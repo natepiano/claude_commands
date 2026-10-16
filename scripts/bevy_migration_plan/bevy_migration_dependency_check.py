@@ -16,10 +16,16 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 from typing import TypedDict, cast
-from urllib import request
+from urllib import parse, request
 from urllib.error import HTTPError, URLError
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bevy_upgrade"))
+
+import crates_io_pacer
 
 
 class CrateVersion(TypedDict):
@@ -51,6 +57,62 @@ class DependencyItem(TypedDict):
     """Type for dependency item from crates.io API"""
     crate_id: str
     req: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class BevyRequirement:
+    requirement: str
+
+
+@dataclass(frozen=True)
+class NoBevyDependency:
+    pass
+
+
+@dataclass(frozen=True)
+class RequirementLookupFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class DiscoveredDependency:
+    name: str
+    version: str
+    lookup: BevyRequirement | RequirementLookupFailed
+
+
+@dataclass(frozen=True)
+class CompatibleVersion:
+    version: str
+
+
+@dataclass(frozen=True)
+class NoCompatibleVersion:
+    pass
+
+
+@dataclass(frozen=True)
+class CompatibilityUnknown:
+    reason: str
+
+
+@dataclass(frozen=True)
+class BevyCheckoutRead:
+    names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class BevyCheckoutMissing:
+    path: Path
+
+
+RequirementLookup = BevyRequirement | NoBevyDependency | RequirementLookupFailed
+BevyCheckout = BevyCheckoutRead | BevyCheckoutMissing
+
+
+def bevy_requirement_names(bevy_checkout: BevyCheckout) -> frozenset[str]:
+    return bevy_checkout.names if isinstance(bevy_checkout, BevyCheckoutRead) else frozenset({'bevy'})
 
 
 @dataclass
@@ -64,7 +126,7 @@ class DependencyInfo:
     reason: str
 
 
-def get_bevy_internal_crates(bevy_version: str) -> set[str]:
+def get_bevy_internal_crates(bevy_version: str) -> BevyCheckout:
     """
     Get the list of bevy internal crates by parsing all Cargo.toml files
     in the cloned bevy repository (including nested macro crates).
@@ -72,9 +134,8 @@ def get_bevy_internal_crates(bevy_version: str) -> set[str]:
     bevy_repo = Path.home() / f"rust/bevy-{bevy_version}"
     crates_dir = bevy_repo / "crates"
 
-    if not crates_dir.exists():
-        # Fallback: return empty set, we'll just include everything
-        return set()
+    if not crates_dir.is_dir():
+        return BevyCheckoutMissing(crates_dir)
 
     internal_crates: set[str] = {'bevy', 'bevy_internal'}
 
@@ -90,7 +151,7 @@ def get_bevy_internal_crates(bevy_version: str) -> set[str]:
             # Skip files we can't read
             continue
 
-    return internal_crates
+    return BevyCheckoutRead(frozenset(internal_crates))
 
 
 def get_workspace_members(codebase: Path) -> set[str]:
@@ -122,12 +183,17 @@ def run_cargo_tree(codebase: Path) -> str | None:
     """
     Run `cargo tree` for direct dependencies and return its stdout.
 
+    Cargo abbreviates already printed packages as `name vX (*)` without children,
+    hiding a member's dependencies when an earlier member depends on it; --no-dedupe
+    prints every package in full each time. --workspace includes every member even
+    when the root manifest is also a package, which cargo otherwise lists alone.
+
     Tries `--all-features` first so optional / feature-gated dependencies are
     included; without it, deps behind a non-default feature are invisible to
     the tree. Falls back to the default feature set if `--all-features` fails
     (e.g. mutually exclusive features). Returns None on error.
     """
-    base_cmd = ['cargo', 'tree', '--depth=1', '--format', '{p}']
+    base_cmd = ['cargo', 'tree', '--workspace', '--no-dedupe', '--depth=1', '--format', '{p}']
 
     for extra_args in (['--all-features'], []):
         try:
@@ -156,15 +222,19 @@ def run_cargo_tree(codebase: Path) -> str | None:
     return None
 
 
-def get_all_direct_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
+def get_all_direct_dependencies(
+    codebase: Path, bevy_checkout: BevyCheckout
+) -> list[tuple[str, str]]:
     """
     Run cargo tree to find all DIRECT dependencies (from Cargo.toml).
     Returns list of (crate_name, version) tuples, excluding bevy internal crates and workspace members.
-    Uses --depth=1 to only get direct dependencies, not transitive ones, and
-    --all-features so optional dependencies are not missed.
+    Uses --depth=1 for direct dependencies, --workspace for every member,
+    --no-dedupe for their complete trees, and --all-features for optional dependencies.
+    --no-dedupe repeats a shared crate under every member that uses it; the set
+    returns each (crate_name, version) once, so discovery looks it up once.
     """
     # Get the definitive list of bevy internal crates
-    internal_crates = get_bevy_internal_crates(bevy_version)
+    internal_crates: frozenset[str] = bevy_checkout.names if isinstance(bevy_checkout, BevyCheckoutRead) else frozenset()
 
     # Get workspace members to exclude
     workspace_members = get_workspace_members(codebase)
@@ -185,7 +255,7 @@ def get_all_direct_dependencies(codebase: Path, bevy_version: str) -> list[tuple
 
     for line in stdout.splitlines():
         # Extract crate name and version, handling tree characters (├──, │, etc.)
-        match = re.search(r'([a-zA-Z0-9_-]+)\s+v([0-9.]+)', line)
+        match = re.search(r'([a-zA-Z0-9_-]+)\s+v(\d\S*)', line)
         if match:
             crate_name = match.group(1)
             version = match.group(2)
@@ -199,36 +269,28 @@ def get_all_direct_dependencies(codebase: Path, bevy_version: str) -> list[tuple
     return sorted(list(dependencies))
 
 
-def has_bevy_dependency(crate_name: str, version: str) -> bool:
-    """
-    Check if a crate version has bevy as a dependency via crates.io API.
-    Returns True if the crate depends on bevy, False otherwise.
-    """
-    bevy_req = get_bevy_dependency_requirement(crate_name, version)
-    return bevy_req is not None
-
-
-def get_bevy_dependencies(codebase: Path, bevy_version: str) -> list[tuple[str, str]]:
+def get_bevy_dependencies(
+    codebase: Path, bevy_checkout: BevyCheckout
+) -> list[DiscoveredDependency]:
     """
     Find all DIRECT dependencies that depend on Bevy.
-    Returns list of (crate_name, version) tuples.
+    Keeps each dependency's name, version and the lookup outcome that retained it.
 
     This function checks ALL direct dependencies (not just ones with 'bevy' in the name)
     against crates.io to determine if they depend on Bevy.
     """
-    all_deps = get_all_direct_dependencies(codebase, bevy_version)
+    all_deps = get_all_direct_dependencies(codebase, bevy_checkout)
+    bevy_names = bevy_requirement_names(bevy_checkout)
 
-    bevy_deps: list[tuple[str, str]] = []
+    bevy_deps: list[DiscoveredDependency] = []
 
     for crate_name, version in all_deps:
-        # Quick heuristic: if name contains 'bevy', it's definitely a bevy ecosystem crate
-        if 'bevy' in crate_name.lower():
-            bevy_deps.append((crate_name, version))
-        else:
-            # Check crates.io to see if this crate depends on bevy
-            print(f"  Checking if {crate_name} depends on bevy...", file=sys.stderr)
-            if has_bevy_dependency(crate_name, version):
-                bevy_deps.append((crate_name, version))
+        print(f"  Checking if {crate_name} depends on bevy...", file=sys.stderr)
+        match get_bevy_dependency_requirement(crate_name, version, bevy_names):
+            case (BevyRequirement() | RequirementLookupFailed()) as lookup:
+                bevy_deps.append(DiscoveredDependency(crate_name, version, lookup))
+            case NoBevyDependency():
+                pass
 
     return bevy_deps
 
@@ -244,6 +306,7 @@ def query_crates_io(crate_name: str) -> QueryResult | None:
         req = request.Request(url)
         req.add_header('User-Agent', 'bevy-dependency-checker/1.0')
 
+        crates_io_pacer.CRATES_IO_PACER.wait()
         with request.urlopen(req, timeout=10) as response:  # pyright: ignore[reportAny]
             data: CratesIOResponse = json.loads(response.read().decode('utf-8'))  # pyright: ignore[reportAny]
 
@@ -270,32 +333,48 @@ def query_crates_io(crate_name: str) -> QueryResult | None:
         return None
 
 
-def get_bevy_dependency_requirement(crate_name: str, version: str) -> str | None:
+def get_bevy_dependency_requirement(
+    crate_name: str, version: str, bevy_names: frozenset[str]
+) -> RequirementLookup:
     """
     Query crates.io API for a specific version's bevy dependency requirement.
-    Returns the version requirement string (e.g., "0.17") or None if no bevy dependency.
+    Distinguishes a Bevy requirement, no Bevy dependency, and an unread release.
     """
-    url = f"https://crates.io/api/v1/crates/{crate_name}/{version}/dependencies"
+    url = f"https://crates.io/api/v1/crates/{crate_name}/{parse.quote(version, safe='')}/dependencies"
 
     try:
         req = request.Request(url)
         req.add_header('User-Agent', 'bevy-dependency-checker/1.0')
 
-        with request.urlopen(req, timeout=10) as response:  # pyright: ignore[reportAny]
-            data: dict[str, list[DependencyItem]] = json.loads(response.read().decode('utf-8'))  # pyright: ignore[reportAny]
+        crates_io_pacer.CRATES_IO_PACER.wait()
+        with cast(HTTPResponse, request.urlopen(req, timeout=10)) as response:
+            raw = cast(object, json.loads(response.read().decode('utf-8')))
+            if not isinstance(raw, dict):
+                raise ValueError('expected a dependencies object')
+            data = cast(dict[str, object], raw)
+            values = data['dependencies']
+            if not isinstance(values, list):
+                raise ValueError('expected a dependencies array')
+            dependencies: list[DependencyItem] = []
+            for value in cast(list[object], values):
+                if not isinstance(value, dict):
+                    raise ValueError('expected a dependency object')
+                fields = cast(dict[str, object], value)
+                name, requirement, kind = fields['crate_id'], fields['req'], fields['kind']
+                if not isinstance(name, str) or not isinstance(requirement, str) or not isinstance(kind, str):
+                    raise ValueError('dependency crate_id, req and kind must be strings')
+                if kind != 'dev' and (name == 'bevy' or name in bevy_names):
+                    dependencies.append(DependencyItem(crate_id=name, req=requirement, kind=kind))
 
-            dependencies: list[DependencyItem] = data.get('dependencies', [])  # type: ignore[assignment]
+            if not dependencies:
+                return NoBevyDependency()
+            dep = min(dependencies, key=lambda dep: (dep['crate_id'] != 'bevy', dep['crate_id']))
+            return BevyRequirement(dep['req'])
 
-            # Find bevy dependency
-            for dep in dependencies:
-                if dep['crate_id'] == 'bevy':
-                    return dep['req']
-
-            return None
-
-    except (HTTPError, URLError, json.JSONDecodeError) as e:
-        print(f"Warning: Could not query dependencies for {crate_name} {version}: {e}", file=sys.stderr)
-        return None
+    except (OSError, HTTPException, ValueError, KeyError, TypeError) as e:
+        reason = f"crates.io response is missing {e}" if isinstance(e, KeyError) else str(e)
+        print(f"Warning: Could not query dependencies for {crate_name} {version}: {reason}", file=sys.stderr)
+        return RequirementLookupFailed(reason)
 
 
 def version_matches_requirement(requirement: str, target_version: str) -> bool:
@@ -336,8 +415,9 @@ def version_matches_requirement(requirement: str, target_version: str) -> bool:
 def find_bevy_compatible_version(
     crate_name: str,
     all_versions: list[str],
-    target_bevy_version: str
-) -> str | None:
+    target_bevy_version: str,
+    bevy_checkout: BevyCheckout
+) -> CompatibleVersion | NoCompatibleVersion | CompatibilityUnknown:
     """
     Find the latest version compatible with target Bevy version by checking
     each version's actual bevy dependency requirement.
@@ -345,15 +425,22 @@ def find_bevy_compatible_version(
     """
     # Only check the 20 most recent versions to avoid false matches from years ago
     recent_versions = all_versions[:20]
+    bevy_names = bevy_requirement_names(bevy_checkout)
+    unsuccessful: NoCompatibleVersion | CompatibilityUnknown = NoCompatibleVersion()
 
     # Check versions from newest to oldest
     for version in recent_versions:
-        bevy_req = get_bevy_dependency_requirement(crate_name, version)
+        match get_bevy_dependency_requirement(crate_name, version, bevy_names):
+            case BevyRequirement(requirement):
+                if version_matches_requirement(requirement, target_bevy_version):
+                    return CompatibleVersion(version)
+            case RequirementLookupFailed(reason):
+                if isinstance(unsuccessful, NoCompatibleVersion):
+                    unsuccessful = CompatibilityUnknown(reason)
+            case NoBevyDependency():
+                pass
 
-        if bevy_req and version_matches_requirement(bevy_req, target_bevy_version):
-            return version
-
-    return None
+    return unsuccessful
 
 
 def classify_dependency(
@@ -390,7 +477,7 @@ def classify_dependency(
 
 
 def generate_markdown_report(
-    dependencies: list[DependencyInfo]
+    dependencies: list[DependencyInfo], warning: str = ''
 ) -> str:
     """Generate markdown report of dependency compatibility."""
 
@@ -404,6 +491,8 @@ def generate_markdown_report(
 
     lines.append("## ⚠️ Dependency Compatibility Review")
     lines.append("")
+    if warning:
+        lines.extend([warning, ""])
     lines.append(f"**Status:** {len(dependencies)} dependencies checked")
     lines.append(f"- ✅ Compatible: {len(ok_deps)}")
     lines.append(f"- 🔄 Updates available: {len(updates_required)}")
@@ -497,12 +586,20 @@ def main() -> None:
 
     # Get bevy dependencies from cargo tree
     print(f"Analyzing dependencies in {codebase}...", file=sys.stderr)
-    deps = get_bevy_dependencies(codebase, bevy_version)
+    bevy_checkout = get_bevy_internal_crates(bevy_version)
+    warning = ''
+    if isinstance(bevy_checkout, BevyCheckoutMissing):
+        warning = (f"Warning: {bevy_checkout.path} not found; "
+                   "crates that depend only on a Bevy sub-crate are not detected")
+        print(warning, file=sys.stderr)
+    deps = get_bevy_dependencies(codebase, bevy_checkout)
 
     if not deps:
         print("No bevy-related dependencies found.", file=sys.stderr)
         # Still output a minimal report
         report = "## ⚠️ Dependency Compatibility Review\n\n"
+        if warning:
+            report += warning + '\n\n'
         report += "**Status:** No bevy-related dependencies found in this project\n"
 
         # Output to file or stdout
@@ -519,7 +616,8 @@ def main() -> None:
     # Analyze each dependency
     dependency_infos: list[DependencyInfo] = []
 
-    for dep_name, current_version in deps:
+    for dependency in deps:
+        dep_name, current_version = dependency.name, dependency.version
         print(f"Checking {dep_name}...", file=sys.stderr)
 
         # Query crates.io
@@ -541,15 +639,28 @@ def main() -> None:
         all_versions = crate_info['all_versions']
 
         # Find compatible version
-        compatible_version = find_bevy_compatible_version(dep_name, all_versions, bevy_version)
-
-        # Classify
-        classification, reason = classify_dependency(
-            current_version,
-            latest_version,
-            compatible_version,
-            bevy_version
-        )
+        compatibility = find_bevy_compatible_version(dep_name, all_versions, bevy_version, bevy_checkout)
+        match compatibility, dependency.lookup:
+            case CompatibleVersion(version), _:
+                compatible_version = version
+                classification, reason = classify_dependency(
+                    current_version, latest_version, version, bevy_version
+                )
+            case CompatibilityUnknown(failure), _:
+                compatible_version = None
+                classification = 'CHECK_NEEDED'
+                reason = ("Could not read every release's dependencies from crates.io "
+                          f"({failure}) - manual verification needed")
+            case NoCompatibleVersion(), BevyRequirement():
+                compatible_version = None
+                classification, reason = classify_dependency(
+                    current_version, latest_version, None, bevy_version
+                )
+            case NoCompatibleVersion(), RequirementLookupFailed(failure):
+                compatible_version = None
+                classification = 'CHECK_NEEDED'
+                reason = (f"Could not read release {current_version}'s dependencies from crates.io "
+                          f"({failure}) - manual verification needed")
 
         dependency_infos.append(DependencyInfo(
             name=dep_name,
@@ -561,7 +672,7 @@ def main() -> None:
         ))
 
     # Generate markdown report
-    report = generate_markdown_report(dependency_infos)
+    report = generate_markdown_report(dependency_infos, warning)
 
     # Output to file or stdout
     if output_path:

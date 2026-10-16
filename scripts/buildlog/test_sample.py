@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import cli
 import sample
+import store
 from test_index import use_test_log
 
 use_test_log()
@@ -72,6 +73,104 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(sample.parse_boot_id(f"{boot_id}\n"), boot_id)
         with self.assertRaises(ValueError):
             _ = sample.parse_boot_id(" \n")
+
+    def test_power_profile_state_reads_name_and_mtime_once(self) -> None:
+        self.root.mkdir(parents=True)
+        state = self.root / "state.ini"
+        since = 1_792_031_396.125
+        for name in ("performance", "balanced", "power-saver"):
+            with self.subTest(profile=name):
+                _ = state.write_text(f"[Other]\nProfile=ignored\n[State]\nProfile={name}\nCpuDriver=amd_pstate\n")
+                os.utime(state, (since, since))
+                with state.open() as handle:
+                    descriptor = handle.fileno()
+                    with patch.object(Path, "open", return_value=handle) as open_file, \
+                         patch.object(os, "fstat", wraps=os.fstat) as stat_file, \
+                         patch.object(handle, "read", wraps=handle.read) as read_file:
+                        profile = sample.read_power_profile(state)
+                self.assertEqual(profile, sample.PowerProfile(name, since))
+                open_file.assert_called_once()
+                stat_file.assert_called_once_with(descriptor)
+                read_file.assert_called_once()
+
+    def test_power_profile_path_replacement_keeps_open_file_profile_and_mtime(self) -> None:
+        self.root.mkdir(parents=True)
+        state = self.root / "state.ini"
+        replacement = self.root / "replacement.ini"
+        _ = state.write_text("[State]\nProfile=balanced\n")
+        _ = replacement.write_text("[State]\nProfile=performance\n")
+        since = 1_792_031_396.125
+        replacement_since = since + 86400
+        os.utime(state, (since, since))
+        os.utime(replacement, (replacement_since, replacement_since))
+        with state.open() as handle:
+            descriptor = handle.fileno()
+            # Replace the path after opening, before metadata or content is read.
+            os.replace(replacement, state)
+            with patch.object(Path, "open", return_value=handle) as open_file, \
+                 patch.object(os, "fstat", wraps=os.fstat) as stat_file:
+                profile = sample.read_power_profile(state)
+        open_file.assert_called_once()
+        stat_file.assert_called_once_with(descriptor)
+        self.assertEqual(profile, sample.PowerProfile("balanced", since))
+        self.assertEqual(state.read_text(), "[State]\nProfile=performance\n")
+        self.assertEqual(os.stat(state).st_mtime, replacement_since)
+
+    def test_power_profile_missing_file_is_unmeasured(self) -> None:
+        self.assertIs(sample.read_power_profile(self.root / "missing.ini"), sample.Unmeasured.VALUE)
+
+    def test_power_profile_without_state_or_value_is_unmeasured(self) -> None:
+        self.root.mkdir(parents=True)
+        state = self.root / "state.ini"
+        for text in ("[Other]\nProfile=performance\n", "[State]\nCpuDriver=amd_pstate\n",
+                     "[State]\nProfile=\n", "[State]\nProfile=   \n",
+                     "[State]\nCpuDriver=amd_pstate\n[Other]\nProfile=performance\n"):
+            with self.subTest(text=text):
+                _ = state.write_text(text)
+                self.assertIs(sample.read_power_profile(state), sample.Unmeasured.VALUE)
+
+    def test_power_profile_unreadable_file_is_unmeasured(self) -> None:
+        self.root.mkdir(parents=True)
+        state = self.root / "state.ini"
+        _ = state.write_text("[State]\nProfile=performance\n")
+        with patch.object(Path, "open", side_effect=PermissionError("unreadable")):
+            self.assertIs(sample.read_power_profile(state), sample.Unmeasured.VALUE)
+
+    def power_profile_sample(self, state: Path) -> Record:
+        proc = self.root / "proc"
+        proc.mkdir(parents=True, exist_ok=True)
+        _ = (proc / "meminfo").write_text("MemTotal: 16 kB\nMemAvailable: 4 kB\nSwapTotal: 8 kB\nSwapFree: 1 kB\n")
+        _ = (proc / "pressure").write_text("some total=100\nfull total=20\n")
+        _ = (proc / "boot_id").write_text("test-boot\n")
+        with patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root),
+                                  "BUILDLOG_BUILDS_CGROUP": str(self.root / "absent-builds"),
+                                  "BUILDLOG_CI_CGROUP": str(self.root / "absent-ci")}), \
+             patch.object(sample, "MEMINFO", proc / "meminfo"), \
+             patch.object(sample, "PRESSURE", proc / "pressure"), \
+             patch.object(sample, "BOOT_ID", proc / "boot_id"), \
+             patch.object(sample, "POWER_PROFILE_STATE", state), \
+             patch.object(subprocess, "Popen", side_effect=AssertionError("sample must not fork")):
+            _ = sample.sample()
+        lines = next(self.root.glob("*/samples-*.jsonl")).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        return cast(Record, json.loads(lines[0]))
+
+    def test_sample_writes_power_profile_and_utc_state_mtime(self) -> None:
+        self.root.mkdir(parents=True)
+        state = self.root / "state.ini"
+        _ = state.write_text("[State]\nProfile=performance\n")
+        since = 1_792_031_396.125
+        os.utime(state, (since, since))
+        record = self.power_profile_sample(state)
+        self.assertEqual(record["kind"], "sample")
+        self.assertEqual(record["power_profile"], "performance")
+        self.assertEqual(record["power_profile_since"], store.utc_iso(since))
+
+    def test_sample_without_power_profile_still_writes_null_fields(self) -> None:
+        record = self.power_profile_sample(self.root / "missing.ini")
+        self.assertEqual(record["kind"], "sample")
+        self.assertIsNone(record["power_profile"])
+        self.assertIsNone(record["power_profile_since"])
 
     def test_slice_anon_reads_fixture_and_marks_missing_slice_unmeasured(self) -> None:
         builds = self.root / "builds.slice"

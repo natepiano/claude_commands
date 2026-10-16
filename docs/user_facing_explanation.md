@@ -4,6 +4,8 @@ Shared by `/adhoc_review` and `/unit:direct`. Both reference this file rather
 than carrying their own copy, so the method cannot drift between them. Applies
 to any turn that presents a finding, a briefing, or a decision to the user.
 
+For wording, load `/message_style`; its rules live in `~/rust/nate_style/message/`.
+
 `~/.claude/docs/explain_on_demand.md` is the companion: this file governs the
 first presentation, that one governs the rebuild after it fails to land.
 

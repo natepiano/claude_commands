@@ -57,6 +57,8 @@ cli_agent_run() {
             exec codex "${agent_args[@]}" "$invocation"
             ;;
         claude)
+            source "$CLI_AGENT_DIR/../agents/claude_account.sh"
+            claude_launch_environment || return 1
             read -r -a agent_args <<< "$(agents_claude_args)"
             if [[ -z "$invocation" ]]; then
                 exec claude "${agent_args[@]}"

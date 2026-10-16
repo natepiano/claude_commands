@@ -23,20 +23,23 @@ from typing import Literal, TextIO, cast, final
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "buildlog"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
 import sweep
+import treekey
 
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
 
-MacDeclineReason = Literal[
+NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
     "linux_only",
     "backoff",
     "blocked",
-    "busy",
     "state",
     "unreachable",
     "mac_busy",
@@ -44,6 +47,7 @@ MacDeclineReason = Literal[
     "disk",
     "copy",
 ]
+MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
 MacPower = Literal["ac", "battery"]
 
 
@@ -60,6 +64,44 @@ class UnknownRepository:
 
 RepositoryIdentity = KnownRepository | UnknownRepository
 UNKNOWN_REPOSITORY = UnknownRepository()
+
+
+class AllMirrors:
+    """Every repository's mirror on the Mac."""
+
+
+MirrorScope = KnownRepository | AllMirrors
+ALL_MIRRORS = AllMirrors()
+
+
+@dataclass(frozen=True)
+class KnownTreeKey:
+    value: str
+
+
+@dataclass(frozen=True)
+class UnavailableTreeKey:
+    pass
+
+
+TreeKey = KnownTreeKey | UnavailableTreeKey
+UNAVAILABLE_TREE_KEY = UnavailableTreeKey()
+
+
+@dataclass(frozen=True)
+class CopiedTree:
+    tree_key: TreeKey
+
+
+@dataclass(frozen=True)
+class TreeCopyFailed:
+    pass
+
+
+def read_tree_key(directory: Path) -> TreeKey:
+    if key := treekey.tree_key(str(directory)):
+        return KnownTreeKey(key)
+    return UNAVAILABLE_TREE_KEY
 
 
 @dataclass(frozen=True)
@@ -95,12 +137,51 @@ class LostMacRun:
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
 
-    reason: MacDeclineReason
+    reason: NonBusyMacDeclineReason
     seconds: float
 
 
+@dataclass(frozen=True)
+class KnownMacJob:
+    what: str
+
+
+@dataclass(frozen=True)
+class LostRunLeftovers:
+    pass
+
+
+@dataclass(frozen=True)
+class UnreadableMacHolder:
+    pass
+
+
+MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
+
+
+@dataclass(frozen=True)
+class BusyMacDecline:
+    holder: MacHolder
+    seconds: float
+
+    @property
+    def reason(self) -> Literal["busy"]:
+        return "busy"
+
+
+def claim_holder(stdout: str) -> MacHolder:
+    match = re.fullmatch(r"busy: (.+) since (?:[01][0-9]|2[0-3]):[0-5][0-9]\n?", stdout)
+    return KnownMacJob(match.group(1)) if match is not None else UnreadableMacHolder()
+
+
+def holder_value(holder: MacHolder) -> str:
+    if isinstance(holder, KnownMacJob):
+        return holder.what
+    return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
+
+
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+    PassedOnMac | FailedOnMac | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
 )
 
 
@@ -156,6 +237,11 @@ class OffloadConfig:
     default_target_budget_gib: str
     values: dict[str, str]
 
+    @property
+    def leftover_timeout_s(self) -> float:
+        """Bound the cleanup SSH call independently of the reachability probe."""
+        return positive_number(self.values, "leftover_timeout_s", 10.0)
+
 
 @dataclass(frozen=True)
 class OffloadRequest:
@@ -167,6 +253,7 @@ class OffloadRequest:
     result: ResultDestination
     nextest_words: tuple[str, ...]
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
+    copy: bool = False
 
 
 @dataclass(frozen=True)
@@ -176,6 +263,24 @@ class ProbeSnapshot:
     power: MacPower
     free_gib: float
     hostname: str
+
+
+@dataclass(frozen=True)
+class LeftoversEnded:
+    """Both selectors completed and found no remaining remote work."""
+
+
+@dataclass(frozen=True)
+class LeftoversRemain:
+    count: int
+
+
+@dataclass(frozen=True)
+class LeftoverCheckFailed:
+    reason: str
+
+
+LeftoverCheckResult = LeftoversEnded | LeftoversRemain | LeftoverCheckFailed
 
 
 @dataclass(frozen=True)
@@ -198,6 +303,35 @@ class CommandCouldNotStart:
 CapturedCommandResult = CommandOutput | CommandTimedOut | CommandCouldNotStart
 COMMAND_TIMED_OUT = CommandTimedOut()
 COMMAND_COULD_NOT_START = CommandCouldNotStart()
+
+
+@dataclass(frozen=True)
+class FreshMacClaim:
+    """New capacity with no remote job started under it."""
+
+
+@dataclass(frozen=True)
+class TakenOverMacClaim:
+    """Capacity inherited from a lost job on the host in the claim's reply."""
+
+    host: str
+
+
+@dataclass(frozen=True)
+class TakeoverHostUnreadable:
+    """A takeover reply that cannot name the host for its leftover check."""
+
+
+@dataclass(frozen=True)
+class MacClaimNotConfirmed:
+    """A refusal or failed call that supplies no confirmed claim to release."""
+
+    reason: MacDeclineReason
+    stdout: str
+    stderr: str
+
+
+MacClaimAnswer = FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
 
 
 class IgnoredPathListingFailed:
@@ -234,8 +368,53 @@ class RunningProcess:
     process: subprocess.Popen[str]
 
 
-ActiveProcess = IdleProcess | RunningProcess
+class NoClaimInterrupt:
+    """No signal arrived while the local claim was completing."""
+
+
+NO_CLAIM_INTERRUPT = NoClaimInterrupt()
+
+
+@dataclass
+class LocalClaimAttempt:
+    """A local claim whose answer is retained before a signal takes effect."""
+
+    answer: MacClaimAnswer = MacClaimNotConfirmed("state", "", "")
+    interruption: NoClaimInterrupt | OffloadInterrupted = NO_CLAIM_INTERRUPT
+
+
+ActiveProcess = IdleProcess | RunningProcess | LocalClaimAttempt
 IDLE_PROCESS = IdleProcess()
+
+
+@dataclass(frozen=True)
+class CleanupDone:
+    """The remote mirror's build output was removed."""
+
+
+@dataclass(frozen=True)
+class CleanupFailed:
+    """The remote delete returned a nonzero status."""
+
+    rc: int
+
+
+@dataclass(frozen=True)
+class CleanupSkipped:
+    """The run selected another target directory."""
+
+
+@dataclass(frozen=True)
+class CleanupKept:
+    """The mirror's build output was kept after the free-space check."""
+
+
+@dataclass(frozen=True)
+class CleanupUnconfirmed:
+    """The remote command did not report a usable cleanup status."""
+
+
+CleanupOutcome = CleanupDone | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
 
 
 @dataclass(frozen=True)
@@ -243,6 +422,7 @@ class ReportedMacStatus:
     """The test status printed by the remote command."""
 
     status: int
+    cleanup: CleanupOutcome = CleanupUnconfirmed()
 
 
 class MissingMacStatus:
@@ -311,6 +491,7 @@ class CliArguments(argparse.Namespace):
         self.result: str | None = None
         self.settings: str = ""
         self.last_decline: str = ""
+        self.copy: bool = False
         self.nextest_words: list[str] = []
 
 
@@ -322,6 +503,8 @@ class ProcessController:
 
     def stop(self) -> None:
         active = self.active
+        if isinstance(active, LocalClaimAttempt):
+            return
         self.active = IDLE_PROCESS
         if not isinstance(active, RunningProcess):
             return
@@ -334,6 +517,32 @@ class ProcessController:
         except subprocess.TimeoutExpired:
             process.kill()
             _ = process.wait()
+
+    def defer_claim_interrupt(self, signal_number: int) -> bool:
+        if not isinstance(self.active, LocalClaimAttempt):
+            return False
+        self.active.interruption = OffloadInterrupted(signal_number)
+        return True
+
+    def complete_claim(self, arguments: Sequence[str], attempt: LocalClaimAttempt) -> None:
+        """Read the bounded local claim's reply even when the runner is signalled."""
+        self.active = attempt
+        try:
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+            except OSError:
+                attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
+            else:
+                stdout, stderr = process.communicate()
+                attempt.answer = read_claim_answer(CommandOutput(process.returncode, stdout, stderr))
+        finally:
+            self.active = IDLE_PROCESS
 
     def capture(
         self,
@@ -384,29 +593,67 @@ class ProcessController:
             return MISSING_MAC_STATUS
         output = cast(TextIO, raw_output)
         self.active = RunningProcess(process)
+        status: RemoteRunStatus = MISSING_MAC_STATUS
+        cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         try:
             for line in output:
+                marker = line.rstrip("\r\n")
+                status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
+                if status_match is not None:
+                    if held_status_line:
+                        print(held_status_line, end="", flush=True)
+                    status_digits = status_match.group(1).lstrip("0") or "0"
+                    mac_status = int(status_digits) if len(status_digits) <= 3 else 256
+                    status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    if isinstance(status, ReportedMacStatus):
+                        held_status_line = line
+                    else:
+                        held_status_line = ""
+                        print(line, end="", flush=True)
+                    cleanup = CleanupUnconfirmed()
+                    continue
+                if marker.startswith("mac_cleanup="):
+                    cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
+                    continue
                 if held_status_line:
                     print(held_status_line, end="", flush=True)
                     held_status_line = ""
-                if re.fullmatch(r"mac_exit=([0-9]+)", line.rstrip("\r\n")):
-                    held_status_line = line
-                else:
-                    print(line, end="", flush=True)
-            status = process.wait()
+                status = MISSING_MAC_STATUS
+                cleanup = CleanupUnconfirmed()
+                print(line, end="", flush=True)
+            _ = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
-        status_match = re.fullmatch(
-            r"mac_exit=([0-9]+)", held_status_line.rstrip("\r\n")
-        )
-        if status_match is None or status == 255:
-            return MISSING_MAC_STATUS
-        mac_status = int(status_match.group(1))
-        if mac_status > 255:
-            return MISSING_MAC_STATUS
-        return ReportedMacStatus(mac_status)
+        if isinstance(status, ReportedMacStatus):
+            return ReportedMacStatus(status.status, cleanup)
+        return MISSING_MAC_STATUS
+
+
+def parse_cleanup(value: str) -> CleanupOutcome:
+    if value == "skipped":
+        return CleanupSkipped()
+    if value == "kept":
+        return CleanupKept()
+    if not re.fullmatch(r"[0-9]+", value):
+        return CleanupUnconfirmed()
+    digits = value.lstrip("0") or "0"
+    if len(digits) > 3:
+        return CleanupUnconfirmed()
+    rc = int(digits)
+    if rc > 255:
+        return CleanupUnconfirmed()
+    return CleanupDone() if rc == 0 else CleanupFailed(rc)
+
+
+def report_cleanup(cleanup: CleanupOutcome) -> None:
+    if isinstance(cleanup, CleanupFailed):
+        print(f"Mac build output not removed: {cleanup.rc}", flush=True)
+    elif isinstance(cleanup, CleanupSkipped):
+        print("Mac build output kept: the run used another target dir", flush=True)
+    elif isinstance(cleanup, CleanupUnconfirmed):
+        print("Mac build output cleanup unconfirmed", flush=True)
 
 
 def config_path() -> Path:
@@ -461,7 +708,7 @@ def elapsed_seconds(started: float) -> float:
     return max(0.0, time.monotonic() - started)
 
 
-def declined(reason: MacDeclineReason, started: float) -> DeclinedMacRun:
+def declined(reason: NonBusyMacDeclineReason, started: float) -> DeclinedMacRun:
     return DeclinedMacRun(reason, elapsed_seconds(started))
 
 
@@ -505,8 +752,9 @@ def write_result(
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the Mac ({reason})")
     if isinstance(destination, ResultFile):
+        holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
         _ = destination.path.write_text(
-            f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n",
+            f"mac={mac}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line,
             encoding="utf-8",
         )
     return status
@@ -609,7 +857,8 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(power, free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
+    copy_words = ["--copy"] if request.copy else []
     return [
         sys.executable,
         str(Path(__file__).with_name("mac_test.py")),
@@ -620,6 +869,9 @@ def claim_arguments(request: OffloadRequest) -> list[str]:
         f"nextest {request.package}",
         "--worktree",
         str(request.repo_root),
+        "--remote",
+        config.host,
+        *copy_words,
     ]
 
 
@@ -633,6 +885,23 @@ def release_claim(controller: ProcessController) -> None:
             str(os.getpid()),
         ]
     )
+
+
+def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
+    if not isinstance(result, CommandOutput):
+        return MacClaimNotConfirmed("state", "", "")
+    if result.status == 0:
+        return FreshMacClaim()
+    if result.status == 13:
+        hosts = [line.removeprefix("leftovers: ").strip() for line in result.stdout.splitlines()
+                 if line.startswith("leftovers: ")]
+        if len(hosts) == 1 and hosts[0]:
+            return TakenOverMacClaim(hosts[0])
+        return TakeoverHostUnreadable()
+    reason: MacDeclineReason = (
+        "blocked" if result.status == 10 else "busy" if result.status == 11 else "state"
+    )
+    return MacClaimNotConfirmed(reason, result.stdout, result.stderr)
 
 
 def probe_reachability(
@@ -741,6 +1010,21 @@ def copy_tree(
         return False
 
 
+def copy_tree_with_key(
+    controller: ProcessController,
+    config: OffloadConfig,
+    request: OffloadRequest,
+    repository: KnownRepository,
+) -> CopiedTree | TreeCopyFailed:
+    before = read_tree_key(request.repo_root)
+    if not copy_tree(controller, config, request, repository):
+        return TreeCopyFailed()
+    after = read_tree_key(request.repo_root)
+    if isinstance(before, KnownTreeKey) and isinstance(after, KnownTreeKey) and before == after:
+        return CopiedTree(before)
+    return CopiedTree(UNAVAILABLE_TREE_KEY)
+
+
 def nextest_words_with_skip(
     words: tuple[str, ...], skip_expression: str
 ) -> tuple[str, ...]:
@@ -763,6 +1047,7 @@ def remote_test_command(
     config: OffloadConfig,
     request: OffloadRequest,
     repository: KnownRepository,
+    sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
@@ -772,33 +1057,176 @@ def remote_test_command(
         config.values.get(f"mac_skip.{repository.name}", ""),
     )
     invocation = shlex.join(["nextest", *words])
+    sent_tree = (
+        f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
+        if isinstance(sent_tree_key, KnownTreeKey) else ""
+    )
+    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
+        cleanup_command = "echo mac_cleanup=skipped"
+    else:
+        target = shlex.quote(f"{remote_mirror(repository)}/target")
+        floor = shlex.quote(f"{config.free_floor_gib:g}")
+        cleanup_command = (
+            'if free_gib=$(df -g "$HOME"); then '
+            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
+            + 'else free_gib=; fi; '
+            + f'if awk -v free="$free_gib" -v floor={floor} '
+            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
+            + f'if rm -rf -- "$HOME"/{target}; then echo mac_cleanup=0; '
+            + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+        )
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
+        f"{sent_tree}"
         "BUILDLOG_SYNC=1 "
+        "LINT_SKIP_SWEEP=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?"
+        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
     )
 
 
-def end_remote_work(config: OffloadConfig, repository: KnownRepository) -> None:
+def extended_regex_literal(text: str) -> str:
+    """Match text literally in pgrep's and awk's extended regular expressions.
+
+    A character that is special inside a bracket (`]`, `^`, `\\`) matches any
+    character instead, which can only widen the selection by that position.
+    """
+    return "".join(
+        character if character.isalnum() or character in "_-"
+        else "." if character in "]^\\"
+        else f"[{character}]"
+        for character in text
+    )
+
+
+def mirror_selector_script(scope: MirrorScope) -> str:
+    """Define select_leftovers: the user's processes running from the scoped mirrors.
+
+    A repository's scope stops at its own mirror, so its leftover check never
+    reaches another repository's run. The `[.]` keeps each pattern from
+    matching this script's own text.
+    """
+    if isinstance(scope, KnownRepository):
+        name = extended_regex_literal(scope.name)
+        command_pattern = f"[.]local/state/mac-test/mirror/{name}([/'\"[:space:]]|$)"
+        cwd_pattern = f"^n.*/[.]local/state/mac-test/mirror/{name}(/|$)"
+    else:
+        command_pattern = "[.]local/state/mac-test/mirror/"
+        cwd_pattern = "^n.*/[.]local/state/mac-test/mirror(/|$)"
+    return (
+        f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
+        + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
+        + r'''select_leftovers() {
+    if command_pids=$(pgrep -u "$(id -u)" -f "$mirror_command_pattern"); then
+        :
+    else
+        selector_result=$?
+        [ "$selector_result" -eq 1 ] || return 1
+    fi
+    cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn) || return 1
+    cwd_pids=$(printf '%s\n' "$cwd_records" | awk -v pattern="$mirror_cwd_pattern" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }') || return 1
+    printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
+}
+'''
+    )
+
+
+def leftover_check_script(repository: KnownRepository) -> str:
+    return mirror_selector_script(repository) + r'''
+leftover_pids=$(select_leftovers) || exit 1
+printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
+    [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
+done
+sleep 1 || exit 1
+leftover_pids=$(select_leftovers) || exit 1
+printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
+    [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
+done
+leftover_pids=$(select_leftovers) || exit 1
+leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+printf 'leftovers=%s\nrc=0\n' "$leftover_count"
+'''
+
+
+def parse_leftover_check(output: str) -> LeftoverCheckResult:
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    count_text = values.get("leftovers", "")
+    if values.get("rc") != "0" or not count_text.isascii() or not count_text.isdecimal():
+        return LeftoverCheckFailed("the leftover check answer could not be read")
+    count = int(count_text)
+    return LeftoversEnded() if count == 0 else LeftoversRemain(count)
+
+
+def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepository) -> LeftoverCheckResult:
+    """End and count one mirror's work without exposing the check to a second signal."""
     try:
-        _ = subprocess.run(
-            [
-                *ssh_prefix(config),
-                f"pkill -f {shlex.quote(remote_mirror(repository))}",
-            ],
+        result = subprocess.run(
+            ["ssh", *ssh_options(config), host, leftover_check_script(repository)],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             check=False,
-            timeout=10,
+            timeout=config.leftover_timeout_s,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return
+    except subprocess.TimeoutExpired:
+        return LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s")
+    except OSError:
+        return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
+    answer = parse_leftover_check(result.stdout)
+    if isinstance(answer, LeftoverCheckFailed):
+        reason = " ".join(result.stderr.split())
+        if reason:
+            return LeftoverCheckFailed(reason)
+    return answer
+
+
+def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) -> None:
+    if isinstance(result, LeftoversRemain):
+        if not decline_already_shown("busy", request.last_decline):
+            print(f"mac_test: {result.count} leftover processes of a lost run are still on the Mac; "
+                  + "it stays busy until they end", file=sys.stderr, flush=True)
+    elif isinstance(result, LeftoverCheckFailed):
+        if not decline_already_shown("unreachable", request.last_decline):
+            print("mac_test: could not confirm that a lost run's leftovers ended: "
+                  + f"{result.reason}; the Mac stays busy", file=sys.stderr, flush=True)
+
+
+def check_taken_over_claim(
+    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository
+) -> LeftoverCheckResult:
+    if isinstance(claim, TakenOverMacClaim):
+        return check_leftovers(config, claim.host, repository)
+    return LeftoverCheckFailed("the kept claim's host could not be read")
+
+
+def claim_for_run(
+    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository
+) -> MacClaimAnswer:
+    attempt = LocalClaimAttempt()
+    try:
+        controller.complete_claim(claim_arguments(request, config), attempt)
+        if isinstance(attempt.interruption, OffloadInterrupted):
+            raise attempt.interruption
+        return attempt.answer
+    except OffloadInterrupted:
+        claim = attempt.answer
+        if isinstance(claim, FreshMacClaim):
+            release_claim(controller)
+        elif isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+            checked = check_taken_over_claim(config, claim, repository)
+            report_leftover_check(checked, request)
+            if isinstance(checked, LeftoversEnded):
+                release_claim(controller)
+        raise
 
 
 def claimed_run(
@@ -808,6 +1236,7 @@ def claimed_run(
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    release_allowed = True
     try:
         probe = probe_mac(controller, config, repository)
         if isinstance(probe, UnavailableProbe):
@@ -819,32 +1248,50 @@ def claimed_run(
             return declined("disk", started)
 
         copy_started = time.monotonic()
-        if not copy_tree(controller, config, request, repository):
+        copied = copy_tree_with_key(controller, config, request, repository)
+        if isinstance(copied, TreeCopyFailed):
             return declined("copy", started)
         copy_seconds = elapsed_seconds(copy_started)
-        print(
-            "mac_test: running on the Mac "
-            + f"(macOS, host {probe.hostname}); tree copied in {copy_seconds:.1f} s",
-            flush=True,
+        running = (
+            f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
+            if request.copy
+            else f"running on the Mac (macOS, host {probe.hostname})"
         )
+        print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
+        release_allowed = False
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
-                remote_test_command(config, request, repository),
+                remote_test_command(config, request, repository, copied.tree_key),
             ]
         )
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MissingMacStatus):
-            end_remote_work(config, repository)
+            checked = check_leftovers(config, config.host, repository)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
             return LostMacRun(elapsed_seconds(started))
+        report_cleanup(remote_status.cleanup)
+        if isinstance(remote_status.cleanup, CleanupUnconfirmed):
+            checked = check_leftovers(config, config.host, repository)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
+        else:
+            release_allowed = True
         if remote_status.status == 0:
             return PassedOnMac(seconds)
         if remote_status.status == 4:
             return NoTestMatchedOnMac(seconds)
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
-        end_remote_work(config, repository)
+        if not release_allowed:
+            checked = check_leftovers(config, config.host, repository)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
         raise
+    finally:
+        if release_allowed:
+            release_claim(controller)
 
 
 def run_offload(
@@ -868,27 +1315,29 @@ def run_offload(
     if isinstance(backoff, ActiveBackoff):
         return declined("backoff", started)
 
-    release_may_be_needed = True
-    try:
-        claim = controller.capture(claim_arguments(request))
-        if not isinstance(claim, CommandOutput):
-            release_may_be_needed = False
-            return declined("state", started)
-        if claim.status != 0:
-            release_may_be_needed = False
-            reason: MacDeclineReason = (
-                "blocked" if claim.status == 10 else "busy" if claim.status == 11 else "state"
-            )
-            if not decline_already_shown(reason, request.last_decline):
-                if claim.stdout:
-                    print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
-                if claim.stderr:
-                    print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
-            return declined(reason, started)
-        return claimed_run(controller, config, request, repository, started)
-    finally:
-        if release_may_be_needed:
-            release_claim(controller)
+    claim = claim_for_run(controller, config, request, repository)
+    if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+        checked = check_taken_over_claim(config, claim, repository)
+        report_leftover_check(checked, request)
+        if isinstance(checked, LeftoverCheckFailed):
+            write_backoff(time.time() + config.unreachable_backoff_s)
+            return declined("unreachable", started)
+        if isinstance(checked, LeftoversRemain):
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        release_claim(controller)
+        claim = claim_for_run(controller, config, request, repository)
+        if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+    if isinstance(claim, MacClaimNotConfirmed):
+        if not decline_already_shown(claim.reason, request.last_decline):
+            if claim.stdout:
+                print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            if claim.stderr:
+                print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        if claim.reason == "busy":
+            return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
+        return declined(claim.reason, started)
+    return claimed_run(controller, config, request, repository, started)
 
 
 @contextmanager
@@ -902,6 +1351,8 @@ def interrupt_handlers(controller: ProcessController) -> Generator[None, None, N
         _ = signal.signal(signal.SIGINT, signal.SIG_IGN)
         _ = signal.signal(signal.SIGTERM, signal.SIG_IGN)
         _ = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if controller.defer_claim_interrupt(signal_number):
+            return
         controller.stop()
         raise OffloadInterrupted(signal_number)
 
@@ -926,6 +1377,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
+    _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--result")
     _ = run.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
@@ -947,6 +1399,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         result=result_destination(arguments.result),
         nextest_words=tuple(words),
         last_decline=last_decline,
+        copy=arguments.copy,
     )
 
 
@@ -959,6 +1412,7 @@ def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     arguments = parser().parse_args(namespace=CliArguments())
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)

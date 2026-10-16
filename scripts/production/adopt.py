@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import add_unit
+import production_units
 import rename_state
 import unit_lookup
 
@@ -75,21 +76,24 @@ def unit_rows(production: add_unit.Production, lines: list[str], gone: set[str])
     owner = {pane: session for session, (_, panes) in tmux.items() for pane in panes}
     claudes = names_to_panes()
     rows: list[UnitRow] = []
-    for cells in add_unit.unit_table(lines):
-        unit, old_name = add_unit.cell_value(cells.get("Unit", "")), add_unit.cell_value(cells.get(COLUMN, ""))
-        if not unit or add_unit.plan_cell_is_retired(cells.get("Plan", "")):
+    for cells in production_units.unit_table(lines):
+        unit, old_name = production_units.cell_value(cells.get("Unit", "")), production_units.cell_value(cells.get(COLUMN, ""))
+        if not unit or production_units.plan_cell_is_retired(cells.get("Plan", "")):
             continue
         # The session of a Claude that has or had the name, or the tmux session still labelled with it.
         found = ({owner[pane] for pane in claudes.get(old_name, ()) if pane in owner}
                  | {session for session, (label, _) in tmux.items() if label == old_name})
         if unit in marked:
-            rows.append(UnitRow(unit, old_name, Marked(marked[unit].pane)))
+            place = marked[unit].place
+            if not isinstance(place, unit_lookup.TmuxPlace):
+                raise production_units.Refusal(f"{unit}: adoption requires a tmux session")
+            rows.append(UnitRow(unit, old_name, Marked(place.pane)))
         elif len(found) == 1:
             target = next(iter(found))
             rows.append(UnitRow(unit, old_name, ToMark(target, tmux[target][0])))
         elif unit in gone:
             rows.append(UnitRow(unit, old_name, StatedGone()))
-        elif not found and not add_unit.worktree_is_linked(add_unit.cell_value(cells.get("Worktree", ""))):
+        elif not found and not production_units.worktree_is_linked(production_units.cell_value(cells.get("Worktree", ""))):
             # Neither a session nor a worktree of its own: the unit is retired, as every reader takes it.
             continue
         else:
@@ -99,13 +103,13 @@ def unit_rows(production: add_unit.Production, lines: list[str], gone: set[str])
 
 def without_column(lines: list[str]) -> list[str]:
     """The doc with the Units table's Session column removed."""
-    index = add_unit.unit_headings(lines).index(COLUMN)
+    index = production_units.unit_headings(lines).index(COLUMN)
     start = lines.index("## Units")
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
     changed = list(lines)
     for position in range(start + 1, end):
         if lines[position].startswith("|"):
-            cells = add_unit.row_cells(lines[position])
+            cells = production_units.row_cells(lines[position])
             changed[position] = "| " + " | ".join(cells[:index] + cells[index + 1:]) + " |"
     return changed
 
@@ -113,7 +117,7 @@ def without_column(lines: list[str]) -> list[str]:
 def adopt(production: add_unit.Production, scratch: Path, gone: set[str]) -> int:
     text = production.doc.read_text(encoding="utf-8")
     lines = text.splitlines()
-    if COLUMN not in add_unit.unit_headings(lines):
+    if COLUMN not in production_units.unit_headings(lines):
         print(f"adopt: nothing to do — the Units table of {production.doc.name} has no {COLUMN} column")
         return 0
     rows = unit_rows(production, lines, gone)
@@ -157,7 +161,7 @@ def main(argv: list[str]) -> int:
     try:
         production = add_unit.read_production(Path(cast(str, arguments.production)))
         return adopt(production, Path(cast(str, arguments.scratch)), set(cast(list[str], arguments.gone)))
-    except (add_unit.Refusal, rename_state.RenameRefused, subprocess.CalledProcessError, OSError,
+    except (production_units.Refusal, rename_state.RenameRefused, subprocess.CalledProcessError, OSError,
             ValueError) as error:
         print(f"adopt: stopped — {error}. Run it again once that is put right; it picks up where it stopped.",
               file=sys.stderr)

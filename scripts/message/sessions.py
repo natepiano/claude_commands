@@ -9,9 +9,14 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
+
+
+# Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
+HEADLESS_ENTRYPOINT_PREFIX = "sdk-"
 
 
 class SessionRecord(TypedDict):
@@ -26,6 +31,9 @@ class SessionRecord(TypedDict):
     tmux: str
     # Every name the session had before the one it has now.
     formerNames: list[str]
+    # How Claude was started: "cli" for an interactive session, "sdk-cli" for a `claude -p` run.
+    # Older records and callers may omit it; read_session normalizes absence to empty.
+    entrypoint: NotRequired[str]
 
 
 class UnreadableSessionRecord(Enum):
@@ -35,44 +43,104 @@ class UnreadableSessionRecord(Enum):
 RegistryEntry = SessionRecord | UnreadableSessionRecord
 
 
+class RegistryDetails(TypedDict, total=False):
+    cwd: str
+    kind: str
+    status: str
+
+
+@dataclass(frozen=True)
+class RegistryObservation:
+    record: SessionRecord
+    details: RegistryDetails
+
+
+@dataclass(frozen=True)
+class RegistryRead:
+    entries: tuple[RegistryObservation, ...]
+    unreadable: tuple[Path, ...]
+
+
+def read_registry() -> RegistryRead:
+    """Keep unreadable directories and records visible to complete observers."""
+    directory = sessions_dir()
+    try:
+        paths = [path for path in directory.iterdir() if path.suffix == ".json"]
+    except OSError:
+        return RegistryRead((), (directory,))
+    entries: list[RegistryObservation] = []
+    unreadable: list[Path] = []
+    for path in paths:
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+            record = parse_session(raw)
+        except (OSError, ValueError, TypeError):
+            record = UnreadableSessionRecord.FOUND
+            raw = {}
+        if isinstance(record, UnreadableSessionRecord):
+            unreadable.append(path)
+        else:
+            entries.append(RegistryObservation(record, cast(RegistryDetails, raw)))
+    return RegistryRead(tuple(entries), tuple(unreadable))
+
+
+def parse_session(parsed: object) -> RegistryEntry:
+    """Validate one decoded registry write without reading its file again."""
+    if not isinstance(parsed, dict):
+        return UnreadableSessionRecord.FOUND
+    data = cast(dict[str, object], parsed)
+    pid = data.get("pid")
+    session_id = data.get("sessionId")
+    name = data.get("name")
+    socket_path = data.get("messagingSocketPath")
+    updated_at = data.get("updatedAt")
+    proc_start = data.get("procStart")
+    tmux = data.get("tmux")
+    former = data.get("formerNames")
+    entrypoint = data.get("entrypoint")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(session_id, str)
+        or not isinstance(name, str)
+        or not isinstance(socket_path, str)
+        or not isinstance(updated_at, int)
+        or isinstance(updated_at, bool)
+    ):
+        return UnreadableSessionRecord.FOUND
+    return SessionRecord(
+        pid=pid,
+        sessionId=session_id,
+        name=name,
+        messagingSocketPath=socket_path,
+        updatedAt=updated_at,
+        procStart=proc_start if isinstance(proc_start, str) else "",
+        tmux=tmux if isinstance(tmux, str) else "",
+        formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
+        if isinstance(former, list) else [],
+        entrypoint=entrypoint if isinstance(entrypoint, str) else "",
+    )
+
+
 def read_session(path: Path) -> RegistryEntry:
     try:
-        parsed = cast(object, json.loads(path.read_text()))
-        if not isinstance(parsed, dict):
-            return UnreadableSessionRecord.FOUND
-        data = cast(dict[str, object], parsed)
-        pid = data.get("pid")
-        session_id = data.get("sessionId")
-        name = data.get("name")
-        socket_path = data.get("messagingSocketPath")
-        updated_at = data.get("updatedAt")
-        proc_start = data.get("procStart")
-        tmux = data.get("tmux")
-        former = data.get("formerNames")
-        if (
-            not isinstance(pid, int)
-            or isinstance(pid, bool)
-            or pid <= 0
-            or not isinstance(session_id, str)
-            or not isinstance(name, str)
-            or not isinstance(socket_path, str)
-            or not isinstance(updated_at, int)
-            or isinstance(updated_at, bool)
-        ):
-            return UnreadableSessionRecord.FOUND
-        return SessionRecord(
-            pid=pid,
-            sessionId=session_id,
-            name=name,
-            messagingSocketPath=socket_path,
-            updatedAt=updated_at,
-            procStart=proc_start if isinstance(proc_start, str) else "",
-            tmux=tmux if isinstance(tmux, str) else "",
-            formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
-            if isinstance(former, list) else [],
-        )
+        return parse_session(cast(object, json.loads(path.read_text())))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return UnreadableSessionRecord.FOUND
+
+
+def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
+    """Read only this confirmed session's Remote Control registry field."""
+    try:
+        value = cast(object, json.loads((sessions_dir() / f"{record['pid']}.json").read_text()))
+        if isinstance(value, dict):
+            bridge = cast(dict[str, object], value).get("bridgeSessionId")
+            if isinstance(bridge, str) and bridge:
+                return "active"
+    except (OSError, ValueError, TypeError):
+        pass
+    return "absent"
 
 
 def process_start(pid: int) -> str | None:
@@ -103,18 +171,28 @@ def process_start(pid: int) -> str | None:
         return None
 
 
+def headless(record: SessionRecord) -> bool:
+    """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
+
+    It is no session: no roster lists it, and no name lookup finds it.
+    """
+    return record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+
+
 def running_session(record: SessionRecord) -> bool:
-    """The pid runs and a socket or matching start identifies it as this session."""
+    """The pid runs with its recorded start, or an older record has its socket. A headless run never counts."""
+    if headless(record):
+        return False
     try:
         os.kill(record["pid"], 0)
     except PermissionError:
         pass
     except (ProcessLookupError, OverflowError):
         return False
-    if messaging_socket_exists(record):
-        return True
     recorded_start = record.get("procStart", "")
-    return bool(recorded_start) and recorded_start == process_start(record["pid"])
+    if recorded_start:
+        return recorded_start == process_start(record["pid"])
+    return messaging_socket_exists(record)
 
 
 def messaging_socket_exists(record: SessionRecord) -> bool:
@@ -133,14 +211,7 @@ def sessions_dir() -> Path:
 
 
 def _readable_records() -> Iterator[SessionRecord]:
-    try:
-        paths = [path for path in sessions_dir().iterdir() if path.suffix == ".json"]
-    except OSError:
-        return
-    for path in paths:
-        record = read_session(path)
-        if not isinstance(record, UnreadableSessionRecord):
-            yield record
+    yield from (item.record for item in read_registry().entries)
 
 
 def running_sessions() -> list[SessionRecord]:

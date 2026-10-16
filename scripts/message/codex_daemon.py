@@ -75,8 +75,16 @@ def daemon_socket(environment: Mapping[str, str]) -> Path:
     configured = environment.get("ROSTER_CODEX_SOCKET")
     if configured:
         return Path(configured).expanduser()
-    home = Path(environment.get("HOME", str(Path.home()))).expanduser()
-    return home / ".codex/app-server-control/app-server-control.sock"
+    home = _daemon_home(environment)
+    return home / "app-server-control/app-server-control.sock"
+
+
+def _daemon_home(environment: Mapping[str, str]) -> Path:
+    """The freestanding daemon's home, independent of the `workers` account role."""
+    configured = environment.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return Path(environment.get("HOME", str(Path.home()))).expanduser() / ".codex"
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -286,12 +294,41 @@ def loaded_sessions(socket_path: Path) -> list[DaemonSession] | DaemonUnreadable
             client.close()
 
 
+def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float) -> QueueResult:
+    deadline = _OperationDeadline.starting_now(timeout)
+    client: _DaemonClient | None = None
+    try:
+        client = _DaemonClient(socket_path, deadline)
+        _ = client.call("initialize", {
+            "clientInfo": {"name": "message", "version": "1"},
+            "capabilities": {"experimentalApi": True},
+        })
+        client.notify("initialized")
+        _ = client.call("thread/queue/add", {
+            "threadId": thread_id,
+            "clientUserMessageId": f"message-{os.urandom(16).hex()}",
+            "input": [{"type": "text", "text": text}],
+        })
+        _ = deadline.remaining_seconds()
+        return Queued()
+    except TimeoutError:
+        return QueueTimedOut(timeout)
+    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+        reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
+        return QueueFailed(reason)
+    finally:
+        if client is not None:
+            client.close()
+
+
 def queue(
     thread_id: str,
     text: str,
     timeout: float = QUEUE_TIMEOUT_SECONDS,
 ) -> QueueResult:
-    """Queue text to a loaded Codex thread through the Codex CLI."""
+    """Queue through the process home, or the exact socket used for discovery."""
+    if os.environ.get("ROSTER_CODEX_SOCKET"):
+        return _queue_socket(daemon_socket(os.environ), thread_id, text, timeout)
     try:
         completed = subprocess.run(
             ["codex", "queue", "--thread", thread_id, "--message", text],
@@ -299,6 +336,7 @@ def queue(
             text=True,
             timeout=timeout,
             check=False,
+            env={**os.environ, "CODEX_HOME": str(_daemon_home(os.environ))},
         )
     except subprocess.TimeoutExpired:
         return QueueTimedOut(timeout)

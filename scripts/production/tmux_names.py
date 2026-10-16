@@ -143,24 +143,31 @@ def rename_session(pane: str, old: str, new: str) -> SessionRenamed | RenameInco
     return _rename_session(pane, old, new, panes)
 
 
-def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSettings) -> None:
-    key = hashlib.sha256(f"{kind}\0{old}\0{new}".encode()).hexdigest()
+def fault(kind: str, old: str, new: str | tuple[str, ...], settings: showrunners.ShowrunnerSettings) -> None:
+    """Tell the showrunner once per fault. A single new name is part of the fault; several are not,
+    because the Claude sessions sharing a tmux session come and go, and the message names them all."""
+    if isinstance(new, str):
+        identity, skipped = f"{kind}\0{old}\0{new}", f"{old} → {new}"
+    else:
+        identity, skipped = f"{kind}\0{old}", f"{old} (sessions {', '.join(sorted(new))})"
+    key = hashlib.sha256(identity.encode()).hexdigest()
     FAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
     marker = FAULT_STATE_DIR / key
     if marker.exists():
         return
     try:
         socket = showrunners.socket_for(settings["faults_to"])
-        # The session named for faults is not live: every running showrunner is told instead, and told why.
+        # The session named for faults is not live: each tree's highest running showrunner is told
+        # instead, and told why. A showrunner below it hears nothing, so the user hears once.
         sockets = [socket] if socket is not None else [
-            runner["socket"] for runner in showrunners.registered_showrunners() if runner["socket"]]
+            runner["socket"] for runner in showrunners.highest_running(showrunners.registered_showrunners())]
     except OSError as error:
         print(f"tmux-names: {error}", file=sys.stderr)
         return
-    message = f"tmux-names: skipped {old} → {new}: {kind}"
+    message = f"tmux-names: skipped {skipped}: {kind}"
     if socket is None:
         message += (f". {settings['faults_to']}, which {showrunners.CONFIG} names for faults, is not a live session,"
-                    + " so every running showrunner is told.")
+                    + " so every running showrunner that reports to no running one is told.")
     if not sockets:
         print(f"{message} No showrunner is running to tell.", file=sys.stderr)
         return
@@ -204,7 +211,7 @@ def tick() -> None:
         if any(session.name == old for session in hosted):
             continue
         if len(hosted) > 1:
-            fault("more than one Claude session", old, new, settings)
+            fault("more than one Claude session", old, tuple(session.name for session in hosted), settings)
             continue
         if not hosted[0].user_named:
             continue

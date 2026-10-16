@@ -15,7 +15,7 @@ SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|pause|unpause|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -67,6 +67,7 @@ write_state() {
     print -r -- "LAST_SENT=${state[LAST_SENT]}"
     print -r -- "LAST_RESTART=${state[LAST_RESTART]}"
     print -r -- "LAST_TARGET=${state[LAST_TARGET]}"
+    if [[ ${state[PAUSED]:-0} == 1 ]]; then print -r -- "PAUSED=1"; fi
   } > "$tmp" || return 1
   mv -f -- "$tmp" "$dir/state" || { rm -f -- "$tmp"; return 1; }
 }
@@ -93,7 +94,15 @@ utc_offset() {
   print -r -- $seconds
 }
 
-local_time() { strftime "$1" "$2" }
+# Times shown are in the user's zone setting. It is read on first use, because most ticks show
+# none; when it cannot be read, the machine's zone stands in.
+shown_zone() {
+  (( ${+SHOWN_ZONE} )) || typeset -g SHOWN_ZONE="$("$PY" "${SCRIPT:h:h}/lib/user_zone.py" 2>/dev/null)"
+}
+local_time() {
+  shown_zone
+  if [[ -n $SHOWN_ZONE ]]; then TZ=$SHOWN_ZONE strftime "$1" "$2"; else strftime "$1" "$2"; fi
+}
 next_line() { print -r -- "next_due=${state[NEXT_DUE]} ($(local_time '%Y-%m-%d %H:%M %Z' ${state[NEXT_DUE]}))" }
 time_line() {
   if (( $2 == 0 )); then
@@ -177,10 +186,17 @@ cmd_state() {
   read_conf
   read_state
   case $action in
-    start) state[ENABLED]=1; schedule; next_line ;;
-    resume) state[ENABLED]=1; write_state; next_line ;;
-    stop) state[ENABLED]=0; write_state ;;
-    restart) state[LAST_RESTART]=$NOW; schedule; next_line ;;
+    # A conversation pause stops a timer with `pause`, which marks it, and brings it back with
+    # `unpause` only while the mark is there. Any explicit action clears the mark, so a timer
+    # someone stopped or started during the pause stays as they left it.
+    start) state[PAUSED]=0; state[ENABLED]=1; schedule; next_line ;;
+    resume) state[PAUSED]=0; state[ENABLED]=1; write_state; next_line ;;
+    stop) state[PAUSED]=0; state[ENABLED]=0; write_state ;;
+    pause)
+      if [[ ${state[ENABLED]:-0} == 1 ]]; then state[PAUSED]=1; state[ENABLED]=0; write_state; fi ;;
+    unpause)
+      if [[ ${state[PAUSED]:-0} == 1 ]]; then state[PAUSED]=0; state[ENABLED]=1; write_state; next_line; fi ;;
+    restart) state[PAUSED]=0; state[LAST_RESTART]=$NOW; schedule; next_line ;;
     interval)
       conf[EVERY]=$3
       write_conf
@@ -357,6 +373,7 @@ cmd_status() {
 cmd_status_all() {
   local dir name mode
   typeset -A conf state
+  shown_zone
   for dir in "$STATE_DIR"/*(/N); do
     [[ -r $dir/conf && -r $dir/state ]] || continue
     name=${dir:t}
@@ -465,7 +482,7 @@ action=$1
 shift
 case $action in
   new) cmd_new "$@" ;;
-  start|resume|stop|restart)
+  start|resume|stop|restart|pause|unpause)
     (( $# == 1 )) || usage
     cmd_state "$action" "$1" ;;
   interval)

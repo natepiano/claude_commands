@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lint — public entry point over invoke.sh, the single bottom layer for cargo
 # invocation policy. Shell aliases (clippy, cf, ct, cwb, mend), validate_ci.sh,
-# pre_release_checks.sh, fix pipeline agent prompts, and /clippy all come through
+# pre_release_checks.sh, fix pipeline agent prompts, and /commit_prep come through
 # here; delegate/verify.sh sources invoke.sh directly to add its per-package
 # scope rules. This file picks workspace scope only, never policy flags.
 set -euo pipefail

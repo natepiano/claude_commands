@@ -13,26 +13,43 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+import production_units
+from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import launch_permission
 import unit_lookup
-from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
+import session_pane
+from herdr import HerdrPlace
+from production_units import Refusal, cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
+from scripts.whoami import account as account_reader
+from scripts.whoami import agent_accounts
+from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
+import herdr
+from scripts.herdr.fake_herdr import CommandResponse
+import usage_store
+from test_support import ShutdownTestCase
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("add_unit.py")
+REAL_WORKTREE_IS_LINKED = production_units.worktree_is_linked
+MARKED_TMUX_PLACE = unit_lookup.TmuxPlace("%7")
+NO_LAUNCH_FIXTURE = add_unit.NoMarkedUnit()
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
               "| --- | --- | --- | --- | --- | --- | --- |"]
 STUB = r'''#!/usr/bin/env python3
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -49,11 +66,17 @@ if name == "tmux":
 
     def named(target):
         for index, session in enumerate(live, 1):
-            if target in (f"${index}", f"%{index}", f"={session}"):
+            if target in (session, f"${index}", f"%{index}", f"={session}"):
                 return session
         return None
 
     target = args[args.index("-t") + 1] if "-t" in args else ""
+    # Option commands take a pane target, where only `=name:` names a session.
+    if args[:1] in (["set-option"], ["show-options"]):
+        if target.startswith("=") and not target.endswith(":"):
+            print(f"no such session: {target}", file=sys.stderr)
+            raise SystemExit(1)
+        target = target.removesuffix(":")
     if args[:1] in (["has-session"], ["show-environment"], ["capture-pane"]) and named(target) is None:
         raise SystemExit(1)
     if args[:1] == ["list-panes"]:
@@ -68,6 +91,25 @@ if name == "tmux":
             print(f"{key}={value}")
     if args[:1] == ["capture-pane"]:
         print("/remote-control is active" if (state / "ready").exists() else "Waiting for remote control")
+    if args[:1] == ["set-environment"]:
+        marks = state / f"env-{named(target)}.json"
+        values = json.loads(marks.read_text()) if marks.exists() else {}
+        values[args[-2]] = args[-1]
+        marks.write_text(json.dumps(values))
+    if args[:1] == ["show-options"]:
+        options = state / f"options-{named(target)}.json"
+        value = (json.loads(options.read_text()) if options.exists() else {}).get(args[-1], "")
+        print(value)
+    if args[:1] == ["set-option"]:
+        options = state / f"options-{named(target)}.json"
+        values = json.loads(options.read_text()) if options.exists() else {}
+        values[args[-2]] = args[-1]
+        options.write_text(json.dumps(values))
+    if args[:1] == ["kill-session"]:
+        session = named(target)
+        for prefix in ("live-", "env-", "options-"):
+            suffix = "" if prefix == "live-" else ".json"
+            (state / f"{prefix}{session}{suffix}").unlink(missing_ok=True)
     if args[:1] == ["new-session"]:
         session = args[args.index("-s") + 1]
         (state / f"live-{session}").touch()
@@ -80,8 +122,22 @@ elif name == "nix":
 '''
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 @final
-class AddUnitTests(unittest.TestCase):
+class AddUnitTests(ShutdownTestCase):
+    seed: ClassVar[ImmutableGitSeed]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="AddUnitTests-seed-")))
+        cls.seed = ImmutableGitSeed.create(root, 'build-followups', 'Unit Test', 'unit@example.invalid', {})
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -97,25 +153,22 @@ class AddUnitTests(unittest.TestCase):
         self.agent_config = Path()
         self.pause_state = Path()
         self.env: dict[str, str] = {}
+        self.herdr_overrides: dict[str, CommandResponse | list[CommandResponse]] = {}
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
         # test asks the real disk, and a row with a worktree never asks tmux. RetiredRowTests covers the rule.
-        _ = self.enterContext(patch.object(add_unit, "worktree_is_linked", return_value=True))
+        _ = self.enterContext(patch.object(production_units, "worktree_is_linked", return_value=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
         ))
         del home_context
         self.checkout = self.root / "project-trunk"
-        self.checkout.mkdir()
         self.origin = self.root / "origin.git"
-        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "build-followups")
-        _ = self.git("config", "user.name", "Unit Test")
-        _ = self.git("config", "user.email", "unit@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
+        self.seed.copy_to(self.checkout, self.origin)
         self.doc = self.checkout / "docs/plans/build-followups-production.md"
         _ = self.doc.parent.mkdir(parents=True)
         _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
@@ -131,13 +184,14 @@ class AddUnitTests(unittest.TestCase):
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)
         _ = (home / ".claude.json").write_text(
-            json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"}}),
+            json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
+                        "projects": self.trusted_projects()}),
             encoding="utf-8",
         )
         notes = self.root / "notes"
         notes.mkdir()
-        _ = (notes / "claude 2.md").write_text(
-            "---\nlogin: owner@example.com\nstate: active\n---\n",
+        _ = (notes / "claude2.md").write_text(
+            "---\nlogin: owner@example.com\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         self.state = self.root / "stub-state"
@@ -168,39 +222,131 @@ class AddUnitTests(unittest.TestCase):
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
+        self.herdr_overrides = {}
+        fake = str(SCRIPT.parents[1] / "herdr/fake_herdr.py")
+        self.env.update({"HERDR_BIN": fake, "SYSTEMD_RUN": fake, "SYSTEMCTL": fake,
+                         "HERDR_PROC": str(self.root / "proc"),
+                         "FAKE_HERDR_LOG": str(self.state / "herdr.jsonl"),
+                         "FAKE_HERDR_RESPONSES": str(self.state / "herdr-responses.json")})
         _ = self.env.pop("CLAUDE_CONFIG_DIR", None)
+        self.configure_herdr()
+        self.quota_reading("owner@example.com", 80, 7)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"}, "projects": self.trusted_projects()}))
+        _ = self.select_unit_account("claude2")
+        self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md")
+
+    def quota_reading(self, login: str, left: float, reset_days: float) -> None:
+        file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
+        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text())) if file.exists() else {}
+        now = datetime.now(timezone.utc)
+        saved[login] = {"weekly": {"left": left, "at": now.isoformat(),
+                                  "resets": (now + timedelta(days=reset_days)).isoformat()}}
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps(saved))
 
     def select_unit_account(self, label: str) -> Path:
         with patch.dict(os.environ, self.env):
-            config = accounts.accounts_config_file()
-            config.parent.mkdir(parents=True, exist_ok=True)
-            _ = config.write_text(
-                json.dumps(accounts.AccountsConfiguration(unit=label)),
-                encoding="utf-8",
-            )
+            path = accounts.groups_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({"units": label, "showrunners": "claude2"}))
             return accounts.account_dir(label)
+
+    def trusted_projects(self) -> dict[str, dict[str, bool]]:
+        return {str(folder): {"hasTrustDialogAccepted": True}
+                for folder in (self.checkout, self.root / "prior-session", self.root / "prior session")}
+
+    def test_untrusted_new_worktree_refuses_before_stub_row_or_worktree(self) -> None:
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
+        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
+                                         "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        for mode in ([], ["--check"]):
+            with self.subTest(mode=mode):
+                result = self.cli("alpha", "--brief", "Add a feature", *mode)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                folder = self.root / "project-alpha"
+                self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on claude2. Run: "
+                              + f"cd {shlex.quote(str(self.checkout))} && "
+                              + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
+                              + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude", result.stderr)
+                self.assert_no_launch_change(document, head)
+                self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
+
+    def test_trust_uses_launch_account_instead_of_callers_account(self) -> None:
+        directory = self.prepare_unit_account("claude3")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude-3@example.invalid"}, "projects": {}}))
+        self.env["CLAUDE_CONFIG_DIR"] = str(Path(self.env["HOME"]) / ".claude")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--brief", "Add a feature")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("on claude3. Run:", result.stderr)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
+        self.assert_no_launch_change(document, head)
+
+    def test_trust_file_becoming_unreadable_after_account_check_refuses_before_any_write(self) -> None:
+        with patch.dict(os.environ, self.env):
+            selected = accounts.role_account("unit")
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
+        _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (patch.dict(os.environ, self.env), redirect_stdout(output), redirect_stderr(errors),
+              patch.object(add_unit, "account_for_launch", return_value=selected),
+              patch.object(accounts, "check", return_value=[]),
+              patch.object(launch_permission, "launch_permission",
+                           return_value=launch_permission.AllowedByShutdownState())):
+            code = add_unit.main(["--production", str(self.doc), "alpha", "--brief", "Add a feature"])
+        self.assertEqual(code, 2, (output.getvalue(), errors.getvalue()))
+        self.assertEqual(errors.getvalue(), f"add_unit: alpha-unit: cannot read {config} "
+                         + "to check Claude trust (JSONDecodeError)\n")
+        self.assertNotIn("SECRET", output.getvalue() + errors.getvalue())
+        self.assert_no_launch_change(document, head)
+        self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+
+    def test_resume_checks_session_cwd_instead_of_worktree(self) -> None:
+        prior = self.root / "untrusted-session"
+        prior.mkdir()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(prior), "--account", "claude2")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"Claude is not trusted in {prior}", result.stderr)
+        self.assert_no_launch_change(document, head)
 
     def prepare_unit_account(self, label: str) -> Path:
         directory = self.select_unit_account(label)
-        login = f"{label.replace(' ', '-')}@example.invalid"
+        parsed = parse_account_label(label)
+        assert isinstance(parsed, NumberedAccountLabel)
+        login = f"{parsed.tool}-{parsed.number}@example.invalid"
         with patch.dict(os.environ, self.env):
             self.assertEqual(accounts.setup(label), [])
             _ = (directory / ".claude.json").write_text(
-                json.dumps({"oauthAccount": {"emailAddress": login}}),
+                json.dumps({"oauthAccount": {"emailAddress": login},
+                            "projects": self.trusted_projects()}),
                 encoding="utf-8",
             )
-            _ = (Path(self.env["AGENT_NOTES_DIR"]) / f"{label}.md").write_text(
-                f"---\nlogin: {login}\nstate: active\n---\n", encoding="utf-8"
+            _ = (Path(self.env["AGENT_NOTES_DIR"]) / note_name(label)).write_text(
+                f"---\nlogin: {login}\nsessions: 1\n---\n", encoding="utf-8"
             )
+        self.quota_reading(login, 1, 2)
         return directory
 
-    def named_prefix(self, directory: Path) -> str:
-        """The assignments a unit on a named account's directory starts with."""
-        memory_base = Path(self.env["HOME"]) / ".claude"
-        return (
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} "
-            f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(memory_base))} "
-        )
+    def persist_unit_account(self, directory: Path, *, session: str = "recorded-tmux", model: str = "opus") -> None:
+        _ = (self.state / f"live-{session}").touch()
+        _ = (self.state / f"env-{session}.json").write_text(json.dumps({
+            unit_lookup.PRODUCTION_MARK: "build-followups", unit_lookup.UNIT_MARK: "alpha-unit"}), encoding="utf-8")
+        _ = (self.state / f"options-{session}.json").write_text(json.dumps({
+            "@claude_config_dir": str(directory), "@claude_model": model}), encoding="utf-8")
+        (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)
 
     def write_agent_config(self, *, family: str = "claude", director: str = "opus:xhigh",
                            claude_set: bool = True) -> None:
@@ -231,13 +377,112 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def cli(self, *args: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.doc), *args],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True,
-                              check=False, timeout=timeout)
+    def server_listener(self, server: Path, name: str) -> None:
+        config = Path(self.env.get("XDG_CONFIG_HOME", str(Path(self.env["HOME"]) / ".config"))) / "herdr"
+        table = self.root / "proc/net/unix"
+        table.parent.mkdir(parents=True, exist_ok=True)
+        line = f"0: 2 0 00010000 0001 01 {server.name} {config}/sessions/{name}/herdr.sock\n"
+        previous = table.read_text() if table.exists() else ""
+        if line not in previous:
+            _ = table.write_text(previous + line)
+        (server / "fd").mkdir(exist_ok=True)
+        (server / "fd/3").unlink(missing_ok=True)
+        (server / "fd/3").symlink_to(f"socket:[{server.name}]")
 
-    def successful(self, *args: str) -> subprocess.CompletedProcess[str]:
-        result = self.cli(*args)
+
+    def configure_herdr(self, request: add_unit.UnitLaunch | add_unit.NoMarkedUnit = NO_LAUNCH_FIXTURE) -> None:
+        responses: dict[str, CommandResponse | list[CommandResponse]] = {
+            "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}'),
+            "default": CommandResponse(code=0, stdout='{"result": {"root_pane": {"pane_id": "w1:p1"}}}'),
+        }
+        # An already launched fixture advertises its session on subsequent CLI calls.
+        sessions = [herdr.SessionEntry(name=path.name.removeprefix("herdr-live-"), running=True,
+                    default=False, session_dir="/fixture", socket_path="/fixture/socket")
+                    for path in self.state.glob("herdr-live-*")]
+        responses["--session default session list --json"] = CommandResponse(
+            code=0, stdout=json.dumps(herdr.SessionListResult(sessions=sessions)))
+        if isinstance(request, add_unit.UnitLaunch):
+            name = add_unit.host_session_name(request)
+            responses[f"--session {name} status server"] = [
+                CommandResponse(code=0, stdout="status: stopped\n"),
+                CommandResponse(code=0, stdout="status: running\n")]
+            responses[f"--session {name} workspace list"] = CommandResponse(
+                code=0, stdout=json.dumps({"result": {"workspaces": []}}))
+            responses[f"--session {name} pane list"] = CommandResponse(code=0, stdout=json.dumps({
+                "result": {"panes": [{"pane_id": "w1:p1", "label": name}]}}))
+            screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
+            responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
+                code=0, stdout=screen)
+            process = self.root / "proc/102"
+            server = self.root / "proc/101"
+            if sessions and not any(session["name"] == name for session in sessions):
+                server = self.root / "proc/103"
+                process = self.root / "proc/104"
+            if not sessions or not any(session["name"] == name for session in sessions):
+                for path, parent, command in ((process, int(server.name), ["zsh"]), (server, 1, ["herdr", "--session", name, "server"])):
+                    path.mkdir(parents=True, exist_ok=True)
+                    _ = (path / "cmdline").write_bytes("\0".join(command).encode() + b"\0")
+                    _ = (path / "stat").write_text(f"{path.name} (fixture) S {parent} 0")
+                    _ = (path / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
+                (process / "cwd").unlink(missing_ok=True)
+                (process / "cwd").symlink_to(request.session_cwd)
+            self.server_listener(server, name)
+            environment = {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": request.production.slug,
+                           "SHOWRUNNER_UNIT_ID": request.identity.unit}
+            running = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
+                *[session for session in sessions if session["name"] != name],
+                herdr.SessionEntry(name=name, running=True, default=False,
+                                   session_dir="/fixture", socket_path="/fixture/socket")])))
+            after = {**responses, "--session default session list --json": running}
+            responses[f"--session {name} agent prompt w1:p1 {add_unit.prompt_for(request)}"] = CommandResponse(
+                code=0, stdout="", write_files={str(process / "environ"): "\0".join(f"{key}={value}" for key, value in environment.items()),
+                    str(self.state / f"herdr-live-{name}"): "",
+                    self.env["FAKE_HERDR_RESPONSES"]: json.dumps(after)})
+        responses.update(self.herdr_overrides)
+        if isinstance(request, add_unit.UnitLaunch) and (self.root / "proc/202").exists():
+            after_stop = {**responses, "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}')}
+            responses[f"--session {request.identity.session} server stop"] = CommandResponse(code=0, stdout="",
+                remove_paths=[str(self.root / "proc/202")],
+                write_files={self.env["FAKE_HERDR_RESPONSES"]: json.dumps(after_stop)})
+        _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
+
+    def prepare_herdr_launch(self, *args: str) -> None:
+        parser = argparse.ArgumentParser()
+        _ = parser.add_argument("name")
+        for flag in ("plan", "brief", "port", "owns", "resume", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model"):
+            _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
+        _ = parser.add_argument("--standby", action="store_true")
+        _ = parser.add_argument("--permanent", action="store_true")
+        _ = parser.add_argument("--adopt")
+        _ = parser.add_argument("--check", action="store_true")
+        _ = parser.add_argument("--probe", action="store_true")
+        _ = parser.add_argument("--timeout", type=float, default=90)
+        parsed = parser.parse_args(args)
+        parsed.production = str(self.doc)
+        try:
+            requested = add_unit.launch_request(parsed)
+            launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
+                worktree=requested.worktree, plan=requested.plan, port=requested.port, owns=requested.owns,
+                session=requested.session, launch_kind=requested.launch_kind, timeout=requested.timeout,
+                identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
+            self.configure_herdr(launch)
+        except (Refusal, OSError, ValueError):
+            self.configure_herdr()
+
+    def cli(self, *args: str, timeout: float = 300, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        self.prepare_herdr_launch(*args)
+        arguments = ["--production", str(self.doc), *args]
+        if subprocess_cli:
+            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+                                  env=self.env, capture_output=True, text=True, check=False, timeout=timeout)
+        # The row-reader fixture patch never reached the old CLI child. Preserve
+        # the real worktree check on this command boundary too.
+        with patch.object(production_units, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
+            return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,
+                              self.env, self.checkout, production_state=True)
+
+    def successful(self, *args: str, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        result = self.cli(*args, subprocess_cli=subprocess_cli)
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         return result
 
@@ -248,10 +493,32 @@ class AddUnitTests(unittest.TestCase):
         records = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
         return [record for record in records if record["command"] == command]
 
+    def herdr_calls(self) -> list[list[str]]:
+        path = Path(self.env["FAKE_HERDR_LOG"])
+        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def agent_arguments(self) -> list[str]:
+        row = next(row for row in self.herdr_calls() if row[2:4] == ["agent", "start"])
+        return row[row.index("--") + 1:]
+
+    def opening_prompt(self) -> str:
+        return next(row[-1] for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"])
+
+    def opened(self, session: str | None = None) -> list[str]:
+        """The first workspace opened, in `session` when named."""
+        return next(row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"]
+                    and (session is None or row[:2] == ["--session", session]))
+
+    def pane_environment(self, session: str | None = None) -> dict[str, str]:
+        row = self.opened(session)
+        return dict(row[index + 1].split("=", 1) for index, value in enumerate(row) if value == "--env")
+
+    def servers_started(self) -> list[list[str]]:
+        return [row for row in self.herdr_calls() if row[:1] == ["--user"] and "--collect" in row]
+
     def launch_command(self) -> str:
-        launches = self.events("systemd-run")
-        self.assertEqual(len(launches), 1)
-        return cast(list[str], launches[0]["args"])[-1]
+        # Used by prompt-content assertions; argv and environment are checked separately.
+        return shlex.join(self.agent_arguments()) + " " + shlex.quote(self.opening_prompt())
 
     def recorded_prompts(self, session_id: str) -> tuple[str, ...]:
         with patch.dict(os.environ, self.env):
@@ -266,7 +533,7 @@ class AddUnitTests(unittest.TestCase):
     ) -> dict[str, object]:
         return {
             "login": "owner@example.com",
-            "label": "claude 2",
+            "label": "claude2",
             "machine": "natedev",
             "state": state,
             "requested_at": "2026-10-09T21:49:10+00:00",
@@ -320,7 +587,7 @@ class AddUnitTests(unittest.TestCase):
 
     def assert_director_flags(self, model: str, effort: str | None) -> None:
         command = self.launch_command()
-        flags = f"claude --model {model}"
+        flags = f"--model {model}"
         if effort is not None:
             flags += f" --effort {effort}"
         self.assertIn(flags + " ", command)
@@ -388,22 +655,20 @@ class AddUnitTests(unittest.TestCase):
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
         self.assertFalse((self.root / "project-alpha").exists())
-        self.assertEqual(self.events("tmux"), [])
-        self.assertEqual(self.events("systemd-run"), [])
+        for event in self.events("tmux"):
+            arguments = cast(list[str], event["args"])
+            self.assertIn(arguments[0], {"list-panes", "show-environment", "show-options", "has-session"})
+        self.assertEqual(self.servers_started(), [])
 
     def marks(self, session: str) -> dict[str, str]:
         return cast(dict[str, str], json.loads((self.state / f"env-{session}.json").read_text()))
-
-    def new_sessions(self) -> list[list[str]]:
-        return [cast(list[str], record["args"]) for record in self.events("tmux")
-                if cast(list[str], record["args"])[:1] == ["new-session"]]
 
     def restore(self, name: str, cwd: Path) -> subprocess.CompletedProcess[str]:
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
                         "--restart-note", str(note), "--session-name", "recorded-name",
-                        "--tmux-session", "recorded-tmux")
+                        "--host-session", "recorded-tmux", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
     def repository_state(self) -> tuple[str, str, str]:
         """The production doc, every branch with its commit, and every worktree with its branch."""
@@ -421,6 +686,9 @@ class AddUnitTests(unittest.TestCase):
         self,
         launch_kind: add_unit.NewWorkLaunch | add_unit.UnitRestoreLaunch,
         claude: unit_lookup.Claude,
+        *,
+        already_marked: bool = True,
+        place: unit_lookup.Place = MARKED_TMUX_PLACE,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
             production=add_unit.read_production(self.doc),
@@ -430,11 +698,15 @@ class AddUnitTests(unittest.TestCase):
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
-            session=add_unit.ResumedSession("session-123", self.root / "prior-session"),
+            session=(add_unit.ResumedSession("session-123", self.root / "prior-session")
+                     if isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NewSession()),
             launch_kind=launch_kind,
             timeout=1.0,
         )
-        marked = unit_lookup.MarkedUnit("alpha-unit", "%7", "marked-tmux", claude)
+        label = place.session if isinstance(place, HerdrPlace) else "marked-tmux"
+        marked = unit_lookup.MarkedUnit("alpha-unit", label, claude, place)
+        launched = (marked if already_marked else unit_lookup.MarkedUnit("alpha-unit", add_unit.host_session_name(request),
+                    claude, HerdrPlace(add_unit.host_session_name(request), "w1:p1")))
         ready = add_unit.ReadyToLaunch(
             request,
             add_unit.NoUnitRow(),
@@ -447,6 +719,8 @@ class AddUnitTests(unittest.TestCase):
             _ = launch_kind.note.write_text("Resume this unit.", encoding="utf-8")
 
         def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "show-options" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
             if "launch-blocked" in command:
                 live = (
                     Path(self.env["SHUTDOWN_STATE_DIR"])
@@ -457,8 +731,8 @@ class AddUnitTests(unittest.TestCase):
                     command,
                     0 if live else 1,
                     (
-                        "claude 2 is held by a shutdown "
-                        + "(down since 2026-10-09 14:49 PDT)\n"
+                        "claude2 is held by a shutdown "
+                        + "(since 2026-10-09 14:49 PDT)\n"
                         if live
                         else ""
                     ),
@@ -469,11 +743,13 @@ class AddUnitTests(unittest.TestCase):
 
         def launch(
             _request: add_unit.UnitLaunch,
-            _tmux: str,
             _director: add_unit.DirectorAgent,
             prompt: str,
-            _selected: accounts.AccountSelection,
+            _selected: accounts.ClaudeLaunchAccount,
+            *, target: str = "", model: str = "",
         ) -> None:
+            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
+            self.assertEqual(model, "")
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
                 self.assertEqual(recorded[-1], prompt)
@@ -489,26 +765,74 @@ class AddUnitTests(unittest.TestCase):
         with (
             patch.object(add_unit, "launch_request", return_value=request),
             patch.object(add_unit, "preflight", return_value=ready),
-            patch.object(unit_lookup, "tmux_binary", return_value="tmux"),
+            patch.object(unit_lookup, "tmux_binary", side_effect=(AssertionError("herdr launch resolves tmux")
+                         if isinstance(place, HerdrPlace) or not already_marked else None), return_value="tmux"),
             patch.object(
                 add_unit,
                 "launched_unit",
-                return_value=add_unit.MarkedUnitFound(marked),
+                return_value=(add_unit.MarkedUnitFound(marked) if already_marked else add_unit.NoMarkedUnit()),
             ),
-            patch.object(add_unit, "tmux_live", return_value=False),
+            patch.object(herdr, "live_sessions", return_value=[]),
             patch.object(add_unit, "write_stub") as write_stub,
             patch.object(add_unit, "append_row"),
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
             patch.object(add_unit, "launch_session", side_effect=launch),
-            patch.object(add_unit, "wait_for_remote_control", return_value=marked),
+            patch.object(add_unit, "wait_for_remote_control", return_value=launched) as wait,
             patch.object(add_unit, "record"),
             patch.object(subprocess, "run", side_effect=run),
             patch.dict(os.environ, self.env),
             redirect_stderr(error),
         ):
-            result = add_unit.main(["--production", "unused", "alpha", "--plan", "unused"])
+            arguments = ["--production", "unused", "alpha", "--plan", "unused"]
+            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
+                arguments.extend(("--config-dir", str(Path(self.env["HOME"]) / ".claude2")))
+            result = add_unit.main(arguments)
+        if result == 0:
+            if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
+                wait.assert_not_called()
+            else:
+                wait.assert_called_once_with(request)
         return result, error.getvalue(), commands, len(launches), write_stub.call_count
+
+    def test_restore_returns_zero_without_waiting_for_remote_control(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.ClaudeNotRunning(), already_marked=False
+            )
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 1)
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach recorded-tmux\n")
+
+    def test_restore_already_running_returns_zero_without_waiting_for_remote_control(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123)
+            )
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 0)
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: tmux attach -t marked-tmux\n")
+
+    def test_new_work_launch_still_waits_for_remote_control(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(
+                add_unit.NewWorkLaunch(), unit_lookup.ClaudeNotRunning(), already_marked=False
+            )
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 1)
+        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach alpha\n")
 
     def test_restore_replaces_marked_tmux_without_running_claude(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -524,6 +848,185 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(launches, 1)
         self.assertEqual(writes, 1)
 
+    def test_restore_replaces_stopped_herdr_unit_by_name_without_tmux_commands(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        with patch("herdr.stop_session") as stopped:
+            result, error, commands, launches, writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.ClaudeNotRunning(), place=HerdrPlace("native-unit", "w1:p1")
+            )
+        self.assertEqual(result, 0, error)
+        stopped.assert_called_once_with("native-unit")
+        self.assertEqual(commands, [])
+        self.assertEqual((launches, writes), (1, 1))
+
+    def test_restore_already_live_in_herdr_launches_nothing_and_prints_herdr_attach(self) -> None:
+        kind = add_unit.UnitRestoreLaunch("session-123", self.root / "restart-note", "recorded-name", "native-unit")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, _writes = self.run_with_marked_unit(kind,
+                unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123),
+                place=HerdrPlace("native-unit", "w1:p1"))
+        self.assertEqual(result, 0, error)
+        self.assertEqual(commands, [])
+        self.assertEqual(launches, 0)
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach native-unit\n")
+
+    def test_unit_start_not_ready_prints_screen_and_sends_no_prompt_or_key(self) -> None:
+        screen = "Do you trust this folder?"
+        self.herdr_overrides['--session alpha agent start alpha --kind claude --pane w1:p1 --timeout 90000 -- --model opus --effort xhigh --remote-control alpha -n alpha --settings {"disableAgentView": true}'] = CommandResponse(
+            code=1, stdout=json.dumps({"error": {"code": "agent_not_ready", "message": "dialog"}}))
+        self.herdr_overrides["--session alpha pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("add_unit: the session is not ready:\n" + screen, result.stderr)
+        self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
+        self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
+                             for row in self.herdr_calls()))
+
+    def test_failed_unit_restore_stops_its_created_server_after_agent_exit(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note"
+        _ = note.write_text("Resume this unit.")
+        with (patch.dict(os.environ, self.env),
+              patch.object(herdr, "start_agent", side_effect=herdr.AgentExited("restored-unit", "w1:p1")),
+              patch.object(herdr, "stop_session") as stopped):
+            request = add_unit.UnitLaunch(
+                production=add_unit.read_production(self.doc),
+                identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+                branch="build-followups-alpha", worktree=self.root / "project-alpha",
+                plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
+                port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+                session=add_unit.ResumedSession("session-123", prior),
+                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "alpha"),
+                timeout=90,
+            )
+            with self.assertRaises(herdr.AgentExited):
+                add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+                                        "Resume this unit.", accounts.role_account("unit"))
+        stopped.assert_called_once_with("alpha")
+        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-alpha.service"] for row in self.herdr_calls()))
+        self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
+
+    def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
+        with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:
+            result = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 0)
+        start.assert_called_once()
+        opening = cast(object, start.call_args.kwargs["opening"])
+        self.assertIsInstance(opening, herdr.OpeningPrompt)
+        assert isinstance(opening, herdr.OpeningPrompt)
+        self.assertEqual(opening.text, "/unit:direct docs/plans/given.md")
+
+    def test_server_start_timeout_exits_one_with_its_text_instead_of_a_traceback(self) -> None:
+        timeout = subprocess.TimeoutExpired("fixture server start", 10)
+        errors = io.StringIO()
+        with (patch.dict(os.environ, self.env), redirect_stderr(errors),
+              patch.object(herdr, "start_new_server", side_effect=timeout) as start,
+              patch.object(herdr, "open_pane") as opened,
+              patch.object(herdr, "start_agent") as agent):
+            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md"])
+        self.assertEqual(code, 1)
+        self.assertEqual(errors.getvalue(), f"add_unit: {timeout}\n")
+        start.assert_called_once_with("alpha", 90_000)
+        opened.assert_not_called()
+        agent.assert_not_called()
+
+    def test_destination_taken_during_start_refuses_without_opening_a_pane(self) -> None:
+        self.herdr_overrides["--session alpha status server"] = CommandResponse(code=0, stdout="status: running\n")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"], ["agent", "prompt"])
+                             for row in self.herdr_calls()))
+
+    def test_explicit_account_environment_omits_every_prepared_removal(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                 "--cwd", str(prior), "--account", "claude2")
+        self.prepare_herdr_launch(*flags)
+        prepared = accounts.PreparedAccount({"ACCOUNT_TEST_VARIABLE": "selected", "CLAUDE_CODE_OAUTH_TOKEN": "remove-me"},
+                                             frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
+        with patch.dict(os.environ, self.env), patch.object(accounts, "prepared_account", return_value=prepared):
+            code = add_unit.main(["--production", str(self.doc), *flags])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.pane_environment()["ACCOUNT_TEST_VARIABLE"], "selected")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.pane_environment())
+        self.assertNotIn("claude", self.agent_arguments())
+        self.assertFalse(any(argument.endswith("accounts.py") for argument in self.agent_arguments()))
+
+    def test_transcript_model_reads_newest_file_and_crosses_chunk_boundaries(self) -> None:
+        root = Path(self.env["HOME"]) / ".claude/projects"
+        old = root / "old/session-123.jsonl"
+        newest = root / "new/session-123.jsonl"
+        for path in (old, newest):
+            path.parent.mkdir(parents=True)
+        _ = old.write_text(json.dumps({"type": "assistant", "message": {"model": "old-model"}}))
+        _ = newest.write_text(json.dumps({"type": "assistant", "message": {"model": "opus", "content": "é" * 70000}})
+                              + '\n' + json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + '\n{partial')
+        os.utime(old, (1, 1))
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(add_unit.transcript_model("session-123"), "opus")
+            self.assertEqual(add_unit.transcript_model("absent"), "")
+
+    def test_prepared_account_refusal_happens_before_any_herdr_call(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.prepare_unit_account("claude3")
+        errors = io.StringIO()
+        with (patch.dict(os.environ, self.env), redirect_stderr(errors),
+              patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("account logged out")) as prepared):
+            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+                                  "--resume", "session-123", "--cwd", str(prior), "--account", "claude3"])
+        self.assertEqual(code, 2)
+        self.assertIn("account logged out", errors.getvalue())
+        prepared.assert_called_once_with("claude3", resume=True)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_herdr_resume_uses_group_account_and_last_real_transcript_model(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        directory = self.prepare_unit_account("claude3")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.persist_herdr_unit("alpha", prior)
+        transcript = Path(self.env["HOME"]) / ".claude/projects/project/session-123.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text('\n'.join([json.dumps({"type": "assistant", "message": {"model": "opus"}}),
+            json.dumps({"type": "user", "message": {"model": "ignored"}}),
+            json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}), "{partial"]))
+        result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
+        self.assertIn("herdr session attach alpha", result.stdout)
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertEqual(self.agent_arguments()[:4], ["--model", "opus", "--effort", "high"])
+        self.assertIn(["--session", "alpha", "server", "stop"], self.herdr_calls())
+        self.assertFalse(any(cast(list[str], row["args"])[0] in ("show-options", "kill-session", "new-session")
+                             for row in self.events("tmux")))
+
+    def test_herdr_resume_without_transcript_uses_director_model(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.persist_herdr_unit("alpha", prior)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
+        self.assertEqual(self.agent_arguments()[:2], ["--model", "sonnet"])
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
+
+    def persist_herdr_unit(self, name: str, cwd: Path) -> None:
+        for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
+            process = self.root / "proc" / str(pid)
+            process.mkdir(parents=True)
+            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0")
+            _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
+            _ = (process / "environ").write_text("HERDR_PANE_ID=w2:p1\0SHOWRUNNER_UNIT=build-followups\0SHOWRUNNER_UNIT_ID=alpha-unit" if pid == 202 else "")
+            (process / "cwd").symlink_to(cwd)
+        self.server_listener(self.root / "proc/201", name)
+        (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)
+        self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
+                herdr.SessionEntry(name=name, running=True, default=False, session_dir="/fixture", socket_path="/fixture/socket")])))
+        self.herdr_overrides[f"--session {name} server stop"] = CommandResponse(code=0, stdout="", remove_paths=[str(self.root / "proc/202")])
+
     def test_new_work_is_refused_while_account_is_down(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
         document = self.doc.read_text(encoding="utf-8")
@@ -534,8 +1037,8 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
             result.stderr,
-            "add_unit: claude 2 is held by a shutdown "
-            + "(down since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            "add_unit: claude2 is held by a shutdown "
+            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 
@@ -559,13 +1062,43 @@ class AddUnitTests(unittest.TestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
         )
 
-        self.assertIn("alpha-unit started", result.stdout)
-        self.assertEqual(len(self.events("systemd-run")), 1)
+        self.assertIn("alpha-unit restore launched", result.stdout)
+        self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+
+    def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
+        self.env["CLAUDE_PROBE_SESSION"] = "1"
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        cases = ((False, ""), (True, ""), (False, "claude2"), (True, "claude2"))
+        for count, (probe, target) in enumerate(cases, 1):
+            with self.subTest(probe=probe, target=target):
+                name = ("probe" if probe else "ordinary") + ("-move" if target else "-restore")
+                self.commit_prepared_row(self.unit_row(name))
+                result = self.successful(
+                    name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
+                    "--cwd", str(prior), "--restart-note", str(note),
+                    "--session-name", name, "--host-session", name,
+                    *(["--probe"] if probe else []),
+                    *(["--account", target] if target else []),
+                )
+                self.assertIn(f"{name}-unit restore launched", result.stdout)
+                self.assertEqual(len(self.servers_started()), count)
+                opened = self.opened(name)
+                self.assertEqual(opened[opened.index("--cwd") + 1], str(prior))
+                starts = [row for row in self.herdr_calls() if row[:4] == ["--session", name, "agent", "start"]]
+                self.assertEqual(len(starts), 1)
+                arguments = starts[0][starts[0].index("--") + 1:]
+                self.assertEqual(arguments[arguments.index("--resume") + 1], f"session-{name}")
+                environment = self.pane_environment(name)
+                self.assertEqual(environment.get("CLAUDE_PROBE_SESSION", ""), "1" if probe else "")
+                self.assertNotIn("CLAUDE_TEST_SECRET", environment)
 
     def test_restart_restore_adopts_a_row_added_from_a_brief_whose_plan_is_now_its_as_built(self) -> None:
         checkout = self.doc.parents[2]
@@ -594,11 +1127,11 @@ class AddUnitTests(unittest.TestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
         )
 
-        self.assertIn("alpha-unit started", result.stdout)
+        self.assertIn("alpha-unit restore launched", result.stdout)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
     def test_restore_without_a_units_row_is_refused_and_adds_nothing(self) -> None:
@@ -614,8 +1147,8 @@ class AddUnitTests(unittest.TestCase):
             "alpha", "--plan", "docs/plans/given.md",
             "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note),
-            "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
-        )
+            "--session-name", "recorded-name", "--host-session", "recorded-tmux",
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
@@ -631,15 +1164,15 @@ class AddUnitTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertEqual(result.stderr, "")
-        tmux = self.new_sessions()[0]
-        self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
 
     def test_new_work_and_a_promote_still_refuse_a_row_off_the_naming_pattern(self) -> None:
         recorded = self.commit_row_off_the_naming_pattern()
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        promote = ("--resume", "session-123", "--cwd", str(recorded))
+        promote = ("--resume", "session-123", "--cwd", str(recorded),
+                   "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         for launch, flags in (("new work", ()), ("promote", promote)):
             with self.subTest(launch=launch):
                 result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
@@ -661,8 +1194,7 @@ class AddUnitTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertEqual(result.stderr, "")
-        tmux = self.new_sessions()[0]
-        self.assertEqual(tmux[tmux.index("-c") + 1], str(recorded))
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
         self.assertFalse(worktree.exists())
 
@@ -697,13 +1229,13 @@ class AddUnitTests(unittest.TestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("/shutdown restart first", result.stderr)
-        self.assertEqual(self.events("systemd-run"), [])
+        self.assertEqual(self.servers_started(), [])
         self.assertEqual(self.recorded_prompts("session-123"), ())
 
     def test_restart_restore_is_refused_when_record_does_not_hold_it(self) -> None:
@@ -727,13 +1259,13 @@ class AddUnitTests(unittest.TestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
-        )
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("/shutdown restart first", result.stderr)
-        self.assertEqual(self.events("systemd-run"), [])
+        self.assertEqual(self.servers_started(), [])
         self.assertEqual(self.recorded_prompts("session-123"), ())
 
     def test_unreadable_shutdown_state_refuses_a_restore_with_one_prefix(self) -> None:
@@ -757,7 +1289,7 @@ class AddUnitTests(unittest.TestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
         )
 
@@ -767,7 +1299,7 @@ class AddUnitTests(unittest.TestCase):
             result.stderr,
         )
         self.assertEqual(result.stderr.count("shutdown state unreadable: "), 1)
-        self.assertEqual(self.events("systemd-run"), [])
+        self.assertEqual(self.servers_started(), [])
         self.assertEqual(self.recorded_prompts("session-123"), ())
 
     def test_refused_marked_restore_does_not_kill_tmux_or_record_prompt(self) -> None:
@@ -814,14 +1346,22 @@ class AddUnitTests(unittest.TestCase):
             add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
-        marked = unit_lookup.MarkedUnit(
-            "alpha-unit",
-            "%7",
-            "recorded-tmux",
-            unit_lookup.LiveClaude(
-                "recorded-name", "session-123", "/socket", 123
-            ),
-        )
+        old = self.shutdown_record("down")
+        owner = cast(list[dict[str, object]], old["entries"])[0]
+        session_shutdown: dict[str, object] = {
+            "login": old["login"],
+            "label": old["label"],
+            "machine": old["machine"],
+            "requested_at": old["requested_at"],
+            "requested_by": old["requested_by"],
+            "request_id": "launch-barrier-request",
+            "hold": "account",
+            "then": "stop",
+            "force": old["force"],
+            "alerts": "user",
+            "workers": [],
+            **owner,
+        }
         creator: subprocess.Popen[str] | None = None
 
         def start_shutdown(_request: add_unit.UnitLaunch) -> None:
@@ -830,12 +1370,12 @@ class AddUnitTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import json, os, record; record.create(json.loads(os.environ['TEST_RECORD']))",
+                    "import os, record; assert record.create_session(record.parse_session_records(os.environ['TEST_RECORD'])[0])",
                 ],
                 cwd=Path(__file__).parents[1] / "shutdown",
                 env={
                     **self.env,
-                    "TEST_RECORD": json.dumps(self.shutdown_record("down")),
+                    "TEST_RECORD": json.dumps([session_shutdown]),
                 },
                 text=True,
                 stdout=subprocess.PIPE,
@@ -844,11 +1384,13 @@ class AddUnitTests(unittest.TestCase):
 
         def launch(
             _request: add_unit.UnitLaunch,
-            _tmux: str,
             _director: add_unit.DirectorAgent,
             _prompt: str,
-            _selected: accounts.AccountSelection,
+            _selected: accounts.ClaudeLaunchAccount,
+            *, target: str = "", model: str = "",
         ) -> None:
+            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
+            self.assertEqual(model, "")
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
@@ -860,15 +1402,12 @@ class AddUnitTests(unittest.TestCase):
                         contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                     )
 
-        def wait(
-            _request: add_unit.UnitLaunch, _tmux: str
-        ) -> unit_lookup.MarkedUnit:
+        def finish_shutdown() -> None:
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            stdout, stderr = creator.communicate(timeout=5)
+            stdout, stderr = creator.communicate(timeout=300)
             self.assertEqual(creator.returncode, 0, (stdout, stderr))
-            return marked
 
         error = io.StringIO()
         with (
@@ -880,25 +1419,28 @@ class AddUnitTests(unittest.TestCase):
                 "launched_unit",
                 return_value=add_unit.NoMarkedUnit(),
             ),
-            patch.object(add_unit, "tmux_live", return_value=False),
+            patch.object(herdr, "live_sessions", return_value=[]),
             patch.object(add_unit, "write_stub", side_effect=start_shutdown),
             patch.object(add_unit, "append_row"),
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
             patch.object(add_unit, "record_scheduled_restore_prompt"),
             patch.object(add_unit, "launch_session", side_effect=launch),
-            patch.object(add_unit, "wait_for_remote_control", side_effect=wait),
+            patch.object(add_unit, "wait_for_remote_control") as wait,
             patch.object(add_unit, "record"),
             patch.dict(os.environ, self.env),
             redirect_stderr(error),
         ):
             result = add_unit.main(
-                ["--production", "unused", "alpha", "--plan", "unused"]
+                ["--production", "unused", "alpha", "--plan", "unused",
+                 "--config-dir", str(Path(self.env["HOME"]) / ".claude2")]
             )
+            finish_shutdown()
 
         self.assertEqual(result, 0, error.getvalue())
+        wait.assert_not_called()
         account = Path(self.env["SHUTDOWN_STATE_DIR"]) / "owner@example.com"
-        self.assertTrue((account / "record.json").is_file())
+        self.assertTrue((account / "sessions" / "session-123.json").is_file())
 
     def test_restore_recording_failure_uses_one_stderr_line_and_does_not_launch(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -945,25 +1487,53 @@ class AddUnitTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertIn(
-            "cannot tell whether Claude runs in tmux session marked-tmux: session registry unreadable",
+            "cannot tell whether Claude runs in session marked-tmux: session registry unreadable",
             error,
         )
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 0)
 
-    def test_new_work_keeps_marked_tmux_without_running_claude(self) -> None:
-        result, error, commands, launches, writes = self.run_with_marked_unit(
-            add_unit.NewWorkLaunch(), unit_lookup.ClaudeNotRunning()
-        )
-
+    def test_rerun_keeps_marked_tmux_and_prints_its_tmux_attach_command(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, error, commands, launches, writes = self.run_with_marked_unit(
+                add_unit.NewWorkLaunch(), unit_lookup.ClaudeNotRunning()
+            )
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 1)
+        self.assertEqual(output.getvalue(), "alpha-unit started: tmux attach -t marked-tmux\n")
+
+    def test_restart_restore_of_a_standby_unit_moved_to_another_account(self) -> None:
+        directory = self.prepare_unit_account("claude3")
+        self.commit_prepared_row(self.unit_row(plan="standby"))
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+
+        result = self.successful(
+            "alpha", "--standby", "--resume", "session-123", "--cwd", str(prior),
+            "--restart-note", str(note), "--session-name", "recorded-name",
+            "--host-session", "recorded-tmux", "--account", "claude3",
+        )
+
+        self.assertIn("alpha-unit restore launched", result.stdout)
+        self.assertEqual(len(self.servers_started()), 1)
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "session-123")
+
+    def test_resume_from_a_brief_is_refused(self) -> None:
+        result = self.cli("alpha", "--brief", "Do it.", "--resume", "session-123", "--cwd", str(self.root))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--resume requires --plan, --standby, or --permanent", result.stdout + result.stderr)
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
-        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
+        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha", subprocess_cli=True)
         worktree = self.root / "project-alpha"
         self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
                       self.doc.read_text())
@@ -975,10 +1545,8 @@ class AddUnitTests(unittest.TestCase):
         self.assertFalse((worktree / "docs/plans/build-followups-alpha.md").exists())
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
-        self.assertEqual(self.marks("alpha"), {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
-        tmux = next(record for record in self.events("tmux")
-                    if cast(list[str], record["args"])[:1] == ["new-session"])
-        command = cast(list[str], tmux["args"])[-1]
+        self.assertEqual({key: value for key, value in self.pane_environment().items() if key.startswith("SHOWRUNNER_")}, {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        command = self.opening_prompt()
         prompt = (f"You are alpha-unit in production build-followups (doc {self.doc}), "
                   "under the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
                   "~/.claude/scripts/production/showrunners.py address build-followups` prints (look it up "
@@ -989,6 +1557,92 @@ class AddUnitTests(unittest.TestCase):
         self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), worktree ")
+
+    def test_permanent_launch_writes_a_permanent_row_and_says_wrap_keeps_it(self) -> None:
+        _ = self.successful("alpha", "--permanent")
+        self.assertIn(self.unit_row(plan="permanent"), self.doc.read_text())
+        self.assertEqual(self.git("log", "-1", "--format=%s"),
+                         "production(build-followups): add unit alpha-unit (permanent)")
+        self.assertIn("on standby. You are permanent: wrap never retires you. Work only in your worktree",
+                      self.opening_prompt())
+        self.assertFalse(any(cast(list[str], row["args"])[0] in
+                             {"new-session", "kill-session", "set-option", "set-environment"}
+                             for row in self.events("tmux")))
+
+    def test_the_nightly_review_unit_runs_from_rust_under_the_review_settings(self) -> None:
+        folder = Path(self.env["HOME"]) / "rust"
+        folder.mkdir()
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
+        _ = config.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "owner@example.com"},
+            "projects": {**self.trusted_projects(), str(folder): {"hasTrustDialogAccepted": True}}}))
+        result = self.successful("nightly-review", "--permanent")
+        self.assertIn("nightly-review-unit started: herdr session attach nightly-review", result.stdout)
+        self.assertEqual(self.opened()[7], str(folder))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(config.parent))
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--remote-control"):], [
+            "--remote-control", "nightly-review", "-n", "nightly-review",
+            "--add-dir", "/etc/nixos", "--add-dir", self.env["HOME"] + "/.claude",
+            "--settings", str(SCRIPT.parents[1] / "nightly_review/settings.json")])
+        prompt = self.opening_prompt()
+        self.assertIn("You run read-only from ~/rust", prompt)
+        self.assertIn("Each night the nightly timer sends you", prompt)
+        self.assertEqual(sum(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()), 1)
+        self.assertNotIn("claude", arguments)
+        self.assertNotIn(prompt, arguments)
+        self.assertFalse(any(cast(list[str], row["args"])[0] in
+                             {"new-session", "kill-session", "set-option", "set-environment"}
+                             for row in self.events("tmux")))
+
+    def test_adopt_marks_existing_tmux_claude_without_launching_in_herdr(self) -> None:
+        (self.state / "live-existing").touch()
+        scripts = self.root / "scripts"
+        sender = scripts / "message/send.py"
+        sender.parent.mkdir(parents=True)
+        _ = sender.write_text(
+            "import json, os, pathlib, sys\n"
+            + "path = pathlib.Path(os.environ['STUB_STATE']) / 'sent.json'\n"
+            + "path.write_text(json.dumps(sys.argv[1:]))\n")
+        claude = unit_lookup.LiveClaude("existing", "conversation", "/fixture/socket", 4242)
+        with (patch.object(unit_lookup, "tmux_claude", return_value=claude),
+              patch("scripts.whoami.account.process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(Path(self.env["HOME"]) / ".claude2")),
+              patch.object(add_unit, "SCRIPTS", scripts)):
+            result = self.successful("alpha", "--permanent", "--adopt", "existing")
+        self.assertIn("alpha-unit adopted: tmux attach -t existing", result.stdout)
+        self.assertEqual(self.marks("existing"), {
+            "SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        options = cast(dict[str, str], json.loads((self.state / "options-existing.json").read_text()))
+        self.assertEqual(options["@claude_config_dir"], self.env["HOME"] + "/.claude2")
+        sent = cast(list[str], json.loads((self.state / "sent.json").read_text()))
+        self.assertEqual(sent[sent.index("--to") + 1], "uds:/fixture/socket")
+        self.assertIn("You are now alpha-unit", sent[sent.index("--text") + 1])
+        self.assertIn(self.unit_row(plan="permanent"), self.doc.read_text())
+        self.assertEqual(self.servers_started(), [])
+        self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"], ["agent", "prompt"])
+                             for row in self.herdr_calls()))
+        self.assertFalse(any(cast(list[str], row["args"])[:1] in (["new-session"], ["kill-session"])
+                             for row in self.events("tmux")))
+        again = self.successful("alpha", "--permanent", "--adopt", "existing")
+        self.assertIn("alpha-unit already adopted: tmux attach -t existing", again.stdout)
+
+    def test_adopt_without_tmux_refuses_before_changing_the_production(self) -> None:
+        self.env["UNIT_LOOKUP_TMUX"] = str(self.root / "missing-tmux")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--standby", "--adopt", "existing")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--adopt needs tmux", result.stderr)
+        self.assert_no_launch_change(document, head)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_adopt_refuses_a_plan_or_a_resume(self) -> None:
+        for args in (("--plan", "docs/plans/given.md", "--adopt", "nightly-review"),
+                     ("--standby", "--adopt", "nightly-review", "--resume", "session-123", "--cwd", str(self.root))):
+            with self.subTest(args=args):
+                result = self.cli("alpha", *args)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn("--adopt takes --standby or --permanent", result.stderr)
 
     def test_standby_rejects_other_modes_before_any_change(self) -> None:
         original = self.doc.read_text()
@@ -1004,7 +1658,7 @@ class AddUnitTests(unittest.TestCase):
                 self.assertFalse(self.config.exists())
                 self.assertFalse(self.log.exists())
                 self.assertFalse((self.root / "project-alpha").exists())
-                self.assertEqual(self.events("systemd-run"), [])
+                self.assertEqual(self.servers_started(), [])
 
     def test_plan_adds_row_commits_worktree_launches_and_records(self) -> None:
         pushed = self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups")
@@ -1029,71 +1683,76 @@ class AddUnitTests(unittest.TestCase):
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
                          self.git("rev-parse", "build-followups"))
-        launch = self.events("systemd-run")
-        self.assertEqual(len(launch), 1)
-        systemd_args = cast(list[str], launch[0]["args"])
-        self.assertEqual(systemd_args[:2], ["--user", "--scope"])
-        self.assertRegex(systemd_args[2], r"^--unit=alpha-[0-9]+$")
-        self.assertEqual(launch[0]["claude_env"], [])
-        tmux = next(record for record in self.events("tmux")
-                    if cast(list[str], record["args"])[:1] == ["new-session"])
-        args = cast(list[str], tmux["args"])
-        self.assertEqual(args[:11], ["new-session", "-d", "-s", "alpha", "-c", str(worktree),
-                                     "-e", "SHOWRUNNER_UNIT=build-followups", "-e", "SHOWRUNNER_UNIT_ID=alpha-unit",
-                                     "zsh"])
-        self.assertIn("claude --model opus --effort xhigh --remote-control alpha -n alpha", args[-1])
-        self.assert_director_flags("opus", "xhigh")
-        self.assertIn("'/unit:direct docs/plans/given.md'", args[-1])
-        self.assertEqual(
-            args[-1],
-            "ENABLE_TOOL_SEARCH=true command " + shlex.join([
-                "claude", "--model", "opus", "--effort", "xhigh",
-                "--remote-control", "alpha", "-n", "alpha",
-                "--settings", '{"disableAgentView": true}',
-                "/unit:direct docs/plans/given.md",
-            ]) + "; exec zsh",
-        )
+        self.assertEqual(self.servers_started(), [["--user", "--unit=herdr-alpha.service", "--collect",
+            self.env["HERDR_BIN"], "--session", "alpha", "server"]])
+        self.assertEqual(self.opened()[4:8], ["--label", "alpha", "--cwd", str(worktree)])
+        self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
+            "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
+            "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
+        self.assertEqual(self.agent_arguments(), ["--model", "opus", "--effort", "xhigh",
+            "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}'])
+        self.assertEqual(self.opening_prompt(), "/unit:direct docs/plans/given.md")
+        self.assertEqual(len([row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]]), 1)
+        self.assertEqual(self.events("tmux"), [row for row in self.events("tmux")
+                                               if cast(list[str], row["args"])[0] == "list-panes"])
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+        self.assertIn("alpha-unit started: herdr session attach alpha", result.stdout)
 
-    def test_named_unit_account_is_quoted_inside_tmux_command(self) -> None:
+    def test_review_unit_uses_an_ordinary_row_and_worktree_with_review_direct_opening(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+        _ = self.successful("review", "--plan", "docs/plans/given.md")
+        worktree = self.root / "project-review"
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
+                         "build-followups-review")
+        row = next(line for line in self.doc.read_text().splitlines() if line.startswith("| review-unit |"))
+        self.assertEqual([cell.strip() for cell in row.strip("|").split("|")],
+                         ["review-unit", "docs/plans/given.md", str(worktree),
+                          "build-followups-review", "—", "—"])
+        self.assertTrue(row.endswith("| — | — |"), row)
+        self.assertEqual({key: value for key, value in self.pane_environment().items() if key.startswith("SHOWRUNNER_")},
+                         {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"})
+        self.assertIn(shlex.quote(f"/review:direct {self.doc}"), self.launch_command())
+        self.assertNotIn("/unit:direct", self.launch_command())
+
+    def test_promoted_review_unit_uses_review_direct_with_its_identity(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+        _ = self.successful("review-unit", "--plan", "docs/plans/given.md",
+                            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        command = self.launch_command()
+        self.assertIn("You are now review-unit in production build-followups", command)
+        self.assertIn(f"Run /review:direct {self.doc}.", command)
+        self.assertNotIn("Run /unit:direct", command)
+
+    def test_review_named_unit_without_a_pool_keeps_unit_direct_opening(self) -> None:
+        _ = self.successful("review", "--plan", "docs/plans/given.md")
+        self.assertIn(shlex.quote("/unit:direct docs/plans/given.md"), self.launch_command())
+        self.assertNotIn("/review:direct", self.launch_command())
+
+    def test_named_unit_account_paths_are_literal_pane_environment_values(self) -> None:
         home = self.root / "home with 'quotes' $()"
         _ = Path(self.env["HOME"]).rename(home)
         self.env["HOME"] = str(home)
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")
-        directory = self.prepare_unit_account("claude 3")
-
+        directory = self.prepare_unit_account("claude3")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-
-        self.assertEqual(
-            self.launch_command(),
-            self.named_prefix(directory)
-            + "ENABLE_TOOL_SEARCH=true command " + shlex.join([
-                "claude", "--model", "opus", "--effort", "xhigh",
-                "--remote-control", "alpha", "-n", "alpha",
-                "--settings", '{"disableAgentView": true}',
-                "/unit:direct docs/plans/given.md",
-            ]) + "; exec zsh",
-        )
-        launches = [
-            *self.events("systemd-run"),
-            *(event for event in self.events("tmux")
-              if cast(list[str], event["args"])[:1] == ["new-session"]),
-        ]
-        for event in launches:
-            self.assertEqual(event["claude_env"], [])
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertEqual(self.pane_environment()["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(home / ".claude"))
+        self.assertNotIn("CLAUDE_TEST_SECRET", self.pane_environment())
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.pane_environment())
 
     def test_held_named_unit_account_refuses_new_work_before_changes(self) -> None:
         """F001: the launch guard checks the selected unit account's shutdown."""
-        _ = self.prepare_unit_account("claude 3")
+        _ = self.prepare_unit_account("claude3")
         login = "claude-3@example.invalid"
         held = self.shutdown_record("down")
         held["login"] = login
-        held["label"] = "claude 3"
+        held["label"] = "claude3"
         self.write_shutdown_record(held, login=login)
         document = self.doc.read_text(encoding="utf-8")
         head = self.git("rev-parse", "HEAD")
@@ -1103,24 +1762,22 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
             result.stderr,
-            "add_unit: claude 3 is held by a shutdown "
-            + "(down since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            "add_unit: claude3 is held by a shutdown "
+            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 
     def test_default_account_shutdown_does_not_block_a_named_unit(self) -> None:
         """F001: another account's shutdown does not block the selected unit account."""
-        directory = self.prepare_unit_account("claude 3")
+        directory = self.prepare_unit_account("claude3")
         self.write_shutdown_record(self.shutdown_record("down"))
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
-        self.assertTrue(self.launch_command().startswith(
-            self.named_prefix(directory)
-        ))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
-    def test_default_unit_guard_environment_is_unchanged(self) -> None:
-        """F001: default selection preserves the original sanitized guard environment."""
+    def test_claude2_guard_environment_selects_its_numbered_folder(self) -> None:
+        """The guard sees the selected folder, never the caller or config home."""
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")
         with (
             patch.dict(os.environ, self.env),
@@ -1139,18 +1796,21 @@ class AddUnitTests(unittest.TestCase):
             ])
 
         self.assertEqual(result, 0)
+        expected["CLAUDE_CONFIG_DIR"] = str(Path(self.env["HOME"]) / ".claude2")
         permission.assert_called_once_with(
             expected, launch_permission.NewWorkLaunchPurpose()
         )
 
-    def test_role_change_after_readiness_keeps_the_checked_launch_account(self) -> None:
-        """F003: a role change after checking cannot select an unchecked account."""
-        directory = self.prepare_unit_account("claude 3")
+    def test_better_candidate_after_readiness_keeps_the_stored_group_account(self) -> None:
+        """Better readings neither replace the stored group nor the checked launch account."""
+        directory = self.prepare_unit_account("claude3")
         ensure_worktree = add_unit.ensure_worktree
 
         def change_role_after_worktree(request: add_unit.UnitLaunch) -> None:
             ensure_worktree(request)
-            _ = self.select_unit_account("claude 1")
+            _ = self.prepare_unit_account("claude1")
+            self.quota_reading("claude-1@example.invalid", 1, 1)
+            _ = self.select_unit_account("claude3")
 
         with (
             patch.dict(os.environ, self.env),
@@ -1164,36 +1824,70 @@ class AddUnitTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         selection.assert_called_once_with("unit")
-        readiness.assert_called_once_with("claude 3")
-        self.assertTrue(self.launch_command().startswith(
-            self.named_prefix(directory)
-        ))
-        self.assertFalse((directory.parent / ".claude1").exists())
+        self.assertIn("claude3", [call.args[0] for call in readiness.call_args_list])
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertTrue((directory.parent / ".claude1").exists())
         with patch.dict(os.environ, self.env):
             self.assertEqual(
                 accounts.role_account("unit"),
-                accounts.NamedAccount("claude 1", directory.parent / ".claude1"),
+                accounts.NamedAccount("claude3", directory),
             )
 
-    def test_named_unit_resume_uses_the_unit_account(self) -> None:
-        directory = self.prepare_unit_account("claude 3")
+    def test_new_claude2_unit_passes_its_numbered_account_variables(self) -> None:
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(self.pane_environment()["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(Path(self.env["HOME"]) / ".claude"))
+
+    def test_new_named_unit_passes_selected_account_variables(self) -> None:
+        directory = self.prepare_unit_account("claude3")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+
+    def test_explicit_unit_account_move_passes_prepared_account_variables(self) -> None:
+        directory = self.prepare_unit_account("claude3")
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--account", "claude3")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
-        _ = self.successful(
-            "alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior),
-        )
+    def test_manual_unit_resume_keeps_its_recorded_model_despite_changed_director_configuration(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        directory = self.prepare_unit_account("claude3")
+        self.persist_unit_account(directory, session="alpha", model="opus")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior))
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
 
-        self.assertTrue(self.launch_command().startswith(
-            self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
-        ))
+    def test_unit_resume_uses_configured_account_instead_of_recorded_account(self) -> None:
+        """F004: the configured units account decides resumes too."""
+        old = self.prepare_unit_account("claude2")
+        caller = self.prepare_unit_account("claude3")
+        directory = self.prepare_unit_account("claude1")
+        self.env["CLAUDE_CONFIG_DIR"] = str(caller)
+        self.persist_unit_account(old, session="alpha")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md",
+                                  "--resume", "session-123", "--cwd", str(prior))
+        with (patch.dict(os.environ, self.env),
+              patch.object(accounts, "prepared_account", wraps=accounts.prepared_account) as prepared):
+            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+                "--resume", "session-123", "--cwd", str(prior)])
+        self.assertEqual(code, 0)
+        prepared.assert_any_call("claude1", resume=True)
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertIn("--resume session-123", self.launch_command())
 
-    def test_unit_restore_uses_the_current_unit_account(self) -> None:
+    def test_unit_resume_uses_configured_account_instead_of_old_named_account(self) -> None:
         self.commit_prepared_row(self.unit_row())
-        self.env["CLAUDE_CONFIG_DIR"] = str(self.select_unit_account("claude 1"))
-        directory = self.prepare_unit_account("claude 3")
+        directory = self.prepare_unit_account("claude1")
+        other_directory = self.prepare_unit_account("claude3")
+        self.env["CLAUDE_CONFIG_DIR"] = str(other_directory)
+        self.persist_unit_account(directory)
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note.txt"
@@ -1203,50 +1897,128 @@ class AddUnitTests(unittest.TestCase):
             "alpha", "--plan", "docs/plans/given.md",
             "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note),
-            "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
+            "--session-name", "recorded-name", "--host-session", "recorded-tmux",
         )
 
-        self.assertTrue(self.launch_command().startswith(
-            self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
-        ))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(other_directory))
+        self.assertFalse(any(argument.endswith("/accounts.py") for argument in self.agent_arguments()))
         self.assertIn("--resume session-123", self.launch_command())
-        self.assertNotIn(self.env["CLAUDE_CONFIG_DIR"], self.launch_command())
+        self.assertNotIn(str(directory), self.launch_command())
 
-    def test_unready_unit_account_is_refused_before_launch_permission(self) -> None:
-        directory = self.select_unit_account("claude 3")
-        document = self.doc.read_text(encoding="utf-8")
-        head = self.git("rev-parse", "HEAD")
+    def test_unit_resume_without_recorded_account_uses_configured_units(self) -> None:
+        """F004: no retained account is needed once the group is configured."""
+        directory = self.prepare_unit_account("claude1")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "unrecorded-session", "--cwd", str(prior))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
-        for mode in ([], ["--check"]):
-            with self.subTest(mode=mode):
-                result = self.cli("alpha", "--plan", "docs/plans/given.md", *mode)
-
-                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                self.assertEqual(
-                    result.stderr,
-                    f"add_unit: unit account claude 3: accounts: {directory} is missing; /accounts status\n",
-                )
-                self.assert_no_launch_change(document, head)
-                self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
-
-    def test_unit_account_refusal_reports_only_the_first_problem(self) -> None:
-        directory = self.select_unit_account("claude 3")
+    def test_unit_resume_refuses_config_directory_outside_configured_account(self) -> None:
+        """F004: an explicit directory cannot replace the units account."""
+        directory = self.root / "external account with spaces"
         directory.mkdir()
-        document = self.doc.read_text(encoding="utf-8")
+        _ = self.prepare_unit_account("claude1")
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(directory))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude1", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_unit_resume_refuses_missing_directory_that_differs_from_configured_default(self) -> None:
+        """F004: an override mismatch names configuration, not a missing former account."""
+        directory = self.root / "gone-account"
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("units account is claude2", result.stderr)
+        self.assertIn("--account and --config-dir must name claude2", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.servers_started(), [])
+
+    def test_resumed_unit_uses_its_recorded_model_despite_a_different_director_configuration(self) -> None:
+        self.write_agent_config(director="sonnet:high")
+        directory = self.prepare_unit_account("claude3")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(prior), "--account", "claude3", "--model", "opus")
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+        self.assertNotIn(str(directory), self.launch_command())
+
+    def test_unit_resume_refuses_account_that_differs_from_configured_units(self) -> None:
+        """F004: --account must agree with the configured group."""
+        _ = self.prepare_unit_account("claude2")
+        _ = self.prepare_unit_account("claude1")
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(self.checkout), "--account", "claude2")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude1", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_unconfigured_units_refuse_new_standby_and_resume_without_writes(self) -> None:
+        """F004: every unit launch mode requires explicit configuration."""
+        with patch.dict(os.environ, self.env):
+            accounts.groups_file().unlink()
+        document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
+        for mode in (("--plan", "docs/plans/given.md"), ("--standby",),
+                     ("--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(self.checkout))):
+            with self.subTest(mode=mode):
+                result = self.cli("alpha", *mode)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("accounts.py move units <claudeN>", result.stderr)
+                self.assert_no_launch_change(document, head)
+                self.assertFalse((Path(self.env["HOME"]) / ".local/state/accounts/groups.json").exists())
 
+    def test_new_unit_refuses_unfit_configured_account_without_default_fallback(self) -> None:
+        """F004: a configured account cannot silently fall back to default."""
+        directory = self.select_unit_account("claude3")
+        directory.mkdir()
+        before = self.repository_state()
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude3", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
 
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(
-            result.stderr,
-            f"add_unit: unit account claude 3: accounts: {directory / 'projects'} is missing; /accounts status\n",
-        )
-        self.assert_no_launch_change(document, head)
-        self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
+    def test_new_unit_and_standby_use_configured_units_despite_showrunner_caller(self) -> None:
+        """F004: caller identity does not decide either new unit launch mode."""
+        caller = self.prepare_unit_account("claude3")
+        directory = self.prepare_unit_account("claude1")
+        self.env["CLAUDE_CONFIG_DIR"] = str(caller)
+        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
+        _ = path.write_text(json.dumps({"units": "claude1", "showrunners": "claude3"}))
+        for name, mode in (("alpha", ("--plan", "docs/plans/given.md")), ("beta", ("--standby",))):
+            with self.subTest(mode=mode):
+                _ = self.successful(name, *mode)
+                self.assertEqual(self.pane_environment(name)["CLAUDE_CONFIG_DIR"], str(directory))
+
+    def test_unit_accepts_explicit_account_matching_configured_units(self) -> None:
+        """F004: matching --account selects no alternative account."""
+        directory = self.prepare_unit_account("claude1")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--account", "claude1")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+
+    def test_units_and_showrunners_may_share_the_launch_account(self) -> None:
+        """F004: sharing one account is valid configuration."""
+        directory = self.prepare_unit_account("claude1")
+        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
+        _ = path.write_text(json.dumps({"units": "claude1", "showrunners": "claude1"}))
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
     def test_ready_unit_account_passes_check_without_launch_changes(self) -> None:
-        _ = self.prepare_unit_account("claude 3")
+        _ = self.prepare_unit_account("claude3")
         document = self.doc.read_text(encoding="utf-8")
         head = self.git("rev-parse", "HEAD")
 
@@ -1264,11 +2036,15 @@ class AddUnitTests(unittest.TestCase):
 
     def test_a_rerun_finds_the_unit_by_its_mark_after_its_session_was_renamed(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        for kind, suffix in (("live", ""), ("env", ".json")):
-            _ = (self.state / f"{kind}-alpha{suffix}").rename(self.state / f"{kind}-renamed{suffix}")
+        _ = (self.state / "herdr-live-alpha").rename(self.state / "herdr-live-renamed")
+        _ = (self.root / "proc/101/cmdline").write_bytes(b"herdr\0--session\0renamed\0server\0")
+        sockets = self.root / "proc/net/unix"
+        _ = sockets.write_text(sockets.read_text().replace("/sessions/alpha/herdr.sock", "/sessions/renamed/herdr.sock"))
+        self.herdr_overrides["--session renamed pane read w1:p1 --source recent --lines 60"] = CommandResponse(
+            code=0, stdout="/remote-control is active")
         result = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(len(self.new_sessions()), 1)
-        self.assertIn("alpha-unit started: tmux attach -t renamed", result.stdout)
+        self.assertEqual(len(self.servers_started()), 1)
+        self.assertIn("alpha-unit started: herdr session attach renamed", result.stdout)
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
 
     def test_sonnet_director_row_changes_launch_model_and_effort(self) -> None:
@@ -1316,7 +2092,7 @@ class AddUnitTests(unittest.TestCase):
         self.assertNotIn("add unit", self.git("log", "-1", "--format=%s"))
         self.assertEqual(self.git("branch", "--show-current", cwd=self.root / "project-alpha"),
                          "build-followups-alpha")
-        self.assertEqual(len(self.events("systemd-run")), 1)
+        self.assertEqual(len(self.servers_started()), 1)
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
@@ -1383,7 +2159,7 @@ class AddUnitTests(unittest.TestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(self.root / "prior-session"), "--check")
+                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
@@ -1393,7 +2169,7 @@ class AddUnitTests(unittest.TestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("new director", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(self.root / "prior-session"), "--check")
+                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
         self.assertIn("name must contain only letters", result.stderr)
@@ -1425,12 +2201,10 @@ class AddUnitTests(unittest.TestCase):
         self.assertIn(self.unit_row(plan="docs/plans/build-followups-alpha.md"), self.doc.read_text())
         self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
                          {"docs/plans/build-followups-production.md", "docs/plans/build-followups-alpha.md"})
-        tmux = next(record for record in self.events("tmux")
-                    if cast(list[str], record["args"])[:1] == ["new-session"])
-        prompt = cast(list[str], tmux["args"])[-1]
+        prompt = self.opening_prompt()
         self.assertIn("Write the full phased plan there", prompt)
         self.assertIn("wait for its approval before you run /unit:direct docs/plans/build-followups-alpha.md", prompt)
-        self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
+        self.assertIn("alpha-unit started: herdr session attach alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
 
     def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
@@ -1452,7 +2226,7 @@ class AddUnitTests(unittest.TestCase):
 
     def test_timeout_keeps_session_then_rerun_finishes_without_duplicate_steps(self) -> None:
         _ = (self.state / "ready").unlink()
-        first = self.cli("alpha", "--plan", "docs/plans/given.md", "--timeout", "0.2")
+        first = self.cli("alpha", "--plan", "docs/plans/given.md", "--timeout", "10")
         self.assertEqual(first.returncode, 1, (first.stdout, first.stderr))
         self.assertIn("alpha", first.stdout + first.stderr)
         self.assertIn("Waiting for remote control", first.stdout + first.stderr)
@@ -1463,8 +2237,7 @@ class AddUnitTests(unittest.TestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(self.git("rev-parse", "HEAD"), commit)
         self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
-        self.assertEqual(len([event for event in self.events("tmux")
-                              if cast(list[str], event["args"])[:1] == ["new-session"]]), 1)
+        self.assertEqual(len(self.servers_started()), 1)
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
@@ -1496,10 +2269,18 @@ class AddUnitTests(unittest.TestCase):
 
     def test_refuses_missing_production_field(self) -> None:
         original = self.doc.read_text()
-        _ = self.doc.write_text(original.replace("- **User zone:** America/Los_Angeles — reports use PDT\n", ""))
+        _ = self.doc.write_text(original.replace("- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n", ""))
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertNotIn("| alpha-unit |", self.doc.read_text())
+
+    def test_a_doc_without_a_user_zone_line_still_adds_a_unit(self) -> None:
+        # The zone is the user's setting; a production doc no longer has to name one.
+        original = self.doc.read_text()
+        _ = self.doc.write_text(original.replace("- **User zone:** America/Los_Angeles — reports use PDT\n", ""))
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn("| alpha-unit |", self.doc.read_text())
 
     def test_refuses_checkout_off_merge_branch(self) -> None:
         _ = self.git("checkout", "-b", "wrong-branch")
@@ -1507,33 +2288,32 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertNotIn("| alpha-unit |", self.doc.read_text())
 
-    def test_refuses_taken_row_and_unowned_live_tmux_session(self) -> None:
+    def test_refuses_taken_row_and_unowned_live_herdr_session(self) -> None:
         original = self.doc.read_text()
         _ = self.doc.write_text(original.replace("## Gates", self.unit_row(branch="different") + "\n\n## Gates"))
         taken = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(taken.returncode, 2, (taken.stdout, taken.stderr))
         _ = self.doc.write_text(original)
-        _ = (self.state / "live-alpha").touch()
+        _ = (self.state / "herdr-live-alpha").touch()
         live = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(live.returncode, 2, (live.stdout, live.stderr))
-        self.assertIn("tmux session alpha is already live and is not marked as alpha-unit", live.stderr)
+        self.assertIn("herdr session alpha is already live and is not marked as alpha-unit", live.stderr)
         self.assertEqual(self.doc.read_text(), original)
-        self.assertEqual(len(self.events("systemd-run")), 0)
+        self.assertEqual(len(self.servers_started()), 0)
 
     def test_resume_uses_session_id_cwd_and_promote_prompt(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                            "--cwd", str(prior))
-        tmux = next(record for record in self.events("tmux")
-                    if cast(list[str], record["args"])[:1] == ["new-session"])
-        args = cast(list[str], tmux["args"])
-        self.assertEqual(args[args.index("-c") + 1], str(prior))
-        command = args[-1]
-        self.assertTrue(command.startswith("ENABLE_TOOL_SEARCH=true command claude "))
-        self.assertNotIn("CLAUDE_CONFIG_DIR", command)
-        self.assertIn("claude --model opus --effort xhigh --resume session-123 --remote-control alpha -n alpha", command)
+                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(self.opened()[7], str(prior))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(self.agent_arguments(), [
+            "--model", "opus", "--effort", "xhigh", "--resume", "session-123",
+            "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}',
+        ])
         self.assert_director_flags("opus", "xhigh")
+        command = self.opening_prompt()
         self.assertIn("You are now alpha-unit in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
@@ -1548,10 +2328,13 @@ class AddUnitTests(unittest.TestCase):
             "plan": "docs/plans/given.md",
             "brief": None,
             "standby": False,
+            "permanent": False,
+            "adopt": None,
             "port": None,
             "owns": None,
             "timeout": 90.0,
             "check": False,
+            "probe": False,
         }
         restored = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -1559,7 +2342,7 @@ class AddUnitTests(unittest.TestCase):
             cwd=str(self.root / "prior-session"),
             restart_note=str(note),
             session_name="recorded name",
-            tmux_session="recorded tmux",
+            host_session="recorded tmux",
         ))
         ordinary_resume = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -1567,7 +2350,7 @@ class AddUnitTests(unittest.TestCase):
             cwd=str(self.root / "prior-session"),
             restart_note=None,
             session_name=None,
-            tmux_session=None,
+            host_session=None,
         ))
         new_work = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -1575,7 +2358,7 @@ class AddUnitTests(unittest.TestCase):
             cwd=None,
             restart_note=None,
             session_name=None,
-            tmux_session=None,
+            host_session=None,
         ))
 
         self.assertEqual(
@@ -1591,8 +2374,8 @@ class AddUnitTests(unittest.TestCase):
         def request(name: str) -> tuple[str, str, Path, str]:
             launched = add_unit.launch_request(argparse.Namespace(
                 production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
-                standby=False, port=None, owns=None, timeout=90.0, check=False, resume=None,
-                cwd=None, restart_note=None, session_name=None, tmux_session=None,
+                standby=False, permanent=False, adopt=None, port=None, owns=None, timeout=90.0, check=False,
+                resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
             ))
             return launched.unit, launched.branch, launched.worktree, launched.requested_name
 
@@ -1608,19 +2391,19 @@ class AddUnitTests(unittest.TestCase):
         for flags in (
             ("--restart-note", str(note)),
             ("--session-name", "recorded-name"),
-            ("--tmux-session", "recorded-tmux"),
+            ("--host-session", "recorded-tmux"),
             (
                 "--restart-note", str(note),
                 "--session-name", "recorded-name",
-                "--tmux-session", "recorded-tmux",
+                "--host-session", "recorded-tmux",
             ),
         ):
             with self.subTest(flags=flags):
                 result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                self.assertEqual(self.events("systemd-run"), [])
+                self.assertEqual(self.servers_started(), [])
 
-    def test_restore_note_recorded_names_and_unique_scope_drive_the_launch(self) -> None:
+    def test_restore_keeps_claude_name_and_sanitizes_herdr_host_name(self) -> None:
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior session"
         prior.mkdir()
@@ -1642,43 +2425,24 @@ class AddUnitTests(unittest.TestCase):
             "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", recorded_session,
-            "--tmux-session", recorded_tmux,
-        )
+            "--host-session", recorded_tmux,
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        tmux = self.new_sessions()[0]
-        self.assertEqual(tmux[tmux.index("-s") + 1], recorded_tmux)
-        self.assertEqual(tmux[tmux.index("-c") + 1], str(prior))
-        has_targets = [cast(list[str], event["args"])[-1] for event in self.events("tmux")
-                       if cast(list[str], event["args"])[:1] == ["has-session"]]
-        self.assertTrue(has_targets)
-        self.assertEqual(set(has_targets), {f"={recorded_tmux}"})
-
-        command = tmux[-1]
-        self.assertTrue(command.startswith("ENABLE_TOOL_SEARCH=true command claude "))
-        self.assertNotIn("CLAUDE_CONFIG_DIR", command)
-        encoded = command.split(" command ", 1)[1].rsplit("; exec zsh", 1)[0]
-        claude = shlex.split(encoded)
+        self.assertEqual(self.opened()[1], "restore----")
+        self.assertEqual(self.opened()[7], str(prior))
+        claude = self.agent_arguments()
+        prompt = self.opening_prompt()
         self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)
         self.assertEqual(claude[claude.index("-n") + 1], recorded_session)
-        self.assertIn("You are now alpha-unit in production build-followups", claude[-1])
-        self.assertTrue(claude[-1].endswith(restart_note), claude[-1])
-        self.assertNotIn("Run /unit:direct", claude[-1])
+        self.assertNotIn("claude", claude)
+        self.assertIn("You are now alpha-unit in production build-followups", prompt)
+        self.assertTrue(prompt.endswith(restart_note), prompt)
+        self.assertNotIn("Run /unit:direct", prompt)
         recorded = self.recorded_prompts("session-123")
-        self.assertEqual(recorded, (existing_prompt, claude[-1]))
-        self.assertIs(
-            conversation_pause.prompt_source(
-                claude[-1], frozenset, lambda: recorded
-            ),
-            conversation_pause.PromptSource.SCHEDULED,
-        )
-
-        launches = self.events("systemd-run")
-        self.assertEqual(len(launches), 1)
-        systemd = cast(list[str], launches[0]["args"])
-        scope = next(argument for argument in systemd if argument.startswith("--unit="))
-        name, epoch = scope.removeprefix("--unit=").rsplit("-", 1)
-        self.assertEqual(name, "restore----")
-        self.assertGreater(int(epoch), 0)
+        self.assertEqual(recorded, (existing_prompt, prompt))
+        self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
+                      conversation_pause.PromptSource.SCHEDULED)
+        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-restore----.service")
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
         self.commit_prepared_row(self.unit_row())
@@ -1695,13 +2459,13 @@ class AddUnitTests(unittest.TestCase):
             "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name",
-            "--tmux-session", "recorded-tmux",
-        )
+            "--host-session", "recorded-tmux",
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("add_unit: restart prompt not recorded:", result.stderr)
-        self.assertEqual(self.events("systemd-run"), [])
+        self.assertEqual(self.servers_started(), [])
 
     def test_new_work_records_no_scheduled_prompt(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
@@ -1712,12 +2476,12 @@ class AddUnitTests(unittest.TestCase):
         _ = self.successful("alpha", "--brief", "Write a full plan")
         original = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        launches = len(self.events("systemd-run"))
+        launches = len(self.servers_started())
         result = self.cli("alpha", "--plan", "docs/plans/build-followups-alpha.md")
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertEqual(len(self.events("systemd-run")), launches)
+        self.assertEqual(len(self.servers_started()), launches)
 
     def test_kebab_alias_refuses_existing_branch_and_worktree_row(self) -> None:
         _ = self.successful("mul_add", "--plan", "docs/plans/given.md")
@@ -1772,18 +2536,32 @@ class AddUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
 
-    def test_the_name_check_is_exact_and_the_pane_is_read_by_its_id(self) -> None:
-        _ = (self.state / "live-alpha2").touch()
+    def test_the_herdr_name_check_is_exact_and_the_pane_is_read_by_its_id(self) -> None:
+        self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
+            herdr.SessionListResult(sessions=[herdr.SessionEntry(name="alpha2", running=True, default=False,
+                session_dir="/fixture", socket_path="/fixture/socket")])))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(len(self.events("systemd-run")), 1)
-        has_targets = [cast(list[str], event["args"])[-1] for event in self.events("tmux")
-                       if cast(list[str], event["args"])[:1] == ["has-session"]]
-        pane_targets = [cast(list[str], event["args"])[-1] for event in self.events("tmux")
-                        if cast(list[str], event["args"])[:1] == ["capture-pane"]]
-        self.assertTrue(has_targets)
-        self.assertTrue(pane_targets)
-        self.assertEqual(set(has_targets), {"=alpha"})
-        self.assertEqual(set(pane_targets), {"%1"})
+        self.assertEqual(len(self.servers_started()), 1)
+        self.assertIn(["--session", "alpha", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60"], self.herdr_calls())
+
+    def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
+        request = add_unit.UnitLaunch(
+            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
+            launch_kind=add_unit.NewWorkLaunch(), timeout=0,
+        )
+        for place in (unit_lookup.TmuxPlace("%1"), HerdrPlace("native", "w1:p1")):
+            with self.subTest(place=place):
+                marked = unit_lookup.MarkedUnit("alpha-unit", "label", unit_lookup.ClaudeNotRunning(), place)
+                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                        patch.object(session_pane, "read_place", return_value="/remote-control is active") as read:
+                    self.assertEqual(add_unit.wait_for_remote_control(request), marked)
+                read.assert_called_once_with(place)
+                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                        patch.object(session_pane, "read_place", side_effect=session_pane.TmuxFailure("unreadable")):
+                    with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
+                        _ = add_unit.wait_for_remote_control(request)
 
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"
@@ -1791,6 +2569,9 @@ class AddUnitTests(unittest.TestCase):
         self.checkout = renamed
         self.doc = renamed / "docs/plans/build-followups-production.md"
         self.plan = renamed / "docs/plans/given.md"
+        _ = (Path(self.env["HOME"]) / ".claude2/.claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "owner@example.com"},
+            "projects": self.trusted_projects()}), encoding="utf-8")
         _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "move checkout")
@@ -1812,9 +2593,10 @@ class PythonImportConfiguration(TypedDict):
 
 
 @final
-class UnitLaunchProtocolTests(unittest.TestCase):
+class UnitLaunchProtocolTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
+        super().setUp()
         home = self.enterContext(tempfile.TemporaryDirectory())
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": home})
@@ -1827,36 +2609,18 @@ class UnitLaunchProtocolTests(unittest.TestCase):
             "</LaunchUnits>", 1
         )[0]
 
-    def test_manual_unit_resume_requires_successful_account_resolution(self) -> None:
-        """F002: failed account resolution must stop the manual resume protocol."""
+    def test_manual_unit_resume_uses_add_unit_without_selecting_the_current_unit_role(self) -> None:
         instructions = self.resume_instructions()
-        resolver = "`~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit`"
-        refusal = "If it exits nonzero, do not resume and tell the user its line."
+        self.assertIn("add_unit.py", instructions)
+        self.assertIn("--resume <session-id>", instructions)
+        self.assertNotIn("env unit", instructions)
+        self.assertNotIn("claude --resume", instructions)
 
-        self.assertLess(instructions.index(resolver), instructions.index(refusal))
-        self.assertLess(instructions.index(refusal), instructions.index("claude --resume"))
-        self.assertNotIn("eval", instructions)
-
-    def test_manual_unit_resume_uses_the_resolved_account_for_guard_and_launch(self) -> None:
-        """F002: the same resolved assignment precedes the guard and Claude resume."""
+    def test_manual_unit_resume_uses_configured_units_account_and_names_missing_configuration_command(self) -> None:
         instructions = self.resume_instructions()
-
-        self.assertIn(
-            "Its output (empty for the default account) is `<account>`; "
-            + "put it verbatim before both commands below.",
-            instructions,
-        )
-        self.assertIn(
-            "`<account>$HOME/.claude/scripts/lib/py "
-            + "$HOME/.claude/scripts/shutdown/shutdown.py "
-            + "launch-blocked --restart-of <session-id>`",
-            instructions,
-        )
-        self.assertIn(
-            "`<account>claude --resume <session-id> <flags> "
-            + "--remote-control <session> -n <session>`",
-            instructions,
-        )
+        self.assertIn("starts it on the configured units account", instructions)
+        self.assertIn("units account is not configured", instructions)
+        self.assertIn("accounts.py move units", instructions)
 
     def test_production_import_paths_resolve_the_accounts_package(self) -> None:
         """F005: production's configured import search can find scripts.accounts."""
@@ -1876,7 +2640,7 @@ class UnitLaunchProtocolTests(unittest.TestCase):
         ))
 
 
-class RetiredRowTests(unittest.TestCase):
+class RetiredRowTests(ShutdownTestCase):
     """A unit is retired by its Plan cell, or when its worktree and its tmux session are both gone."""
 
     root: Path = Path()
@@ -1886,6 +2650,7 @@ class RetiredRowTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root)
         home_context = cast(object, self.enterContext(
@@ -1903,14 +2668,14 @@ class RetiredRowTests(unittest.TestCase):
         return f"| `{unit}-unit` | {plan} | `{worktree}` | `branch` | `{unit}` (resumed elsewhere) | — | — |"
 
     def session(self, unit: str) -> unit_lookup.MarkedUnit:
-        return unit_lookup.MarkedUnit(unit, "%1", "any-label", unit_lookup.ClaudeNotRunning())
+        return unit_lookup.MarkedUnit(unit, "any-label", unit_lookup.ClaudeNotRunning(), unit_lookup.TmuxPlace("%1"))
 
     def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
         """Whether the row is retired, and how many times tmux was asked."""
         found = {} if gone else {"some-unit": self.session("some-unit")}
-        cells = add_unit.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
+        cells = production_units.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
         with patch.object(unit_lookup, "marked_units", return_value=found) as asked:
-            return add_unit.unit_is_retired(cells, add_unit.SessionMarks("show")), asked.call_count
+            return production_units.unit_is_retired(cells, production_units.SessionMarks("show")), asked.call_count
 
     def test_a_unit_is_gone_only_without_both_its_worktree_and_its_session(self) -> None:
         self.assertEqual(self.retired(self.missing, gone=True), (True, 1))
@@ -1941,6 +2706,35 @@ class RetiredRowTests(unittest.TestCase):
         with patch.object(unit_lookup, "marked_units", return_value={}):
             self.assertEqual(retired_units(lines, "show"), {"marked-unit", "gone-unit"})
             self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "show")], ["parked-unit"])
+
+
+class AdoptAccountTests(unittest.TestCase):
+    """An adopted session keeps the account it runs on, named by its configured label."""
+
+    def adopted(self, folder: Path, named: list[accounts.NamedAccount]) -> add_unit.Adoptable | add_unit.AlreadyAdopted:
+        claude = unit_lookup.LiveClaude("nightly-review", "sid", "/sock", 4242)
+        with patch.object(add_unit, "launched_unit", return_value=None), \
+             patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {})), \
+             patch.object(unit_lookup, "tmux_claude", return_value=claude), \
+             patch("scripts.whoami.account.process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(folder)), \
+             patch.object(accounts, "main_config_dir", return_value=Path("/home/someone/.claude")), \
+             patch.object(accounts, "account_identity", return_value=agent_accounts.NumberedAccount("claude2", Path("/home/someone/.claude"), "owner@example.invalid")), \
+             patch.object(accounts, "checked_named_accounts", return_value=named):
+            return add_unit.adoptable(cast(add_unit.RequestedUnitLaunch, cast(object, None)), "nightly-review")
+
+    def test_a_session_on_a_named_account_is_adopted_on_that_account(self) -> None:
+        three = accounts.NamedAccount("claude3", Path("/home/someone/.claude3"))
+        adopted = self.adopted(three.dir, [accounts.NamedAccount("claude1", Path("/home/someone/.claude1")), three])
+        self.assertEqual(cast(add_unit.Adoptable, adopted).account, three)
+
+    def test_a_session_on_the_main_folder_is_adopted_on_the_default_account(self) -> None:
+        adopted = self.adopted(Path("/home/someone/.claude"), [])
+        self.assertEqual(cast(add_unit.Adoptable, adopted).account, accounts.NamedAccount("claude2", Path("/home/someone/.claude")))
+
+    def test_a_session_on_no_fit_account_is_refused(self) -> None:
+        with self.assertRaises(Refusal) as refused:
+            _ = self.adopted(Path("/home/someone/.claude9"), [])
+        self.assertIn("runs on /home/someone/.claude9, which is no account fit to launch", str(refused.exception))
 
 
 if __name__ == "__main__":

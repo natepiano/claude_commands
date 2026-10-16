@@ -97,7 +97,7 @@ class BusyTests(unittest.TestCase):
             (
                 "thread child",
                 [row("feature", "idle", "~/rust/feature", {"detached": "codex"}, "thread", "shell")],
-                "a Codex seat of feature",
+                "a Codex worker of feature",
             ),
             ("detached app server only", [row("feature", "idle", "~/rust/feature", {"detached": "codex"})], None),
         ]
@@ -233,7 +233,7 @@ class CommandTests(unittest.TestCase):
             tree_key=key,
             rustc=rustc,
             caller="verify",
-            seat="impl2",
+            worker="impl2",
             duration_s=41.6,
             **fields,
         )

@@ -16,18 +16,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from statistics import fmean, median
 from typing import Literal, NamedTuple, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 
 import store
 from memory_admit import expected_peak, test_threads
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 BLOCK_S = 6000
 WASHOUT_S = 900
 WIDTHS = {16: "physical", 32: "logical"}
 GIB = 1 << 30
-PACIFIC = ZoneInfo("America/Los_Angeles")
 BOOTSTRAP_SEED = 20261009
 MIN_RUNS = 60
 MIN_BLOCKS = 15
@@ -356,6 +356,8 @@ def _uses_memory_gate(step_name: object, raw_argv: object) -> bool:
     argv = _argv(raw_argv)
     if step_name == "sweep" and any(argument.endswith("/sweep.py") for argument in argv):
         return False
+    if argv and argv[0] == "taplo":
+        return False
     if not argv or argv[0] != "cargo":
         return True
     subcommand = 1
@@ -439,7 +441,7 @@ def _script_hash() -> str:
 
 
 def _clock(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, PACIFIC).strftime("%Y-%m-%d %H:%M %Z")
+    return datetime.fromtimestamp(epoch, user_zone()).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def report(since: float, until: float, host: str = "natedev", root: Path | None = None) -> str:

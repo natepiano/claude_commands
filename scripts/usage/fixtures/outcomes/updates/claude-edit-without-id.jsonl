@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-10-10T21:15:00Z","message":{"content":[{"type":"tool_use","name":"Edit"}]}}
+{"type":"user","timestamp":"2026-10-10T21:05:00Z","message":{"content":"Invented follow-up"}}

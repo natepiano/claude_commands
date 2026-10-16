@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and trust the Rust PostToolUse hooks for Codex."""
+"""Install and trust the Codex `apply_patch` hooks: the Rust PostToolUse checks and the berth PreToolUse check."""
 
 from __future__ import annotations
 
@@ -16,21 +16,29 @@ from typing import cast
 
 
 class CodexHook:
-    """A named PostToolUse handler that must be installed and trusted."""
+    """A named `apply_patch` handler for one hook event that must be installed and trusted."""
 
-    __slots__: tuple[str, ...] = ("name", "command")
+    __slots__: tuple[str, ...] = ("name", "command", "event", "timeout")
 
-    def __init__(self, name: str, script: str) -> None:
+    def __init__(self, name: str, script: str, event: str = "PostToolUse", timeout: int = 10) -> None:
         self.name: str = name
         self.command: str = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{script}"'
+        self.event: str = event
+        self.timeout: int = timeout
 
     def handler(self) -> dict[str, object]:
-        return {"type": "command", "command": self.command, "timeout": 10}
+        return {"type": "command", "command": self.command, "timeout": self.timeout}
+
+    def listed_event(self) -> str:
+        """The event name `hooks/list` reports: `PreToolUse` lists as `preToolUse`."""
+        return self.event[:1].lower() + self.event[1:]
 
 
 HOOKS: tuple[CodexHook, ...] = (
     CodexHook("fn-length", "post-tool-use-fn-length.py"),
     CodexHook("mul_add", "post-tool-use-mul-add.py"),
+    # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
+    CodexHook("berth", "pre-tool-use-berth.py", "PreToolUse", 30),
 )
 
 
@@ -93,7 +101,7 @@ def _matching_group(group: object, hook: CodexHook) -> bool:
         isinstance(handler, dict)
         and cast(dict[str, object], handler).get("type") == "command"
         and cast(dict[str, object], handler).get("command") == hook.command
-        and cast(dict[str, object], handler).get("timeout") == 10
+        and cast(dict[str, object], handler).get("timeout") == hook.timeout
         for handler in handlers
     )
 
@@ -109,23 +117,26 @@ def _install_file(path: str) -> None:
     else:
         document = {"hooks": {}}
     hooks = _object(document.get("hooks"), f"{path} hooks")
-    groups_value = hooks.setdefault("PostToolUse", [])
-    if not isinstance(groups_value, list):
-        raise HookError(f"{path}: invalid PostToolUse groups")
-    groups = cast(list[object], groups_value)
-    missing = [hook for hook in HOOKS if not any(_matching_group(group, hook) for group in groups)]
+    missing = 0
+    for hook in HOOKS:
+        groups_value = hooks.setdefault(hook.event, [])
+        if not isinstance(groups_value, list):
+            raise HookError(f"{path}: invalid {hook.event} groups")
+        groups = cast(list[object], groups_value)
+        if not any(_matching_group(group, hook) for group in groups):
+            groups.append({"matcher": "apply_patch", "hooks": [hook.handler()]})
+            missing += 1
     if not missing:
         return
-    for hook in missing:
-        groups.append({"matcher": "apply_patch", "hooks": [hook.handler()]})
-    directory = os.path.dirname(path)
+    destination = os.path.realpath(path) if os.path.islink(path) else path
+    directory = os.path.dirname(destination)
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".hooks-", suffix=".json", dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             json.dump(document, output, indent=2)
             _ = output.write("\n")
-        os.replace(temporary, path)
+        os.replace(temporary, destination)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -223,16 +234,15 @@ def _listed_hooks(server: AppServer, path: str) -> dict[CodexHook, LocatedHook |
             raise HookError("invalid hooks/list hooks")
         for candidate in cast(list[object], hooks):
             entry = _object(candidate, "hooks/list entry")
+            hook = next((hook for hook in HOOKS if entry.get("command") == hook.command), None)
             if (
-                entry.get("eventName") != "postToolUse"
+                hook is None
+                or entry.get("eventName") != hook.listed_event()
                 or entry.get("matcher") != "apply_patch"
                 or entry.get("handlerType") != "command"
-                or entry.get("timeoutSec") != 10
+                or entry.get("timeoutSec") != hook.timeout
                 or entry.get("sourcePath") != path
             ):
-                continue
-            hook = next((hook for hook in HOOKS if entry.get("command") == hook.command), None)
-            if hook is None:
                 continue
             key = entry.get("key")
             current_hash = entry.get("currentHash")

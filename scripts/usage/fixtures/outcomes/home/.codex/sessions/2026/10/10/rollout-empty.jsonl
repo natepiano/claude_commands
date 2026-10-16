@@ -1,0 +1,2 @@
+{"timestamp":"2026-10-10T21:10:00Z","type":"session_meta","payload":{"id":"thread-without-tokens"}}
+{"timestamp":"2026-10-10T21:10:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"low"}}

@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
-from zoneinfo import ZoneInfo
 
 from compare import CLASSES, ComparisonReport, DirectorComparison, DifferenceEstimate, TurnClassStatistics
 from phases import PhaseComparison, PhaseReport, PhaseRow
+from turns import RECORDED_ZONE
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
-PDT = ZoneInfo("America/Los_Angeles")
-SAMPLE_DEADLINE_PDT = datetime(2026, 10, 7, 10, 30, tzinfo=PDT)
+# The deadline was set as a Pacific wall time. It is shown in the user's zone.
+SAMPLE_DEADLINE_PDT = datetime(2026, 10, 7, 10, 30, tzinfo=RECORDED_ZONE)
 DROP_FIELDS = ("before_director", "sidechain", "no_trigger", "negative", "over_limit", "synthetic")
 
 
@@ -94,7 +97,7 @@ def history_measure(row: DirectorComparison | None) -> HistoryMeasure:
 
 
 def history_row(comparison: ComparisonReport, phases: PhaseReport, now: datetime, final: bool) -> HistoryRun:
-    clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now
+    clock = now.replace(tzinfo=user_zone()) if now.tzinfo is None else now
     directors: list[DirectorHistoryMeasure] = []
     for row in comparison["directors"]:
         measured = history_measure(row)
@@ -144,8 +147,8 @@ def since_lines(history: FirstRun | FollowingRun) -> list[str]:
     if isinstance(history, FirstRun):
         return ["first run"]
     current, previous = history.current, history.previous
-    at = datetime.fromisoformat(previous["at"]).astimezone(PDT)
-    lines = [f"Previous run: {at:%Y-%m-%d %H:%M PDT} ({previous['mode']})."]
+    at = datetime.fromisoformat(previous["at"]).astimezone(user_zone())
+    lines = [f"Previous run: {at:%Y-%m-%d %H:%M %Z} ({previous['mode']})."]
     prior = {row["name"]: row for row in previous["directors"]}
     for row in current["directors"]:
         earlier = prior.get(row["name"])
@@ -301,7 +304,7 @@ def verdict_lines(comparison: ComparisonReport, phases: PhaseReport) -> list[str
 
 def director_table(comparison: ComparisonReport, phases: PhaseReport) -> list[str]:
     lines = [
-        "| Director | Opus n | Sonnet n | First Sonnet request PDT | Continuation median s O → S | Raw Δ seconds and label | Output median O → S | Mean cost USD O → S | Repair rounds median O → S |",
+        "| Director | Opus n | Sonnet n | First Sonnet request | Continuation median s O → S | Raw Δ seconds and label | Output median O → S | Mean cost USD O → S | Repair rounds median O → S |",
         "| --- | ---: | ---: | --- | --- | --- | --- | --- | --- |",
     ]
     for row in comparison["directors"]:
@@ -446,9 +449,9 @@ def limits(comparison: ComparisonReport, phases: PhaseReport, extracted: Extract
 def render(comparison: ComparisonReport, phases: PhaseReport, extracted: ExtractReport, now: datetime, final: bool = False,
            history: RunHistory = NO_HISTORY) -> str:
     kind = "FINAL" if final else "INTERIM"
-    clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now.astimezone(PDT)
+    clock = now.replace(tzinfo=user_zone()) if now.tzinfo is None else now.astimezone(user_zone())
     since = ["## Since the last run", "", *since_lines(history), ""] if not isinstance(history, NotRecorded) else []
-    lines = [f"# {kind} director model study — {clock:%Y-%m-%d %H:%M PDT}", "", "## The user's measure", "",
+    lines = [f"# {kind} director model study — {clock:%Y-%m-%d %H:%M %Z}", "", "## The user's measure", "",
              *measure_lines(comparison), "", *since, "## Verdict", "", *verdict_lines(comparison, phases), "",
              "## Per-director comparison", "", *director_table(comparison, phases), "", "## Pooled turn classes", "",
              *class_table(comparison), "", "## Control", "", *control_section(comparison), "", "## Compactions", "",
@@ -460,7 +463,7 @@ def render(comparison: ComparisonReport, phases: PhaseReport, extracted: Extract
 def message(comparison: ComparisonReport, phases: PhaseReport, extracted: ExtractReport, now: datetime, final: bool, path: Path,
             history: RunHistory = NO_HISTORY) -> str:
     kind = "FINAL" if final else "INTERIM"
-    clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now.astimezone(PDT)
+    clock = now.replace(tzinfo=user_zone()) if now.tzinfo is None else now.astimezone(user_zone())
     dropped = sum(sum(session["dropped"].values()) for session in extracted["sessions"])
     since = [since_pooled_line(history)] if not isinstance(history, NotRecorded) else []
     measures = measure_lines(comparison)
@@ -468,7 +471,7 @@ def message(comparison: ComparisonReport, phases: PhaseReport, extracted: Extrac
              *measures, *since,
              "Verdict:", *verdict_lines(comparison, phases), "Per-director comparison:"]
     table = director_table(comparison, phases)
-    ending = ["Limits: " + f"as of {clock:%Y-%m-%d %H:%M PDT}; {len(comparison['directors'])} directors; {dropped} extract drops; {phases['drops']['stopped']} stopped, {phases['drops']['errored']} errored, {phases['drops']['empty']} phases without requests; natedev only; API-equivalent cost; clock and decision-quality limits apply.",
+    ending = ["Limits: " + f"as of {clock:%Y-%m-%d %H:%M %Z}; {len(comparison['directors'])} directors; {dropped} extract drops; {phases['drops']['stopped']} stopped, {phases['drops']['errored']} errored, {phases['drops']['empty']} phases without requests; natedev only; API-equivalent cost; clock and decision-quality limits apply.",
               str(path)]
     if len(lines) + len(table) + len(ending) > 60 and len(table) > 2:
         keep = max(0, 60 - len(lines) - 2 - len(ending) - 1)
@@ -488,10 +491,10 @@ def message(comparison: ComparisonReport, phases: PhaseReport, extracted: Extrac
 
 
 def ready(comparison: ComparisonReport, now: datetime | None = None) -> tuple[bool, list[str]]:
-    clock = now or datetime.now(PDT)
-    clock = clock.replace(tzinfo=PDT) if clock.tzinfo is None else clock.astimezone(PDT)
+    clock = now or datetime.now(user_zone())
+    clock = clock.replace(tzinfo=user_zone()) if clock.tzinfo is None else clock.astimezone(user_zone())
     switched = [row for row in comparison["directors"] if row["status"] == "switched"]
-    lines = [f"Deadline: {SAMPLE_DEADLINE_PDT:%Y-%m-%d %H:%M PDT}"]
+    lines = [f"Deadline: {SAMPLE_DEADLINE_PDT.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}"]
     qualified = 0
     for row in switched:
         sonnet = continuation(row, "sonnet")

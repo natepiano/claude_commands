@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -552,6 +553,119 @@ class ShellTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "Granted|\n")
             self.assertIn("memory gate could not track this step; starting without a reservation", result.stderr)
+
+
+class QueueLeaveTests(unittest.TestCase):
+    """LINT_QUEUE_LEAVE_HOOK on run_once's memory wait, with a stand-in build log recorder."""
+
+    root: Path = Path()
+    meminfo: Path = Path()
+    calls: Path = Path()
+    ran: Path = Path()
+    recorded: Path = Path()
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.meminfo = self.root / "meminfo"
+        self.calls = self.root / "hook-calls"
+        self.ran = self.root / "ran"
+        self.recorded = self.root / "recorded"
+        scripts = self.root / ".claude/scripts"
+        (scripts / "lib").mkdir(parents=True)
+        (scripts / "buildlog").mkdir()
+        py = scripts / "lib/py"
+        _ = py.write_text('#!/bin/sh\nexec python3 "$@"\n')
+        py.chmod(0o755)
+        _ = (scripts / "buildlog/record.py").write_text(
+            f"import sys\nwith open({str(self.recorded)!r}, 'a') as log:\n    log.write(sys.argv[1] + '\\n')\n")
+        config = self.root / "config.sh"
+        _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
+        self.environment = {**os.environ,
+                            "BUILD_HOLD_DIR": str(self.root / "holders"),
+                            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+                            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+                            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+                            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
+                            "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
+                            "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
+                            "LINT_CONFIG_READER": str(config)}
+        _ = self.environment.pop("LINT_QUEUE_LEAVE_HOOK", None)
+
+    def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
+        _ = self.meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = dict(self.environment)
+        if hook is not None:
+            environment["LINT_QUEUE_LEAVE_HOOK"] = f'echo poll >> "{self.calls}"; {hook}'
+        command = (f'source "$1"; sleeps=0; sleep() {{ sleeps=$((sleeps + 1)); {sleep} }}; '
+                   + f'status=0; {step} || status=$?; '
+                   + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
+        return subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
+                              capture_output=True, text=True, timeout=20, check=False, env=environment)
+
+    def hook_calls(self) -> int:
+        return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
+
+    def recorder_actions(self) -> list[str]:
+        return self.recorded.read_text().splitlines() if self.recorded.exists() else []
+
+    def reservations(self) -> list[Path]:
+        return list((self.root / "log/admission").glob("*.reservation"))
+
+    def test_hook_leaves_a_held_step_before_it_starts(self) -> None:
+        started = self.root / "started"
+        self.environment["BUILDLOG_HOLD_STARTED_FILE"] = str(started)
+        result = self.run_step(f'test -e "{started}"', ":;")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
+        self.assertFalse(self.ran.exists())
+        # The hook saw the started mark; leaving takes it back.
+        self.assertEqual(self.hook_calls(), 1)
+        self.assertFalse(started.exists())
+        self.assertEqual(self.reservations(), [])
+        self.assertEqual(self.recorder_actions(), ["key"])
+        # The wait is measured in whole seconds of SECONDS, so a loaded machine
+        # can cross a second between the first check and the leave.
+        self.assertRegex(result.stderr, r"another machine is free after \d+ min \d+ s: leaving the memory wait\n")
+
+    def test_step_that_can_start_never_asks_the_hook(self) -> None:
+        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
+        result = self.run_step("exit 0", free)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        self.assertTrue(self.ran.exists())
+        self.assertEqual(self.hook_calls(), 0)
+        self.assertEqual(self.recorder_actions(), ["key", "step"])
+
+    def test_declining_hook_and_no_hook_wait_alike(self) -> None:
+        free_on_second = 'if (( sleeps == 2 )); then printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi;'
+        outputs: list[tuple[str, list[str]]] = []
+        for hook in ("exit 1", None):
+            with self.subTest(hook=hook):
+                self.ran.unlink(missing_ok=True)
+                result = self.run_step(hook, free_on_second)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.ran.exists())
+                self.assertEqual(self.reservations(), [])
+                lines = result.stderr.splitlines()
+                outputs.append((result.stdout.splitlines()[-1].split("|")[1], [re.sub(r"\d+", "N", line) for line in lines]))
+        self.assertEqual(self.hook_calls(), 1)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0][0], "Granted")
+
+    def test_nextest_helper_returns_the_status_and_drops_its_width_claim(self) -> None:
+        step = ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; touch "$2"; }; '
+                + 'run_nextest --workspace')
+        result = self.run_step("exit 0", ":;", step)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
+        self.assertFalse(self.ran.exists())
+        self.assertEqual([path.name for path in (self.root / "log/admission/nextest").iterdir()], ["lock"])
+        self.assertEqual(self.reservations(), [])
 
 
 if __name__ == "__main__":

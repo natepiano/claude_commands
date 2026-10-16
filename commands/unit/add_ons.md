@@ -39,7 +39,9 @@ Handle current-phase defects under <PhaseEnd/> step 3; in `single`, return them
 to <Synthesize/>.
 
 Each new candidate is an `add` proposal with title, target, need, completion
-condition, source phase, and `Class: gate`. Import each architect proposal with
+condition, source phase, and `Class: gate`. Write the title as one plain
+sentence saying what changes for the user, with no file, type or phase name:
+`/showrunner:proposals` shows it to the user as written. Import each architect proposal with
 its exact `Action`, `Current`, `Target`, `Proposed`, `Why`, source phase, and
 `Class`, then delete its amendment artifact. Deduplicate all proposals by action,
 target, and observable outcome against `${NEXT_ITEMS_PATH}` and
@@ -63,6 +65,25 @@ just steered the run with an instruction that is more than an authorization
 word, the run is ending through <RunSummary/>, or the user typed
 `/unit:add_ons`. Automatic mode never stops for this; a run the user has
 walked away from accumulates and stays silent.
+
+**In a production unit the showrunner settles add-ons, not the user**
+(`~/.claude/docs/production_format.md` → <ProductionUnit/> item 2; user,
+2026-10-12), and no interactive point is needed. At <PhaseEnd/>'s add-on
+check, when `${NEXT_ITEMS_PENDING}` holds an item not yet sent, send the
+showrunner one message and keep working:
+
+```
+From <unit>: <n> add-ons for your call.
+1. <title> — recommend current|next|drop: <reason>
+```
+
+Add `Sent: <HH:MM zone>` under each item sent, so no item is sent twice. The
+answer names a disposition for each number. Apply each as the list below says
+when it arrives, with no `/adhoc_review` and no question to the user; at
+<RunSummary/> the choices are `next` and `drop`. Never stop the run to wait
+for the answer, and never hold an add-on for the user: one that only the user
+can judge is the showrunner's to take to them. The rest of this contract is
+for a run outside a production, where the user is the one who answers.
 
 At a stop for a decision, resolve that decision first. Then say
 `<n> add-ons accumulated since Phase <id>.` and invoke `/adhoc_review` over the

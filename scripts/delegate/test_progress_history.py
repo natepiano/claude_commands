@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.delegate import progress_history
+from scripts.delegate.recorder_fixture import invoke_recorder
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -65,6 +67,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.history_dir = self.root / "history"
@@ -95,11 +98,94 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
+        history = self.root / "sync-event.jsonl"
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            self.assertTrue(history.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                append({"history_file": str(history)}, {"event_type": "probe"})
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(json.loads(history.read_text()), {"event_type": "probe"})
+            history.unlink()
+
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
             f"PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={seconds}\n",
             encoding="utf-8",
         )
+
+    def test_cold_recorder_calls_use_each_home_and_restore_the_callers_configuration(self) -> None:
+        caller = self.root / "caller"
+        caller.mkdir()
+        program = r'''import fcntl, hashlib, json, os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.delegate.recorder_fixture import invoke_recorder
+from scripts.delegate import progress_history
+from scripts.lib import user_zone
+
+root, working = map(Path, sys.argv[1:])
+caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
+          progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+                          (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
+plan = working / 'cold-plan.md'
+plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
+for number in (1, 2):
+    home = root / str(number)
+    config = home / '.claude/config'
+    config.mkdir(parents=True)
+    settings = config / 'delegate.conf'
+    registry = config / 'agents.conf'
+    settings.write_text(f'PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
+    registry.write_text(f'registry-{number}\n')
+    environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
+                   'PLAN_DELEGATE_SYNC_WRITES': '0', 'PLAN_DELEGATE_PASS_OWNER': 'launcher',
+                   'PLAN_DELEGATE_NOW_EPOCH': '1000'}
+    for key in ('PLAN_DELEGATE_CONFIG', 'AGENTS_CONFIG_FILE', 'PLAN_DELEGATE_HISTORY_DIR',
+                'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
+        environment.pop(key, None)
+    session = home / 'session'
+    commands = (
+        ['start-run', '--session-dir', str(session), '--working-dir', str(working),
+         '--plan-doc', str(plan), '--main-model', 'fixture-model'],
+        ['start-phase', '--session-dir', str(session), '--phase-id', '1', '--phase-title', 'First'],
+        ['start-pass', '--session-dir', str(session), '--pass-kind', 'impl', '--activity', 'writing',
+         '--called-task', 'delegate.implementation', '--called-family', 'codex',
+         '--called-model', 'fixture-model'],
+    )
+    for arguments in commands:
+        with patch.object(fcntl, 'flock', wraps=fcntl.flock) as lock:
+            result = invoke_recorder(arguments, environment, working, check=True)
+        assert [call.args[1] for call in lock.call_args_list][0] == fcntl.LOCK_EX
+        assert lock.call_args_list[-1].args[1] == fcntl.LOCK_UN
+        assert (session / '.progress_history.lock').exists()
+    history, = (home / '.local/state/plan-delegate/runs').glob('*.jsonl')
+    events = [json.loads(line) for line in history.read_text().splitlines()]
+    started, = [event for event in events if event['event_type'] == 'pass_started']
+    assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
+    assert progress_history._config_digest.cache_info().currsize == 0
+    restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
+                progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+    assert restored == caller, (restored, caller)
+print('two homes isolated; recorder lock retained; caller restored')
+'''
+        environment = {**os.environ, "HOME": str(caller),
+                       "USER_ZONE_CONF": str(caller / "zone.conf")}
+        result = subprocess.run([sys.executable, "-c", program, str(self.root), str(self.working_dir)],
+                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("two homes isolated; recorder lock retained; caller restored", result.stdout)
 
     def isolate_identity(self, environment: dict[str, str]) -> None:
         """Point unit-director detection at the temporary home, not this machine's.
@@ -135,10 +221,11 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
+        environment["USER_ZONE"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
-        # environment, so a developer running with a seat exported would
+        # environment, so a developer running with a worker exported would
         # otherwise see it stamped on every pass these tests record.
         if self.team_slot:
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
@@ -148,13 +235,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.isolate_identity(environment)
         if claude_session:
             environment["CLAUDE_CODE_SESSION_ID"] = claude_session
-        result = subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd(), check=True)
         return result.stdout.strip()
 
     def run_failing_command(
@@ -165,10 +246,11 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
+        environment["USER_ZONE"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
-        # environment, so a developer running with a seat exported would
+        # environment, so a developer running with a worker exported would
         # otherwise see it stamped on every pass these tests record.
         if self.team_slot:
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
@@ -176,13 +258,7 @@ class ProgressHistoryTests(unittest.TestCase):
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
-        return subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        return invoke_recorder(arguments, environment, Path.cwd())
 
     def invoke_handler(
         self,
@@ -198,6 +274,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         stdout = io.StringIO()
@@ -506,7 +583,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "",
                 "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
                 "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                "| Project |  80 | 00:01:40 | today 05:35 |           | today 05:35 (-00:00) | today 05:35 (+00:00) |",
+                "| Project |  80 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "",
                 "**Phase 3: Retry handling**",
@@ -547,7 +624,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         self.assertIn(
-            "| Project |  80 | 00:02:40 | today 05:36 | 00:01:00  |",
+            "| Project |  80 | 00:02:40 | today 05:44 | 00:01:00  |",
             unchanged_header,
         )
         self.assertIn(
@@ -582,7 +659,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 180,
         )
         self.assertIn(
-            "| Project |  85 | 00:03:00 | today 05:36 |           |",
+            "| Project |  85 | 00:03:00 | today 05:45 |           |",
             independently_changed,
         )
         self.assertIn(
@@ -792,12 +869,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -820,7 +898,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("**now 1970-01-01 05:35:00 - next report 05:50:00**", report)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -837,12 +915,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -879,7 +958,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("--cap-stage is required", result.stderr)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -905,12 +984,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -940,7 +1020,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("say nothing about whether the workers are alive", result.stderr)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -1105,7 +1185,7 @@ class ProgressHistoryTests(unittest.TestCase):
                     "",
                     "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
                     "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                    "| Project |  40 | 00:01:40 | today 05:37 |           | today 05:36 (-00:00) | today 05:38 (+00:01) |",
+                    "| Project |  40 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
                     "| Phase 3 |  30 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
                     "",
                     "**Phase 3: Retry handling**",
@@ -1374,12 +1454,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -1440,7 +1521,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
         restart = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -1809,6 +1890,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
         if self.team_slot:
@@ -1816,13 +1898,8 @@ class ProgressHistoryTests(unittest.TestCase):
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
-        return subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        self.isolate_identity(environment)
+        return invoke_recorder(arguments, environment, Path.cwd())
 
     def test_start_pass_outside_a_launcher_is_refused(self) -> None:
         session_dir = self.start_run("owned", 20_000)
@@ -1947,7 +2024,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(second), 12)
         self.assertNotEqual(second, expected)
 
-    def test_a_pass_records_the_team_seat_that_launched_it(self) -> None:
+    def test_a_pass_records_the_team_worker_that_launched_it(self) -> None:
         """Which of the three members recorded this pass."""
         self.team_slot = "impl"
         session_dir = self.start_run("slot", 23_000)
@@ -1956,8 +2033,8 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].get("team_slot"), "impl")
 
-    def test_a_pass_with_no_seat_records_an_empty_team_slot(self) -> None:
-        """Empty is unknown, not a seat name.
+    def test_a_pass_with_no_worker_records_an_empty_team_slot(self) -> None:
+        """Empty is unknown, not a worker name.
 
         Passes predating the field, and any recorder outside implement.sh, have
         to stay separable from a launcher that really is the `impl` member.
@@ -1975,11 +2052,11 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].get("config_digest"), "")
 
-    def test_the_finished_pass_carries_the_seat_that_opened_it(self) -> None:
-        """The reader joins on finished events, so the seat has to survive there.
+    def test_the_finished_pass_carries_the_worker_that_opened_it(self) -> None:
+        """The reader joins on finished events, so the worker has to survive there.
 
         Taken from the pass record rather than the environment: the phase ends
-        under the unit director, which holds no seat at all, and the pass it closes
+        under the unit director, which holds no worker at all, and the pass it closes
         still has to name the member that opened it.
         """
         self.team_slot = "review"
@@ -2030,6 +2107,7 @@ class ProgressHistoryTests(unittest.TestCase):
         at: int,
         called_model: str = "gpt-called",
         fix_pass: int = 0,
+        *extra: str,
     ) -> None:
         """Open a pass the way one member of a phase team opens its own."""
         self.team_slot = slot
@@ -2051,6 +2129,7 @@ class ProgressHistoryTests(unittest.TestCase):
             called_model,
             "--called-effort",
             "high",
+            *extra,
             at=at,
         )
 
@@ -2080,10 +2159,10 @@ class ProgressHistoryTests(unittest.TestCase):
         slots = cast(dict[str, object], state["pass"])
         return {slot: cast(dict[str, object], record) for slot, record in slots.items()}
 
-    def demote_to_legacy_pass(self, session_dir: Path, keep_seat: bool) -> None:
-        """Rewrite state the way a session that started before seats holds it.
+    def demote_to_legacy_pass(self, session_dir: Path, keep_worker: bool) -> None:
+        """Rewrite state the way a session that started before workers holds it.
 
-        One pass object under the key rather than a map, and the seat under the
+        One pass object under the key rather than a map, and the worker under the
         `team_role` name it was stamped with for a day, which is what every run
         already in flight has on disk when this recorder replaces the old one.
         """
@@ -2093,9 +2172,9 @@ class ProgressHistoryTests(unittest.TestCase):
         slots = cast(dict[str, object], state["pass"])
         [record_value] = list(slots.values())
         record = cast(dict[str, object], record_value)
-        seat = record.pop("team_slot", "")
-        if keep_seat:
-            record["team_role"] = seat
+        worker = record.pop("team_slot", "")
+        if keep_worker:
+            record["team_role"] = worker
         state["pass"] = record
         _ = path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -2203,7 +2282,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase(session_dir, 44_010)
         self.start_slot_pass(session_dir, "impl", "impl", 44_020)
         instance = self.pass_slots(session_dir)["impl"]["instance_id"]
-        self.demote_to_legacy_pass(session_dir, keep_seat=True)
+        self.demote_to_legacy_pass(session_dir, keep_worker=True)
         self.finish_slot_pass(session_dir, "impl", "completed", 44_100)
         finished = self.pass_events("legacy", "pass_finished")
         self.assertEqual(len(finished), 1)
@@ -2221,7 +2300,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase(session_dir, 45_010)
         self.start_slot_pass(session_dir, "", "impl", 45_020)
         instance = self.pass_slots(session_dir)[""]["instance_id"]
-        self.demote_to_legacy_pass(session_dir, keep_seat=False)
+        self.demote_to_legacy_pass(session_dir, keep_worker=False)
         self.finish_slot_pass(session_dir, "", "completed", 45_100)
         finished = self.pass_events("legacy-unslotted", "pass_finished")
         self.assertEqual(len(finished), 1)
@@ -2265,7 +2344,7 @@ class ProgressHistoryTests(unittest.TestCase):
             {"interrupted"},
         )
 
-    def test_a_round_gives_every_open_seat_its_own_column(self) -> None:
+    def test_a_round_gives_every_open_worker_its_own_column(self) -> None:
         """Two agents at work read across one row, not as whichever wrote last."""
         session_dir = self.start_run("live-rows", 47_000)
         self.start_phase(session_dir, 47_010)
@@ -2277,7 +2356,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # One row, because both seats are working one round. Each carries its
+        # One row, because both workers are working one round. Each carries its
         # own elapsed: they launch together but do not finish together, and a
         # single shared number would hide exactly that.
         self.assertEqual(
@@ -2296,8 +2375,8 @@ class ProgressHistoryTests(unittest.TestCase):
         # opened first rather than the one that opened last.
         self.assertIn("▸ **Impl - implementing**", header)
 
-    def test_a_seat_that_says_it_is_held_up_does_not_read_as_working(self) -> None:
-        """A seat waiting on its peer has an open window and the peer's clock."""
+    def test_a_worker_that_says_it_is_held_up_does_not_read_as_working(self) -> None:
+        """A worker waiting on its peer has an open window and the peer's clock."""
         session_dir = self.start_run("waiting", 51_000)
         self.start_phase(session_dir, 51_010)
         for slot, kind in (("impl", "impl"), ("test", "test")):
@@ -2317,12 +2396,12 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         # Nothing in the pass records separates these two: both windows are
         # open and both clocks read the same. One is sitting on the other, and
-        # only what each seat said last can say so.
+        # only what each worker said last can say so.
         self.assertEqual(
             list(rows[-1][3:5]),
             ["impl 3m waiting", "test 3m running"],
         )
-        # The board has a kind for it as well as words, and both count: a seat
+        # The board has a kind for it as well as words, and both count: a worker
         # that posted `blocked` said the same thing in the field rather than in
         # the sentence.
         self.run_board(
@@ -2367,8 +2446,8 @@ class ProgressHistoryTests(unittest.TestCase):
             ),
         )
 
-    def test_a_round_gains_a_row_each_time_its_seats_change_role(self) -> None:
-        """Seats recruit each other, and every new shape gets its own row."""
+    def test_a_round_gains_a_row_each_time_its_workers_change_role(self) -> None:
+        """Workers recruit each other, and every new shape gets its own row."""
         session_dir = self.start_run("recruit", 49_000)
         self.start_phase(session_dir, 49_010)
         for slot in ("impl", "test"):
@@ -2379,7 +2458,7 @@ class ProgressHistoryTests(unittest.TestCase):
         for slot, kind in (("impl", "impl"), ("test", "test")):
             self.start_slot_pass(session_dir, slot, kind, 49_020)
         self.team_slot = ""
-        # The test seat is recruited across to write, then both converge on
+        # The test worker is recruited across to write, then both converge on
         # review.
         self.run_board(session_dir, "role", "test", "impl", "recruited", at=49_320)
         for slot in ("impl", "test"):
@@ -2413,11 +2492,11 @@ class ProgressHistoryTests(unittest.TestCase):
                 "Agent 1 → review, Agent 2 → review; running",
             ],
         )
-        # Which delegate is in which seat sits under the table, once, and the
+        # Which delegate is in which worker sits under the table, once, and the
         # unit director is left out of it -- the reader is the unit director. Each
-        # seat carries its last board line and that line's age, because a role
+        # worker carries its last board line and that line's age, because a role
         # alone -- and an open pass window, which grows either way -- cannot say
-        # whether a seat is working or has been silent since it took the role.
+        # whether a worker is working or has been silent since it took the role.
         for label, slot in (("Agent 1", "impl"), ("Agent 2", "test")):
             self.assertIn(
                 f"- **{label}** ({slot}) gpt-called high · 3m ago · handoff: converging",
@@ -2427,8 +2506,8 @@ class ProgressHistoryTests(unittest.TestCase):
     def test_a_role_reannouncement_does_not_split_a_round(self) -> None:
         """A handoff that re-states the role its slot already holds is not a movement.
 
-        What live runs write: each seat opens with a `board.sh role` seconds
-        after its launcher registered the same role, and a seat routes narration
+        What live runs write: each worker opens with a `board.sh role` seconds
+        after its launcher registered the same role, and a worker routes narration
         through `role` because it is the command that takes a note. Every such
         line used to open a near-empty row whose columns matched the row above.
         """
@@ -2462,9 +2541,9 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
     def test_movements_seconds_apart_are_one_row(self) -> None:
-        """Seats converging one `board.sh role` at a time is one movement.
+        """Workers converging one `board.sh role` at a time is one movement.
 
-        The calls land seconds apart because the seats run in sequence, and a
+        The calls land seconds apart because the workers run in sequence, and a
         boundary per call would put a near-empty row on each. One boundary, and
         the roles the later calls carry describe the row from its start.
         """
@@ -2607,8 +2686,9 @@ class ProgressHistoryTests(unittest.TestCase):
             [("Impl", "impl 3m done", "clean"), ("Fix 1", "fix 1m running", "running")],
         )
 
-    def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
-        session_dir = self.start_run("awake", 22_000)
+    def test_finish_pass_ignores_awake_seconds_from_an_older_launcher(self) -> None:
+        """A launcher started before the flag was retired still finishes its pass."""
+        session_dir = self.start_run("older-launcher", 22_000)
         self.start_phase_and_pass(session_dir, 22_010)
         _ = self.run_command(
             "finish-pass",
@@ -2617,34 +2697,12 @@ class ProgressHistoryTests(unittest.TestCase):
             "--status",
             "completed",
             "--agent-awake-seconds",
-            "1800",
-            at=72_020,
+            "2100",
+            at=22_200,
         )
-        finished = self.pass_events("awake", "pass_finished")
+        finished = self.pass_events("older-launcher", "pass_finished")
         self.assertEqual(len(finished), 1)
-        # The point of the field: elapsed covers the stretch the machine spent
-        # suspended, and the beat count does not.
-        self.assertEqual(finished[0].get("pass_elapsed_seconds"), 50_000)
-        self.assertEqual(finished[0].get("agent_awake_seconds"), 1800)
-
-    def test_a_pass_with_nothing_counted_records_no_awake_seconds(self) -> None:
-        for name, reported in (("unreported", ()), ("none-counted", ("-1",))):
-            with self.subTest(name):
-                session_dir = self.start_run(name, 23_000)
-                self.start_phase_and_pass(session_dir, 23_010)
-                awake = ("--agent-awake-seconds", *reported) if reported else ()
-                _ = self.run_command(
-                    "finish-pass",
-                    "--session-dir",
-                    str(session_dir),
-                    "--status",
-                    "completed",
-                    *awake,
-                    at=23_050,
-                )
-                finished = self.pass_events(name, "pass_finished")
-                self.assertEqual(len(finished), 1)
-                self.assertNotIn("agent_awake_seconds", finished[0])
+        self.assertNotIn("agent_awake_seconds", finished[0])
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
@@ -2879,6 +2937,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         result = subprocess.run(
             ["python3", str(FINDINGS), *arguments, "--session-dir", str(session_dir)],
@@ -2950,8 +3009,8 @@ class ProgressHistoryTests(unittest.TestCase):
         ]
         return rows[rows.index(header) + 1 :]
 
-    def test_a_running_round_reports_the_role_each_seat_holds_now(self) -> None:
-        """One column per seat, showing the role it holds right now."""
+    def test_a_running_round_reports_the_role_each_worker_holds_now(self) -> None:
+        """One column per worker, showing the role it holds right now."""
         self.write_full_config()
         started_at = 60_000
         session_dir = self.start_run("team", started_at)
@@ -2971,7 +3030,7 @@ class ProgressHistoryTests(unittest.TestCase):
         for slot in ("impl", "test"):
             self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
             self.run_board(session_dir, "role", slot, slot, "opening", at=started_at + 2)
-        # The test seat gets recruited into implementation: the slot keeps its
+        # The test worker gets recruited into implementation: the slot keeps its
         # identity and its column, and only the role in the cell changes.
         self.run_board(session_dir, "role", "test", "impl", "recruited", at=started_at + 3)
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
@@ -2998,7 +3057,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # The recruited test seat reads `impl` under Agent 2: the seat keeps its
+        # The recruited test worker reads `impl` under Agent 2: the worker keeps its
         # identity and its column, and only the role in the cell moves. It has
         # registered without opening a pass yet, so it reports the role the
         # board knows and no duration, which is the part that is genuinely
@@ -3007,15 +3066,15 @@ class ProgressHistoryTests(unittest.TestCase):
             [rows[0][0], *rows[0][3:5]], ["Impl", "impl 4m running", "impl"]
         )
 
-    def test_a_closed_round_keeps_the_roles_of_its_passless_seats(self) -> None:
-        """A finished round still names what its test seat was doing."""
+    def test_a_closed_round_keeps_the_roles_of_its_passless_workers(self) -> None:
+        """A finished round still names what its test worker was doing."""
         started_at = 62_000
         session_dir = self.start_run("closed", started_at)
         self.start_phase(session_dir, started_at)
         for slot in ("impl", "test"):
             self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
             self.run_board(session_dir, "role", slot, slot, "opening", at=started_at + 2)
-        # One seat records a pass here; the other is board-only for this round,
+        # One worker records a pass here; the other is board-only for this round,
         # which is what the closed round has to keep reporting.
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
         self.finish_slot_pass(session_dir, "impl", "completed", started_at + 310)
@@ -3035,15 +3094,15 @@ class ProgressHistoryTests(unittest.TestCase):
             [rows[0][0], *rows[0][3:5]], ["Impl", "impl 5m done", "test"]
         )
 
-    def test_each_seat_reports_its_last_board_line_and_its_age(self) -> None:
-        """The note under the table says what each seat said, and how long ago."""
+    def test_each_worker_reports_its_last_board_line_and_its_age(self) -> None:
+        """The note under the table says what each worker said, and how long ago."""
         started_at = 63_000
         session_dir = self.start_run("narration", started_at)
         self.start_phase(session_dir, started_at)
         # `test` is board-only: it registers and narrates but opens no pass.
         self.run_board(session_dir, "post", "test", "register", "up", at=started_at + 1)
         # `impl` opens a pass before it has posted anything, which is the case
-        # the note has to name rather than leave looking like a seat at work.
+        # the note has to name rather than leave looking like a worker at work.
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
         self.team_slot = ""
         self.assertIn(
@@ -3057,14 +3116,14 @@ class ProgressHistoryTests(unittest.TestCase):
             session_dir, "post", "impl", "status", "rerunning the scoped test", at=started_at + 120
         )
         header = self.run_progress(session_dir, started_at + 300)
-        # The age is the whole point: a seat four minutes into one activity and a
-        # seat that has said nothing read differently, where two identical role
+        # The age is the whole point: a worker four minutes into one activity and a
+        # worker that has said nothing read differently, where two identical role
         # words in the table do not.
         self.assertIn("- **Agent 1** (impl) gpt-called high · 3m ago · rerunning the scoped test", header)
         self.assertIn("- **Agent 2** (test) · 4m ago · writing the token race test", header)
 
-    def test_a_finished_seat_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
-        """The launcher's exit post names the kind; the seat's narration names the work."""
+    def test_a_finished_worker_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
+        """The launcher's exit post names the kind; the worker's narration names the work."""
         started_at = 64_000
         session_dir = self.start_run("ownwords", started_at)
         self.start_phase(session_dir, started_at)
@@ -3074,8 +3133,8 @@ class ProgressHistoryTests(unittest.TestCase):
         self.run_board(
             session_dir, "post", "test", "status", "hana_catalyst tests 240 passed", at=started_at + 200
         )
-        # What implement.sh posts on exit: after the seat's last line, and marked
-        # as the launcher's. Without the mark every finished seat read `fix
+        # What implement.sh posts on exit: after the worker's last line, and marked
+        # as the launcher's. Without the mark every finished worker read `fix
         # finished` and the narration the reader wanted sat one line up, unseen.
         self.run_board(
             session_dir,
@@ -3105,12 +3164,12 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
     def broad_review(self, session_dir: Path, lenses: tuple[str, ...], started_at: int) -> None:
-        """Both seats write, then the broad review seats one pass per lens.
+        """Both workers write, then the broad review workers one pass per lens.
 
-        Each lens takes the seat review.sh gives it and posts the register line
+        Each lens takes the worker review.sh gives it and posts the register line
         the launcher posts, a second apart in the order given.
         """
-        seats = {"adversary": "test", "contract": "impl", "craft": "review"}
+        workers = {"adversary": "test", "contract": "impl", "craft": "review"}
         self.start_phase(session_dir, started_at)
         for offset, slot in enumerate(("impl", "test")):
             self.start_slot_pass(session_dir, slot, slot, started_at + 10 + offset * 10)
@@ -3119,13 +3178,13 @@ class ProgressHistoryTests(unittest.TestCase):
         for offset, lens in enumerate(lenses):
             at = started_at + 700 + offset
             self.run_board(
-                session_dir, "post", seats[lens], "register",
+                session_dir, "post", workers[lens], "register",
                 f"{lens} review up; mesh=none; role=review", at=at,
             )
-            self.start_slot_pass(session_dir, seats[lens], "review", at, called_model=f"gpt-{lens}")
+            self.start_slot_pass(session_dir, workers[lens], "review", at, called_model=f"gpt-{lens}")
         self.team_slot = ""
 
-    def test_a_craft_review_draws_a_third_seat_column(self) -> None:
+    def test_a_craft_review_draws_a_third_worker_column(self) -> None:
         """The craft lens sits in `review`, and the table gains Agent 3 for it."""
         started_at = 66_000
         session_dir = self.start_run("craft-column", started_at)
@@ -3154,10 +3213,10 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
         )
 
-    def test_a_review_without_the_craft_lens_keeps_two_seat_columns(self) -> None:
+    def test_a_review_without_the_craft_lens_keeps_two_worker_columns(self) -> None:
         """No pass in `review`, no Agent 3: not in the header, not in the note.
 
-        The review seat's board line from an earlier phase outlives that phase,
+        The review worker's board line from an earlier phase outlives that phase,
         and must not put a note line under a table with no column for it.
         """
         started_at = 67_000
@@ -3259,7 +3318,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # A writer's pass is not review time.
         self.start_slot_pass(session_dir, "impl", "impl", base + 10)
         self.finish_slot_pass(session_dir, "impl", "completed", base + 3_010)
-        # Every seat's review counts, whatever its status: 600 + 900 + 1200 s.
+        # Every worker's review counts, whatever its status: 600 + 900 + 1200 s.
         reviews = (("impl", 600, "completed"), ("test", 900, "completed"), ("review", 1_200, "error"))
         for slot, _, _ in reviews:
             self.start_slot_pass(session_dir, slot, "review", base + 3_100)
@@ -3283,7 +3342,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
         expected = (
-            "review trial: ux 1 findings, code 4 findings, review-seat minutes 51, "
+            "review trial: ux 1 findings, code 4 findings, review-worker minutes 51, "
             + "ux check minutes 6, ux repair minutes 0"
         )
         self.assertEqual(
@@ -3311,7 +3370,7 @@ class ProgressHistoryTests(unittest.TestCase):
                     "review-trial", "--session-dir", str(session_dir), at=at
                 ),
                 f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
-                + "review-seat minutes 0, ux check minutes 0, ux repair minutes 0",
+                + "review-worker minutes 0, ux check minutes 0, ux repair minutes 0",
             )
 
         for index, lens in enumerate(("adversary,contract", "contract", "contract")):
@@ -3373,16 +3432,16 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         _ = self.run_command("finish-activity", "--session-dir", str(session_dir), at=base + 250)
 
-        def repair(finding: str, lens: str, round_number: int, seats: tuple[tuple[str, int], ...], at: int) -> None:
+        def repair(finding: str, lens: str, round_number: int, workers: tuple[tuple[str, int], ...], at: int) -> None:
             _ = self.run_findings(
                 session_dir, "open", "--severity", "blocker", "--title", f"{lens} finding",
                 "--file", "src/lib.rs", "--caught-by", "delegate", "--lens", lens, at=at,
             )
             _ = self.run_findings(session_dir, "gate", at=at + 5)
             _ = self.run_findings(session_dir, "dispatch", "--covers", finding, at=at + 10)
-            for slot, _ in seats:
+            for slot, _ in workers:
                 self.start_slot_pass(session_dir, slot, "fix", at + 20, fix_pass=round_number)
-            for slot, elapsed in seats:
+            for slot, elapsed in workers:
                 self.finish_slot_pass(session_dir, slot, "completed", at + 20 + elapsed)
             self.team_slot = ""
             _ = self.run_findings(session_dir, "landed", at=at + 2_000)
@@ -3393,13 +3452,13 @@ class ProgressHistoryTests(unittest.TestCase):
 
         # Round 1 repairs a code finding: none of its 600 s is the check's.
         repair("F001", "adversary", 1, (("impl", 600),), base + 300)
-        # Round 2 repairs a ux finding on two seats: 900 + 300 s is 20 minutes.
+        # Round 2 repairs a ux finding on two workers: 900 + 300 s is 20 minutes.
         repair("F002", "ux", 2, (("impl", 900), ("test", 300)), base + 3_000)
 
         # 150 s rounds to 3 minutes, not 2.
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
-            "review trial: ux 1 findings, code 1 findings, review-seat minutes 3, "
+            "review trial: ux 1 findings, code 1 findings, review-worker minutes 3, "
             + "ux check minutes 3, ux repair minutes 20",
         )
 
@@ -3480,9 +3539,9 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # No board and no seat on the pass: the window sits in no round, so it
+        # No board and no worker on the pass: the window sits in no round, so it
         # renders on its own the way every solo run always has, drawn in the
-        # seat its kind names.
+        # worker its kind names.
         self.assertEqual(
             [rows[0][0], *rows[0][3:5]], ["Impl", "impl 3m running", "-"]
         )
@@ -3725,7 +3784,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # A solo run records no seat, so every window keeps a row and the
+        # A solo run records no worker, so every window keeps a row and the
         # per-window finding attribution it always had -- for the last three
         # stages, which is all the table draws. The three before them are named
         # by the line above it rather than dropped without a word.
@@ -3738,9 +3797,9 @@ class ProgressHistoryTests(unittest.TestCase):
             ],
         )
         self.assertIn("*Earlier: 3 stages not shown - Impl through Fix 1.*", header)
-        # A slotless pass is drawn in the seat its kind names -- the closure
-        # review under Agent 2, the seat that reviews, where a reader looks for
-        # it -- and a unit-director activity names no seat and keeps both dashes.
+        # A slotless pass is drawn in the worker its kind names -- the closure
+        # review under Agent 2, the worker that reviews, where a reader looks for
+        # it -- and a unit-director activity names no worker and keeps both dashes.
         self.assertEqual(
             [tuple(row[3:5]) for row in rows],
             [
@@ -3798,6 +3857,21 @@ class ProgressHistoryTests(unittest.TestCase):
             at=at,
         )
 
+    def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
+        """`review.sh --phase` writes its status there, so the marker must watch the same file."""
+        self.write_agents_registry()
+        started_at = 90_000
+        session_dir = self.start_run("early-phase", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "arm-review", "--session-dir", str(session_dir), "--phase-id", "3", "--lens", "adversary",
+            "--activity", "reviewing the diff the writer is still producing", at=started_at + 100,
+        )
+        state = cast(dict[str, object], json.loads((session_dir / "progress_history_state.json").read_text()))
+        armed = cast(dict[str, object], state["early_review"])
+        self.assertEqual(armed["status_file"], str(session_dir / "phases" / "3" / "review_status_adversary"))
+        self.assertEqual(armed["pid_file"], str(session_dir / "phases" / "3" / "review_pid_adversary"))
+
     def test_an_early_review_runs_as_its_own_row_beside_the_open_pass(self) -> None:
         """The one moment two agents work at once, shown as two running rows."""
         self.write_agents_registry()
@@ -3827,7 +3901,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # Neither window has opened a round -- the writer predates seats and the
+        # Neither window has opened a round -- the writer predates workers and the
         # armed reviewer has no pass yet -- so there is no round for the
         # reviewer to join and it keeps the row beside the writer that it
         # always had.
@@ -3835,7 +3909,7 @@ class ProgressHistoryTests(unittest.TestCase):
             [(row[0], row[2], row[5]) for row in rows],
             [("Fix 2", "2m", "running"), ("Review Fix 2", "1m", "running (early)")],
         )
-        # The armed reviewer claims the test seat, where the adversary lens sits
+        # The armed reviewer claims the test worker, where the adversary lens sits
         # and a lone closure reviewer reads, so it is drawn under Agent 2.
         self.assertEqual(
             [tuple(row[3:5]) for row in rows],
@@ -4108,6 +4182,40 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertIn("| sonnet-5 low |", rendered)
         self.assertNotIn("gpt-main xhigh", rendered)
+
+    def test_identity_detection_prefers_codex_falls_back_to_claude_and_refuses_unknown(self) -> None:
+        codex = self.root / ".codex/sessions/turn-codex-session.jsonl"
+        claude = self.root / ".claude/projects/project/claude-session.jsonl"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        _ = codex.write_text(json.dumps({"type": "turn_context", "payload": {"model": "codex-model"}}) + "\n")
+        _ = claude.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-model"}}) + "\n")
+        plan = self.working_dir / "identity-plan.md"
+        _ = plan.write_text("## Delegation Context\n\n- **Project:** Identity fallback\n")
+        environment = os.environ.copy()
+        self.isolate_recorder_roots(environment)
+        self.isolate_identity(environment)
+        environment.update({"CODEX_THREAD_ID": "codex-session", "CLAUDE_CODE_SESSION_ID": "claude-session",
+                            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir), "PLAN_DELEGATE_NOW_EPOCH": "1000"})
+        for family, model in (("codex", "codex-model"), ("claude", "claude-model"), ("unknown", "unknown")):
+            with self.subTest(family=family):
+                session = self.root / f"identity-{family}"
+                result = invoke_recorder(["start-run", "--session-dir", str(session),
+                                          "--working-dir", str(self.working_dir), "--plan-doc", str(plan)],
+                                         environment, self.working_dir)
+                if family == "unknown":
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("Unable to detect the unit director's model and effort", result.stderr)
+                    self.assertFalse((session / "progress_history_state.json").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    identity = cast("dict[str, object]", self.read_state(session)["main_agent"])
+                    self.assertEqual((identity["family"], identity["model"], identity["effort"]),
+                                     (family, model, "unset"))
+                if family == "codex":
+                    _ = codex.write_text('{"type":"turn_context","payload":{}}\n')
+                elif family == "claude":
+                    claude.unlink()
 
     def test_the_eta_names_the_day_the_work_is_expected_to_land(self) -> None:
         """A duration has to be added to the clock by hand; an arrival does not."""
@@ -4803,12 +4911,14 @@ class ProgressHistoryTests(unittest.TestCase):
         note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file())
         self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:8],
+            note.read_text(encoding="utf-8").splitlines()[:10],
             [
                 "---",
                 "phase_table: true",
-                "production: example",
+                "showrunner: example-showrunner",
+                f'production_file: "{production_doc.resolve().as_uri()}"',
                 "unit: unit-a",
+                'now: "Phase 3 of 1 — Retry handling"',
                 "---",
                 "",
                 "# unit-a",
@@ -4900,6 +5010,188 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
 
+    def start_numbered_phase(
+        self, session_dir: Path, phase_id: str, at: int, *extra: str
+    ) -> None:
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            phase_id,
+            "--phase-title",
+            f"Phase {phase_id} work",
+            *extra,
+            at=at,
+        )
+
+    def finish_numbered_phase(self, session_dir: Path, at: int, *extra: str) -> None:
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            *extra,
+            at=at,
+        )
+
+    def phase_events(self, name: str, event_type: str) -> list[dict[str, object]]:
+        return [event for event in self.read_events(name) if event.get("event_type") == event_type]
+
+    def open_phase_ids(self, session_dir: Path) -> tuple[str, list[str]]:
+        state = self.read_state(session_dir)
+        current = cast(dict[str, object], state["phase"])
+        parked = cast(list[dict[str, object]], state.get("open_phases", []))
+        return cast(str, current["id"]), [cast(str, phase["id"]) for phase in parked]
+
+    def test_a_phase_started_while_another_is_open_leaves_the_older_one_open(self) -> None:
+        started_at = 40_000
+        session_dir = self.start_run("overlapping-phases", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
+        self.team_slot = ""
+        self.start_numbered_phase(session_dir, "18", started_at + 100)
+
+        self.assertEqual(self.open_phase_ids(session_dir), ("18", ["6"]))
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
+        self.assertEqual(self.phase_events("overlapping-phases", "phase_finished"), [])
+
+        self.finish_slot_pass(session_dir, "impl", "completed", started_at + 150)
+        finished_pass = self.phase_events("overlapping-phases", "pass_finished")[-1]
+        self.assertEqual(finished_pass.get("phase_id"), "6")
+
+        self.team_slot = ""
+        self.finish_numbered_phase(session_dir, started_at + 200)
+        state = self.read_state(session_dir)
+        current = cast(dict[str, object], state["phase"])
+        self.assertEqual((current["id"], current["status"]), ("6", "active"))
+        self.assertEqual(state["open_phases"], [])
+        self.finish_numbered_phase(session_dir, started_at + 300, "--phase-id", "6")
+        finished = self.phase_events("overlapping-phases", "phase_finished")
+        self.assertEqual(
+            [(event.get("phase_id"), event.get("phase_elapsed_seconds")) for event in finished],
+            [("18", 100), ("6", 290)],
+        )
+
+    def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_workers(self) -> None:
+        started_at = 41_000
+        session_dir = self.start_run("finish-older-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
+        self.team_slot = ""
+        self.start_numbered_phase(session_dir, "18", started_at + 100)
+        self.start_slot_pass(session_dir, "review", "review", started_at + 110)
+        self.team_slot = ""
+
+        self.finish_numbered_phase(session_dir, started_at + 200, "--phase-id", "6")
+
+        self.assertEqual(self.open_phase_ids(session_dir), ("18", []))
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(slots["impl"]["status"], "interrupted")
+        self.assertEqual(slots["review"]["status"], "active")
+        finished = self.phase_events("finish-older-phase", "phase_finished")[-1]
+        self.assertEqual(finished.get("phase_id"), "6")
+        self.assertNotIn("pass_instance_id", finished)
+
+    def test_finish_phase_naming_a_phase_that_is_not_open_is_refused(self) -> None:
+        started_at = 42_000
+        session_dir = self.start_run("finish-unknown-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.finish_numbered_phase(session_dir, started_at + 20, "--phase-id", "7")
+        self.assertIn("Phase 7 is not open; open phases: 6", cast(str, raised.exception.stderr))
+        self.assertEqual(self.open_phase_ids(session_dir), ("6", []))
+
+    def test_a_pass_naming_an_older_open_phase_is_stamped_with_it(self) -> None:
+        started_at = 42_500
+        session_dir = self.start_run("pass-names-phase", started_at)
+        self.start_numbered_phase(session_dir, "15", started_at + 10)
+        older = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.start_numbered_phase(session_dir, "16", started_at + 20)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 30, "gpt-called", 0, "--phase-id", "15")
+        self.team_slot = ""
+        self.start_slot_pass(session_dir, "test", "test", started_at + 40)
+        self.team_slot = ""
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(cast(dict[str, object], slots["impl"]["phase"])["instance_id"], older["instance_id"])
+        current = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(cast(dict[str, object], slots["test"]["phase"])["instance_id"], current["instance_id"])
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.start_slot_pass(session_dir, "fix", "fix", started_at + 50, "gpt-called", 0, "--phase-id", "7")
+        self.assertIn("Phase 7 is not open; open phases: 15, 16", cast(str, raised.exception.stderr))
+
+    def test_back_filling_an_earlier_phase_leaves_the_open_phase_unchanged(self) -> None:
+        started_at = 43_000
+        session_dir = self.start_run("back-filled-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
+        self.team_slot = ""
+        phase_six = cast(dict[str, object], self.read_state(session_dir)["phase"])
+
+        def moment(offset: int) -> str:
+            return datetime.fromtimestamp(started_at + offset, UTC).isoformat()
+
+        self.start_numbered_phase(
+            session_dir, "18", started_at + 500, "--started-at", moment(30)
+        )
+        self.finish_numbered_phase(
+            session_dir, started_at + 510, "--phase-id", "18", "--finished-at", moment(70)
+        )
+
+        state = self.read_state(session_dir)
+        self.assertEqual(state["phase"], phase_six)
+        self.assertEqual(state["open_phases"], [])
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
+        started = self.phase_events("back-filled-phase", "phase_started")[-1]
+        finished = self.phase_events("back-filled-phase", "phase_finished")[-1]
+        self.assertEqual(
+            (started.get("phase_id"), started.get("timestamp_epoch"), started.get("backfilled")),
+            ("18", float(started_at + 30), True),
+        )
+        self.assertEqual(
+            (finished.get("phase_id"), finished.get("phase_elapsed_seconds"), finished.get("backfilled")),
+            ("18", 40, True),
+        )
+        trial = self.run_command(
+            "review-trial", "--session-dir", str(session_dir), "--phase-id", "18",
+            at=started_at + 520,
+        )
+        self.assertTrue(trial.startswith("review trial: ux 0 findings, code 0 findings"))
+
+    def test_a_back_fill_time_in_the_future_or_before_its_start_is_refused(self) -> None:
+        started_at = 44_000
+        session_dir = self.start_run("bad-back-fill", started_at)
+
+        def moment(offset: int) -> str:
+            return datetime.fromtimestamp(started_at + offset, UTC).isoformat()
+
+        with self.assertRaises(subprocess.CalledProcessError) as future:
+            self.start_numbered_phase(
+                session_dir, "18", started_at + 10, "--started-at", moment(60)
+            )
+        self.assertIn("--started-at", cast(str, future.exception.stderr))
+        self.start_numbered_phase(session_dir, "18", started_at + 100, "--started-at", moment(50))
+        with self.assertRaises(subprocess.CalledProcessError) as early:
+            self.finish_numbered_phase(
+                session_dir, started_at + 110, "--phase-id", "18", "--finished-at", moment(40)
+            )
+        self.assertIn("--finished-at is before Phase 18 started", cast(str, early.exception.stderr))
+
+    def test_finish_run_closes_every_open_phase(self) -> None:
+        started_at = 45_000
+        session_dir = self.start_run("finish-run-open-phases", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_numbered_phase(session_dir, "18", started_at + 20)
+        _ = self.run_command(
+            "finish-run", "--session-dir", str(session_dir), "--status", "completed",
+            at=started_at + 30,
+        )
+        finished = self.phase_events("finish-run-open-phases", "phase_finished")
+        self.assertEqual([event.get("phase_id") for event in finished], ["18", "6"])
+        self.assertEqual(self.read_state(session_dir)["open_phases"], [])
+
+
 class PhaseCountTests(unittest.TestCase):
     """A plan's phase headings take three forms; all three must be counted.
 
@@ -4911,6 +5203,7 @@ class PhaseCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
 
@@ -5000,6 +5293,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -5039,10 +5333,34 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.assertEqual(
             progress_history.plan_phases(plan),
             [
-                {"id": "1", "title": "Archived delivery", "done": True},
-                {"id": "2", "title": "Finished delivery", "done": True},
-                {"id": "3", "title": "Live delivery", "done": False},
+                {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None, "blocked_by": ""},
+                {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None, "blocked_by": ""},
+                {"id": "3", "title": "Live delivery", "done": False, "depends_on": None, "blocked_by": ""},
             ],
+        )
+
+    def test_plan_phases_read_each_phase_dependencies_and_gate(self) -> None:
+        plan = self.root / "plan.md"
+        _ = plan.write_text(
+            "\n".join(
+                (
+                    "### Phase 1 — Base  · status: todo",
+                    "**Depends on:** none",
+                    "### Phase 2 — Report  · status: todo",
+                    "**Blocked by:** G3 — trunk phase 4 merged",
+                    "**Depends on:** Phase 1, Phase 4",
+                    "### Phase 3 — Docs  · status: todo",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        phases = progress_history.plan_phases(plan)
+
+        self.assertEqual(
+            [(phase["depends_on"], phase["blocked_by"]) for phase in phases],
+            [([], ""), (["1", "4"], "G3"), (None, "")],
         )
 
     def test_plan_phases_preserves_descriptive_parentheticals(self) -> None:
@@ -5144,6 +5462,104 @@ class PublicPhaseHelperTests(unittest.TestCase):
             {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
         ):
             self.assertEqual(progress_history.plan_runs(plan), [])
+
+
+WorkSeconds = Callable[[list[dict[str, object]], str, float, float], int]
+SummaryTable = Callable[[str, dict[str, int], dict[str, int], dict[str, object], float, float, float], list[str]]
+CalibrationSamples = Callable[[list[dict[str, object]]], list[dict[str, object]]]
+
+
+def private(name: str) -> object:
+    found = vars(progress_history).get(name)
+    if not callable(found):
+        raise AssertionError(f"progress recorder function is unavailable: {name}")
+    return found
+
+
+def window(kind: str, key: str, started_at: float, finished_at: float | None) -> list[dict[str, object]]:
+    """A pass or activity window of phase `p`, open when `finished_at` is None."""
+    id_field = f"{kind}_instance_id"
+    events: list[dict[str, object]] = [
+        {"phase_instance_id": "p", "event_type": f"{kind}_started", id_field: key, "timestamp_epoch": started_at}
+    ]
+    if finished_at is not None:
+        events.append(
+            {"phase_instance_id": "p", "event_type": f"{kind}_finished", id_field: key, "timestamp_epoch": finished_at}
+        )
+    return events
+
+
+class EtaWorkClockTests(unittest.TestCase):
+    """The phase clock leaves idle stretches out, and the project never lands before its phase.
+
+    herdr-trial, 2026-10-15: a phase whose clock ran through a night quoted the next
+    evening for an hour of work, and the project row arrived hours before it.
+    """
+
+    @property
+    def grace(self) -> int:
+        grace = vars(progress_history).get("IDLE_GRACE_SECONDS")
+        if not isinstance(grace, int):
+            raise AssertionError("progress recorder idle grace is unavailable")
+        return grace
+
+    def work_seconds(self, events: list[dict[str, object]], phase_instance_id: str, started_at: float, until: float) -> int:
+        return cast(WorkSeconds, private("_work_seconds"))(events, phase_instance_id, started_at, until)
+
+    def test_an_overnight_gap_between_dispatches_counts_only_the_grace(self) -> None:
+        night = 10 * 3600
+        events = window("pass", "a", 100, 1_100) + window("pass", "b", 1_100 + night, 2_100 + night)
+        self.assertEqual(self.work_seconds(events, "p", 0, 2_100 + night), 100 + 1_000 + self.grace + 1_000)
+
+    def test_an_open_window_counts_up_to_now(self) -> None:
+        events = window("activity", "a", 0, None)
+        self.assertEqual(self.work_seconds(events, "p", 0, 5 * 3600), 5 * 3600)
+
+    def test_a_wait_after_the_last_window_counts_only_the_grace(self) -> None:
+        events = window("pass", "a", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 600 + 8 * 3600), 600 + self.grace)
+
+    def test_overlapping_windows_count_once(self) -> None:
+        events = window("pass", "a", 0, 1_000) + window("activity", "b", 500, 1_500)
+        self.assertEqual(self.work_seconds(events, "p", 0, 1_500), 1_500)
+
+    def test_another_phase_windows_do_not_count(self) -> None:
+        events = [{**event, "phase_instance_id": "q"} for event in window("pass", "a", 0, 10_000)]
+        events += window("pass", "b", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 10_000), 600 + self.grace)
+
+    def test_a_phase_with_no_windows_keeps_the_wall_clock(self) -> None:
+        self.assertEqual(self.work_seconds([], "p", 1_000, 1_000 + 9 * 3600), 9 * 3600)
+
+    def test_the_project_eta_is_never_earlier_than_its_phase(self) -> None:
+        summary_table = cast(SummaryTable, private("_summary_table"))
+        # The project reads 90% after ten hours, an hour left; the phase reads 20%
+        # after one hour, four left. Unfloored, the project lands three hours early.
+        project = {"percent": 90, "elapsed": 10 * 3600, "unchanged": 0}
+        phase = {"percent": 20, "elapsed": 3600, "unchanged": 0}
+        rows = [
+            [cell.strip() for cell in line.strip("|").split("|")]
+            for line in summary_table("7", project, phase, {}, 10.0, 0.0, 0.0)
+            if line.startswith("| Project") or line.startswith("| Phase")
+        ]
+        project_row, phase_row = rows
+        self.assertEqual(project_row[3], phase_row[3])
+        self.assertEqual(project_row[5:], phase_row[5:])
+
+    def test_calibration_measures_time_spent_in_work_time(self) -> None:
+        calibration_samples = cast(CalibrationSamples, private("_calibration_samples"))
+        night = 10 * 3600
+        phase: dict[str, object] = {"phase_instance_id": "p", "phase_started_at": 0}
+        events: list[dict[str, object]] = [
+            *window("pass", "a", 0, 3_600),
+            *window("pass", "b", 3_600 + night, 7_200 + night),
+            {**phase, "event_type": "progress_reported", "timestamp_epoch": 7_000 + night, "raw_percent": 90, "percent": 90},
+            {**phase, "event_type": "phase_finished", "status": "completed", "timestamp_epoch": 7_200 + night},
+        ]
+        sample, = calibration_samples(events)
+        # Work time: 3600 + grace + 3400 of 3600 + grace + 3600. Wall time read 79%.
+        expected = 100.0 * (7_000 + self.grace) / (7_200 + self.grace)
+        self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
 
 
 if __name__ == "__main__":

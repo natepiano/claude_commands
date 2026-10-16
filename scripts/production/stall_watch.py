@@ -13,19 +13,23 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import add_unit
+import production_units
 import showrunners
 import unit_lookup
+from session_pane import HerdrFailure, read_place
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
-TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
@@ -53,7 +57,18 @@ class Delivery(NamedTuple):
     command: list[str]
 
 
+class ContentBlock(TypedDict, total=False):
+    type: str
+    text: str
 
+
+class TranscriptMessage(TypedDict, total=False):
+    content: list[ContentBlock] | str
+
+
+class TranscriptEntry(TypedDict, total=False):
+    type: str
+    message: TranscriptMessage
 
 
 def command_output(command: list[str]) -> str:
@@ -85,12 +100,50 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
     return found
 
 
-def work_running(pid: int, rows: list[Process]) -> bool:
+def unit_marks(pid: int) -> tuple[str, str] | None:
+    """The production and unit a process's environment marks it with, inherited from its unit's session."""
+    try:
+        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+    slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
+    return (slug, unit) if slug and unit else None
+
+
+def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = None) -> bool:
+    """A shell or launcher under the unit's Claude, or any process the unit started that left its tree.
+
+    A process carrying the unit's marks counts wherever it sits, except the Claude, the pane around
+    it, and the long-lived helpers the Claude starts itself (its MCP servers).
+    """
     for row in descendants(pid, rows):
         if row.command.endswith(" <defunct>"):
             continue
         word = row.command.split(" ", 1)[0]
         if Path(word).name in WORK:
+            return True
+    if marks is None:
+        return False
+    parents = {row.pid: row.parent for row in rows}
+    ancestors: set[int] = set()
+    current = pid
+    while current in parents and current not in ancestors:
+        ancestors.add(current)
+        current = parents[current]
+    helpers = {row.pid for row in rows if row.parent == pid}
+    helpers.update(child.pid for helper in tuple(helpers) for child in descendants(helper, rows))
+    current_slugs: dict[str, str] = {}
+    for row in rows:
+        if row.pid in ancestors or row.pid in helpers or row.command.endswith(" <defunct>"):
+            continue
+        inherited = unit_marks(row.pid)
+        if inherited is None or inherited[1] != marks[1]:
+            continue
+        slug = inherited[0]
+        if slug not in current_slugs:
+            current_slugs[slug] = showrunners.canonical_slug(slug)
+        if (current_slugs[slug], inherited[1]) == marks:
             return True
     return False
 
@@ -104,6 +157,51 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
+
+
+def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
+    """The file's lines, last first, read a block at a time from its end."""
+    with path.open("rb") as file:
+        end = file.seek(0, os.SEEK_END)
+        rest = b""
+        while end > 0:
+            start = max(0, end - block)
+            _ = file.seek(start)
+            lines = (file.read(end - start) + rest).split(b"\n")
+            rest = lines.pop(0) if start > 0 else b""
+            yield from reversed(lines)
+            end = start
+
+
+def transcript_turn_end(session_id: str) -> re.Match[str] | None:
+    """The turn-end line closing the session's last assistant text, read from its transcript.
+
+    Compaction clears the pane, so a unit that ended its turn and then compacted while idle shows no
+    turn-end line on screen; its transcript still ends with that text. A tool call after the text
+    means the turn went on, so there is no turn-end line.
+    """
+    try:
+        transcripts = sorted(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
+        if not transcripts:
+            return None
+        for line in lines_from_end(transcripts[-1]):
+            if b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            content = entry.get("message", {}).get("content") if entry.get("type") == "assistant" else None
+            blocks = content if isinstance(content, list) else []
+            if any(block.get("type") == "tool_use" for block in blocks):
+                return None
+            text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            if text:
+                turns = list(TURN_END.finditer(text))
+                return turns[-1] if turns else None
+    except OSError:
+        return None
+    return None
 
 
 def stretch_path(slug: str, unit: str) -> Path:
@@ -182,13 +280,17 @@ def tick(now: float) -> None:
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
-            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
-                    for cells in add_unit.live_unit_table(lines, slug)}
+            live = {production_units.cell_value(cells.get("Unit", "")): production_units.cell_value(cells.get("Worktree", ""))
+                    for cells in production_units.live_unit_table(lines, slug)}
             marked = unit_lookup.marked_units(slug)
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
+            # The review unit waits for a review merge by design, so idle is its normal state.
+            if add_unit.is_review_unit(name, lines):
+                stretch_path(slug, name).unlink(missing_ok=True)
+                continue
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
             try:
                 running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
@@ -204,21 +306,22 @@ def tick(now: float) -> None:
                     print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
                 continue
             try:
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", unit.pane])
-            except OSError as error:
+                pane = read_place(unit.place, 400, joined=True).strip()
+            except (OSError, HerdrFailure) as error:
                 print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket
             path = stretch_path(slug, name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
-            last = turns[-1].group(0).strip() if turns else "none on screen"
-            if turns and turns[-1].group("kind") in WAITING_KINDS:
+            turn = turns[-1] if turns else transcript_turn_end(session_id)
+            last = turn.group(0).strip() if turn else "none on screen"
+            if turn and turn.group("kind") in WAITING_KINDS:
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
                 continue
-            running_work = work_running(pid, rows)
+            running_work = work_running(pid, rows, (slug, unit.unit))
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")

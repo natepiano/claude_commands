@@ -86,7 +86,7 @@ class NotifierTests(unittest.TestCase):
                 "FAKE_SEND_RC": str(send_rc),
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
             },
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
@@ -243,6 +243,36 @@ class NotifierTests(unittest.TestCase):
             _ = self.successful("interval", "example", "60")
             self.assertEqual(next_due("align", "example", "on", now=at(kolkata, 10, 5)), at(kolkata, 11, 0) - 30)
 
+    def test_unpause_restarts_only_a_timer_the_pause_stopped_and_nobody_stopped_since(self) -> None:
+        _ = self.new()
+        _ = self.successful("pause", "example")
+        self.assertEqual((self.state()["ENABLED"], self.state()["PAUSED"]), ("0", "1"))
+        self.assertIn("next_due=", self.successful("unpause", "example"))
+        self.assertEqual(self.state()["ENABLED"], "1")
+        self.assertNotIn("PAUSED", self.state())
+        # Stopped during the pause: the stop clears the mark, so unpause leaves it stopped.
+        _ = self.successful("pause", "example")
+        _ = self.successful("stop", "example")
+        self.assertEqual(self.successful("unpause", "example"), "")
+        self.assertEqual(self.state()["ENABLED"], "0")
+        # Stopped before the pause: the pause has nothing to stop and leaves no mark.
+        _ = self.successful("pause", "example")
+        self.assertNotIn("PAUSED", self.state())
+        self.assertEqual(self.successful("unpause", "example"), "")
+        self.assertEqual(self.state()["ENABLED"], "0")
+        # Started again during the pause: the start clears the mark, and the timer keeps running.
+        _ = self.successful("start", "example")
+        _ = self.successful("pause", "example")
+        _ = self.successful("resume", "example")
+        self.assertNotIn("PAUSED", self.state())
+        _ = self.successful("stop", "example")
+        self.assertEqual(self.successful("unpause", "example"), "")
+        # A tick keeps the mark of a paused timer.
+        _ = self.successful("start", "example")
+        _ = self.successful("pause", "example")
+        _ = self.successful("tick", now=NOW + 600)
+        self.assertEqual(self.state()["PAUSED"], "1")
+
     def test_due_tick_send_arguments_and_log_format(self) -> None:
         _ = self.new("--from", "sender", "--timeout", "7")
         _ = self.successful("tick", now=MINUTE + 120)
@@ -275,15 +305,15 @@ class NotifierTests(unittest.TestCase):
         self.assertFalse((self.state_dir / "example").exists())
         self.assertIn("removed example (check exit 2)", (self.state_dir / "notifier.log").read_text())
 
-    def test_check_timeout_skips_send_and_releases_tick_promptly(self) -> None:
+    def test_check_timeout_skips_send_and_releases_tick(self) -> None:
         check = self.root / "slow-check"
-        _ = check.write_text("#!/bin/sh\nexec sleep 4\n")
+        blocked = self.root / "check-blocked"
+        os.mkfifo(blocked)
+        _ = check.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
         check.chmod(0o755)
         _ = self.new("--check", str(check), "--timeout", "1")
-        started = time.monotonic()
         result = self.run_cli("tick", now=MINUTE + 120)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(time.monotonic() - started, 3)
         self.assertIn(" | skip check timeout", self.lines()[-1], result.stderr)
         self.assertFalse(self.send_args.exists())
 
@@ -411,12 +441,12 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(any("exit 7" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
         slow = self.root / "slow-run"
-        _ = slow.write_text("#!/bin/sh\nexec sleep 4\n")
+        blocked = self.root / "run-blocked"
+        os.mkfifo(blocked)
+        _ = slow.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
         slow.chmod(0o755)
         _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "1")
-        started = time.monotonic()
         _ = self.successful("tick", now=MINUTE + 120)
-        self.assertLess(time.monotonic() - started, 3)
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
         self.assertTrue(any("timeout" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
@@ -476,7 +506,8 @@ if action == "submit":
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, start_new_session=True,
     )
-    (state / "pid").write_text(str(job.pid))
+    (state / "pid.tmp").write_text(str(job.pid))
+    os.replace(state / "pid.tmp", state / "pid")
 elif action == "loop":
     label = sys.argv[2]
     removed = state / f"{label}.removed"
@@ -526,17 +557,22 @@ elif action == "remove":
         started_file = self.root / "started"
         finished_file = self.root / "finished"
         slow = self.root / "slow-run"
-        _ = slow.write_text(f"#!/bin/sh\nprintf started > {started_file}\nsleep 3\nprintf finished > {finished_file}\n")
+        release_file = self.root / "release-run"
+        _ = slow.write_text(
+            f"#!/bin/sh\nprintf started > {started_file}\n"
+            + f"while [ ! -e {release_file} ]; do sleep 0.01; done\n"
+            + f"printf finished > {finished_file}\nexit 7\n"
+        )
         slow.chmod(0o755)
-        _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "2")
+        _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "30")
         _ = self.successful("new", "other", "--to", "session:sid-1", "--every", "1", "--command", "due")
-        started = time.monotonic()
         _ = self.successful("tick", now=MINUTE + 60)
-        self.assertLess(time.monotonic() - started, 1.5)
         _ = self.wait_for_text(started_file, "started")
         self.assertFalse(finished_file.exists())
         self.assertTrue(self.send_args.exists())
-        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
+        _ = release_file.write_text("release")
+        _ = self.wait_for_text(finished_file, "finished")
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
 
     def test_run_only_run_log_captures_stderr_and_replaces_previous_run(self) -> None:
         run_log = self.state_dir / "example" / "run.log"

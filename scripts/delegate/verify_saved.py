@@ -27,6 +27,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
 BUILDLOG = Path.home() / ".claude/scripts/buildlog/buildlog"
 QUERY = (
     "SELECT started_at, host, repo, worktree_name, branch, outcome, wall_s, saved_s"
@@ -90,7 +94,7 @@ def calls() -> list[Call]:
 
 
 def local_time(stamp: str) -> datetime:
-    return datetime.fromisoformat(stamp).astimezone()
+    return datetime.fromisoformat(stamp).astimezone(user_zone())
 
 
 def sync_note() -> str:
@@ -125,7 +129,7 @@ def main() -> None:
     _ = parser.add_argument("--by", choices=("workspace", "worktree", "day", "week"), default="workspace")
     _ = parser.add_argument("--no-mac", action="store_true")
     args = parser.parse_args()
-    end = cast(date | None, args.end) or date.today()
+    end = cast(date | None, args.end) or datetime.now(user_zone()).date()
     start = cast(date | None, args.start) or end - timedelta(days=cast(int, args.days) - 1)
     workspace_filter = cast(str | None, args.workspace)
     by = cast(str, args.by)

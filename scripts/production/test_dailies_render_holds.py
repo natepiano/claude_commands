@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
@@ -82,7 +84,10 @@ class DailiesHoldTests(unittest.TestCase):
         _ = path.write_text(json.dumps(record) + "\n")
         return path
 
-    def write_cycle(self, states: list[tuple[str, str]], *, outcomes: dict[str, str] | None = None) -> None:
+    def write_cycle(
+        self, states: list[tuple[str, str]], *, outcomes: dict[str, str] | None = None,
+        names: dict[str, str] | None = None, release_started_at: str = "2026-10-04T10:57:00-07:00",
+    ) -> None:
         release = self.scratch / "release"
         directory = release / CYCLE_ID
         directory.mkdir(parents=True)
@@ -90,7 +95,8 @@ class DailiesHoldTests(unittest.TestCase):
         entries: list[dict[str, str]] = []
         for index, (session_id, state) in enumerate(states):
             entry = {
-                "session_id": session_id, "name": f"session {index + 1}", "state": state,
+                "session_id": session_id, "name": (names or {}).get(session_id, f"session {index + 1}"),
+                "state": state,
             }
             if state in {"DeliveryQueued", "DeliveryFailed"}:
                 entry["attempted_at"] = "2026-10-04T10:57:00-07:00"
@@ -105,8 +111,8 @@ class DailiesHoldTests(unittest.TestCase):
         cycle: dict[str, object] = {
             "id": CYCLE_ID,
             "opened_at": "2026-10-04T10:55:00-07:00",
-            "release_started_at": "2026-10-04T10:57:00-07:00",
-            "holders": {"seat": {"since": "2026-10-04T10:56:00-07:00", "released_at": ""}},
+            "release_started_at": release_started_at,
+            "holders": {"worker": {"since": "2026-10-04T10:56:00-07:00", "released_at": ""}},
             "recipients": {session_id: f"session {index + 1}" for index, (session_id, _) in enumerate(states)},
             "entries": entries,
         }
@@ -184,12 +190,12 @@ class DailiesHoldTests(unittest.TestCase):
                     self.assertTrue(mac_line.endswith(" - CI can still use the Mac"))
 
     def test_mac_block_follows_hold_release_lines_and_precedes_agents(self) -> None:
-        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
-        self.write_cycle([("first", "DeliveryQueued")])
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.write_cycle([("first", "DeliveryFailed")])
         _ = self.write_mac_block()
         lines = self.assert_ok(self.footer())
         hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
-        release_index = lines.index("  * session 1 [first]: DeliveryQueued")
+        release_index = lines.index("  * session 1 could not be told builds are released; tell it")
         mac_index = next(index for index, line in enumerate(lines) if line.startswith("* Mac block:"))
         agent_index = lines.index("* none active")
         self.assertLess(hold_index, release_index)
@@ -198,8 +204,17 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertEqual(lines[-1], "* next dailies: 11:30 PDT - nothing needed")
 
     def test_mac_block_reason_with_plumbing_is_refused_with_recovery(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
         _ = self.write_mac_block(reason="the tester handoff")
-        suffix = "; have alice run /mac_test block again with other words"
+        suffix = "; have alice run /build:mac block again with other words"
         self.assert_refused(self.report(False), "tester", suffix)
         self.assert_refused(self.footer(), "tester", suffix)
 
@@ -250,8 +265,8 @@ class DailiesHoldTests(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertEqual(checked.stdout.strip(), "False")
 
-    def test_footer_and_report_nest_each_release_state_below_hold(self) -> None:
-        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+    def test_a_release_shows_its_progress_and_names_only_sessions_to_act_on(self) -> None:
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         states = [
             ("first", "MemoryGateReturned"), ("second", "AwaitingRelease"),
             ("third", "DeliveryQueued"), ("fourth", "DeliveryFailed"),
@@ -263,18 +278,48 @@ class DailiesHoldTests(unittest.TestCase):
         outcomes = {"first": "Granted", "eighth": "TimedOut", "ninth": "MeminfoUnavailable"}
         self.write_cycle(states, outcomes=outcomes)
         for lines in (self.assert_ok(self.report(True)), self.assert_ok(self.footer())):
+            # The session that has gone is not counted; the three back from the memory wait are free.
+            self.assertIn("* build hold: worker holds builds since 10:56 PDT for the focused test; "
+                          + "released 10:57 PDT; 3 of 10 sessions free to build again", lines)
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
-            for index, (session_id, state) in enumerate(states, start=1):
-                expected = f"session {index} [{session_id}]: {state}"
-                if state == "MemoryGateReturned":
-                    expected += f"({outcomes[session_id]})"
-                matches = [line for line in lines if line == "  * " + expected]
-                self.assertEqual(matches, ["  * " + expected])
-                self.assertGreater(lines.index(matches[0]), hold_index)
-            self.assertTrue(any("next session 2 [second] at 11:00:30 PDT" in line for line in lines))
+            self.assertEqual(lines[hold_index + 1:hold_index + 3], [
+                "  * session 4 could not be told builds are released; tell it",
+                "  * session 10 has not answered the release for 15 minutes; check it",
+            ])
+            self.assertFalse(lines[hold_index + 3].startswith("  * "))
+            text = "\n".join(lines)
+            for session_id, state in states:
+                self.assertNotIn(f"[{session_id}]", text)
+                self.assertNotIn(state, text)
+            self.assertNotIn("next session", text)
+
+    def test_a_session_whose_name_is_its_id_is_never_shown_by_that_id(self) -> None:
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
+        session_id = "450ac99b-caed-49ba-8c6f-29016df421ab"
+        self.write_cycle([(session_id, "NoAdmissionAck")], names={session_id: session_id})
+        lines = self.assert_ok(self.footer())
+        self.assertIn("  * an unnamed session has not answered the release for 15 minutes; check it", lines)
+        self.assertNotIn(session_id, "\n".join(lines))
+
+    def test_a_hold_not_yet_released_keeps_its_expected_release(self) -> None:
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test", "2026-10-04T11:15:00-07:00")
+        self.write_cycle([("first", "AwaitingRelease")], release_started_at="")
+        lines = self.assert_ok(self.footer())
+        self.assertIn("* build hold: worker holds builds since 10:56 PDT for the focused test; "
+                      + "expected to release 11:15 PDT (in 15 minutes)", lines)
+        self.assertEqual([line for line in lines if line.startswith("  * ")], [])
 
     def test_footer_and_report_keep_hold_lines_when_release_record_is_damaged(self) -> None:
-        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         self.write_cycle([("first", "ReleasedAwaitingAdmission")])
         path = self.scratch / "release" / CYCLE_ID / "cycle.json"
         cycle = cast(dict[str, object], json.loads(path.read_text()))
@@ -286,42 +331,51 @@ class DailiesHoldTests(unittest.TestCase):
         footer = self.assert_ok(self.footer())
         for lines in (report, footer):
             hold_index = next(index for index, line in enumerate(lines) if line.startswith("* build hold:"))
-            error_line = "release record could not be read: invalid released_at for first; /build_hold release sets it aside and ends the hold"
+            error_line = "release record could not be read: invalid released_at for first; /build:hold release sets it aside and ends the hold"
             self.assertIn("  * " + error_line, lines)
             self.assertLess(hold_index, next(index for index, line in enumerate(lines) if error_line in line))
         self.assertLess(next(index for index, line in enumerate(report) if error_line in line), report.index("* none active"))
         self.assertEqual(path.read_bytes(), before)
 
     def test_footer_reports_damaged_current_without_changing_it(self) -> None:
-        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         self.write_cycle([("first", "AwaitingRelease")])
         path = self.scratch / "release" / "current"
         content = b"invalid-current\n"
         _ = path.write_bytes(content)
         lines = self.assert_ok(self.footer())
         self.assertIn(
-            "  * release record could not be read: invalid current hold cycle; /build_hold release sets it aside and ends the hold",
+            "  * release record could not be read: invalid current hold cycle; /build:hold release sets it aside and ends the hold",
             lines,
         )
         self.assertEqual(path.read_bytes(), content)
         self.assertEqual(list(path.parent.glob("current.damaged-*")), [])
 
     def test_legacy_holder_renders_unknown_release(self) -> None:
-        _ = (self.folder / "old-seat").write_text("old seat, 2026-10-04T10:56:00-07:00, the focused test\n")
+        _ = (self.folder / "old-worker").write_text("old worker, 2026-10-04T10:56:00-07:00, the focused test\n")
         lines = self.assert_ok(self.report(True))
         holds = [line for line in lines if line.startswith("* build hold:")]
         self.assertEqual(len(holds), 1)
-        self.assertIn("build hold: old-seat since 10:56 PDT", holds[0])
-        self.assertIn("the focused test - release eta: unknown", holds[0])
+        self.assertIn("build hold: old-worker holds builds since 10:56 PDT", holds[0])
+        self.assertIn("the focused test; no release time given", holds[0])
 
     def test_multiple_holders_ordered_with_known_past_future_and_unknown_eta(self) -> None:
         _ = self.write_holder("future", "2026-10-04T10:55:00-07:00", "the second test", "2026-10-04T11:15:00-07:00")
         _ = self.write_holder("past", "2026-10-04T10:50:00-07:00", "the first test", "2026-10-04T10:54:00-07:00")
         _ = self.write_holder("unknown", "2026-10-04T10:58:00-07:00", "the third test")
         expected = [
-            "build hold: past since 10:50 PDT, for the first test - release eta: 10:54 PDT (overdue 6 minutes)",
-            "build hold: future since 10:55 PDT, for the second test - release eta: 11:15 PDT (15 minutes)",
-            "build hold: unknown since 10:58 PDT, for the third test - release eta: unknown",
+            "build hold: past holds builds since 10:50 PDT for the first test; expected to release 10:54 PDT (6 minutes overdue)",
+            "build hold: future holds builds since 10:55 PDT for the second test; expected to release 11:15 PDT (in 15 minutes)",
+            "build hold: unknown holds builds since 10:58 PDT for the third test; no release time given",
         ]
         report = self.assert_ok(self.report(True))
         footer = self.assert_ok(self.footer())
@@ -332,17 +386,17 @@ class DailiesHoldTests(unittest.TestCase):
     def test_known_release_on_next_day_shows_weekday(self) -> None:
         _ = self.write_holder("later", "2026-10-04T10:56:00-07:00", "the later test", "2026-10-05T09:30:00-07:00")
         lines = self.assert_ok(self.footer())
-        self.assertTrue(any("release eta: Mon 09:30 PDT (1350 minutes)" in line for line in lines))
+        self.assertTrue(any("expected to release Mon 09:30 PDT (in 1350 minutes)" in line for line in lines))
 
     def test_stale_unit_marker_after_last_release_is_refused(self) -> None:
         self.assert_refused(self.report(True), "build_hold", "holder")
 
     def test_active_holder_without_marked_unit_is_refused(self) -> None:
-        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         self.assert_refused(self.report(False), "build_hold", "unit")
 
     def test_top_level_build_hold_is_refused_even_when_files_exist(self) -> None:
-        _ = self.write_holder("seat", "2026-10-04T10:56:00-07:00", "the focused test")
+        _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
         self.assert_refused(
             self.report(True, extra={"build_hold": {"since": "10:56", "for": "the focused test", "release": "11:15"}}),
             "build_hold",
@@ -350,16 +404,36 @@ class DailiesHoldTests(unittest.TestCase):
         )
 
     def test_report_footer_and_marker_agree_after_partial_release(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.scratch), "BUILDLOG_DIR": str(self.scratch / "buildlog"),
+            "BUILD_HOLD_DIR": str(self.folder),
+            "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
+            "MAC_TEST_STATE_DIR": str(self.mac_state),
+            "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }))
         _ = self.write_holder("first", "2026-10-04T10:50:00-07:00", "the first test")
         _ = self.write_holder("second", "2026-10-04T10:56:00-07:00", "the second test")
         units = [unit(True), {**unit(True), "unit": "frame-time", "label": "frame"}]
-        release = self.run_script(HOLD_SCRIPT, "release", "--holder", "first")
+        # The child joins its recorder before the temporary log is removed.
+        child = (
+            "import sys, threading; sys.path.insert(0, sys.argv.pop(1)); import build_hold; "
+            "status = build_hold.main(sys.argv[1:]); "
+            "[thread.join(timeout=5) for thread in threading.enumerate() if thread.name == 'hold-event-recorder']; "
+            "assert not any(thread.name == 'hold-event-recorder' for thread in threading.enumerate()); "
+            "sys.exit(status)"
+        )
+        release = subprocess.run(
+            [sys.executable, "-c", child, str(HOLD_SCRIPT.parent), "release", "--holder", "first"],
+            capture_output=True, text=True, check=False, env=dict(os.environ))
         self.assertEqual(release.returncode, 0, release.stderr)
         self.assertIn("still held by second", release.stdout)
+        self.assertEqual(len(list((self.scratch / "buildlog").rglob("*.jsonl"))), 1)
         report = self.assert_ok(self.report(True, extra={"units": units}))
         footer = self.assert_ok(self.footer())
         hold_lines = [line for line in report if line.startswith("* build hold:")]
-        self.assertEqual(hold_lines, ["* build hold: second since 10:56 PDT, for the second test - release eta: unknown"])
+        self.assertEqual(hold_lines, ["* build hold: second holds builds since 10:56 PDT for the second test; no release time given"])
         self.assertEqual([line for line in footer if line.startswith("* build hold:")], hold_lines)
         for label in ("widget", "frame"):
             self.assertEqual(len([line for line in report if line.startswith(label) and "build hold" in line]), 1)

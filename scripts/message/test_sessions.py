@@ -10,9 +10,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+from test_support import ShutdownTestCase
 import sessions
 
 
@@ -23,7 +26,7 @@ STAT_WITH_TRUNCATED_PROCESS_NAME = b"4242 (with ) spaces \xc3) " + b" ".join(
 )
 
 
-class SessionLookupTests(unittest.TestCase):
+class SessionLookupTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -33,6 +36,7 @@ class SessionLookupTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
@@ -43,7 +47,7 @@ class SessionLookupTests(unittest.TestCase):
     def record(
         self, filename: str, *, pid: int | None = None, name: str = "agent",
         session_id: str = "session-1", socket_path: Path | None = None, updated: int = 1,
-        proc_start: str = "",
+        proc_start: str = "", entrypoint: str = "",
     ) -> None:
         data = {
             "pid": os.getpid() if pid is None else pid,
@@ -52,6 +56,7 @@ class SessionLookupTests(unittest.TestCase):
             "messagingSocketPath": str(self.socket_path if socket_path is None else socket_path),
             "updatedAt": updated,
             "procStart": proc_start,
+            **({"entrypoint": entrypoint} if entrypoint else {}),
         }
         _ = (self.sessions / filename).write_text(json.dumps(data))
 
@@ -62,6 +67,27 @@ class SessionLookupTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
 
+    def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
+        self.record(f"{os.getpid()}.json")
+        path = self.sessions / f"{os.getpid()}.json"
+        registered = sessions.read_session(path)
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        original = path.read_text()
+        for value, expected in (("bridge-id", "active"), ("", "absent"), (None, "absent"), (3, "absent")):
+            with self.subTest(value=value):
+                data = cast(dict[str, object], json.loads(original))
+                if value is not None:
+                    data["bridgeSessionId"] = value
+                _ = path.write_text(json.dumps(data))
+                with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+                    self.assertEqual(sessions.remote_control(registered), expected)
+        _ = path.write_text("broken JSON")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.remote_control(registered), "absent")
+        path.unlink()
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            self.assertEqual(sessions.remote_control(registered), "absent")
+
     def test_live_name_session_id_and_pid_lookup(self) -> None:
         self.record("one.json", name="showrunner", session_id="sid-123")
         self.assertEqual(self.run_cli("socket", "showrunner").stdout.strip(), str(self.socket_path))
@@ -71,6 +97,25 @@ class SessionLookupTests(unittest.TestCase):
         self.assertEqual(self.run_cli("address", "session:sid-123").stdout, f"uds:{self.socket_path}\n")
         self.assertEqual(self.run_cli("id", "showrunner").stdout.strip(), "sid-123")
         self.assertEqual(self.run_cli("id", str(os.getpid())).stdout.strip(), "sid-123")
+
+    def test_a_relay_named_like_a_session_is_never_found_or_listed(self) -> None:
+        relay_socket = socket.socket(socket.AF_UNIX)
+        self.addCleanup(relay_socket.close)
+        relay_path = self.root / "relay.sock"
+        relay_socket.bind(str(relay_path))
+        self.record("session.json", name="natedev", session_id="sid-session", updated=10, entrypoint="cli")
+        # send.py's relay is a newer `claude -p` run started with `-n natedev`.
+        self.record("relay.json", name="natedev", session_id="sid-relay", socket_path=relay_path, updated=20,
+                    entrypoint="sdk-cli")
+        self.assertEqual(self.run_cli("address", "natedev").stdout, f"uds:{self.socket_path}\n")
+        self.assertEqual(self.run_cli("socket", "session:sid-relay").returncode, 1)
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            live = sessions.live_sessions()
+            running = sessions.running_sessions()
+        self.assertEqual([record["sessionId"] for record in live], ["sid-session"])
+        self.assertEqual([record["sessionId"] for record in running], ["sid-session"])
+        found = sessions.addressed("natedev", live)
+        self.assertEqual(found["sessionId"] if found else None, "sid-session")
 
     def test_newest_live_match_wins(self) -> None:
         other = socket.socket(socket.AF_UNIX)
@@ -120,6 +165,46 @@ class SessionLookupTests(unittest.TestCase):
             live = sessions.live_sessions()
         self.assertEqual(live, [record])
         accepts.assert_called_once_with(record)
+
+    def test_record_with_socket_and_wrong_process_start_is_not_running(self) -> None:
+        self.record("reused.json", pid=4242, proc_start="recorded start")
+        registered = sessions.read_session(self.sessions / "reused.json")
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        self.assertTrue(sessions.messaging_socket_exists(registered))
+        with (
+            mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+            mock.patch.object(os, "kill"),
+            mock.patch.object(sessions, "process_start", return_value="new process start") as start,
+        ):
+            self.assertFalse(sessions.running_session(registered))
+            self.assertFalse(sessions.live_session(registered))
+            self.assertEqual(sessions.running_sessions(), [])
+            self.assertEqual(sessions.live_sessions(), [])
+        self.assertTrue(start.called)
+        for call in start.call_args_list:
+            self.assertEqual(call.args, (4242,))
+
+    def test_record_with_socket_and_matching_process_start_is_live(self) -> None:
+        self.record("matching.json", pid=4242, proc_start="recorded start")
+        registered = sessions.read_session(self.sessions / "matching.json")
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        with (
+            mock.patch.object(os, "kill"),
+            mock.patch.object(sessions, "process_start", return_value="recorded start"),
+        ):
+            self.assertTrue(sessions.running_session(registered))
+            self.assertTrue(sessions.live_session(registered))
+
+    def test_record_with_socket_and_unreadable_process_start_is_not_running(self) -> None:
+        self.record("unknown.json", pid=4242, proc_start="recorded start")
+        registered = sessions.read_session(self.sessions / "unknown.json")
+        assert not isinstance(registered, sessions.UnreadableSessionRecord)
+        with (
+            mock.patch.object(os, "kill"),
+            mock.patch.object(sessions, "process_start", return_value=None),
+        ):
+            self.assertFalse(sessions.running_session(registered))
+            self.assertFalse(sessions.live_session(registered))
 
     def test_socketless_record_with_another_process_start_is_not_running(self) -> None:
         self.record("reused.json", socket_path=self.root / "absent.sock", proc_start="another start")
@@ -221,8 +306,38 @@ class SessionLookupTests(unittest.TestCase):
         for args in ((), ("socket",), ("address",), ("id",), ("unknown", "agent")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
 
+    def test_registry_read_reports_directory_failure_instead_of_empty_success(self) -> None:
+        original = Path.iterdir
 
-class ProcessStartTests(unittest.TestCase):
+        def paths(path: Path) -> Iterator[Path]:
+            if path == self.sessions:
+                raise PermissionError("registry denied")
+            return original(path)
+
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), mock.patch.object(Path, "iterdir", paths):
+            read = sessions.read_registry()
+            self.assertEqual(read.unreadable, (self.sessions,))
+            self.assertEqual(read.entries, ())
+            self.assertEqual(sessions.live_sessions(), [])
+
+    def test_registry_read_keeps_good_records_and_names_each_bad_record(self) -> None:
+        self.record("good.json", name="kept")
+        good = self.sessions / "good.json"
+        contents = cast(dict[str, object], json.loads(good.read_text()))
+        contents["cwd"], contents["status"] = "/kept-folder", "idle"
+        _ = good.write_text(json.dumps(contents))
+        broken = self.sessions / "bad.json"
+        _ = broken.write_text("{broken")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            read = sessions.read_registry()
+            self.assertEqual([item.record["name"] for item in read.entries], ["kept"])
+            self.assertEqual(read.unreadable, (broken,))
+            self.assertEqual(read.entries[0].details.get("cwd"), "/kept-folder")
+            self.assertEqual(read.entries[0].details.get("status"), "idle")
+            self.assertEqual([item["name"] for item in sessions.live_sessions()], ["kept"])
+
+
+class ProcessStartTests(ShutdownTestCase):
     def test_linux_start_survives_a_process_name_cut_inside_a_utf8_character(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         stat_path = root / "stat"
@@ -280,3 +395,5 @@ class ProcessStartTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+

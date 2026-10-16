@@ -7,8 +7,8 @@
 # stop-delegate-continue.py refuses to let the turn end near the auto-compaction
 # threshold, on the assumption that the run still has phases to go.
 #
-# Removes every claude seat this run launched, and any a dead run left alive
-# (remove_seats.py). Also stops this run's codex app-server, if one was
+# Removes every claude worker this run launched, and any a dead run left alive
+# (remove_workers.py). Also stops this run's codex app-server, if one was
 # started. That server is detached on purpose -- it has to outlive each
 # delegate so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
@@ -33,13 +33,21 @@ if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   exit 0
 fi
 
-MARKER="/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+# The marker is under unit/, or delegate/ for a run started before the rename.
+if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
+  MARKER="${PLAN_DELEGATE_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+else
+  MARKER="/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}"
+  if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}" ]]; then
+    MARKER="/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+  fi
+fi
 
 if [[ -f "${MARKER}" ]]; then
   # The marker holds the session directory, which is where the mesh files live.
   SESSION_DIR="$(head -n 1 "${MARKER}")"
   if [[ -n "${SESSION_DIR}" ]]; then
-    "$PY" "${SCRIPT_DIR}/remove_seats.py" \
+    "$PY" "${SCRIPT_DIR}/remove_workers.py" \
       --session-dir "${SESSION_DIR}" || true
   fi
   if [[ -n "${SESSION_DIR}" && ( -f "${SESSION_DIR}/mesh_roster.json" || -f "${SESSION_DIR}/mesh_server.json" || -f "${SESSION_DIR}/mesh_retired.json" ) ]]; then
@@ -53,7 +61,12 @@ if [[ -f "${MARKER}" ]]; then
     rm -rf -- "${SESSION_DIR}/verify_cache"
   fi
   if [[ -n "${SESSION_DIR}" ]]; then
-    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "delegate-$(basename "${SESSION_DIR}")" \
+    # A run folder under delegate/ keeps the instance name it started with.
+    INSTANCE="unit-$(basename "${SESSION_DIR}")"
+    if [[ "$(basename "$(dirname "${SESSION_DIR}")")" == delegate ]]; then
+      INSTANCE="delegate-$(basename "${SESSION_DIR}")"
+    fi
+    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "${INSTANCE}" \
       >/dev/null 2>&1 || true
   fi
   rm -f "${MARKER}"

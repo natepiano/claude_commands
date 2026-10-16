@@ -1,0 +1,159 @@
+"""An observed refusal outranks saved room until its own recovery is observed."""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import cast, override
+from unittest.mock import patch
+
+from scripts.accounts import accounts, refusals
+import usage_store
+
+
+WEEKLY_REFUSAL_WINDOW = refusals.KnownWindow("weekly")
+UNKNOWN_REFUSAL_RESET = refusals.NoResetKnown()
+
+
+class AccountRefusalTests(unittest.TestCase):
+    now: datetime = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
+    home: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+
+    def refusal(self, *, window: refusals.KnownWindow | refusals.UnknownWindow = WEEKLY_REFUSAL_WINDOW,
+                reset: refusals.KnownReset | refusals.NoResetKnown = UNKNOWN_REFUSAL_RESET,
+                login: str = "owner@example.invalid", tool: str = "claude") -> refusals.AccountRefusal:
+        self.assertIn(tool, ("claude", "codex"))
+        return refusals.AccountRefusal("codex" if tool == "codex" else "claude", login, window, reset, self.now)
+
+    def reading(self, *, at: datetime, weekly: float = 80, five: float = 80,
+                reset: datetime, tool: str = "claude", include_five: bool = True
+                ) -> accounts.FreshReading | accounts.StaleReading | accounts.NoReading:
+        usage = usage_store.StoredUsage(weekly=usage_store.StoredWindow(left=weekly,
+            resets=reset.isoformat(), at=at.isoformat()))
+        if include_five:
+            usage["five_hour"] = usage_store.StoredWindow(left=five, resets=reset.isoformat(), at=at.isoformat())
+        file = usage_store.store_file()
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps({usage_store.key(tool.capitalize(), "owner@example.invalid"): usage}))
+        return refusals.stored_reading("codex" if tool == "codex" else "claude", "owner@example.invalid", self.now + timedelta(minutes=2))
+
+    def test_refusal_round_trips_semantic_window_reset_and_timestamp(self) -> None:
+        original = self.refusal(reset=refusals.KnownReset(self.now + timedelta(hours=3)))
+        refusals.write_refusal(original)
+        self.assertEqual(refusals.load(), {refusals.key("claude", original.login): original})
+        self.assertEqual(refusals.store_file(), self.home / ".local/state/accounts/refusals.json")
+
+    def test_refusal_unknown_window_and_reset_round_trip_without_bare_optionals(self) -> None:
+        original = self.refusal(window=refusals.UnknownWindow())
+        refusals.write_refusal(original)
+        self.assertEqual(next(iter(refusals.load().values())), original)
+
+    def test_refusal_store_keys_same_login_independently_for_each_tool(self) -> None:
+        claude = self.refusal(login="OWNER@example.invalid")
+        codex = self.refusal(tool="codex")
+        refusals.write_refusal(claude)
+        refusals.write_refusal(codex)
+        self.assertEqual(len(refusals.load()), 2)
+        self.assertEqual(refusals.load()[refusals.key("claude", "owner@example.invalid")], claude)
+        self.assertEqual(refusals.load()[refusals.key("codex", "OWNER@example.invalid")], codex)
+
+    def test_concurrent_refusals_preserve_each_accounts_record_under_the_lock(self) -> None:
+        records = [self.refusal(login=f"account-{number}@example.invalid") for number in range(12)]
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            _ = list(workers.map(refusals.write_refusal, records))
+        self.assertEqual(set(refusals.load()), {refusals.key(item.tool, item.login) for item in records})
+
+    def test_known_reset_resolves_at_its_reset_without_a_new_reading(self) -> None:
+        reset = self.now + timedelta(minutes=15)
+        refused = self.refusal(reset=refusals.KnownReset(reset))
+        self.assertFalse(refusals.resolved(refused, accounts.NoReading(), reset - timedelta(microseconds=1)))
+        self.assertTrue(refusals.resolved(refused, accounts.NoReading(), reset))
+
+    def test_weekly_refusal_resolves_when_a_later_reading_moves_weekly_reset_later(self) -> None:
+        reset = self.now + timedelta(hours=3)
+        refused = self.refusal(reset=refusals.KnownReset(reset))
+        reading = self.reading(at=self.now + timedelta(seconds=1), reset=reset + timedelta(days=7))
+        self.assertTrue(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_five_hour_refusal_resolves_when_a_later_reading_moves_five_hour_reset_later(self) -> None:
+        reset = self.now + timedelta(hours=3)
+        refused = self.refusal(window=refusals.KnownWindow("five_hour"), reset=refusals.KnownReset(reset))
+        reading = self.reading(at=self.now + timedelta(seconds=1), reset=reset + timedelta(hours=5))
+        self.assertTrue(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_positive_reading_before_refusal_never_resolves_it(self) -> None:
+        reset = self.now + timedelta(hours=3)
+        refused = self.refusal(reset=refusals.KnownReset(reset))
+        reading = self.reading(at=self.now - timedelta(seconds=1), reset=reset + timedelta(days=7))
+        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_reading_at_same_time_as_refusal_never_resolves_it(self) -> None:
+        refused = self.refusal(window=refusals.UnknownWindow())
+        reading = self.reading(at=self.now, reset=self.now + timedelta(days=7))
+        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_known_window_refusal_keeps_blocking_when_later_reading_has_same_reset(self) -> None:
+        reset = self.now + timedelta(hours=3)
+        refused = self.refusal(reset=refusals.KnownReset(reset))
+        reading = self.reading(at=self.now + timedelta(seconds=1), reset=reset)
+        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_unknown_window_resolves_only_after_both_windows_have_positive_later_readings(self) -> None:
+        refused = self.refusal(window=refusals.UnknownWindow())
+        for weekly, five, expected in ((80, 0, False), (0, 80, False), (1, 1, True)):
+            with self.subTest(weekly=weekly, five=five):
+                reading = self.reading(at=self.now + timedelta(seconds=1), reset=self.now + timedelta(hours=3),
+                                       weekly=weekly, five=five)
+                self.assertEqual(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)), expected)
+
+    def test_unknown_reset_on_known_window_requires_both_windows_recovered(self) -> None:
+        refused = self.refusal(window=refusals.KnownWindow("weekly"))
+        reading = self.reading(at=self.now + timedelta(seconds=1), reset=self.now + timedelta(hours=3), five=0)
+        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+        reading = self.reading(at=self.now + timedelta(seconds=1), reset=self.now + timedelta(hours=3), five=1)
+        self.assertTrue(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_unknown_refusal_without_five_hour_window_resolves_only_on_positive_later_weekly_reading(self) -> None:
+        refused = self.refusal(window=refusals.UnknownWindow())
+        for at, weekly, expected in ((self.now, 80, False),
+                                     (self.now + timedelta(seconds=1), 0, False),
+                                     (self.now + timedelta(seconds=1), 1, True)):
+            with self.subTest(at=at, weekly=weekly):
+                reading = self.reading(at=at, weekly=weekly,
+                    reset=self.now + timedelta(hours=3), include_five=False)
+                self.assertEqual(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)), expected)
+
+    def test_stale_or_missing_reading_does_not_resolve_an_unexpired_refusal(self) -> None:
+        refused = self.refusal(reset=refusals.KnownReset(self.now + timedelta(hours=3)))
+        for reading in (accounts.NoReading(), accounts.StaleReading()):
+            with self.subTest(reading=reading):
+                self.assertFalse(refusals.resolved(refused, reading, self.now))
+
+    def test_unknown_refusal_window_requires_new_readings_even_when_a_reset_was_recorded(self) -> None:
+        refused = self.refusal(window=refusals.UnknownWindow(), reset=refusals.KnownReset(self.now))
+        self.assertFalse(refusals.resolved(refused, accounts.NoReading(), self.now))
+
+    def test_weekly_refusal_does_not_resolve_when_only_five_hour_reset_moves_later(self) -> None:
+        reset = self.now + timedelta(hours=3)
+        refused = self.refusal(reset=refusals.KnownReset(reset))
+        at = self.now + timedelta(seconds=1)
+        reading = accounts.FreshReading(
+            accounts.ReadingWindow(80, refusals.KnownReset(reset), at),
+            accounts.ReadingWindow(80, refusals.KnownReset(reset + timedelta(hours=5)), at), "0")
+        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_reading_with_only_one_window_observed_after_refusal_does_not_resolve_unknown_window(self) -> None:
+        refused = self.refusal(window=refusals.UnknownWindow())
+        reset = refusals.KnownReset(self.now + timedelta(hours=3))
+        reading = accounts.FreshReading(accounts.ReadingWindow(80, reset, self.now + timedelta(seconds=1)),
+            accounts.ReadingWindow(80, reset, self.now - timedelta(seconds=1)), "0")
+        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))

@@ -1,0 +1,5 @@
+{"id":"report-parent","role":"interactive","at":"2026-10-10T21:00:00Z"}
+{"id":"report-child","role":"subagent","at":"2026-10-10T21:00:00Z"}
+{"id":"report-review","role":"review","at":"2026-10-10T21:00:00Z"}
+{"id":"report-switch","role":"review","lens":"adversary","at":"2026-10-10T21:00:00Z"}
+not a ledger record

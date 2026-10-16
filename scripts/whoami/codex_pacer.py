@@ -48,6 +48,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
+from note_file import InvalidReset, KnownReset, NoResetKnown, reset_time
+
 STATE_DIR = Path(os.environ.get("CODEX_PACER_STATE_DIR", Path.home() / ".local" / "state" / "codex-pacer"))
 SESSIONS = Path.home() / ".codex" / "sessions"
 AGENTS_CONF = Path.home() / ".claude" / "config" / "agents.conf"
@@ -159,7 +161,7 @@ class Line(TypedDict, total=False):
 @dataclass(frozen=True)
 class Account:
     remaining: float
-    resets: datetime | None
+    resets: KnownReset | NoResetKnown | InvalidReset
     limit_resets: int
 
 
@@ -352,10 +354,12 @@ def accounts(notes: Sequence[AgentNote], now: datetime) -> list[Account]:
             continue
         resets = parse_local(note.get("resets"))
         remaining = parse_float(note.get("weekly_remaining_usage"))
-        if resets is None or resets <= local_now:
+        if not isinstance(resets, KnownReset) or resets.value <= local_now:
             # A weekly window that has closed has refreshed; one that opens on first
             # use starts full.
-            resets, remaining = None, 100.0
+            remaining = 100.0
+            if isinstance(resets, KnownReset):
+                resets = NoResetKnown()
         count = int(parse_float(note.get("limit_reset_count")) or 0)
         expiry = note.get("limit_reset")
         if count and expiry and expiry != "null" and parse_time(expiry) <= now:
@@ -364,13 +368,10 @@ def accounts(notes: Sequence[AgentNote], now: datetime) -> list[Account]:
     return found
 
 
-def parse_local(value: str | None) -> datetime | None:
-    if not value or value == "null":
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        return None
+def parse_local(value: str | None) -> KnownReset | NoResetKnown | InvalidReset:
+    """A note's reset as this machine's wall time, whichever zone wrote it."""
+    reset = reset_time(value)
+    return KnownReset(reset.value.astimezone().replace(tzinfo=None)) if isinstance(reset, KnownReset) else reset
 
 
 def parse_float(value: str | None) -> float | None:
@@ -383,7 +384,8 @@ def parse_float(value: str | None) -> float | None:
 def checkpoints(found: list[Account], now: datetime) -> list[Checkpoint]:
     local_now = now.astimezone().replace(tzinfo=None)
     available = sum(a.remaining for a in found) + 100 * sum(a.limit_resets for a in found)
-    resets = sorted(a.resets for a in found if a.resets is not None and a.resets - local_now <= HORIZON)
+    resets = sorted(a.resets.value for a in found
+                    if isinstance(a.resets, KnownReset) and a.resets.value - local_now <= HORIZON)
     points: list[Checkpoint] = []
     for index, at in enumerate(resets):
         budget = available + 100 * index - BUFFER * (index + 1)

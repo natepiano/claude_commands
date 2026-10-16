@@ -42,7 +42,9 @@ Pass `--guide` and `--tags` through only when given. Each line reads
 `<stem> — <title> — <test>`.
 
 Then read `docs/design-decisions.md` in the working directory's repository,
-when it exists. What it records as deliberate is never a defect.
+when it exists. What it records as deliberate is never a defect. Read its
+targets file the same way (`docs/hana/targets.md` in hana): a shot that misses
+a target there is a defect.
 </LoadChecklist>
 
 ---

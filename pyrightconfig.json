@@ -10,36 +10,63 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/herdr",
+      "extraPaths": [
+        ".",
+        "scripts/herdr",
+        "scripts/message",
+        "scripts/production",
+        "scripts/lib"
+      ]
+    },
+    {
+      "root": "scripts/delegate",
+      "extraPaths": [
+        ".",
+        "scripts/production",
+        "scripts/message",
+        "scripts/herdr",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/feature_log",
       "extraPaths": [
-        "scripts/feature_log"
+        "scripts/feature_log",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/model_study",
       "extraPaths": [
-        "scripts/model_study"
+        "scripts/model_study",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
+        "scripts/delegate",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/production",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/fix",
       "extraPaths": [
-        "scripts/fix"
+        "scripts/fix",
+        "scripts/lib"
       ]
     },
     {
@@ -48,7 +75,8 @@
         ".",
         "scripts/whoami",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {
@@ -56,8 +84,10 @@
       "extraPaths": [
         ".",
         "scripts/nightly_review",
+        "scripts/herdr",
         "scripts/shutdown",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib"
       ]
     },
     {
@@ -67,7 +97,9 @@
         "scripts/production",
         "scripts/delegate",
         "scripts/notify",
-        "scripts/shutdown"
+        "scripts/shutdown",
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
@@ -81,14 +113,21 @@
       "root": "scripts/buildlog",
       "extraPaths": [
         "scripts/buildlog",
-        "scripts/lint"
+        "scripts/build_hold",
+        "scripts/lint",
+        "scripts/lib",
+        "scripts/build_targets",
+        "scripts/mac_test"
       ]
     },
     {
       "root": "scripts/mac_test",
       "extraPaths": [
         "scripts/mac_test",
-        "scripts/lint"
+        "scripts/buildlog",
+        "scripts/build_hold",
+        "scripts/lint",
+        "scripts/lib"
       ]
     },
     {
@@ -98,13 +137,15 @@
         "scripts/build_hold",
         "scripts/mac_test",
         "scripts/lint",
-        "scripts/message"
+        "scripts/message",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/lint",
       "extraPaths": [
-        "scripts/lint"
+        "scripts/lint",
+        "scripts/lib"
       ]
     },
     {
@@ -125,26 +166,48 @@
         "scripts/message",
         "scripts/notify",
         "scripts/shutdown",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
       "root": "scripts/build_hold",
       "extraPaths": [
         "scripts/build_hold",
+        "scripts/build_targets",
+        "scripts/lint",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/shutdown",
       "extraPaths": [
+        ".",
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/message",
         "scripts/notify",
         "scripts/production",
-        "scripts/hooks"
+        "scripts/hooks",
+        "scripts/lib",
+        "scripts/herdr"
+      ]
+    },
+    {
+      "root": "scripts/bevy_upgrade",
+      "extraPaths": [
+        "scripts/bevy_upgrade",
+        "scripts/production"
+      ]
+    },
+    {
+      "root": "scripts/bevy_migration_plan",
+      "extraPaths": [
+        "scripts/bevy_migration_plan",
+        "scripts/bevy_upgrade"
       ]
     },
     {

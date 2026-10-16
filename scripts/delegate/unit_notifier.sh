@@ -17,11 +17,11 @@ fi
 notifier=$REPO/scripts/message/notifier.sh
 
 # The leading digits, as progress_timer.sh reads them, so a trailing comment
-# leaves the interval alone. PLAN_DELEGATE_PROGRESS_UPDATES=on-demand gives a
-# new run no schedule: /unit:report runs only when someone asks for it, and
-# `on` makes the schedule then.
+# leaves the interval alone. PLAN_DELEGATE_PROGRESS_UPDATES=on-demand, or no
+# line, gives a new run no schedule: /unit:report runs only when someone asks
+# for it, and `on` makes the schedule then. Only `scheduled` starts one.
 seconds=900
-updates=scheduled
+updates=on-demand
 config=${PLAN_DELEGATE_CONFIG:-$HOME/.claude/config/delegate.conf}
 if [[ -r $config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
@@ -37,7 +37,8 @@ minutes=$(( (seconds + 59) / 60 ))
 if [[ $1 == --all ]]; then
   (( $# == 2 )) && minutes=$2
   failed=0
-  dirs=(${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/delegate-*(/N))
+  state=${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}
+  dirs=($state/unit-*(/N) $state/delegate-*(/N))
   (( $#dirs )) || print -r -- 'no unit run has a report schedule'
   for dir in $dirs; do
     [[ -r $dir/conf && -r $dir/state ]] || continue
@@ -55,7 +56,13 @@ if [[ $1 == --all ]]; then
 fi
 
 session_id=$1
-marker=${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/$session_id
+# The marker is under unit/, or delegate/ for a run started before the rename.
+if [[ -n ${PLAN_DELEGATE_ACTIVE_DIR:-} ]]; then
+  marker=$PLAN_DELEGATE_ACTIVE_DIR/$session_id
+else
+  marker=/tmp/claude/unit/active/$session_id
+  [[ -f $marker || ! -f /tmp/claude/delegate/active/$session_id ]] || marker=/tmp/claude/delegate/active/$session_id
+fi
 if [[ ! -f $marker ]]; then
   print -u2 -r -- "no active unit run marker: $marker"
   exit 1
@@ -66,7 +73,9 @@ if [[ -z $session_dir ]]; then
   exit 1
 fi
 run_id=${session_dir:t}
-instance=delegate-$run_id
+# A run folder under delegate/ keeps the instance name it started with.
+instance=unit-$run_id
+[[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-$run_id
 
 make_instance() {
   local check_words=("$REPO/scripts/lib/py" "$REPO/scripts/hooks/delegate_run.py" check "$session_id" "$session_dir")
@@ -91,9 +100,11 @@ if (( $# == 2 )); then
 fi
 
 if [[ $updates == on-demand ]]; then
-  # A resumed run may still hold the schedule an earlier start made.
+  # A resumed run keeps the schedule it has, on or off: `new` retargets it and
+  # leaves its clock alone (user, 2026-10-13: existing work keeps what it has).
   if zsh "$notifier" status "$instance" >/dev/null 2>&1; then
-    zsh "$notifier" stop "$instance" >/dev/null || exit $?
+    make_instance
+    exit $?
   fi
   print -r -- "progress updates on demand: $instance has no schedule; /unit:report on starts one"
   exit 0

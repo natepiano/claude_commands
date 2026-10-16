@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import cast, override
 
@@ -18,6 +19,11 @@ HERE = Path(__file__).parent
 CLI = HERE / "cli.py"
 RECORD = HERE / "record.py"
 AT = "2026-10-04T21:00:00.000Z"
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class MemoryRecordTests(unittest.TestCase):

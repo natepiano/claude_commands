@@ -33,8 +33,8 @@ rather than enforced:
   * the gating open count failed to decrease across `STALLED_ROUNDS` rounds
   * the phase spent its repair budget, which is the first round's gating count
     times `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`
-  * one seat ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
-  * one seat had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
+  * one worker ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
+  * one worker had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
   * a runaway backstop at `RUNAWAY_ROUNDS` rounds
 
 Every one of those limits is set in `~/.claude/config/delegate.conf`, which is
@@ -53,6 +53,7 @@ import fcntl
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -66,6 +67,9 @@ from typing import TypedDict, cast
 SCHEMA_VERSION = 1
 STATE_FILENAME = "findings_state.json"
 PROGRESS_STATE_FILENAME = "progress_history_state.json"
+# The progress recorder's key for the older open phases (progress_history.OPEN_PHASES_KEY).
+OPEN_PHASES_KEY = "open_phases"
+PHASE_HELP = "the plan phase id this call is for; required when more than one phase is open"
 
 SEVERITIES = ("blocker", "minor", "nit")
 FIRST_ROUND_GATING = ("blocker", "minor")
@@ -277,9 +281,43 @@ def _state_path(session_dir: Path) -> Path:
     return session_dir / STATE_FILENAME
 
 
+def _parked_path(session_dir: Path, instance_id: str) -> Path:
+    """Where a phase's ledger waits while another open phase is current.
+
+    Phases can be open together, and the current one owns `findings_state.json`
+    (implement.sh reads it there). The ledger it displaces is kept here rather
+    than discarded, so the older phase finds its findings when it is current
+    again.
+    """
+    return session_dir / f"findings_state-{instance_id}.json"
+
+
+def _ledger_instance(path: Path) -> str:
+    try:
+        state = _json_object(path.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    return _string(state.get("phase_instance_id")) if state is not None else ""
+
+
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
+    """Write a phase's ledger where its readers look for it.
+
+    The newest open phase owns `findings_state.json`. An older open phase named
+    with `--phase` writes its parked file instead, so its repair never displaces
+    the newest phase's ledger from the file implement.sh checks.
+    """
     session_dir.mkdir(parents=True, exist_ok=True)
-    target = _state_path(session_dir)
+    live = _state_path(session_dir)
+    instance_id = _string(state.get("phase_instance_id"))
+    displaced = _ledger_instance(live) if live.exists() else ""
+    newest = _newest_open_instance(session_dir)
+    if live.exists() and displaced != instance_id and instance_id and newest and newest != instance_id:
+        target = _parked_path(session_dir, instance_id)
+    else:
+        target = live
+        if displaced and displaced != instance_id:
+            _ = shutil.copyfile(live, _parked_path(session_dir, displaced))
     with tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
@@ -293,18 +331,52 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     os.replace(temporary, target)
 
 
-def _phase_identity(session_dir: Path) -> tuple[str, str]:
-    """Read the active phase from progress state so the ledger is phase-scoped."""
+def _progress_state(session_dir: Path) -> dict[str, object] | None:
     path = session_dir / PROGRESS_STATE_FILENAME
     if not path.exists():
-        return "", ""
+        return None
     try:
-        progress = _json_object(path.read_text(encoding="utf-8"))
+        return _json_object(path.read_text(encoding="utf-8"))
     except OSError:
-        return "", ""
+        return None
+
+
+def _open_phases(progress: dict[str, object]) -> list[dict[str, object]]:
+    """Every open phase, oldest first: the older ones the recorder parks, then the newest."""
+    phases = _object_list(progress.get(OPEN_PHASES_KEY))
+    current = _object_dict(progress.get("phase"))
+    if current is not None and _string(current.get("status")) == "active":
+        phases.append(current)
+    return phases
+
+
+def _newest_open_instance(session_dir: Path) -> str:
+    progress = _progress_state(session_dir)
+    phases = _open_phases(progress) if progress is not None else []
+    return _string(phases[-1].get("instance_id")) if phases else ""
+
+
+def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
+    """The phase this ledger call is for, so two open phases keep separate ledgers.
+
+    A named phase must be open. With none named, the one open phase is meant;
+    with several open the call is refused, since picking one would act on the
+    newest phase's ledger whatever the caller meant.
+    """
+    progress = _progress_state(session_dir)
     if progress is None:
-        return "", ""
-    phase = _object_dict(progress.get("phase"))
+        return "", phase_id
+    phases = _open_phases(progress)
+    if phase_id:
+        for phase in phases:
+            if _string(phase.get("id")) == phase_id:
+                return _string(phase.get("instance_id")), phase_id
+        open_ids = ", ".join(_string(phase.get("id")) for phase in phases) or "none"
+        raise SystemExit(f"Phase {phase_id} is not open (open phases: {open_ids})")
+    if len(phases) > 1:
+        open_ids = ", ".join(_string(phase.get("id")) for phase in phases)
+        raise SystemExit(f"{len(phases)} phases are open ({open_ids}); name one with --phase")
+    phase = phases[0] if phases else _object_dict(progress.get("phase"))
     if phase is None:
         return "", ""
     return _string(phase.get("instance_id")), _string(phase.get("id"))
@@ -343,12 +415,13 @@ def _append_event(session_dir: Path, state: dict[str, object], event: dict[str, 
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _fresh_state(session_dir: Path, now: float) -> dict[str, object]:
-    instance_id, phase_id = _phase_identity(session_dir)
+def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "phase_instance_id": instance_id,
@@ -360,12 +433,12 @@ def _fresh_state(session_dir: Path, now: float) -> dict[str, object]:
     }
 
 
-def _read_state(session_dir: Path, now: float) -> dict[str, object]:
-    """Load the ledger, resetting it when the active phase has moved on."""
+def _read_state(session_dir: Path, now: float, phase: str = "") -> dict[str, object]:
+    """Load the phase's ledger: the live file, a parked one, or a fresh one."""
     path = _state_path(session_dir)
-    instance_id, phase_id = _phase_identity(session_dir)
+    instance_id, phase_id = _phase_identity(session_dir, phase)
     if not path.exists():
-        return _fresh_state(session_dir, now)
+        return _fresh_state(instance_id, phase_id, now)
     try:
         state = _json_object(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -373,10 +446,15 @@ def _read_state(session_dir: Path, now: float) -> dict[str, object]:
     if state is None:
         raise SystemExit(f"Invalid findings state: {path}")
     if instance_id and _string(state.get("phase_instance_id")) != instance_id:
-        fresh = _fresh_state(session_dir, now)
-        fresh["phase_instance_id"] = instance_id
-        fresh["phase_id"] = phase_id
-        return fresh
+        parked = _parked_path(session_dir, instance_id)
+        if parked.exists():
+            try:
+                kept = _json_object(parked.read_text(encoding="utf-8"))
+            except OSError as error:
+                raise SystemExit(f"Unable to read findings state {parked}: {error}") from error
+            if kept is not None:
+                return kept
+        return _fresh_state(instance_id, phase_id, now)
     return state
 
 
@@ -422,10 +500,10 @@ def _history_root() -> Path:
 
 
 class PhasePass(TypedDict):
-    """One pass a phase ran: what work it was, which seat ran it, how it ended.
+    """One pass a phase ran: what work it was, which worker ran it, how it ended.
 
     `kind` stays semantic -- impl, test, fix, review -- and says nothing about
-    who ran it. `slot` is the seat: a stable worker identity for the length of
+    who ran it. `slot` is the worker: a stable worker identity for the length of
     one launcher, not the role that worker is performing, which changes during a
     phase and lives on the coordination board.
     """
@@ -436,11 +514,11 @@ class PhasePass(TypedDict):
 
 
 def _event_slot(event: dict[str, object]) -> str:
-    """The seat a pass event was stamped with, under whichever key wrote it.
+    """The worker a pass event was stamped with, under whichever key wrote it.
 
     The field was `team_role` for a day, before the value was understood to
-    name a seat. Reading both keeps a phase that spans the rename to one bucket
-    per seat instead of splitting each seat in two.
+    name a worker. Reading both keeps a phase that spans the rename to one bucket
+    per worker instead of splitting each worker in two.
     """
     if "team_slot" in event:
         return _string(event.get("team_slot"))
@@ -451,7 +529,7 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
     """Every pass this phase instance has run, in the order they opened.
 
     Read from the durable event stream rather than the session cache: the cache
-    holds one pass per seat and what the gate needs is the whole phase.
+    holds one pass per worker and what the gate needs is the whole phase.
     `finished` carries the outcome; a pass still running contributes its
     `started` row with an empty status.
     """
@@ -493,11 +571,11 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
 
 
 def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
-    """The phase's passes split into one sequence per seat, order preserved.
+    """The phase's passes split into one sequence per worker, order preserved.
 
-    Passes with no seat land in one bucket together, which is every pass the
+    Passes with no worker land in one bucket together, which is every pass the
     back corpus recorded and every pass of a phase run by a single launcher --
-    the sequence those see is the flat one, exactly as before seats existed.
+    the sequence those see is the flat one, exactly as before workers existed.
     """
     by_slot: dict[str, list[PhasePass]] = {}
     for entry in passes:
@@ -506,22 +584,22 @@ def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
 
 
 def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
-    """The longest run of one kind ending at some seat's most recent pass.
+    """The longest run of one kind ending at some worker's most recent pass.
 
-    Counted within a seat, never across seats. A phase team runs its launchers
+    Counted within a worker, never across workers. A phase team runs its launchers
     at once, so two impl passes in the event stream are one round with two
-    workers; what this limit guards against is one seat being handed the same
+    workers; what this limit guards against is one worker being handed the same
     kind of work over and over while the phase fails to advance, and only that
-    seat's own sequence shows it.
+    worker's own sequence shows it.
     """
     longest_kind = ""
     longest_run = 0
     by_slot = _passes_by_slot(passes)
     for slot in sorted(by_slot):
-        seat_passes = by_slot[slot]
-        kind = seat_passes[-1]["kind"]
+        worker_passes = by_slot[slot]
+        kind = worker_passes[-1]["kind"]
         run = 0
-        for entry in reversed(seat_passes):
+        for entry in reversed(worker_passes):
             if entry["kind"] != kind:
                 break
             run += 1
@@ -531,10 +609,10 @@ def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
 
 
 def _review_cancellations(passes: list[PhasePass]) -> int:
-    """The most times any one seat had a review pass canceled.
+    """The most times any one worker had a review pass canceled.
 
-    Per seat for the same reason the kind run is: the limit asks whether a
-    reviewer is never completing, and one cancellation each across two seats
+    Per worker for the same reason the kind run is: the limit asks whether a
+    reviewer is never completing, and one cancellation each across two workers
     is two reviewers interrupted once, not one that cannot finish.
     """
     per_slot: dict[str, int] = {}
@@ -679,7 +757,7 @@ def _advisory_reason(
 def _open(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     severity = _arg_string(args, "severity")
     ordinal = _integer(state.get("next_ordinal"), 1)
     finding_id = f"F{ordinal:03d}"
@@ -724,7 +802,7 @@ def _open(args: argparse.Namespace) -> None:
 def _verdict(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     finding_id = _arg_string(args, "id")
     entry = _finding(state, finding_id)
     outcome = _arg_string(args, "state")
@@ -812,7 +890,7 @@ def _gate_payload(state: dict[str, object], session_dir: Path) -> dict[str, obje
 def _gate(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     in_flight = _in_flight_ids(state)
     if in_flight:
         raise SystemExit(
@@ -849,7 +927,7 @@ def _gate(args: argparse.Namespace) -> None:
 def _dispatch(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     payload = _gate_payload(state, session_dir)
     verdict = _string(payload.get("verdict"))
     if verdict != "dispatch":
@@ -928,7 +1006,7 @@ def _landed(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     round_entry = _in_flight_round(state)
     in_flight = _in_flight_ids(state)
     if round_entry is None or not in_flight:
@@ -970,7 +1048,7 @@ def _abandon(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     round_entry = _in_flight_round(state)
     in_flight = _in_flight_ids(state)
     if round_entry is None or not in_flight:
@@ -1014,7 +1092,7 @@ def _abandon(args: argparse.Namespace) -> None:
 def _status(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now)
+    state = _read_state(session_dir, now, _arg_string(args, "phase"))
     findings = [_summarize(_finding(state, key)) for key in sorted(_findings(state))]
     payload: dict[str, object] = {
         "phase_id": _string(state.get("phase_id")),
@@ -1058,6 +1136,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     opened = subparsers.add_parser("open", help="record a confirmed finding and print its id")
     _ = opened.add_argument("--session-dir", required=True)
+    _ = opened.add_argument("--phase", default="", help=PHASE_HELP)
     _ = opened.add_argument("--severity", choices=SEVERITIES, required=True)
     _ = opened.add_argument("--title", required=True)
     _ = opened.add_argument("--file", default="")
@@ -1075,6 +1154,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")
     _ = verdict.add_argument("--session-dir", required=True)
+    _ = verdict.add_argument("--phase", default="", help=PHASE_HELP)
     _ = verdict.add_argument("--id", required=True)
     _ = verdict.add_argument(
         "--state", choices=("accepted", "still_open", "reopened"), required=True
@@ -1084,10 +1164,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     gate = subparsers.add_parser("gate", help="decide converged / dispatch / stop")
     _ = gate.add_argument("--session-dir", required=True)
+    _ = gate.add_argument("--phase", default="", help=PHASE_HELP)
     gate.set_defaults(handler=_gate)
 
     dispatch = subparsers.add_parser("dispatch", help="record a fix round covering the batch")
     _ = dispatch.add_argument("--session-dir", required=True)
+    _ = dispatch.add_argument("--phase", default="", help=PHASE_HELP)
     _ = dispatch.add_argument("--covers", required=True)
     dispatch.set_defaults(handler=_dispatch)
 
@@ -1095,12 +1177,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "landed", help="promote an in-flight round to review after a clean worker exit"
     )
     _ = landed.add_argument("--session-dir", required=True)
+    _ = landed.add_argument("--phase", default="", help=PHASE_HELP)
     landed.set_defaults(handler=_landed)
 
     abandon = subparsers.add_parser(
         "abandon", help="return an in-flight round to open because its repair died"
     )
     _ = abandon.add_argument("--session-dir", required=True)
+    _ = abandon.add_argument("--phase", default="", help=PHASE_HELP)
     _ = abandon.add_argument("--reason", required=True)
     _ = abandon.add_argument(
         "--edits-landed",
@@ -1111,6 +1195,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="print the whole ledger")
     _ = status.add_argument("--session-dir", required=True)
+    _ = status.add_argument("--phase", default="", help=PHASE_HELP)
     status.set_defaults(handler=_status)
 
     return parser

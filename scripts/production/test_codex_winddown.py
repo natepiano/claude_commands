@@ -36,6 +36,24 @@ with open(os.environ["LOG"], "a") as log:
 
 
 class CountTests(unittest.TestCase):
+    def test_reset_ready_notification_retries_failed_delivery_and_sends_once_after_success(self) -> None:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with (mock.patch.object(codex_winddown, "STATE", directory),
+              mock.patch.object(codex_winddown, "instances", return_value=["production"]),
+              mock.patch.object(broadcast, "SEND", directory / "fake-send.py"),
+              mock.patch.object(socket, "gethostname", return_value="natedev"),
+              mock.patch.object(subprocess, "run", side_effect=[
+                  subprocess.CompletedProcess([], 3, "FAILED: unavailable", ""),
+                  subprocess.CompletedProcess([], 0, "SENT", "")]) as run):
+            codex_winddown.announce_quiet(0)
+            self.assertFalse((directory / codex_winddown.QUIET).exists())
+            codex_winddown.announce_quiet(0)
+            codex_winddown.announce_quiet(0)
+        self.assertEqual(run.call_count, 2)
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[1], str(directory / "fake-send.py"))
+        self.assertEqual(command[command.index("--text-id") + 1], "codex.reset_ready")
+
     def test_announcement_uses_showrunner_and_unit_director_groups(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (
@@ -347,9 +365,8 @@ class MessageTests(unittest.TestCase):
         for _ in range(2):
             _ = self.run_script("count", "hana")
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertEqual(log.count("send --to user --from codex-winddown --summary Codex wind-down --need decision"
-                                   + " --action Reset Codex, then run /codex_winddown clear."
-                                   + " --text No Codex agent is running on"), 1)
+        self.assertEqual(log.count("send --to user --from codex-winddown --need decision --text-id codex.reset_ready"), 1)
+        self.assertIn("--value machine=", log)
         self.set_processes(*agent)
         _ = self.run_script("count", "hana")
         self.set_processes()

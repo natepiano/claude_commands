@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import shlex
+import socket
+import sys
 import unittest
 from enum import StrEnum
 from types import ModuleType
@@ -10,10 +12,13 @@ from typing import Never, cast, override
 from unittest.mock import patch
 
 import remote
+import remote_control
 import restart
+import herdr
 import settle
 import shutdown
-from record import ShutdownRecord, ShutdownSessionEntry
+import sessions
+from record import SessionShutdown
 
 
 class ShutdownSendLeaf(StrEnum):
@@ -22,6 +27,7 @@ class ShutdownSendLeaf(StrEnum):
     RESTART_RETIRE = "restart._retire"
     RUN_REMOTE = "remote.run_remote"
     LAUNCH_CONDUCTOR = "settle._launch_conductor"
+    LAUNCH_REMOTE_CONTROL_FIXER = "remote_control.launch_fixer"
     RUN_NOTIFIER = "settle.run_notifier"
 
 
@@ -44,8 +50,23 @@ _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object]
     ShutdownSendLeaf.LAUNCH_CONDUCTOR: (
         (settle, "_launch_conductor", settle._launch_conductor),  # pyright: ignore[reportPrivateUsage]
     ),
+    ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: (
+        (remote_control, "launch_fixer", remote_control.launch_fixer),
+    ),
     ShutdownSendLeaf.RUN_NOTIFIER: ((settle, "run_notifier", settle.run_notifier),),
 }
+
+
+def registry_confirmation(ids: frozenset[str]) -> restart.RegistryConfirmation:
+    return restart.RegistryConfirmation(tuple(sessions.SessionRecord(pid=index + 1,
+        sessionId=identity, name=identity, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        for index, identity in enumerate(sorted(ids))))
+
+
+def linux_process_fixture(test: unittest.TestCase) -> None:
+    """Select the platform modeled by proc trees and systemd stand-ins."""
+    _ = cast(object, test.enterContext(patch.object(sys, "platform", "linux")))
+    _ = cast(object, test.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
 
 
 class ShutdownTestCase(unittest.TestCase):
@@ -56,6 +77,8 @@ class ShutdownTestCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # Records and reports in these fixtures belong to natedev.
+        _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         self._send_leaf_hits.clear()
         # Run after patch cleanups, so caught assertions still fail the test.
         self.addCleanup(self._fail_send_leaf_hits)
@@ -66,6 +89,7 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.RUN_REMOTE: self._block_run_remote,
             ShutdownSendLeaf.LAUNCH_CONDUCTOR: self._block_launch_conductor,
             ShutdownSendLeaf.RUN_NOTIFIER: self._block_run_notifier,
+            ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: self._block_launch_remote_control,
         }
         for leaf, bindings in _REAL_LEAF_BINDINGS.items():
             for module, name, _real in bindings:
@@ -104,14 +128,14 @@ class ShutdownTestCase(unittest.TestCase):
         )
 
     def _block_restart_retire(
-        self, record: ShutdownRecord, entry: ShutdownSessionEntry, *, dry_run: bool
+        self, record: SessionShutdown, *, dry_run: bool
     ) -> None:
         if dry_run:
-            _REAL_RESTART_RETIRE(record, entry, dry_run=True)
+            _REAL_RESTART_RETIRE(record, dry_run=True)
             return
         self._reached_send_leaf(
             ShutdownSendLeaf.RESTART_RETIRE,
-            f"session:{entry['session']['session_id']}",
+            f"session:{record['session']['session_id']}",
         )
 
     def _block_run_remote(
@@ -126,11 +150,18 @@ class ShutdownTestCase(unittest.TestCase):
             f"{remote.other_machine()}: shutdown.py {shlex.join(args)}",
         )
 
-    def _block_launch_conductor(self, login: str, label: str, here: bool) -> Never:
+    def _block_launch_conductor(self, login: str, label: str, here: bool = True) -> Never:
         del label, here
         self._reached_send_leaf(
             ShutdownSendLeaf.LAUNCH_CONDUCTOR, f"conductor for {login}"
         )
+
+    def _block_launch_remote_control(
+        self, session_id: str, pid: int, proc_start: str, who: str,
+        session: str
+    ) -> Never:
+        del pid, proc_start, who, session
+        self._reached_send_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, f"session:{session_id}")
 
     def _block_run_notifier(self, verb: str, instance: str) -> Never:
         del verb

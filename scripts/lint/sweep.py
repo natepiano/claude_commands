@@ -122,7 +122,13 @@ each with LOCK_EX|LOCK_NB while a build script slept). This takes all of them
 without waiting, in every build tree, before scanning, and skips the sweep if
 any is held: a delete under a running build leaves cargo failing to write
 into fingerprint dirs that vanished. Holding them makes a build that starts
-mid-sweep wait until the sweep finishes.
+mid-sweep wait until the sweep finishes. A test run holds none of those locks:
+nextest executes its binaries straight from deps/ after the build, and on
+2026-10-15 a floor sweep at test 2105 of 4072 left 1965 hana tests failing to
+exec theirs. So a target is also busy while a live process runs from it, works
+in it or maps a file under it (/proc/<pid>/exe, cwd, maps), or while a
+cargo-nextest runs whose workspace owns it, which covers the moments between two
+test binaries. A running app counts too, so its target waits for it to exit.
 """
 
 from __future__ import annotations
@@ -141,8 +147,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TypeGuard, TypedDict, cast
-from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+if TYPE_CHECKING:
+    from ..notify.push_texts import RenderedPush
+    from ..notify import review
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -163,6 +174,10 @@ DOC_LOCK_NAME = ".lock"
 MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+PROC_DIR = "/proc"
+# cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
+NEXTEST_ARG = "nextest"
+CARGO_TARGET_DIR_ENV = "CARGO_TARGET_DIR"
 HASHED_DIRS = (".fingerprint", "build", "deps", "examples")
 FINGERPRINT_DIR = ".fingerprint"
 INCREMENTAL_DIR = "incremental"
@@ -192,7 +207,6 @@ ALERT_INTERVAL_SECONDS = 60 * 60
 # loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
 UNEXPLAINED_FALL_BYTES = 10 * GIB
 LARGE_REMOVAL_BYTES = 32 * GIB
-PACIFIC = ZoneInfo("America/Los_Angeles")
 # A nightly worktree's target is 5 below its root, a scratch crate's under
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
 FLOOR_SEARCH_DEPTH = 8
@@ -420,6 +434,81 @@ def lock_trees(trees: list[str]) -> tuple[list[int], str | None]:
 def release(held: list[int]) -> None:
     for fd in held:
         os.close(fd)
+
+
+@dataclass(frozen=True)
+class TargetUse:
+    """A live process using a target directory, and how."""
+
+    pid: int
+    how: str
+
+
+def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
+    """Each target a live process uses, with one such process: its exe, its working directory or a
+    file it maps lies under the target, or it is a cargo-nextest run whose workspace owns the target.
+
+    nextest's run phase holds none of cargo's locks: it executes test binaries straight from
+    deps/, and between two of them no child may be running from the target, so the nextest
+    process itself counts. Without /proc (the Mac) no use can be seen.
+    """
+    prefixes = {target: os.path.realpath(target) + os.sep for target in targets}
+    found: dict[str, TargetUse] = {}
+    try:
+        names = [name for name in os.listdir(proc) if name.isdigit()]
+    except OSError:
+        return found
+    for name in names:
+        left = [target for target in prefixes if target not in found]
+        if not left:
+            break
+        base = os.path.join(proc, name)
+        try:
+            exe = os.readlink(os.path.join(base, "exe"))
+            cwd = os.readlink(os.path.join(base, "cwd"))
+            with open(os.path.join(base, "maps"), "rb") as handle:
+                maps = handle.read()
+            with open(os.path.join(base, "cmdline"), "rb") as handle:
+                argv = [arg.decode(errors="replace") for arg in handle.read().split(b"\0") if arg]
+        except OSError:
+            continue
+        pid = int(name)
+        for target in left:
+            prefix = prefixes[target]
+            # A maps line ends in the mapped file's path, after a space.
+            mapped = maps.find(b" " + os.fsencode(prefix)) + 1
+            if exe.startswith(prefix):
+                found[target] = TargetUse(pid, f"runs {exe}")
+            elif (cwd + os.sep).startswith(prefix):
+                found[target] = TargetUse(pid, f"works in {cwd}")
+            elif mapped:
+                path = maps[mapped:maps.find(b"\n", mapped)].decode(errors="replace")
+                found[target] = TargetUse(pid, f"maps {path}")
+        if NEXTEST_ARG in argv[1:2] or (argv and os.path.basename(argv[0]) == f"cargo-{NEXTEST_ARG}"):
+            for target in nextest_targets(argv, cwd, os.path.join(base, "environ"), left):
+                _ = found.setdefault(target, TargetUse(pid, f"runs cargo-nextest in {cwd}"))
+    return found
+
+
+def nextest_targets(argv: list[str], cwd: str, environ: str, targets: list[str]) -> list[str]:
+    """The targets a nextest run in cwd builds into: the one --target-dir or CARGO_TARGET_DIR names,
+    or else each target beside a directory that holds cwd (a workspace's default target)."""
+    named = next((arg.split("=", 1)[1] for arg in argv if arg.startswith(f"{TARGET_DIR_FLAG}=")), None)
+    if named is None and TARGET_DIR_FLAG in argv[:-1]:
+        named = argv[argv.index(TARGET_DIR_FLAG) + 1]
+    if named is None:
+        try:
+            with open(environ, "rb") as handle:
+                entries = handle.read().split(b"\0")
+        except OSError:
+            entries = []
+        prefix = f"{CARGO_TARGET_DIR_ENV}=".encode()
+        named = next((entry[len(prefix):].decode(errors="replace") for entry in entries if entry.startswith(prefix)), None)
+    if named:
+        chosen = os.path.realpath(os.path.join(cwd, named))
+        return [target for target in targets if os.path.realpath(target) == chosen]
+    return [target for target in targets
+            if (cwd + os.sep).startswith(os.path.dirname(os.path.realpath(target)) + os.sep)]
 
 
 def newest_times(directory: str) -> tuple[float, float]:
@@ -755,7 +844,7 @@ def mib(size: int) -> str:
 
 
 def when(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def scan_roots(roots: list[str], trees: list[str]) -> Scan:
@@ -996,7 +1085,7 @@ def read_disk_measurement() -> DiskMeasurement:
 
 
 def pacific_time(timestamp: float | datetime) -> str:
-    value = timestamp.astimezone(PACIFIC) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, PACIFIC)
+    value = timestamp.astimezone(user_zone()) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, user_zone())
     return value.strftime("%Y-%m-%d %H:%M %Z")
 
 
@@ -1082,11 +1171,11 @@ def floor_alert_text(now: float, removed: int, previous: NoFloorRecord | FloorRe
 def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
                             held_count: int, held_bytes: int, ci_bytes: int,
                             measurement: DiskMeasurement, failures: int) -> str:
-    held = f"{held_count} target dirs a build holds ({gib(held_bytes)}), which the sweep takes once their builds end; " if held_count else ""
+    held = f"{held_count} target dirs a build or test run uses ({gib(held_bytes)}), which the sweep takes once those end; " if held_count else ""
     for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
         message = "\n".join([
-            f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} and has no build cache left that it may remove; free space is {gib(free)}, under the {gib(floor)} floor.",
-            f"To get back over the floor, free {gib(floor - free)} outside build caches.",
+            f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No build cache is left to remove.",
+            f"Free {gib(floor - free)} outside build caches in a terminal on natedev.",
             f"Not swept: {held}CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
             *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
@@ -1096,22 +1185,51 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     return message
 
 
-def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
+@dataclass(frozen=True)
+class NoPhoneAlert:
+    """This cleanup report goes only to the machine's session."""
+
+
+NO_PHONE_ALERT = NoPhoneAlert()
+
+
+def disk_floor_push(removed: int, free: int, floor: int) -> RenderedPush:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    if TYPE_CHECKING:
+        from ..notify.push_texts import render
+    else:
+        from push_texts import render
+
+    return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
+                  shortfall=gib(max(0, floor - free)))
+
+
+def send_floor_alert(message: str, channels: FloorAlertChannels, *,
+                     phone: RenderedPush | NoPhoneAlert = NO_PHONE_ALERT) -> bool:
     scripts = Path(__file__).resolve().parents[1]
+    if not TYPE_CHECKING:
+        # Imported here, so modules that only read sweep's config never load the reviewer.
+        sys.path.insert(0, str(scripts / "notify"))
+        import review
     commands = [
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        commands.append(("phone", [
-            sys.executable, str(scripts / "message/send.py"),
-            "--to", "user", "--need", "note",
-            "--action", "Free disk space outside build caches on natedev.",
-            "--summary", "natedev: disk under its floor", "--text", message,
-        ]))
+        if TYPE_CHECKING:
+            from ..notify.push_texts import RenderedPush, user_send_argv
+        else:
+            from push_texts import RenderedPush, user_send_argv
+
+        if not isinstance(phone, RenderedPush):
+            raise ValueError("phone channel requires a rendered disk alert")
+        command = user_send_argv(phone)
+        command[1] = str(scripts / "message/send.py")
+        commands.append(("phone", command))
     delivered = False
     for channel, command in commands:
         try:
-            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=40)
+            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True
                 state = "queued" if result.returncode == 1 else "delivered"
@@ -1149,7 +1267,13 @@ def hold_floor(
         trees: list[str] = []
         tree_targets: dict[str, str] = {}
         busy: list[str] = []
-        for root in target_dirs(roots):
+        targets = target_dirs(roots)
+        uses = process_uses(targets)
+        for root in targets:
+            if root in uses:
+                print(f"lint sweep: pid {uses[root].pid} {uses[root].how}; {root} left alone")
+                busy.append(root)
+                continue
             root_trees = build_trees(root)
             root_held, blocked = lock_trees(root_trees)
             if blocked is not None:
@@ -1172,7 +1296,7 @@ def hold_floor(
         before_caches = total + unchanged_caches
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
-            + f" target dirs ({gib(total)}), {len(busy)} left alone while a build holds them"
+            + f" target dirs ({gib(total)}), {len(busy)} left alone while a build or test run uses them"
         )
         budget = total - (floor - free)
         ordered_at = time.time()
@@ -1209,7 +1333,8 @@ def hold_floor(
             if left > budget and after_free < floor and push_due:
                 message = floor_out_of_reach_text(now, removed, after_free, floor, len(busy),
                                                    held_bytes, ci_bytes, read_disk_measurement(), failures)
-                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE):
+                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE,
+                                    phone=disk_floor_push(removed, after_free, floor)):
                     push_history = DeliveredAlert(time.time())
             elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
                 free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0
@@ -1365,6 +1490,11 @@ def sweep_workspace(target_dir: str | None, config: str, dry_run: bool) -> int:
         roots = [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else []
     if not roots:
         print("lint sweep: no target directory to sweep")
+        return 0
+    uses = process_uses(roots)
+    if uses:
+        root, use = next(iter(uses.items()))
+        print(f"lint sweep: pid {use.pid} {use.how}; {root} skipped")
         return 0
     trees = [tree for root in roots for tree in build_trees(root)]
     held, blocked = lock_trees(trees)
