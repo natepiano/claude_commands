@@ -6,7 +6,6 @@ import argparse
 import json
 from collections.abc import Iterator
 import os
-import re
 import subprocess
 import sys
 import time
@@ -21,7 +20,9 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "hooks"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
+import rename_state
 import unit_lookup
+import unit_names
 from production_units import Refusal, cell_value, unit_rows, unit_headings, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -299,23 +300,20 @@ def stub_plan(production: Production, branch: str) -> Path:
 
 def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     production = read_production(Path(cast(str, args.production)))
-    name = cast(str, args.name)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
-        raise Refusal("name must contain only letters, numbers, hyphens, or underscores")
-    # A name given as its unit id would get the suffix twice: feature-log-unit-unit.
-    if name.replace("_", "-").endswith("-unit"):
-        name = name[: -len("-unit")]
+    try:
+        # A name given as its unit id would get the suffix twice: feature-log-unit-unit.
+        name = unit_names.name(cast(str, args.name))
+    except unit_names.BadName as error:
+        raise Refusal(str(error)) from error
     given_plan = cast(str | None, args.plan)
     given_brief = cast(str | None, args.brief)
     standby = cast(bool, args.standby)
     permanent = cast(bool, args.permanent)
     if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
         raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
-    kebab = name.replace("_", "-")
-    # The slug names the branch, as it names the production's plans; the merge branch may differ.
-    branch = f"{production.slug}-{kebab}"
-    checkout_name = production.checkout.name.removesuffix("-trunk")
-    worktree = production.checkout.parent / f"{checkout_name}-{kebab}"
+    kebab = unit_names.stem(unit_names.unit_id(name))
+    branch = unit_names.branch(production.slug, kebab)
+    worktree = unit_names.worktree(production.checkout, kebab)
     plan: PlanGiven | BriefGiven | Standby
     if given_plan is not None:
         plan = PlanGiven(relative_plan(production, given_plan))
@@ -503,6 +501,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
         raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
+    if request.unit in rename_state.rename_claim(production.slug):
+        raise Refusal(f"{request.unit} is being renamed; finish it with rename_unit.py apply")
     try:
         _ = production.doc.relative_to(production.checkout)
     except ValueError as error:
@@ -667,7 +667,8 @@ def prompt_for(request: UnitLaunch) -> str:
         plan = str(request.worktree / request.plan_path)
         identity = (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
                     f"{showrunner}. Work only in your worktree {request.worktree}, "
-                    f"branch {request.branch}, and name it in every Work Order.")
+                    f"branch {request.branch}, and name in every Work Order the worktree and branch "
+                    "git reports at dispatch.")
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             note = request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
             return f"{identity} {note}"
@@ -680,7 +681,8 @@ def prompt_for(request: UnitLaunch) -> str:
         return f"/unit:direct {plan}"
     return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "
-            f"branch {request.branch}, and name it in every Work Order. Your plan {plan} holds only the "
+            f"branch {request.branch}, and name in every Work Order the worktree and branch git reports "
+            f"at dispatch. Your plan {plan} holds only the "
             f"user's words. Write the full phased plan there, send it to the showrunner, and wait for its "
             f"approval before you run /unit:direct {plan}.")
 

@@ -333,6 +333,17 @@ Each phase is one checkpoint on `build-followups-enh-showrunner`, gated with
 - Tests run on fixture repos and a fake state root: every refusal, every step, resume after each
   step, and `rename.py unit` still passing its own suite on the shared module.
 
+**As built (Phase 2).** `apply` runs seven journaled steps: merge `origin/<merge branch>` into
+the unit, git, Claude, the doc commit, the rename commit merged into the unit branch, state, and
+retiring the old branch. Phase 3 adds stop, the restart record, relaunch and verify around them, so
+until then `apply` needs a stopped unit. Calls made while building:
+- The Mac refusal is the linked-worktree check: a Mac unit's worktree is not on this machine, so
+  the rename makes no cross-machine call.
+- Phase notes get their `unit:` key only; the unit's next refresh rewrites the rest of the note.
+- The rename claim is checked in `add_unit.preflight`, which `agents restart` launches through, so
+  one check covers both.
+- The launches cursor is not moved (one harmless re-read).
+
 ### Phase 3 — verify, the shutdown record, the commands and the as-built (M)
 
 - `rename_unit.py verify`: the place registry (live places clean, apply's places hold the new

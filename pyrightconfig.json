@@ -177,7 +177,8 @@
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/lib",
-        "scripts/herdr"
+        "scripts/herdr",
+        "scripts/make_a_worktree"
       ]
     },
     {

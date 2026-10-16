@@ -452,6 +452,54 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     os.replace(temporary, target)
 
 
+SESSION_ROOTS = tuple(
+    Path(root)
+    for root in (os.environ.get("PROGRESS_SESSION_ROOTS") or "/tmp/claude/unit:/tmp/claude/delegate").split(":")
+    if root
+)
+
+
+def _moved_fields(fields: dict[str, object], old: Path, new: Path, new_branch: str) -> bool:
+    if fields.get("working_dir") not in (str(old), str(new)):
+        return False
+    fields.update({"working_dir": str(new), "worktree": new.name, "branch": new_branch})
+    for key in ("plan_doc", "project_plan_doc"):
+        value = fields.get(key)
+        if isinstance(value, str) and (value == str(old) or value.startswith(f"{old}/")):
+            fields[key] = str(new) + value[len(str(old)):]
+    return True
+
+
+def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[Path]:
+    """Point a run at its unit's moved worktree and new branch: its record and its live state.
+
+    A unit rename calls this while the unit is stopped, so no recorder writes meanwhile. Each
+    event and the state keep their run and phase ids; only the location fields change.
+    """
+    lines: list[str] = []
+    for line in history_file.read_text(encoding="utf-8").splitlines(keepends=True):
+        event = _json_object(line)
+        if event is not None and _moved_fields(event, old, new, new_branch):
+            line = json.dumps(event, separators=(",", ":")) + "\n"
+        lines.append(line)
+    temporary = history_file.with_name(f".{history_file.name}.move")
+    _ = temporary.write_text("".join(lines), encoding="utf-8")
+    os.replace(temporary, history_file)
+    moved = [history_file]
+    for root in SESSION_ROOTS:
+        for path in root.glob(f"*/{STATE_FILENAME}"):
+            try:
+                state = _json_object(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                continue
+            if state is not None and state.get("history_file") == str(history_file) and _moved_fields(
+                state, old, new, new_branch
+            ):
+                _write_state(path.parent, state)
+                moved.append(path)
+    return moved
+
+
 def _refresh_phase_table(session_dir: Path) -> None:
     """Rewrite a production unit's phase note without affecting the recorder."""
     try:

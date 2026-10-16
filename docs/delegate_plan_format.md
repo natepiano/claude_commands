@@ -52,7 +52,9 @@ to rediscover after a context compaction lives in the doc.
   `progress_history.py start-run` recorder; if absent, the recorder derives it
   from the oldest Git commit touching this plan and persists it>
 - **Stack:** <language + key frameworks/versions the work touches>
-- **Layout:** <only the dirs/files phases touch, as a short map>
+- **Layout:** <only the dirs/files phases touch, as a short map. Paths are
+  repository-relative; the plan never names its worktree or branch, which
+  /unit:direct reads from git at dispatch>
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Test lanes:** <for each crate a phase touches, its `tests/` directory or
   `none` — what a Work Order's **Workers** opens the `test` worker against>
