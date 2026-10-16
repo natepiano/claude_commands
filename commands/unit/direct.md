@@ -863,7 +863,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
    sibling phase already holds is allowed and records nothing: the engine
    answers `left_unmapped` with the sibling's reservation. A Claude edit's hook
    protects the paths but writes no state, so a first touch of your own leaves
-   the state for the checkpoint backstop (<CheckpointCommit/> step 5). With two
+   the state for the checkpoint backstop (<CheckpointCommit/> step 5). That
+   edit checks under your bare session id, and cargo-berth maps its reservation
+   there, so the phase's own check later answers `left_unmapped` with it. With
+   one open phase, the hook and the backstop record that reservation as the
+   phase's `Active`. With two
    phases holding reservations, your own edit is refused as ambiguous until you
    name its phase: `cargo-berth check <path> --reservation <that phase's
    reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
