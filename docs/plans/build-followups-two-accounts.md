@@ -1174,3 +1174,30 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `docs/accounts.md`, `commands/showrunner/accounts.md` — ended-session line and folding.
 
 **Ruled out:** one row per holder for a run two holders share, because a worker belongs to its run.
+
+### Phase 37 — A folded swap row counts its mid-turn workers  · status: done
+
+**Depends on:** Phase 36
+
+#### Work Order
+
+**Goal:** a folded swap row says how many of its entries were mid-turn, so `→ codex2 ×12, interrupted and resumed` no longer claims twelve interrupts when one worker was mid-turn.
+
+**Constraints from prior phases:** rows fold per (holder, slot) through `FoldedWorkerRow` in `scripts/accounts/accounts.py` `_workers_swap_lines` (Phase 36); failed entries never fold and keep their own reason and resume command; `--dry-run` prints the same lines.
+
+**Spec:**
+
+1. `FoldedWorkerRow` counts mid-turn entries (`mid_turn_count: int`) in place of the `mid_turn` flag.
+2. A row of one entry keeps today's text: `  <context> → <target>, interrupted and resumed` when mid-turn, `  <context> → <target>` when idle.
+3. A row of several entries reads `  <context> → <target> ×N` when none was mid-turn, and `  <context> → <target> ×N, K interrupted and resumed` when K were.
+4. `docs/accounts.md` and `commands/showrunner/accounts.md` describe the count in place of "keeps `, interrupted and resumed` if any entry was mid-turn".
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — `FoldedWorkerRow`, `_workers_swap_lines`.
+- `scripts/accounts/test_accounts.py` — fold count tests.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — folded row text.
+
+**Workers:** impl (code and docs), test (tests).
+
+**Acceptance gate:** a test folds eleven idle entries and one mid-turn entry of one holder and slot into exactly `→ codex2 ×12, 1 interrupted and resumed`; single-entry rows and failure rows print as before; the merge gate is green.
