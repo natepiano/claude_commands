@@ -69,7 +69,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -298,6 +298,8 @@ class ActiveRecord(TypedDict):
 class StartingRecord(TypedDict):
     thread_id: str
     status: Literal["starting"]
+    previous_role: NotRequired[WorkerRole]
+    previous_status: NotRequired[Literal["done", "failed"]]
     revision: NotRequired[int]
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
@@ -1206,6 +1208,74 @@ def _record_port(session_dir: str) -> int | None:
 
 def _end_marker_path(session_dir: str, name: str) -> Path:
     return _session_path(session_dir, f"{name}.end")
+
+
+ACCOUNT_MOVE_CONTINUATION = (
+    "Your turn was interrupted to move your Codex account; any command you had running "
+    "was stopped with it, so run it again. Continue where you stopped."
+)
+ACCOUNT_MOVE_RESUME_TIMEOUT_SECS = 30.0
+
+
+class StoredAccountMove(TypedDict):
+    thread_id: str
+    turn_id: str
+    label: str
+    move_id: str
+
+
+@dataclass(frozen=True)
+class AccountMoveMarker:
+    thread_id: str
+    turn_id: str
+    label: str
+    move_id: str
+
+
+@dataclass(frozen=True)
+class NoAccountMove:
+    """This thread has no pending account-move interrupt."""
+
+
+def _account_move_path(session_dir: str, name: str) -> Path:
+    return _session_path(session_dir, f"{name}.account-move.json")
+
+
+def _account_move_result_path(session_dir: str, name: str) -> Path:
+    return _session_path(session_dir, f"{name}.account-move-result.json")
+
+
+def _write_account_move_json(path: Path, value: Mapping[str, object]) -> None:
+    temporary = path.with_name(path.name + f".{secrets.token_hex(8)}.tmp")
+    try:
+        _ = temporary.write_text(json.dumps(value), encoding="utf-8")
+        _ = temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_account_move(session_dir: str, name: str, thread_id: str) -> AccountMoveMarker | NoAccountMove:
+    record = _read_json_object(_account_move_path(session_dir, name))
+    thread, turn, label, move_id = (record.get(key) for key in ("thread_id", "turn_id", "label", "move_id"))
+    if (thread == thread_id and isinstance(thread, str) and thread
+            and isinstance(turn, str) and turn and isinstance(label, str) and label
+            and isinstance(move_id, str) and move_id):
+        return AccountMoveMarker(thread, turn, label, move_id)
+    return NoAccountMove()
+
+
+def _finish_account_move(session_dir: str, name: str, marker: AccountMoveMarker) -> None:
+    current = _read_account_move(session_dir, name, marker.thread_id)
+    if isinstance(current, AccountMoveMarker) and current.move_id == marker.move_id:
+        _account_move_path(session_dir, name).unlink(missing_ok=True)
+    _write_account_move_json(_account_move_result_path(session_dir, name),
+                            {"move_id": marker.move_id, "resumed": True})
+    _post_board_status(session_dir, name, f"account moved to {marker.label}; resumed")
+
+
+def _fail_account_move(session_dir: str, name: str, marker: AccountMoveMarker, reason: str) -> None:
+    _write_account_move_json(_account_move_result_path(session_dir, name),
+                            {"move_id": marker.move_id, "error": reason})
 
 
 @contextlib.contextmanager
@@ -2146,7 +2216,7 @@ def _abandon_compaction(client: Client, name: str, thread_id: str, timeout: Comp
     # A live turn that is not the compaction's belongs to someone else and is left alone.
     if isinstance(state, ThreadLive) and timeout.turn_id in ("", state.turn_id):
         # Best effort, as in `end`: a turn that finished since the read answers with an error.
-        _ = client.call("turn/interrupt", {"threadId": thread_id, "turnId": state.turn_id})
+        _ = _interrupt_turn(client, thread_id, state.turn_id)
         interrupted = True
         state = _wait_for_idle(client, thread_id)
     if isinstance(state, ThreadIdle):
@@ -2380,6 +2450,34 @@ def _attach_and_run(
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
 
 
+def _resume_account_move(
+    args: argparse.Namespace,
+    session_dir: str,
+    name: str,
+    thread_id: str,
+    client: Client,
+    marker: AccountMoveMarker,
+) -> MovedWorker:
+    """Resume the marked worker and acknowledge its accepted continuation."""
+    try:
+        resumed = _start_workers_turn(
+            args, session_dir, name, thread_id, client, ACCOUNT_MOVE_CONTINUATION)
+        if not resumed.turn_id:
+            raise SystemExit("account move continuation returned no turn id")
+        _ = _update_roster_if_expected(
+            session_dir,
+            name,
+            {"thread_id": resumed.thread_id, "turn_id": resumed.turn_id,
+             "status": "running", "port": resumed.port},
+            RosterOnThread(resumed.thread_id),
+        )
+        _finish_account_move(session_dir, name, marker)
+        return resumed
+    except (ConnectionError, OSError, SystemExit) as error:
+        _fail_account_move(session_dir, name, marker, f"resume failed: {error}")
+        raise
+
+
 def _stream_turn(
     args: argparse.Namespace,
     client: Client,
@@ -2430,10 +2528,14 @@ def _stream_turn(
         # creation must still leave its id reachable.
         if not follow:
             _ = client.call("thread/name/set", {"threadId": thread_id, "name": name})
+        initial_move = (_read_account_move(session_dir, name, thread_id)
+                        if _attr(args, "account_move") is True else NoAccountMove())
         started = _start_workers_turn(args, session_dir, name, thread_id, client, prompt)
         client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
         if not turn_id:
             raise SystemExit("codex_mesh: turn/start returned no turn id")
+        if isinstance(initial_move, AccountMoveMarker):
+            _finish_account_move(session_dir, name, initial_move)
         followed_turn = turn_id if follow else ""
         _ = _update_roster_if_expected(
             session_dir,
@@ -2463,10 +2565,20 @@ def _stream_turn(
             while time.time() < deadline:
                 # A resident thread must wake to see `end` between turns. Any other
                 # wakes to check that its turn has not ended without the notice.
-                poll = (RESIDENT_POLL_SECS if resident or _continuation_is_owed(session_dir, name)
-                        else UNSEEN_END_CHECK_SECS)
+                # Account-move intent can arrive while a completion notice is lost.
+                # Check it on the resident cadence even for a one-turn launcher.
+                poll = min(RESIDENT_POLL_SECS, UNSEEN_END_CHECK_SECS)
                 frame = client.next_frame(min(deadline, time.time() + poll))
                 if frame is None:
+                    account_move = _read_account_move(session_dir, name, thread_id)
+                    if (isinstance(account_move, AccountMoveMarker) and not end_marker.exists()
+                            and _ended_unseen(client, thread_id)):
+                        started = _resume_account_move(args, session_dir, name, thread_id, client, account_move)
+                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
+                        if follow:
+                            followed_turn = turn_id
+                        failure = followed_failure = final_answer = ""
+                        continue
                     if not resident and time.time() < deadline:
                         quota_owed = _continuation_is_owed(session_dir, name)
                         if not resume_owed and _ended_unseen(client, thread_id):
@@ -2564,13 +2676,23 @@ def _stream_turn(
                             final_answer = text
                 elif method in ("turn/completed", "turn/failed"):
                     notice_turn = _as_str(_as_dict(params.get("turn")).get("id"))
-                    if follow and notice_turn and followed_turn and notice_turn != followed_turn:
+                    account_move = _read_account_move(session_dir, name, thread_id)
+                    moved_turn = isinstance(account_move, AccountMoveMarker) and notice_turn == account_move.turn_id
+                    if follow and notice_turn and followed_turn and notice_turn != followed_turn and not moved_turn:
                         continue
                     # The followed turn has ended. A later turn names itself in its own
                     # `turn/started`; a thread read at this moment can still name this one.
                     if follow:
                         followed_turn = ""
                     turn_outcome = _turn_outcome(method, params)
+                    if (isinstance(account_move, AccountMoveMarker) and not end_marker.exists()
+                            and (not notice_turn or notice_turn == account_move.turn_id)):
+                        started = _resume_account_move(args, session_dir, name, thread_id, client, account_move)
+                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
+                        if follow:
+                            followed_turn = turn_id
+                        failure = followed_failure = final_answer = ""
+                        continue
                     if isinstance(turn_outcome, TurnFailed):
                         serving = client.serving
                         identity = (serving, thread_id, notice_turn or turn_id)
@@ -2972,6 +3094,8 @@ def _resume_worker_thread(
     if not resumed.get("error"):
         _ = _require(resumed, "thread/resume")
         return _WorkerThreadForHome(thread_id, False)
+    if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
+        _ = _require(resumed, "thread/resume")
     start_params = _thread_start_params(args)
     if "developerInstructions" in params:
         start_params.update({
@@ -3312,9 +3436,7 @@ def _end_unwatched_turn(
             live = _read_live_turn(client, thread_id)
             turn_id = _interruptible_turn_id(client, thread_id, live)
             if isinstance(turn_id, ThreadLive):
-                reply = client.call("turn/interrupt", {
-                    "threadId": thread_id, "turnId": turn_id.turn_id
-                })
+                reply = _interrupt_turn(client, thread_id, turn_id.turn_id)
                 if "error" in reply:
                     reason = _as_str(_as_dict(reply["error"]).get("message")) or "turn/interrupt failed"
                     remaining = _read_live_turn(client, thread_id)
@@ -3473,9 +3595,7 @@ def command_end(args: argparse.Namespace) -> int:
         if isinstance(state, ThreadLive):
             # Best effort: a turn that finished between the read and this call
             # answers with an error, and the marker below ends it either way.
-            _ = client.call(
-                "turn/interrupt", {"threadId": thread_id, "turnId": state.turn_id}
-            )
+            _ = _interrupt_turn(client, thread_id, state.turn_id)
         client.close()
         if isinstance(state, ThreadStateUnknown):
             print(f"codex_mesh: {target}: thread {thread_id} could not be read ({state.reason})", file=sys.stderr)
@@ -3539,6 +3659,11 @@ def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
     # Active is enough to refuse a relaunch, even if the server has not yet
     # persisted the new turn in the read response.
     return ThreadActiveWithoutTurn()
+
+
+def _interrupt_turn(client: Client, thread_id: str, turn_id: str) -> RpcMessage:
+    """Interrupt one identified turn without conflating account moves with user stops."""
+    return client.call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
 
 def _interruptible_turn_id(client: Client, thread_id: str, state: ThreadState) -> ThreadState:
@@ -4137,8 +4262,8 @@ def command_signin_changed(args: argparse.Namespace) -> int:
 
     A path watch on the sign-in file runs this the moment it changes; `ensure_server` makes the
     same check at each launch for a run this missed. Each run's record is retired, so its next
-    dispatch starts a server that reads the current sign-in. A worker mid-turn keeps the old server
-    until the turn ends, and a resident worker then moves itself. The old server is stopped now if
+    dispatch starts a server that reads the current sign-in. Running workers are interrupted and
+    resume immediately on that server. The old server is stopped now if
     nothing uses it, otherwise by its watcher once nothing does. Run twice for one change, the
     second run finds nothing older and moves nothing.
     """
@@ -4149,7 +4274,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         print("codex_mesh: no Codex sign-in file; nothing moved")
         return 0
     at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
-    moved = 0
+    runs: list[WorkersRunMove] = []
     for record_path in sorted(path for root in roots for path in root.glob(f"*/{SERVER_FILE}")):
         folder = record_path.parent
         with _server_lock(str(folder)):
@@ -4161,26 +4286,63 @@ def command_signin_changed(args: argparse.Namespace) -> int:
                     and _holds_old_sign_in(pid, recorded_home)):
                 continue
             _retire_record(str(folder), record)
+        workers = _switch_run_workers(folder, port, codex_home_role_label(workers_home()), dry_run=False)
+        runs.append(WorkersRunMove(folder, tuple(_marker_sessions(roots, folder)), ((port, pid),), workers))
+    switches = _finish_run_moves(runs)
+    for run, switched in zip(runs, switches, strict=True):
+        folder = run.folder
+        port, pid = run.servers[0]
         stopped = _stop_unused(None, pid, port, RetiredRunServer(folder))
         if not stopped:
             _ = _start_watcher(str(folder), pid, port)
         old = "is stopped" if stopped else "stops once nothing uses it"
         line = (f"Codex sign-in changed at {at}: run {folder.name}'s app-server {pid} started before it, so the "
-                + "run's workers move to a new server, an idle worker at its next turn and a worker mid-turn when "
-                + f"that turn ends; the old server {old}.")
+                + "run's running workers were interrupted and resumed on a new server; "
+                + f"idle workers move at their next turn; the old server {old}.")
+        failures = [f"{worker.name}: {worker.failure}; resume with {worker.resume_command}"
+                    for worker in switched.workers if worker.failure]
+        if failures:
+            line += " Worker move failures: " + "; ".join(failures)
         _log_server(str(folder), line)
-        for session_id in _marker_sessions(roots, folder):
+        for session_id in switched.holders:
             _notify_holder(session_id, line, CodexNoticeKind.SIGN_IN_CHANGED)
         print(line)
-        moved += 1
-    print(f"{moved} run(s) moved off the old sign-in")
+    print(f"{len(switches)} run(s) moved off the old sign-in")
     return 0
+
+
+@dataclass(frozen=True)
+class WorkerMoveReady:
+    """An idle worker moves at its next turn, or this is a dry-run prediction."""
+
+
+@dataclass(frozen=True)
+class WorkerMoveResumed:
+    """The interrupted worker confirmed a continuation on its new server."""
+
+
+@dataclass(frozen=True)
+class WorkerMoveFailed:
+    reason: str
+    command: str
+
+
+WorkerSwitchOutcome = WorkerMoveReady | WorkerMoveResumed | WorkerMoveFailed
 
 
 @dataclass(frozen=True)
 class SwitchingWorker:
     name: str
     mid_turn: bool
+    outcome: WorkerSwitchOutcome = field(default_factory=WorkerMoveReady)
+
+    @property
+    def failure(self) -> str:
+        return self.outcome.reason if isinstance(self.outcome, WorkerMoveFailed) else ""
+
+    @property
+    def resume_command(self) -> str:
+        return self.outcome.command if isinstance(self.outcome, WorkerMoveFailed) else ""
 
 
 @dataclass(frozen=True)
@@ -4190,50 +4352,264 @@ class WorkersRunSwitch:
     workers: tuple[SwitchingWorker, ...]
 
 
+@dataclass(frozen=True)
+class InterruptedWorkerMove:
+    """An interrupted worker whose continuation has not yet been acknowledged."""
+
+    session_dir: str
+    name: str
+    marker: AccountMoveMarker
+    launcher_pid: int
+
+
+@dataclass(frozen=True)
+class WorkersRunMove:
+    """A retired run with all interrupts dispatched, ready to await continuations."""
+
+    folder: Path
+    holders: tuple[str, ...]
+    servers: tuple[tuple[int, int], ...]  # port, pid
+    workers: tuple[SwitchingWorker | InterruptedWorkerMove, ...]
+
+
+def _account_move_command(session_dir: str, name: str) -> str:
+    return shlex.join([sys.executable, str(Path(__file__).resolve()), "resume-account-move",
+                       "--session-dir", session_dir, "--to", name])
+
+
+def _resume_account_move_detached(session_dir: str, name: str) -> None:
+    """Give an interrupted worker without a launcher its own continuation watcher."""
+    with _session_path(session_dir, f"{name}.account-move-launcher.log").open("ab") as log:
+        _ = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "resume-account-move",
+             "--session-dir", session_dir, "--to", name],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+
+
+def command_resume_account_move(args: argparse.Namespace) -> int:
+    session_dir, name = _as_str(_attr(args, "session_dir")), _as_str(_attr(args, "to"))
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    marker = _read_account_move(session_dir, name, _as_str(record.get("thread_id")))
+    if isinstance(marker, NoAccountMove):
+        port = record.get("port")
+        if not isinstance(port, int) or not _as_str(record.get("thread_id")):
+            print(f"codex_mesh: {name}: no recorded thread to resume", file=sys.stderr)
+            return 1
+        retried = _interrupt_worker_for_account_move(
+            session_dir, name, record, port, codex_home_role_label(workers_home()))
+        outcome = (_wait_account_move_resumes((retried,))[(session_dir, name)]
+                   if isinstance(retried, InterruptedWorkerMove) else retried.outcome)
+        if isinstance(outcome, WorkerMoveFailed):
+            print(f"codex_mesh: {name}: {outcome.reason}", file=sys.stderr)
+            return 1
+        return 0
+    role = _roster_role(record.get("role"))
+    if not isinstance(role, AssignedDelegateRole):
+        _fail_account_move(session_dir, name, marker, "resume failed: worker has no recorded role")
+        return 1
+    launcher_pid = _as_int(record.get("launcher_pid"))
+    if launcher_pid > 0 and _pid_alive(launcher_pid):
+        _fail_account_move(session_dir, name, marker, "resume failed: existing launcher is still running")
+        return 1
+    assignment = agents_log.role_at(
+        agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+        marker.thread_id, datetime.now(timezone.utc),
+    )
+    lens = assignment.lens if isinstance(assignment, agents_log.Assignment) and assignment.role == role.role else None
+    claimed: StartingRecord = {
+        "thread_id": marker.thread_id, "status": "starting", "launcher_pid": os.getpid(),
+        "role": role.role, "previous_role": role.role, "previous_status": "failed",
+    }
+    if not _update_roster_if_expected(session_dir, name, claimed,
+                                     RosterUnchanged(marker.thread_id, _roster_revision(record))):
+        _fail_account_move(session_dir, name, marker, "resume failed: worker changed before launcher claim")
+        return 1
+    message = _session_path(session_dir, f"{name}.account-move-prompt.txt")
+    _ = message.write_text(ACCOUNT_MOVE_CONTINUATION, encoding="utf-8")
+    follow_args = argparse.Namespace(
+        session_dir=session_dir, to=name, role=role.role, lens=lens, claim_pid=os.getpid(),
+        message_file=str(message), summary_file=str(_session_path(session_dir, f"{name}.account-move-summary.txt")),
+        reply_file="", log_file=str(_session_path(session_dir, f"{name}.account-move.log")),
+        model="", effort="", service_tier="", turn_cwd="", read_only=False, image=[],
+        timeout=86400.0, account_move=True,
+    )
+    try:
+        result = command_follow(follow_args)
+    except (ConnectionError, OSError, SystemExit) as error:
+        _fail_account_move(session_dir, name, marker, f"resume failed: {error}")
+        return 1
+    if result and isinstance(_read_account_move(session_dir, name, marker.thread_id), AccountMoveMarker):
+        _fail_account_move(session_dir, name, marker, "resume failed; see account-move launcher log")
+    return result
+
+
+def _wait_account_move_resumes(
+    moves: tuple[InterruptedWorkerMove, ...],
+) -> dict[tuple[str, str], WorkerSwitchOutcome]:
+    """Await every dispatched move against one deadline, without serial worker waits."""
+    pending = {(move.session_dir, move.name): move for move in moves}
+    outcomes: dict[tuple[str, str], WorkerSwitchOutcome] = {}
+    detached: set[tuple[str, str]] = set()
+    deadline = time.monotonic() + ACCOUNT_MOVE_RESUME_TIMEOUT_SECS
+    while pending:
+        for key, move in tuple(pending.items()):
+            try:
+                result = _read_json_object(_account_move_result_path(move.session_dir, move.name))
+                if result.get("move_id") == move.marker.move_id:
+                    if result.get("resumed") is True:
+                        outcomes[key] = WorkerMoveResumed()
+                    elif reason := _as_str(result.get("error")):
+                        outcomes[key] = WorkerMoveFailed(reason, _account_move_command(*key))
+                if key in outcomes:
+                    del pending[key]
+                    continue
+                if key not in detached and (move.launcher_pid <= 0 or not _pid_alive(move.launcher_pid)):
+                    _resume_account_move_detached(*key)
+                    detached.add(key)
+            except (ConnectionError, OSError, SystemExit) as error:
+                outcomes[key] = WorkerMoveFailed(f"resume failed: {error}", _account_move_command(*key))
+                del pending[key]
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            for key in pending:
+                outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key))
+            break
+        time.sleep(0.05)
+    return outcomes
+
+
+def _finish_run_moves(runs: list[WorkersRunMove]) -> tuple[WorkersRunSwitch, ...]:
+    outcomes = _wait_account_move_resumes(tuple(
+        worker for run in runs for worker in run.workers if isinstance(worker, InterruptedWorkerMove)
+    ))
+    return tuple(WorkersRunSwitch(run.folder, run.holders, tuple(
+        SwitchingWorker(worker.name, True, outcomes[(worker.session_dir, worker.name)])
+        if isinstance(worker, InterruptedWorkerMove) else worker for worker in run.workers
+    )) for run in runs)
+
+
+def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
+                                       port: int, label: str) -> SwitchingWorker | InterruptedWorkerMove:
+    thread_id = _as_str(entry.get("thread_id"))
+    marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
+    client: Client | None = None
+    try:
+        if not thread_id:
+            raise SystemExit("worker has no recorded thread")
+        client = Client(port, f"account-move-{name}")
+        state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+        if isinstance(state, ThreadStateUnknown):
+            raise SystemExit(state.reason)
+        if isinstance(state, ThreadActiveWithoutTurn):
+            raise SystemExit("live turn has no interruptible id")
+        # The turn may have just ended. It still needs a continuation if its launcher
+        # has not consumed that completion, so retain the roster's last turn id.
+        turn_id = state.turn_id if isinstance(state, ThreadLive) else _as_str(entry.get("turn_id"))
+        if not turn_id:
+            return SwitchingWorker(name, False)
+        marker = AccountMoveMarker(thread_id, turn_id, label, secrets.token_hex(16))
+        stored: StoredAccountMove = {"thread_id": marker.thread_id, "turn_id": marker.turn_id,
+                                    "label": marker.label, "move_id": marker.move_id}
+        with _pending_file(session_dir, name):
+            if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
+                raise SystemExit("worker ended or was replaced before interruption")
+            _write_account_move_json(_account_move_path(session_dir, name), stored)
+        if isinstance(state, ThreadLive):
+            reply = _interrupt_turn(client, thread_id, state.turn_id)
+            if "error" in reply and not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+                _account_move_path(session_dir, name).unlink(missing_ok=True)
+                _ = _require(reply, "turn/interrupt")
+        client.close()
+        client = None
+        return InterruptedWorkerMove(session_dir, name, marker, _as_int(entry.get("launcher_pid")))
+    except (ConnectionError, OSError, SystemExit) as error:
+        reason = f"interrupt failed: {error}"
+        if isinstance(marker, AccountMoveMarker):
+            with contextlib.suppress(OSError):
+                _fail_account_move(session_dir, name, marker, reason)
+        return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name)))
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _switch_run_workers(
+    folder: Path, port: int, label: str, *, dry_run: bool,
+) -> tuple[SwitchingWorker | InterruptedWorkerMove, ...]:
+    entries = _read_json_object(folder / ROSTER_FILE)
+    workers: list[SwitchingWorker | InterruptedWorkerMove] = []
+    for name, value in sorted(entries.items()):
+        entry = _as_dict(value)
+        if entry.get("status") == "ended" or entry.get("port", port) != port:
+            continue
+        if entry.get("status") == "running" and not dry_run:
+            workers.append(_interrupt_worker_for_account_move(str(folder), name, entry, port, label))
+        else:
+            workers.append(SwitchingWorker(name, entry.get("status") == "running"))
+    return tuple(workers)
+
+
 def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> tuple[WorkersRunSwitch, ...]:
-    """Retire current run servers and notify each affected holder once."""
+    """Retire run servers, interrupt running turns, and confirm their continuations."""
     notices: dict[str, list[str]] = {}
-    switches: list[WorkersRunSwitch] = []
+    notice_failures: dict[str, list[str]] = {}
+    runs: list[WorkersRunMove] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
-    for record_path in sorted(path for root in SWEEP_ROOTS for path in root.glob(f"*/{SERVER_FILE}")):
-        folder = record_path.parent
+    folders = sorted({path.parent for root in SWEEP_ROOTS
+                      for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")})
+    for folder in folders:
         with _server_lock(str(folder)):
-            record = _read_json_object(record_path)
-            pid, port = record.get("pid"), record.get("port")
-            if not isinstance(pid, int) or not isinstance(port, int) or not _pid_alive(pid):
+            current = _read_json_object(folder / SERVER_FILE)
+            outgoing: dict[int, int] = {}
+            for record in _recorded_run_servers(str(folder)):
+                pid, port = record.get("pid"), record.get("port")
+                if (isinstance(pid, int) and isinstance(port, int) and _pid_alive(pid)
+                        and server_record_home(record) != workers_home):
+                    outgoing[port] = pid
+            if not outgoing:
                 continue
-            previous_home = server_record_home(record)
-            if previous_home == workers_home:
-                continue
-            workers = tuple(
-                SwitchingWorker(name, _as_dict(entry).get("status") == "running")
-                for name, entry in sorted(_read_json_object(folder / ROSTER_FILE).items())
-                if _as_dict(entry).get("status") != "ended"
-            )
             holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
-            line = (
-                f"Workers account {'would move' if dry_run else 'changed'} at {at} to {label} "
-                + f"({codex_home_display(workers_home)}): run {folder.name}'s workers move from "
-                + f"{codex_home_display(previous_home)} at their next turn; "
-                + "a working worker finishes first. Continue dispatching as usual."
-            )
-            if not dry_run:
-                _retire_record(str(folder), record)
-                _log_server(str(folder), line)
-        if not dry_run and not _stop_unused(None, pid, port, RetiredRunServer(folder)):
-            _ = _start_watcher(str(folder), pid, port)
-        switches.append(WorkersRunSwitch(folder, holders, workers))
+            current_port = current.get("port")
+            if not dry_run and isinstance(current_port, int) and current_port in outgoing:
+                _retire_record(str(folder), current)
+        workers = tuple(worker for port in outgoing
+                        for worker in _switch_run_workers(folder, port, label, dry_run=dry_run))
+        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
+    switches = _finish_run_moves(runs)
+    for run, switched in zip(runs, switches, strict=True):
+        folder, holders, workers = switched.folder, switched.holders, switched.workers
+        line = (
+            f"Workers account {'would move' if dry_run else 'changed'} at {at} to {label} "
+            + f"({codex_home_display(workers_home)}): run {folder.name}'s running workers "
+            + "were interrupted and resumed on the new account; idle workers move at their next turn."
+        )
+        failures = [f"{worker.name}: {worker.failure}; resume with {worker.resume_command}"
+                    for worker in workers if worker.failure]
+        if failures:
+            line = (f"Workers account changed at {at} to {label}: running workers were interrupted; "
+                    + "some continuations failed: " + "; ".join(failures))
+        if not dry_run:
+            _log_server(str(folder), line)
+            for port, pid in run.servers:
+                if not _stop_unused(None, pid, port, RetiredRunServer(folder)):
+                    _ = _start_watcher(str(folder), pid, port)
         for session_id in holders:
             notices.setdefault(session_id, []).append(folder.name)
+            notice_failures.setdefault(session_id, []).extend(failures)
     if not dry_run:
-        for session_id, runs in notices.items():
+        for session_id, holder_runs in notices.items():
             _notify_holder(
                 session_id,
                 f"Workers account changed at {at} to {label} ({codex_home_display(workers_home)}): "
-                + f"runs {', '.join(runs)} move at their next turn; working workers finish first. Continue dispatching as usual.",
+                + f"runs {', '.join(holder_runs)}: running workers were interrupted and resumed on the new account; "
+                + "idle workers move at their next turn."
+                + (" Worker move failures: " + "; ".join(notice_failures[session_id])
+                   if notice_failures[session_id] else ""),
                 CodexNoticeKind.WORKERS_CHANGED,
             )
-    return tuple(switches)
+    return switches
 
 
 def command_serve(args: argparse.Namespace) -> int:
@@ -4480,6 +4856,11 @@ def main(argv: list[str] | None = None) -> int:
         help="stay attached across turns, delivering each reply, until `end`",
     )
     start.set_defaults(handler=command_start)
+
+    account_move = subparsers.add_parser("resume-account-move", help="resume an interrupted account move")
+    _ = account_move.add_argument("--session-dir", required=True)
+    _ = account_move.add_argument("--to", required=True)
+    account_move.set_defaults(handler=command_resume_account_move)
 
     follow = subparsers.add_parser("follow", help="run one turn on a finished delegate")
     _ = follow.add_argument("--session-dir", required=True)
