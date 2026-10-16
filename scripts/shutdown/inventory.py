@@ -574,7 +574,7 @@ def _tmux_session(pane: str) -> tuple[
     try:
         result = subprocess.run(
             (
-                unit_lookup.tmux_binary(),
+                unit_lookup.installed_tmux_binary(),
                 "display",
                 "-p",
                 "-t",

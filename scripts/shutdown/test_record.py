@@ -1452,6 +1452,78 @@ class RecoverySnapshotTests(ShutdownTestCase):
         return record.RecoverySnapshot(machine="natedev", login="owner@example.com", label="owner",
                                        taken_at=NOW, sessions=entries, boot_id="boot-one")
 
+    def test_snapshot_attempt_success_and_failure_keep_the_last_success_across_reads(self) -> None:
+        self.assertIsInstance(record.read_snapshot_attempts(), record.NoSnapshotAttempt)
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=NOW, accounts=2), "snapshot-host")
+        first = record.read_snapshot_attempts()
+        assert not isinstance(first, record.NoSnapshotAttempt)
+        self.assertEqual(first["latest"], {"kind": "taken", "at": NOW, "accounts": 2})
+        self.assertEqual(first["last_success"], {"kind": "taken", "at": NOW})
+        self.assertEqual(first["machine"], "snapshot-host")
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=LATER, reasons=["registry unreadable"]), "snapshot-host")
+        failed = record.read_snapshot_attempts()
+        assert not isinstance(failed, record.NoSnapshotAttempt)
+        self.assertEqual(failed["last_success"], first["last_success"])
+        self.assertEqual(failed["latest"], {"kind": "failed", "at": LATER, "reasons": ["registry unreadable"]})
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=LATER, accounts=0), "snapshot-host")
+        recovered = record.read_snapshot_attempts()
+        assert not isinstance(recovered, record.NoSnapshotAttempt)
+        self.assertEqual(recovered["last_success"], {"kind": "taken", "at": LATER})
+        self.assertEqual(recovered["latest"], {"kind": "taken", "at": LATER, "accounts": 0})
+        self.assertEqual(recovered["machine"], first["machine"])
+
+    def test_first_failed_attempt_does_not_claim_a_success_for_existing_snapshots(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=LATER, reasons=["host lookup failed"]), "natedev")
+        loaded = record.read_snapshot_attempts()
+        assert not isinstance(loaded, record.NoSnapshotAttempt)
+        self.assertEqual(loaded["last_success"], {"kind": "not recorded"})
+        self.assertEqual(record.all_snapshots(), [saved])
+
+    def test_snapshot_attempt_parser_rejects_invalid_times_counts_and_missing_success(self) -> None:
+        path = self.root / "shutdown/snapshot_attempt.json"
+        path.parent.mkdir()
+        good: dict[str, object] = {"machine": "natedev", "latest": {"kind": "taken", "at": NOW, "accounts": 1},
+                                   "last_success": {"kind": "taken", "at": NOW}}
+        invalid: list[dict[str, object]] = [
+            {"machine": "natedev", "latest": good["latest"]},
+            {**good, "latest": {"kind": "taken", "at": "yesterday", "accounts": 1}},
+            {**good, "latest": {"kind": "taken", "at": NOW, "accounts": -1}},
+            {**good, "latest": {"kind": "taken", "at": NOW, "accounts": True}},
+            {**good, "last_success": {"kind": "taken", "at": "2026-10-09T17:49:10-04:00"}},
+            {**good, "latest": {"kind": "failed", "at": NOW, "reasons": [7]}},
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                _ = path.write_text(json.dumps(value))
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.read_snapshot_attempts()
+        _ = path.write_text("{")
+        with self.assertRaises(record.InvalidRecord):
+            _ = record.read_snapshot_attempts()
+
+    def test_snapshot_attempt_metadata_and_leftover_write_keep_account_enumeration_intact(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        shutdown = session_shutdown()
+        self.assertTrue(record.create_session(shutdown))
+        hold = account_hold()
+        record.set_account_hold(hold)
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=NOW, accounts=1), "natedev")
+        self.assertTrue((self.root / "shutdown/snapshot_attempt.lock").is_file())
+        _ = (self.root / "shutdown/.record.interrupted.tmp").write_text("unfinished outcome")
+        self.assertEqual(record.all_snapshots(), [saved])
+        self.assertEqual(record.all_session_records(), [shutdown])
+        self.assertEqual(record.all_account_holds(), [hold])
+        for name in ("stray", "record.interrupted.tmp"):
+            stray = self.root / "shutdown" / name
+            _ = stray.write_text("not account metadata")
+            for read in (record.all_session_records, record.all_account_holds):
+                with self.subTest(reader=read.__name__, name=name), self.assertRaises(record.InvalidRecord):
+                    _ = read()
+            stray.unlink()
+
     def test_snapshot_round_trip_preserves_workers_timers_and_canonical_login(self) -> None:
         saved = self.snapshot(1)
         saved["login"] = "OWNER@example.com"
@@ -1509,10 +1581,54 @@ class RecoverySnapshotTests(ShutdownTestCase):
         self.assertEqual(persisted["workers"], saved["sessions"][0]["workers"])
         self.assertEqual(persisted["timers"], saved["sessions"][0]["timers"])
         self.assertEqual((persisted["requested_at"], persisted["request_id"], persisted["requested_by"]),
-                         (NOW, "recovery-" + NOW, {"kind": "snapshot", "taken_at": NOW}))
+                         (NOW, "recovery-" + NOW, {"kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"}}))
         self.assertEqual((persisted["hold"], persisted["then"], persisted["progress"], persisted["trail"], persisted["stop_issues"]),
                          ("session", "restart", {"kind": "already gone", "at": NOW}, [], []))
         self.assertIsNone(record.account_hold(saved["login"]))
+
+    def test_recovery_origin_round_trip_keeps_crash_signal_and_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        snapshot["taken_at"] = LATER
+        for signal in ("reboot", "host gone"):
+            with self.subTest(signal=signal):
+                item["crash"] = signal
+                saved = record.snapshot_restore_record(snapshot, item)
+                self.assertTrue(record.create_session(saved))
+                loaded = record.session_records(snapshot["login"])[0]
+                self.assertEqual(loaded["requested_by"], {
+                    "kind": "snapshot", "taken_at": LATER,
+                    "recovery": {"kind": signal, "last_seen": NOW},
+                })
+                path = self.directory / "sessions/session-1.json"
+                path.unlink()
+
+    def test_older_snapshot_origin_normalizes_missing_crash_evidence(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        saved = record.snapshot_restore_record(snapshot, item)
+        wire = cast(dict[str, object], json.loads(json.dumps(saved)))
+        wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW}
+        parsed = record.parse_session_records(json.dumps([wire]))[0]
+        self.assertEqual(parsed["requested_by"], {
+            "kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"},
+        })
+        self.assertEqual(record.parse_session_records(json.dumps([parsed]))[0], parsed)
+
+    def test_recovery_origin_refuses_invalid_crash_signal_or_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        wire = cast(dict[str, object], json.loads(json.dumps(record.snapshot_restore_record(snapshot, item))))
+        for context in ({"kind": "shutdown", "last_seen": NOW},
+                        {"kind": "reboot", "last_seen": "yesterday"},
+                        {"kind": "host gone"}):
+            with self.subTest(context=context):
+                wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW, "recovery": context}
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([wire]))
 
     def test_materialization_never_overwrites_an_existing_shutdown_request(self) -> None:
         existing = session_shutdown(progress=record.SessionWaiting(kind="waiting"))

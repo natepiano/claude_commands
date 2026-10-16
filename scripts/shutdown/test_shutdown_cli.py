@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 
 from test_support import registry_confirmation, ShutdownTestCase
 import inventory
+import herdr
+from fake_herdr import CommandResponse
 from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
@@ -40,6 +42,7 @@ LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
 JANUARY = "2026-01-15T17:30:00+00:00"
 PERMISSION_SCRIPT = Path(__file__).with_name("launch_permission.py")
+EMPTY_HERDR_SESSIONS = json.dumps(herdr.SessionListResult(sessions=[]))
 
 
 def unit_session(session_id: str) -> inventory.UnitSession:
@@ -168,6 +171,203 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def tmux_free_fixture(self, tmux: CommandResponse, *, native_stdout: str = EMPTY_HERDR_SESSIONS) -> Path:
+        fake = self.root / "observation-tool"
+        _ = shutil.copyfile(Path(__file__).resolve().parents[1] / "herdr/fake_herdr.py", fake)
+        fake.chmod(0o755)
+        responses = self.root / "observations.json"
+        replies: dict[str, CommandResponse] = {
+            "list-sessions -F #{session_name}": tmux,
+            "--session default session list --json": {"stdout": native_stdout, "code": 0},
+            "default": {"stdout": "unexpected command", "code": 99},
+        }
+        _ = responses.write_text(json.dumps(replies))
+        log = self.root / "observation-calls.jsonl"
+        self.enterContext(patch.dict(os.environ, {
+            "SHUTDOWN_TMUX": str(fake), "HERDR_BIN": str(fake),
+            "FAKE_HERDR_RESPONSES": str(responses), "FAKE_HERDR_LOG": str(log),
+        }))
+        return log
+
+    def tmux_free_owner(self, host: inventory.SessionHost) -> inventory.TopLevelSession:
+        return inventory.TopLevelSession(kind="top-level", session_id="writing-id", pid=123,
+            proc_start="456", name="Writing", cwd="/tmp/writing", status="idle", updated_at=0,
+            probe=False, model=inventory.NoReplyYet(kind="no reply yet"),
+            checkout=inventory.NotACheckout(kind="not a checkout"), run_dirs=[], codex_servers=[],
+            timers=[], host=host)
+
+    def test_tmux_free_accepts_empty_or_absent_tmux_without_writing_or_starting_anything(self) -> None:
+        for reply in (CommandResponse(stdout="", code=0), CommandResponse(stdout="", code=1,
+                stderr="no server running on /tmp/fake-tmux")):
+            with self.subTest(reply=reply):
+                log = self.tmux_free_fixture(reply)
+                log.unlink(missing_ok=True)
+                saved = self.recovery("retained")
+                before = {path.relative_to(self.state): path.read_bytes()
+                          for path in self.state.rglob("*") if path.is_file()}
+                with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                        "natedev", {}, {})) as observe, redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(shutdown.main(["tmux-free"]), 0)
+                self.assertEqual(output.getvalue(), "nothing needs tmux\n")
+                observe.assert_called_once_with()
+                self.assertEqual([cast(list[str], json.loads(line)) for line in log.read_text().splitlines()], [
+                    ["list-sessions", "-F", "#{session_name}"],
+                    ["--session", "default", "session", "list", "--json"],
+                ])
+                self.assertEqual({path.relative_to(self.state): path.read_bytes()
+                    for path in self.state.rglob("*") if path.is_file()}, before)
+                self.assertEqual(record.read_snapshot(LOGIN), saved)
+
+    def test_tmux_free_allows_live_herdr_agents_and_herdr_units(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0), native_stdout=json.dumps(
+            herdr.SessionListResult(sessions=[herdr.SessionEntry(name="writing", running=True, default=False,
+                session_dir="/tmp/writing", socket_path="/tmp/writing/herdr.sock")])))
+        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
+        unit = unit_session("unit-id")
+        unit["host"]["session_host"] = "herdr"
+        entries: list[inventory.SnapshotSession] = [
+            inventory.SnapshotClaudeSession(agent="claude", session=unit, workers=[], timers=[], last_seen=OCTOBER, state="running"),
+            inventory.SnapshotCodexSession(agent="codex", session=owner, workers=[], timers=[], last_seen=OCTOBER,
+                state="running", codex=inventory.CodexLaunch(home="/tmp/codex", resume=inventory.CodexResumePicker(kind="picker"))),
+        ]
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: entries}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 0)
+        self.assertEqual(output.getvalue(), "nothing needs tmux\n")
+
+    def test_tmux_free_checks_workers_beside_a_safe_owner(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
+        worker = inventory.WorkerSession(kind="worker", session_id="worker-id", pid=124, proc_start="457",
+            name="Worker", cwd="/tmp/writing", status="idle", updated_at=0, probe=False,
+            model=inventory.NoReplyYet(kind="no reply yet"), checkout=inventory.NotACheckout(kind="not a checkout"),
+            run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
+            owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))
+        entry = inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[worker], timers=[],
+            last_seen=OCTOBER, state="running")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        self.assertIn("Worker (worker-id) uses an unknown host", output.getvalue())
+        self.assertNotIn("Writing (writing-id)", output.getvalue())
+
+    def test_tmux_free_refuses_a_shell_only_tmux_session_after_its_claude_migrated(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="old writing room\n", code=0))
+        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
+        entry = inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
+            last_seen=OCTOBER, state="running")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        self.assertEqual(output.getvalue(),
+            "tmux session 'old writing room' is still registered; close it after moving its agents\n")
+
+    def test_tmux_free_reports_every_partial_source_including_a_config_only_home(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        failures = ("session writing-id: bare ~/.claude is config-only; account cannot be attributed",
+                    "production alpha: unit marks unreadable")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory(failures)) as observe,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        observe.assert_called_once_with()
+        self.assertEqual(output.getvalue().splitlines(), [f"inventory incomplete: {reason}" for reason in failures])
+
+    def test_tmux_free_refuses_unknown_tmux_and_tmux_unit_hosts_for_both_agents(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        for agent in ("claude", "codex"):
+            for host in (inventory.UnknownHost(kind="unknown"), inventory.TmuxHost(kind="tmux",
+                    tmux_session="writing", session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
+                    server=inventory.TmuxServerNotRecorded(kind="not recorded"),
+                    pane=inventory.PaneNotRecorded(kind="not recorded"))):
+                with self.subTest(agent=agent, host=host):
+                    owner = self.tmux_free_owner(host)
+                    entry: inventory.SnapshotSession = (
+                        inventory.SnapshotCodexSession(agent="codex", session=owner, workers=[], timers=[],
+                            last_seen=OCTOBER, state="running", codex=inventory.CodexLaunch(
+                                home="/tmp/codex", resume=inventory.CodexResumePicker(kind="picker"))) if agent == "codex" else
+                        inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
+                            last_seen=OCTOBER, state="running"))
+                    with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                            "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+                        self.assertEqual(shutdown.main(["tmux-free"]), 1)
+                    self.assertIn(f"{LOGIN}: Writing (writing-id) uses ", output.getvalue())
+                    self.assertIn("unknown host" if host["kind"] == "unknown" else "tmux session 'writing'", output.getvalue())
+        unit = inventory.SnapshotClaudeSession(agent="claude", session=unit_session("unit-id"),
+            workers=[], timers=[], last_seen=OCTOBER, state="running")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: [unit]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        self.assertIn("alpha (unit-id) uses tmux unit demo/alpha-unit in session 'alpha'", output.getvalue())
+
+    def test_tmux_free_collects_unreadable_tmux_herdr_and_inventory_causes(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=1, stderr="permission denied on /tmp/tmux"),
+            native_stdout="not json")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory((
+                "session registry unreadable",))) as observe, redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        observe.assert_called_once_with()
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0], "tmux sessions unreadable: permission denied on /tmp/tmux")
+        self.assertTrue(lines[1].startswith("herdr sessions unreadable:"), lines)
+        self.assertEqual(lines[2], "inventory incomplete: session registry unreadable")
+
+    def test_tmux_free_refuses_missing_tmux_and_inventory_read_errors(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        with (patch.dict(os.environ, {"SHUTDOWN_TMUX": str(self.root / "missing-tmux")}),
+              patch.object(inventory, "snapshot_inventory", side_effect=OSError("proc unavailable")) as observe,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        observe.assert_called_once_with()
+        self.assertIn("tmux sessions unreadable:", output.getvalue())
+        self.assertIn("missing-tmux", output.getvalue())
+        self.assertIn("inventory unreadable: proc unavailable", output.getvalue())
+
+    def test_missing_tmux_never_builds_during_tmux_free_or_recovery_observation(self) -> None:
+        proc = self.root / "proc"
+        boot = proc / "sys/kernel/random/boot_id"
+        boot.parent.mkdir(parents=True)
+        _ = boot.write_text("boot-one\n")
+        registry = self.root / "registry"
+        registry.mkdir()
+        calls: list[list[str]] = []
+
+        def run(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            calls.append(argv)
+            if argv[1:] == ["--session", "default", "session", "list", "--json"]:
+                return subprocess.CompletedProcess(argv, 0, EMPTY_HERDR_SESSIONS, "")
+            raise FileNotFoundError(f"no executable: {argv[0]}")
+
+        with (patch.dict(os.environ, {
+                  "HERDR_PROC": str(proc), "HERDR_BIN": "/missing/herdr",
+                  "UNIT_LOOKUP_TMUX": "", "SHUTDOWN_TMUX": "/missing/tmux",
+                  "NOTIFIER_SESSIONS_DIR": str(registry),
+                  "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
+              }), patch.object(shutil, "which", return_value=None),
+              patch.object(subprocess, "run", side_effect=run)):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["tmux-free"]), 1)
+            self.assertIn("tmux sessions unreadable:", output.getvalue())
+            self.assertIn("inventory incomplete: shared observations: tmux is not installed", output.getvalue())
+            self.assertFalse(any(Path(argv[0]).name == "nix" for argv in calls), calls)
+            self.assertTrue(any(argv[1:] == ["--session", "default", "session", "list", "--json"]
+                                for argv in calls), calls)
+            calls.clear()
+            observed = inventory.snapshot_inventory()
+        self.assertIsInstance(observed, inventory.PartialInventory)
+        if isinstance(observed, inventory.PartialInventory):
+            self.assertTrue(any("tmux is not installed" in failure for failure in observed.failures), observed)
+        self.assertFalse(any(Path(argv[0]).name == "nix" for argv in calls), calls)
+
+    def test_elapsed_text_uses_seconds_minutes_hours_and_days(self) -> None:
+        cases = ((-1, "0s"), (0, "0s"), (59, "59s"), (60, "1m"),
+                 (3599, "59m"), (3600, "1h"), (86399, "23h"),
+                 (86400, "1d"), (172801, "2d"))
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(settle.elapsed_text(seconds), expected)
+
     def recovery(self, *identities: str) -> record.RecoverySnapshot:
         entries: list[record.SnapshotSession] = []
         for identity in identities:
@@ -191,18 +391,156 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(record.read_snapshot(LOGIN), saved)
         self.assertIn("session registry unreadable", error.getvalue())
         self.assertIn("production marks unreadable", error.getvalue())
+        attempts = record.read_snapshot_attempts()
+        assert not isinstance(attempts, record.NoSnapshotAttempt)
+        self.assertEqual(attempts["latest"]["kind"], "failed")
+        self.assertEqual(attempts["latest"].get("reasons"), ["session registry unreadable", "production marks unreadable"])
+        self.assertEqual(attempts["last_success"], {"kind": "not recorded"})
 
     def test_snapshot_command_retains_a_crash_confirmed_entry_during_an_empty_observation(self) -> None:
         _ = self.recovery("recoverable")
         with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
                 "natedev", {}, {})), patch.object(settle, "record_time", return_value=JANUARY),
+              patch.object(settle, "local_machine", return_value="snapshot-host"),
               redirect_stdout(io.StringIO())):
             self.assertEqual(shutdown.main(["snapshot"]), 0)
         saved = record.read_snapshot(LOGIN)
         assert not isinstance(saved, record.NoRecoverySnapshot)
         self.assertEqual(saved["taken_at"], JANUARY)
+        attempts = record.read_snapshot_attempts()
+        assert not isinstance(attempts, record.NoSnapshotAttempt)
+        self.assertEqual(attempts["machine"], "snapshot-host")
+        self.assertEqual(attempts["latest"], {"kind": "taken", "at": JANUARY, "accounts": 1})
+        self.assertEqual(attempts["last_success"], {"kind": "taken", "at": JANUARY})
         self.assertEqual([(item["session"]["session_id"], item["last_seen"], item["state"])
                           for item in saved["sessions"]], [("recoverable", OCTOBER, "unresolved")])
+
+    def test_snapshot_merge_errors_record_failure_and_keep_the_original_exit_code(self) -> None:
+        for failure in (record.InvalidRecord("invalid recovery file"), OSError("disk unavailable")):
+            with (self.subTest(failure=failure),
+                patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory("natedev", {}, {})),
+                patch.object(record, "merge_snapshots", side_effect=failure),
+                patch.object(settle, "record_time", return_value=OCTOBER),
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(shutdown.main(["snapshot"]), 1)
+            attempts = record.read_snapshot_attempts()
+            assert not isinstance(attempts, record.NoSnapshotAttempt)
+            self.assertEqual(attempts["latest"], {"kind": "failed", "at": OCTOBER, "reasons": [str(failure)]})
+            self.assertIn(str(failure), error.getvalue())
+
+    def test_snapshot_outcome_write_failure_keeps_success_and_partial_exit_codes(self) -> None:
+        observations = (inventory.CompleteInventory("natedev", {}, {}), inventory.PartialInventory(("registry failed",)))
+        for observed, expected in zip(observations, (0, 1)):
+            with (self.subTest(expected=expected),
+                patch.object(inventory, "snapshot_inventory", return_value=observed),
+                patch.object(record, "record_snapshot_attempt", side_effect=OSError("outcome disk full")),
+                redirect_stdout(io.StringIO()) as output,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(shutdown.main(["snapshot"]), expected)
+            self.assertIn("snapshot outcome not recorded: outcome disk full", error.getvalue())
+            if expected == 0:
+                self.assertIn("recovery snapshot saved for 0 accounts", output.getvalue())
+            else:
+                self.assertIn("snapshot incomplete: registry failed", error.getvalue())
+
+    def test_status_without_outcome_still_includes_existing_recovery_and_explicit_json_state(self) -> None:
+        _ = self.recovery("crashed")
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
+        self.assertIn("crashed-name: unresolved", output.getvalue())
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+        payload = cast(dict[str, object], json.loads(output.getvalue()))
+        self.assertEqual(payload["snapshot"], {"kind": "no outcome recorded"})
+        self.assertEqual(len(cast(list[object], payload["recovery"])), 1)
+
+    def test_status_reports_taken_then_failed_in_user_zone_only_under_the_local_machine(self) -> None:
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=OCTOBER, accounts=2), "natedev")
+        failed_at = "2026-10-09T21:50:10+00:00"
+        for failed in (False, True):
+            if failed:
+                record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=failed_at,
+                    reasons=["registry unreadable", "host unreadable"]), "natedev")
+            with (self.subTest(failed=failed),
+                patch.object(shutdown, "inventory", return_value=local),
+                patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
+                patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(kind="records", records=[])),
+                patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
+                patch.object(settle, "record_time", return_value=failed_at),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(shutdown.main(["status", LABEL]), 0)
+            text = output.getvalue()
+            line = "recovery snapshot: last taken 2026-10-09 17:49:10 EDT (1m ago)"
+            self.assertIn(line, text)
+            self.assertLess(text.index(line), text.index("Mac"))
+            self.assertEqual(text.count("recovery snapshot: last taken"), 1)
+            if failed:
+                self.assertIn("recovery snapshot failed 2026-10-09 17:50:10 EDT: registry unreadable; host unreadable", text)
+            else:
+                self.assertNotIn("recovery snapshot failed", text)
+            with patch.object(shutdown, "inventory", return_value=local), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+            payload = cast(dict[str, object], json.loads(output.getvalue()))
+            status = cast(dict[str, object], payload["snapshot"])
+            self.assertEqual(status["kind"], "recorded")
+            self.assertEqual(status["last_success"], {"kind": "taken", "at": OCTOBER})
+            self.assertEqual(cast(dict[str, object], status["latest"])["kind"], "failed" if failed else "taken")
+            self.assertEqual(payload["recovery"], [])
+
+    def test_json_status_accepts_a_remote_report_without_snapshot_metadata(self) -> None:
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=local),
+              patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        self.assertEqual(reports[0]["snapshot"], {"kind": "no outcome recorded"})
+        self.assertEqual(reports[0]["recovery"], [])
+        self.assertEqual(reports[1], remote)
+
+    def test_invalid_or_unreadable_snapshot_outcome_does_not_fail_status(self) -> None:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        self.state.mkdir(exist_ok=True)
+        _ = (self.state / "snapshot_attempt.json").write_text("{")
+        for as_json in (False, True):
+            with self.subTest(as_json=as_json), patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["status", LABEL, "--here", *(["--json"] if as_json else [])]), 0)
+            if as_json:
+                payload = cast(dict[str, object], json.loads(output.getvalue()))
+                status = cast(dict[str, object], payload["snapshot"])
+                self.assertEqual(status["kind"], "unreadable")
+                self.assertIn("cannot be read", str(status["error"]))
+            else:
+                self.assertIn("recovery snapshot: outcome unreadable:", output.getvalue())
+        with (patch.object(record, "read_snapshot_attempts", side_effect=OSError("permission denied")),
+              patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("outcome unreadable: permission denied", output.getvalue())
+
+    def test_codex_status_includes_snapshot_outcome_in_text_and_json(self) -> None:
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=OCTOBER, reasons=["Codex unreadable"]), "natedev")
+        selection = shutdown.TerminalAccountSelection((Account("codex", "codex-work", "codex-work"),))
+        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", "--here"]), 0)
+        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
+        self.assertIn("Codex unreadable", output.getvalue())
+        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        status = cast(dict[str, object], reports[0]["snapshot"])
+        self.assertEqual(status["last_success"], {"kind": "not recorded"})
+        self.assertEqual(status["latest"], {"kind": "failed", "at": OCTOBER, "reasons": ["Codex unreadable"]})
+        self.assertEqual(reports[0]["recovery"], [])
 
     def test_forget_removes_only_the_named_recovery_entry_and_keeps_shutdown_record(self) -> None:
         _ = self.recovery("first", "second")
@@ -260,6 +598,20 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
         self.assertIn("crashed-name: unresolved; last seen 2026-10-09 17:49:10 EDT", output.getvalue())
+
+    def test_status_places_local_recovery_before_the_remote_machine_section(self) -> None:
+        _ = self.recovery("crashed")
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "_status", return_value=[local, remote]),
+              patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(
+                  kind="records", records=[])),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL]), 0)
+        text = output.getvalue()
+        self.assertLess(text.index("natedev"), text.index("crashed-name: unresolved"))
+        self.assertLess(text.index("crashed-name: unresolved"), text.index("Mac"))
+        self.assertEqual(text.count("crashed-name: unresolved"), 1)
 
     def test_json_status_keeps_recovery_last_seen_as_an_iso_timestamp(self) -> None:
         _ = self.recovery("crashed")

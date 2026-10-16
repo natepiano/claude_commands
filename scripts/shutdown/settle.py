@@ -210,6 +210,18 @@ def record_time() -> str:
     """Return a canonical timestamp for a shutdown record field."""
     return now_utc().isoformat(timespec="seconds")
 
+
+def elapsed_text(seconds: int) -> str:
+    """Format an elapsed duration in whole seconds, minutes, hours, or days."""
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
 def _user_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(
         user_zone()

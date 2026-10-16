@@ -490,6 +490,21 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(sample.call_args.args, ([Path("one.jsonl"), Path("two.jsonl")], 2))
         self.assertEqual(sample.call_args.kwargs["since"], datetime.fromisoformat("2026-10-12T00:00:00+00:00"))
 
+    def test_sample_still_counts_a_relayed_question_as_a_detected_ask(self) -> None:
+        # Recipient filtering belongs to the Stop check, not to the sample count.
+        body = ('**Also sent to the hana showrunner:** distant picking is listed as "waiting for review". '
+                + 'Did you approve it? It stays "waiting for review" until hana answers.')
+        path = self.transcript("relay.jsonl", [("2026-10-15T21:49:10Z", body, "end_turn")])
+        runner = mock.Mock(side_effect=AssertionError("relayed ask reached the reviewer"))
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], 0, since=datetime.fromisoformat("2026-10-15T00:00:00Z"),
+                                           runner=runner), 0)
+        self.assertEqual(review.reply_questions(body).sentences, ("Did you approve it?",))
+        self.assertIn("sample: 0 replies", output.getvalue())
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+        runner.assert_not_called()
+
     def test_request_sentences_and_recommended_choices_are_asks(self) -> None:
         requests = ["Reply upgrade or wait.", "Choose upgrade or wait.", "Pick a version.",
                     "Confirm the version.", "Decide whether to upgrade.", "Approve the upgrade.",
@@ -517,6 +532,105 @@ class LocalReviewTests(unittest.TestCase):
         line = "Run `retry build-42` (recommended), or stop?"
         asks = review.reply_questions(line + "\nExample: `Stop (recommended)`")
         self.assertEqual(asks.choice_lines, (line,))
+
+    def test_user_asks_exclude_explicit_peer_recipient_headings_and_lead_ins(self) -> None:
+        relays = (
+            '**Also sent to the hana showrunner:** distant picking is listed as "waiting for review". '
+            + 'Did you approve it? It stays "waiting for review" until hana answers.',
+            "**To the hana showrunner:**\nDid you approve it?",
+            "I asked the handler-enh unit director: Should we start phase 3?",
+        )
+        for relay in relays:
+            with self.subTest(relay=relay):
+                self.assertEqual(review.user_reply_questions(relay), review.ReplyAsks((), False))
+
+    def test_attributed_unit_choices_are_exempt_without_changing_measurement_choices(self) -> None:
+        choice = '"Run phases 1 and 2 (recommended), or wait."'
+        reply = "The handler-enh unit director said, in its own words:\n\n" + choice
+        self.assertEqual(review.reply_questions(reply).choice_lines, (choice,))
+        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((), False))
+
+    def test_naming_a_unit_as_the_subject_or_executor_keeps_the_user_ask(self) -> None:
+        # Real user decisions that name a unit as subject or executor.
+        question = "Should handler-enh go ahead with phases 1 and 2?"
+        request = "Say go and I'll have cargo-liner do it."
+        choice = ("Allow (recommended, since both requests are a day old): "
+                  + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
+        self.assertEqual(review.user_reply_questions(question + "\n" + request + "\n" + choice),
+                         review.ReplyAsks((question, request), True, (choice,)))
+
+    def test_peer_recipient_scope_ends_before_the_next_user_paragraph(self) -> None:
+        relay = "**Also sent to the hana showrunner:** Did you approve it?"
+        question = "Want me to stop the nine idle ones now?"
+        choice = "Leave on (recommended), or turn off."
+        for separator in ("\n\n", "\n\n**Question for you:**\n"):
+            with self.subTest(separator=separator):
+                self.assertEqual(review.user_reply_questions(relay + separator + question + "\n" + choice),
+                                 review.ReplyAsks((question,), True, (choice,)))
+
+    def test_quoted_or_code_recipient_headings_do_not_hide_a_user_request(self) -> None:
+        request = "Say go and I'll run it."
+        prefixes = (
+            "`To the hana showrunner:`\n\n",
+            "```text\nTo the handler-enh unit director:\nChoose retry (recommended).\n```\n\n",
+            "**To the hana showrunner:**\n> Did you approve it?\n\n",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(review.user_reply_questions(prefix + request), review.ReplyAsks((request,), False))
+
+    def test_a_peer_message_in_code_does_not_extend_recipient_scope_to_the_user(self) -> None:
+        request = "Want me to have it added?"
+        reply = ("**To the hana showrunner:**\n\n"
+                 + "```text\nDid you approve it?\n```\n\n" + request)
+        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((request,), False))
+
+    def test_purpose_headings_keep_user_requests_and_choices(self) -> None:
+        request = "Say go and I'll cancel the two requests."
+        choice = "Cancel (recommended), or wait."
+        for heading in ("To unblock the shutdown unit:", "To finish the worker move:",
+                        "For review by the hana showrunner:"):
+            with self.subTest(heading=heading):
+                self.assertEqual(review.user_reply_questions(heading + "\n" + request + "\n" + choice),
+                                 review.ReplyAsks((request,), True, (choice,)))
+
+    def test_inline_return_to_user_retains_the_user_question_and_inline_code(self) -> None:
+        question = "should I retire `handler-enh` (recommended), or wait?"
+        for marker in ("Back to you:", "For you:", "Question for you:", "To you:", "Your decision:"):
+            with self.subTest(marker=marker):
+                reply = "**To the hana showrunner:** Did you approve it? " + marker + " " + question
+                self.assertEqual(review.user_reply_questions(reply), review.reply_questions(question))
+
+    def test_recipient_headings_without_colons_exempt_only_their_next_paragraph(self) -> None:
+        user_question = "Want me to stop it?"
+        for heading in ("**To the hana showrunner**", "# For the handler-enh unit director",
+                        "To the hana showrunner"):
+            for separator in ("\n", "\n\n"):
+                with self.subTest(heading=heading, separator=separator):
+                    reply = heading + separator + "Did you approve it?\n\n" + user_question
+                    self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((user_question,), False))
+
+    def test_subject_headings_keep_the_question_addressed_to_the_user(self) -> None:
+        cases = (
+            ("**Hana session**\nWant me to restart it?", "Want me to restart it?"),
+            ("### Shutdown unit\nShould I cancel the two old requests?", "Should I cancel the two old requests?"),
+            ("Trunk unit: remote control is off. Want me to turn it on?", "Want me to turn it on?"),
+            ("hana showrunner\nDid you approve it?", "Did you approve it?"),
+        )
+        for reply, question in cases:
+            with self.subTest(reply=reply):
+                self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((question,), False))
+
+    def test_inline_code_recipient_and_return_markers_do_not_change_the_addressee(self) -> None:
+        question = "Want me to use it?"
+        reply = "`To the hana showrunner:` is only an example. " + question
+        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((question,), False))
+        reply = "**To the hana showrunner:** The example says `Back to you:`. Did you approve it?"
+        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((), False))
+
+    def test_session_address_colon_keeps_the_following_paragraph_addressed_to_the_peer(self) -> None:
+        reply = "To session:other:\n\nDid you approve it?\n\nWant me to stop it?"
+        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks(("Want me to stop it?",), False))
 
     def test_reviewed_question_is_registered_from_outstanding_and_after_closing(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
