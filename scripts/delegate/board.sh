@@ -14,6 +14,7 @@
 #   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
+#                    (without --pid, a token recorded for a live pid is refused)
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS]
 #   board.sh role    <session_dir> <slot> <role> [note...]
 #   board.sh roles   <session_dir>
@@ -405,6 +406,16 @@ cmd_release() {
   local holder holder_pid
   holder="$(lock_holder "$dir")"
   holder_pid="$(cat "$dir/holder_pid" 2>/dev/null || true)"
+  # A release that names no pid cannot tell its own hold from a live process's
+  # under the same agent name: two phases' seats share role names, and a
+  # launcher's closing release once removed a peer phase's token mid-build. A
+  # live recorded holder releases itself by pid; once it is gone, this frees it.
+  if [[ -z "$release_pid" && "$holder_pid" =~ ^[1-9][0-9]*$ ]] && ! pid_is_gone "$holder_pid"; then
+    exec 9>&-
+    printf 'board.sh: %s gave no pid and %s is held by live pid %s\n' \
+      "$agent" "$resource" "$holder_pid" >&2
+    return 1
+  fi
   # Releasing a token another agent now holds would hand a third agent a lock
   # while the real holder is still working behind it.
   if [[ "$holder" != "$agent" && "$holder" != "unknown" ]] \
