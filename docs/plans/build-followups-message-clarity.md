@@ -368,24 +368,35 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Depends on:** Phase 5, Phase 6
 
-#### Work Order
+#### As-built
 
-**Goal:** The nightly count of replies holding an unregistered question is re-measured once the question history covers 48 hours, and it stops counting requests to units or sessions if those are still a large part of it.
+- Measured after the 48 h history gate (2026-10-16 00:02 EDT) over a frozen window [2026-10-15 00:10, 2026-10-16 00:10) EDT, with transcripts and outstanding/history records copied first so any later count reads identical inputs. The counting script reproduced `review.sample`'s unregistered count without calling a reviewer.
+- 578 showrunner replies, 50 registered question texts, 29 replies counted as holding an unregistered question. One (3.4%) was peer-only: a question relayed to another showrunner. The other 28 were questions or requests put to the user and never registered ("Say go and I'll …", "Want me to …?", `(recommended` choice lines).
+- Under the one-in-four bar, so no recipient filter was built: `reply_questions`, `sample` and the Stop hook's choice-line check are unchanged. No repository code changed.
 
-**Spec:**
-- Runs after Phase 5's checkpoint, and not before 48 h after question history began (showrunner's call 2026-10-13: the count is measured against a full history window first). `record_question_history` prunes lines older than 48 h on every write, so the earliest retained line never ages past 48 h and cannot be the clock: at Phase 5's PhaseEnd the unit director reads the earliest `time` in `~/.local/state/showrunner/outstanding/*.history.jsonl` (none existed at 2026-10-13 23:50 EDT) and writes it here as a fixed EDT time; the gate is that time plus 48 h. No history file at that point means the gate stays shut and the read repeats at the next check. Read at Phase 5's PhaseEnd (2026-10-15 12:49 EDT): the earliest `time` is 2026-10-14 00:02 EDT (`build-followups.history.jsonl`), so the gate opens at **2026-10-16 00:02 EDT**.
-- Measure first, before any code change: a dry pass over the last 24 h of showrunner replies (`nightly_review.showrunner_transcripts(since)`, the worktree's `scripts/notify/review.py`: `transcript_replies`, `reply_questions`, `registered_questions`) that lists, for every reply counted as holding an unregistered question, each unregistered sentence — and for a reply counted only for its `(recommended` choice lines (`sample`'s `asks.has_choices` branch), those lines. Classify each sentence or choice block as put to the user or addressed to a unit or session. Report total counted replies and the share whose unregistered sentences are all addressed to units or sessions. Measurement output goes in `SESSION_DIR`, never in the repository; it posts nothing. The pass first copies its inputs into `SESSION_DIR` — the transcript replies inside a fixed `[since, until)` window and a snapshot of the outstanding and history records it matched against — and both the measured count and any later before-and-after count read those copies, so the comparison is over identical inputs.
-- Build the recipient filter only when that share is one in four or more (unit director's call: "a large part", per the showrunner). Then `sample`'s unregistered count stops counting a sentence or choice block addressed to a unit or session, by rules derived from the forms the measured peer sentences actually take (for example a sentence inside a message relayed to a session, or one naming a unit or session as its addressee), and keeps every sentence put to the user. The filter is a separate step applied only to that count (unit director's call after Phase 5's phase review): `reply_questions` and its result stay unchanged, so `sample`'s choice of which replies enter clarity review and the Stop hook's choice-line check behave exactly as before. Below one in four, the phase ships no code: its checkpoint is the plan doc and the notice.
-- The checkpoint notice carries the measured share (counted replies, peer-only replies, percentage) and whether the filter was built (showrunner's request).
+**Ruled out:** a recipient filter in the nightly count; peer requests are too small a share to matter.
+
+### Phase 15 — Every question a showrunner puts to the user is registered and reviewed  · status: done
+
+#### As-built
+
+- `commands/showrunner/produce.md`, under `open_for_user`: before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, the showrunner registers an item with the full ask in `question`, and the reply carries the printed `reviewed question` text.
+- `showrunner_footer.check_reviewed_text` (called first in `block_reason`, before the footers-off return and the `stop_hook_active` skip) runs the pending reviewed-text check, then takes the reply's asks from `review.user_reply_questions` and blocks with `QuestionReplyBlocked("Unregistered ask …")` on any sentence or choice line that matches no registered text. The reason names the sentence and says to record it with `update_registration.py footer --state` and paste the reviewed question.
+- Registered text is the instances' pending reviewed records plus `text`, `question` and `reviewed` of every outstanding item for the instance's slug and every slug below it; both sides pass through `choice_comparison_text` and `review.question_prose`, and a match is either string containing the other.
+- `review.user_reply_questions` blanks paragraphs addressed to another session before calling `reply_questions`: `peer_question_lead` recognises a recipient heading or lead-in (`to`/`for` a unit, session, worker, agent or showrunner; "sent/relayed/forwarded to …"; "quoted from …"; "… said/wrote/in its own words"), and an inline user-return marker ("back to you:", "for you:", "your decision:") hands the rest of the line back to the user. Code fences, inline code and `>` quotes stay excluded.
+- Over Phase 7's frozen inputs the check flags all 28 user asks and passes reply 28, the question relayed to hana.
 
 **Files:**
-- `scripts/notify/review.py` — recipient filter in `reply_questions` (only when built)
-- `scripts/notify/test_review.py` — its cases (only when built)
-- `scripts/hooks/test_stop_showrunner_footer.py` — the choice-line check unchanged by the filter (only when built)
+- `scripts/hooks/showrunner_footer.py` — `check_reviewed_text`: reviewed-text and unregistered-ask checks
+- `scripts/hooks/test_stop_showrunner_footer.py` — unregistered "Say go" and `(recommended` cases block; registered, relayed and unit-quoted cases pass
+- `scripts/notify/review.py` — `peer_question_lead`, `user_reply_questions`
+- `scripts/notify/test_review.py` — recipient-detection cases
+- `commands/showrunner/produce.md` — the registration sentence
 
-**Workers:** 1 writer
-- `impl` — the measurement script (session directory) and, when built, `review.py` and its tests; hub: `scripts/notify/review.py`
+**Gotchas:**
+- `reply_questions` and `review.sample` are unchanged; recipient context applies only to the Stop hook through `user_reply_questions`.
+- A heading that only names a unit or session (no `to`/`for`, no attribution) is a subject, not a recipient, so questions under it stay the user's; status replies use such headings often.
+- `review` is imported inside `check_reviewed_text`, never at module level, since `test_update_registration.py` loads `showrunner_footer.py`.
+- A dry check against an outstanding snapshot taken later than the replies over-reports: questions registered before their reply and closed before the snapshot read as unregistered.
 
-**Constraints from prior phases:** Phase 6: `review.py sample` counts a reply as holding an unregistered question when a question or request sentence from `reply_questions` (`ReplyAsks`; fenced code, inline code and `>` quotes excluded) matches no text from `registered_questions(since)` (current outstanding plus 48 h of `outstanding/<slug>.history.jsonl`), and a reply with only `(recommended` choice lines when no registered text appears in it. Phase 5 records the reviewed question text in that history too: `registered_questions` returns `question_prose` (inline code removed, whitespace collapsed) of each item's `text`, `reviewed` and `question` fields, from outstanding and from history lines within the window, and `reply_questions` applies the same `question_prose` to each line before splitting sentences, so matching compares like with like. Its footer hook reuses `reply_questions` for the choice-line check, so a filter change must keep that check's behavior; run `scripts/hooks` tests as well when the filter is built. Dry checks use the worktree's `review.py`; nothing reaches the phone.
-
-**Acceptance gate:** the measured share is recorded; when the filter is built: test lines for `scripts/notify` and `scripts/hooks` green, basedpyright 0/0, a test with one reply holding a user question and one holding a peer request counts 1, a test with a user-directed and a peer-directed choice-only reply counts 1, a test shows a peer-only reply still stays out of clarity review and the Stop hook still blocks an unrecorded `(recommended` line addressed to a session, and a dry sample over the same 24 h prints its new count beside the measured one.
+**Ruled out:** a bare-name recipient rule (a heading naming a unit marks a relay) — it hides real user asks under status headings.
