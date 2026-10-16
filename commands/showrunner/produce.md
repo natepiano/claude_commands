@@ -223,6 +223,9 @@ State:
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
   they want it (user, 2026-10-15).
+  When the user's answer needs research before they can finish it, remove the
+  item from `open_for_user` in that turn; it returns, in full, when the
+  research reports (user, 2026-10-15).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -610,9 +613,9 @@ For each distinct user-visible result:
    check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
    from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
    `--unit`, and one `--old` per replaced live entry. When the merge has
-   several results, pass `--separate-result` for every row. A Hana row is the
-   bare `C<n>`; any other list's row names the list, `<slug>/C<n>`
-   (`build-followups/C3`).
+   several results, pass `--separate-result` for every row. A row on hana's
+   list is the bare `C<n>`; a row on any other list names its showrunner,
+   `<showrunner>/C<n>` (`natedev/C3`).
 
 Several results get several rows. Internal-only work gets none; write
 `feature log: none — <reason>` to the production log. The merge is not complete
@@ -659,9 +662,9 @@ beginning `works` or `fine` lands the row; any other returns it to its unit.
 1. **Feature log.** Only when the production's project closes out by change
    review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
-   review id is the row: bare `C<n>` on Hana's list, `<list>/C<n>` on any other,
-   where `<list>` is the list file's name without `.md`
-   (`build-followups/C3`).
+   review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
+   other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
+   is named for (`natedev/C3`).
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
      its proposal has `--old`. Propose a missing row first; correct wrong
      meaning by rerunning `propose` while it is open.
@@ -884,8 +887,8 @@ it needs. Every other wait is yours to clear, and fast.
    what to run, and log the call. Each unit director runs its own cargo-berth
    commands. When a unit director sends an overlap, reply in that turn with the
    answer it records —
-   `--before`, `--after`, `--defer` or `--override` on the named holder — and a
-   one-line why.
+   `--before`, `--after`, `--defer` or `--override` on each named holder, all
+   in one claim — and a one-line why.
    1. The holding unit checkpoints what is green; merge it, and its
       reservations release.
    2. Release in batches: the holder releases what it is done with, you merge,

@@ -218,7 +218,7 @@ Release refusals, each checked before any write:
 | `add`/`supersede --review ROW` | lands with the saved arguments; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
 | `drop --review ROW --verdict TEXT` | becomes dropped | refused | `unchanged: <ROW>` | refused |
 
-A row is `A<n>` or `C<n>`, bare for a row of Hana's list `~/rust/hanadocs/change-review.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the file name of `~/rust/hanadocs/change-review/<list>.md` without `.md`, the production slug (`build-followups/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
+A row is `A<n>` or `C<n>`, bare for a row of hana's list `~/rust/hanadocs/change-review/change-review - hana.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the showrunner `~/rust/hanadocs/change-review/change-review - <list>.md` is named for (`natedev/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
 
 A verb that differs from the proposal's fails and names the right verb. `propose` also requires every `--old` note to exist and be live.
 
@@ -285,7 +285,7 @@ A call is off host when the verb is not `project-of`, the short host name is not
 
 - An entry exists for a result when a user or operator can state what is now possible, now works, changed, went away or became noticeably faster. Refactor, test, build, CI and docs-only work gets none; it may be evidence for an entry.
 - Before writing, the agent reads `live` for affected entries. Still true: leave it. Stale wording or scope: `amend`. Replaced: `supersede --old`.
-- Hana: each distinct result gets one `A<n>` or `C<n>` row under `## To review` in `~/rust/hanadocs/change-review.md` and one `propose --review <row>` with `--project hana`, every owning crate, the merge sha as `--link`, `--evidence "Showrunner merge <merge-sha>, from checkpoint <checkpoint-sha>."`, `--production`, every `--unit`, and one `--old` per replaced entry. Internal-only work logs `feature log: none — <reason>` in the production log. A script failure leaves the row open.
+- Hana: each distinct result gets one `A<n>` or `C<n>` row under `## To review` in `~/rust/hanadocs/change-review/change-review - hana.md` and one `propose --review <row>` with `--project hana`, every owning crate, the merge sha as `--link`, `--evidence "Showrunner merge <merge-sha>, from checkpoint <checkpoint-sha>."`, `--production`, every `--unit`, and one `--old` per replaced entry. Internal-only work logs `feature log: none — <reason>` in the production log. A script failure leaves the row open.
 - claude: the same, with no `--crate`, the merge sha as `--link` (a `natepiano/claude_commands` commit), and each row qualified by its list, `<list>/C<n>`.
 - `<FeatureLogCloseOut/>` starts with `project-of .` and prints nothing for `hana`, `natedev`, `claude` or `none`.
 

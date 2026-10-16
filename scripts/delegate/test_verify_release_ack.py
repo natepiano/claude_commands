@@ -67,7 +67,8 @@ PY
         _ = sweep.write_text('#!/bin/sh\nexit 0\n')
         sweep.chmod(0o755)
         self.environment = {
-            **os.environ,
+            **{name: value for name, value in os.environ.items()
+               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
             "HOME": str(self.root),
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "TMPDIR": str(self.root),

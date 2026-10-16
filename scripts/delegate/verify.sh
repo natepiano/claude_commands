@@ -574,11 +574,31 @@ compose_nextest_args() {
         -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}")
 }
 
+VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
 if [[ "${1:-}" == "--session-dir" ]]; then
     export PLAN_DELEGATE_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
+fi
+
+# A Codex mesh worker's command dies with its turn, and a worker that waits on
+# one spends a model call per wait. So a worker's call detaches: mesh_runs.py
+# runs this same call under a supervisor outside the worker's process group,
+# returns at once, and sends the result to the worker as its next message.
+# Exit 3 means the caller is not a mesh worker; this call then runs attached.
+# The detached run sets PLAN_DELEGATE_DETACHED_RUN, so it does not detach again.
+MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
+if [[ -z "${PLAN_DELEGATE_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
+    VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    DETACH_STATUS=0
+    "$PY" "$MESH_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+        bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
+    case "$DETACH_STATUS" in
+        0) exit 0 ;;
+        3) ;;
+        *) echo "verify.sh: mesh_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
+    esac
 fi
 
 CMD="${1:-}"
@@ -1218,6 +1238,13 @@ ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
 BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
+# The unit director's own run (a session dir, no board, no team role) takes the
+# token too, as slot `director` on the session's board, so it queues with the
+# workers' detached runs instead of building beside them.
+if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
+    BOARD_DIR="${PLAN_DELEGATE_SESSION_DIR}"
+    BOARD_SLOT=director
+fi
 TOKEN_HELD=0
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
@@ -1287,7 +1314,15 @@ if child:
 os.setsid()
 with (lock.parent / "cargo.guard").open("a+") as guard:
     fcntl.flock(guard, fcntl.LOCK_EX)
-    if (lock / "holder_pid").read_text() != holder:
+    # A token released or reclaimed during the memory wait leaves no holder_pid,
+    # or a holder that recorded none: either way this run no longer holds it.
+    try:
+        recorded = (lock / "holder_pid").read_text()
+    except OSError:
+        recorded = ""
+    if recorded != holder:
+        print("verify.sh: this run lost the cargo token before its step started; run it again.",
+              file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))

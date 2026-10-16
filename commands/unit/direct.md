@@ -271,6 +271,18 @@ Applies to every implementation, test, fix, and review launcher.
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
+<WorkerRuns>
+A Codex worker runs only commands that finish within one call and never makes
+an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
+started with `mesh_runs.py start`, detaches and pushes its own result to the
+worker, per <WritePromptContract/> item 3. A live run keeps the worker's
+launcher attached, so the dispatch finishes only when the worker is done.
+Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
+a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
+launcher is attached carries the result to you: dispatch that seat
+(`implement.sh --to <full worker name>`) when it should act on it.
+</WorkerRuns>
+
 <DelegateLaunchFailure>
 When the production doc names a review pool, on a pool review's `error` export
 `REVIEW_LEASE=<slug>/<unit>/<phase>` and retry with
@@ -501,8 +513,11 @@ recording the result.
 
 <FindingsLedger>
 Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
-"${SESSION_DIR}"` for confirmed style violations in the main review, or after
-<Synthesize/> confirms another issue.
+"${SESSION_DIR}" --phase "<phase id>"` for confirmed style violations in the
+main review, or after <Synthesize/> confirms another issue. Each open phase has
+its own ledger, and `--phase` names which one: with two phases open, a call
+naming none is refused. Every launch names its phase (<PassOwnership/>), so the
+launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
@@ -868,10 +883,14 @@ yourself. Either way, report what was decided in one line.
 An answer is `cargo-berth claim <paths> --reservation <id> --<choice> <holder>
 --overlap-why "<why>"`, `<choice>` one of `before`, `after`, `defer`,
 `override`, and `<id>` the asking phase's recorded reservation; it records in
-one step and exits 0. Until the installed engine takes `--reservation` on
-`claim`, leave it out with one phase open; with two, send the overlap and hold
-that phase's dispatch. If another holder also conflicts, it is refused and
-records nothing: split the claim so each call meets one holder.
+one step and exits 0. `before` and `after` widen only that phase's reservation,
+with the ordering edge; `defer` records the answer and takes no paths, so the
+phase holds its dispatch on them. An id the ledger does not know is refused.
+A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
+recorded: the answer stands, so do not repeat it. When several holders
+conflict, name every one in the same claim, one flag each: `--before`,
+`--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
+claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
@@ -990,7 +1009,7 @@ always may — early launch is opportunistic, never required.
 
 | Event | Required action |
 | --- | --- |
-| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
+| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `review.sh`'s run then sends the reviewer its Stage 2. |
 | Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; on the pool arm, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |

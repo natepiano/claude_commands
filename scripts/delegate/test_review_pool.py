@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -11,7 +13,8 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 from pathlib import Path
 from typing import cast, override
 
@@ -269,14 +272,19 @@ class ReviewPoolTests(unittest.TestCase):
             "reviewers": entries,
         })
 
-    def idle(self, unit: str = "", phase: str = "phase1", *, prime_hash: str = "current",
-             served: tuple[tuple[str, str], ...] = ()) -> dict[str, object]:
+    def idle(self, unit: str = "", *, prime_hash: str = "current") -> dict[str, object]:
         return {
             "type": "code", "thread_id": "existing-thread", "prime_hash": prime_hash,
-            "lease": {"unit": unit, "phase": phase, "ordinal": 3} if unit else None,
-            "busy_pid": None, "served": [list(entry) for entry in served], "reviews": 5,
-            "last_allocated": time.time(),
+            "lease": {"unit": unit, "ordinal": 3} if unit else None,
+            "busy_pid": None, "reviews": 5, "last_allocated": time.time(),
         }
+
+    def fork_sources(self) -> list[str]:
+        sources: list[str] = []
+        for event in self.events("fork"):
+            argv = cast("list[str]", event["argv"])
+            sources.append(argv[argv.index("--from") + 1])
+        return sources
 
     def allocation_args(self, unit: str = "unit", phase: str = "phase1", review_pass: str = "1",
                         lens: str = "contract", reviewer_type: str = "code") -> list[str]:
@@ -451,24 +459,48 @@ class ReviewPoolTests(unittest.TestCase):
             observed.add(expected)
         self.assertEqual(observed, {"own", "pool"})
 
-    def test_allocation_prefers_existing_phase_lease_over_unleased_reviewer(self) -> None:
+    def test_allocation_prefers_the_units_reviewer_over_unleased_reviewer(self) -> None:
         self.seed({"code1": self.idle(), "code2": self.idle("unit")})
         result = self.allocate()
         self.assertEqual(result["reviewer"], "code2")
         self.assertEqual(result["lease_ordinal"], 4)
         self.assertEqual(self.reviewer("code2")["busy_pid"], os.getpid())
-        self.assertEqual(self.reviewer("code2")["served"], [["1", "contract"]])
         self.assertEqual(self.events(), [])
 
-    def test_allocation_reuses_same_lens_but_excludes_other_lens_on_same_pass(self) -> None:
-        self.seed({"code1": self.idle("unit", served=(("1", "contract"),)), "code2": self.idle()})
-        self.assertEqual(self.allocate()["reviewer"], "code1")
-        self.release("code1")
-        self.assertEqual(self.allocate(lens="adversary")["reviewer"], "code2")
+    def test_later_phases_passes_and_lenses_reuse_the_units_one_reviewer(self) -> None:
+        self.seed({"code1": self.idle("unit"), "code2": self.idle()})
+        for phase, review_pass, lens in (("phase1", "1", "contract"), ("phase1", "1", "adversary"),
+                                         ("phase2", "1", "contract"), ("phase3", "2", "")):
+            with self.subTest(phase=phase, review_pass=review_pass, lens=lens):
+                self.assertEqual(self.allocate(phase=phase, review_pass=review_pass, lens=lens)["reviewer"], "code1")
+                self.release("code1")
+        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "ordinal": 7})
+        self.assertIsNone(self.reviewer("code2")["lease"])
+        self.assertEqual(self.events(), [])
 
-    def test_previous_pass_other_lens_does_not_exclude_phase_reviewer(self) -> None:
-        self.seed({"code1": self.idle("unit", served=(("1", "adversary"),))})
-        self.assertEqual(self.allocate(review_pass="2")["reviewer"], "code1")
+    def test_concurrent_review_forks_the_units_newest_reviewer_not_the_template(self) -> None:
+        older = {**self.idle("unit"), "busy_pid": os.getpid(), "last_allocated": time.time() - 60}
+        newest = {**self.idle("unit", prime_hash="old"), "busy_pid": os.getpid()}
+        self.seed({"code1": older, "code2": newest, "code3": self.idle(), "code4": self.idle("other-unit")})
+        result = self.allocate()
+        self.assertEqual(result["reviewer"], "code5")
+        self.assertEqual(result["lease_ordinal"], 4)
+        self.assertEqual(result["prime_hash"], "old")
+        self.assertEqual(self.fork_sources(), ["code2"])
+        self.assertEqual(self.reviewer("code5")["lease"], {"unit": "unit", "ordinal": 4})
+        self.release("code5")
+        self.assertEqual(self.allocate(phase="phase2")["reviewer"], "code5")
+        self.assertEqual(len(self.events("fork")), 1)
+
+    def test_failed_fork_of_the_units_reviewer_falls_back_to_the_template(self) -> None:
+        self.seed({"code1": {**self.idle("unit"), "busy_pid": os.getpid()}})
+        self.control({"fork:code2": {"exit": 1, "failures": 1}})
+        result = self.run_pool(*self.allocation_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(parse_object(result.stdout)["reviewer"], "code2")
+        self.assertEqual(self.fork_sources(), ["code1", "code-template-current"])
+        self.assertIn("fork of code1 failed", result.stderr)
+        self.assertEqual(self.reviewer("code2")["thread_id"], "thread-code2")
 
     def test_old_hash_phase_lease_is_reused_until_lease_end(self) -> None:
         self.seed({"code1": self.idle("unit", prime_hash="old"), "code2": self.idle()})
@@ -491,12 +523,12 @@ class ReviewPoolTests(unittest.TestCase):
         result = self.allocate()
         self.assertEqual(result["reviewer"], "code1")
         self.assertEqual(result["lease_ordinal"], 1)
-        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "phase": "phase1", "ordinal": 1})
+        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "ordinal": 1})
 
-    def test_allocation_skips_busy_wrong_type_other_phase_and_old_unleased_reviewers(self) -> None:
-        busy = {**self.idle("unit"), "busy_pid": os.getpid()}
+    def test_first_review_skips_busy_wrong_type_other_unit_and_old_unleased_reviewers(self) -> None:
+        busy = {**self.idle(), "busy_pid": os.getpid()}
         ui = {**self.idle("unit"), "type": "ui"}
-        self.seed({"code1": busy, "ui1": ui, "code2": self.idle("unit", "phase2"),
+        self.seed({"code1": busy, "ui1": ui, "code2": self.idle("other-unit"),
                    "code3": self.idle(prime_hash="old"), "code4": self.idle()})
         self.assertEqual(self.allocate()["reviewer"], "code4")
         self.assertEqual(self.events("fork"), [])
@@ -631,7 +663,7 @@ class ReviewPoolTests(unittest.TestCase):
         code, output, errors = self.finish(process)
         self.assertEqual(code, 0, errors)
         self.assertEqual(parse_object(output)["lease_ordinal"], 4)
-        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "phase": "phase1", "ordinal": 4})
+        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "ordinal": 4})
         self.assertEqual(self.reviewer("code1")["busy_pid"], os.getpid())
 
     def test_fresh_reset_failure_retires_reviewer_and_retries_allocation(self) -> None:
@@ -694,27 +726,30 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual([event["name"] for event in self.events("end")], ["code1"])
         self.assert_fork_names_are_unique_per_generation()
 
-    def test_end_lease_resets_idle_reviewer_and_clears_lease_served_and_owner(self) -> None:
-        self.seed({"code1": self.idle("unit", served=(("1", "contract"),)),
-                   "code2": self.idle("other-unit"), "code3": self.idle("unit", "phase2")})
-        before_other = self.reviewer("code2")
-        before_phase = self.reviewer("code3")
+    def test_phase_end_lease_leaves_the_units_reviewer(self) -> None:
+        self.seed({"code1": self.idle("unit")})
+        before = self.reviewer("code1")
         _ = self.succeed("end-lease", "--unit", "unit", "--phase", "phase1")
+        self.assertEqual(self.reviewer("code1"), before)
+        self.assertEqual(self.events(), [])
+
+    def test_end_lease_resets_idle_reviewer_and_clears_lease_and_owner(self) -> None:
+        self.seed({"code1": self.idle("unit"), "code2": self.idle("other-unit")})
+        before_other = self.reviewer("code2")
+        _ = self.succeed("end-lease", "--unit", "unit")
         record = self.reviewer("code1")
         self.assertIsNone(record["lease"])
         self.assertIsNone(record["busy_pid"])
-        self.assertEqual(record["served"], [])
         self.assertEqual(record["reviews"], 5)
         self.assertEqual(self.reviewer("code2"), before_other)
-        self.assertEqual(self.reviewer("code3"), before_phase)
         self.assertEqual([event["name"] for event in self.events("reset")], ["code1"])
         reused = self.allocate(unit="new-unit")
         self.assertEqual(reused["reviewer"], "code1")
         self.assertEqual(reused["lease_ordinal"], 1)
         self.assertEqual(self.events("fork"), [])
 
-    def test_end_lease_without_phase_clears_every_phase_for_the_unit(self) -> None:
-        self.seed({"code1": self.idle("unit"), "code2": self.idle("unit", "phase2")})
+    def test_end_lease_clears_every_reviewer_of_the_unit(self) -> None:
+        self.seed({"code1": self.idle("unit"), "code2": self.idle("unit")})
         _ = self.succeed("end-lease", "--unit", "unit")
         self.assertIsNone(self.reviewer("code1")["lease"])
         self.assertIsNone(self.reviewer("code2")["lease"])
@@ -1027,7 +1062,7 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         leased = next(line for line in lines if "code1" in line)
         busy = next(line for line in lines if "code2" in line)
-        for text in ("code", "unit", "phase1", "idle", "5"):
+        for text in ("code", "unit:3", "idle", "5"):
             self.assertIn(text, leased)
         self.assertIn("busy", busy)
 
@@ -1045,6 +1080,93 @@ class ReviewPoolTests(unittest.TestCase):
         _ = self.succeed("health", "--stale-hours", "1")
         self.assertIsNone(self.reviewer("code1")["lease"])
 
+    def migrate(self, running: set[str], *, apply: bool) -> list[list[str]]:
+        arguments = review_pool.PoolArguments()
+        arguments.production = "production"
+        arguments.apply = apply
+        output = io.StringIO()
+        with (patch.dict(os.environ, self.environment()),
+              patch.object(review_pool, "running_units", return_value=running) as units,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(review_pool.command_migrate(arguments), 0)
+        units.assert_called_once_with("production")
+        return [line.split("\t") for line in output.getvalue().splitlines()]
+
+    def seed_tool_based_ui(self) -> None:
+        """The tool-based-ui pool's layout: phase leases left on every finished phase's reviewers."""
+        now = time.time()
+
+        def phase_leased(unit: str, phase: str, age: int) -> dict[str, object]:
+            return {"type": "code", "thread_id": f"thread-{unit}-{phase}-{age}", "prime_hash": "current",
+                    "lease": {"unit": unit, "phase": phase, "ordinal": 1}, "busy_pid": None,
+                    "served": [["1", "contract"]], "reviews": 1, "last_allocated": now - age}
+
+        self.seed({
+            "code49": phase_leased("widget-unit", "14", 900), "code71": phase_leased("widget-unit", "phase15", 500),
+            "code80": phase_leased("widget-unit", "15", 100),
+            "code74": phase_leased("trunk", "127", 700), "code78": phase_leased("trunk", "128", 300),
+            "code63": phase_leased("gone-unit", "26", 800),
+            "code81": {**self.idle(), "thread_id": "thread-spare"},
+            "code82": {**phase_leased("widget-unit", "16", 50), "busy_pid": os.getpid()},
+        })
+
+    def test_migrate_prints_its_plan_and_changes_nothing_without_apply(self) -> None:
+        self.seed_tool_based_ui()
+        before = self.state()
+        plan = self.migrate({"widget-unit", "trunk-unit"}, apply=False)
+        self.assertEqual({row[1]: row[0] for row in plan}, {
+            "code82": "keep", "code80": "keep", "code71": "retire", "code49": "retire",
+            "code78": "keep", "code74": "retire", "code63": "retire", "code81": "retire",
+        })
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.events(), [])
+
+    def test_migrate_apply_keeps_one_reviewer_per_running_unit_and_ends_the_rest(self) -> None:
+        self.seed_tool_based_ui()
+        _ = self.migrate({"widget-unit", "trunk-unit"}, apply=True)
+        self.assertEqual(sorted(self.reviewers()), ["code78", "code80", "code82"])
+        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")),
+                         ["code49", "code63", "code71", "code74", "code81"])
+        self.assertEqual(self.reviewer("code80")["lease"], {"unit": "widget-unit", "ordinal": 1})
+        self.assertNotIn("served", self.reviewer("code80"))
+        self.assertEqual(self.allocate(unit="trunk", phase="140")["reviewer"], "code78")
+        self.assertEqual(self.events("fork"), [])
+
+    def test_migrate_apply_leaves_a_reviewer_allocation_took_after_the_plan(self) -> None:
+        plan = [review_pool.MigrationStep("code2", "existing-thread", False, "unit keeps a newer code reviewer")]
+        self.seed({"code1": self.idle("unit"), "code2": {**self.idle("unit"), "busy_pid": os.getpid()}})
+        with patch.object(review_pool, "migration_plan", return_value=plan):
+            arguments = review_pool.PoolArguments()
+            arguments.production = "production"
+            arguments.apply = True
+            errors = io.StringIO()
+            with (patch.dict(os.environ, self.environment()),
+                  patch.object(review_pool, "running_units", return_value={"unit"}),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors)):
+                self.assertEqual(review_pool.command_migrate(arguments), 0)
+        self.assertIn("code2", self.reviewers())
+        self.assertIn("code2 changed since the plan", errors.getvalue())
+        self.assertEqual(self.events(), [])
+
+    def test_running_units_counts_a_unit_of_unknown_state_as_running(self) -> None:
+        # A stand-in module keeps tmux, herdr and the top-level showrunners module out of this suite.
+        class ClaudeNotRunning:
+            pass
+
+        class LiveClaude:
+            pass
+
+        class ClaudeUnknown:
+            pass
+
+        marked = {unit: SimpleNamespace(claude=claude()) for unit, claude in (
+            ("live-unit", LiveClaude), ("unknown-unit", ClaudeUnknown), ("stopped-unit", ClaudeNotRunning))}
+        lookup = Mock(return_value=marked)
+        stand_in = ModuleType("unit_lookup")
+        stand_in.__dict__.update(ClaudeNotRunning=ClaudeNotRunning, marked_units=lookup)
+        with patch.dict(sys.modules, {"unit_lookup": stand_in}):
+            self.assertEqual(review_pool.running_units("production"), {"live-unit", "unknown-unit"})
+        lookup.assert_called_once_with("production", every_host=True)
 
 class UIStandingPromptTests(unittest.TestCase):
     def test_ui_standing_prompt_defines_report_and_measurement_without_rule_reads(self) -> None:

@@ -764,6 +764,24 @@ fi
 
 bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset})" "${ROLE_DESC}" || true
 
+# Early mode: the reviewer ends Stage 1 with provisional findings while the
+# implementation still runs. A detached run for the reviewer waits until the
+# sentinel exists, then sends Stage 2 as the reviewer's next message; the live
+# run keeps the reviewer's launcher attached until then. It exits 1, sending
+# nothing, if this script exits first.
+if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
+  STAGE_TWO_FILE="${ARTIFACT_DIR}/review_stage2_${PASS_INDEX}${SUFFIX}.$$.txt"
+  printf 'Stage 2: the final diff is at %s; review it per your prompt'"'"'s Stage 2.\n' \
+    "${EARLY_READY_FILE%.ready}.diff" > "${STAGE_TWO_FILE}"
+  if ! "$PY" "${MESH_RUNS_SCRIPT:-${SCRIPT_DIR}/../agents/mesh_runs.py}" start \
+    --session-dir "${MESH_SESSION_DIR}" --to "${REVIEW_WORKER}" --director-dir "${SESSION_DIR}" \
+    --label "final diff ready" --done-message-file "${STAGE_TWO_FILE}" -- \
+    bash -c 'while [[ ! -e "$1" ]]; do kill -0 "$2" 2>/dev/null || [[ -e "$1" ]] || exit 1; sleep "$3"; done' \
+    stage-two "${EARLY_READY_FILE}" "$$" "${PLAN_DELEGATE_EARLY_POLL_SECS:-5}" >>"${LOG_FILE}" 2>&1; then
+    echo "ERROR: could not start the Stage 2 run for ${REVIEW_WORKER}; see ${LOG_FILE}." >&2
+  fi
+fi
+
 TURN_WORKTREE_ARGS=()
 if [[ -n "${POOL_TYPE}" ]]; then
   TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)

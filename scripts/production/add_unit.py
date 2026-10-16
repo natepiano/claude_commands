@@ -839,8 +839,12 @@ def launch_session(
     timeout_ms = int(request.timeout * 1000)
     herdr.start_new_server(name, timeout_ms)
     pane = herdr.open_pane(name, name, str(request.session_cwd), environment)
-    herdr.start_agent(name, pane, kind="claude", agent_arguments=arguments,
-                      opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
+    try:
+        herdr.start_agent(name, pane, kind="claude", agent_arguments=arguments,
+                          opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
+    except herdr.AgentExited:
+        herdr.stop_session(name)
+        raise
 
 
 def launch_environment() -> dict[str, str]:

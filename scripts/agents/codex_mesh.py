@@ -41,6 +41,9 @@ Verbs:
          still live on the thread and no follow-up can be sent.
   send   Queue a message for a named delegate, delivered at its next turn.
   steer  Inject into a named delegate's running turn.
+  interrupt
+         Stop a named delegate's running turn and keep the delegate. A --message
+         is held first and opens its next turn.
   end    Finish a resident delegate: drop its queued messages, interrupt its
          running turn, if any, and release its `start`.
   stop   Stop the session's app-server, and any it replaced mid-run.
@@ -169,6 +172,10 @@ def _serving_request(
 SERVER_FILE = "mesh_server.json"
 SERVER_LOG = "mesh_server.log"
 ROSTER_FILE = "mesh_roster.json"
+# Runs a worker detached with mesh_runs.py: one `<run id>.json` record and `<run id>.log` each.
+DETACHED_RUNS_DIR = "mesh_runs"
+# A run record written before its supervisor's pid counts as live for this long.
+DETACHED_RUN_START_GRACE_SECS = 60.0
 BOARD_HELPER = Path(__file__).resolve().parent.parent / "delegate" / "board.sh"
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
@@ -186,6 +193,16 @@ COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
+# Codex compacts a thread on its own once its context passes this many tokens. Every request
+# re-reads the whole context, and threads left to Codex's default grew to 460K; a 200K cap cut a
+# replayed day of worker usage by 19% (user, 2026-10-15). A server started with another value is
+# retired at the next dispatch, so each worker moves to the new limit after its current turn.
+AUTO_COMPACT_TOKENS = 200_000
+# The longest one write_stdin call may block on a command a worker started, in milliseconds.
+# Codex's default ends a wait after a short time, so a worker waiting on a build made a model
+# call every few seconds; 68% of worker calls were such waits (2026-10-15). Not part of the
+# server record: an older server keeps its value until it retires for another reason.
+BACKGROUND_TERMINAL_MAX_TIMEOUT_MS = 300_000
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
@@ -236,6 +253,7 @@ class ServerRecord(TypedDict):
     port: int
     pid: int
     codex_home: NotRequired[str]
+    auto_compact_tokens: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -1323,7 +1341,7 @@ def _write_pending(handle: TextIO, thread_id: str, messages: list[str], *, accep
 def _close_messages_if_empty(session_dir: str, name: str, thread_id: str) -> bool:
     """Exclude senders while claiming an empty inbox and closing its launcher."""
     with _pending_file(session_dir, name) as handle:
-        if _pending_for_thread(handle, thread_id):
+        if _pending_for_thread(handle, thread_id) or _detached_run_live(session_dir, name):
             return False
         _write_pending(handle, thread_id, [], accepting_messages=False)
         return True
@@ -1335,6 +1353,98 @@ def _close_messages_and_keep_pending(session_dir: str, name: str, thread_id: str
         messages = _pending_for_thread(handle, thread_id)
         _write_pending(handle, thread_id, messages, accepting_messages=False)
         return len(messages)
+
+
+def _detached_run_live(session_dir: str, name: str) -> bool:
+    """Whether a run the worker started with mesh_runs.py is still going.
+
+    A record with no pid yet counts as live for its first minute: `start` writes the record
+    before it spawns the supervisor and fills the pid in after.
+    """
+    folder = _session_path(session_dir, DETACHED_RUNS_DIR)
+    if not folder.is_dir():
+        return False
+    now = time.time()
+    for path in folder.glob("*.json"):
+        record = _read_json_object(path)
+        if record.get("worker") != name or record.get("status") != "running":
+            continue
+        pid = _as_int(record.get("pid"))
+        if pid > 0 and _pid_alive(pid):
+            return True
+        if pid == 0 and now - _as_float(record.get("started_at"), 0.0) < DETACHED_RUN_START_GRACE_SECS:
+            return True
+    return False
+
+
+def _waiting_on_detached_run(session_dir: str, name: str, thread_id: str) -> bool:
+    """A live run with nothing held yet: the launcher stays attached and makes no calls."""
+    with _pending_file(session_dir, name) as handle:
+        held = bool(_pending_for_thread(handle, thread_id))
+    return not held and _detached_run_live(session_dir, name)
+
+
+@dataclass(frozen=True)
+class HeldForLauncher:
+    """The worker's launcher is attached and opens the next turn from this message."""
+
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class HeldForNextDispatch:
+    """No launcher is attached; the message waits for the worker's next dispatch."""
+
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class NoLauncherAttached:
+    """No launcher is attached and the caller asked not to hold; nothing was written."""
+
+    thread_id: str
+    status: str
+
+
+@dataclass(frozen=True)
+class WorkerEnded:
+    """The worker is ended or gone from the roster; nothing was written."""
+
+    reason: str
+
+
+HoldOutcome = HeldForLauncher | HeldForNextDispatch | NoLauncherAttached | WorkerEnded
+
+
+def hold_message(session_dir: str, name: str, text: str, *, without_launcher: bool) -> HoldOutcome:
+    """Add one message to a worker's held messages for the thread the roster names now.
+
+    The roster is read under the pending lock, so a run that finished after an account move or a
+    server change reaches the thread the worker is on at this moment. The attached check and the
+    write share that lock: a launcher closing its inbox either sees the message or closed first,
+    and then this call reports it not attached. The stored accepting flag is kept, so a closing
+    launcher never refuses the message. With `without_launcher` false, a message no launcher
+    would read is not written.
+    """
+    with _pending_file(session_dir, name) as handle:
+        if _end_marker_path(session_dir, name).exists():
+            return WorkerEnded(f"{name} is being ended")
+        entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        thread_id = _as_str(entry.get("thread_id"))
+        status = _as_str(entry.get("status"))
+        if not entry or not thread_id:
+            return WorkerEnded(f"{name} is not on the roster")
+        if status == "ended":
+            return WorkerEnded(f"{name} is ended")
+        closed = _messages_closed(handle, thread_id)
+        launcher_pid = _as_int(entry.get("launcher_pid"))
+        attached = status in LAUNCHER_ATTACHED_STATUSES and _pid_alive(launcher_pid) and not closed
+        if not attached and not without_launcher:
+            return NoLauncherAttached(thread_id, status)
+        messages = _pending_for_thread(handle, thread_id)
+        messages.append(text)
+        _write_pending(handle, thread_id, messages, accepting_messages=not closed)
+        return HeldForLauncher(thread_id) if attached else HeldForNextDispatch(thread_id)
 
 
 def _add_pending(session_dir: str, name: str, thread_id: str, message: str) -> None:
@@ -1603,15 +1713,17 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
             recorded_home = server_record_home(record)
             matching_home = recorded_home == selected_home
             old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
-            if matching_home and not old_sign_in:
+            old_limit = record.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
+            if matching_home and not old_sign_in and not old_limit:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
                 return port, False
             # A sign-in change `signin-changed` did not catch. The workers still on this server keep
             # it until they let go; its watcher then stops it.
             _retire_record(session_dir, record)
-            cause = (f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
-                     else f"no longer serves the workers home {codex_home_display(selected_home)}")
+            cause = (f"no longer serves the workers home {codex_home_display(selected_home)}" if not matching_home
+                     else f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
+                     else f"compacts at another limit than {AUTO_COMPACT_TOKENS} tokens")
             _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
             if not _stop_unused_with_lock_held(None, pid, port):
                 _ = _start_watcher(session_dir, pid, port)
@@ -1624,13 +1736,16 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
     log_path = _session_path(session_dir, SERVER_LOG)
     with log_path.open("ab") as log_handle:
         process = subprocess.Popen(
-            ["codex", "-c", "thread_unload_delay_secs=0", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
+            ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
+             "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
+             "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
             stdout=subprocess.DEVNULL,
             stderr=log_handle,
             start_new_session=True,
             env={**os.environ, "CODEX_HOME": str(workers_home)},
         )
-    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home)}
+    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
+                            "auto_compact_tokens": AUTO_COMPACT_TOKENS}
     try:
         deadline = time.time() + SERVER_START_TIMEOUT_SECS
         while time.time() < deadline:
@@ -1881,6 +1996,24 @@ def _turn_outcome(method: str, params: dict[str, object]) -> TurnOutcome:
     return TurnCompleted()
 
 
+def _interrupted_for_held_work(
+    method: str, params: dict[str, object], session_dir: str, name: str, thread_id: str,
+) -> bool:
+    """An interrupted turn with no error while a run is live or a message is held.
+
+    `interrupt` stops a turn so a held message opens the next one; that stop is not a failure,
+    so the slot is not recorded failed for it.
+    """
+    turn = _as_dict(params.get("turn"))
+    if method != "turn/completed" or turn.get("status") != "interrupted":
+        return False
+    if _as_str(_as_dict(turn.get("error")).get("message")):
+        return False
+    with _pending_file(session_dir, name) as handle:
+        held = bool(_pending_for_thread(handle, thread_id))
+    return held or _detached_run_live(session_dir, name)
+
+
 def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) -> bool:
     """Whether this failure is worth one more run against a clean app-server.
 
@@ -2086,7 +2219,15 @@ def command_follow(args: argparse.Namespace) -> int:
             raise SystemExit(released.reason)
         client = Client(port, name)
         _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-        resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home)
+        # Held under the pending lock: a message held while the roster moves to a replacement
+        # thread waits here, then lands on the replacement with the ones carried over.
+        with _pending_file(session_dir, name) as handle:
+            resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home)
+            if resumed.thread_replaced:
+                carried = _pending_for_thread(handle, thread_id)
+                if carried:
+                    _write_pending(handle, resumed.thread_id, carried,
+                                   accepting_messages=not _messages_closed(handle, thread_id))
         if resumed.thread_replaced:
             thread_id = resumed.thread_id
             if not _update_roster_if_expected(session_dir, name, {
@@ -2566,7 +2707,8 @@ def _stream_turn(
                 # A resident thread must wake to see `end` between turns. Any other
                 # wakes to check that its turn has not ended without the notice.
                 # Account-move intent can arrive while a completion notice is lost.
-                # Check it on the resident cadence even for a one-turn launcher.
+                # Wake on the resident cadence so moves and held detached-run results
+                # open their continuation promptly, including one-turn launchers.
                 poll = min(RESIDENT_POLL_SECS, UNSEEN_END_CHECK_SECS)
                 frame = client.next_frame(min(deadline, time.time() + poll))
                 if frame is None:
@@ -2580,6 +2722,8 @@ def _stream_turn(
                         failure = followed_failure = final_answer = ""
                         continue
                     if not resident and time.time() < deadline:
+                        if _waiting_on_detached_run(session_dir, name, thread_id):
+                            continue
                         quota_owed = _continuation_is_owed(session_dir, name)
                         if not resume_owed and _ended_unseen(client, thread_id):
                             moved = _move_resident(args, session_dir, name, thread_id, client)
@@ -2693,6 +2837,8 @@ def _stream_turn(
                             followed_turn = turn_id
                         failure = followed_failure = final_answer = ""
                         continue
+                    if _interrupted_for_held_work(method, params, session_dir, name, thread_id):
+                        turn_outcome = TurnCompleted()
                     if isinstance(turn_outcome, TurnFailed):
                         serving = client.serving
                         identity = (serving, thread_id, notice_turn or turn_id)
@@ -2899,6 +3045,9 @@ def _stream_turn(
                     if not resident:
                         if _close_messages_if_empty(session_dir, name, thread_id):
                             break
+                        # The turn ended on a run still going: stay attached until its result is held.
+                        if _waiting_on_detached_run(session_dir, name, thread_id):
+                            continue
                         moved = _move_resident(args, session_dir, name, thread_id, client)
                         if isinstance(moved, WorkerThreadStateUnknown):
                             if isinstance(moved.cleanup, WorkerTurnCleanup):
@@ -3543,6 +3692,60 @@ def command_steer(args: argparse.Namespace) -> int:
     _ = _require(reply, "turn/steer")
     client.close()
     print(f"steered {target}")
+    return 0
+
+
+def command_interrupt(args: argparse.Namespace) -> int:
+    """Stop a worker's running turn without ending the worker.
+
+    `steer` only adds input to the turn and `end` ends the worker, so neither stops just the turn.
+    The message, if any, is held first, so the launcher opens the next turn from it once the
+    interrupted turn ends; with no launcher attached it waits for the worker's next dispatch.
+    """
+    session_dir = _as_str(_attr(args, "session_dir"))
+    target = _as_str(_attr(args, "to"))
+    message = _message_text(args)
+    held = ""
+    if message:
+        outcome = hold_message(session_dir, target, message, without_launcher=True)
+        if isinstance(outcome, WorkerEnded):
+            print(f"codex_mesh: {outcome.reason}; nothing held or interrupted", file=sys.stderr)
+            return 2
+        held = ("; the message opens its next turn" if isinstance(outcome, HeldForLauncher)
+                else "; no launcher is attached, so the message waits for its next dispatch")
+    record = _lookup(session_dir, target)
+    launcher_pid = _as_int(record.get("launcher_pid"))
+    if _pid_alive(launcher_pid):
+        port = _worker_port(session_dir, record)
+    else:
+        availability = _server_availability(session_dir)
+        if not isinstance(availability, LiveServer):
+            print(f"{target} has no running app-server; no turn to interrupt{held}")
+            return 0
+        port = availability.port
+    thread_id = record["thread_id"]
+    client = Client(port, f"interrupt-{os.getpid()}")
+    try:
+        state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+        if isinstance(state, ThreadIdle):
+            print(f"{target} has no running turn; nothing interrupted{held}")
+            return 0
+        if isinstance(state, ThreadStateUnknown):
+            print(f"codex_mesh: {target}: thread {thread_id} could not be read ({state.reason}){held}",
+                  file=sys.stderr)
+            return 1
+        if isinstance(state, ThreadActiveWithoutTurn):
+            print(f"codex_mesh: {target}: thread {thread_id} could not be interrupted (no turn id){held}",
+                  file=sys.stderr)
+            return 1
+        reply = _interrupt_turn(client, thread_id, state.turn_id)
+    finally:
+        client.close()
+    error = _as_str(_as_dict(reply.get("error")).get("message"))
+    if error:
+        print(f"codex_mesh: {target}: turn {state.turn_id} not interrupted: {error}{held}", file=sys.stderr)
+        return 1
+    print(f"interrupted {target}'s turn {state.turn_id}{held}")
     return 0
 
 
@@ -4935,6 +5138,14 @@ def main(argv: list[str] | None = None) -> int:
     _ = steer_body.add_argument("--message")
     _ = steer_body.add_argument("--message-file", help="read the message from this file")
     steer.set_defaults(handler=command_steer)
+
+    interrupt = subparsers.add_parser("interrupt", help="stop a delegate's running turn, keeping the delegate")
+    _ = interrupt.add_argument("--session-dir", required=True)
+    _ = interrupt.add_argument("--to", required=True)
+    interrupt_body = interrupt.add_mutually_exclusive_group()
+    _ = interrupt_body.add_argument("--message", default="")
+    _ = interrupt_body.add_argument("--message-file", help="read the message from this file")
+    interrupt.set_defaults(handler=command_interrupt)
 
     end = subparsers.add_parser("end", help="release a resident delegate")
     _ = end.add_argument("--session-dir", required=True)

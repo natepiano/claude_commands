@@ -52,6 +52,23 @@ class AgentBlocked(HerdrFailure):
     """An agent requires user input; nothing is sent in response."""
 
 
+class AgentExited(HerdrFailure):
+    """The submitted agent returned to its shell before startup completed."""
+
+    def __init__(self, session: str, pane: str) -> None:
+        super().__init__(f"herdr {session}:{pane}: agent process exited before startup completed", "agent_exited")
+
+
+@dataclass(frozen=True)
+class ServerCreated:
+    """This attempt started the server and may clean up its failed agent."""
+
+
+@dataclass(frozen=True)
+class ServerAdopted:
+    """The server was already running and belongs to an earlier launch."""
+
+
 class AgentNotReady(HerdrFailure):
     """Startup stopped before interactive readiness, with its visible screen."""
 
@@ -180,6 +197,40 @@ class PaneRunning:
     commands: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class AgentProcessIdentity:
+    pid: int
+    start_ticks: int
+
+
+@dataclass(frozen=True)
+class AgentProcessPresent:
+    """An identified agent process is still alive, including after exec."""
+
+    identities: tuple[AgentProcessIdentity, ...] = ()
+
+
+@dataclass(frozen=True)
+class PaneProcessesUnreadable:
+    """The pane's current processes cannot establish startup or exit."""
+
+
+@dataclass(frozen=True)
+class PaneShell:
+    pid: int
+
+
+@dataclass(frozen=True)
+class PaneShellUnknown:
+    """No process observation has located the pane's shell yet."""
+
+
+@dataclass(frozen=True)
+class PaneStartupObservation:
+    shell: PaneShell
+    activity: AgentProcessPresent | PaneAtShell | PaneRunning
+
+
 class SessionEntry(TypedDict):
     name: str
     running: bool
@@ -201,8 +252,16 @@ class PaneListResult(TypedDict):
     panes: list[PaneIdentity]
 
 
+class PaneForegroundProcess(TypedDict):
+    pid: int
+    name: str
+    argv: list[str]
+
+
 class PaneProcessInfo(TypedDict):
     shell_pid: NotRequired[int]
+    foreground_process_group_id: NotRequired[int]
+    foreground_processes: NotRequired[list[PaneForegroundProcess]]
 
 
 class PaneProcessInfoResult(TypedDict):
@@ -403,12 +462,16 @@ class Herdr:
         attempt_timeout_ms = timeout_ms
         try:
             while True:
-                result = run_program(self.argv("agent", "start", _agent_name(name), "--kind", kind, "--pane", pane,
-                                               "--timeout", str(attempt_timeout_ms), "--", *agent_arguments),
-                                     timeout=attempt_timeout_ms / 1000 + 10)
+                result = self.start_command(
+                    self.argv("agent", "start", _agent_name(name), "--kind", kind, "--pane", pane,
+                              "--timeout", str(attempt_timeout_ms), "--", *agent_arguments),
+                    kind, pane, attempt_timeout_ms / 1000 + 10,
+                )
                 try:
                     require_success(result, f"start agent {name}")
                 except HerdrFailure as error:
+                    if error.code == "agent_start_failed" and "process exited" in str(error):
+                        raise AgentExited(self.session, pane) from error
                     if error.code != "agent_pane_busy":
                         raise
                     remaining_ms = int((deadline - time.monotonic()) * 1000)
@@ -430,6 +493,96 @@ class Herdr:
             raise AgentNotReady(screen) from error
         if isinstance(opening, OpeningPrompt):
             self.prompt(pane, opening.text)
+
+    def start_command(self, argv: list[str], kind: str, pane: str,
+                      timeout: float) -> subprocess.CompletedProcess[str]:
+        """Observe a submitted agent while its CLI waits for interactive readiness."""
+        deadline = time.monotonic() + timeout
+        shell: PaneShell | PaneShellUnknown = PaneShellUnknown()
+        agent_seen = False
+        tracked: set[AgentProcessIdentity] = set()
+        # Locate the shell before submitting the command, so a short-lived agent
+        # cannot run entirely during the first herdr observation.
+        try:
+            shell = self.startup_processes(pane, kind, min(0.5, timeout)).shell
+        except (HerdrFailure, subprocess.TimeoutExpired):
+            pass
+        next_observation = time.monotonic() + 0.5
+        try:
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as error:
+            raise HerdrFailure(f"{argv[0]}: {error}") from error
+        with process:
+            try:
+                while True:
+                    # A completed CLI result wins over a deadline or concurrent exit.
+                    if process.poll() is not None:
+                        stdout, stderr = process.communicate()
+                        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    activity: AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable = PaneProcessesUnreadable()
+                    if isinstance(shell, PaneShell):
+                        activity = _startup_processes(shell, kind, tracked)
+                    remaining = deadline - time.monotonic()
+                    if (isinstance(activity, PaneProcessesUnreadable)
+                            and time.monotonic() >= next_observation and remaining > 0):
+                        try:
+                            observation = self.startup_processes(pane, kind, min(0.5, remaining))
+                            shell, activity = observation.shell, observation.activity
+                        except (HerdrFailure, subprocess.TimeoutExpired):
+                            pass
+                        next_observation = time.monotonic() + 0.5
+                    if isinstance(activity, AgentProcessPresent):
+                        tracked.update(activity.identities)
+                    agent_seen = agent_seen or isinstance(activity, AgentProcessPresent)
+                    if agent_seen and not tracked and isinstance(activity, PaneAtShell):
+                        if process.poll() is not None:
+                            stdout, stderr = process.communicate()
+                            return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                        raise AgentExited(self.session, pane)
+            except BaseException:
+                # Only the waiting CLI is ours; this never signals the pane's process.
+                process.kill()
+                _ = process.communicate()
+                raise
+
+    def startup_processes(self, pane: str, kind: str, timeout: float) -> PaneStartupObservation:
+        result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
+        require_success(result, "startup pane processes")
+        payload = json_object(decode_object(result.stdout, "startup pane processes").get("result"), "startup pane result")
+        info = json_object(payload.get("process_info"), "startup pane process info")
+        shell = info.get("shell_pid")
+        foreground = info.get("foreground_process_group_id")
+        for pid in (shell, foreground):
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                raise HerdrFailure("startup pane process info: expected positive process ids")
+        commands: list[str] = []
+        agent_present = False
+        identities: list[AgentProcessIdentity] = []
+        for value in json_items(info.get("foreground_processes"), "startup foreground processes"):
+            process = json_object(value, "startup foreground process")
+            commands.append(json_text(process.get("name"), "startup process name"))
+            arguments = [json_text(arg, "startup process argument")
+                         for arg in json_items(process.get("argv"), "startup process argv")]
+            if _is_agent_process(arguments, kind):
+                agent_present = True
+                pid = process.get("pid")
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    try:
+                        stat = (_proc_root() / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+                        if stat[0] != "Z":
+                            identities.append(AgentProcessIdentity(pid, int(stat[19])))
+                    except (OSError, ValueError, IndexError):
+                        pass
+        activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
+        return PaneStartupObservation(PaneShell(cast(int, shell)), activity)
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
@@ -616,14 +769,14 @@ def _server_unit_active(name: str) -> bool:
     ]).returncode == 0
 
 
-def start_server(name: str, timeout_ms: int) -> None:
+def start_server(name: str, timeout_ms: int) -> ServerCreated | ServerAdopted:
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
-            return
+            return ServerAdopted()
     except subprocess.TimeoutExpired:
         pass
     require_success(run_program([
@@ -638,7 +791,8 @@ def start_server(name: str, timeout_ms: int) -> None:
             if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, remaining))):
                 if _server_unit_active(name):
                     _clear_restored_workspaces(herdr)
-                return
+                    return ServerCreated()
+                return ServerAdopted()
         except subprocess.TimeoutExpired:
             pass
         remaining = deadline - time.monotonic()
@@ -709,6 +863,81 @@ def _process_environment(process: Path) -> dict[str, str]:
 
 def _process_arguments(process: Path) -> list[str]:
     return [value for value in process.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0") if value]
+
+
+def _is_agent_process(arguments: list[str], kind: str) -> bool:
+    if not arguments:
+        return False
+    executable = Path(arguments[0]).name
+    if executable == kind:
+        return True
+    # The npm installations run a specific script through node, not a bare executable.
+    script = arguments[1] if len(arguments) > 1 else ""
+    return executable in {"node", "nodejs"} and (
+        kind == "claude" and script.endswith("/@anthropic-ai/claude-code/cli.js")
+        or kind == "codex" and script.endswith("/@openai/codex/bin/codex.js")
+    )
+
+
+def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:
+    """Keep identified processes across exec and parent changes; inspect every thread."""
+    root = _proc_root()
+    commands: list[str] = []
+    pending: list[tuple[int, bool]] = [(shell.pid, False)]
+    live: set[AgentProcessIdentity] = set()
+    unreadable = False
+    for identity in tuple(tracked):
+        try:
+            stat = (root / str(identity.pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            if stat[0] == "Z" or int(stat[19]) != identity.start_ticks:
+                tracked.remove(identity)
+            else:
+                live.add(identity)
+                pending.append((identity.pid, True))
+        except FileNotFoundError:
+            tracked.remove(identity)
+        except (OSError, ValueError, IndexError):
+            unreadable = True
+    visited: set[int] = set()
+    while pending:
+        pid, belongs_to_agent = pending.pop()
+        if pid in visited:
+            continue
+        visited.add(pid)
+        try:
+            process = root / str(pid)
+            if pid != shell.pid:
+                stat = (process / "stat").read_text().rsplit(")", 1)[1].split()
+                if stat[0] == "Z":
+                    continue
+                if not belongs_to_agent:
+                    arguments = _process_arguments(process)
+                    belongs_to_agent = _is_agent_process(arguments, kind)
+                    if not belongs_to_agent:
+                        commands.append(arguments[0] if arguments else str(pid))
+                if belongs_to_agent:
+                    identity = AgentProcessIdentity(pid, int(stat[19]))
+                    tracked.add(identity)
+                    live.add(identity)
+            # children is per-thread, not the entire process's child list.
+            for task in (process / "task").iterdir():
+                children = (task / "children").read_text().split()
+                pending.extend((int(child), belongs_to_agent) for child in children)
+        except (OSError, ValueError, IndexError):
+            unreadable = True
+    if live:
+        return AgentProcessPresent(tuple(live))
+    if unreadable:
+        return PaneProcessesUnreadable()
+    try:
+        # Read foreground ownership after walking the tree, not before launch.
+        shell_stat = (root / str(shell.pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        foreground = int(shell_stat[5])
+    except (OSError, ValueError, IndexError):
+        return PaneProcessesUnreadable()
+    if not commands and foreground == shell.pid:
+        return PaneAtShell()
+    return PaneRunning(tuple(commands))
 
 
 def _herdr_command(arguments: list[str], default_session: str) -> tuple[str, list[str]]:

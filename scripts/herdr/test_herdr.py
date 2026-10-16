@@ -24,6 +24,46 @@ from fake_herdr import CommandResponse
 GIT_BINARY = shutil.which("git") or "git"
 
 
+class StartupClock:
+    elapsed: float = 0.0
+
+
+class WaitingAgentCLI:
+    """A waiting CLI whose clock also advances the fake pane's processes."""
+
+    def __init__(self, clock: StartupClock, ready_after: float, on_wait: Callable[[], None]) -> None:
+        self.clock: StartupClock = clock
+        self.ready_after: float = ready_after
+        self.on_wait: Callable[[], None] = on_wait
+        self.returncode: int | None = None  # Popen's external running-process state.
+        self.killed: bool = False
+
+    def __enter__(self) -> WaitingAgentCLI:
+        return self
+
+    def __exit__(self, kind: object, value: object, traceback: object) -> None:
+        pass
+
+    def poll(self) -> int | None:
+        if self.clock.elapsed >= self.ready_after:
+            self.returncode = 0
+        return self.returncode
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        if timeout is not None:
+            self.clock.elapsed += timeout
+            self.on_wait()
+        if self.poll() is None:
+            if timeout is None:
+                raise AssertionError("unbounded collection of a running CLI")
+            raise subprocess.TimeoutExpired(["fake agent start"], timeout)
+        return "CLI completed", ""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+
 class HerdrTests(unittest.TestCase):
     root: Path = Path()
     fake: Path = Path()
@@ -62,6 +102,11 @@ class HerdrTests(unittest.TestCase):
 
     def commands(self) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def start_commands(self) -> list[list[str]]:
+        """Startup commands, excluding read-only lifecycle observations."""
+        return [command for command in self.commands()
+                if command[2:4] not in (["agent", "get"], ["pane", "process-info"])]
 
     def configure_herdr(self, arguments: list[str], stdout: str = "", code: int = 0, stderr: str = "") -> None:
         self.configure(["--session", "fixture", *arguments], stdout, code, stderr)
@@ -122,7 +167,8 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["workspace", "list"], json.dumps({
             "result": {"workspaces": [{"workspace_id": "w1"}]},
         }))
-        herdr.start_server("fixture", 10_000)
+        outcome = herdr.start_server("fixture", 10_000)
+        self.assertIsInstance(outcome, herdr.ServerAdopted)
         self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]])
 
     def test_new_server_refuses_a_running_destination_without_starting_a_unit(self) -> None:
@@ -167,7 +213,7 @@ class HerdrTests(unittest.TestCase):
     def test_server_start_deadline(self) -> None:
         self.configure_herdr(["status", "server"], "status: stopped\n")
         with self.assertRaisesRegex(herdr.HerdrFailure, "server fixture not answering after 0 ms"):
-            herdr.start_server("fixture", 0)
+            _ = herdr.start_server("fixture", 0)
         self.assertEqual(self.commands()[-1], ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"])
 
     def test_server_start_polls_after_launch(self) -> None:
@@ -175,7 +221,8 @@ class HerdrTests(unittest.TestCase):
             {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0},
         ]
         _ = self.responses_path.write_text(json.dumps(self.responses))
-        herdr.start_server("fixture", 10_000)
+        outcome = herdr.start_server("fixture", 10_000)
+        self.assertIsInstance(outcome, herdr.ServerCreated)
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "status", "server"],
             ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"],
@@ -201,7 +248,7 @@ class HerdrTests(unittest.TestCase):
                     {"stdout": "status: running\n", "code": 0},
                 ]
                 _ = self.responses_path.write_text(json.dumps(self.responses))
-                start("fixture", 10_000)
+                _ = start("fixture", 10_000)
                 self.assertEqual(self.commands(), [
                     ["--session", "fixture", "status", "server"],
                     ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"],
@@ -226,7 +273,7 @@ class HerdrTests(unittest.TestCase):
                 ]
                 _ = self.responses_path.write_text(json.dumps(self.responses))
                 with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture:.*workspace w1:.*fixture close refused"):
-                    start("fixture", 10_000)
+                    _ = start("fixture", 10_000)
                 self.assertEqual(self.commands()[-1], ["--session", "fixture", "workspace", "close", "w1"])
 
     def test_answering_server_with_inactive_spawned_unit_is_never_cleared(self) -> None:
@@ -244,10 +291,11 @@ class HerdrTests(unittest.TestCase):
                 _ = self.responses_path.write_text(json.dumps(self.responses))
                 if start is herdr.start_new_server:
                     with self.assertRaises(herdr.SessionTaken) as raised:
-                        start("fixture", 10_000)
+                        _ = start("fixture", 10_000)
                     self.assertEqual(raised.exception.name, "fixture")
                 else:
-                    start("fixture", 10_000)
+                    outcome = start("fixture", 10_000)
+                    self.assertIsInstance(outcome, herdr.ServerAdopted)
                 self.assertEqual(self.commands(), [
                     ["--session", "fixture", "status", "server"],
                     ["--user", "--unit=herdr-fixture.service", "--collect", str(self.fake), "--session", "fixture", "server"],
@@ -276,7 +324,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_promptless_start_never_sends_input(self) -> None:
         self.herdr.start_agent("worker", "pane-1", "claude", ["-n", "solo"], herdr.NoOpeningPrompt(), 90_000)
-        self.assertEqual(self.commands(), [["--session", "fixture", "agent", "start", "worker", "--kind",
+        self.assertEqual(self.start_commands(), [["--session", "fixture", "agent", "start", "worker", "--kind",
                                            "claude", "--pane", "pane-1", "--timeout", "90000", "--", "-n", "solo"]])
 
     def test_session_name_contract_refuses_before_external_commands(self) -> None:
@@ -295,7 +343,7 @@ class HerdrTests(unittest.TestCase):
     def test_valid_name_starts_and_stops_its_exact_unit(self) -> None:
         self.configure(["--session", "a-b", "status", "server"], "status: stopped")
         with self.assertRaises(herdr.HerdrFailure):
-            herdr.start_server("a-b", 0)
+            _ = herdr.start_server("a-b", 0)
         herdr.stop_session("a-b")
         commands = self.commands()
         self.assertIn(["--user", "--unit=herdr-a-b.service", "--collect", str(self.fake), "--session", "a-b", "server"], commands)
@@ -321,7 +369,7 @@ class HerdrTests(unittest.TestCase):
         for text, suffix in (("space é" * 20, "123"), (".", ""), ("..", ""), ("", "")):
             name = herdr.generated_session_name(text, suffix)
             self.configure(["--session", name, "status", "server"], "status: running")
-            herdr.start_server(name, 10_000)
+            _ = herdr.start_server(name, 10_000)
             self.assertLessEqual(len(name.encode("ascii")), 64)
             if suffix:
                 self.assertTrue(name.endswith("-123"))
@@ -462,11 +510,211 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaises(herdr.AgentNotReady) as raised:
             self.herdr.start_agent("worker", "pane-1", "claude", ["--model", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 100)
         self.assertEqual(raised.exception.screen, "Trust this folder?")
-        self.assertEqual(self.commands(), [["--session", "fixture", *arguments], ["--session", "fixture", "pane", "read", "pane-1", "--source", "visible"]])
+        self.assertEqual(self.start_commands(), [["--session", "fixture", *arguments], ["--session", "fixture", "pane", "read", "pane-1", "--source", "visible"]])
+
+    def startup_process(self, pid: int, arguments: list[str]) -> None:
+        process = self.process(pid, 10 if pid != 10 else 1, arguments, {})
+        fields = ["S", str(10 if pid != 10 else 1), str(pid), "10", "1", "10",
+                  *(["0"] * 13), str(pid * 100)]
+        _ = (process / "stat").write_text(f"{pid} (pane process) {' '.join(fields)}\n")
+        task = process / "task" / str(pid)
+        task.mkdir(parents=True)
+        _ = (task / "children").write_text("")
+
+    def startup_observation(self, arguments: list[str]) -> str:
+        return json.dumps({"result": {"process_info": {
+            "shell_pid": 10, "foreground_process_group_id": 10 if arguments == ["zsh"] else 11,
+            "foreground_processes": [{"pid": 10 if arguments == ["zsh"] else 11,
+                                      "name": arguments[0], "argv": arguments}],
+        }}})
+
+    def startup_watch(self, clock: StartupClock, ready_after: float, on_wait: Callable[[], None],
+                      observation: Callable[[], str]) -> tuple[WaitingAgentCLI, list[tuple[float, float]]]:
+        process = WaitingAgentCLI(clock, ready_after, on_wait)
+        calls: list[tuple[float, float]] = []
+
+        def run(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+            calls.append((clock.elapsed, timeout))
+            payload = observation()
+            if argv[3:5] == ["agent", "get"]:
+                payload = json.dumps({"result": {"agent": {
+                    "name": "worker", "agent_status": "unknown", "launch_pending": True,
+                }}})
+            return subprocess.CompletedProcess(argv, 0, payload, "")
+
+        _ = self.enterContext(patch.object(herdr, "run_program", run))
+        _ = self.enterContext(patch.object(subprocess, "Popen", return_value=process))
+        _ = self.enterContext(patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed)))
+        return process, calls
+
+    def test_start_detects_a_brief_agent_exit_while_registration_stays_pending(self) -> None:
+        self.startup_process(10, ["zsh"])
+        self.startup_process(11, ["claude", "--not-a-real-flag"])
+        clock = StartupClock()
+        children = self.proc / "10/task/10/children"
+
+        def advance() -> None:
+            _ = children.write_text("11" if 0.2 <= clock.elapsed < 0.3 else "")
+            if clock.elapsed >= 0.3:
+                shutil.rmtree(self.proc / "11", ignore_errors=True)
+
+        process, calls = self.startup_watch(clock, 90, advance, lambda: self.startup_observation(["zsh"]))
+        with self.assertRaisesRegex(herdr.AgentExited, "fixture:pane-1.*exited"):
+            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertLess(clock.elapsed, 1)
+        self.assertTrue(process.killed)
+        self.assertEqual(len(calls), 1)
+
+    def test_start_keeps_an_identified_pid_alive_after_exec_and_parent_change(self) -> None:
+        self.startup_process(10, ["zsh"])
+        self.startup_process(11, ["claude", "--resume", "missing-id"])
+        children = self.proc / "10/task/10/children"
+        clock = StartupClock()
+
+        def advance() -> None:
+            _ = children.write_text("11" if clock.elapsed < 0.3 else "")
+            if clock.elapsed >= 0.3:
+                # An exec changes argv/comm but preserves PID and start time.
+                _ = (self.proc / "11/cmdline").write_bytes(b"/nix/store/runtime/bin/runtime\0")
+                stat = (self.proc / "11/stat").read_text().replace("pane process", "runtime").replace("S 10 ", "S 1 ")
+                _ = (self.proc / "11/stat").write_text(stat)
+
+        process, calls = self.startup_watch(clock, 4.3, advance, lambda: self.startup_observation(["zsh"]))
+        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertEqual(process.returncode, 0)
+        self.assertFalse(process.killed)
+        self.assertEqual(len(calls), 1)
+
+    def test_start_keeps_a_wrapper_child_alive_after_its_parent_exits(self) -> None:
+        self.startup_process(10, ["zsh"])
+        self.startup_process(11, ["claude"])
+        self.startup_process(12, ["/nix/store/runtime/bin/runtime"])
+        stat = self.proc / "12/stat"
+        _ = stat.write_text(stat.read_text().replace("S 10 ", "S 11 "))
+        _ = (self.proc / "11/task/11/children").write_text("12")
+        children = self.proc / "10/task/10/children"
+        clock = StartupClock()
+
+        def advance() -> None:
+            _ = children.write_text("11" if clock.elapsed < 0.3 else "")
+            if clock.elapsed >= 0.3:
+                shutil.rmtree(self.proc / "11", ignore_errors=True)
+                _ = stat.write_text(stat.read_text().replace("S 11 ", "S 1 "))
+
+        process, calls = self.startup_watch(clock, 4.3, advance, lambda: self.startup_observation(["zsh"]))
+        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertEqual(process.returncode, 0)
+        self.assertFalse(process.killed)
+        self.assertEqual(len(calls), 1)
+
+    def test_start_detects_exit_of_an_agent_forked_by_another_shell_thread(self) -> None:
+        self.startup_process(10, ["zsh"])
+        self.startup_process(11, ["claude", "--not-a-real-flag"])
+        task = self.proc / "10/task/20"
+        task.mkdir()
+        children = task / "children"
+        clock = StartupClock()
+
+        def advance() -> None:
+            _ = children.write_text("11" if 0.2 <= clock.elapsed < 0.3 else "")
+            if clock.elapsed >= 0.3:
+                shutil.rmtree(self.proc / "11", ignore_errors=True)
+
+        process, calls = self.startup_watch(clock, 90, advance, lambda: self.startup_observation(["zsh"]))
+        with self.assertRaises(herdr.AgentExited):
+            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertLess(clock.elapsed, 1)
+        self.assertTrue(process.killed)
+        self.assertEqual(len(calls), 1)
+
+    def test_start_ignores_prompt_helpers_before_a_healthy_agent(self) -> None:
+        for arguments in (["git", "status", "claude"], ["node", "prompt-helper.js", "claude"]):
+            with self.subTest(helper=arguments):
+                for pid in (10, 11):
+                    shutil.rmtree(self.proc / str(pid), ignore_errors=True)
+                self.startup_process(10, ["zsh"])
+                self.startup_process(11, arguments)
+                clock = StartupClock()
+                children = self.proc / "10/task/10/children"
+
+                def advance() -> None:
+                    _ = children.write_text("11" if clock.elapsed < 0.2 or clock.elapsed >= 0.4 else "")
+                    if clock.elapsed >= 0.4:
+                        _ = (self.proc / "11/cmdline").write_bytes(b"claude\0")
+
+                process, calls = self.startup_watch(clock, 1.5, advance, lambda: self.startup_observation(["zsh"]))
+                self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+                self.assertFalse(process.killed)
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(len(calls), 1)
+
+    def test_start_uses_slow_herdr_observations_when_proc_is_unreadable(self) -> None:
+        clock = StartupClock()
+
+        def observation() -> str:
+            return self.startup_observation(["claude"] if clock.elapsed >= 0.4 else ["zsh"])
+
+        process, calls = self.startup_watch(clock, 4.3, lambda: None, observation)
+        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertFalse(process.killed)
+        self.assertLessEqual(len(calls), 1 + int(clock.elapsed * 2))
+        self.assertTrue(all(later[0] - earlier[0] >= 0.5 for earlier, later in zip(calls, calls[1:])))
+
+    def test_start_falls_back_to_process_info_to_confirm_shell_return(self) -> None:
+        clock = StartupClock()
+
+        def observation() -> str:
+            return self.startup_observation(["claude"] if 0.4 <= clock.elapsed < 0.9 else ["zsh"])
+
+        process, calls = self.startup_watch(clock, 90, lambda: None, observation)
+        with self.assertRaises(herdr.AgentExited):
+            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertLess(clock.elapsed, 2)
+        self.assertTrue(process.killed)
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_start_collects_cli_completion_after_a_slow_observation_crosses_deadline(self) -> None:
+        clock = StartupClock()
+
+        def observation() -> str:
+            if clock.elapsed > 0:
+                clock.elapsed += 1.0
+            return self.startup_observation(["zsh"])
+
+        process, calls = self.startup_watch(clock, 0.7, lambda: None, observation)
+        result = self.herdr.start_command(["fake-herdr", "agent", "start"], "claude", "pane-1", 1)
+        self.assertEqual(result.stdout, "CLI completed")
+        self.assertFalse(process.killed)
+        self.assertGreater(clock.elapsed, 1)
+        self.assertTrue(all(timeout <= 1 - called_at for called_at, timeout in calls))
+        self.assertLess(calls[-1][1], 0.5)
+
+    def test_start_does_not_treat_an_unreadable_observation_as_an_exit(self) -> None:
+        source = self.fake.read_text().replace(
+            '    responses = cast(',
+            '    if argv[2:4] == ["agent", "start"]:\n'
+            + '        import time\n'
+            + '        time.sleep(0.3)\n'
+            + '    responses = cast(',
+        )
+        _ = self.fake.write_text(source)
+        self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], code=1, stderr="unreadable")
+        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.OpeningPrompt("continue"), 90_000)
+        self.assertTrue(any(command[2:4] == ["pane", "process-info"] for command in self.commands()))
+        self.assertEqual(self.commands()[-1], ["--session", "fixture", "agent", "prompt", "pane-1", "continue"])
+
+    def test_start_maps_an_explicit_process_exit_to_the_cleanup_error(self) -> None:
+        self.configure_herdr(
+            ["agent", "start", "worker", "--kind", "claude", "--pane", "pane-1", "--timeout", "90000", "--"],
+            code=1, stderr=json.dumps({"error": {"code": "agent_start_failed",
+                                              "message": "agent process exited before becoming interactive"}}))
+        with self.assertRaises(herdr.AgentExited):
+            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        self.assertEqual(len(self.start_commands()), 1)
 
     def test_start_sends_exactly_one_multiline_prompt(self) -> None:
         self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 200)
-        self.assertEqual(self.commands(), [
+        self.assertEqual(self.start_commands(), [
             ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "200", "--", "-m", "fixture-model"],
             ["--session", "fixture", "agent", "prompt", "pane-1", "opening\nprompt"],
         ])
@@ -479,17 +727,18 @@ class HerdrTests(unittest.TestCase):
         return arguments
 
     def enforce_start_timeout_minimum(self) -> None:
-        command = herdr.run_program
+        command = herdr.Herdr.start_command
 
-        def constrained_command(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
-            result = command(argv, timeout)
+        def constrained_command(client: herdr.Herdr, argv: list[str], kind: str, pane: str,
+                                timeout: float) -> subprocess.CompletedProcess[str]:
+            result = command(client, argv, kind, pane, timeout)
             if argv[3:5] == ["agent", "start"] and int(argv[argv.index("--timeout") + 1]) <= 3000:
                 return subprocess.CompletedProcess(argv, 1, "", json.dumps({"error": {
                     "code": "invalid_agent_timeout", "message": "timeout must exceed 3000 ms",
                 }}))
             return result
 
-        _ = cast(object, self.enterContext(patch.object(herdr, "run_program", side_effect=constrained_command)))
+        _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "start_command", constrained_command)))
 
     def test_start_retries_busy_then_prompts_once(self) -> None:
         self.enforce_start_timeout_minimum()
@@ -500,7 +749,7 @@ class HerdrTests(unittest.TestCase):
         pause = Mock()
         with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
             self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue\nworking"), 10_000)
-        self.assertEqual(self.commands(), [arguments, arguments, arguments,
+        self.assertEqual(self.start_commands(), [arguments, arguments, arguments,
                                           ["--session", "fixture", "agent", "prompt", "pane-1", "continue\nworking"]])
         self.assertEqual([call.args for call in pause.call_args_list], [(0.1,), (0.1,)])
 
@@ -520,7 +769,7 @@ class HerdrTests(unittest.TestCase):
             with self.assertRaisesRegex(herdr.HerdrFailure, "last busy") as raised:
                 self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), 3200)
         self.assertEqual(raised.exception.code, "agent_pane_busy")
-        self.assertEqual(self.commands(), attempts)
+        self.assertEqual(self.start_commands(), attempts)
 
     def test_start_initial_small_timeout_keeps_herdr_refusal_without_retry(self) -> None:
         self.enforce_start_timeout_minimum()
@@ -533,7 +782,7 @@ class HerdrTests(unittest.TestCase):
                     with self.assertRaises(herdr.HerdrFailure) as raised:
                         self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), timeout_ms)
                 self.assertEqual(raised.exception.code, "invalid_agent_timeout")
-                self.assertEqual(self.commands(), [arguments])
+                self.assertEqual(self.start_commands(), [arguments])
                 pause.assert_not_called()
 
     def test_start_does_not_retry_other_failure_codes(self) -> None:
@@ -548,7 +797,7 @@ class HerdrTests(unittest.TestCase):
                     with self.assertRaisesRegex(herdr.HerdrFailure, "start refused") as raised:
                         self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), 10_000)
                 self.assertEqual(raised.exception.code, code)
-                self.assertEqual(self.commands(), [arguments])
+                self.assertEqual(self.start_commands(), [arguments])
                 pause.assert_not_called()
 
     def test_claude_start_passes_only_extra_arguments_after_separator(self) -> None:
@@ -557,7 +806,7 @@ class HerdrTests(unittest.TestCase):
             agent_arguments=["--resume", "conversation", "--model", "fixture-model"],
             opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
         )
-        start, prompt = self.commands()
+        start, prompt = self.start_commands()
         self.assertEqual(start, [
             "--session", "fixture", "agent", "start", "worker", "--kind", "claude",
             "--pane", "pane-1", "--timeout", "10000", "--", "--resume", "conversation",
@@ -591,7 +840,7 @@ class HerdrTests(unittest.TestCase):
             "fixture", "pane-1", kind="claude", agent_arguments=["--resume", "conversation"],
             opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
         )
-        self.assertEqual(self.commands(), [
+        self.assertEqual(self.start_commands(), [
             ["--session", "fixture", "pane", "list"],
             ["--session", "fixture", "agent", "start", "worker", "--kind", "claude", "--pane", "pane-1",
              "--timeout", "10000", "--", "--resume", "conversation"],
@@ -611,7 +860,7 @@ class HerdrTests(unittest.TestCase):
                         herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
                     else:
                         self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
-                    start, prompt = self.commands()[-2:]
+                    start, prompt = self.start_commands()[-2:]
                     self.assertEqual(start, [
                         "--session", "fixture", "agent", "start", expected, "--kind", "claude",
                         "--pane", "7pane-1", "--timeout", "200", "--", "--model", "opus",

@@ -14,6 +14,9 @@ from typing import cast
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+# A Codex worker running this suite must not make verify.sh detach its call.
+WORKER_FREE_ENVIRONMENT = {name: value for name, value in os.environ.items()
+                           if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}}
 
 
 def classifier_functions() -> str:
@@ -46,7 +49,7 @@ class MemoryKillTests(unittest.TestCase):
             )
             result = subprocess.run(
                 ["bash", "-c", script], cwd=root,
-                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "MODE": "stopped" if stopped else "recovered",
+                env={**WORKER_FREE_ENVIRONMENT, "PATH": f"{root}:{os.environ['PATH']}", "MODE": "stopped" if stopped else "recovered",
                      "ATTEMPTS_DIR": str(attempts), "MEM_KILL_FILE": str(root / "kills"),
                      "PY": sys.executable, "BUILDLOG_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
                      "BUILDLOG_DIR": str(root / "buildlog")},
@@ -79,7 +82,7 @@ class MemoryKillTests(unittest.TestCase):
             )
             result = subprocess.run(
                 ["bash", "-c", script, "bash", str(log_file), str(status)],
-                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "JOURNAL_FIXTURE": journal},
+                env={**WORKER_FREE_ENVIRONMENT, "PATH": f"{root}:{os.environ['PATH']}", "JOURNAL_FIXTURE": journal},
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -128,7 +131,7 @@ class MemoryKillTests(unittest.TestCase):
             )
             result = subprocess.run(
                 ["bash", "-c", script, "bash", str(root / "run.log")],
-                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "TMPDIR": str(root), "ATTEMPTS": str(root / "attempts"), "MEM_KILL_FILE": str(root / "kills")},
+                env={**WORKER_FREE_ENVIRONMENT, "PATH": f"{root}:{os.environ['PATH']}", "TMPDIR": str(root), "ATTEMPTS": str(root / "attempts"), "MEM_KILL_FILE": str(root / "kills")},
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -149,7 +152,7 @@ class MemoryKillTests(unittest.TestCase):
             )
             result = subprocess.run(
                 ["bash", "-c", script],
-                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "TMPDIR": str(root), "ATTEMPTS": str(root / "attempts"), "MEM_KILL_FILE": str(root / "kills")},
+                env={**WORKER_FREE_ENVIRONMENT, "PATH": f"{root}:{os.environ['PATH']}", "TMPDIR": str(root), "ATTEMPTS": str(root / "attempts"), "MEM_KILL_FILE": str(root / "kills")},
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

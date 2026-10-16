@@ -1430,5 +1430,255 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual([call.args for call in sleep.call_args_list], [(0.05,)] * 5)
 
 
+class RecoverySnapshotTests(ShutdownTestCase):
+    root: Path = Path()
+    directory: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.directory = self.root / "shutdown" / "owner@example.com"
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+        })))
+
+    def snapshot(self, *numbers: int) -> record.RecoverySnapshot:
+        entries: list[record.SnapshotSession] = []
+        for number in numbers:
+            entries.append(record.SnapshotClaudeSession(agent="claude", session=session(number), workers=[],
+                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True,
+                    footer=record.ShowrunnerFooter(kind="footer", slug="show"))], last_seen=NOW, state="running", boot_id="boot-one"))
+        return record.RecoverySnapshot(machine="natedev", login="owner@example.com", label="owner",
+                                       taken_at=NOW, sessions=entries, boot_id="boot-one")
+
+    def test_snapshot_round_trip_preserves_workers_timers_and_canonical_login(self) -> None:
+        saved = self.snapshot(1)
+        saved["login"] = "OWNER@example.com"
+        saved["sessions"][0]["workers"].append(owned_worker())
+        record.write_snapshot(saved)
+        loaded = record.read_snapshot("owner@example.com")
+        assert not isinstance(loaded, record.NoRecoverySnapshot)
+        self.assertEqual(loaded["login"], "owner@example.com")
+        self.assertEqual(loaded["sessions"], saved["sessions"])
+        self.assertEqual(record.all_snapshots(), [loaded])
+        self.assertEqual(record.all_session_records(), [])
+        self.assertIsNone(record.account_hold("owner@example.com"))
+
+    def test_partial_observation_keeps_snapshot_bytes_and_timestamp(self) -> None:
+        record.write_snapshot(self.snapshot(1))
+        path = self.root / "shutdown/snapshots/owner@example.com.json"
+        before, stamp = path.read_bytes(), path.stat().st_mtime_ns
+        _ = record.merge_snapshots(inventory.PartialInventory(("registry unreadable",)), LATER)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, stamp))
+
+    def test_reboot_retains_absent_sessions_until_seen_again(self) -> None:
+        saved = self.snapshot(1, 2)
+        record.write_snapshot(saved)
+        merged = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("boot-two")), LATER)
+        self.assertEqual([(item["session"]["session_id"], item["state"], item["last_seen"]) for item in merged[0]["sessions"]],
+                         [("session-1", "unresolved", NOW), ("session-2", "unresolved", NOW)])
+        observed = self.snapshot(2)["sessions"]
+        updated = record.merge_snapshots(inventory.CompleteInventory("natedev", {saved["login"]: observed},
+                                            {saved["login"]: "owner"}), LATER)[0]
+        self.assertEqual({item["session"]["session_id"]: (item["state"], item["last_seen"]) for item in updated["sessions"]},
+                         {"session-1": ("unresolved", NOW), "session-2": ("running", LATER)})
+
+    def test_acknowledgement_removes_only_the_named_session(self) -> None:
+        saved = self.snapshot(1, 2)
+        record.write_snapshot(saved)
+        other = self.snapshot(3)
+        other["login"] = "other@example.com"
+        record.write_snapshot(other)
+        self.assertIsInstance(record.acknowledge_snapshot(saved["login"], "session-1"), record.SnapshotAcknowledged)
+        self.assertIsInstance(record.acknowledge_snapshot(saved["login"], "missing"), record.SnapshotAlreadyAbsent)
+        loaded = record.read_snapshot(saved["login"])
+        assert not isinstance(loaded, record.NoRecoverySnapshot)
+        self.assertEqual([item["session"]["session_id"] for item in loaded["sessions"]], ["session-2"])
+        self.assertEqual(record.read_snapshot(other["login"]), other)
+
+    def test_materialization_persists_complete_restart_mapping_without_an_account_hold(self) -> None:
+        saved = self.snapshot(1)
+        saved["sessions"][0]["workers"].append(owned_worker())
+        created = record.materialize_snapshot(saved, cast(record.SnapshotClaudeSession, saved["sessions"][0]))
+        persisted = record.session_records(saved["login"])[0]
+        self.assertEqual(persisted, created)
+        self.assertEqual((persisted["login"], persisted["label"], persisted["machine"]),
+                         (saved["login"], saved["label"], saved["machine"]))
+        self.assertEqual(persisted["session"], saved["sessions"][0]["session"])
+        self.assertEqual(persisted["workers"], saved["sessions"][0]["workers"])
+        self.assertEqual(persisted["timers"], saved["sessions"][0]["timers"])
+        self.assertEqual((persisted["requested_at"], persisted["request_id"], persisted["requested_by"]),
+                         (NOW, "recovery-" + NOW, {"kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"}}))
+        self.assertEqual((persisted["hold"], persisted["then"], persisted["progress"], persisted["trail"], persisted["stop_issues"]),
+                         ("session", "restart", {"kind": "already gone", "at": NOW}, [], []))
+        self.assertIsNone(record.account_hold(saved["login"]))
+
+    def test_recovery_origin_round_trip_keeps_crash_signal_and_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        snapshot["taken_at"] = LATER
+        for signal in ("reboot", "host gone"):
+            with self.subTest(signal=signal):
+                item["crash"] = signal
+                saved = record.snapshot_restore_record(snapshot, item)
+                self.assertTrue(record.create_session(saved))
+                loaded = record.session_records(snapshot["login"])[0]
+                self.assertEqual(loaded["requested_by"], {
+                    "kind": "snapshot", "taken_at": LATER,
+                    "recovery": {"kind": signal, "last_seen": NOW},
+                })
+                path = self.directory / "sessions/session-1.json"
+                path.unlink()
+
+    def test_older_snapshot_origin_normalizes_missing_crash_evidence(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        saved = record.snapshot_restore_record(snapshot, item)
+        wire = cast(dict[str, object], json.loads(json.dumps(saved)))
+        wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW}
+        parsed = record.parse_session_records(json.dumps([wire]))[0]
+        self.assertEqual(parsed["requested_by"], {
+            "kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"},
+        })
+        self.assertEqual(record.parse_session_records(json.dumps([parsed]))[0], parsed)
+
+    def test_recovery_origin_refuses_invalid_crash_signal_or_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        wire = cast(dict[str, object], json.loads(json.dumps(record.snapshot_restore_record(snapshot, item))))
+        for context in ({"kind": "shutdown", "last_seen": NOW},
+                        {"kind": "reboot", "last_seen": "yesterday"},
+                        {"kind": "host gone"}):
+            with self.subTest(context=context):
+                wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW, "recovery": context}
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([wire]))
+
+    def test_materialization_never_overwrites_an_existing_shutdown_request(self) -> None:
+        existing = session_shutdown(progress=record.SessionWaiting(kind="waiting"))
+        existing["target"] = "claude2"
+        self.assertTrue(record.create_session(existing))
+        path = self.directory / "sessions/session-1.json"
+        before = path.read_bytes()
+        snapshot = self.snapshot(1)
+        result = record.materialize_snapshot(snapshot, cast(record.SnapshotClaudeSession, snapshot["sessions"][0]))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((result["progress"], result.get("target"), result["requested_by"]),
+                         (existing["progress"], "claude2", existing["requested_by"]))
+
+    def test_codex_snapshot_preserves_resume_id_or_picker_and_cannot_become_a_claude_record(self) -> None:
+        for resume in (record.CodexSessionId(kind="session id", session_id="rollout-id"), record.CodexResumePicker(kind="picker")):
+            with self.subTest(resume=resume):
+                owner = session(1 if resume["kind"] == "session id" else 2)
+                saved = record.RecoverySnapshot(machine="natedev", login="codex-work", label="codex-work", taken_at=NOW,
+                    sessions=[record.SnapshotCodexSession(agent="codex", session=owner,
+                        codex=record.CodexLaunch(home=str(self.root / "work"), resume=resume),
+                        workers=[], timers=[], last_seen=NOW, state="running")])
+                record.write_snapshot(saved)
+                self.assertEqual(record.read_snapshot(saved["login"]), saved)
+                with self.assertRaisesRegex(record.InvalidRecord, "Codex restore path"):
+                    _ = record.materialize_snapshot(saved, cast(record.SnapshotClaudeSession, saved["sessions"][0]))
+                self.assertEqual(record.session_records(saved["login"]), [])
+
+    def test_unknown_agent_and_unsafe_login_cannot_replace_a_snapshot(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        invalid = cast(dict[str, object], json.loads(json.dumps(saved)))
+        invalid["login"] = "../escape"
+        with self.assertRaises(ValueError):
+            _ = record.parse_snapshot(invalid)
+        invalid = cast(dict[str, object], json.loads(json.dumps(saved)))
+        values = cast(list[dict[str, object]], invalid["sessions"])
+        values[0]["agent"] = "other"
+        with self.assertRaisesRegex(record.InvalidRecord, "agent"):
+            _ = record.parse_snapshot(invalid)
+        self.assertEqual(record.read_snapshot(saved["login"]), saved)
+
+    def test_rollout_identity_replaces_the_same_codex_process_picker_entry(self) -> None:
+        owner = session(1)
+        owner["session_id"] = "codex-1001-12345"
+        entry = record.SnapshotCodexSession(agent="codex", session=owner,
+            codex=record.CodexLaunch(home=str(self.root / "codex"), resume=record.CodexResumePicker(kind="picker")),
+            workers=[], timers=[], last_seen=NOW, state="running", boot_id="boot-one")
+        saved = record.RecoverySnapshot(machine="natedev", login="codex-work", label="codex-work", taken_at=NOW,
+                                        sessions=[entry], boot_id="boot-one")
+        record.write_snapshot(saved)
+        promoted = record.parse_snapshot(saved)["sessions"][0]
+        assert promoted["agent"] == "codex"
+        promoted["session"]["session_id"] = "12345678-1234-1234-1234-123456789abc"
+        promoted["codex"]["resume"] = record.CodexSessionId(kind="session id", session_id=promoted["session"]["session_id"])
+        merged = record.merge_snapshots(inventory.CompleteInventory("natedev", {"codex-work": [promoted]},
+            {"codex-work": "codex-work"}, inventory.KnownBoot("boot-one")), LATER)[0]
+        self.assertEqual([(item["session"]["session_id"], item["state"]) for item in merged["sessions"]],
+                         [(promoted["session"]["session_id"], "running")])
+
+    def test_reboot_pid_and_start_reuse_keeps_the_crashed_codex_rollout(self) -> None:
+        owner = session(1)
+        owner["session_id"] = "12345678-1234-1234-1234-123456789abc"
+        entry = record.SnapshotCodexSession(agent="codex", session=owner,
+            codex=record.CodexLaunch(home=str(self.root / "codex"), resume=record.CodexSessionId(
+                kind="session id", session_id=owner["session_id"])),
+            workers=[], timers=[], last_seen=NOW, state="running", boot_id="boot-one")
+        saved = record.RecoverySnapshot(machine="natedev", login="codex-work", label="codex-work", taken_at=NOW,
+                                        sessions=[entry], boot_id="boot-one")
+        record.write_snapshot(saved)
+        current = record.parse_snapshot(saved)["sessions"][0]
+        assert current["agent"] == "codex"
+        current["boot_id"] = "boot-two"
+        current["session"]["session_id"] = "87654321-4321-4321-4321-cba987654321"
+        current["codex"]["resume"] = record.CodexSessionId(kind="session id", session_id=current["session"]["session_id"])
+        _ = record.merge_snapshots(inventory.CompleteInventory("natedev", {"codex-work": [current]},
+            {"codex-work": "codex-work"}, inventory.KnownBoot("boot-two")), LATER)
+        loaded = record.read_snapshot("codex-work")
+        assert not isinstance(loaded, record.NoRecoverySnapshot)
+        entries = {item["session"]["session_id"]: item for item in loaded["sessions"]}
+        self.assertEqual(set(entries), {owner["session_id"], current["session"]["session_id"]})
+        crashed = entries[owner["session_id"]]
+        self.assertEqual((crashed["state"], crashed.get("crash"), crashed["last_seen"], crashed.get("boot_id")),
+                         ("unresolved", "reboot", NOW, "boot-one"))
+        running = entries[current["session"]["session_id"]]
+        self.assertEqual((running["state"], running["last_seen"], running.get("boot_id")),
+                         ("running", LATER, "boot-two"))
+
+    def test_clean_exit_is_removed_and_shutdown_records_own_stopped_session_recovery(self) -> None:
+        saved = self.snapshot(1, 2)
+        record.write_snapshot(saved)
+        clean = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("boot-one")), LATER)[0]
+        self.assertEqual(clean["sessions"], [])
+        record.write_snapshot(saved)
+        _ = record.create_session(session_shutdown())
+        rebooted = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("boot-two")), LATER)[0]
+        self.assertEqual([item["session"]["session_id"] for item in rebooted["sessions"]], ["session-2"])
+        self.assertEqual(record.session_records(saved["login"])[0]["session"]["session_id"], "session-1")
+
+    def test_restarted_history_skips_bad_files_and_preserves_stale_target_without_resolving(self) -> None:
+        history = self.directory / "history"
+        history.mkdir(parents=True)
+        saved = session_shutdown(progress=record.SessionRestarted(kind="restarted", at=LATER))
+        saved["target"] = "claude999"
+        _ = (history / "good.json").write_text(json.dumps(saved))
+        _ = (history / "invalid.json").write_text("{broken")
+        _ = (history / "unreadable.json").write_text(json.dumps(saved))
+        (history / "linked.json").symlink_to(history / "good.json")
+        original = Path.read_text
+        reads: list[Path] = []
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            reads.append(path)
+            if path.name == "unreadable.json":
+                raise PermissionError("history denied")
+            return original(path, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", read):
+            found = record.restarted_history()
+        self.assertEqual([(item["session"]["session_id"], item.get("target")) for item in found], [("session-1", "claude999")])
+        self.assertEqual(reads.count(history / "good.json"), 1)
+        self.assertNotIn(history / "linked.json", reads)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
