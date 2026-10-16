@@ -14,6 +14,7 @@ import sys
 import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
@@ -120,9 +121,39 @@ class WatchState(TypedDict):
     auto_moves: NotRequired[dict[str, AutoResetObservation]]
 
 
-class AutoResetObservation(TypedDict):
+class AutoResetObservationDocument(TypedDict):
     observed_reset: str
     acted_reset: str
+
+
+class WatchStateDocument(TypedDict):
+    sessions: dict[str, WatchedSession]
+    notices: dict[str, str]
+    auto_moves: NotRequired[dict[str, AutoResetObservationDocument]]
+
+
+@dataclass(frozen=True)
+class NeverActedOnReset:
+    """This rule has not acted on an observed reset."""
+
+
+@dataclass(frozen=True)
+class ActedOnReset:
+    at: datetime
+
+    def __post_init__(self) -> None:
+        if self.at.utcoffset() is None:
+            raise ValueError("acted reset needs a zone")
+
+
+@dataclass(frozen=True)
+class AutoResetObservation:
+    observed_reset: datetime
+    acted_reset: NeverActedOnReset | ActedOnReset
+
+    def __post_init__(self) -> None:
+        if self.observed_reset.utcoffset() is None:
+            raise ValueError("observed reset needs a zone")
 
 
 @dataclass(frozen=True)
@@ -248,9 +279,31 @@ def _load_state() -> WatchState:
                 fields = cast(dict[str, object], raw)
                 observed, acted = fields.get("observed_reset"), fields.get("acted_reset")
                 if isinstance(observed, str) and isinstance(acted, str):
-                    observations[name] = AutoResetObservation(observed_reset=observed, acted_reset=acted)
+                    try:
+                        progress = ActedOnReset(datetime.fromisoformat(acted)) if acted else NeverActedOnReset()
+                        observations[name] = AutoResetObservation(datetime.fromisoformat(observed), progress)
+                    except ValueError:
+                        # An invalid observation is first sight on the next fresh reading.
+                        continue
         result["auto_moves"] = observations
     return result
+
+
+def _state_document(state: WatchState) -> WatchStateDocument:
+    document = WatchStateDocument(sessions=state["sessions"], notices=state["notices"])
+    if "auto_moves" in state:
+        document["auto_moves"] = {
+            name: AutoResetObservationDocument(
+                observed_reset=observation.observed_reset.isoformat(),
+                acted_reset=observation.acted_reset.at.isoformat()
+                if isinstance(observation.acted_reset, ActedOnReset) else "")
+            for name, observation in state["auto_moves"].items()
+        }
+    return document
+
+
+def _save_state(state: WatchState) -> None:
+    _atomic_json(state_root() / "refusal_watch.json", _state_document(state))
 
 
 @contextmanager
@@ -410,7 +463,7 @@ def cancelled(session_id: str) -> None:
         transcript = transcript_refusal(session_id)
         if isinstance(transcript, TranscriptRefusal):
             state["sessions"][session_id] = WatchedSession(entry_id=transcript.entry_id, state="cancelled", move_id="")
-        _atomic_json(state_root() / "refusal_watch.json", state)
+        _save_state(state)
         clear_assumed(session_id)
 
 
@@ -479,7 +532,7 @@ def _reading_values_fingerprint() -> str:
 
 def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
     state = _load_state()
-    original_state = json.dumps(state, sort_keys=True)
+    original_state = deepcopy(state)
     open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
@@ -593,7 +646,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         refusals.write_refusal(account_refusal)
                     _set_transition(state, session_id, refusal.entry_id, "retry", "")
                 state["sessions"][session_id]["refusal"] = observation
-                _atomic_json(state_root() / "refusal_watch.json", state)
+                _save_state(state)
         window, reset = account_refusal.window, account_refusal.reset
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited":
             waited = next((entry for entry in entries if entry["kind"] == "waited" and entry["move_id"] == previous["move_id"]), None)
@@ -702,7 +755,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         reset_text = first_refusal.reset.at.astimezone(agent_accounts.user_zone()).isoformat() if isinstance(first_refusal.reset, refusals.KnownReset) else "unknown reset"
         why = f"{source} refused: {window_name} limit until {reset_text}"
         move_origin = accounts.RefusalOrigin(window_name, first_refusal.reset)
-        transition = accounts.GroupTransition(uuid4().hex, move_origin)
+        transition = accounts.GroupTransition(uuid4().hex, move_origin, accounts.RecordedTransitionReason(why))
         if group_name != "ungrouped":
             prepared = accounts.prepared_account(chosen.label, resume=True)
             if isinstance(prepared, accounts.AccountRefused):
@@ -714,7 +767,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             for session, refusal, _ in group:
                 _set_transition(state, session["session_id"], refusal.entry_id, "group selected", "")
             # The chosen group account survives a member's failed request or interrupted delivery.
-            _atomic_json(state_root() / "refusal_watch.json", state)
+            _save_state(state)
             ids = tuple(session.session_id for session in all_members[group_name]
                         if not accounts.session_on_account(session, chosen.label))
         else:
@@ -733,8 +786,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if isinstance(outcome, accounts.SessionMoveRefused):
                 lines.append(f"{outcome.session_id}: move refused: {outcome.reason}")
     if not proof_group:
-        if not dry_run and json.dumps(state, sort_keys=True) != original_state:
-            _atomic_json(state_root() / "refusal_watch.json", state)
+        if not dry_run and state != original_state:
+            _save_state(state)
         before_rules = dict(selected_groups)
         lines.extend(run_auto_moves(now, dry_run=dry_run, moved_groups=frozenset(moved_groups)))
         if not dry_run:
@@ -742,7 +795,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             moved_groups.update(group for group in accounts.CLAUDE_GROUPS
                                 if selected_groups.get(group) != before_rules.get(group))
             state = _load_state()
-            original_state = json.dumps(state, sort_keys=True)
+            original_state = deepcopy(state)
     # A committed group choice is stable. Complete its off-target members without choosing again.
     if not proof_group and selected_groups:
         for group_name in accounts.CLAUDE_GROUPS:
@@ -777,12 +830,14 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 transition = accounts.group_transition(group_name)
                 if isinstance(transition, accounts.NoGroupTransition):
                     transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
-                why = transition.why if isinstance(transition.origin, accounts.AutoOrigin) else f"complete {group_name} move to {target}"
+                why = f"complete {group_name} move to {target}"
+                if isinstance(transition.origin, accounts.AutoOrigin):
+                    why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
                 _ = accounts.move_sessions(tuple(session.session_id for session in members), target,
                     why=why, origin=transition.origin, move_id=transition.move_id,
                     alerts="none" if isinstance(transition.origin, accounts.AutoOrigin) else "user")
-    if not dry_run and json.dumps(state, sort_keys=True) != original_state:
-        _atomic_json(state_root() / "refusal_watch.json", state)
+    if not dry_run and state != original_state:
+        _save_state(state)
     return lines
 
 
@@ -797,7 +852,7 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
     if not rules:
         return lines
     state = _load_state()
-    original = json.dumps(state, sort_keys=True)
+    original = deepcopy(state)
     observations = state.setdefault("auto_moves", {})
     threshold = max((rule.when.percent for rule in rules if isinstance(rule.when, LeftAtMost)), default=0)
     selected = accounts.group_accounts()
@@ -819,30 +874,23 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         target = refusals.stored_reading("claude", target_identity.login, now)
         if not isinstance(target, refusals.FreshReading):
             continue
-        passed_reset = ""
+        progress: NeverActedOnReset | ActedOnReset = NeverActedOnReset()
         if isinstance(rule.when, AfterReset):
             if not isinstance(target.weekly.reset, refusals.KnownReset):
                 continue
-            current_reset = target.weekly.reset.at.isoformat()
+            current_reset = target.weekly.reset.at
             previous = observations.get(rule.name)
             if previous is None:
-                observations[rule.name] = AutoResetObservation(observed_reset=current_reset, acted_reset="")
+                observations[rule.name] = AutoResetObservation(current_reset, NeverActedOnReset())
                 continue
-            try:
-                observed_reset = datetime.fromisoformat(previous["observed_reset"])
-                if observed_reset.tzinfo is None:
-                    raise ValueError("reset needs a zone")
-            except ValueError:
-                observations[rule.name] = AutoResetObservation(observed_reset=current_reset, acted_reset="")
-                continue
-            if previous["acted_reset"] == previous["observed_reset"]:
-                if current_reset != previous["observed_reset"]:
+            if isinstance(previous.acted_reset, ActedOnReset) and previous.acted_reset.at == previous.observed_reset:
+                if current_reset != previous.observed_reset:
                     observations[rule.name] = AutoResetObservation(
-                        observed_reset=current_reset, acted_reset=previous["acted_reset"])
+                        observed_reset=current_reset, acted_reset=previous.acted_reset)
                 continue
-            if observed_reset > now:
+            if previous.observed_reset > now:
                 continue
-            passed_reset = previous["observed_reset"]
+            progress = ActedOnReset(previous.observed_reset)
         source_label = accounts.group_label(selected, rule.group)
         if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
                 or rule.group in moved or rule.group in in_flight):
@@ -874,17 +922,17 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         if isinstance(rule.when, AfterReset):
             assert isinstance(target.weekly.reset, refusals.KnownReset)
             observations[rule.name] = AutoResetObservation(
-                observed_reset=target.weekly.reset.at.isoformat(), acted_reset=passed_reset)
+                observed_reset=target.weekly.reset.at, acted_reset=progress)
         # Commit the once-per-reset decision before starting detached session moves.
-        _atomic_json(state_root() / "refusal_watch.json", state)
+        _save_state(state)
         ids = tuple(member.session_id for member in members[rule.group]
                     if not accounts.session_on_account(member, rule.to))
         outcomes = accounts.move_sessions(ids, rule.to, why=why, origin=transition.origin,
                                          move_id=transition.move_id, alerts="none") if ids else ()
         lines.extend(f"{outcome.session_id}: move refused: {outcome.reason}" for outcome in outcomes
                      if isinstance(outcome, accounts.SessionMoveRefused))
-    if not dry_run and json.dumps(state, sort_keys=True) != original:
-        _atomic_json(state_root() / "refusal_watch.json", state)
+    if not dry_run and state != original:
+        _save_state(state)
     return lines
 
 

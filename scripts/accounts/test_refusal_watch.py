@@ -323,6 +323,9 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(record.all_session_records(), [])
         history = accounts.roles_history_file().read_bytes()
         transition = cast(dict[str, object], json.loads(path.read_text())["units"])
+        decoded = accounts.group_transition("units")
+        assert isinstance(decoded, accounts.GroupTransition)
+        self.assertEqual(decoded.why, accounts.RecordedTransitionReason("auto: units-low"))
         code, _, error = self.cli()
         self.assertEqual((code, error), (0, ""))
         requested = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
@@ -399,6 +402,9 @@ class RefusalWatchTests(unittest.TestCase):
         first_reset = NOW + timedelta(minutes=5)
         self.reading(SOURCE_LOGIN, 80)
         self.reading(TARGET_LOGIN, 90, reset=first_reset)
+        before = self.snapshot()
+        _ = self.cli("--dry-run")
+        self.assertEqual(self.snapshot(), before)
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude1")
         self.assertFalse(accounts.roles_history_file().exists())
@@ -423,6 +429,86 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude3")
         self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 2)
+
+    def test_legacy_never_acted_reset_loads_as_named_progress_and_dry_run_preserves_it(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        observed = NOW - timedelta(minutes=1)
+        current_reset = NOW + timedelta(days=7)
+        self.reading(TARGET_LOGIN, 90, reset=current_reset)
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+            "units-reset": {"observed_reset": observed.isoformat(), "acted_reset": ""}}}))
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(observed, refusal_watch.NeverActedOnReset()))
+        before = self.snapshot()
+        code, output, error = self.cli("--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("would move from claude1 to claude3", output)
+        self.assertEqual(self.snapshot(), before)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(current_reset, refusal_watch.ActedOnReset(observed)))
+        document = cast(dict[str, object], json.loads(state_file.read_text()))
+        observations = cast(dict[str, object], document["auto_moves"])
+        self.assertEqual(observations["units-reset"],
+                         {"observed_reset": current_reset.isoformat(), "acted_reset": observed.isoformat()})
+        self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 1)
+
+    def test_legacy_acted_reset_does_not_repeat_and_a_later_reset_can_fire(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        acted = NOW - timedelta(minutes=1)
+        next_reset = NOW + timedelta(minutes=5)
+        self.reading(TARGET_LOGIN, 90, reset=next_reset)
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+            "units-reset": {"observed_reset": acted.isoformat(), "acted_reset": acted.isoformat()}}}))
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(acted, refusal_watch.ActedOnReset(acted)))
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertFalse(accounts.roles_history_file().exists())
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(next_reset, refusal_watch.ActedOnReset(acted)))
+        WatchTime.at = next_reset + timedelta(seconds=1)
+        following_reset = WatchTime.at + timedelta(days=7)
+        self.reading(TARGET_LOGIN, 90, at=WatchTime.at, reset=following_reset)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(following_reset, refusal_watch.ActedOnReset(next_reset)))
+        self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 1)
+
+    def test_malformed_observed_or_acted_reset_is_relearned_without_moving_on_first_sight(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        past = (NOW - timedelta(minutes=1)).isoformat()
+        current_reset = NOW + timedelta(days=7)
+        self.reading(TARGET_LOGIN, 90, reset=current_reset)
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        for observed, acted in (("invalid", ""), (past, "invalid"),
+                                ("2026-10-01T12:00:00", ""), (past, "2026-10-01T12:00:00")):
+            with self.subTest(observed=observed, acted=acted):
+                _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+                    "units-reset": {"observed_reset": observed, "acted_reset": acted}}}))
+                code, _, error = self.cli()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                self.assertFalse(accounts.roles_history_file().exists())
+                loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                                 refusal_watch.AutoResetObservation(current_reset, refusal_watch.NeverActedOnReset()))
+                document = cast(dict[str, object], json.loads(state_file.read_text()))
+                observations = cast(dict[str, object], document["auto_moves"])
+                self.assertEqual(observations["units-reset"],
+                                 {"observed_reset": current_reset.isoformat(), "acted_reset": ""})
 
     def test_automatic_rules_report_malformed_entries_and_still_apply_valid_configured_thresholds(self) -> None:
         path = self.groups()

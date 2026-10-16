@@ -193,6 +193,7 @@ class RoleMapTests(unittest.TestCase):
         self.assertIsInstance(transition, accounts.GroupTransition)
         assert isinstance(transition, accounts.GroupTransition)
         self.assertEqual(transition.move_id, "automatic-transition")
+        self.assertEqual(transition.why, accounts.RecordedTransitionReason("auto: units-low"))
         self.assertEqual(accounts.move_origin_fields(transition.origin), {"cause": "auto", "window": "unknown"})
         history = self.server_home / ".local/state/accounts/roles.jsonl"
         self.assertEqual(json.loads(history.read_text()), {
