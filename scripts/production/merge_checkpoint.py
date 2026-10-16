@@ -331,16 +331,29 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
 
 
 def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
-    """Read checkpoint merge subjects on a branch, newest first."""
+    """Read checkpoint merge subjects on a branch, newest first.
+
+    A `chore(<slug>): rename unit <old> to <new>` subject carries a unit's history over: every
+    older entry under `<old>` counts as `<new>`, through a chain of renames, while a later unit
+    that reuses `<old>` keeps its own newer entries. The commit is the record; no alias is stored.
+    """
     output = good(git(checkout, "log", "--first-parent", merge_branch, "--format=%H%x00%s"), "ancestry")
     pattern = re.compile(r"^Merge (.+?) phase (\S+?)( shrink| as-built)? \(([0-9a-f]+)\)")
+    rename = re.compile(r"^chore\([^)]*\): rename unit (\S+) to (\S+)$")
+    renamed: dict[str, str] = {}
     entries: list[MergeEntry] = []
     for row in output.splitlines():
         merge_hash, separator, subject = row.partition("\x00")
+        moved = rename.match(subject) if separator else None
+        if moved is not None:
+            old, new = moved.groups()
+            renamed[old] = renamed.get(new, new)
+            continue
         match = pattern.match(subject) if separator else None
         if match is None:
             continue
         unit, phase, docs, short = match.groups()
+        unit = renamed.get(unit, unit)
         kind = ShrinkCommit() if docs == " shrink" else AsBuiltCommit() if docs == " as-built" else CodeCheckpoint()
         entries.append(MergeEntry(unit, phase, short, merge_branch, merge_hash, kind))
     return MergeBranchHistory(tuple(entries))

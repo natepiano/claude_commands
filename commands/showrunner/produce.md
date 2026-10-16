@@ -35,7 +35,9 @@ State:
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
   `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
-  merge commit subjects on `MERGE_BRANCH`, never from memory.
+  merge commit subjects on `MERGE_BRANCH`, never from memory. A
+  `chore(<slug>): rename unit <old> to <new>` commit carries the merges under
+  `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
   name less `-production.md`.
@@ -503,7 +505,7 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
-| the user asks for "change review" | `/change_review` show; each verdict through <CloseChangeReview/> |
+| the user asks for "change review" or "the next change" | `/change_review` show; each verdict through <CloseChangeReview/> |
 | a change for the user to check that no checkpoint `Change-Review:` line carries | `/change_review` add |
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
