@@ -3029,7 +3029,8 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
     holders = {entry.session.session_id: entry for entry in listing.entries
                if isinstance(entry.session, roster.ClaudeSession)}
     saved_names: dict[str, str] = {}
-    if any(not any(session_id in holders for session_id in switch.holders) for switch in active):
+    if any(not any(session_id in holders for session_id in (switch.holders or switch.launcher_sessions))
+           for switch in active):
         try:
             paths = sessions.sessions_dir().glob("*.json")
             records = [sessions.read_session(path) for path in paths]
@@ -3041,8 +3042,9 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
                 _ = saved_names.setdefault(record["sessionId"], record["name"])
     folded: dict[tuple[str, str], FoldedWorkerRow] = {}
     for switch in active:
-        holder_id = next((session_id for session_id in switch.holders if session_id in holders),
-                         next(iter(switch.holders), str(switch.folder)))
+        naming_sessions = switch.holders or switch.launcher_sessions
+        holder_id = next((session_id for session_id in naming_sessions if session_id in holders),
+                         next(iter(naming_sessions), str(switch.folder)))
         holder = holders.get(holder_id)
         parts: list[str] = []
         if holder is not None:
@@ -3055,7 +3057,7 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
             parts.append(holder.director.unit if isinstance(holder.director, (roster.DirectsUnit, roster.UnderDirector))
                          and holder.director.unit else holder.name)
         else:
-            parts.append(next((saved_names[session_id] for session_id in switch.holders if session_id in saved_names),
+            parts.append(next((saved_names[session_id] for session_id in naming_sessions if session_id in saved_names),
                               f"unknown session ({switch.folder.name})"))
         for worker in switch.workers:
             stem = worker.name.removesuffix("-worker")
