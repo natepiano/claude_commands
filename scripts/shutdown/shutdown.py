@@ -9,6 +9,7 @@ import io
 from contextlib import redirect_stdout
 import os
 import json
+import subprocess
 import sys
 import time
 from collections.abc import Iterable
@@ -40,6 +41,7 @@ from inventory import (
     parse_inventory,
 )
 import inventory as inventory_work
+import herdr
 import record as recovery_store
 from launch_permission import (
     LaunchPurpose,
@@ -504,6 +506,56 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     return ResolvedSessions(tuple(result), report)
 
 
+def _tmux_free() -> int:
+    causes: list[str] = []
+    try:
+        result = subprocess.run(
+            [os.environ.get("SHUTDOWN_TMUX", "tmux"), "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        names = result.stdout.splitlines()
+        detail = result.stderr.strip()
+        no_server = (not names and len(detail.splitlines()) == 1
+                     and (detail == "no server running" or detail.startswith("no server running on ")))
+        if result.returncode != 0 and not (result.returncode == 1 and no_server):
+            causes.append(f"tmux sessions unreadable: {detail or f'exit {result.returncode}'}")
+        for name in names:
+            causes.append(f"tmux session {name!r} is still registered; close it after moving its agents")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        causes.append(f"tmux sessions unreadable: {error}")
+    try:
+        _ = herdr.live_sessions()
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        causes.append(f"herdr sessions unreadable: {error}")
+    try:
+        observed = inventory_work.snapshot_inventory()
+        if isinstance(observed, inventory_work.PartialInventory):
+            causes.extend(f"inventory incomplete: {failure}" for failure in observed.failures)
+            if not observed.failures:
+                causes.append("inventory incomplete: no failure details were returned")
+        else:
+            for login, entries in observed.sessions.items():
+                for entry in entries:
+                    for owner in (entry["session"], *entry["workers"]):
+                        host = owner["host"]
+                        location = ""
+                        if host["kind"] == "tmux":
+                            location = f"tmux session {host['tmux_session']!r}"
+                        elif host["kind"] == "unit" and host["session_host"] == "tmux":
+                            location = f"tmux unit {host['production']}/{host['unit']} in session {host['session_name']!r}"
+                        elif host["kind"] == "unknown":
+                            location = "an unknown host; prove its host before removing tmux"
+                        if location:
+                            causes.append(f"{login}: {owner['name']} ({owner['session_id']}) uses {location}")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        causes.append(f"inventory unreadable: {error}")
+    if causes:
+        print("\n".join(causes))
+        return 1
+    print("nothing needs tmux")
+    return 0
+
+
 def _snapshot() -> int:
     observed = inventory_work.snapshot_inventory()
     at = settle.record_time()
@@ -822,9 +874,10 @@ def main(arguments: list[str] | None = None) -> int:
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{down,status,follow,now,cancel,restart,snapshot,forget,remote-control,launch-blocked}",
+        metavar="{down,status,follow,now,cancel,restart,snapshot,tmux-free,forget,remote-control,launch-blocked}",
     )
     _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
+    _ = commands.add_parser("tmux-free", help="check whether anything local still needs tmux")
     forget = commands.add_parser("forget", help="retire one local recovery snapshot entry")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
     _ = forget.add_argument("--account", help="account login or label containing this recovery entry")
@@ -1077,6 +1130,8 @@ def _all_accounts(options: CommandLine) -> int:
 
 
 def _dispatch(options: CommandLine) -> int:
+    if options.command == "tmux-free":
+        return _tmux_free()
     if options.command in {"snapshot", "forget"}:
         try:
             return _snapshot() if options.command == "snapshot" else _forget(options.forget_name, options.account or "")

@@ -346,14 +346,14 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_excluding_tmux_reads_herdr_without_resolving_tmux(self) -> None:
         self.herdr_session()
-        with mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
+        with mock.patch.object(unit_lookup, "installed_tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
             found = unit_lookup.every_marked_unit(include_tmux=False)
         resolver.assert_not_called()
         self.assertEqual(list(found.units["show"]), ["trunk-unit"])
         self.assertEqual(found.faults, {})
 
     def test_excluding_tmux_reports_only_an_unreadable_herdr_source(self) -> None:
-        with mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver, \
+        with mock.patch.object(unit_lookup, "installed_tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver, \
                 self.assertRaises(OSError) as refused:
             _ = unit_lookup.every_marked_unit(include_tmux=False)
         resolver.assert_not_called()
@@ -363,6 +363,14 @@ class UnitLookupTests(unittest.TestCase):
         self.herdr_session()
         with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}):
             self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+
+    def test_tmux_observation_never_builds_a_missing_binary(self) -> None:
+        with (mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
+              mock.patch("shutil.which", return_value=None),
+              mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("no executable")) as run,
+              self.assertRaises(OSError)):
+            _ = unit_lookup.tmux_sessions()
+        run.assert_not_called()
 
     def test_every_host_lookup_refuses_partial_discovery_but_default_keeps_available_units(self) -> None:
         self.herdr_session()
