@@ -37,7 +37,7 @@ from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import refusals
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
+from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, workers_home as resolve_workers_home)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
@@ -422,13 +422,9 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
         except (OSError, UnicodeError) as error:
             messages.append(f"readings log: {error}")
     try:
-        # Keep the default Claude input; Codex ownership comes from the frozen pass.
         watch_reports = [report for report in reports
                          if (report.tool.lower() != "codex" or codex_report_in_use(report, workers_home))
-                         and (report.tool.lower() != "claude" or not selection.multiple_accounts
-                              or (report.source.directory == Path.home() / ".claude"
-                                  if isinstance(report.source, ClaudeDirectorySource)
-                                  else selection.is_home_directory_login(report.email or "")))]
+                         and (report.tool.lower() != "claude" or selection.is_in_use(report.email or ""))]
         messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.

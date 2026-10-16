@@ -126,6 +126,9 @@ class AddShowrunnerTests(unittest.TestCase):
         file.parent.mkdir(parents=True)
         _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
             "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         _ = self.configure_groups()
         self.timer("top", PARENT_SESSION)
         self.live(PARENT_SESSION)
@@ -239,8 +242,11 @@ class AddShowrunnerTests(unittest.TestCase):
                                     "zsh", "-ic"])
         # No unit mark: a marked session would be relayed to as a unit of the parent.
         self.assertNotIn("-e", args)
-        # No account prefix and no CLAUDE_* variable: it takes the main login, whatever the caller's units use.
-        self.assertEqual(args[8], "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude --model opus --effort high "
+        # The configured account is explicit inside tmux, independent of its server environment.
+        self.assertEqual(args[8], "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; "
+                         + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
+                         + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} "
+                         + "ENABLE_TOOL_SEARCH=true command claude --model opus --effort high "
                          + "--remote-control kid -n kid --settings '{\"disableAgentView\": true}' "
                          + f"'/showrunner:produce {self.doc('kid')}'; exec zsh")
         self.assertEqual(self.started()["claude_env"], [])
@@ -449,7 +455,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         options = [cast(list[str], event["args"]) for event in self.events("tmux")
                    if cast(list[str], event["args"])[:1] == ["set-option"]]
-        self.assertIn(["set-option", "-t", "=kid:", "@claude_config_dir", str(Path(self.env["HOME"]) / ".claude")], options)
+        self.assertIn(["set-option", "-t", "=kid:", "@claude_config_dir", str(Path(self.env["HOME"]) / ".claude2")], options)
         self.assertIn(["set-option", "-t", "=kid:", "@claude_model", "opus"], options)
 
     def test_new_showrunner_zero_reading_without_refusal_can_launch(self) -> None:
@@ -462,7 +468,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("CLAUDE_CONFIG_DIR=", cast(list[str], self.started()["args"])[-1])
+        self.assertIn(f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}", cast(list[str], self.started()["args"])[-1])
 
     def test_a_timer_left_by_an_ended_session_does_not_stand_in_the_way(self) -> None:
         # The child ran before under this parent; its session ended, and its timer and its edge are still stored.
@@ -601,7 +607,8 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         result = self.run_command("kid", "--check")
         self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on claude2. "
                      + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
-                     + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
+                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
+                     + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude")
         self.assertNotIn("SECRET", result.stdout + result.stderr)
 
     def test_trust_comes_from_the_repository_root_or_a_worktrees_main_checkout(self) -> None:

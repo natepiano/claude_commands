@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, cast
 
 import showrunners
 import unit_lookup
@@ -32,13 +32,6 @@ from add_unit import Production, Refusal, launch_environment, read_production, t
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
-
-class DefaultClaudeConfiguration(NamedTuple):
-    """Trust comes from the default login's configuration."""
-
-
-_DEFAULT_CONFIGURATION = DefaultClaudeConfiguration()
-
 
 WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
 # The session registry has no notification interface; callers may choose its retry interval.
@@ -54,18 +47,18 @@ def running(slug: str) -> bool:
     return bool(showrunners.current_address(slug))
 
 
-def claude_json(config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> Path:
+def claude_json(config_dir: Path) -> Path:
     """The configuration of the account this launch will use."""
-    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or (config_dir / ".claude.json" if isinstance(config_dir, Path) and config_dir != Path.home() / ".claude" else Path.home() / ".claude.json"))
+    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or config_dir / ".claude.json")
 
 
-def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> str:
+def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path) -> str:
     """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
 
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import NamedAccount, account_dir, home_account_label, main_config_dir, trust_command
+    from scripts.accounts.accounts import NamedAccount, account_dir, trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     if not caller:
@@ -87,15 +80,11 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if child.slug != ending and tmux_live(tmux, child.slug):
         raise Refusal(f"a tmux session named {child.slug} is already live")
     folder = start_in or child.checkout
-    if isinstance(config_dir, Path) and config_dir != main_config_dir():
-        label = str(config_dir)
-        numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
-        if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
-            label = f"claude{numbered.group(1)}"
-        selected = NamedAccount(label, config_dir)
-    else:
-        label = home_account_label("claude")
-        selected = NamedAccount(label, main_config_dir())
+    label = str(config_dir)
+    numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
+    if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
+        label = f"claude{numbered.group(1)}"
+    selected = NamedAccount(label, config_dir)
     trust = claude_trust(folder, claude_json(config_dir))
     if isinstance(trust, UnreadableTrustFile):
         raise Refusal(f"{child.slug}: {trust}")

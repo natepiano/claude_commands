@@ -902,9 +902,14 @@ def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
     return AccountLabel(identity.label) if isinstance(identity, agent_accounts.KnownCodexAccount) else AccountUnread(identity.reason)
 
 
-def _process_account(pid: int, kind: str) -> AccountLabel | AccountUnread:
+_HOME_ACCOUNT_UNCHECKED = account.HomeAccountUnchecked()
+
+
+def _process_account(pid: int, kind: str, *,
+                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED,
+                     ) -> AccountLabel | AccountUnread:
     if kind == "claude":
-        identity = account.account_of(pid)
+        identity = account.account_of(pid, home_state=home_state)
         return AccountLabel(identity.label) if identity is not None else AccountUnread("process account could not be read")
     home = account.process_codex_home(pid)
     if isinstance(home, account.ProcessEnvironmentUnread):
@@ -966,7 +971,8 @@ def _claude_entries(
     machine: str, records: list[SessionRecord], details: Mapping[str, _ClaudeDetails],
     runner_ids: Mapping[str, showrunners.Showrunner],
     production_places: Mapping[str, _ProductionPlace], runs: list[_LiveRun],
-    workers: Mapping[str, _WorkerPlace],
+    workers: Mapping[str, _WorkerPlace], *,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> dict[str, RosterEntry]:
     marker_directors = {
         run.director.session_id
@@ -1033,7 +1039,7 @@ def _claude_entries(
             director=director,
             assignment=assignment,
             session=ClaudeSession(session_id),
-            account=_process_account(record["pid"], "claude"),
+            account=_process_account(record["pid"], "claude", home_state=home_state),
         )
     return entries
 
@@ -1087,7 +1093,8 @@ def _reviewer_cwd(process: _ReviewerProcess, fallback: str) -> str:
 
 def _review_workers(
     machine: str, run: _LiveRun, place: _RunPlace,
-    table: Mapping[int, process_table.Process], problems: list[str],
+    table: Mapping[int, process_table.Process], problems: list[str], *,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
@@ -1131,7 +1138,7 @@ def _review_workers(
             showrunner=place.showrunner,
             director=place.director,
             assignment=WorkerAssignment(slot_role, str(run.path)),
-            account=_process_account(process.pid, process.kind),
+            account=_process_account(process.pid, process.kind, home_state=home_state),
         ))
     return entries
 
@@ -1139,7 +1146,7 @@ def _review_workers(
 def _delegate_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
-    problems: list[str],
+    problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
         table = process_table.snapshot()
@@ -1183,7 +1190,7 @@ def _delegate_workers(
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))
-        entries.extend(_review_workers(machine, run, place, table, problems))
+        entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
     return entries, worker_threads
 
 
@@ -1230,6 +1237,7 @@ def machine_name() -> str:
 
 
 def _local_roster(environment: Mapping[str, str]) -> Roster:
+    home_state = account.home_account_state()
     problems: list[str] = []
     machine = machine_name()
     records = _newest_sessions()
@@ -1243,10 +1251,10 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
         records, details, registered, runner_ids, set(workers), problems
     )
     claude = _claude_entries(
-        machine, records, details, runner_ids, production_places, runs, workers
+        machine, records, details, runner_ids, production_places, runs, workers, home_state=home_state
     )
     delegate_workers, worker_threads = _delegate_workers(
-        machine, runs, claude, production_places, problems
+        machine, runs, claude, production_places, problems, home_state=home_state
     )
     daemon_socket = codex_daemon.daemon_socket(environment)
     daemon = codex_daemon.loaded_sessions(daemon_socket)

@@ -34,7 +34,6 @@ from account import (  # noqa: E402
     named_account_environment,
     named_claude_account,
     own_claude_account,
-    NAMED_ACCOUNT_VARIABLES,
 )
 import add_unit  # noqa: E402
 import herdr  # noqa: E402
@@ -523,12 +522,16 @@ class ResumeParts:
     account: RetainResumeAccount | MoveResumeAccount
 
 
-def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumeParts:
-    default_dir = Path.home() / ".claude"
-    config_dir = Path(session.get("config_dir", str(default_dir)))
-    if session["kind"] in ("unit", "showrunner"):
-        from scripts.accounts import accounts
+def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "") -> ResumeParts:
+    from scripts.accounts import accounts
 
+    config_dir = Path(session.get("config_dir", str(accounts.main_config_dir()))).expanduser()
+    if not target and config_dir == accounts.main_config_dir() and session["kind"] not in ("unit", "showrunner"):
+        resolved = accounts.resolve_history_label("~/.claude", at, login=login)
+        if not isinstance(resolved, accounts.ResolvedHistoryLabel):
+            raise accounts.AccountsError("home account unresolved in shutdown record")
+        config_dir = accounts.claude_account_dir(resolved.label)
+    if session["kind"] in ("unit", "showrunner"):
         role = "unit" if session["kind"] == "unit" else "showrunner"
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
         selected_dir = selected.dir
@@ -539,13 +542,14 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
             target = selected.label
         else:
             config_dir = selected_dir
+    if not target:
+        number = re.fullmatch(r"\.claude([1-9][0-9]*)", config_dir.name)
+        if number is None or config_dir != accounts.account_dir("claude" + number.group(1)):
+            raise accounts.AccountsError("shutdown record must name a numbered Claude account folder")
     account: RetainResumeAccount | MoveResumeAccount = (
         MoveResumeAccount(target) if target else RetainResumeAccount(config_dir)
     )
-    environment = (
-        named_account_environment(config_dir)
-        if config_dir != default_dir and not target else {}
-    )
+    environment = named_account_environment(config_dir) if not target else {}
     environment["ENABLE_TOOL_SEARCH"] = "true"
     argv = [
         "--resume",
@@ -588,8 +592,6 @@ def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest
             raise accounts.AccountsError(prepared.reason)
         environment.update(prepared.variables)
         unset.update(prepared.remove)
-    elif parts.account.config_dir == Path.home() / ".claude":
-        unset.update(NAMED_ACCOUNT_VARIABLES)
     return relaunch.RelaunchRequest(
         argv=["claude", *parts.claude_arguments, parts.opening_prompt],
         cwd=parts.cwd,
@@ -600,8 +602,8 @@ def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest
     )
 
 
-def _resume_command(session: Session, prompt: str, target: str = "") -> str:
-    return _resume_shell(_resume_parts(session, prompt, target))
+def _resume_command(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "") -> str:
+    return _resume_shell(_resume_parts(session, prompt, target, login=login, at=at))
 
 
 def account_move_note(session: Session, target: str, source_label: str, why: str = "") -> str:
@@ -1033,15 +1035,13 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
-        from scripts.accounts.accounts import NamedAccount, home_account_label, trust_command
+        from scripts.accounts.accounts import NamedAccount, trust_command
 
         config_dir = parts.account.config_dir
-        claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
-                       else config_dir / ".claude.json")
+        claude_json = config_dir / ".claude.json"
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
         if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            account = NamedAccount(home_account_label("claude") if config_dir == Path.home() / ".claude"
-                                   else str(config_dir), config_dir)
+            account = NamedAccount(config_dir.name.removeprefix("."), config_dir)
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
@@ -1066,6 +1066,13 @@ def _launch_session(
     dry_run: bool,
 ) -> SessionLaunched | ManualRestartRequired:
     """Launch an entry or return its explicit manual-restart requirement."""
+    from scripts.accounts import accounts
+
+    if "target" in record:
+        resolved = accounts.resolve_history_label(record["target"], record["requested_at"])
+        if not isinstance(resolved, accounts.ResolvedHistoryLabel):
+            raise accounts.AccountsError("home account unresolved in shutdown record")
+        record = {**record, "target": resolved.label}
     session = record["session"]
     host = session["host"]
     if session["kind"] == "unit":
@@ -1086,7 +1093,7 @@ def _launch_session(
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
     if session["kind"] == "showrunner" and "target" in record:
         prompt += " " + note
-    parts = _resume_parts(session, prompt, record.get("target", ""))
+    parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"], at=record["requested_at"])
     if host["kind"] == "herdr":
         if session["kind"] == "showrunner" and isinstance(parts.account, MoveResumeAccount):
             return ManualRestartRequired(_resume_command(
@@ -1135,8 +1142,6 @@ def _launch_session(
         case "tmux":
             retained_session = _tmux_launch(command, session, dry_run=dry_run)
             if "target" in record:
-                from scripts.accounts import accounts
-
                 directory = accounts.claude_account_dir(record["target"])
                 _ = _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), "set-option", "-t",
                           retained_session, "@claude_config_dir", str(directory)], dry_run=dry_run)
@@ -1296,11 +1301,20 @@ class LiveObservationUnavailable:
 
 
 def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecordedConfigDir:
+    from scripts.accounts import accounts
+
     target_label = record.get("target", "")
     if not target_label:
         session = record["session"]
-        return RecordedConfigDir(Path(session["config_dir"])) if "config_dir" in session else NoRecordedConfigDir()
-    from scripts.accounts import accounts
+        directory = Path(session.get("config_dir", str(accounts.main_config_dir()))).expanduser()
+        if directory != accounts.main_config_dir():
+            return RecordedConfigDir(directory)
+        target_label = "~/.claude"
+    resolved = accounts.resolve_history_label(target_label, record["requested_at"],
+                                             login=record["login"] if not record.get("target") else "")
+    if not isinstance(resolved, accounts.ResolvedHistoryLabel):
+        return NoRecordedConfigDir()
+    target_label = resolved.label
     return RecordedConfigDir(accounts.claude_account_dir(target_label))
 
 
@@ -1309,8 +1323,12 @@ def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObserva
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
     if live is None:
         return LiveObservationUnavailable("not live")
-    directory = account.process_config_dir(live["pid"])
-    return ObservedConfigDir(directory) if directory is not None else LiveObservationUnavailable("environment unreadable")
+    setting = account.process_account_directory(account.process_config_dir(live["pid"]))
+    match setting:
+        case account.ConfiguredClaudeFolder(path):
+            return ObservedConfigDir(path)
+        case account.NoAccountSetting() | account.ProcessEnvironmentUnread():
+            return LiveObservationUnavailable("environment unreadable")
 
 
 def _confirm_move(record: SessionShutdown) -> None:

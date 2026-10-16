@@ -31,9 +31,8 @@ anything.
     error's class name, never the file's contents.
 - `trust_command(folder, account: ClaudeLaunchAccount) -> str` is the line the
   user runs, accepts the prompt in, then leaves with `/exit`:
-  `cd <folder> && <account prefix> claude`. The default account's prefix is
-  `env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR`, so an inherited
-  account directory never redirects it; a named account uses `account_prefix`.
+  `cd <folder> && <account prefix> claude`. Every account uses `account_prefix`
+  with its numbered `CLAUDE_CONFIG_DIR` and the shared memory directory.
 - Callers, each refusing with
   `<unit | child slug | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`
   or `<prefix>: <UnreadableTrustFile text>`:
@@ -45,10 +44,10 @@ anything.
     `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` overrides the account
     file in tests.
   - `scripts/nightly_review/nightly_review.py`, on the account its spawn uses.
-- Launchers pick their account by room; each check reads that account's file:
-  `~/.claude.json` for the default account, `<CLAUDE_CONFIG_DIR>/.claude.json`
-  for a named one.
-- `scripts/herdr/trust_survey.py` is a read-only survey. Per account file
+- Launchers use the configured group account; each trust check reads
+  `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder.
+  `~/.claude.json` remains the seed and MCP baseline.
+- `scripts/herdr/trust_survey.py` is a read-only survey. For the seed and each account file
   (`~/.claude.json` and every `~/.claude[0-9]/.claude.json`) it prints
   `<account> <key> <accepted> <kind>`, the kind being main checkout, worktree
   of `<main>`, plain folder, or ancestor of `<n>` repositories, nested
@@ -79,9 +78,8 @@ anything.
 - An absent key alone does not show that a folder launched without a prompt;
   that needs runtime evidence such as a Claude project directory. The one
   uncovered worktree in the survey had none, so it never ran.
-- When `nightly_review.py` picks the default account but inherits
-  `CLAUDE_CONFIG_DIR`, it checks trust on the inherited directory, the one the
-  spawned session reads.
+- Nightly review launches through `add_unit.py` on the configured units
+  account, whose numbered directory supplies its trust file.
 
 ### Ruled out
 

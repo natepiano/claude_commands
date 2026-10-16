@@ -1062,7 +1062,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:** folders open without following links, so a `~/.claudeN` swapped for a link after discovery is never scanned.
 
-### Phase 31 — ~/.claude is a config home, not an account  · status: todo
+### Phase 31 — ~/.claude is a config home, not an account  · status: done
 
 **Depends on:** Phase 30
 

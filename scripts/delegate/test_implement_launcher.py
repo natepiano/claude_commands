@@ -21,7 +21,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, override
+from unittest.mock import patch
 
+from scripts.accounts import accounts
 from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
 from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
@@ -168,6 +170,10 @@ import sys
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
     (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
+    (root / 'launch_environment.json').write_text(json.dumps({
+        key: os.environ.get(key, '')
+        for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_REMOTE_MEMORY_DIR')
+    }))
     (root / 'worker_state').write_text('busy')
     own_summary = root / 'own_summary.bin'
     if own_summary.exists():
@@ -285,6 +291,12 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         registry = self.root / ".claude" / "config" / "agents.conf"
         registry.parent.mkdir(parents=True)
         _ = registry.write_text(AGENTS_REGISTRY, encoding="utf-8")
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
+        _ = (self.root / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "worker@example.invalid"},
+        }))
         self.prompt_file = self.root / "implementation_prompt.md"
         _ = self.prompt_file.write_text("Write the retry path.\n", encoding="utf-8")
         self.implement_script = self.build_script_tree()
@@ -317,7 +329,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
+        for name in ("agents_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
@@ -337,6 +349,13 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["HOME"] = str(self.root)
+        environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
+        # The copied shell helper uses the real account policy, while identity
+        # and configuration stay in this fixture's home.
+        environment["PYTHONPATH"] = str(DELEGATE_DIR.resolve().parents[1])
+        for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+                     "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
+            _ = environment.pop(name, None)
         environment["XDG_CACHE_HOME"] = str(self.root / "cache")
         cache = self.root / "cache" / "claude" / "python3-3.10"
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -718,6 +737,29 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 self.assertIn(
                     "abc12345\t", (session_dir / "workers").read_text(encoding="utf-8")
                 )
+
+    def test_copied_claude_launcher_keeps_legacy_home_then_uses_showrunners_after_cutover(self) -> None:
+        with patch.dict(os.environ, self.environment(), clear=True):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "worker@example.invalid"},
+            }))
+            groups = accounts.groups_file()
+            groups.parent.mkdir(parents=True, exist_ok=True)
+            _ = groups.write_text(json.dumps({"showrunners": "claude2"}))
+        for cutover in (False, True):
+            with self.subTest(cutover=cutover):
+                if cutover:
+                    _ = (self.root / ".claude.json").write_text("{}")
+                session_dir = self.start_phase(f"copied-account-{cutover}")
+
+                result = self.claude_launch(session_dir, "sonnet:low")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads((self.root / "launch_environment.json").read_text()), {
+                    "CLAUDE_CONFIG_DIR": str(self.root / ".claude2") if cutover else "",
+                    "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / ".claude") if cutover else "",
+                })
 
     def test_claude_pane_fallback_strips_controls_before_character_cut(self) -> None:
         session_dir = self.start_phase("pane-cleanup")

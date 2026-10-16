@@ -591,7 +591,7 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
-    from scripts.accounts.accounts import main_config_dir, trust_command
+    from scripts.accounts.accounts import trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     production = request.production
@@ -623,7 +623,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         timeout=request.timeout,
     )
     account = selected
-    account_file = Path.home() / ".claude.json" if account.dir == main_config_dir() else account.dir / ".claude.json"
+    account_file = account.dir / ".claude.json"
     folder = request.session_cwd
     check_folder = (repository_trust_key(production.checkout)
                     if isinstance(request.session, NewSession) and not folder.exists() else folder)
@@ -949,7 +949,7 @@ class AlreadyAdopted:
 
 def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAdopted:
     from scripts.accounts import accounts
-    from scripts.whoami.account import process_config_dir
+    from scripts.whoami import account as account_reader
     from scripts.whoami.agent_accounts import NumberedAccount
 
     found = launched_unit(request)
@@ -965,9 +965,10 @@ def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAd
     if not isinstance(claude, unit_lookup.LiveClaude):
         reason = claude.reason if isinstance(claude, unit_lookup.ClaudeUnknown) else "no Claude runs in it"
         raise Refusal(f"tmux session {label} cannot be adopted: {reason}")
-    directory = process_config_dir(claude.pid)
-    if directory is None:
+    setting = account_reader.process_account_directory(account_reader.process_config_dir(claude.pid))
+    if not isinstance(setting, account_reader.ConfiguredClaudeFolder):
         raise Refusal(f"tmux session {label} cannot be adopted: the account of pid {claude.pid} is unreadable")
+    directory = setting.path
     if directory.resolve() == accounts.main_config_dir().resolve():
         identity = accounts.account_identity(directory)
         if not isinstance(identity, NumberedAccount):
@@ -1028,12 +1029,11 @@ def main(argv: list[str]) -> int:
             return 0
         unit_account = (adopted.account if adopted is not None
                         else account_for_launch(request, cast(str, args.account), cast(str, args.config_dir)))
-        if unit_account.dir != accounts.main_config_dir():
-            problems = accounts.check(unit_account.label)
-            if problems:
-                raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
-                )
+        problems = accounts.check(unit_account.label)
+        if problems:
+            raise Refusal(
+                f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
+            )
         resume_model = model_for_resume(request, cast(str, args.model))
         # Imported only on the launch path: table readers import add_unit from
         # copied trees that do not include scripts/shutdown.
@@ -1055,8 +1055,7 @@ def main(argv: list[str]) -> int:
                 else launch_permission.NewWorkLaunchPurpose()
             )
             permission_environment = launch_environment()
-            if unit_account.dir != accounts.main_config_dir():
-                permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
+            permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
             permission = launch_permission.launch_permission(
                 permission_environment, purpose
             )

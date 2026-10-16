@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
     ("shutdown/restart.py", "_resume_parts"): "ungrouped resumes retain their recorded directory; groups use the resolver",
-    ("message/send.py", "relay"): "the headless message relay uses its own login",
+    ("message/send.py", "relay"): "the relay retains the caller account or uses the showrunners resolver",
     ("notify/review.py", "reviewer_environment"): "the headless reviewer uses the units account through role_account",
 }
 SELECTORS = frozenset({"pick", "placement", "role_account", "group_label"})
@@ -70,7 +70,7 @@ def launch_account_violations(source: str, path: str) -> list[str]:
             break
         connected = expanded
     resolver_helpers = {name for name, nodes in calls.items()
-                        if any(called(node) == "account_for_group_launch" for node in nodes)}
+                        if any(called(node) in {"account_for_group_launch", "account_for_unscoped_launch"} for node in nodes)}
     while True:
         expanded = resolver_helpers | {name for name, nodes in calls.items()
                                        if any(called(node) in resolver_helpers for node in nodes)}
@@ -100,7 +100,7 @@ def launch_account_violations(source: str, path: str) -> list[str]:
             for assignment in assignments:
                 value = assignment.value
                 assert value is not None
-                selected = any(isinstance(node, ast.Call) and called(node) in {"account_for_group_launch", *resolver_helpers}
+                selected = any(isinstance(node, ast.Call) and called(node) in {"account_for_group_launch", "account_for_unscoped_launch", *resolver_helpers}
                                for node in ast.walk(value))
                 retained = bool(names(value) & trusted)
                 if selected or retained:
@@ -137,15 +137,26 @@ def launch_account_violations(source: str, path: str) -> list[str]:
 
 def shell_launch_account_violations(source: str, path: str) -> list[str]:
     active = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
-    if not re.search(r"\bclaude(?:\s|$)", active):
+    if not re.search(r"\bclaude(?:\s|$)|CLAUDE_BIN", active):
         return []
     problems: list[str] = []
+    launches = re.search(
+        r'(?m)^\s*(?:(?:exec|command|open_window)\s+)?claude(?=\s|$)(?!\s*=)'
+        + r'|\bcommand=\(claude\b|"\$\{CLAUDE_BIN\}" "\$\{launch_args', active)
+    shared_environment = (re.search(r'^\s*claude_launch_environment\s', active, re.M)
+                          and 'claude_account.sh"' in active)
+    if launches and not shared_environment and "CLAUDE_CONFIG_DIR=" not in active:
+        problems.append(f"{path}: Claude launch has no resolved account environment")
+    resolved_lines = {source[:match.start()].count("\n") + 1
+                      for match in re.finditer(r'(?ms)^[ \t]*CLAUDE_CONFIG_DIR="\$\((.*?)^[ \t]*\)"', source)
+                      if "account_for_unscoped_launch(" in match.group(1)}
     for number, line in enumerate(source.splitlines(), 1):
         if line.lstrip().startswith("#"):
             continue
         if re.search(r"accounts(?:\.py)?\s+(?:pick|placement|role)\b", line):
             problems.append(f"{path}:{number}: shell launcher selects its own account")
-        if re.search(r"\bCLAUDE_CONFIG_DIR=", line) and not re.search(r"resolver|record|account_for_group_launch", line):
+        if (re.search(r"\bCLAUDE_CONFIG_DIR=", line) and number not in resolved_lines
+                and not re.search(r"resolver|record|account_for_group_launch", line)):
             problems.append(f"{path}:{number}: shell launcher sets an account without a resolved account or record")
     return problems
 
@@ -234,6 +245,23 @@ def _resume_parts(session: Session, prompt: str):
                 continue
             violations.extend(launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
         self.assertEqual(violations, [], "\n".join(violations))
+
+    def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
+        for path, source in (
+                ("fix/style-eval-review-all.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
+                ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
+                 + 'open_window claude -n "$session_name" /berth_fix'),
+                ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):
+            with self.subTest(path=path):
+                self.assertTrue(any("no resolved account" in problem
+                                    for problem in shell_launch_account_violations(source, path)))
+
+    def test_embedded_python_binary_lookup_does_not_count_as_a_shell_launch(self) -> None:
+        source = '''\
+claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
+subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
+'''
+        self.assertEqual(shell_launch_account_violations(source, "delegate/implement.sh"), [])
 
     def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:
         for arguments in ("--print prompt", "-p prompt", "prompt", ""):

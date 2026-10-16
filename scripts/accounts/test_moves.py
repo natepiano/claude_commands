@@ -141,6 +141,29 @@ class MoveJournalTests(unittest.TestCase):
         self.assertNotIn("default", rendered)
         self.assertEqual(path.read_bytes(), original)
 
+    def test_historical_source_uses_matching_shutdown_login_not_later_cutover(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        notes = self.home / "rust/hanadocs/agents"
+        notes.mkdir(parents=True)
+        _ = (notes / "claude2.md").write_text("---\nlogin: source@example.invalid\n---\n")
+        _ = (notes / "claude3.md").write_text("---\nlogin: later@example.invalid\n---\n")
+        configuration = self.home / ".claude/config/accounts.json"
+        configuration.parent.mkdir(parents=True)
+        _ = configuration.write_text(json.dumps({"home_cutovers": [{"at": "2026-10-14T00:00:00Z",
+            "label": "claude3", "login": "later@example.invalid"}]}))
+        record = self.home / ".local/state/shutdown/session.json"
+        record.parent.mkdir(parents=True)
+        _ = record.write_text(json.dumps({"request_id": "attempt", "login": "source@example.invalid",
+            "source_label": "default", "session": {"config_dir": str(self.home / ".claude")}, "target": "default"}))
+        original = json.dumps({**self.common(tool="claude"), "request_id": "attempt", "kind": "requested",
+            "from": "default", "to": "default", "window": "unknown", "why": "fixture"}) + "\n"
+        _ = path.write_text(original)
+        loaded = moves.read_moves()
+        self.assertEqual(loaded[0].get("from"), "claude2")
+        self.assertEqual(loaded[0].get("to"), "claude3")
+        self.assertEqual(path.read_text(), original)
+
     def test_superseded_home_role_evidence_leaves_later_legacy_moves_unresolved(self) -> None:
         path = moves.store_file()
         path.parent.mkdir(parents=True, exist_ok=True)

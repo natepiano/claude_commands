@@ -999,9 +999,11 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path) -> li
     """Live Claude directories and every Codex home, fetched concurrently."""
     homes = codex_homes(workers_home)
     directories = list(dict.fromkeys([
-        Path.home() / ".claude", *(named.directory for named in selection.named_accounts),
+        *(named.directory for named in selection.named_accounts),
         *selection.live_directories,
     ]))
+    if claude_on_disk(Path.home() / ".claude").email and Path.home() / ".claude" not in directories:
+        directories.append(Path.home() / ".claude")
     return list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
         *(codex_live(home) for home in homes),

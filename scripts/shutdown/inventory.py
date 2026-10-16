@@ -232,7 +232,7 @@ class SessionFields(TypedDict):
     proc_start: str
     name: str
     cwd: str
-    # Records from before account-directory capture use the default directory.
+    # Legacy absence requires the shutdown record's login or dated cutover evidence on resume.
     config_dir: NotRequired[str]
     status: str
     updated_at: int
@@ -878,14 +878,18 @@ class UnreadableSessionConfiguration:
 
 
 def _configuration_for_session(
-    pid: int,
+    pid: int, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> AttributedSessionConfiguration | UnreadableSessionConfiguration:
     """Keep account lookup at one boundary so an unreadable process stays unattributed."""
     try:
-        config_dir = account.process_config_dir(pid)
-        if config_dir is None:
+        setting = account.process_account_directory(account.process_config_dir(pid), home_state=home_state)
+        if not isinstance(setting, account.ConfiguredClaudeFolder):
             return UnreadableSessionConfiguration()
-        attributed = account.claude_account(config_dir)
+        config_dir = setting.path
+        if config_dir == Path.home() / ".claude":
+            attributed = home_state.account if isinstance(home_state, account.LegacyHomeLogin) else None
+        else:
+            attributed = account.claude_account(config_dir)
         if attributed is None:
             return UnreadableSessionConfiguration()
         return AttributedSessionConfiguration(attributed, config_dir)
@@ -1484,12 +1488,13 @@ def _listed_session(
     record: SessionFile,
     productions: dict[str, ProductionSession],
     units: dict[str, UnitMarks],
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> ListedSession | UnattributedSession:
     pid = record.get("pid", 0)
     name = _string(record.get("name"))
     if not _record_matches_process(record):
         return {"pid": pid, "name": name, "reason": "process start mismatch"}
-    attributed = _configuration_for_session(pid)
+    attributed = _configuration_for_session(pid, home_state)
     if isinstance(attributed, UnreadableSessionConfiguration):
         return {"pid": pid, "name": name, "reason": "account unreadable"}
     session_id = _string(record.get("sessionId"))
@@ -1520,12 +1525,13 @@ def _listed_session(
 def listing(login: str | None = None, *,
             registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[ListedSession]:
     """List membership without inspecting transcripts, worktrees or host resources."""
+    home_state = account.home_account_state()
     timers = showrunner_registrations() if isinstance(registrations, str) else registrations
     productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
     units = _unit_sessions(timers.entries)
     found: list[ListedSession] = []
     for record in sessions.live_sessions():
-        entry = _listed_session(_session_file(record), productions, units)
+        entry = _listed_session(_session_file(record), productions, units, home_state)
         if isinstance(entry, ListedSession) and (
             login is None or entry.login.casefold() == login.casefold()
         ):
@@ -1539,6 +1545,7 @@ def inventory(
     *, refresh_desktops: bool = True,
 ) -> Inventory:
     """Return account sessions in ``only`` and their workers, or all when empty."""
+    home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
     timers = showrunner_registrations()
     productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
@@ -1553,7 +1560,7 @@ def inventory(
     worker_owners = _worker_owners(run_directories, session_ids)
     wanted_login = login.casefold()
     candidates = [
-        (record, _listed_session(record, productions, units))
+        (record, _listed_session(record, productions, units, home_state))
         for record in records
         if not only or _string(record.get("sessionId")) in only
         or worker_owners.get(_string(record.get("sessionId"))) in only

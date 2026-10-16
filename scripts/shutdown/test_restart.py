@@ -118,6 +118,7 @@ def common_session(
 ) -> inventory.SessionFields:
     return {
         "session_id": session_id,
+        "config_dir": str(Path.home() / ".claude2"),
         "pid": 1000 + len(session_id),
         "proc_start": f"start-{session_id}",
         "name": name or session_id,
@@ -307,6 +308,8 @@ class RestartTests(ShutdownTestCase):
         _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
         self.assertEqual(accounts.setup("claude3"), [])
         _ = (self.root / ".claude3/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "third@example.invalid"}}))
+        self.assertEqual(accounts.setup("claude2"), [])
+        _ = (self.root / ".claude2/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
         self.configure_groups()
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
@@ -337,7 +340,7 @@ class RestartTests(ShutdownTestCase):
         live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
             name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         with (patch.object(sessions, "live_sessions", return_value=[live]),
-              patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude2"),
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
               patch.object(account_reader, "account_of", return_value=Account("claude", LOGIN, LABEL)),
               patch.object(settle, "run_notifier") as timers):
             restart.confirm_entry(saved, RESTARTED, True)
@@ -365,7 +368,7 @@ class RestartTests(ShutdownTestCase):
                 directory = (None if observation == "environment unreadable" else
                              self.root / (".claude3" if observation == "target" else ".claude2"))
                 with (patch.object(sessions, "live_sessions", return_value=live),
-                      patch.object(account_reader, "process_config_dir", return_value=directory)):
+                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(directory) if directory is not None else account_reader.ProcessEnvironmentUnread("unreadable"))):
                     result = restart._prove_move(saved)  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(result, observation == "target")
                 entries = [entry for entry in moves.read_moves() if entry["move_id"] == saved["move_id"]]
@@ -390,7 +393,7 @@ class RestartTests(ShutdownTestCase):
                     sessionId=owner["session_id"], name=owner["name"], messagingSocketPath="",
                     updatedAt=1, tmux="", formerNames=[])]
                 with (patch.object(sessions, "live_sessions", return_value=live),
-                      patch.object(account_reader, "process_config_dir", return_value=None)):
+                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ProcessEnvironmentUnread("unreadable"))):
                     checked = restart.clear_running_on_target([saved])
                 self.assertEqual((checked.remaining, checked.finished), ([saved], []))
                 self.assertEqual(record.find_session(LOGIN, owner["session_id"]), saved)
@@ -427,7 +430,7 @@ class RestartTests(ShutdownTestCase):
         live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
             name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         with (patch.object(sessions, "live_sessions", return_value=[live]),
-              patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude3"),
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude3")),
               patch.object(account_reader, "account_of", return_value=Account("claude", "target@example.com", "claude3")),
               patch.object(settle, "run_notifier", side_effect=RuntimeError("timer unavailable"))):
             restart.confirm_entry(saved, RESTARTED, True)
@@ -457,7 +460,7 @@ class RestartTests(ShutdownTestCase):
 
     def running_on(self, saved: SessionShutdown, directory: Path) -> list[sessions.SessionRecord]:
         owner = saved["session"]
-        _ = self.enterContext(patch.object(account_reader, "process_config_dir", return_value=directory))
+        _ = self.enterContext(patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(directory)))
         return [sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
             name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])]
 
@@ -525,7 +528,27 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(push.id, "shutdown.restart_failed")
         self.assertEqual(push.values["stopped"], "One session")
 
+    def home_cutover_evidence(self) -> None:
+        configuration = accounts.accounts_config_file()
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text(json.dumps({"home_cutovers": [{
+            "label": "claude2", "login": LOGIN, "at": RESTARTED}]}))
+
+    def test_home_move_launch_and_confirmation_use_destination_history_not_source_login(self) -> None:
+        self.home_cutover_evidence()
+        _ = (self.root / "notes/claude1.md").write_text("---\nlogin: source@example.invalid\n---\n")
+        saved = entry(top_level("old-target", host=tmux_host("old-target")))
+        saved.update(login="source@example.invalid", label="claude1", target="~/.claude")
+        recorder = CommandRecorder()
+        with patch.object(restart, "_run", recorder):
+            result = restart._launch_session(saved, "continue", self.desktop_state, dry_run=True)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        commands = [argv[-1] for argv in recorder.calls if "-ic" in argv]
+        self.assertTrue(any("accounts.py exec claude2" in command for command in commands), commands)
+        self.assertEqual(restart._target_config_dir(saved), restart.RecordedConfigDir(self.root / ".claude2"))  # pyright: ignore[reportPrivateUsage]
+
     def test_legacy_default_record_restarts_on_the_numbered_home_without_rewriting_it_on_read(self) -> None:
+        self.home_cutover_evidence()
         saved = entry(top_level("legacy-home-move", host=tmux_host("legacy-home-move")))
         saved["target"] = "claude2"
         self.create([saved])
@@ -556,6 +579,7 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(parts.account, restart.MoveResumeAccount("claude2"))
 
     def test_default_target_process_confirms_main_directory_and_removes_assumption(self) -> None:
+        self.home_cutover_evidence()
         saved = entry(top_level("default-target", host=tmux_host("default-target")))
         saved["target"] = "default"
         self.create([saved])
@@ -565,14 +589,14 @@ class RestartTests(ShutdownTestCase):
         live = sessions.SessionRecord(pid=23456, sessionId="default-target", name="default-target",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         with (patch.object(sessions, "live_sessions", return_value=[live]),
-              patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude")):
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2"))):
             restart.confirm_entry(saved, RESTARTED, True)
         self.assertFalse(assumed.exists())
         entries = moves.read_moves()
         self.assertEqual([item["kind"] for item in entries], ["confirmed"])
         confirmed = entries[0]
         assert confirmed["kind"] == "confirmed" and "config_dir" in confirmed
-        self.assertEqual(confirmed["config_dir"], str(self.root / ".claude"))
+        self.assertEqual(confirmed["config_dir"], str(self.root / ".claude2"))
 
     def test_manual_move_restart_records_failure_instead_of_confirmation(self) -> None:
         saved = entry(top_level("manual-owner"))
@@ -642,7 +666,7 @@ class RestartTests(ShutdownTestCase):
         self.assert_move_resume(launch[-1], owner)
 
     def test_tmux_account_move_updates_retained_directory_for_named_and_default_targets(self) -> None:
-        for target, directory in (("claude3", self.root / ".claude3"), ("claude2", self.root / ".claude")):
+        for target, directory in (("claude3", self.root / ".claude3"), ("claude2", self.root / ".claude2")):
             with self.subTest(target=target):
                 owner = showrunner("moved-showrunner", host=recorded_tmux_host("kept", "%move", 420))
                 owner["config_dir"] = str(self.root / ".claude1")
@@ -880,7 +904,7 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(commands.calls[-1], ["kdotool", "set_desktop", "2"])
                 self.assertFalse((self.state_root / "relaunch/902.json").exists())
 
-    def test_supervised_default_account_request_removes_inherited_named_account(self) -> None:
+    def test_supervised_claude2_request_replaces_the_inherited_account(self) -> None:
         owner = top_level("default-supervisor", host=inventory.WindowHost(kind="ghostty", window_shell=901,
             desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
             supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
@@ -892,11 +916,11 @@ class RestartTests(ShutdownTestCase):
             _ = restart._launch_session(entry(owner), "resume default", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         request = cast(dict[str, object], json.loads((self.state_root / "relaunch/902.json").read_text()))
         environment = cast(dict[str, str], request["environment"])
-        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
         unset = cast(list[str], request["unset"])
-        self.assertIn("CLAUDE_CONFIG_DIR", unset)
-        self.assertIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", unset)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", unset)
+        self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", unset)
         self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", unset)
 
     def test_supervised_restart_preview_creates_no_request_or_window(self) -> None:
@@ -988,10 +1012,10 @@ class RestartTests(ShutdownTestCase):
     def herdr_restart_fixture(self) -> tuple[inventory.TopLevelSession, Path, Path]:
         cwd = self.root / "trusted folder"
         cwd.mkdir()
-        config = self.root / "account dir"
-        config.mkdir()
+        config = self.root / ".claude3"
         _ = (config / ".claude.json").write_text(json.dumps({
             "projects": {str(cwd): {"hasTrustDialogAccepted": True}},
+            "oauthAccount": {"emailAddress": "third@example.invalid"},
         }), encoding="utf-8")
         self.assertIsInstance(herdr.claude_trust(cwd, config / ".claude.json"), herdr.Trusted)
         owner = top_level("resume-id", name="kept name", cwd=str(cwd),
@@ -1175,17 +1199,16 @@ class RestartTests(ShutdownTestCase):
         self.assertNotIn("do not disclose", str(refused.exception))
         self.assertFalse(log.exists())
 
-    def test_herdr_restart_default_account_trust_refusals_clear_named_account_variables(self) -> None:
+    def test_herdr_legacy_home_restart_checks_its_resolved_numbered_trust_file(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
         owner["config_dir"] = str(self.root / ".claude")
         for content, trust_type in (("{\"projects\": {}}", herdr.Untrusted), ("{", herdr.UnreadableTrustFile)):
             with self.subTest(trust_type=trust_type):
-                _ = (self.root / ".claude.json").write_text(content)
-                self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), self.root / ".claude.json"), trust_type)
+                _ = (self.root / ".claude2/.claude.json").write_text(content)
+                self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), self.root / ".claude2/.claude.json"), trust_type)
                 with self.assertRaises(OSError) as refused:
                     _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-                command = (f"cd {shlex.quote(owner['cwd'])} && env -u CLAUDE_CONFIG_DIR "
-                           "-u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
+                command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(self.root / '.claude2'))}claude"
                 self.assertIn(f"Run: {command}", str(refused.exception))
                 self.assertFalse(log.exists())
 
@@ -1215,7 +1238,7 @@ class RestartTests(ShutdownTestCase):
                             owner = unit("parser-review", session_host="herdr", session_name="writing")
                             owner["name"] = "Parser Review"
                             owner["cwd"] = template["cwd"]
-                            directory = accounts.main_config_dir() if label == "claude2" else accounts.account_dir(label)
+                            directory = accounts.account_dir(label)
                             old_directory = accounts.account_dir("claude1")
                             owner["config_dir"] = str(directory if already_on_group else old_directory)
                             saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
@@ -1670,8 +1693,8 @@ class RestartTests(ShutdownTestCase):
         self.assertIn('cannot restart', output.getvalue())
         self.assertNotIn('add_unit.py', output.getvalue())
 
-    def test_dry_run_preserves_ad_hoc_directories_and_defers_group_accounts_to_configuration(self) -> None:
-        config_dir = str(self.root / "account with 'quotes' and $()")
+    def test_dry_run_preserves_numbered_ungrouped_accounts_and_defers_groups_to_configuration(self) -> None:
+        config_dir = str(self.root / ".claude3")
         restored_entries = [entry(showrunner('named-showrunner')), entry(top_level('named-tmux', host=tmux_host('named-tmux-host'))), entry(top_level('named-terminal', host=inventory.TerminalHost(kind='terminal'))), entry(top_level('named-window', host=inventory.WindowHost(kind='ghostty', window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot')))), entry(top_level('named-manual')), entry(unit('named-unit'))]
         for restored in restored_entries:
             restored['session']['config_dir'] = config_dir
@@ -1700,25 +1723,43 @@ class RestartTests(ShutdownTestCase):
         self.assertNotIn('CLAUDE_CONFIG_DIR', shlex.join(unit_argv))
         self.assertCountEqual(record.session_records(LOGIN), saved)
 
-    def test_default_and_legacy_resume_commands_are_byte_identical(self) -> None:
-        restored = entry(top_level('default-command'))
-        expected = 'cd /tmp/default-command && ENABLE_TOOL_SEARCH=true command claude --resume default-command -n default-command --remote-control default-command --settings \'{"disableAgentView": true}\' prompt; exec zsh'
-        resume_command = cast(Callable[[inventory.Session, str], str], getattr(restart, '_resume_command'))
-        self.assertEqual(resume_command(restored['session'], 'prompt'), expected)
-        restored['session']['config_dir'] = str(Path.home() / '.claude')
-        self.assertEqual(resume_command(restored['session'], 'prompt'), expected)
+    def test_legacy_home_resume_uses_the_records_login_after_the_home_login_changes(self) -> None:
+        owner = top_level("legacy-command")
+        owner["config_dir"] = str(self.root / ".claude")
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "third@example.invalid"}}))
+        for login, label in ((LOGIN, "claude2"), ("third@example.invalid", "claude3")):
+            with self.subTest(login=login):
+                saved = entry(owner)
+                saved["login"] = login
+                commands = CommandRecorder()
+                with patch.object(restart, "_run", commands):
+                    result = restart._launch_session(saved, "continue", self.desktop_state, dry_run=True)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.ManualRestartRequired)
+                assert isinstance(result, restart.ManualRestartRequired)
+                self.assertIn(named_prefix(str(self.root / f".{label}")), result.command)
+
+    def test_legacy_home_resume_without_record_evidence_refuses_todays_login(self) -> None:
+        owner = top_level("unresolved-command")
+        _ = owner.pop("config_dir", None)
+        with self.assertRaisesRegex(accounts.AccountsError, "home account unresolved"):
+            _ = restart._resume_parts(owner, "continue")  # pyright: ignore[reportPrivateUsage]
+
+    def test_resume_refuses_a_recorded_folder_that_is_not_a_numbered_account(self) -> None:
+        owner = top_level("invalid-directory")
+        owner["config_dir"] = str(self.root / "arbitrary-directory")
+        with self.assertRaisesRegex(accounts.AccountsError, "numbered Claude account folder"):
+            _ = restart._resume_parts(owner, "continue")  # pyright: ignore[reportPrivateUsage]
 
     def test_resume_parts_preserve_named_account_and_move_shell_commands(self) -> None:
         owner = top_level("resume-id", name="kept name", cwd="/tmp/with space",
                           model=inventory.ModelName(kind="model", name="opus"))
-        owner["config_dir"] = "/tmp/account dir"
+        owner["config_dir"] = str(self.root / ".claude3")
         suffix = ("--resume resume-id -n 'kept name' --remote-control 'kept name' "
                   "--model opus --settings '{\"disableAgentView\": true}' 'line one\nline two'; exec zsh")
         self.assertEqual(
             restart._resume_command(owner, "line one\nline two"),  # pyright: ignore[reportPrivateUsage]
-            "cd '/tmp/with space' && CLAUDE_CONFIG_DIR='/tmp/account dir' "
-            + "CLAUDE_CODE_REMOTE_MEMORY_DIR=" + shlex.quote(str(Path.home() / ".claude"))
-            + " ENABLE_TOOL_SEARCH=true command claude " + suffix,
+            "cd '/tmp/with space' && " + named_prefix(str(self.root / ".claude3"))
+            + "ENABLE_TOOL_SEARCH=true command claude " + suffix,
         )
         self.assertEqual(
             restart._resume_command(owner, "line one\nline two", "claude3"),  # pyright: ignore[reportPrivateUsage]
@@ -1759,7 +1800,7 @@ class RestartTests(ShutdownTestCase):
         model = "model with 'quotes' and $()"
         where = "where with 'quotes' and $()"
         restored = entry(top_level('quoted-id', name=name, cwd=str(cwd), model=inventory.ModelName(kind='model', name=model), host=inventory.WindowHost(kind='ghostty', window_shell=12, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot'))), where=record.WhereSaid(kind='said', text=where, at=STOPPED))
-        config_dir = str(self.root / "account with 'quotes' and $()")
+        config_dir = str(self.root / ".claude3")
         restored['session']['config_dir'] = config_dir
         saved = records_for_test([restored])
         self.create(saved)

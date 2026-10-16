@@ -282,23 +282,30 @@ class SessionRecordTests(ShutdownTestCase):
                          ("claude2", "claude2", "claude2"))
         self.assertEqual(path.read_bytes(), original)
 
-    def test_legacy_default_target_reads_as_the_home_number_without_rewriting_the_record(self) -> None:
+    def test_legacy_home_move_target_uses_cutover_evidence_instead_of_the_source_login(self) -> None:
         notes = self.root / "notes"
         notes.mkdir()
+        _ = (notes / "claude1.md").write_text("---\nlogin: owner@example.com\n---\n")
         _ = (notes / "claude2.md").write_text("---\nlogin: home@example.invalid\n---\n")
-        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "home@example.invalid"}}))
+        configuration = self.root / ".claude/config/accounts.json"
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text(json.dumps({"home_cutovers": [{
+            "label": "claude2", "login": "home@example.invalid", "at": LATER}]}))
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "different@example.invalid"}}))
         saved = session_shutdown()
         saved["target"] = "claude2"
         self.assertTrue(record.create_session(saved))
         path = next((self.directory / "sessions").glob("*.json"))
-        original = path.read_bytes().replace(b'"target": "claude2"', b'"target": "default"')
-        self.assertIn(b'"target": "default"', original)
-        _ = path.write_bytes(original)
-        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
-            loaded = record.find_session(saved["login"], "session-1")
-        assert loaded is not None
-        self.assertEqual(loaded.get("target"), "claude2")
-        self.assertEqual(path.read_bytes(), original)
+        original = path.read_bytes()
+        for target in ("default", "~/.claude"):
+            with self.subTest(target=target):
+                legacy = original.replace(b'"target": "claude2"', f'"target": "{target}"'.encode())
+                _ = path.write_bytes(legacy)
+                with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
+                    loaded = record.find_session(saved["login"], "session-1")
+                assert loaded is not None
+                self.assertEqual(loaded.get("target"), "claude2")
+                self.assertEqual(path.read_bytes(), legacy)
 
     def test_first_read_converts_nested_worker_ownership_and_fields_without_rewriting_again(self) -> None:
         saved = session_shutdown(progress=record.SessionStopping(kind="stopping", at=LATER))
