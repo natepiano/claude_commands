@@ -9,6 +9,7 @@ import io
 from contextlib import redirect_stdout
 import os
 import json
+import subprocess
 import sys
 import time
 from collections.abc import Iterable
@@ -40,6 +41,7 @@ from inventory import (
     parse_inventory,
 )
 import inventory as inventory_work
+import herdr
 import record as recovery_store
 from launch_permission import (
     LaunchPurpose,
@@ -123,8 +125,27 @@ class UnresolvedRecoverySession(TypedDict):
     last_seen: str
 
 
+class SnapshotOutcomeRecorded(TypedDict):
+    kind: Literal["recorded"]
+    last_success: recovery_store.LastSuccessfulSnapshot | recovery_store.NoSuccessfulSnapshotRecorded
+    latest: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed
+
+
+class NoSnapshotOutcomeRecorded(TypedDict):
+    kind: Literal["no outcome recorded"]
+
+
+class SnapshotOutcomeUnreadable(TypedDict):
+    kind: Literal["unreadable"]
+    error: str
+
+
+SnapshotStatus = SnapshotOutcomeRecorded | NoSnapshotOutcomeRecorded | SnapshotOutcomeUnreadable
+
+
 class RecoveryStatusInventory(Inventory):
     recovery: list[UnresolvedRecoverySession]
+    snapshot: SnapshotStatus
 
 
 MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
@@ -241,8 +262,7 @@ def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
 def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
     local = inventory(selected.login, only=frozenset(only)) if only else inventory(selected.login)
     unresolved = _unresolved_snapshot_status(selected.login, only)
-    if unresolved:
-        local = RecoveryStatusInventory(**local, recovery=unresolved)
+    local = RecoveryStatusInventory(**local, recovery=unresolved, snapshot=_snapshot_status())
     reports: list[MachineStatusReport] = [local]
     if here:
         return reports
@@ -486,42 +506,160 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     return ResolvedSessions(tuple(result), report)
 
 
+def _tmux_free() -> int:
+    causes: list[str] = []
+    try:
+        result = subprocess.run(
+            [os.environ.get("SHUTDOWN_TMUX", "tmux"), "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        names = result.stdout.splitlines()
+        detail = result.stderr.strip()
+        no_server = (not names and len(detail.splitlines()) == 1
+                     and (detail == "no server running" or detail.startswith("no server running on ")))
+        if result.returncode != 0 and not (result.returncode == 1 and no_server):
+            causes.append(f"tmux sessions unreadable: {detail or f'exit {result.returncode}'}")
+        for name in names:
+            causes.append(f"tmux session {name!r} is still registered; close it after moving its agents")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        causes.append(f"tmux sessions unreadable: {error}")
+    try:
+        _ = herdr.live_sessions()
+    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        causes.append(f"herdr sessions unreadable: {error}")
+    try:
+        observed = inventory_work.snapshot_inventory()
+        if isinstance(observed, inventory_work.PartialInventory):
+            causes.extend(f"inventory incomplete: {failure}" for failure in observed.failures)
+            if not observed.failures:
+                causes.append("inventory incomplete: no failure details were returned")
+        else:
+            for login, entries in observed.sessions.items():
+                for entry in entries:
+                    for owner in (entry["session"], *entry["workers"]):
+                        host = owner["host"]
+                        location = ""
+                        if host["kind"] == "tmux":
+                            location = f"tmux session {host['tmux_session']!r}"
+                        elif host["kind"] == "unit" and host["session_host"] == "tmux":
+                            location = f"tmux unit {host['production']}/{host['unit']} in session {host['session_name']!r}"
+                        elif host["kind"] == "unknown":
+                            location = "an unknown host; prove its host before removing tmux"
+                        if location:
+                            causes.append(f"{login}: {owner['name']} ({owner['session_id']}) uses {location}")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        causes.append(f"inventory unreadable: {error}")
+    if causes:
+        print("\n".join(causes))
+        return 1
+    print("nothing needs tmux")
+    return 0
+
+
 def _snapshot() -> int:
     observed = inventory_work.snapshot_inventory()
+    at = settle.record_time()
     if isinstance(observed, inventory_work.PartialInventory):
+        _record_snapshot_outcome(recovery_store.SnapshotFailed(kind="failed", at=at, reasons=list(observed.failures)))
         print("snapshot incomplete: " + "; ".join(observed.failures), file=sys.stderr)
         return 1
-    saved = recovery_store.merge_snapshots(observed, settle.record_time())
+    try:
+        saved = recovery_store.merge_snapshots(observed, at)
+    except (InvalidRecord, OSError) as error:
+        _record_snapshot_outcome(recovery_store.SnapshotFailed(kind="failed", at=at, reasons=[str(error)]))
+        raise
+    _record_snapshot_outcome(recovery_store.SnapshotTaken(kind="taken", at=at, accounts=len(saved)))
     print(f"recovery snapshot saved for {len(saved)} accounts")
     return 0
 
 
+def _record_snapshot_outcome(outcome: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed) -> None:
+    try:
+        recovery_store.record_snapshot_attempt(outcome, settle.local_machine())
+    except (InvalidRecord, OSError) as error:
+        print(f"snapshot outcome not recorded: {error}", file=sys.stderr)
+
+
+def _snapshot_status() -> SnapshotStatus:
+    try:
+        attempts = recovery_store.read_snapshot_attempts()
+    except (InvalidRecord, OSError) as error:
+        return SnapshotOutcomeUnreadable(kind="unreadable", error=str(error))
+    if isinstance(attempts, recovery_store.NoSnapshotAttempt):
+        return NoSnapshotOutcomeRecorded(kind="no outcome recorded")
+    return SnapshotOutcomeRecorded(kind="recorded", last_success=attempts["last_success"], latest=attempts["latest"])
+
+
+def _snapshot_outcome_lines(status: SnapshotStatus) -> list[str]:
+    if status["kind"] == "unreadable":
+        return [f"  recovery snapshot: outcome unreadable: {status['error']}"]
+    lines = ["  recovery snapshot: no successful snapshot recorded"]
+    if status["kind"] == "recorded":
+        success = status["last_success"]
+        if success["kind"] == "taken":
+            elapsed = datetime.fromisoformat(settle.record_time()) - datetime.fromisoformat(success["at"])
+            age = settle.elapsed_text(int(elapsed.total_seconds()))
+            lines = [f"  recovery snapshot: last taken {_local_time(success['at'])} ({age} ago)"]
+        latest = status["latest"]
+        if latest["kind"] == "failed":
+            lines.append(f"  recovery snapshot failed {_local_time(latest['at'])}: {'; '.join(latest['reasons'])}")
+    return lines
+
+
+@dataclass
+class ForgetCandidate:
+    login: str
+    label: str
+    session_id: str
+    name: str
+    names: set[str]
+
+
 def _forget(text: str, account: str = "") -> int:
-    candidates: list[tuple[recovery_store.RecoverySnapshot, recovery_store.SnapshotSession]] = []
+    if account:
+        try:
+            account = _selected_account(account).login
+        except (UnreadableAccount, UnknownAccountName) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 2
+    candidates: dict[tuple[str, str], ForgetCandidate] = {}
+    machine = settle.local_machine()
+
+    def add(login: str, label: str, owner: Session) -> None:
+        if account and account.casefold() != login.casefold():
+            return
+        key = (login.casefold(), owner["session_id"])
+        names = {owner["session_id"], owner["name"]}
+        host = owner["host"]
+        if host["kind"] == "herdr":
+            names.add(host["herdr_session"])
+        if key in candidates:
+            candidates[key].names.update(names)
+        else:
+            candidates[key] = ForgetCandidate(login, label, owner["session_id"], owner["name"], names)
+
     for snapshot in recovery_store.all_snapshots():
-        if account and account.casefold() not in {snapshot["login"].casefold(), snapshot["label"].casefold()}:
+        if snapshot["machine"].casefold() != machine.casefold():
             continue
         for item in snapshot["sessions"]:
-            owner = item["session"]
-            host = owner["host"]
-            names = {owner["session_id"], owner["name"]}
-            if host["kind"] == "herdr":
-                names.add(host["herdr_session"])
-            if text in names:
-                candidates.append((snapshot, item))
-    exact = [(snapshot, item) for snapshot, item in candidates if item["session"]["session_id"] == text]
-    matches = exact or candidates
+            add(snapshot["login"], snapshot["label"], item["session"])
+    for saved in all_session_records():
+        if saved["machine"].casefold() == machine.casefold():
+            add(saved["login"], saved["label"], saved["session"])
+    exact = [item for item in candidates.values() if item.session_id == text]
+    matches = exact or [item for item in candidates.values() if text in item.names]
     if len(matches) != 1:
-        print(f"forget: {text} matches {'no recovery session' if not matches else 'more than one recovery session'}", file=sys.stderr)
-        for snapshot, item in matches:
-            print(f"  {snapshot['label']}: {item['session']['name']} ({item['session']['session_id']})", file=sys.stderr)
+        print(f"forget: {text} matches {'no local session' if not matches else 'more than one local session'}", file=sys.stderr)
+        for item in matches:
+            print(f"  {item.label}: {item.name} ({item.session_id})", file=sys.stderr)
         return 2
-    snapshot, item = matches[0]
-    outcome = recovery_store.acknowledge_snapshot(snapshot["login"], item["session"]["session_id"])
-    if isinstance(outcome, recovery_store.SnapshotAlreadyAbsent):
-        print(f"{text}: recovery entry already removed")
-    else:
-        print(f"{item['session']['name']}: recovery entry forgotten")
+    item = matches[0]
+    outcome = recovery_store.forget_session(item.login, item.session_id, machine)
+    if isinstance(outcome, recovery_store.SessionRetained):
+        print(f"forget: {item.name}: cannot forget shutdown in progress ({outcome.record['progress']['kind']})", file=sys.stderr)
+        return 1
+    _ = recovery_store.acknowledge_snapshot(item.login, item.session_id)
+    print(f"{item.name}: forgotten")
     return 0
 
 
@@ -764,12 +902,13 @@ def main(arguments: list[str] | None = None) -> int:
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{down,status,follow,now,cancel,restart,snapshot,forget,remote-control,launch-blocked}",
+        metavar="{down,status,follow,now,cancel,restart,snapshot,tmux-free,forget,remote-control,launch-blocked}",
     )
     _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
-    forget = commands.add_parser("forget", help="retire one local recovery snapshot entry")
+    _ = commands.add_parser("tmux-free", help="check whether anything local still needs tmux")
+    forget = commands.add_parser("forget", help="forget one local recovery entry or stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
-    _ = forget.add_argument("--account", help="account login or label containing this recovery entry")
+    _ = forget.add_argument("--account", help="account login or label containing this session")
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
     _ = down.add_argument("--here", action="store_true")
@@ -985,11 +1124,12 @@ def _all_accounts(options: CommandLine) -> int:
                 status = max(status, restart_work.up(account.login, options.dry_run, ids))
             elif options.command == "status" and not options.as_json:
                 print(f"{account.label} · {account.login}")
+                print("\n".join(_snapshot_outcome_lines(_snapshot_status())))
                 print("\n".join(_unresolved_snapshot_lines(account.login, ids)))
             elif options.command == "status":
                 reports.append(RecoveryStatusInventory(machine=settle.local_machine(), login=account.login,
                     label=account.label, sessions=[], unattributed=[],
-                    recovery=_unresolved_snapshot_status(account.login, ids)))
+                    recovery=_unresolved_snapshot_status(account.login, ids), snapshot=_snapshot_status()))
             continue
         if options.command == "status" and options.as_json:
             try:
@@ -1018,6 +1158,8 @@ def _all_accounts(options: CommandLine) -> int:
 
 
 def _dispatch(options: CommandLine) -> int:
+    if options.command == "tmux-free":
+        return _tmux_free()
     if options.command in {"snapshot", "forget"}:
         try:
             return _snapshot() if options.command == "snapshot" else _forget(options.forget_name, options.account or "")
@@ -1200,8 +1342,11 @@ def _dispatch(options: CommandLine) -> int:
                     record_lines.extend(_status_actions(outcome["records"], ownership))
                 if record_lines:
                     print("\n".join(record_lines))
-            for line in _unresolved_snapshot_lines(selected.login, status_ids):
-                print(line)
+                if index == 0:
+                    for line in _snapshot_outcome_lines(_snapshot_status()):
+                        print(line)
+                    for line in _unresolved_snapshot_lines(selected.login, status_ids):
+                        print(line)
         return 0
     except SessionSelectionError as error:
         print(f"shutdown: {error}", file=sys.stderr)

@@ -12,7 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:

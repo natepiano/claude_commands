@@ -21,13 +21,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+import production_units
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import launch_permission
 import unit_lookup
 import session_pane
 from herdr import HerdrPlace
-from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
+from production_units import Refusal, cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
 from scripts.whoami import account as account_reader
 from scripts.whoami import agent_accounts
@@ -40,7 +41,7 @@ from test_support import ShutdownTestCase
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("add_unit.py")
-REAL_WORKTREE_IS_LINKED = add_unit.worktree_is_linked
+REAL_WORKTREE_IS_LINKED = production_units.worktree_is_linked
 MARKED_TMUX_PLACE = unit_lookup.TmuxPlace("%7")
 NO_LAUNCH_FIXTURE = add_unit.NoMarkedUnit()
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -159,7 +160,7 @@ class AddUnitTests(ShutdownTestCase):
         super().setUp()
         # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
         # test asks the real disk, and a row with a worktree never asks tmux. RetiredRowTests covers the rule.
-        _ = self.enterContext(patch.object(add_unit, "worktree_is_linked", return_value=True))
+        _ = self.enterContext(patch.object(production_units, "worktree_is_linked", return_value=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
@@ -465,7 +466,7 @@ class AddUnitTests(ShutdownTestCase):
                 session=requested.session, launch_kind=requested.launch_kind, timeout=requested.timeout,
                 identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
             self.configure_herdr(launch)
-        except (add_unit.Refusal, OSError, ValueError):
+        except (Refusal, OSError, ValueError):
             self.configure_herdr()
 
     def cli(self, *args: str, timeout: float = 300, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
@@ -476,7 +477,7 @@ class AddUnitTests(ShutdownTestCase):
                                   env=self.env, capture_output=True, text=True, check=False, timeout=timeout)
         # The row-reader fixture patch never reached the old CLI child. Preserve
         # the real worktree check on this command boundary too.
-        with patch.object(add_unit, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
+        with patch.object(production_units, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
             return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,
                               self.env, self.checkout, production_state=True)
 
@@ -880,8 +881,34 @@ class AddUnitTests(ShutdownTestCase):
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("add_unit: the session is not ready:\n" + screen, result.stderr)
+        self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
                              for row in self.herdr_calls()))
+
+    def test_failed_unit_restore_stops_its_created_server_after_agent_exit(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note"
+        _ = note.write_text("Resume this unit.")
+        with (patch.dict(os.environ, self.env),
+              patch.object(herdr, "start_agent", side_effect=herdr.AgentExited("restored-unit", "w1:p1")),
+              patch.object(herdr, "stop_session") as stopped):
+            request = add_unit.UnitLaunch(
+                production=add_unit.read_production(self.doc),
+                identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+                branch="build-followups-alpha", worktree=self.root / "project-alpha",
+                plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
+                port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+                session=add_unit.ResumedSession("session-123", prior),
+                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "alpha"),
+                timeout=90,
+            )
+            with self.assertRaises(herdr.AgentExited):
+                add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+                                        "Resume this unit.", accounts.role_account("unit"))
+        stopped.assert_called_once_with("alpha")
+        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-alpha.service"] for row in self.herdr_calls()))
+        self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
         with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:
@@ -2646,9 +2673,9 @@ class RetiredRowTests(ShutdownTestCase):
     def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
         """Whether the row is retired, and how many times tmux was asked."""
         found = {} if gone else {"some-unit": self.session("some-unit")}
-        cells = add_unit.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
+        cells = production_units.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
         with patch.object(unit_lookup, "marked_units", return_value=found) as asked:
-            return add_unit.unit_is_retired(cells, add_unit.SessionMarks("show")), asked.call_count
+            return production_units.unit_is_retired(cells, production_units.SessionMarks("show")), asked.call_count
 
     def test_a_unit_is_gone_only_without_both_its_worktree_and_its_session(self) -> None:
         self.assertEqual(self.retired(self.missing, gone=True), (True, 1))
@@ -2705,7 +2732,7 @@ class AdoptAccountTests(unittest.TestCase):
         self.assertEqual(cast(add_unit.Adoptable, adopted).account, accounts.NamedAccount("claude2", Path("/home/someone/.claude")))
 
     def test_a_session_on_no_fit_account_is_refused(self) -> None:
-        with self.assertRaises(add_unit.Refusal) as refused:
+        with self.assertRaises(Refusal) as refused:
             _ = self.adopted(Path("/home/someone/.claude9"), [])
         self.assertIn("runs on /home/someone/.claude9, which is no account fit to launch", str(refused.exception))
 

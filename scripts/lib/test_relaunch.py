@@ -44,7 +44,7 @@ class RelaunchTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state = self.root / "state"
         (self.state / "relaunch").mkdir(parents=True)
 

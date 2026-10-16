@@ -20,6 +20,16 @@
       ]
     },
     {
+      "root": "scripts/delegate",
+      "extraPaths": [
+        ".",
+        "scripts/production",
+        "scripts/message",
+        "scripts/herdr",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",

@@ -39,21 +39,14 @@ from account import (  # noqa: E402
     own_claude_account,
     NAMED_ACCOUNT_VARIABLES,
 )
-import add_unit  # noqa: E402
+import production_units  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
 import conversation_pause  # noqa: E402
 import relaunch  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 from inventory import (  # noqa: E402
-    PaneNotRecorded,
     Session,
-    TmuxHost,
-    TmuxPane,
-    TmuxServer,
-    TmuxServerNotRecorded,
-    TmuxSessionId,
-    TmuxSessionIdNotRecorded,
     Desktop,
     Host,
     DesktopNotInSnapshot,
@@ -121,6 +114,7 @@ class ShutdownServices(Protocol):
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
+    def elapsed_text(self, seconds: int) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
     def shutdown_command(self, *arguments: str) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
@@ -390,7 +384,7 @@ class MachineRestartResult:
 
     @property
     def exit_status(self) -> int:
-        return 0 if self.status in {"done", "nothing"} and not self.refused else 1
+        return 0 if self.status in {"done", "nothing"} and not self.failed and not self.refused else 1
 
 
 @dataclass
@@ -587,7 +581,7 @@ def restart_note(
     record: SessionShutdown, restarted_at: str
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
-    if "target" in record:
+    if "target" in record and record["requested_by"]["kind"] != "snapshot":
         note = account_move_note(record["session"], record["target"],
                                  record.get("source_label", record["label"]), record.get("why", ""))
         where = record["where"]
@@ -595,11 +589,27 @@ def restart_note(
             punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
             note += f" Before it you wrote: {where['text']}{punctuation}"
         return note
-    opening = (
-        f"Restarted after /shutdown of {record['label']} "
-        f"(stopped {_user_time(record['requested_at'])}, "
-        f"restarted {_user_time(restarted_at)}). "
-    )
+    origin = record["requested_by"]
+    if origin["kind"] == "snapshot":
+        context = origin["recovery"]
+        if context["kind"] == "not recorded":
+            opening = (
+                "Restored after a crash (crash evidence and last-seen time were not recorded; "
+                f"restored {_user_time(restarted_at)}). "
+            )
+        else:
+            signal = "the machine rebooted" if context["kind"] == "reboot" else "its host was lost"
+            opening = (
+                f"Restored after a crash: {signal} "
+                f"(last seen {_user_time(context['last_seen'])}, "
+                f"restored {_user_time(restarted_at)}). "
+            )
+    else:
+        opening = (
+            f"Restarted after /shutdown of {record['label']} "
+            f"(stopped {_user_time(record['requested_at'])}, "
+            f"restarted {_user_time(restarted_at)}). "
+        )
     where = record["where"]
     if where["kind"] == "said":
         punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
@@ -632,6 +642,22 @@ class MoveResumeAccount:
 
 
 @dataclass(frozen=True)
+class ResumeConversation:
+    """The launch account has a transcript for this session."""
+
+
+@dataclass(frozen=True)
+class StartFreshConversation:
+    """Keep the session identity when its launch account has no transcript."""
+
+
+def _conversation_launch(session_id: str, config_dir: Path) -> ResumeConversation | StartFreshConversation:
+    if any(path.is_file() for path in (config_dir / "projects").glob("*/" + session_id + ".jsonl")):
+        return ResumeConversation()
+    return StartFreshConversation()
+
+
+@dataclass(frozen=True)
 class ResumeParts:
     """A conversation launch before any host-specific command rendering."""
 
@@ -640,6 +666,7 @@ class ResumeParts:
     claude_arguments: tuple[str, ...]
     opening_prompt: str
     account: RetainResumeAccount | MoveResumeAccount
+    conversation: ResumeConversation | StartFreshConversation
 
 
 @dataclass(frozen=True)
@@ -654,6 +681,10 @@ class RecordedHerdrPane:
 
 
 HerdrDestination = NewHerdrSession | RecordedHerdrPane
+
+
+class HerdrDestinationTaken(OSError):
+    """An exclusive launch found an occupied destination, before opening a pane."""
 
 
 def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False) -> ResumeParts:
@@ -680,8 +711,10 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     environment["ENABLE_TOOL_SEARCH"] = "true"
     if probe or session.get("probe", False):
         environment[PROBE_ENV] = "1"
+    launch_config_dir = accounts.account_dir(target) if target else config_dir
+    conversation = _conversation_launch(session["session_id"], launch_config_dir)
     argv = [
-        "--resume",
+        "--resume" if isinstance(conversation, ResumeConversation) else "--session-id",
         session["session_id"],
         "-n",
         session["name"],
@@ -692,42 +725,18 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     if model["kind"] == "model":
         argv.extend(("--model", model["name"]))
     argv.extend(("--settings", '{"disableAgentView": true}'))
-    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account)
+    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation)
 
 
-def _resume_shell(parts: ResumeParts, *, supervised: bool = False) -> str:
+def _resume_shell(parts: ResumeParts) -> str:
     argv = ["claude", *parts.claude_arguments, parts.opening_prompt]
     if isinstance(parts.account, MoveResumeAccount):
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
                 "exec", parts.account.target, *argv[1:]]
-    if supervised:
-        argv = [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
-                "run", "--", *argv]
     prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in parts.environment.items())
     return (
         f"cd {shlex.quote(parts.cwd)} && {prefix}command "
         f"{shlex.join(argv)}; exec zsh"
-    )
-
-
-def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest:
-    environment = dict(parts.environment)
-    unset = {"CLAUDE_CODE_OAUTH_TOKEN"}
-    if isinstance(parts.account, MoveResumeAccount):
-        from scripts.accounts import accounts
-
-        prepared = accounts.prepared_account(parts.account.target, resume=True)
-        if isinstance(prepared, accounts.AccountRefused):
-            raise accounts.AccountsError(prepared.reason)
-        environment.update(prepared.variables)
-        unset.update(prepared.remove)
-    return relaunch.RelaunchRequest(
-        argv=["claude", *parts.claude_arguments, parts.opening_prompt],
-        cwd=parts.cwd,
-        environment=environment,
-        unset=sorted(unset),
-        written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        note=note,
     )
 
 
@@ -809,13 +818,13 @@ def _units_row_plan(doc: str, unit: str) -> str | None:
     A run record's plan can differ from it: the plan moves to as-built, or a later run uses another doc.
     """
     try:
-        table = add_unit.unit_table(Path(doc).read_text(encoding="utf-8").splitlines())
-    except (OSError, UnicodeError, add_unit.Refusal):
+        table = production_units.unit_table(Path(doc).read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError, production_units.Refusal):
         return None
-    rows = [row for row in table if add_unit.cell_value(row.get("Unit", "")) == unit]
+    rows = [row for row in table if production_units.cell_value(row.get("Unit", "")) == unit]
     if len(rows) != 1 or "Plan" not in rows[0]:
         return None
-    return add_unit.cell_value(rows[0]["Plan"])
+    return production_units.cell_value(rows[0]["Plan"])
 
 
 def _unit_argv(record: SessionShutdown) -> list[str]:
@@ -937,208 +946,6 @@ def restore_desktop(state: DesktopLaunchState, *, dry_run: bool = False) -> None
     )
 
 
-def _probe(argv: list[str], *, dry_run: bool) -> subprocess.CompletedProcess[str]:
-    if dry_run:
-        _display(argv)
-    return subprocess.run(
-        argv,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def _recorded_pane(host: TmuxHost) -> TmuxPane | PaneNotRecorded:
-    return host["pane"]
-
-
-@dataclass(frozen=True)
-class ReusableTmuxPane:
-    pass
-
-
-@dataclass(frozen=True)
-class OccupiedTmuxPane:
-    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded
-
-
-@dataclass(frozen=True)
-class TmuxPaneUnavailable:
-    pass
-
-
-TmuxPaneState = ReusableTmuxPane | OccupiedTmuxPane | TmuxPaneUnavailable
-
-
-def _pane_is_reusable(
-    pane: TmuxPane,
-    pane_pid_text: str,
-    pane_dead: str,
-    *,
-    dry_run: bool,
-) -> bool:
-    if pane_dead == "1":
-        return True
-    if pane_dead != "0":
-        return False
-    try:
-        pane_pid = int(pane_pid_text)
-    except ValueError:
-        return False
-    if pane_pid != pane["pane_pid"]:
-        return False
-
-    children = _probe(["pgrep", "-P", str(pane_pid)], dry_run=dry_run)
-    return children.returncode == 1
-
-
-def _tmux_server_matches(
-    server: TmuxServer | TmuxServerNotRecorded, started_at_text: str, pid_text: str,
-) -> bool:
-    if server["kind"] == "not recorded":
-        return False
-    try:
-        return int(started_at_text) == server["started_at"] and int(pid_text) == server["pid"]
-    except ValueError:
-        return False
-
-
-def _tmux_pane_state(
-    tmux: str, pane: TmuxPane | PaneNotRecorded,
-    server: TmuxServer | TmuxServerNotRecorded, *, dry_run: bool,
-) -> TmuxPaneState:
-    if pane["kind"] == "not recorded" or server["kind"] == "not recorded":
-        return TmuxPaneUnavailable()
-    pane_probe = _probe(
-        [
-            tmux,
-            "display",
-            "-p",
-            "-t",
-            pane["pane_id"],
-            "#{session_id}\t#{pane_pid}\t#{pane_dead}\t#{start_time}\t#{pid}",
-        ],
-        dry_run=dry_run,
-    )
-    if pane_probe.returncode != 0:
-        return TmuxPaneUnavailable()
-    fields = pane_probe.stdout.rstrip("\r\n").split("\t")
-    if len(fields) != 5 or not _tmux_server_matches(server, fields[3], fields[4]):
-        return TmuxPaneUnavailable()
-    if _pane_is_reusable(pane, fields[1], fields[2], dry_run=dry_run):
-        return ReusableTmuxPane()
-    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded = {"kind": "not recorded"}
-    if re.fullmatch(r"\$[0-9]+", fields[0]) is not None:
-        session_ref = {"kind": "session id", "session_id": fields[0]}
-    return OccupiedTmuxPane(session_ref)
-
-
-def _respawn_pane_argv(
-    tmux: str, pane: TmuxPane, session: Session, command: str
-) -> list[str]:
-    return [
-        tmux,
-        "respawn-pane",
-        "-k",
-        "-t",
-        pane["pane_id"],
-        "-c",
-        session["cwd"],
-        "zsh",
-        "-ic",
-        command,
-    ]
-
-
-def _new_window_argv(tmux: str, target: str, cwd: str, command: str) -> list[str]:
-    return [
-        tmux,
-        "new-window",
-        "-t",
-        target,
-        "-c",
-        cwd,
-        "zsh",
-        "-ic",
-        command,
-    ]
-
-
-def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> str:
-    host = session["host"]
-    if host["kind"] != "tmux":
-        raise ValueError("tmux launch needs a tmux host")
-    tmux = os.environ.get("SHUTDOWN_TMUX", "tmux")
-    pane = _recorded_pane(host)
-    server = host["server"]
-    pane_state = _tmux_pane_state(tmux, pane, server, dry_run=dry_run)
-    if pane["kind"] == "pane" and isinstance(pane_state, ReusableTmuxPane):
-        _ = _run(
-            _respawn_pane_argv(tmux, pane, session, command),
-            dry_run=dry_run,
-        )
-        return pane["pane_id"]
-
-    if isinstance(pane_state, OccupiedTmuxPane) and pane_state.session_ref["kind"] == "session id":
-        _ = _run(
-            _new_window_argv(
-                tmux, f"{pane_state.session_ref['session_id']}:", session["cwd"], command,
-            ),
-            dry_run=dry_run,
-        )
-        return pane_state.session_ref["session_id"]
-    session_ref = host["session_ref"]
-    if server["kind"] == "server" and session_ref["kind"] == "session id":
-        session_probe = _probe(
-            [tmux, "display", "-p", "-t", session_ref["session_id"], "#{start_time}\t#{pid}"],
-            dry_run=dry_run,
-        )
-        server_fields = session_probe.stdout.rstrip("\r\n").split("\t")
-        if (
-            session_probe.returncode == 0
-            and len(server_fields) == 2
-            and _tmux_server_matches(server, server_fields[0], server_fields[1])
-        ):
-            _ = _run(
-                _new_window_argv(tmux, f"{session_ref['session_id']}:", session["cwd"], command),
-                dry_run=dry_run,
-            )
-            return session_ref["session_id"]
-    probe_argv = [tmux, "has-session", "-t", f"={host['tmux_session']}"]
-    probe = _probe(probe_argv, dry_run=dry_run)
-    if probe.returncode == 0:
-        _ = _run(
-            _new_window_argv(tmux, f"={host['tmux_session']}:", session["cwd"], command),
-            dry_run=dry_run,
-        )
-        return f"={host['tmux_session']}"
-    try:
-        _ = _run(
-            [
-                tmux,
-                "new-session",
-                "-d",
-                "-s",
-                host["tmux_session"],
-                "-c",
-                session["cwd"],
-                "zsh",
-                "-ic",
-                command,
-            ],
-            dry_run=dry_run,
-        )
-    except subprocess.CalledProcessError:
-        if dry_run or _probe(probe_argv, dry_run=False).returncode != 0:
-            raise
-        _ = _run(
-            _new_window_argv(tmux, f"={host['tmux_session']}:", session["cwd"], command),
-            dry_run=False,
-        )
-
-    return f"={host['tmux_session']}"
-
-
 def _herdr_launch(
     parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool
 ) -> None:
@@ -1163,7 +970,6 @@ def _herdr_launch(
                     else "a new pane")
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return
-    _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
         from scripts.accounts.accounts import NamedAccount, trust_command
 
@@ -1177,8 +983,9 @@ def _herdr_launch(
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         if isinstance(destination, NewHerdrSession):
             herdr.start_new_server(name, 90_000)
+            server = herdr.ServerCreated()
         else:
-            herdr.start_server(name, 90_000)
+            server = herdr.start_server(name, 90_000)
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -1202,11 +1009,30 @@ def _herdr_launch(
                 client.close_pane(destination.pane_id)
             else:
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
+        _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
         pane = herdr.open_pane(name, name, parts.cwd, environment)
-        client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
-                           opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
+        try:
+            client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
+                               opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
+        except herdr.AgentExited:
+            if isinstance(server, herdr.ServerCreated):
+                herdr.stop_session(name)
+            raise
+        if isinstance(server, herdr.ServerAdopted):
+            _focus_restored_pane(client, pane, session["name"])
+        if isinstance(parts.conversation, StartFreshConversation):
+            print(f"{session['name']}: no conversation to resume; started a new one")
+    except herdr.SessionTaken as error:
+        raise HerdrDestinationTaken(str(error)) from error
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+
+
+def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> None:
+    try:
+        client.focus_workspace(pane.split(":", 1)[0])
+    except herdr.HerdrFailure as error:
+        print(f"{name} restart issue: restored workspace not focused: {error}")
 
 
 def launches_window(host: Host) -> bool:
@@ -1221,16 +1047,37 @@ def _herdr_attach_command(name: str, cwd: str) -> str:
     return f"cd {shlex.quote(cwd)} && {shlex.join(argv)}; exec zsh"
 
 
+@dataclass(frozen=True)
+class CodexWindowRestore:
+    """A restored Codex session has no Claude shutdown record for window issues."""
+
+    machine: str
+    session_name: str
+
+
 def _herdr_window(
-    record: SessionShutdown, name: str, cwd: str, desktop: Desktop,
+    record: SessionShutdown | CodexWindowRestore, name: str, cwd: str, desktop: Desktop,
     desktop_state: DesktopLaunchState, *, dry_run: bool,
 ) -> None:
     """Report a failed attachment without turning a launched agent into another launch."""
     try:
-        _open_window(_herdr_attach_command(name, cwd), desktop, desktop_state, dry_run=dry_run)
+        if sys.platform == "darwin":
+            if not dry_run and desktop_state.started_windows:
+                time.sleep(WINDOW_DELAY_SECONDS)
+            _ = _run([
+                os.environ.get("SHUTDOWN_OPEN", "open"), "-na",
+                "/Applications/Nix Apps/Ghostty.app", "--args", "-e",
+                herdr.herdr_binary(), "session", "attach", name,
+            ], dry_run=dry_run)
+            desktop_state.started_windows += 1
+        else:
+            _open_window(_herdr_attach_command(name, cwd), desktop, desktop_state, dry_run=dry_run)
     except (OSError, subprocess.SubprocessError) as error:
         attach = shlex.join(["herdr", "session", "attach", name])
         issue = f"window not opened: {_error_reason(error)}; {attach}"
+        if isinstance(record, CodexWindowRestore):
+            print(f"{record.machine}: {record.session_name}: {issue}")
+            return
         print(f"{record['machine']}: {record['session']['name']} restart issue: {issue}")
         if not dry_run:
             def remember(current: SessionShutdown) -> None:
@@ -1270,7 +1117,7 @@ def _launch_session(
         return SessionLaunched()
 
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
-    if session["kind"] == "showrunner" and "target" in record:
+    if session["kind"] == "showrunner" and ("target" in record or record["requested_by"]["kind"] == "snapshot"):
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
                           at=record["requested_at"], probe=record.get("probe", False))
@@ -1290,18 +1137,25 @@ def _launch_session(
         else:
             print(shlex.join(["herdr", "session", "attach", name]))
         return SessionLaunched()
-    if host["kind"] == "tmux" and session["kind"] == "showrunner":
-        name = herdr.generated_session_name(host["tmux_session"])
-        _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
+    if host["kind"] == "tmux":
+        suffix = 0
+        while True:
+            name = herdr.generated_session_name(host["tmux_session"], str(suffix) if suffix else "")
+            try:
+                _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
+                break
+            except HerdrDestinationTaken:
+                suffix += 1
         return SessionLaunched()
-    if host["kind"] == "ghostty" or host["kind"] == "zed":
+    if host["kind"] == "ghostty" or host["kind"] == "zed" or (host["kind"] == "terminal" and sys.platform == "darwin"):
         name = herdr.generated_session_name(session["name"])
         _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
-        if host["kind"] == "ghostty":
+        if host["kind"] == "ghostty" or host["kind"] == "terminal":
             supervisor = live_supervisor(host)
             if supervisor["kind"] == "supervisor":
                 request = relaunch.RelaunchRequest(
-                    argv=["herdr", "session", "attach", name], cwd=parts.cwd,
+                    argv=[herdr.herdr_binary() if sys.platform == "darwin" else "herdr",
+                          "session", "attach", name], cwd=parts.cwd,
                     environment={}, unset=[],
                     written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), note=note)
                 if dry_run:
@@ -1309,52 +1163,13 @@ def _launch_session(
                 else:
                     relaunch.write_request(supervisor["pid"], request)
                 return SessionLaunched()
-        _herdr_window(record, name, parts.cwd, host["desktop"], desktop_state, dry_run=dry_run)
+        desktop = (DesktopNotInSnapshot(kind="not in snapshot") if host["kind"] == "terminal"
+                   else host["desktop"])
+        _herdr_window(record, name, parts.cwd, desktop, desktop_state, dry_run=dry_run)
         return SessionLaunched()
-    window_launch = host["kind"] == "terminal" and sys.platform == "darwin"
-    command = _resume_shell(parts, supervised=True) if window_launch else _resume_shell(parts)
-    if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
-        return ManualRestartRequired(command)
-    _record_scheduled_restart_prompt(
-        session["session_id"], prompt, dry_run=dry_run
-    )
-    if host["kind"] == "terminal" and sys.platform == "darwin":
-        supervisor = live_supervisor(host)
-        if supervisor["kind"] == "supervisor":
-            request = _relaunch_request(parts, note)
-            if dry_run:
-                print(f"restart in window via supervisor {supervisor['pid']}: {shlex.join(request['argv'])}")
-            else:
-                relaunch.write_request(supervisor["pid"], request)
-            return SessionLaunched()
-    match host["kind"]:
-        case "terminal":
-            if not dry_run and desktop_state.started_windows:
-                time.sleep(WINDOW_DELAY_SECONDS)
-            opener = os.environ.get("SHUTDOWN_OPEN", "open")
-            _ = _run(
-                [
-                    opener,
-                    "-na",
-                    "/Applications/Nix Apps/Ghostty.app",
-                    "--args",
-                    "-e",
-                    "zsh",
-                    "-ic",
-                    command,
-                ],
-                dry_run=dry_run,
-            )
-            desktop_state.started_windows += 1
-        case "tmux":
-            retained_session = _tmux_launch(command, session, dry_run=dry_run)
-            if "target" in record:
-                directory = accounts.claude_account_dir(record["target"])
-                _ = _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), "set-option", "-t",
-                          retained_session, "@claude_config_dir", str(directory)], dry_run=dry_run)
-        case "unit":
-            raise ValueError("non-unit session has a unit host")
-    return SessionLaunched()
+    if host["kind"] == "unit":
+        raise ValueError("non-unit session has a unit host")
+    return ManualRestartRequired(_resume_shell(parts))
 
 
 def _message_key(record: SessionShutdown, session_id: str) -> str:
@@ -1885,7 +1700,7 @@ def confirm_entry(
         return
     if not _prove_move(record):
         return
-    if record["session"]["kind"] == "showrunner":
+    if record["session"]["kind"] == "showrunner" and record["requested_by"]["kind"] != "snapshot":
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
             return
@@ -2099,9 +1914,8 @@ def _acknowledge_restored_snapshots(identity: str) -> None:
 
 def snapshot_source(last_seen: str) -> str:
     taken = datetime.fromisoformat(last_seen)
-    age = max(0, int((datetime.now(timezone.utc) - taken).total_seconds()))
-    elapsed = f"{age}s" if age < 60 else f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
-    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({elapsed} ago)"
+    age = int((datetime.now(timezone.utc) - taken).total_seconds())
+    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({settle.elapsed_text(age)} ago)"
 
 
 @dataclass(frozen=True)
@@ -2210,6 +2024,7 @@ def _launch_codex_snapshot(
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
         herdr.stop_session(name)
         raise
+    _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
     _acknowledge_restored_snapshots(owner["session_id"])
     attach = shlex.join(["herdr", "session", "attach", name])
     if launches_window(owner["host"]):
@@ -2217,6 +2032,10 @@ def _launch_codex_snapshot(
         if isinstance(clients, herdr.ClientsAttached):
             return
         if isinstance(clients, herdr.NoClientAttached):
+            if sys.platform == "darwin":
+                _herdr_window(CodexWindowRestore(snapshot["machine"], owner["name"]), name,
+                    owner["cwd"], DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)
+                return
             try:
                 _open_window(_herdr_attach_command(name, owner["cwd"]),
                     DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)
@@ -2235,6 +2054,8 @@ class CrashNotChecked:
 class CrashConfirmed:
     """A recorded or current boot/host observation proves a crash signal."""
 
+    signal: Literal["reboot", "host gone"]
+
 
 @dataclass(frozen=True)
 class NoCrashSignal:
@@ -2252,7 +2073,7 @@ class RecoveryCrashCheck:
 
     def check(self, snapshot: RecoverySnapshot, entry: SnapshotSession) -> CrashConfirmed | NoCrashSignal | CrashEvidenceUnreadable:
         if "crash" in entry:
-            return CrashConfirmed()
+            return CrashConfirmed(entry["crash"])
         if isinstance(self.observation, CrashNotChecked):
             self.observation = inventory_work.snapshot_inventory()
         observed = self.observation
@@ -2261,9 +2082,9 @@ class RecoveryCrashCheck:
         previous_boot = entry.get("boot_id", snapshot.get("boot_id", ""))
         if (isinstance(observed.boot, inventory_work.KnownBoot) and previous_boot
                 and previous_boot != observed.boot.boot_id):
-            return CrashConfirmed()
+            return CrashConfirmed("reboot")
         if (snapshot["login"], entry["session"]["session_id"]) in observed.gone_hosts:
-            return CrashConfirmed()
+            return CrashConfirmed("host gone")
         return NoCrashSignal()
 
 
@@ -2336,8 +2157,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             if isinstance(evidence, NoCrashSignal):
                 print(f"{name}: no crash signal; skipped")
                 continue
-            saved = (recovery_store.snapshot_restore_record(snapshot, entry) if dry_run
-                     else materialize_snapshot(snapshot, entry))
+            verified_entry: recovery_store.SnapshotClaudeSession = {**entry, "crash": evidence.signal}
+            saved = (recovery_store.snapshot_restore_record(snapshot, verified_entry) if dry_run
+                     else materialize_snapshot(snapshot, verified_entry))
             saved = _restore_target(saved, decision, dry_run=dry_run)
             all_records.append(saved)
             recorded_ids.add(identity)
@@ -2523,7 +2345,8 @@ def up_result(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> Pe
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             print(f"{settle.local_machine()}: restart failed: {error}")
             result = MachineRestartResult(settle.local_machine(), login, "partial", failed=1)
-    return PeerRestartResult(machine=result.machine, label=result.label, outcome=result.status,
+    return PeerRestartResult(machine=result.machine, label=result.label,
+        outcome="partial" if result.failed else result.status,
         lines=output.getvalue().splitlines(), no_remote_control=[], refused=list(result.refused))
 
 

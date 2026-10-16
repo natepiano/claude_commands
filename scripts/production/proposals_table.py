@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import showrunners
-from add_unit import Refusal, production_field
+from add_unit import production_field
+from production_units import Refusal
 from issues import Issue, open_issues
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))

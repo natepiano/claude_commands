@@ -177,8 +177,10 @@ class AccountMoveTests(ShutdownTestCase):
         self.owner = worker_session("move-id", owner="director")
         self.refuses_without_change("workers move with their unit director")
 
-    def test_move_refuses_the_targets_first_check_problem_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: first target problem", "second problem"]):
+    def test_move_refuses_the_targets_first_preparation_problem_without_change(self) -> None:
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused(
+            "accounts: first target problem\naccounts: second target problem"
+        )):
             self.refuses_without_change("first target problem")
 
     def test_move_refuses_its_current_login_without_change(self) -> None:
@@ -708,7 +710,9 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_not_called()
 
     def test_group_move_refuses_first_preparation_problem_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: target problem"]):
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused(
+            "accounts: target problem\naccounts: second target problem"
+        )):
             self.batch_refuses_without_change("target problem")
 
     def assert_group_alias_moves_to_default(self, target: str) -> None:

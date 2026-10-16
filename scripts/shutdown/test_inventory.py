@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownTestCase
+from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, pane_display, top_level
 import record
 import inventory
@@ -33,7 +33,7 @@ import restart
 import shutdown
 import stop
 from fake_tmux import FakeSession
-from fake_herdr import herdr_listener
+from fake_herdr import CommandResponse, herdr_listener
 
 
 TARGET_LOGIN = "owner@example.com"
@@ -334,7 +334,8 @@ class InventoryTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        linux_process_fixture(self)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home"
         self.notes = self.root / "agents"
         self.records = self.root / "sessions"
@@ -1027,10 +1028,18 @@ elif "comm=" in joined:
                 format_text = "\t".join(field for field in format_text.split("\t") if field != "#{pid}")
             return subprocess.CompletedProcess(argv, 0,
                 pane_display(format_text, name, session_id, pid, "", started_at, server_pid), "")
-        with patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
+        with patch.object(unit_lookup, "installed_tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
             found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(len(calls), 1)
         return found
+
+    def test_tmux_host_observation_never_builds_when_its_binary_is_gone(self) -> None:
+        with (patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
+              patch.object(shutil, "which", return_value=None),
+              patch.object(subprocess, "run", side_effect=FileNotFoundError("no executable")) as run):
+            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(found, ("", {"kind": "not recorded"}, {"kind": "not recorded"}, {"kind": "not recorded"}))
+        run.assert_not_called()
 
     def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
         self.assertEqual(self.discover_tmux("production work", "$8", "62008"),
@@ -1510,9 +1519,9 @@ class ProcessEnvironmentTests(unittest.TestCase):
         ]) as probe:
             environment = inventory._process_environment(42)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(environment, {"HERDR_PANE_ID": "w1:p1", "REAL_ENTRY": "value=with=equals"})
-        self.assertEqual(probe.call_args_list[0].args[0], ("ps", "-o", "command=", "-p", "42"))
-        self.assertEqual(probe.call_args_list[1].args[0], ("ps", "eww", "-o", "command=", "-p", "42"))
-        self.assertEqual(probe.call_args_list[2].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[0].args[0], ["ps", "-o", "command=", "-p", "42"])
+        self.assertEqual(probe.call_args_list[1].args[0], ["ps", "eww", "-o", "command=", "-p", "42"])
+        self.assertEqual(probe.call_args_list[2].args[0], ["ps", "-o", "command=", "-p", "42"])
         self.assertEqual(probe.call_count, 3)
 
     def test_darwin_environment_refuses_arguments_added_between_reads(self) -> None:
@@ -1582,7 +1591,8 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        linux_process_fixture(self)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
         self.registry = self.root / "registry"
         self.config = self.root / "claude"
@@ -1630,6 +1640,230 @@ class RecoveryInventoryTests(unittest.TestCase):
             "messagingSocketPath": str(self.root / "unused.sock"), "updatedAt": 123,
             "tmux": "", "cwd": str(self.root), "status": "idle", "kind": "interactive",
         }))
+
+    def darwin_snapshot(self) -> dict[str, CommandResponse]:
+        """A Mac process tree whose external readers all use the shared fake."""
+        self.claude()
+        registered = self.registry / "1001.json"
+        data = cast(dict[str, object], json.loads(registered.read_text()))
+        data["procStart"] = "Thu Oct 15 12:00:00 2026"
+        _ = registered.write_text(json.dumps(data))
+        fake = str(Path(__file__).parents[1] / "herdr/fake_herdr.py")
+        _ = cast(object, self.enterContext(patch.object(sys, "platform", "darwin")))
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "darwin")))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_PS": fake, "HERDR_LSOF": fake, "SHUTDOWN_SYSCTL": fake,
+            "XDG_CONFIG_HOME": str(self.root / ".config"),
+        })))
+        # Unit lookup's registry liveness is independent of this synthetic PID.
+        _ = self.enterContext(patch.object(unit_lookup, "live_session", return_value=True))
+        responses: dict[str, CommandResponse] = {
+            "default": {"code": 97, "stdout": "", "stderr": "unconfigured external read"},
+            "-n kern.bootsessionuuid": {"code": 0, "stdout": "boot-mac-one\n"},
+            "--session default session list --json": {"code": 0, "stdout": json.dumps({"sessions": [{
+                "name": "writing", "running": True, "default": False,
+                "session_dir": "", "socket_path": "", } ]})},
+            "--session writing pane list": {"code": 0, "stdout": '{"result":{"panes":[]}}'},
+            "-n -P -a -U -u " + str(os.getuid()) + " -F pfn": {"code": 0,
+                "stdout": f"p500\nf3\nn{self.root}/.config/herdr/sessions/writing/herdr.sock\n"},
+        }
+        commands = {400: (1, "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", ""),
+                    300: (400, "zsh", ""), 500: (1, "herdr", " --session writing server"),
+                    501: (500, "zsh", ""), 1001: (501, "claude", " --name owner"),
+                    2001: (300, "codex", " resume"), 2002: (300, "codex", " app-server")}
+        responses["-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="] = {
+            "code": 0, "stdout": "".join(f"{pid} {parent} {os.getuid()} {executable}\n"
+                for pid, (parent, executable, _) in commands.items())}
+        responses["-U " + str(os.getuid()) + " -o pid=,command="] = {
+            "code": 0, "stdout": "".join(f"{pid} {executable}{arguments}\n"
+                for pid, (_, executable, arguments) in commands.items())}
+        for pid, (_, executable, arguments) in commands.items():
+            command = executable + arguments
+            environment = (f"CLAUDE_CONFIG_DIR={self.config} HERDR_PANE_ID=w1:p1" if pid == 1001 else
+                           "HERDR_PANE_ID=w1:p1" if pid == 501 else
+                           f"CODEX_HOME={self.root}/.codex" if pid == 2001 else "")
+            responses[f"-o command= -p {pid}"] = {"code": 0, "stdout": command + "\n"}
+            responses[f"eww -o command= -p {pid}"] = {"code": 0, "stdout": command + " " + environment + "\n"}
+            responses[f"-o lstart=,tty= -p {pid}"] = {"code": 0, "stdout": "Thu Oct 15 12:00:00 2026 ttys001\n"}
+            responses[f"-a -p {pid} -d cwd -Fn"] = {"code": 0, "stdout": f"p{pid}\nn{self.root}\n"}
+        responses["-a -p 2001 -Fn"] = {"code": 0,
+            "stdout": f"p2001\nf8\nn{self.root}/.codex/sessions/2026/rollout-date-{OTHER_ID}.jsonl\n"}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        # Fail on even an attempted proc read, including swallowed fallback reads.
+        read_bytes, read_text, iterdir = Path.read_bytes, Path.read_text, Path.iterdir
+
+        def forbid_proc(path: Path) -> None:
+            if path.is_relative_to(self.proc) or path.is_relative_to(Path("/proc")):
+                self.fail(f"Darwin observation tried to read {path}")
+
+        def checked_bytes(path: Path) -> bytes:
+            forbid_proc(path)
+            return read_bytes(path)
+
+        def checked_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            forbid_proc(path)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        def checked_iterdir(path: Path) -> Iterator[Path]:
+            forbid_proc(path)
+            return iterdir(path)
+
+        _ = self.enterContext(patch.object(Path, "read_bytes", checked_bytes))
+        _ = self.enterContext(patch.object(Path, "read_text", checked_text))
+        _ = self.enterContext(patch.object(Path, "iterdir", checked_iterdir))
+        return responses
+
+    def test_darwin_snapshot_reads_claude_codex_and_socket_host_without_proc(self) -> None:
+        _ = self.darwin_snapshot()
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        self.assertEqual(found.boot, inventory.KnownBoot("boot-mac-one"))
+        owner = found.sessions[TARGET_LOGIN][0]
+        self.assertEqual(owner["session"]["host"], inventory.HerdrHost(kind="herdr",
+            herdr_session="writing", pane_id="w1:p1", presentation="detached"))
+        self.assertEqual(owner.get("host_process"), inventory.RecoveryHostProcess(
+            kind="process", pid=500, proc_start="Thu Oct 15 12:00:00 2026"))
+        codex = found.sessions["codex-.codex"]
+        self.assertEqual(len(codex), 1)
+        self.assertEqual(codex[0]["session"]["host"], {"kind": "terminal"})
+        self.assertEqual(codex[0].get("host_process"), inventory.RecoveryHostProcess(
+            kind="process", pid=400, proc_start="Thu Oct 15 12:00:00 2026"))
+        codex_entry = codex[0]
+        assert codex_entry["agent"] == "codex"
+        self.assertEqual(codex_entry["codex"]["resume"], inventory.CodexSessionId(kind="session id", session_id=OTHER_ID))
+        self.assertEqual(inventory.codex_liveness(codex_entry), inventory.CodexLive(2001))
+        calls = [cast(list[str], json.loads(line)) for line in (self.root / "herdr-log").read_text().splitlines()]
+        self.assertIn(["-n", "kern.bootsessionuuid"], calls)
+        self.assertFalse(any("server" in call and "stop" in call for call in calls))
+
+    def test_darwin_without_installed_tmux_still_observes_native_sessions(self) -> None:
+        _ = self.darwin_snapshot()
+        with (patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
+              patch.object(shutil, "which", return_value=None)):
+            found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        self.assertEqual(set(found.sessions), {TARGET_LOGIN, "codex-.codex"})
+
+    def test_darwin_spaced_ghostty_executable_records_window_loss_for_recovery(self) -> None:
+        responses = self.darwin_snapshot()
+        for response in responses.values():
+            response["stdout"] = response["stdout"].replace(
+                "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+                "/Applications/Nix Apps/Ghostty.app/Contents/MacOS/ghostty")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        codex = first.sessions["codex-.codex"][0]
+        self.assertEqual(codex["session"]["host"], inventory.TerminalHost(kind="terminal"))
+        self.assertEqual(codex.get("host_process"), inventory.RecoveryHostProcess(
+            kind="process", pid=400, proc_start="Thu Oct 15 12:00:00 2026"))
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
+        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
+            if not line.startswith(("400 ", "300 ", "2001 ", "2002 ")))
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        lost = inventory.snapshot_inventory()
+        assert isinstance(lost, inventory.CompleteInventory), lost
+        self.assertIn(("codex-.codex", OTHER_ID), lost.gone_hosts)
+        _ = record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")
+        saved = record.read_snapshot("codex-.codex")
+        assert isinstance(saved, dict), saved
+        self.assertEqual([(item["state"], item.get("crash")) for item in saved["sessions"]],
+            [("unresolved", "host gone")])
+
+    def test_darwin_unreadable_codex_arguments_preserve_the_previous_snapshot(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        saved = record.read_snapshot("codex-.codex")
+        key = "-U " + str(os.getuid()) + " -o pid=,command="
+        responses[key]["stdout"] = responses[key]["stdout"].replace("2001 codex resume\n", "2001 (codex)\n")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.PartialInventory), found
+        self.assertIn("process 2001: arguments are unreadable", "; ".join(found.failures))
+        self.assertEqual(record.merge_snapshots(found, "2026-10-15T12:01:00+00:00"), [])
+        self.assertEqual(record.read_snapshot("codex-.codex"), saved)
+
+    def test_darwin_unreadable_codex_arguments_leave_liveness_unknown(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        codex = first.sessions["codex-.codex"][0]
+        assert codex["agent"] == "codex"
+        key = "-U " + str(os.getuid()) + " -o pid=,command="
+        responses[key]["stdout"] = responses[key]["stdout"].replace("2001 codex resume\n", "2001 (codex)\n")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        found = inventory.codex_liveness(codex)
+        assert isinstance(found, inventory.CodexLivenessUnknown), found
+        self.assertIn("process 2001: arguments are unreadable", found.reason)
+
+    def test_darwin_server_loss_retains_recovery_but_clean_exit_drops_it(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
+        # Claude exits but its listening herdr server remains: this is clean.
+        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
+            if not line.startswith("1001 "))
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        clean = inventory.snapshot_inventory()
+        assert isinstance(clean, inventory.CompleteInventory), clean
+        self.assertEqual(clean.gone_hosts, frozenset())
+        saved = record.merge_snapshots(clean, "2026-10-15T12:01:00+00:00")
+        self.assertFalse(any(item["session"]["session_id"] == "owner-id"
+            for snapshot in saved for item in snapshot["sessions"]))
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
+            if not line.startswith(("500 ", "501 ")))
+        responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
+        responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        lost = inventory.snapshot_inventory()
+        assert isinstance(lost, inventory.CompleteInventory), lost
+        self.assertEqual(lost.gone_hosts, frozenset({(TARGET_LOGIN, "owner-id")}))
+        saved = record.merge_snapshots(lost, "2026-10-15T12:02:00+00:00")
+        retained = [item for snapshot in saved for item in snapshot["sessions"]
+            if item["session"]["session_id"] == "owner-id"]
+        self.assertEqual([(item["state"], item.get("crash")) for item in retained], [("unresolved", "host gone")])
+
+    def test_darwin_reboot_retains_missing_sessions_with_crash_evidence(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        responses["-n kern.bootsessionuuid"]["stdout"] = "boot-mac-two\n"
+        responses["-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="]["stdout"] = ""
+        responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
+        responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        second = inventory.snapshot_inventory()
+        assert isinstance(second, inventory.CompleteInventory), second
+        saved = record.merge_snapshots(second, "2026-10-15T12:01:00+00:00")
+        self.assertEqual({item.get("crash") for snapshot in saved for item in snapshot["sessions"]}, {"reboot"})
+        self.assertEqual(sum(len(snapshot["sessions"]) for snapshot in saved), 2)
+        self.assertTrue(all(item["state"] == "unresolved" for snapshot in saved for item in snapshot["sessions"]))
+
+    def test_darwin_unreadable_required_program_prevents_snapshot_replacement(self) -> None:
+        responses = self.darwin_snapshot()
+        keys = ("-n kern.bootsessionuuid", "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm=",
+                "-U " + str(os.getuid()) + " -o pid=,command=",
+                "-n -P -a -U -u " + str(os.getuid()) + " -F pfn", "eww -o command= -p 1001",
+                "-a -p 1001 -d cwd -Fn", "-a -p 2001 -d cwd -Fn", "-a -p 2001 -Fn", "-o lstart=,tty= -p 1001")
+        for key in keys:
+            original = responses[key]
+            responses[key] = {"code": 1, "stdout": "", "stderr": "fixture source denied"}
+            _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+            with self.subTest(source=key):
+                found = inventory.snapshot_inventory()
+                self.assertIsInstance(found, inventory.PartialInventory)
+                assert isinstance(found, inventory.PartialInventory)
+                self.assertIn("fixture source denied", "; ".join(found.failures))
+                self.assertEqual(record.merge_snapshots(found, "2026-10-15T12:00:00+00:00"), [])
+                self.assertFalse((self.root / "shutdown/snapshots").exists())
+            responses[key] = original
 
     def test_complete_snapshot_collects_shared_sources_once_across_accounts_without_mutations(self) -> None:
         self.claude()

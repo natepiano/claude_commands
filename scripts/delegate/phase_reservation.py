@@ -9,7 +9,9 @@ a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its
 session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
 reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
 reservation, which is never recorded here (`commands/unit/direct.md` →
-<DelegatedPhaseReservationContract/>). Codex seats edit through `apply_patch`, so the Codex
+<DelegatedPhaseReservationContract/>). With one open phase there is no sibling: a `left_unmapped`
+reservation that cargo-berth's session map names for the director's bare session id, from an edit
+the director made itself, is that phase's own. Codex seats edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
 it checks every path of the phase changed since its baseline and writes `Active` from the answer.
@@ -46,6 +48,10 @@ SESSION_ENVIRONMENT = "CARGO_BERTH_SESSION_ID"
 # The engine's answer when a sibling reservation of the run already holds every checked path:
 # the reservation id it returns is the sibling's, so it is never this phase's to record.
 LEFT_UNMAPPED = "left_unmapped"
+# cargo-berth's ledger folder in the repository's common git directory, and its map from a
+# harness session id to the reservation that session holds.
+LEDGER_DIRECTORY = "cargo-berth"
+SESSION_MAP_FILE = "session-identities.json"
 # The engine's single ledger deadline is ten seconds; the rest covers a slow start under load.
 CHECK_TIMEOUT_SECONDS = 25
 PATCH_PATH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
@@ -135,9 +141,35 @@ def parse_answer(stdout: str) -> CheckAnswer:
     )
 
 
-def own_acquisition(answer: CheckAnswer) -> Acquisition | None:
-    """The reservation a clear answer gives this phase: none when a sibling's already held every path."""
-    return None if answer.session_mapping == LEFT_UNMAPPED else answer.acquisition
+def session_reservation(root: Path, session_id: str) -> tuple[str, str] | None:
+    """The reservation and run cargo-berth's session map names for `session_id`, if any."""
+    result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+    if result.returncode != 0 or not session_id:
+        return None
+    path = Path(result.stdout.strip()) / LEDGER_DIRECTORY / SESSION_MAP_FILE
+    try:
+        identities = _object(_object(cast(object, json.loads(path.read_text(encoding="utf-8")))).get("identities"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    mapped = _object(identities.get(session_id))
+    reservation, run = _string(mapped.get("reservation_id")), _string(mapped.get("coordination_run_id"))
+    return (reservation, run) if reservation and run else None
+
+
+def own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str) -> Acquisition | None:
+    """The reservation a clear answer gives this phase: none when a sibling's already held every path.
+
+    The one exception is the director's own reservation. An edit the director makes itself, such as
+    to the plan doc, checks under its bare session id, so cargo-berth maps that reservation there
+    and a later check under the phase's session answers `left_unmapped` with it. With one open
+    phase there is no sibling, and a reservation the map names for the bare session id is the phase's.
+    """
+    acquisition = answer.acquisition
+    if answer.session_mapping != LEFT_UNMAPPED or acquisition is None:
+        return acquisition
+    director = session_reservation(root, session_id) if len(phases) == 1 else None
+    return acquisition if director == (acquisition.reservation_id, acquisition.coordination_run_id) else None
 
 
 def check(root: Path, scopes: list[str], session_id: str) -> CheckAnswer:
@@ -298,11 +330,12 @@ def _record_active_command(args: argparse.Namespace) -> int:
     if not scopes:
         print("phase reservation: nothing of this phase changed since its baseline; still awaiting first touch")
         return 0
-    answer = check(root, scopes, phase_session_id(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), phase.phase))
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    answer = check(root, scopes, phase_session_id(session_id, phase.phase))
     if answer.status != CLEAR or answer.acquisition is None:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
-    acquisition = own_acquisition(answer)
+    acquisition = own_acquisition(answer, root, phases, session_id)
     if acquisition is None:
         print("phase reservation: a sibling phase's reservation holds every changed path; still awaiting first touch")
         return 0
