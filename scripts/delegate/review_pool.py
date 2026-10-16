@@ -573,11 +573,6 @@ def command_end_lease(_args: PoolArguments) -> int:
     return 0
 
 
-def command_health(_args: PoolArguments) -> int:
-    # No lease ages out any more; the hourly check stays a no-op until /review:direct drops it.
-    return 0
-
-
 def running_units(slug: str) -> set[str]:
     """Units of the production whose unit director runs, plus those whose state is unknown."""
     # unit_lookup imports its siblings by bare name, and it reads tmux and herdr, so only migrate loads it.
@@ -688,7 +683,7 @@ def command_stop(args: PoolArguments) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="verb", required=True)
-    for verb in ("prime", "allocate", "release", "retire", "end-lease", "status", "health", "stop", "unit-memory",
+    for verb in ("prime", "allocate", "release", "retire", "end-lease", "status", "stop", "unit-memory",
                  "migrate"):
         command = subparsers.add_parser(verb)
         _ = command.add_argument("--production", required=True)
@@ -713,14 +708,12 @@ def main() -> int:
             _ = command.add_argument("--thread-id", default="")
         if verb == "migrate":
             _ = command.add_argument("--apply", action="store_true")
-        if verb == "health":
-            _ = command.add_argument("--stale-hours", type=float, default=12.0)
     args = parser.parse_args(namespace=PoolArguments())
     handlers = {
         "prime": command_prime,
         "allocate": command_allocate, "release": command_release, "retire": command_retire,
         "end-lease": command_end_lease,
-        "status": command_status, "health": command_health, "stop": command_stop,
+        "status": command_status, "stop": command_stop,
         "unit-memory": command_unit_memory, "migrate": command_migrate,
     }
     try:

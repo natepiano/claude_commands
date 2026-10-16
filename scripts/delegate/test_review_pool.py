@@ -524,7 +524,7 @@ class ReviewPoolTests(unittest.TestCase):
         # The template fork has none of the unit's context, so its first turn carries the unit memory.
         self.assertEqual(parse_object(result.stdout)["lease_ordinal"], 1)
 
-    def test_old_hash_phase_lease_is_reused_until_lease_end(self) -> None:
+    def test_unit_reviewer_with_an_old_hash_is_reused_not_forked(self) -> None:
         self.seed({"code1": self.idle("unit", prime_hash="old"), "code2": self.idle()})
         result = self.allocate()
         self.assertEqual(result["reviewer"], "code1")
@@ -691,11 +691,11 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.reviewer("code1"), before)
         self.assertEqual(self.events(), [])
 
-    def test_end_lease_and_health_end_nothing(self) -> None:
+    def test_end_lease_ends_nothing_and_health_is_gone(self) -> None:
         self.seed({"code1": {**self.idle("unit"), "last_allocated": time.time() - 13 * 3600}})
+        self.assertEqual(self.run_pool("health").returncode, 2)
         before = self.reviewers()
-        for arguments in (("end-lease", "--unit", "unit"), ("end-lease", "--unit", "unit", "--phase", "phase1"),
-                          ("health",), ("health", "--stale-hours", "0")):
+        for arguments in (("end-lease", "--unit", "unit"), ("end-lease", "--unit", "unit", "--phase", "phase1")):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.succeed(*arguments), "")
                 self.assertEqual(self.reviewers(), before)
