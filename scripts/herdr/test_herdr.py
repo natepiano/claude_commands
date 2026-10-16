@@ -78,7 +78,7 @@ class HerdrTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.fake = self.root / "fake-herdr"
         source = Path(__file__).with_name("fake_herdr.py").read_text()
         _ = self.fake.write_text("#!" + sys.executable + "\n" + source.split("\n", 1)[1])

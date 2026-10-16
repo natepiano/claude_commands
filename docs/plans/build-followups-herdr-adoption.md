@@ -501,7 +501,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Gotchas:** a test that builds Linux `/proc` files pins `herdr._PLATFORM`; patching `sys.platform` after import changes nothing.
 
-### Phase 17 — Mac test parity  · status: todo
+### Phase 17 — Mac test parity  · status: done
 
 **Depends on:** Phase 16
 
@@ -515,9 +515,10 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 1. After Phase 16's checkpoint the unit director re-runs the Mac suites and hands the workers the remaining failure list and text; Phase 16's shared fixture repairs may already clear some of the 38. Group what remains by cause before any fix (Linux-only fakes such as `/proc` or systemd reached on Darwin, `/tmp` resolving to `/private/tmp`, unpinned platform branches, real Darwin defects). Fix the code when it is wrong on the Mac, the test when only the test assumes Linux.
 2. The unit director re-runs both suites on the Mac from each pushed checkpoint.
+3. Untrusted start folder (the showrunner, 2026-10-16, after the user's Mac check stopped at once on "Claude has not trusted ~"): a user never gets a trust error they have to work out. When `herdr_sessions.py start` (or `resume`) meets a folder the account has not trusted, it refuses with one command to paste that does the whole fix: the account's trust command for that folder, then `&&` the same start command with every option it was given and `--cwd` written out. The message says to accept Claude's trust prompt and exit, and the session then starts. Claude's own trust prompt stays the user's to answer; nothing writes `hasTrustDialogAccepted`. Unit director's call over a trusted default folder: no record says which trusted folder the user worked in last, and a session opened somewhere the user did not ask for is a worse surprise than one prompt. The impl worker builds it after the Mac failures, with a test that pastes nothing but checks the printed command quotes paths with spaces and keeps the claude arguments after `--`.
 
 **Files:**
-- `scripts/herdr/` — failing tests and any module a Darwin defect lives in.
+- `scripts/herdr/` — failing tests and any module a Darwin defect lives in; the untrusted-folder refusal in `herdr_sessions.py`.
 - `scripts/shutdown/` — the same.
 
 **Workers:** 2 writers, split by suite: `impl` — `scripts/herdr`; `test` — `scripts/shutdown`.

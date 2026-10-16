@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownTestCase
+from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, pane_display, top_level
 import record
 import inventory
@@ -334,9 +334,8 @@ class InventoryTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # The shared process fixture builds Linux /proc files, including socket ownership.
-        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        linux_process_fixture(self)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home"
         self.notes = self.root / "agents"
         self.records = self.root / "sessions"
@@ -1592,7 +1591,8 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        linux_process_fixture(self)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
         self.registry = self.root / "registry"
         self.config = self.root / "claude"

@@ -24,7 +24,7 @@ from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
+from test_support import linux_process_fixture, registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
 import record
 import sessions
@@ -302,9 +302,10 @@ class RestartTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        # Default fixtures model Linux; Mac cases override dispatch locally.
-        _ = cast(object, self.enterContext(patch.object(sys, "platform", "linux")))
-        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
+        # Mac cases override the shared Linux fixture locally.
+        linux_process_fixture(self)
+        # Synthetic saved PIDs do not identify processes on the test machine.
+        _ = self.enterContext(patch.object(sessions, "process_start", return_value="unrelated-process-start"))
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.desktop_state = restart.DesktopLaunchState()
         self.addCleanup(self.desktop_state.restore, dry_run=True)
@@ -3894,7 +3895,7 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(seconds, restart.WINDOW_DELAY_SECONDS)
             events.append("delay")
 
-        with patch.object(restart, "_herdr_launch"), patch.object(restart, "_retire"), patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "_run", run), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(time, "sleep", sleep), redirect_stdout(io.StringIO()):
+        with patch.object(herdr, "attached_clients", return_value=herdr.NoClientAttached()), patch.object(restart, "_herdr_launch"), patch.object(restart, "_retire"), patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "_run", run), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(time, "sleep", sleep), redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 1 if sys.platform == "linux" else 0)
         self.assertEqual(events, ["a-ghostty", "delay", "b-zed", "delay", "c-native"] if sys.platform == "linux" else
             ["a-ghostty", "delay", "b-zed", "delay", "c-native", "delay", "d-terminal"])
