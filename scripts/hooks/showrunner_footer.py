@@ -493,7 +493,15 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
             if normalised(question) not in normalised(reply):
                 return QuestionReplyBlocked(f"Question {item.text!r}: paste its reviewed question into this reply:\n{question}")
         slugs.add(Path(instance).name.removeprefix("showrunner-"))
-    if "(recommended" not in reply.lower():
+    notify_scripts = str(Path(__file__).resolve().parent.parent / "notify")
+    if notify_scripts not in sys.path:
+        sys.path.insert(0, notify_scripts)
+    if TYPE_CHECKING:
+        from ..notify import reply_asks
+    else:
+        import reply_asks
+    asks = reply_asks.user_reply_questions(reply)
+    if not asks.sentences and not asks.has_choices:
         return QuestionReplyReady()
     for slug in tuple(slugs):
         slugs.update(place_of(slug).below)
@@ -509,19 +517,12 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
                 fields = cast(dict[str, object], entry)
                 accepted.extend(value for key in ("text", "question", "reviewed")
                                 if isinstance(value := fields.get(key), str))
-    notify_scripts = str(Path(__file__).resolve().parent.parent / "notify")
-    if notify_scripts not in sys.path:
-        sys.path.insert(0, notify_scripts)
-    if TYPE_CHECKING:
-        from ..notify import reply_asks
-    else:
-        import reply_asks
-    recorded_choices = {choice_comparison_text(line) for question in accepted
-                        for line in reply_asks.reply_questions(question).choice_lines}
-    for line in reply_asks.reply_questions(reply).choice_lines:
-        compared = choice_comparison_text(line)
-        if compared not in recorded_choices and not any(compared in choice_comparison_text(question) for question in accepted):
-            return QuestionReplyBlocked(f"Unrecorded choice {line!r}: record the item and paste its reviewed question "
+    registered = [reply_asks.question_prose(choice_comparison_text(question)) for question in accepted]
+    for sentence in (*asks.sentences, *asks.choice_lines):
+        compared = reply_asks.question_prose(choice_comparison_text(sentence))
+        if compared and not any(item and (compared in item or item in compared) for item in registered):
+            return QuestionReplyBlocked(f"Unregistered ask {sentence!r}: record the item with "
+                                        + "update_registration.py footer --state and paste its reviewed question "
                                         + "into this reply.")
     return QuestionReplyReady()
 

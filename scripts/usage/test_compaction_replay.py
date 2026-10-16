@@ -27,10 +27,10 @@ class CompactionReplayTests(CollectorFixture):
                 day: int = 10, output: int = 10) -> None:
         at = f"2026-10-{day:02d}T22:{minute:02d}:00+00:00"
         with closing(sqlite3.connect(self.db_path)) as db, db:
-            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            ("natedev", "codex", "worker", "", thread, key, at, model, "medium",
                             size - cached, 0, 0, cached, output, 1, "impl", None,
-                            "recorded", "not_applicable"))
+                            "recorded", "not_applicable", "work", None))
 
     def compaction(self, thread: str, minute: int, *, day: int = 10) -> None:
         with closing(sqlite3.connect(self.db_path)) as db, db:

@@ -14,7 +14,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 | `scripts/buildlog/record.py` | `peak_and_stall()` parses the scope file into a `StepScopeMemory`. `step()` writes `peak_mem_bytes`, `mem_stall_some_s` and `mem_stall_full_s` into the step record. |
 | `scripts/buildlog/sample.py` | `sample()` (the `buildlog sample` command), the parsers `parse_meminfo`, `parse_pressure` and `parse_boot_id`, and `read_power_profile` with its path `POWER_PROFILE_STATE`. Also the types `MachineMemoryUse`, `MemoryStallTotals`, `PartialMemoryStallTotals`, `PowerProfile` and `Unmeasured`. |
 | `scripts/buildlog/store.py` | `sample_file(host, epoch)` names `<root>/<host>/samples-<YYYY-MM>.jsonl`. |
-| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 15` (the memory-admission columns are in `docs/as-built/build-memory-admission.md`): the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
+| `scripts/buildlog/index.py` | `SCHEMA_VERSION = 16` (the memory-admission columns are in `docs/as-built/build-memory-admission.md`): the two step stall columns, `SAMPLE_COLUMNS` and the `samples` table, `add_sample`, and the indexes `samples_host_at` and `steps_host_started`. |
 | `scripts/buildlog/cli.py` | The `sample` command. It takes no arguments and exits 2 if given any. |
 | `scripts/buildlog/report.py` | `memory_pressure_section()` and `MAX_SAMPLE_GAP_S`. It reuses `SCRATCH` and `SCRATCH_LABEL`. The samples' power profile feeds `power_profile_section()` (`docs/as-built/build-targets.md`, "What the reports read"). |
 | `scripts/buildlog/test_{record,index,store,sample,report}.py` | Fixture tests; see Tests below. |
