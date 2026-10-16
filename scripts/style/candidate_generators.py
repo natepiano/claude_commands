@@ -24,6 +24,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from typing import Literal
 from typing import cast
 
 @dataclass(frozen=True)
@@ -44,6 +45,12 @@ class CandidatesSpec:
     paths_exempt: tuple[str, ...] = ()
     structs: tuple[str, ...] = ()
     field_type_pattern: str = ""
+    surface: Literal["whole", "partial"] = "whole"
+    uncovered: str = ""
+
+
+class CandidatesSpecError(ValueError):
+    """A rule's candidate declaration cannot describe a valid enumeration."""
 
 
 @dataclass(frozen=True)
@@ -85,11 +92,13 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
     if not lines or lines[0].strip() != "---":
         return None
     in_block = False
+    has_candidates = False
     values: dict[str, str | tuple[str, ...]] = {}
     for line in lines[1:]:
         if line.strip() == "---":
             break
         if line.rstrip() == "candidates:":
+            has_candidates = True
             in_block = True
             continue
         if not in_block:
@@ -99,7 +108,7 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
             in_block = False
             continue
         values[match.group(1)] = _parse_spec_value(match.group(2))
-    if "kind" not in values:
+    if not has_candidates:
         return None
 
     def str_value(key: str) -> str:
@@ -112,8 +121,18 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
             return value
         return (value,) if value else ()
 
+    kind = str_value("kind")
+    if not kind:
+        raise CandidatesSpecError(f"{style_path}: candidates.kind is required")
+    surface = str_value("surface")
+    if surface not in ("whole", "partial"):
+        raise CandidatesSpecError(f"{style_path}: candidates.surface must be whole or partial")
+    uncovered = str_value("uncovered")
+    if surface == "partial" and not uncovered.strip():
+        raise CandidatesSpecError(f"{style_path}: partial candidates.surface requires uncovered")
+
     return CandidatesSpec(
-        kind=str_value("kind"),
+        kind=kind,
         origin=str(style_path),
         pattern=str_value("pattern"),
         exclude_pattern=str_value("exclude_pattern"),
@@ -122,6 +141,8 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
         paths_exempt=tuple_value("paths_exempt"),
         structs=tuple_value("structs"),
         field_type_pattern=str_value("field_type_pattern"),
+        surface=surface,
+        uncovered=uncovered,
     )
 
 

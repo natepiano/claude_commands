@@ -25,7 +25,7 @@ class CandidateGeneratorTests(unittest.TestCase):
     def test_regex_rule_filters_paths_and_lines_and_sorts_sites(self) -> None:
         rule = self.root / "rule.md"
         _ = rule.write_text(
-            "---\ncandidates:\n  kind: regex\n"
+            "---\ncandidates:\n  kind: regex\n  surface: whole\n"
             + "  pattern: 'unwrap\\('\n  exclude_pattern: 'approved'\n"
             + "  globs: ['*.rs']\n  paths: [src]\n"
             + "  paths_exempt: [src/generated]\n---\n"
@@ -53,7 +53,7 @@ class CandidateGeneratorTests(unittest.TestCase):
     def test_struct_field_rule_limits_structs_and_field_types(self) -> None:
         rule = self.root / "rule.md"
         _ = rule.write_text(
-            "---\ncandidates:\n  kind: struct_fields\n  structs: [Settings]\n"
+            "---\ncandidates:\n  kind: struct_fields\n  surface: whole\n  structs: [Settings]\n"
             + "  field_type_pattern: '\\bbool\\b'\n---\n"
         )
         _ = (self.root / "src" / "lib.rs").write_text(

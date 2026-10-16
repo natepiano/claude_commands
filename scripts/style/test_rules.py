@@ -1,0 +1,254 @@
+"""Rule metadata is validated before global and local rules enter the registry."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import cast, final, override
+from unittest import mock
+
+import rules
+import style_rules
+from candidate_generators import CandidatesSpecError, read_candidates_spec
+
+
+@final
+class RuleTests(unittest.TestCase):
+    root: Path = Path()
+    global_dir: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.global_dir = self.root / "nate_style" / "rust"
+        self.global_dir.mkdir(parents=True)
+        _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.global_dir.parent))
+
+    def write_rule(self, name: str, metadata: str) -> Path:
+        path = self.global_dir / f"{name}.md"
+        _ = path.write_text(f"---\n{metadata}---\n# {name}\n")
+        return path
+
+    def test_loads_each_tier_and_preserves_scheduling_metadata(self) -> None:
+        _ = self.write_rule("tool", "tier: A\nmechanism: clippy\n")
+        _ = self.write_rule("listed", "tier: B\nfamily: names\npre_filter: 'Some<'\nmode: propose\n")
+        _ = self.write_rule("read", "tier: C\nfamily: values\ninput_scope: file\n")
+        _ = self.write_rule("structure", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        _ = self.write_rule("process", "tier: E\n")
+
+        loaded = {rule.name: rule for rule in rules.load_rules(None)}
+
+        self.assertEqual({name: rule.tier for name, rule in loaded.items()}, {
+            "tool": "A", "listed": "B", "read": "C", "structure": "D", "process": "E",
+        })
+        self.assertEqual(loaded["listed"].pre_filter, "Some<")
+        self.assertTrue(loaded["listed"].mode_propose)
+        self.assertEqual(loaded["listed"].family, "names")
+        self.assertEqual(loaded["listed"].input_scope, "crate")
+        self.assertEqual(loaded["read"].input_scope, "file")
+        self.assertEqual(loaded["structure"].input_scope, "manifest")
+        self.assertFalse(loaded["process"].mode_propose)
+        self.assertIsNone(loaded["process"].family)
+        self.assertIsNone(loaded["read"].candidates)
+        self.assertIsNone(loaded["read"].pre_filter)
+        self.assertEqual({rule.origin for rule in loaded.values()}, {"global"})
+
+    def test_partial_candidates_retain_uncovered_surface_and_generator_constraints(self) -> None:
+        path = self.write_rule(
+            "owned-booleans",
+            "tier: B\nfamily: types\ncandidates:\n  kind: struct_fields\n"
+            + "  surface: 'partial'\n  uncovered: 'arguments, returns, accumulators'\n"
+            + "  structs: [Settings]\n  field_type_pattern: 'bool'\n",
+        )
+
+        rule, = rules.load_rules(None)
+        spec = rule.candidates
+        if spec is None:
+            self.fail("The listed rule lost its candidate declaration")
+        self.assertEqual((spec.surface, spec.uncovered), ("partial", "arguments, returns, accumulators"))
+        self.assertEqual((spec.kind, spec.structs, spec.field_type_pattern), ("struct_fields", ("Settings",), "bool"))
+        self.assertEqual(spec.origin, str(path))
+
+    def test_listed_rule_requires_a_top_level_pre_filter(self) -> None:
+        metadata = "tier: B\nfamily: names\nother:\n  pre_filter: never_matches\n"
+        path = self.write_rule("listed", metadata)
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(None)
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("requires candidates or pre_filter", str(raised.exception))
+
+        _ = self.write_rule("listed", metadata + "pre_filter: 'Some<'\n")
+        rule, = rules.load_rules(None)
+        self.assertEqual(rule.pre_filter, "Some<")
+
+    def test_candidate_metadata_errors_name_the_rule(self) -> None:
+        declarations = (
+            ("kind: regex\n  pattern: item", "surface"),
+            ("kind: regex\n  surface: uncertain", "surface"),
+            ("kind: regex\n  surface: partial", "uncovered"),
+            ("kind: regex\n  surface: partial\n  uncovered: ''", "uncovered"),
+            ("surface: whole", "kind"),
+            ("", "kind"),
+        )
+        for declaration, reason in declarations:
+            with self.subTest(declaration=declaration):
+                path = self.write_rule("invalid", f"tier: B\nfamily: names\ncandidates:\n  {declaration}\n")
+                with self.assertRaises(CandidatesSpecError) as raised:
+                    _ = read_candidates_spec(path)
+                self.assertIn(str(path), str(raised.exception))
+                self.assertIn(reason, str(raised.exception))
+                with self.assertRaises(rules.RuleValidationError) as raised_rule:
+                    _ = rules.load_rules(None)
+                self.assertIn(str(path), str(raised_rule.exception))
+
+    def test_candidate_surface_must_be_inside_its_block(self) -> None:
+        path = self.write_rule(
+            "invalid", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: item\nsurface: whole\n"
+        )
+        with self.assertRaises(CandidatesSpecError) as raised:
+            _ = read_candidates_spec(path)
+        self.assertIn("candidates.surface", str(raised.exception))
+
+    def test_nested_candidate_values_do_not_replace_top_level_rule_metadata(self) -> None:
+        _ = self.write_rule(
+            "listed", "tier: B\nfamily: names\ninput_scope: crate\n"
+            + "candidates:\n  kind: regex\n  surface: whole\n  pattern: item\n"
+            + "  family: types\n  input_scope: file\n",
+        )
+        rule, = rules.load_rules(None)
+        self.assertEqual((rule.family, rule.input_scope), ("names", "crate"))
+
+    def test_rejects_invalid_tier_family_mechanism_scope_and_listing(self) -> None:
+        declarations = (
+            ("family: names\n", "tier"),
+            ("tier: F\n", "tier"),
+            ("tier: ''\n", "tier"),
+            ("tier: A\nmechanism: llm\n", "mechanism"),
+            ("tier: A\n", "mechanism"),
+            ("tier: C\nfamily: names\nmechanism: rustfmt\n", "mechanism"),
+            ("tier: B\nfamily: names\nmechanism: mend\n", "mechanism"),
+            ("tier: A\nmechanism: clippy\nfamily: names\n", "forbidden"),
+            ("tier: E\nfamily: names\n", "forbidden"),
+            ("tier: B\npre_filter: item\n", "family"),
+            ("tier: C\n", "family"),
+            ("tier: D\n", "family"),
+            ("tier: C\nfamily: other\n", "family"),
+            ("tier: C\nfamily: names\ninput_scope: directory\n", "input_scope"),
+            ("tier: C\nfamily: names\ninput_scope: ''\n", "input_scope"),
+            ("tier: B\nfamily: names\n", "requires candidates or pre_filter"),
+            ("tier: B\nfamily: names\npre_filter: ''\n", "requires candidates or pre_filter"),
+        )
+        for declaration, reason in declarations:
+            with self.subTest(declaration=declaration):
+                path = self.write_rule("invalid", declaration)
+                with self.assertRaises(rules.RuleValidationError) as raised:
+                    _ = rules.load_rules(None)
+                self.assertIn(str(path), str(raised.exception))
+                self.assertIn(reason, str(raised.exception))
+
+    def test_tool_mechanisms_are_all_tier_a(self) -> None:
+        for mechanism in ("clippy", "mend", "rustfmt"):
+            _ = self.write_rule(mechanism, f"tier: A\nmechanism: '{mechanism}'\n")
+        loaded = rules.load_rules(None)
+        self.assertEqual([rule.name for rule in loaded], ["clippy", "mend", "rustfmt"])
+        self.assertEqual([rule.tier for rule in loaded], ["A", "A", "A"])
+
+    def test_discovers_root_and_member_rules_without_filtering_tool_or_bevy_rules(self) -> None:
+        global_path = self.write_rule("same-name", "tier: A\nmechanism: mend\ntags:\n  - bevy\nmode: auto\n")
+        repo = self.root / "repo"
+        root_dir = repo / "docs" / "style"
+        member_dir = repo / "docs" / "member" / "style"
+        nested_dir = repo / "docs" / "nested" / "other" / "style"
+        for directory in (root_dir, member_dir, nested_dir):
+            directory.mkdir(parents=True)
+        root_path = root_dir / "same-name.md"
+        member_path = member_dir / "member-rule.md"
+        _ = root_path.write_text("---\ntier: C\nfamily: values\n---\n# Root rule\n")
+        _ = member_path.write_text("---\ntier: D\nfamily: modules\n---\n# Member rule\n")
+        _ = (nested_dir / "ignored.md").write_text("No metadata: below the lookup depth\n")
+
+        loaded = rules.load_rules(repo)
+
+        self.assertEqual([rule.path for rule in loaded], [global_path, root_path, member_path])
+        self.assertEqual([rule.origin for rule in loaded], ["global", "local", "local"])
+        self.assertEqual([rule.family for rule in loaded], [None, "values", "modules"])
+
+    def test_local_rules_must_declare_tier_and_family(self) -> None:
+        repo = self.root / "repo"
+        local_dir = repo / "docs" / "member" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "local.md"
+        for declaration, reason in (("family: names", "tier"), ("tier: C", "family")):
+            with self.subTest(declaration=declaration):
+                _ = path.write_text(f"---\n{declaration}\n---\n# Local rule\n")
+                with self.assertRaises(rules.RuleValidationError) as raised:
+                    _ = rules.load_rules(repo)
+                self.assertIn(str(path), str(raised.exception))
+                self.assertIn(reason, str(raised.exception))
+
+    def test_blob_tracks_uncommitted_file_contents(self) -> None:
+        path = self.write_rule("read", "tier: C\nfamily: types\n")
+        first, = rules.load_rules(None)
+        content = path.read_bytes()
+        expected = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+        self.assertEqual(first.blob, expected)
+        _ = path.write_text(path.read_text() + "Changed rule text\n")
+        second, = rules.load_rules(None)
+        self.assertNotEqual(first.blob, second.blob)
+
+    def test_focused_eval_keeps_its_json_protocol_with_new_metadata(self) -> None:
+        path = self.write_rule(
+            "listed", "tier: B\nfamily: names\ninput_scope: crate\nmechanism: llm\nmode: propose\n"
+            + "tags:\n  - non-negotiable\ncandidates:\n  kind: regex\n  surface: whole\n  pattern: item\n",
+        )
+        loader = self.root / "list-files.zsh"
+        _ = loader.write_text('printf \'%s\\n\' "$STYLE_RULE_TEST_FILE"\n')
+        environment = {
+            **os.environ,
+            "STYLE_HISTORY_NATE_STYLE_DIR": str(self.global_dir.parent),
+            "STYLE_HISTORY_LOAD_STYLE_SCRIPT": str(loader),
+            "STYLE_RULE_TEST_FILE": str(path),
+        }
+        output = subprocess.run(
+            [sys.executable, str(Path(style_rules.__file__)), "focused-eval",
+             "--project-root", str(self.root), "--guideline", "listed"],
+            env=environment, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(output.stdout, json.dumps({
+            "unit_id": "rust/listed.md",
+            "display_name": "listed",
+            "guideline_ids": ["rust/listed.md"],
+            "see_also_guideline_ids": [],
+        }, sort_keys=True) + "\n")
+
+    def test_cli_lists_the_same_metadata_as_text_and_json_and_reports_invalid_rules(self) -> None:
+        _ = self.write_rule(
+            "listed", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: item\n  surface: whole\n"
+        )
+        environment = {**os.environ, "STYLE_HISTORY_NATE_STYLE_DIR": str(self.global_dir.parent)}
+        command = [sys.executable, str(Path(rules.__file__)), "list"]
+        text = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+        self.assertEqual(text.stdout.splitlines(), [
+            "name\ttier\tfamily\tinput_scope\tsurface", "listed\tB\tnames\tcrate\twhole",
+        ])
+        output = subprocess.run([*command, "--json"], env=environment, capture_output=True, text=True, check=True)
+        rows = cast(list[rules.RuleListing], json.loads(output.stdout))
+        self.assertEqual(rows, [{
+            "name": "listed", "tier": "B", "family": "names", "input_scope": "crate", "surface": "whole",
+        }])
+        invalid = self.write_rule("invalid", "tier: C\n")
+        error = subprocess.run(command, env=environment, capture_output=True, text=True, check=False)
+        self.assertEqual(error.returncode, 2)
+        self.assertIn(str(invalid), error.stderr)
+        self.assertNotIn("Traceback", error.stderr)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

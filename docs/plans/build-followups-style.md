@@ -123,7 +123,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** Holding the new tests to Python 3.10 — the repo already uses `typing.override`.
 
-### Phase 2 — Rule metadata: tier, family, input scope and generator surface  · status: todo
+### Phase 2 — Rule metadata: tier, family, input scope and generator surface  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
