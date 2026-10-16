@@ -186,6 +186,11 @@ COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
+# Codex compacts a thread on its own once its context passes this many tokens. Every request
+# re-reads the whole context, and threads left to Codex's default grew to 460K; a 200K cap cut a
+# replayed day of worker usage by 19% (user, 2026-10-15). A server started with another value is
+# retired at the next dispatch, so each worker moves to the new limit after its current turn.
+AUTO_COMPACT_TOKENS = 200_000
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
@@ -236,6 +241,7 @@ class ServerRecord(TypedDict):
     port: int
     pid: int
     codex_home: NotRequired[str]
+    auto_compact_tokens: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -1533,15 +1539,17 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
             recorded_home = server_record_home(record)
             matching_home = recorded_home == selected_home
             old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
-            if matching_home and not old_sign_in:
+            old_limit = record.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
+            if matching_home and not old_sign_in and not old_limit:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
                 return port, False
             # A sign-in change `signin-changed` did not catch. The workers still on this server keep
             # it until they let go; its watcher then stops it.
             _retire_record(session_dir, record)
-            cause = (f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
-                     else f"no longer serves the workers home {codex_home_display(selected_home)}")
+            cause = (f"no longer serves the workers home {codex_home_display(selected_home)}" if not matching_home
+                     else f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
+                     else f"compacts at another limit than {AUTO_COMPACT_TOKENS} tokens")
             _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
             if not _stop_unused_with_lock_held(None, pid, port):
                 _ = _start_watcher(session_dir, pid, port)
@@ -1554,13 +1562,15 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
     log_path = _session_path(session_dir, SERVER_LOG)
     with log_path.open("ab") as log_handle:
         process = subprocess.Popen(
-            ["codex", "-c", "thread_unload_delay_secs=0", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
+            ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
+             "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
             stdout=subprocess.DEVNULL,
             stderr=log_handle,
             start_new_session=True,
             env={**os.environ, "CODEX_HOME": str(workers_home)},
         )
-    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home)}
+    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
+                            "auto_compact_tokens": AUTO_COMPACT_TOKENS}
     try:
         deadline = time.time() + SERVER_START_TIMEOUT_SECS
         while time.time() < deadline:
