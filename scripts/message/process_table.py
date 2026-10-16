@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+from collections.abc import Mapping
 from typing import NamedTuple
 
 PS = shlex.split(os.environ.get("PROCESS_TABLE_PS") or "ps -eo pid=,ppid=,comm=,args=")
@@ -31,6 +32,22 @@ def snapshot() -> dict[int, Process]:
                 fields[3] if len(fields) > 3 else "",
             )
     return table
+
+
+def nearest_named(
+    process: Process,
+    table: Mapping[int, Process],
+    names: Mapping[int, str],
+) -> str | None:
+    """Find the nearest named process, including this one; stop at a missing parent or cycle."""
+    seen: set[int] = set()
+    current: Process | None = process
+    while current is not None and current.pid not in seen:
+        if current.pid in names:
+            return names[current.pid]
+        seen.add(current.pid)
+        current = table.get(current.parent)
+    return None
 
 
 def is_codex_agent(process: Process) -> bool:

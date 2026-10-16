@@ -15,7 +15,8 @@ Specification, team partition, boundaries, or verification on the strength of
 earlier work.
 
 Every review prompt carries sections 7 and 9 the same way, plus the role-switch
-opening in <ReviewPromptContract/>.
+opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
+3's `## Builds and tests` section verbatim.
 
 1. Role: write the requested code directly; do not ask questions. Name the
    slot this prompt is for and the role assigned by the Work Order's **Workers**
@@ -24,7 +25,8 @@ opening in <ReviewPromptContract/>.
    committed.` A replacement thread uses opening wording instead.
 2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
    reasons, and deviations when done, and **write that summary to this slot's
-   `impl_summary_<slot>.txt` as the last act before finishing** — a background
+   `${PHASE_DIR}/impl_summary_<slot>.txt`, its path written out in full, as the
+   last act before finishing** — a background
    session has no output redirect, so a summary left only in the reply is a
    summary the unit director never sees. State this slot's file set and the
    peer's file set per <TeamFilePartition/>, and that a peer's file is blocked
@@ -36,9 +38,33 @@ opening in <ReviewPromptContract/>.
    `load-rust-style.sh`; the unit director runs the style review in its main
    review each phase." Codex lists `rust_style` to every worker, which loads
    it unless told not to.
-3. Narration: before each activity, run
+3. Narration: when the activity changes — a new piece of work, or a run
+   started — run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
-   Use short present-tense text and never read the heartbeat file. Role
+   Use short present-tense text and never read the heartbeat file. Post
+   nothing while the activity stays the same. Every prompt to a Codex worker
+   carries this section verbatim, after section 2:
+
+   ```
+   ## Builds and tests
+
+   Run only commands that finish within one call. Never make an empty
+   write_stdin poll, for any command, build or not. Anything longer runs
+   detached: each verify.sh line as listed, which detaches itself, or any
+   other command as
+   `python3 ~/.claude/scripts/agents/mesh_runs.py start --label "<what>" -- <command>`.
+   Either returns at once with one line naming the run, its pid and its log.
+   Keep working if you have other work; otherwise end your turn. The result
+   (pass or fail, exit code, log path, last lines) arrives as your next
+   message, also after an account move or a stop. Never poll, sleep, call
+   `wait`, loop on a status file, or post a waiting status.
+   ```
+
+   Every model call resends the worker's whole context, and on 2026-10-15
+   68% of worker calls were waits, sleeps and status posts. The unit
+   director's side is <WorkerRuns/> in `/unit:direct`. A Claude worker
+   gets no such section: it runs its commands with `run_in_background: true`
+   and ends its turn until the task notification arrives. Role
    changes: **before the first tool call in a new role** — taking a slice of
    the test work, standing down — run
    `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
@@ -113,7 +139,8 @@ The Verification section carries the applicable command lines and every
 delegate-facing rule from <VerificationContract/>, with nothing added around
 them. It must also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
-output has been read. A run that prints `PASS (recorded)` is that gate's result,
+output has been read. For a Codex worker, the final report waits for the
+results item 3's runs send. A run that prints `PASS (recorded)` is that gate's result,
 and the log it names is the output to read; add `--no-cache` only to re-run a
 passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
 package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
@@ -172,7 +199,7 @@ open Codex worker with `--to <full-worker-name>`, then apply
 the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
 the rest of the procedure.
 
-The phase is complete only when every slot has a terminal `impl_status_<slot>`,
+The phase is complete only when every slot has a terminal `${PHASE_DIR}/impl_status_<slot>`,
 not when the first one lands. Reading one slot's `implemented` as the phase's
 result is the same defect as reading a completion notification as a finished
 assignment. Completion ends the turns, not their Codex threads.

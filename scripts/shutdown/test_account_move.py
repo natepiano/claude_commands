@@ -61,12 +61,13 @@ class AccountMoveTests(ShutdownTestCase):
             "oauthAccount": {"emailAddress": "default@example.invalid"},
         }), encoding="utf-8")
         self.note("claude2", "default@example.invalid")
+        self.named_account("claude2", "default@example.invalid")
         self.named_account("claude1", "current@example.invalid")
         self.named_account("claude3", "target@example.invalid")
         self.owner = top_level("move-id", name="kept name", host=tmux_host("kept tmux"))
         self.owner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=self.live_registry))
-        _ = self.enterContext(patch.object(account, "process_config_dir", return_value=accounts.account_dir("claude1")))
+        _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=AssertionError("accounts must use the listing")))
         _ = self.enterContext(patch.object(inventory, "listing", side_effect=self.current_listing))
         at = datetime.now(timezone.utc)
@@ -176,8 +177,10 @@ class AccountMoveTests(ShutdownTestCase):
         self.owner = worker_session("move-id", owner="director")
         self.refuses_without_change("workers move with their unit director")
 
-    def test_move_refuses_the_targets_first_check_problem_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: first target problem", "second problem"]):
+    def test_move_refuses_the_targets_first_preparation_problem_without_change(self) -> None:
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused(
+            "accounts: first target problem\naccounts: second target problem"
+        )):
             self.refuses_without_change("first target problem")
 
     def test_move_refuses_its_current_login_without_change(self) -> None:
@@ -202,12 +205,12 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_called_once()
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--to") + 1], target)
-        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / ".claude")
+        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / f".{target}")
 
-    def test_move_to_the_home_logins_note_number_uses_its_home(self) -> None:
+    def test_move_to_claude2_uses_its_numbered_folder(self) -> None:
         self.assert_move_to_the_home_number("claude2")
 
-    def test_move_to_a_named_directory_sharing_the_home_login_uses_its_home(self) -> None:
+    def test_move_to_a_named_directory_sharing_the_legacy_login_keeps_the_numbered_folder(self) -> None:
         self.named_account("claude4", "default@example.invalid")
         self.assert_move_to_the_home_number("claude4")
 
@@ -707,7 +710,9 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_not_called()
 
     def test_group_move_refuses_first_preparation_problem_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: target problem"]):
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused(
+            "accounts: target problem\naccounts: second target problem"
+        )):
             self.batch_refuses_without_change("target problem")
 
     def assert_group_alias_moves_to_default(self, target: str) -> None:

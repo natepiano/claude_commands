@@ -21,11 +21,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
 for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-import add_unit  # noqa: E402
+import production_units  # noqa: E402
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
 import showrunners  # noqa: E402
@@ -35,8 +36,10 @@ import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 if TYPE_CHECKING:
+    from ..accounts.role_map import role_map_command
     from ..whoami import account, agent_accounts, note_file
 else:
+    from scripts.accounts.role_map import role_map_command
     import account as account
     import agent_accounts as agent_accounts
     import note_file as note_file
@@ -639,7 +642,7 @@ def _showrunner_ids(
     return found
 
 
-class _ProductionUnitMarks(add_unit.SessionMarks):
+class _ProductionUnitMarks(production_units.SessionMarks):
     """Use the roster's known marks, retaining rows when those marks are unreadable."""
 
     def __init__(self, slug: str, every: unit_lookup.MarkedProductions | OSError) -> None:
@@ -660,7 +663,7 @@ def _production_rows(
 ) -> list[dict[str, str]]:
     lines = doc.read_text(encoding="utf-8").splitlines()
     marks = _ProductionUnitMarks(slug, every)
-    return [row for row in add_unit.unit_table(lines) if not add_unit.unit_is_retired(row, marks)]
+    return [row for row in production_units.unit_table(lines) if not production_units.unit_is_retired(row, marks)]
 
 
 def _every_marked_unit(*, include_tmux: bool) -> unit_lookup.MarkedProductions | OSError:
@@ -697,11 +700,11 @@ def _production_places(
                 raise OSError(every.faults[runner["slug"]])
             rows = _production_rows(doc, runner["slug"], every)
             units = every.units.get(runner["slug"], {})
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             _problem(problems, f"unit hosts for {runner['slug']} were not read", error)
         else:
             for row in rows:
-                unit_name = add_unit.cell_value(row.get("Unit", ""))
+                unit_name = production_units.cell_value(row.get("Unit", ""))
                 marked = units.get(unit_name)
                 if marked is None:
                     continue
@@ -723,12 +726,12 @@ def _production_places(
         # Worktree ownership is a fallback only when neither host could be read.
         try:
             rows = _production_rows(doc, runner["slug"], every)
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as fallback_error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
             _problem(problems, f"units in {doc}", fallback_error)
             continue
         for row in rows:
-            unit_name = add_unit.cell_value(row.get("Unit", ""))
-            worktree = add_unit.cell_value(row.get("Worktree", ""))
+            unit_name = production_units.cell_value(row.get("Unit", ""))
+            worktree = production_units.cell_value(row.get("Worktree", ""))
             for record in records:
                 if (record["sessionId"] not in ledger_workers and worktree
                         and details[record["sessionId"]].cwd == worktree):
@@ -902,9 +905,14 @@ def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
     return AccountLabel(identity.label) if isinstance(identity, agent_accounts.KnownCodexAccount) else AccountUnread(identity.reason)
 
 
-def _process_account(pid: int, kind: str) -> AccountLabel | AccountUnread:
+_HOME_ACCOUNT_UNCHECKED = account.HomeAccountUnchecked()
+
+
+def _process_account(pid: int, kind: str, *,
+                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED,
+                     ) -> AccountLabel | AccountUnread:
     if kind == "claude":
-        identity = account.account_of(pid)
+        identity = account.account_of(pid, home_state=home_state)
         return AccountLabel(identity.label) if identity is not None else AccountUnread("process account could not be read")
     home = account.process_codex_home(pid)
     if isinstance(home, account.ProcessEnvironmentUnread):
@@ -922,7 +930,10 @@ def _worker_account(run: _LiveRun, worker: _MeshWorker, homes: dict[int, Path]) 
     if isinstance(port, int) and not isinstance(port, bool) and port in homes:
         return _codex_home_account(homes[port])
     # Idle shutdown removes server metadata; the next turn uses the workers home.
-    return _codex_home_account(agent_accounts.workers_home())
+    try:
+        return _codex_home_account(agent_accounts.workers_home())
+    except ValueError as error:
+        return AccountUnread(str(error))
 
 
 def _worker_status(status: str) -> str:
@@ -966,7 +977,8 @@ def _claude_entries(
     machine: str, records: list[SessionRecord], details: Mapping[str, _ClaudeDetails],
     runner_ids: Mapping[str, showrunners.Showrunner],
     production_places: Mapping[str, _ProductionPlace], runs: list[_LiveRun],
-    workers: Mapping[str, _WorkerPlace],
+    workers: Mapping[str, _WorkerPlace], *,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> dict[str, RosterEntry]:
     marker_directors = {
         run.director.session_id
@@ -1033,7 +1045,7 @@ def _claude_entries(
             director=director,
             assignment=assignment,
             session=ClaudeSession(session_id),
-            account=_process_account(record["pid"], "claude"),
+            account=_process_account(record["pid"], "claude", home_state=home_state),
         )
     return entries
 
@@ -1087,11 +1099,13 @@ def _reviewer_cwd(process: _ReviewerProcess, fallback: str) -> str:
 
 def _review_workers(
     machine: str, run: _LiveRun, place: _RunPlace,
-    table: Mapping[int, process_table.Process], problems: list[str],
+    table: Mapping[int, process_table.Process], problems: list[str], *,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
-        statuses = sorted(run.path.glob("review_status*"))
+        # A launch that names its phase writes in that phase's directory.
+        statuses = sorted([*run.path.glob("review_status*"), *run.path.glob("phases/*/review_status*")])
     except OSError as error:
         _problem(problems, f"review state in {run.path}", error)
         return entries
@@ -1107,7 +1121,7 @@ def _review_workers(
             continue
         if status != "reviewing":
             continue
-        pid_path = run.path / f"review_pid{suffix}"
+        pid_path = status_path.parent / f"review_pid{suffix}"
         try:
             launcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
         except (OSError, UnicodeError, ValueError) as error:
@@ -1131,7 +1145,7 @@ def _review_workers(
             showrunner=place.showrunner,
             director=place.director,
             assignment=WorkerAssignment(slot_role, str(run.path)),
-            account=_process_account(process.pid, process.kind),
+            account=_process_account(process.pid, process.kind, home_state=home_state),
         ))
     return entries
 
@@ -1139,7 +1153,7 @@ def _review_workers(
 def _delegate_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
-    problems: list[str],
+    problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
         table = process_table.snapshot()
@@ -1183,7 +1197,7 @@ def _delegate_workers(
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))
-        entries.extend(_review_workers(machine, run, place, table, problems))
+        entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
     return entries, worker_threads
 
 
@@ -1230,6 +1244,7 @@ def machine_name() -> str:
 
 
 def _local_roster(environment: Mapping[str, str]) -> Roster:
+    home_state = account.home_account_state()
     problems: list[str] = []
     machine = machine_name()
     records = _newest_sessions()
@@ -1243,10 +1258,10 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
         records, details, registered, runner_ids, set(workers), problems
     )
     claude = _claude_entries(
-        machine, records, details, runner_ids, production_places, runs, workers
+        machine, records, details, runner_ids, production_places, runs, workers, home_state=home_state
     )
     delegate_workers, worker_threads = _delegate_workers(
-        machine, runs, claude, production_places, problems
+        machine, runs, claude, production_places, problems, home_state=home_state
     )
     daemon_socket = codex_daemon.daemon_socket(environment)
     daemon = codex_daemon.loaded_sessions(daemon_socket)
@@ -1317,6 +1332,7 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
     return result
 
 
+@role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
     match scope:
         case ThisMachine():

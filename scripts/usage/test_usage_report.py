@@ -188,12 +188,81 @@ class UsageReportTests(ReportFixture):
 
     def metric_request(self, thread: str, minute: int, uncached: int, cached: int = 0, *,
                        key: str = "rollout-metric.jsonl:100", role: str = "impl",
-                       model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev") -> None:
+                       model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev",
+                       activity: str = "work", wait_action: str | None = None) -> None:
         with closing(sqlite3.connect(self.db_path)) as db, db:
-            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (machine, "codex", "worker", parent, thread, key,
                             f"2026-10-11T12:{minute:02d}:00+00:00", model, "medium",
-                            uncached, 0, 0, cached, 10, 1, role, None, "recorded", "not_applicable"))
+                            uncached, 0, 0, cached, 10, 1, role, None, "recorded", "not_applicable",
+                            activity, wait_action))
+
+    def activity_requests(self) -> None:
+        """gpt-5.6-sol weighs cached input 0.1 and output 8; every request has 10 output, 80 weighted."""
+        self.clear_metric_turns()
+        self.metric_request("worker", 0, 100, 1000, key="rollout-metric.jsonl:0")  # 100 + 100 + 80 = 280
+        self.metric_request("worker", 1, 20, 200, key="rollout-metric.jsonl:1",
+                            activity="wait", wait_action="empty write_stdin")  # 20 + 20 + 80 = 120
+        self.metric_request("worker", 2, 0, key="rollout-metric.jsonl:2", activity="status")  # 80
+        self.metric_request("reviewer", 3, 50, role="review", key="rollout-metric.jsonl:3",
+                            activity="unclassified")  # 50 + 80 = 130
+
+    def table_rows(self, *arguments: str) -> list[list[str]]:
+        result = self.report(*arguments)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        lines = result.stdout.split("\nCoverage\n", 1)[0].splitlines()
+        return [[cell.strip() for cell in line.strip("|").split("|")] for line in lines
+                if line.startswith("| ") and not line.startswith("| ---")][1:]
+
+    def test_wait_status_and_context_shares_divide_their_weighted_parts_by_weighted_tokens(self) -> None:
+        self.activity_requests()
+        self.assertEqual(self.table_rows("wait_share", "--by", "role"),
+                         [["impl", "120", "480", "25.0%"], ["review", "0", "130", "0.0%"]])
+        self.assertEqual(self.table_rows("status_share", "--by", "role"),
+                         [["impl", "80", "480", "16.7%"], ["review", "0", "130", "0.0%"]])
+        self.assertEqual(self.table_rows("context_share", "--by", "role"),
+                         [["impl", "120", "480", "25.0%"], ["review", "0", "130", "0.0%"]])
+
+    def test_activity_dimension_groups_every_turn_metric_and_coverage_counts_unclassified_turns(self) -> None:
+        self.activity_requests()
+        self.assertEqual(self.table_rows("weighted", "--by", "activity"),
+                         [["status", "80", "1", "80"], ["unclassified", "130", "1", "130"],
+                          ["wait", "120", "1", "120"], ["work", "280", "1", "280"]])
+        self.assertEqual(self.table_rows("wait_share", "--by", "role,activity")[1],
+                         ["impl", "wait", "120", "120", "100.0%"])
+        result = self.report("wait_share")
+        self.assertIn("Review turns with unrecorded lens: 0.\nTurns with unclassified activity: 1.\n", result.stdout)
+        refused = self.report("compactions_per_thread", "--by", "activity")
+        self.assertEqual((refused.returncode, refused.stdout), (2, ""))
+        self.assertIn("cannot group by 'activity'", refused.stderr)
+
+    def test_activity_reads_the_same_through_a_general_aggregate(self) -> None:
+        self.activity_requests()
+        script = """
+import argparse
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from scripts.usage.usage_report import METRICS, Metric, ReportFormat, TurnAggregate, main
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--db', type=Path, required=True)
+parser.add_argument('--production-docs', type=Path, required=True)
+paths = parser.parse_args()
+METRICS['wait_share'] = Metric('wait_share', METRICS['wait_share'].description,
+    TurnAggregate('wait', "sum(CASE WHEN activity = 'wait' THEN weighted ELSE 0 END)", weighted=True),
+    TurnAggregate('weighted', 'sum(weighted)', weighted=True), ReportFormat.SHARE)
+output = StringIO()
+with redirect_stdout(output):
+    assert main(['--db', str(paths.db), '--production-docs', str(paths.production_docs),
+                 'wait_share', '--by', 'role,activity']) == 0
+print(output.getvalue(), end='')
+"""
+        general = self.report_script(script)
+        self.assertEqual((general.returncode, general.stderr), (0, ""))
+        additive = self.report("wait_share", "--by", "role,activity")
+        self.assertEqual(general.stdout, additive.stdout)
+        self.assertIn("Turns with unclassified activity: 1.\n", general.stdout)
 
     def metric_compaction(self, thread: str, minute: int) -> None:
         with closing(sqlite3.connect(self.db_path)) as db, db:

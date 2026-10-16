@@ -1000,6 +1000,78 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(self.command("free-now", "--repo-root", str(liner)), 1, "blocked\n")
         self.assertEqual(self.logged_arguments("gh"), [])
 
+    def start_script_child(self, code: str) -> subprocess.Popen[str]:
+        ready = self.root / f"ready-{len(self.children)}"
+        child = subprocess.Popen([sys.executable, "-c", code + f"\nopen({str(ready)!r}, 'w').close()\n"
+                                  + "import time\ntime.sleep(60)"], text=True)
+        self.children.append(child)
+        self.wait_for_path(ready)
+        return child
+
+    def copy_claim(self, owner: int, worktree: Path) -> subprocess.CompletedProcess[str]:
+        return self.command("claim", "--pid", str(owner), "--what", "nextest hana", "--worktree", str(worktree),
+                            "--copy")
+
+    def test_copy_claim_record_status_and_free_now(self) -> None:
+        hana = self.repository("hana")
+        self.write_config(offload="on", ci_repo="")
+        owner = self.start_child()
+        self.assert_command(self.copy_claim(owner.pid, hana), 0, "claimed\n")
+        record = cast(dict[str, object], json.loads((self.state_directory / "claims" / "hana.json").read_text()))
+        self.assertIs(record["copy"], True)
+        status = self.command("status")
+        self.assertEqual(status.stdout.splitlines()[0], f"running: copy of nextest hana ({hana}) since "
+                         + self.local_time(cast(str, record["since"])))
+        # A copy holds the scope only for another copy.
+        self.assert_command(self.command("free-now", "--repo-root", str(hana)), 0, "free\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(hana), "--copy"), 1, "busy\n")
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        self.assertNotIn("copy", self.repository_claim("hana"))
+        self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(hana), "--copy"), 1, "busy\n")
+
+    def test_new_test_stops_a_copy_and_claims(self) -> None:
+        hana = self.repository("hana")
+        copy = self.start_child()
+        self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
+        taker = self.start_child()
+        # The copy's parent reaps it, as the copy watcher reaps offload.py.
+        reaper = threading.Thread(target=copy.wait)
+        reaper.start()
+        self.assert_command(self.claim_in(taker.pid, "hana tests", hana), 0, "claimed\n")
+        reaper.join(timeout=10)
+        self.assertEqual(copy.returncode, -15)
+        self.assertEqual(self.repository_claim("hana")["pid"], taker.pid)
+
+    def test_copy_that_does_not_stop_leaves_the_new_test_busy(self) -> None:
+        hana = self.repository("hana")
+        copy = self.start_script_child("import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)")
+        self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        taker = self.start_child()
+        started = time.monotonic()
+        result = self.command("claim", "--pid", str(taker.pid), "--what", "hana tests", "--worktree", str(hana),
+                              environment={**self.environment, "MAC_TEST_COPY_YIELD_S": "0.5"})
+        self.assert_command(result, 11, self.busy_line(held))
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        self.assertIsNone(copy.poll())
+        self.assertEqual(self.repository_claim("hana"), held)
+
+    def test_a_copy_never_replaces_a_copy_and_a_mac_only_run_never_gives_way(self) -> None:
+        hana = self.repository("hana")
+        first, second = self.start_child(), self.start_child()
+        self.assert_command(self.copy_claim(first.pid, hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        self.assert_command(self.copy_claim(second.pid, hana), 11, self.busy_line(held))
+        self.assertIsNone(first.poll())
+        self.assert_command(self.command("release", "--pid", str(first.pid)), 0, "")
+        self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        self.assert_command(self.claim_in(second.pid, "more hana tests", hana), 11, self.busy_line(held))
+        self.assert_command(self.copy_claim(second.pid, hana), 11, self.busy_line(held))
+        self.assertIsNone(first.poll())
+
     def write_machine_wide_record(self, owner: int, worktree: Path) -> RunState:
         started = mac_test.process_start_time(owner)
         assert started is not None

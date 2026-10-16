@@ -5,7 +5,7 @@ Usage: promote_showrunner.py <unit> --production <child production doc> --model 
 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
 The unit gets `/exit`; once its Claude is gone its host session is ended, and add_showrunner.py resumes
-the same conversation as the child's showrunner: in tmux, with no unit mark, on the configured showrunners account,
+the same conversation as the child's showrunner: in its own herdr session, with no unit mark, on the configured showrunners account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
 showrunner's checkout. --check runs every refusal and stops nothing.
 
@@ -35,8 +35,8 @@ import unit_lookup
 import unit_runs
 import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
-from add_unit import (Production, Refusal, cell_value, commit_paths, plan_cell_is_retired, read_production,
-                      unit_headings, unit_rows, unit_table)
+from add_unit import Production, commit_paths, read_production
+from production_units import Refusal, cell_value, plan_cell_is_retired, unit_headings, unit_rows, unit_table
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -135,9 +135,9 @@ def checked(name: str, child_doc: Path) -> Promotion:
     _settled(unit, claude, worktree)
     child = read_production(child_doc)
     _committed(child.doc)
-    # Only the unit's tmux session is exempt from the destination's tmux name collision.
+    # Only the unit's herdr session will end before the same-named destination starts.
     directory = showrunner_account_directory()
-    ending = marked.label if isinstance(marked.place, unit_lookup.TmuxPlace) else ""
+    ending = marked.label if isinstance(marked.place, herdr.HerdrPlace) else ""
     _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 
@@ -256,6 +256,10 @@ def main(argv: list[str]) -> int:
     started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                    "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
                                    "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
+    if started == add_showrunner.SESSION_NOT_READY:
+        print(f"{unit}'s session is open but not ready; its showrunner prompt was not sent and its Units row "
+              + f"is unchanged. Look at it with `herdr session attach {slug}`.")
+        return 1
     if started == 2:
         print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
               + f"Bring it back as the unit it was with: {restore_line(promotion)}")

@@ -164,10 +164,14 @@ was a fresh blind review of a now-larger diff, with no memory of what had alread
 been accepted, so it always returned something.
 
 State lives in `findings_state.json` beside the progress state and holds the
-ledger of the progress state's current `phase.instance_id`. When the current
-phase changes, the ledger it displaces is copied to
-`findings_state-<instance_id>.json` and read back when that phase is current
-again; a phase with no ledger yet starts fresh. Findings get stable
+ledger of the newest open phase. When the current phase changes, the ledger it
+displaces is copied to `findings_state-<instance_id>.json` and read back when
+that phase is current again; a phase with no ledger yet starts fresh. Every
+command takes `--phase <id>`: a named older open phase reads and writes its
+parked file, so its repair never moves the newest phase's ledger. A named phase
+that is not open exits with `Phase <id> is not open (open phases: …)`; with two
+or more open and none named, `<N> phases are open (<ids>); name one with
+--phase`. implement.sh passes its `--phase` to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
@@ -220,11 +224,11 @@ as slow, not where it is cut off.
 ## Commands
 
 ```text
-findings.py open --session-dir <dir> --severity blocker|minor|nit --title <text> --caught-by delegate|main|both [--file <path>] [--line <N>] [--detail <text>]
-findings.py verdict --session-dir <dir> --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
-findings.py gate --session-dir <dir>
-findings.py dispatch --session-dir <dir> --covers F001,F002,...
-findings.py status --session-dir <dir>
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by delegate|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
+findings.py gate --session-dir <dir> [--phase <id>]
+findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,...
+findings.py status --session-dir <dir> [--phase <id>]
 ```
 
 ```text

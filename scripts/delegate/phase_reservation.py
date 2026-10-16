@@ -5,8 +5,13 @@ Each open phase of a unit has its own directory, `${SESSION_DIR}/phases/<phase>/
 reservation state, its baselines and its `files` list, so a later phase running beside the
 current one keeps its own state. A unit director persists `enrolled_awaiting_first_touch` in
 the phase's `delegated_phase_reservation_state.json` before dispatch, and the first edit that
-a clear `cargo-berth check` acquires turns it `Active` (`commands/unit/direct.md` →
-<DelegatedPhaseReservationContract/>). Codex seats edit through `apply_patch`, so the Codex
+a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its own berth
+session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
+reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
+reservation, which is never recorded here (`commands/unit/direct.md` →
+<DelegatedPhaseReservationContract/>). With one open phase there is no sibling: a `left_unmapped`
+reservation that cargo-berth's session map names for the director's bare session id, from an edit
+the director made itself, is that phase's own. Codex seats edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
 it checks every path of the phase changed since its baseline and writes `Active` from the answer.
@@ -40,6 +45,13 @@ ACTIVE = "active"
 CLEAR = "clear"
 UNCONFIGURED = "unconfigured"
 SESSION_ENVIRONMENT = "CARGO_BERTH_SESSION_ID"
+# The engine's answer when a sibling reservation of the run already holds every checked path:
+# the reservation id it returns is the sibling's, so it is never this phase's to record.
+LEFT_UNMAPPED = "left_unmapped"
+# cargo-berth's ledger folder in the repository's common git directory, and its map from a
+# harness session id to the reservation that session holds.
+LEDGER_DIRECTORY = "cargo-berth"
+SESSION_MAP_FILE = "session-identities.json"
 # The engine's single ledger deadline is ten seconds; the rest covers a slow start under load.
 CHECK_TIMEOUT_SECONDS = 25
 PATCH_PATH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
@@ -57,6 +69,7 @@ class CheckAnswer(NamedTuple):
     status: str
     message: str
     acquisition: Acquisition | None
+    session_mapping: str = ""
 
 
 class OpenPhase(NamedTuple):
@@ -124,7 +137,39 @@ def parse_answer(stdout: str) -> CheckAnswer:
         _string(envelope.get("status")) or "malformed",
         _string(envelope.get("message")),
         acquisition if all(acquisition) else None,
+        _string(_object(acquired.get("session_mapping_publication")).get("status")),
     )
+
+
+def session_reservation(root: Path, session_id: str) -> tuple[str, str] | None:
+    """The reservation and run cargo-berth's session map names for `session_id`, if any."""
+    result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+    if result.returncode != 0 or not session_id:
+        return None
+    path = Path(result.stdout.strip()) / LEDGER_DIRECTORY / SESSION_MAP_FILE
+    try:
+        identities = _object(_object(cast(object, json.loads(path.read_text(encoding="utf-8")))).get("identities"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    mapped = _object(identities.get(session_id))
+    reservation, run = _string(mapped.get("reservation_id")), _string(mapped.get("coordination_run_id"))
+    return (reservation, run) if reservation and run else None
+
+
+def own_acquisition(answer: CheckAnswer, root: Path, phases: list[OpenPhase], session_id: str) -> Acquisition | None:
+    """The reservation a clear answer gives this phase: none when a sibling's already held every path.
+
+    The one exception is the director's own reservation. An edit the director makes itself, such as
+    to the plan doc, checks under its bare session id, so cargo-berth maps that reservation there
+    and a later check under the phase's session answers `left_unmapped` with it. With one open
+    phase there is no sibling, and a reservation the map names for the bare session id is the phase's.
+    """
+    acquisition = answer.acquisition
+    if answer.session_mapping != LEFT_UNMAPPED or acquisition is None:
+        return acquisition
+    director = session_reservation(root, session_id) if len(phases) == 1 else None
+    return acquisition if director == (acquisition.reservation_id, acquisition.coordination_run_id) else None
 
 
 def check(root: Path, scopes: list[str], session_id: str) -> CheckAnswer:
@@ -155,8 +200,19 @@ def _state_phase(state: dict[str, object]) -> str:
                                                 if _string(fields.get("phase"))), "")
 
 
+def phase_directory_name(phase: str) -> str:
+    """The phase id's letters, digits, `.`, `_` and `-`: `ad hoc` is `adhoc`, as the launchers name it."""
+    name = "".join(character for character in phase if character.isalnum() or character in "._-")
+    return "" if name in (".", "..") else name
+
+
 def phase_directory(session_dir: Path, phase: str) -> Path:
-    return session_dir / PHASES_DIR / phase
+    return session_dir / PHASES_DIR / phase_directory_name(phase)
+
+
+def phase_session_id(session_id: str, phase: str) -> str:
+    """The berth session a phase checks under, so two open phases each hold a reservation of their own."""
+    return f"{session_id}.phase-{phase_directory_name(phase)}" if session_id else ""
 
 
 def _adopt_session_level_files(session_dir: Path) -> None:
@@ -166,7 +222,7 @@ def _adopt_session_level_files(session_dir: Path) -> None:
     baselines at the top of its session directory; they move once, before anything reads them.
     """
     phase = _state_phase(_read_state(session_dir))
-    if not phase or "/" in phase or phase in (".", ".."):
+    if not phase_directory_name(phase):
         return
     target = phase_directory(session_dir, phase)
     if (target / STATE_FILE).exists():
@@ -258,7 +314,8 @@ def changed_since_baseline(root: Path, baseline: str) -> list[str]:
 def _record_active_command(args: argparse.Namespace) -> int:
     session_dir = Path(cast(str, args.session_dir))
     phases = open_phases(session_dir)
-    phase = next((open_phase for open_phase in phases if open_phase.phase == cast(str, args.phase)), None)
+    directory = phase_directory(session_dir, cast(str, args.phase))
+    phase = next((open_phase for open_phase in phases if open_phase.directory == directory), None)
     state = _read_state(phase.directory) if phase is not None else {}
     if phase is None or _string(state.get("kind")) != AWAITING_FIRST_TOUCH:
         print(f"phase reservation: {_string(state.get('kind')) or 'no state'}; nothing to record")
@@ -273,12 +330,17 @@ def _record_active_command(args: argparse.Namespace) -> int:
     if not scopes:
         print("phase reservation: nothing of this phase changed since its baseline; still awaiting first touch")
         return 0
-    answer = check(root, scopes, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    answer = check(root, scopes, phase_session_id(session_id, phase.phase))
     if answer.status != CLEAR or answer.acquisition is None:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
-    _ = record_active(phase.directory, answer.acquisition)
-    print(f"phase reservation: Active, reservation {answer.acquisition.reservation_id}")
+    acquisition = own_acquisition(answer, root, phases, session_id)
+    if acquisition is None:
+        print("phase reservation: a sibling phase's reservation holds every changed path; still awaiting first touch")
+        return 0
+    _ = record_active(phase.directory, acquisition)
+    print(f"phase reservation: Active, reservation {acquisition.reservation_id}")
     return 0
 
 

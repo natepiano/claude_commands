@@ -13,6 +13,7 @@ from typing import TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import add_unit
+import production_units
 import pins
 import showrunners
 import upstream
@@ -58,7 +59,7 @@ def _production(args: argparse.Namespace) -> add_unit.Production:
     if doc is None:
         doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if doc is None:
-        raise add_unit.Refusal("this session runs no production; pass --production <doc>")
+        raise production_units.Refusal("this session runs no production; pass --production <doc>")
     return add_unit.read_production(doc)
 
 
@@ -218,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return _run(args, _production(args), datetime.now(timezone.utc))
-    except (upgrade_record.RecordFailure, pins.PinsFailure, add_unit.Refusal) as error:
+    except (upgrade_record.RecordFailure, pins.PinsFailure, production_units.Refusal) as error:
         print(f"bevy_upgrade: {error}", file=sys.stderr)
         return 2
 

@@ -21,7 +21,8 @@ import unit_effort
 import unit_lookup
 import session_pane
 import herdr
-from add_unit import Production, Refusal, plan_cell_is_retired, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, plan_cell_is_retired, unit_table
 from scripts.accounts import accounts
 from scripts.herdr import herdr as trust_reader
 from scripts.whoami import account
@@ -100,15 +101,19 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.events, self.alive, self.started = [], [True, True, False], 0
         self.marked = {"demo-unit": unit_lookup.MarkedUnit(
             "demo-unit", "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), unit_lookup.TmuxPlace(PANE))}
-        self.unit_account = accounts.NamedAccount("claude2", self.root / ".claude")
+        self.unit_account = accounts.NamedAccount("claude2", self.root / ".claude2")
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: default@example.invalid\n---\n")
+        directory = self.root / ".claude2"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
+        self.assertEqual(accounts.setup("claude2"), [])
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_units", self.marked_units),
                 (promote_showrunner, "_tmux", self.tmux), (session_pane, "_tmux", self.pane_tmux), (promote_showrunner, "_alive", self.is_alive),
@@ -158,12 +163,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(pid, PID)
         return self.alive.pop(0) if len(self.alive) > 1 else self.alive[0]
 
-    def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | None = None) -> str:
+    def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | None = None) -> None:
         self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
         self.assertEqual(config_dir, self.unit_account.dir)
         if self.child_refusal:
             raise Refusal(f"{self.child_refusal} (ending {ending})")
-        return "tmux"
 
     def start(self, argv: list[str]) -> int:
         self.events.append("start " + " ".join(argv))
@@ -208,7 +212,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "demo-unit's pane: a form, prompt or menu is open": form,
             "demo-unit has a /unit:delegate run open": run_open,
             "has uncommitted work; it checkpoints first": lambda: (self.worktree / "draft.py").write_text("x"),
-            "child already has a running showrunner (ending demo)": child_taken,
+            "child already has a running showrunner (ending )": child_taken,
         }
         for cause, arrange in cases.items():
             with self.subTest(cause=cause):
@@ -269,6 +273,31 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(subject, "production(parent): retire demo-unit, promoted to showrunner of child")
         self.assertIn("demo-unit is now the showrunner of child", out)
 
+    def test_unready_showrunner_leaves_the_units_row_unchanged_and_offers_only_attach(self) -> None:
+        self.started = add_showrunner.SESSION_NOT_READY
+        before = self.parent_doc.read_text()
+        with mock.patch.object(promote_showrunner, "retire") as retire, \
+                mock.patch.object(promote_showrunner, "restore_line") as restore:
+            code, out, err = self.run_main()
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(self.parent_doc.read_text(), before)
+        retire.assert_not_called()
+        restore.assert_not_called()
+        self.assertIn("session is open but not ready", out)
+        self.assertIn("showrunner prompt was not sent", out)
+        self.assertIn("herdr session attach child", out)
+        self.assertNotIn("add_unit.py", out)
+        self.assertNotIn("--resume", out)
+        self.assertTrue(self.events[-1].startswith("start"))
+
+    def test_prompted_showrunner_not_yet_attached_still_retires_the_units_row(self) -> None:
+        self.started = 1
+        code, out, err = self.run_main()
+        self.assertEqual((code, err), (1, ""))
+        self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
+        self.assertIn("demo-unit is now the showrunner of child", out)
+        self.assertNotIn("add_unit.py", out)
+
     def test_promotion_refuses_unconfigured_showrunners_before_stopping_unit(self) -> None:
         """F004: promotion does not inherit the unit's previous account."""
         with mock.patch.object(accounts, "role_account", side_effect=accounts.AccountsError(
@@ -285,11 +314,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> str:
             self.assertEqual(config_dir, directory)
-            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.assertEqual((ending, start_in), ("", self.worktree))
             self.events.append("check showrunner account")
             return "tmux"
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
-            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude")
+            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude2")
         with (mock.patch.object(accounts, "role_account", side_effect=resolved) as resolve,
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
             code, _, error = self.run_main()
@@ -308,11 +337,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         selected = self.ready_showrunner_account()
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
             self.events.append("resolve " + role)
-            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude")
+            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude2")
         def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> str:
             self.assertEqual(config_dir, selected.dir)
-            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.assertEqual((ending, start_in), ("", self.worktree))
             return "tmux"
         with (mock.patch.object(accounts, "role_account", side_effect=resolved),
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
@@ -331,10 +360,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> str:
             self.assertEqual(config_dir, selected.dir)
-            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.assertEqual((ending, start_in), ("", self.worktree))
             return "tmux"
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
-            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude")
+            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude2")
         with (mock.patch.object(accounts, "role_account", side_effect=resolved),
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
             code, output, error = self.run_main()
@@ -427,7 +456,24 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertLess(self.events.index("stop herdr native"), start_at)
         self.assertFalse(any(event.startswith("tmux") for event in self.events))
 
-    def test_herdr_name_does_not_exempt_an_unrelated_tmux_destination(self) -> None:
+    def test_a_tmux_unit_does_not_exempt_a_live_herdr_destination_with_the_same_name(self) -> None:
+        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+            "demo-unit", "child", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+            unit_lookup.TmuxPlace(PANE))
+        with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
+                mock.patch.object(showrunners, "descendants_of", return_value=[]), \
+                mock.patch.object(add_showrunner, "running", return_value=False), \
+                mock.patch.object(add_showrunner, "herdr_session_running", return_value=True) as live, \
+                mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
+                    self.worktree, self.root / ".claude.json", self.worktree)):
+            code, _out, err = self.run_main()
+        self.assertEqual(code, 2, err)
+        self.assertIn("a herdr session named child is already live", err)
+        live.assert_called_once_with("child")
+        self.assert_nothing_stopped()
+        self.assertFalse(any("kill-session" in event for event in self.events))
+
+    def test_a_herdr_unit_exempts_its_own_same_named_destination_before_stopping_it(self) -> None:
         self.native_unit()
         self.marked["demo-unit"] = unit_lookup.MarkedUnit(
             "demo-unit", "child", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
@@ -435,20 +481,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
         with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
                 mock.patch.object(showrunners, "descendants_of", return_value=[]), \
                 mock.patch.object(add_showrunner, "running", return_value=False), \
-                mock.patch.object(unit_lookup, "tmux_binary", return_value="fake-tmux"), \
-                mock.patch.object(add_showrunner, "tmux_live", return_value=True) as live, \
+                mock.patch.object(add_showrunner, "herdr_session_running", return_value=True) as live, \
                 mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
                     self.worktree, self.root / ".claude.json", self.worktree)), \
                 mock.patch.object(herdr, "stop_session") as stopped:
             code, _out, err = self.run_main()
-        self.assertEqual(code, 2, err)
-        self.assertIn("a tmux session named child is already live", err)
-        live.assert_called_once_with("fake-tmux", "child")
-        stopped.assert_not_called()
-        self.assert_nothing_stopped()
-        calls = [cast(list[str], json.loads(line)) for line in (self.root / "herdr.log").read_text().splitlines()]
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][2:4], ["pane", "read"])
+        self.assertEqual(code, 0, err)
+        live.assert_not_called()
+        stopped.assert_called_once_with("child")
+        self.assertTrue(any(event.startswith("start") for event in self.events))
+        self.assertFalse(any(event.startswith("tmux") for event in self.events))
 
     def test_a_blocked_herdr_unit_is_never_stopped_or_restarted(self) -> None:
         self.native_unit()
@@ -479,29 +521,27 @@ class PromoteShowrunnerTests(unittest.TestCase):
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
         with (mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
-              mock.patch.object(add_showrunner, "tmux_live", mock.Mock(return_value=True)),
+              mock.patch.object(add_showrunner, "herdr_session_running", mock.Mock(return_value=True)),
               mock.patch.object(add_showrunner, "claude_json", return_value=config),
-              mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
-              mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
-            self.assertEqual(ORIGINAL_CHECKED(child, "parent", ending="child"), "tmux")
-            with self.assertRaisesRegex(Refusal, "a tmux session named child is already live"):
-                _ = ORIGINAL_CHECKED(child, "parent")
+              mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[]))):
+            self.assertIsNone(ORIGINAL_CHECKED(child, "parent", ending="child", config_dir=self.unit_account.dir))
+            with self.assertRaisesRegex(Refusal, "a herdr session named child is already live"):
+                _ = ORIGINAL_CHECKED(child, "parent", config_dir=self.unit_account.dir)
 
     def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
         code, _out, err = self.run_main("--check")
         self.assertEqual(code, 0, err)
-        self.assertIn(f"check child for parent, ending demo, starting in {self.worktree}", self.events)
+        self.assertIn(f"check child for parent, ending , starting in {self.worktree}", self.events)
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(self.root.resolve()): {"hasTrustDialogAccepted": True}}}))
         child = read_production(self.child_doc)
         with (mock.patch.dict(os.environ, {"ADD_SHOWRUNNER_CLAUDE_JSON": str(config)}),
               mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
-              mock.patch.object(add_showrunner, "tmux_live", mock.Mock(return_value=False)),
-              mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
-              mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
+              mock.patch.object(add_showrunner, "herdr_session_running", mock.Mock(return_value=False)),
+              mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[]))):
             with self.assertRaisesRegex(Refusal, f"child: Claude is not trusted in {self.worktree.resolve()} on "
                                         + "claude2. Run:"):
-                _ = ORIGINAL_CHECKED(child, "parent", ending="demo", start_in=self.worktree)
+                _ = ORIGINAL_CHECKED(child, "parent", ending="demo", start_in=self.worktree, config_dir=self.unit_account.dir)
 
 
 if __name__ == "__main__":

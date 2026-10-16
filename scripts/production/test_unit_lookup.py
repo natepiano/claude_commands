@@ -18,6 +18,7 @@ import fake_tmux
 import showrunners
 import unit_lookup
 import herdr
+from fake_herdr import herdr_listener
 from fake_tmux import FakeSession
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 
@@ -77,6 +78,7 @@ class UnitLookupTests(unittest.TestCase):
             }]})}
         }))
         self.process(991000, 0, ["herdr", "--session", name, "server"])
+        herdr_listener(self.root / "proc", 991000, name, self.environment)
         self.process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID=pane,
                      SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID=unit)
 
@@ -298,6 +300,36 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
                          ["trunk-unit", "herdr:native:w1:p1", "native", "live"])
 
+    def test_attach_started_server_joins_live_claude_by_its_listening_socket(self) -> None:
+        self.herdr_session(name="writing")
+        server = self.root / "proc/991000"
+        _ = (server / "cmdline").write_bytes(b"herdr\0server\0")
+        _ = (server / "environ").write_bytes(b"HERDR_SESSION=writing\0")
+        self.claude("writer", "", session_id="writer-id")
+        found = unit_lookup.marked_units("show")["trunk-unit"]
+        self.assertEqual(found.place, herdr.HerdrPlace("writing", "w1:p1"))
+        self.assertIsInstance(found.claude, LiveClaude)
+        assert isinstance(found.claude, LiveClaude)
+        self.assertEqual((found.claude.name, found.claude.session_id), ("writer", "writer-id"))
+        self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
+                         ["trunk-unit", "herdr:writing:w1:p1", "writing", "live"])
+
+    def test_live_claude_with_deleted_cwd_joins_its_marked_shell(self) -> None:
+        self.herdr_session(name="writing")
+        self.process(991001, 991000, ["zsh"], HERDR_PANE_ID="w1:p1",
+                     SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit")
+        claude_cwd = self.root / "proc" / str(os.getpid()) / "cwd"
+        claude_cwd.unlink()
+        claude_cwd.symlink_to(self.root / "deleted-directory")
+        self.claude("writer", "", session_id="writer-id")
+        found = unit_lookup.marked_units("show")["trunk-unit"]
+        self.assertEqual(found.place, herdr.HerdrPlace("writing", "w1:p1"))
+        self.assertIsInstance(found.claude, LiveClaude)
+        assert isinstance(found.claude, LiveClaude)
+        self.assertEqual((found.claude.pid, found.claude.session_id), (os.getpid(), "writer-id"))
+        self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
+                         ["trunk-unit", "herdr:writing:w1:p1", "writing", "live"])
+
     def test_a_herdr_unit_without_a_live_record_is_stopped_or_unknown(self) -> None:
         self.herdr_session()
         self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, ClaudeNotRunning)
@@ -314,14 +346,14 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_excluding_tmux_reads_herdr_without_resolving_tmux(self) -> None:
         self.herdr_session()
-        with mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
+        with mock.patch.object(unit_lookup, "installed_tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
             found = unit_lookup.every_marked_unit(include_tmux=False)
         resolver.assert_not_called()
         self.assertEqual(list(found.units["show"]), ["trunk-unit"])
         self.assertEqual(found.faults, {})
 
     def test_excluding_tmux_reports_only_an_unreadable_herdr_source(self) -> None:
-        with mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver, \
+        with mock.patch.object(unit_lookup, "installed_tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver, \
                 self.assertRaises(OSError) as refused:
             _ = unit_lookup.every_marked_unit(include_tmux=False)
         resolver.assert_not_called()
@@ -331,6 +363,14 @@ class UnitLookupTests(unittest.TestCase):
         self.herdr_session()
         with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}):
             self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+
+    def test_tmux_observation_never_builds_a_missing_binary(self) -> None:
+        with (mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
+              mock.patch("shutil.which", return_value=None),
+              mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("no executable")) as run,
+              self.assertRaises(OSError)):
+            _ = unit_lookup.tmux_sessions()
+        run.assert_not_called()
 
     def test_every_host_lookup_refuses_partial_discovery_but_default_keeps_available_units(self) -> None:
         self.herdr_session()

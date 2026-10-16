@@ -61,8 +61,11 @@ Loop/verbose only:
    `/unit:direct` <BerthDecisions/>:
 
    ```sh
-   cargo-berth drift --full --json
+   cargo-berth drift --full --reservation <recorded-reservation-id> --json
    ```
+
+   Name the reservation: each open phase holds its own, so a drift that picks
+   one for itself is ambiguous whenever a phase runs beside this one.
 
    Require an exit-`0` result with `payload.kind = drift`,
    `payload.data.comparison = full_phase_start`, and exactly one
@@ -98,6 +101,8 @@ Loop/verbose only:
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what you see change> | <how to check it>`, one line per
    visible change, or `Change-Review: none — <why nothing visible changes>`.
+   A change the user can check outside the app counts as visible too: a
+   table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;
    the merge turns each visible line into a row on the change-review list.
 

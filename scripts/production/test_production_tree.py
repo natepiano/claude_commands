@@ -98,16 +98,25 @@ class ProductionTreeTests(unittest.TestCase):
             {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
         ])
 
-    def test_an_end_that_is_not_running_leaves_its_edges_out(self) -> None:
+    def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}}, server=False)
         _ = self.run_folder("unit", ORPHAN, {"c-impl": {"thread_id": "thread-orphan", "role": "impl", "status": "running"}})
         edges = self.tree({CHILD_RUNNER, DIRECTOR, ORPHAN}, {
             "main": {"one": unit(DIRECTOR, "one")},
             "gone": {"orphan": unit(ORPHAN, "orphan")},
         })
-        # The main showrunner is not running, so its child and its unit have no manager; the
-        # director's server has stopped, so its worker is gone; the orphan's own worker still runs.
-        self.assertEqual(edges, [{"manager": ORPHAN, "member": "thread-orphan", "role": "impl"}])
+        # Neither showrunner runs here, yet each timer names its session, so its child and its
+        # units keep their manager; the director's server has stopped, so its worker is gone.
+        self.assertEqual(edges, [
+            {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
+            {"manager": GONE_RUNNER, "member": ORPHAN, "role": "unit"},
+            {"manager": RUNNER, "member": DIRECTOR, "role": "unit"},
+            {"manager": ORPHAN, "member": "thread-orphan", "role": "impl"},
+        ])
+
+    def test_a_member_that_is_not_running_here_leaves_its_edges_out(self) -> None:
+        edges = self.tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
+        self.assertEqual(edges, [])
 
     def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
@@ -116,6 +125,42 @@ class ProductionTreeTests(unittest.TestCase):
             edges = production_tree.tree()
         self.assertEqual(edges, [{"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}])
         self.assertIn("unit marks unreadable: tmux: gone", errors.getvalue())
+
+    def test_claude_workers_take_their_slot_role_from_the_board_without_a_server(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {}, server=False)
+        _ = (run / "board.log").write_text("".join(f"2026-10-16T09:00:00-0400 {line}\n" for line in (
+            "[impl] register: impl launcher up (claude/opus:high); mesh=proj-impl; role=impl",
+            "[test] register: test launcher up (claude/opus:high); mesh=proj-test; role=test",
+            "[review] register: review launcher up (claude/opus:high); mesh=proj-review; role=review",
+            "[test] handoff: role=impl writing the second half",
+            "[stray] register: hello, no role yet",
+        )))
+        for slot, worker, family in (
+            ("impl", "sid-claude-impl", "claude"),
+            ("review", "sid-claude-review-gone", "claude"),
+            ("fix", "thread-codex-fix", "codex"),
+        ):
+            _ = (run / f"impl_worker_{slot}.json").write_text(json.dumps(
+                {"name": f"proj-{slot}", "slot": slot, "family": family, "model": "m", "worker_id": worker}))
+        # The test worker has no launch record yet: its ledger short id prefixes its session id, and
+        # its name ends with its slot, so its role is the one its slot took over on the board.
+        _ = (run / "workers").write_text("sid-claude-t\tproj-test\nsid-claude-s\tproj-stray\nsid-nobody\tproj-impl\n")
+        edges = self.tree({DIRECTOR, "sid-claude-impl", "sid-claude-test", "sid-claude-stray", "thread-codex-fix"}, {})
+        self.assertEqual(edges, [
+            {"manager": DIRECTOR, "member": "sid-claude-impl", "role": "impl"},
+            {"manager": DIRECTOR, "member": "sid-claude-test", "role": "impl"},
+        ])
+
+    def test_a_run_with_both_families_lists_codex_and_claude_workers(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {"proj-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}})
+        _ = (run / "board.log").write_text("2026-10-16T09:00:00-0400 [fix] register: fix launcher up; role=fix\n")
+        _ = (run / "impl_worker_fix.json").write_text(json.dumps(
+            {"name": "proj-fix", "slot": "fix", "family": "claude", "model": "m", "worker_id": "sid-claude-fix"}))
+        edges = self.tree({DIRECTOR, "sid-claude-fix"}, {})
+        self.assertEqual(edges, [
+            {"manager": DIRECTOR, "member": "thread-impl", "role": "impl"},
+            {"manager": DIRECTOR, "member": "sid-claude-fix", "role": "fix"},
+        ])
 
     def test_a_large_tree_answers_well_under_a_second(self) -> None:
         directors = [f"sid-director-{number}" for number in range(40)]

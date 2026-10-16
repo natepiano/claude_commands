@@ -22,11 +22,13 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
+for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import Account
 import conversation_pause
+import detached
+import herdr
 import note_file
 from inventory import Inventory, Session, inventory
 from launch_permission import shutdown_state_root
@@ -209,6 +211,18 @@ def now_utc() -> datetime:
 def record_time() -> str:
     """Return a canonical timestamp for a shutdown record field."""
     return now_utc().isoformat(timespec="seconds")
+
+
+def elapsed_text(seconds: int) -> str:
+    """Format an elapsed duration in whole seconds, minutes, hours, or days."""
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 def _user_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(
@@ -720,6 +734,7 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
         at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
         lines.append(f"    {at} {step['kind']} {located_detail(record, step['detail'])}".rstrip())
     lines.extend(f"    {stop_issue_text(issue)}" for issue in record["stop_issues"])
+    lines.extend(f"    restart issue: {issue}" for issue in record.get("restart_issues", []))
     return lines
 
 
@@ -752,11 +767,10 @@ def begin(
     at = record_time()
     origin: store.RequestOrigin = ({"kind": "session", "session_id": requested_by}
                                    if requested_by else {"kind": "terminal"})
-    if not ids and isinstance(store.lookup_account_hold(login), store.AccountOpen):
-        store.set_account_hold(store.AccountHold(
-            login=login, label=report["label"], machine=report["machine"], requested_at=at,
-            request_id=request_id, requested_by=origin, then=then,
-        ))
+    store.register_account_hold_request(store.AccountHold(
+        login=login, label=report["label"], machine=report["machine"], requested_at=at,
+        request_id=request_id, requested_by=origin, then=then,
+    ), account_wide=not ids)
     added: list[SessionShutdown] = []
     for session in report["sessions"]:
         if session["kind"] == "worker":
@@ -806,6 +820,7 @@ def begin(
             continue
         added.append(saved)
         print(f"{session['name']}: added")
+    store.complete_account_hold_registration(login, request_id)
     return added
 
 
@@ -1159,8 +1174,23 @@ def _launch_conductor(login: str, label: str) -> None:
     if os.environ.get("REFUSAL_WATCH_INVENTORY") == "read existing":
         # Service managers do not inherit the caller's environment automatically.
         command = ["env", "REFUSAL_WATCH_INVENTORY=read existing", *command]
-    launch = (["launchctl", "submit", "-l", service, "--", *command] if sys.platform == "darwin"
-              else ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command])
+    if sys.platform == "darwin":
+        try:
+            logs = shutdown_state_root() / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=logs, prefix=service + "-", suffix=".log", delete=False) as output:
+                log = Path(output.name)
+        except OSError as error:
+            raise RuntimeError(f"could not start shutdown conductor {service}: {error}") from error
+        try:
+            _ = detached.start_detached(command, within=15,
+                ready=lambda: "shutdown conductor started\n" in log.read_text(encoding="utf-8"),
+                output=detached.AppendLog(log),
+                environment=detached.ExplicitEnvironment({**os.environ, detached.STARTUP_SIGNAL_ENV: "1"}))
+        except (detached.DetachedStartFailure, OSError) as error:
+            raise RuntimeError(f"could not start shutdown conductor {service}: {error}; log: {log}") from error
+        return
+    launch = ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command]
     result = subprocess.run(launch, check=False, timeout=15)
     if result.returncode != 0:
         raise RuntimeError(f"could not start shutdown conductor {service}")
@@ -1620,9 +1650,10 @@ def _complete_stop_action(saved: SessionShutdown) -> None:
 
 def _clear_finished_hold(login: str, seen: dict[str, SessionShutdown]) -> None:
     outcome = store.lookup_account_hold(login)
-    if isinstance(outcome, store.AccountHeld) and any(saved["request_id"] == outcome.hold["request_id"]
-        and saved["progress"]["kind"] == "restarted" for saved in seen.values()
-    ):
+    if isinstance(outcome, store.AccountHeld) and (outcome.hold["then"] == "restart" or any(
+        saved["request_id"] == outcome.hold["request_id"] and saved["progress"]["kind"] == "restarted"
+        for saved in seen.values()
+    )):
         store.clear_finished_account_hold(login)
 
 
@@ -1694,16 +1725,19 @@ def _write_conduct_archive(login: str, archived: dict[str, SessionShutdown]) -> 
 
 def conduct(login: str) -> int:
     """Keep an owner available for work added while a conductor releases its lock."""
+    if os.environ.pop(detached.STARTUP_SIGNAL_ENV, "") == "1":
+        print("shutdown conductor started", file=sys.stderr, flush=True)
     fingerprint = _module_fingerprint()
     for line in store.migrate(login):
         print(line)
+    session_kind = herdr.security_session()
     archived: dict[str, SessionShutdown] = {}
     while True:
         with store.conductor_lock(login) as ownership:
             if isinstance(ownership, store.ConductorAlreadyRunning):
                 return 0
             archived.update(_read_conduct_archive(login))
-            outcome = _conduct_owned(login, archived, fingerprint)
+            outcome = _conduct_owned(login, archived, fingerprint, session_kind)
             if isinstance(outcome, _ReloadRequested):
                 _write_conduct_archive(login, archived)
         if isinstance(outcome, _ReloadRequested):
@@ -1717,7 +1751,7 @@ def conduct(login: str) -> int:
 
 
 def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
-                   fingerprint: _ModuleFingerprint) -> _ConductorFinished | _ReloadRequested:
+                   fingerprint: _ModuleFingerprint, session_kind: herdr.SecuritySession) -> _ConductorFinished | _ReloadRequested:
     """Advance one locked account while long actions run independently."""
     import restart as restart_work
 
@@ -1725,7 +1759,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
         if _archive_finished(saved):
             archived[saved["session"]["session_id"]] = saved
 
-    desktop = restart_work.DesktopLaunchState()
+    desktop = restart_work.DesktopLaunchState(session_kind=session_kind)
     pending: dict[str, PendingSessionAction] = {}
     confirmations: list[PendingRegistryConfirmation] = []
     launched: list[SessionShutdown] = []
@@ -1746,7 +1780,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     archive(result)
 
             def start_launch(saved: SessionShutdown) -> None:
-                if saved["session"]["host"]["kind"] in {"ghostty", "zed", "terminal"}:
+                if restart_work.launches_window(saved["session"]["host"]):
                     try:
                         result = restart_work.relaunch_session(saved, dry_run=False, desktop_state=desktop)
                         accept_launch(saved, result)

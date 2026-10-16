@@ -113,11 +113,69 @@ class BerthHookTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
                               text=True, check=False, env=self.environment, timeout=60)
 
+    def test_a_path_a_sibling_phase_holds_allows_the_edit_and_records_nothing(self) -> None:
+        # The engine names the sibling's reservation and leaves this phase's session unmapped.
+        answer = envelope("clear", acquisition=acquired())
+        data = cast(dict[str, object], cast(dict[str, object], answer["payload"])["data"])
+        cast(dict[str, object], data["acquisition"])["session_mapping_publication"] = {"status": "left_unmapped"}
+        self.answer(answer)
+        before = self.state()
+        result = self.hook(patch_text("*** Update File: lib.rs"), cwd=self.repo / "src")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state(), before)
+
+    def answer_left_unmapped(self) -> None:
+        """The engine names a reservation another session of the run holds, and leaves the phase's unmapped."""
+        answer = envelope("clear", acquisition=acquired())
+        data = cast(dict[str, object], cast(dict[str, object], answer["payload"])["data"])
+        cast(dict[str, object], data["acquisition"])["session_mapping_publication"] = {"status": "left_unmapped"}
+        self.answer(answer)
+
+    def map_director_session(self, reservation: str = RESERVATION) -> None:
+        """cargo-berth's session map names `reservation` for the director's bare session id."""
+        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger.mkdir()
+        _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
+            DIRECTOR: {"coordination_run_id": RUN, "reservation_id": reservation}}}))
+
+    def test_with_one_open_phase_the_directors_own_reservation_is_recorded_active(self) -> None:
+        # The director edited the plan doc itself, so its reservation is mapped to the bare session id.
+        self.answer_left_unmapped()
+        self.map_director_session()
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, written = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}", written)
+        self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["reservation_id"], RESERVATION)
+
+    def test_the_hook_records_the_directors_own_reservation_with_one_open_phase(self) -> None:
+        self.answer_left_unmapped()
+        self.map_director_session()
+        result = self.hook(patch_text("*** Update File: lib.rs"), cwd=self.repo / "src")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state()["kind"], "active")
+
+    def test_a_left_unmapped_reservation_stays_unrecorded_unless_the_map_names_it_for_one_open_phase(self) -> None:
+        self.answer_left_unmapped()
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        for case in ("another reservation mapped", "a sibling phase open"):
+            with self.subTest(case=case):
+                if case == "another reservation mapped":
+                    self.map_director_session(reservation="01a13f9c-0000-7000-8000-000000000002")
+                else:
+                    shutil.rmtree(self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY)
+                    self.map_director_session()
+                    self.open_second_phase()
+                code, written = self.backstop()
+                self.assertEqual(code, 0)
+                self.assertIn("a sibling phase's reservation holds every changed path", written)
+                self.assertEqual(self.state(), AWAITING)
+
     def test_a_seat_first_touch_checks_its_paths_and_records_active(self) -> None:
         result = self.hook(patch_text("*** Add File: new.rs", "*** Update File: lib.rs"), cwd=self.repo / "src")
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.berth_calls(), [{"argv": ["check", "src/new.rs", "src/lib.rs", "--json"],
-                                               "cwd": str(self.repo), "session": DIRECTOR}])
+                                               "cwd": str(self.repo), "session": f"{DIRECTOR}.phase-15"}])
         self.assertEqual(self.state(), {"kind": "active", "active_phase_reservation": {
             "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD,
         }})
@@ -241,7 +299,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"Active, reservation {RESERVATION}", written)
         self.assertEqual(self.berth_calls(), [{"argv": ["check", "src/lib.rs", "src/added.rs", "--json"],
-                                               "cwd": str(self.repo), "session": DIRECTOR}])
+                                               "cwd": str(self.repo), "session": f"{DIRECTOR}.phase-15"}])
         self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["phase"], "15")
 
     def test_the_backstop_checks_only_the_paths_its_phase_owns(self) -> None:

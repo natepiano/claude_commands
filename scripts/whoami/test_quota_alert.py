@@ -32,7 +32,7 @@ import note_file
 import account
 from agent_notes import local_reset
 from note_file import read_note
-from scripts.accounts import accounts, moves, refusals
+from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.production import showrunners
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
@@ -102,6 +102,7 @@ def configured_recipients(config: quota_alert.Config, here: str | None = None) -
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    _ = unittest.enterModuleContext(mock.patch.object(role_map, "is_role_map_host", return_value=True))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
@@ -128,7 +129,9 @@ class QuotaAlertTests(unittest.TestCase):
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
         })))
         del environment_context
-        (self.root / ".claude").mkdir()
+        (self.root / ".claude/config").mkdir(parents=True)
+        _ = (self.root / ".claude/config/accounts.json").write_text(
+            json.dumps({"workers": "codex1"}))
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
         codex_home = self.root / ".codex"
         codex_home.mkdir()
@@ -259,6 +262,7 @@ class QuotaAlertTests(unittest.TestCase):
               quota_alert.READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
         checked = now or self.now
         readings = self.alert_readings(notes, checked)
+        assert not isinstance(readings.selected_account, agent_accounts.NoWorkersHome)
         return quota_alert.blocked(notes, readings.selected_account, checked,
                                     selection=selection, codex_readings=readings)
 
@@ -295,7 +299,7 @@ class QuotaAlertTests(unittest.TestCase):
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
         _ = (self.root / "claude2.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
-        for label, login in (("claude1", "spare@example.invalid"), ("claude3", "unit@example.invalid")):
+        for label, login in (("claude1", "spare@example.invalid"), ("claude2", "showrunner@example.invalid"), ("claude3", "unit@example.invalid")):
             self.assertEqual(accounts.setup(label), [])
             _ = (self.root / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
             _ = (accounts.account_dir(label) / ".claude.json").write_text(
@@ -425,8 +429,12 @@ class QuotaAlertTests(unittest.TestCase):
         notes: Notes = [self.note("claude1.md", "active", "0", login="spare@example.invalid"),
                         self.note("claude2.md", "active", "0", login="showrunner@example.invalid"),
                         self.note("claude3.md", "active", "0", login="unit@example.invalid")]
-        def observed_account(pid: int) -> account.Account | None:
-            return identities.get(pid)
+        def observed_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            identity = identities.get(pid)
+            if (identity is not None and isinstance(home_state, account.LegacyHomeLogin)
+                    and identity.login.casefold() == home_state.account.login.casefold()):
+                return home_state.account
+            return identity
         with (mock.patch.object(sessions, "live_sessions", return_value=owners),
               mock.patch.object(account, "account_of", side_effect=observed_account)):
             _ = self.alert(notes, self.now)
@@ -446,15 +454,19 @@ class QuotaAlertTests(unittest.TestCase):
         owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in (10001, 10003)]
         directories = {10001: external, 10003: unfit}
-        logins = {self.root / ".claude": "showrunner@example.invalid", unfit: "unit@example.invalid",
+        logins = {self.root / ".claude": "showrunner@example.invalid", accounts.account_dir("claude2"): "showrunner@example.invalid",
+                  unfit: "unit@example.invalid",
                   external: "external@example.invalid", accounts.account_dir("claude1"): "spare@example.invalid"}
         _ = self.note("claude4.md", "inactive", "90", login="external@example.invalid")
         _ = self.note("claude3.md", "inactive", "90", login="unit@example.invalid")
         _ = self.note("claude2.md", "active", "90", login="showrunner@example.invalid")
-        def process_directory(pid: int) -> Path | None:
-            return directories.get(pid)
-        def process_account(pid: int) -> account.Account | None:
+        def process_directory(pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
             directory = directories.get(pid)
+            return account.ConfiguredClaudeFolder(directory) if directory is not None else account.ProcessEnvironmentUnread("fixture")
+        def process_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            directory = directories.get(pid)
+            if directory == Path.home() / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
+                return home_state.account
             return account.Account("claude", logins[directory], "fixture") if directory is not None else None
         def live(directory: Path) -> Report:
             return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 100,
@@ -742,7 +754,8 @@ class QuotaAlertTests(unittest.TestCase):
     def test_outgoing_account_refusal_is_logged_without_a_phone_push(self) -> None:
         """F005: a refusal from an account no longer used needs no user action."""
         outgoing = self.note("codex1.md", "inactive", "0", login="old@example.invalid")
-        current = self.note("codex2.md", "active", "90", login="current@example.invalid")
+        current = self.note("codex2.md", "active", "90", login="someone@example.com")
+        accounts.set_role("workers", "codex2")
         readings = self.alert_readings([outgoing, current], self.now)
         refusing = agent_accounts.KnownCodexAccount(self.root / "outgoing", "old@example.invalid", "codex1")
         lines = quota_alert.blocked([outgoing, current], refusing, self.now, codex_readings=readings)
@@ -1834,6 +1847,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         for availability in ("stale", "unknown", "missing"):
             with self.subTest(availability=availability):
                 fresh = self.readings(later, left=50)
+                assert isinstance(fresh.workers, accounts.CodexWorkersAccount)
                 checked: list[quota_alert.CodexHomeReading] = []
                 for home in fresh.checked_homes:
                     if home.home == fresh.workers.home:
@@ -2087,6 +2101,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             original = state.get("codex_zero", {})["codex1"].copy()
         reading = self.readings(self.now + timedelta(minutes=2))
+        assert isinstance(reading.workers, accounts.CodexWorkersAccount)
         unknown = quota_alert.CodexAlertPassReadings(reading.workers,
             agent_accounts.UnknownCodexAccount(reading.workers.home, "sign-in temporarily unreadable"), reading.checked_homes)
         with mock.patch.object(self, "readings", return_value=unknown):
@@ -2184,7 +2199,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             self.assertEqual(state.get("codex_zero", {}), {})
 
-    def test_zero_opening_names_unlimited_or_unknown_balance_truthfully(self) -> None:
+    def test_zero_opening_names_unlimited_or_unknown_balance(self) -> None:
         for balance in ("unlimited", None):
             with self.subTest(balance=balance):
                 quota_alert.STATE.unlink(missing_ok=True)

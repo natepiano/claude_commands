@@ -118,9 +118,9 @@ Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
     On a plan that `/plan:shrink` has run over, a completed phase carries a
     `#### As-built` block instead of a Work Order + Retrospective; its
     **Gotchas** and **Ruled out** lines are the same input, already distilled.
-  - **Why** — the rationale behind load-bearing decisions, reconstructed as
-    "why it is this way" (the useful residue of the resolved-decision record),
-    not a debate transcript.
+  - **Why** — the rationale behind the decisions the design rests on,
+    reconstructed as "why it is this way" (the useful residue of the
+    resolved-decision record), not a debate transcript.
 - The instruction to **drop**: Work Order scaffolding (Goal/Spec/Files/Acceptance
   gate phrasing), phase sequencing, commit refs, Delegation Context
   build/test/style boilerplate, and process retrospective framing. The reader is
@@ -129,7 +129,7 @@ Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
   an overview of a feature, with no trace that it was once a phased plan.
 
 Capture the draft. Review it yourself for accuracy against the plan; tighten if
-needed. Do not pad — keep it to load-bearing content.
+needed. Do not pad — keep only content a reader needs.
 </Distill>
 
 ---
@@ -248,8 +248,8 @@ must include:
   material, delete it or rewrite it to the current state — do not keep it as
   "history." The **only** reason to retain something about an old approach is if
   it would help a developer working in this code today (e.g. a still-live
-  migration shim they must not remove, or a gotcha that still bites); that is
-  rare. When in doubt, cut it. If stripping the historical narrative leaves a
+  migration shim they must not remove, or a gotcha that still trips people
+  up); that is rare. When in doubt, cut it. If stripping the historical narrative leaves a
   doc that is wholly about a replaced/removed design, treat it as `obsolete`
   (return path + reason for the orchestrator to delete) rather than
   keeping a hollow record.

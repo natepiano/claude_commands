@@ -178,7 +178,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 | --- | --- | --- | --- |
 | G0 | Phase 1 | the user | cleared 2026-10-10 for the code phases 1–5: "prepare everything but don't initiate" |
 | G1 | Phase 6 | the user | the user explicitly authorizes the first live proof. Phase 6 then creates `~/.claude3`, and the user completes its login (step 2) before any probe starts |
-| G2 | Phase 7 | the user | the user authorizes cutover at a chosen time and confirms the unit account. Phase 7 then sets up and logs in the remaining dirs, and every check passes before step 4 writes the role |
+| G2 | Phase 7 | the user | the user runs Phase 7's two open checks with the director: the spare `~/.claude1` passing `check`, and messages across machines and accounts. The cutover, its setups, logins and role writes are done and not replayed |
 | G3 | Phase 9 | the clock | 7 days after Phase 25's live proof |
 | G4 | Phase 25 | the user | lifted 2026-10-15: the user cancelled the desk visit, and the unit director ran the proof on throwaway probes |
 
@@ -422,7 +422,7 @@ Asked for by the user through the showrunner. Text above this section that names
 - `down --to/--why` stores `target`, `source_label` and `why` on each new `SessionShutdown`; an existing record never gains them; the peer `down` carries both. A record with no target resumes on the account it ran on.
 - Restart relaunches a targeted record through `accounts.py exec '<target>'` with the usual resume arguments plus one moved-not-stopped note from `restart.account_move_note` (moved from, to, because; an account move, not a stop; continue). A unit continues `/unit:direct`; a showrunner gets `/showrunner:produce <doc> resume` with the note. tmux respawns its pane; a unit resumes through `add_unit.py --resume --account '<target>'`; a Ghostty session is closed at stop and reopened on its recorded desktop (kdotool `set_desktop`), so one window per session on its desktop; an unknown host prints the resume line once before the stop, and restart reports `manual restart <name>: <line>`. A moved session keeps its name, so `send.py` reaches it; its Remote Control registers on the target account.
 - `exec default` drops `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`. `swap unit` is `set-role unit` plus `down '<old>' --restart --to '<new>'` and refuses a unit with an open record; `swap seats` is unchanged.
-- `add_unit.py` stores `@claude_config_dir` and `@claude_model` on each unit's tmux session and reads the unit role only for a new unit. An untargeted `--resume` uses the shutdown record's target, then those options, else refuses naming `--account`; a recorded dir outside the account farm is kept (`RetainedUnitAccount`), a missing one is refused; the recorded model goes through `--model`. `produce.md`'s manual unit resume runs `add_unit.py --resume`.
+- `add_unit.py` stores `@claude_config_dir` and `@claude_model` on each unit's tmux session and reads the unit role only for a new unit. An untargeted `--resume` uses the shutdown record's target, then those options, else refuses naming `--account`; a recorded dir outside the account farm is kept (`RetainedUnitAccount`), a missing one is refused; the recorded model goes through `--model`. `produce.md`'s manual unit resume runs `add_unit.py --resume`. Superseded by herdr-adoption Phase 7 (`docs/as-built/herdr-adoption.md`): `add_unit.py` launches every unit in herdr and writes neither option; those options are read only for a unit still in a tmux place, and a herdr unit's untargeted resume takes `accounts.role_account("unit")` and its transcript's model.
 
 **Files:**
 - `scripts/accounts/accounts.py` — `move`, `move_showrunners`, `_move_target`, `exec default`, swap through `down --to`; `test_accounts.py`.
@@ -452,9 +452,9 @@ Asked for by the user through the showrunner. Text above this section that names
 
 **Goal:** answer the user's question with a week of data: how often sessions and workers moved between accounts, why, and whether any time passed with no eligible destination.
 
-**Constraints from prior phases:** from "Two account groups" on, unit directors and showrunners each sit on one stored account (`~/.local/state/accounts/groups.json`; each change is a `roles.jsonl` entry `{at, group, label, why}`), a new Claude session launches on its group's account, and a group moves whole on a refusal. Codex workers move on a refusal ("Codex workers move on a refusal") and Claude sessions move on a refusal ("Claude sessions move on a refusal"). Every automatic transition is one line of `~/.local/state/accounts/moves.jsonl`, keyed by a stable `move_id`: `requested`, `confirmed`, `failed`, `waited`, `wait ended`, `no room`, `room again`. `requested` and `waited` carry the reset when it is known (`reset` is omitted when unknown); `no room` carries `earliest_reset`. A Codex request has one `confirmed` per worker (`run`, `worker`; `moves.read_journal()` turns a historical `seat` field into `worker`), and one worker may fail beside others confirming; a Claude batch shares one shutdown `request_id` across several session subjects. A targeted Claude move, automatic or by hand (`move`, `move showrunners`), is journalled: its `requested` carries `cause` (`refusal` or `by hand`; a missing `cause` is `refusal`) and, for a refusal, the window and reset of the refusal that started it ("Proof refusals stay with their session"); reconcile it with shutdown history by request id and session id and count it once. A Codex `requested` carries `cause: credits off` when `use_credits: off` at 0% weekly started it ("Codex credits setting and the 0% alert"), and so does a recovery request (`why: "Codex has room again"`) that releases a credits-off hold; count both under credits off, never as a refusal. The cause is `refusal`, `credits off` or `by hand`; a missing `cause` is `refusal`. A credits-off or refusal request whose swap failed (`failed` under its `move_id`) followed by Codex work going to Claude (`switch_to_claude`, a work-routing change in `quota_alert.json`, not a journal move) is one failed account move plus one routing fallback, never a confirmed workers move; only a `confirmed` per worker proves a workers move. From "Proof refusals stay with their session" on, each routing is journalled apart from account moves as `routed to claude` (`cause`, `moved`), then `routed back` (written only when every owed assignment came back or was kept as re-assigned since the switch) or `routing not restored` (`outcome: partial` or `failed`, with the `failed` keys), all three without `move_id` and paired by `fallback_at`, the fallback's own stored time, which survives an updater restart; `owner` is the numbered Codex account the fallback stored or `unknown`, never read from today's `~/.codex`. `moves.read_journal()` returns account moves and routing; `moves.read_moves()` returns account moves only. A routing outcome with no `routed to claude` of its `fallback_at` (a fallback saved before that phase) started at `fallback_at`. A legacy `default` in a journal entry's `from`, `to` or `label` resolves only from the `roles.jsonl` line in force at the entry's time or the same move's shutdown record ("Accounts named by number only"); with no such evidence it reads as `moves.HomeAccountUnresolved` and prints `home account unresolved`, and "Proof refusals stay with their session" keeps that resolution in `read_journal()`. Codex hand swaps and `set-role` are not journalled: take them from `roles.jsonl`. A group transition's `move_id` is durable ("Proof refusals stay with their session"): `groups.json` stores it with the group's origin beside its label, the group's `roles.jsonl` line and every member's `requested` and `SessionShutdown` record (`move_id` beside `request_id`) carry it, and a reconciliation after a restart reuses it; count the group once by it. A record or `groups.json` value written before that phase has no `move_id` and counts as a standalone move by its `request_id`. A five-hour wait ends `wait ended` and the session continues on its own account; the continuation is not journalled. A Claude move is also a `SessionShutdown` record with `target`, `source_label` and `why` in `~/.local/state/shutdown/<login>/sessions/`, moved to `history/` there once the session is confirmed restarted; a `confirmed` proves the move even when its record stays in `sessions/` with `timers pending`; `failed` with `manual restart`, `cancelled`, `restart failed` or `still on <source>`, and a standalone `failed` with no `requested` (refused before any record existed), are not completed moves; a session that failed and later confirmed on a new request counts once, as confirmed. A `no room` means no eligible destination for that session (its refusing logins excluded), not that every account was at zero. Role history `~/.local/state/accounts/roles.jsonl` records each workers-home write; read it through `worker_names.role_history_lines` (`scripts/accounts/worker_names.py`), which turns a historical `role: seats` into `role: workers`. Retained idle workers count in account-note sessions, and a worker whose server record is gone is attributed to the workers home its next turn runs on ("Roster rows stable between runs"); neither that presence nor that attribution proves a move or a continuation, and `confirmed` is written before the owed continuation's `turn/start`, so whether a worker continued needs its own evidence (a later turn on the thread) or is reported unknown. `agent_notes.py` keeps readings (`~/.local/state/agent-notes/readings.jsonl`) for eight days, so the readout runs at T0 + 7 d, T0 being the live proof: 2026-10-15 11:47 EDT ("Live proof of the moves"). The proof's own probe moves (`twoacct-probe-a` to `-d`, 11:28–11:46 EDT) and the shutdown unit's `pm-move-ghostty` check fall before T0 and stay out of the counts. The Codex workers move was not proven live then; the first real Codex refusal in the window is that proof, so report its `requested`, each worker's `confirmed` and whether every running worker continued, by a later turn on its thread, else unknown. `accounts.py burn` reads a `--since` or `--until` time with no zone in the user's zone, so give both with an explicit UTC offset.
+**Constraints from prior phases:** from "Two account groups" on, unit directors and showrunners each sit on one stored account (`~/.local/state/accounts/groups.json`; each change is a `roles.jsonl` entry `{at, group, label, why}`), a new Claude session launches on its group's account, and a group moves whole on a refusal. Codex workers move on a refusal ("Codex workers move on a refusal") and Claude sessions move on a refusal ("Claude sessions move on a refusal"). Every automatic transition is one line of `~/.local/state/accounts/moves.jsonl`, keyed by a stable `move_id`: `requested`, `confirmed`, `failed`, `waited`, `wait ended`, `no room`, `room again`. `requested` and `waited` carry the reset when it is known (`reset` is omitted when unknown); `no room` carries `earliest_reset`. A Codex request has one `confirmed` per worker (`run`, `worker`; `moves.read_journal()` turns a historical `seat` field into `worker`), and one worker may fail beside others confirming; a Claude batch shares one shutdown `request_id` across several session subjects. A targeted Claude move, automatic or by hand (`move`, `move showrunners`), is journalled: its `requested` carries `cause` (`refusal` or `by hand`; a missing `cause` is `refusal`) and, for a refusal, the window and reset of the refusal that started it ("Proof refusals stay with their session"); reconcile it with shutdown history by request id and session id and count it once. A Codex `requested` carries `cause: credits off` when `use_credits: off` at 0% weekly started it ("Codex credits setting and the 0% alert"), and so does a recovery request (`why: "Codex has room again"`) that releases a credits-off hold; count both under credits off, never as a refusal. The cause is `refusal`, `credits off` or `by hand`; a missing `cause` is `refusal`. A credits-off or refusal request whose swap failed (`failed` under its `move_id`) followed by Codex work going to Claude (`switch_to_claude`, a work-routing change in `quota_alert.json`, not a journal move) is one failed account move plus one routing fallback, never a confirmed workers move; only a `confirmed` per worker proves a workers move. From "Proof refusals stay with their session" on, each routing is journalled apart from account moves as `routed to claude` (`cause`, `moved`), then `routed back` (written only when every owed assignment came back or was kept as re-assigned since the switch) or `routing not restored` (`outcome: partial` or `failed`, with the `failed` keys), all three without `move_id` and paired by `fallback_at`, the fallback's own stored time, which survives an updater restart; `owner` is the numbered Codex account the fallback stored or `unknown`, never read from today's `~/.codex`. `moves.read_journal()` returns account moves and routing; `moves.read_moves()` returns account moves only. A routing outcome with no `routed to claude` of its `fallback_at` (a fallback saved before that phase) started at `fallback_at`. A legacy `default` in a journal entry's `from`, `to` or `label` resolves only from the `roles.jsonl` line in force at the entry's time or the same move's shutdown record ("Accounts named by number only"); with no such evidence it reads as `moves.HomeAccountUnresolved` and prints `home account unresolved`, and "Proof refusals stay with their session" keeps that resolution in `read_journal()`. Codex hand swaps and `set-role` are not journalled: take them from `roles.jsonl`. A group transition's `move_id` is durable ("Proof refusals stay with their session"): `groups.json` stores it with the group's origin beside its label, the group's `roles.jsonl` line and every member's `requested` and `SessionShutdown` record (`move_id` beside `request_id`) carry it, and a reconciliation after a restart reuses it; count the group once by it. A record or `groups.json` value written before that phase has no `move_id` and counts as a standalone move by its `request_id`. A five-hour wait ends `wait ended` and the session continues on its own account; the continuation is not journalled. A Claude move is also a `SessionShutdown` record with `target`, `source_label` and `why` in `~/.local/state/shutdown/<login>/sessions/`, moved to `history/` there once the session is confirmed restarted; a `confirmed` proves the move even when its record stays in `sessions/` with `timers pending`; `failed` with `manual restart`, `cancelled`, `restart failed` or `still on <source>`, and a standalone `failed` with no `requested` (refused before any record existed), are not completed moves; a session that failed and later confirmed on a new request counts once, as confirmed. A `no room` means no eligible destination for that session (its refusing logins excluded), not that every account was at zero. Role history `~/.local/state/accounts/roles.jsonl` records each workers-home write; read it through `worker_names.role_history_lines` (`scripts/accounts/worker_names.py`), which turns a historical `role: seats` into `role: workers`. Retained idle workers count in account-note sessions, and a worker whose server record is gone is attributed to the workers home its next turn runs on ("Roster rows stable between runs"); neither that presence nor that attribution proves a move or a continuation, and `confirmed` is written before the owed continuation's `turn/start`, so whether a worker continued needs its own evidence (a later turn on the thread) or is reported unknown. `agent_notes.py` keeps readings (`~/.local/state/agent-notes/readings.jsonl`) for eight days, so the readout runs at T0 + 7 d, T0 being the live proof: 2026-10-15 11:47 EDT ("Live proof of the moves"). The proof's own probe moves (`twoacct-probe-a` to `-d`, 11:28–11:46 EDT) and the shutdown unit's `pm-move-ghostty` check fall before T0 and stay out of the counts. The Codex workers move was not proven live then; the first real Codex refusal in the window is that proof, so report its `requested`, each worker's `confirmed` and whether every eligible worker continued, by a later turn on its thread, else unknown. Since Phase 36 a swap interrupts and resumes only the workers of live runs: a run is live when a holder is among `sessions.running_sessions()` (messaging sockets play no part), or, for a run with no holder, when its launcher survives; an ended run's workers are left untouched, mid-turn ones included. Report such a worker as skipped, never as a failed continuation, and report a worker's eligibility at the time as unknown when the evidence is gone, never rebuilt from today's sessions. `accounts.py burn` reads a `--since` or `--until` time with no zone in the user's zone, so give both with an explicit UTC offset. `burn` spreads the drop between two readings of an account evenly over the whole interval and counts all of it as observed time, however long the gap (`accounts.burn`), so its points stand but its observed days do not measure coverage: derive coverage from the reading times in `readings.jsonl` instead, where a gap of more than 10 minutes (`accounts.STALE_AFTER`; the updater reads every two minutes) between consecutive readings of one account is unobserved, and report per-day points that span such a gap as spread across it. Since Phase 31, a `default`/`~/.claude` label also resolves from the dated `home_cutovers` record (`moves.py` `read_journal`): that record is evidence for the destination of a cutover, while a matching shutdown record's `login` is evidence for the moved session's source; a label with neither stays unresolved and is counted as before. natedev cut over on 2026-10-15 at 23:09 EDT (`home_cutovers` row for claude2), inside the window: its postmaster session moved by hand to claude1 at 23:05 EDT for the cutover. A `--undo` leaves its `home_cutovers` row in place, so a row followed by an undo is not evidence for later records. The Mac cut over on 2026-10-16 at 10:17 EDT (Phase 34), but its claude2 `home_cutovers` row is gone: the role writer before Phase 40 rewrote `config/accounts.json` with only its `workers` key, and the Mac's workers change later that morning dropped the row (Phase 40's writer keeps every key). On the Mac, no reader consumes the journal `~/.local/state/accounts/cutover-home.json` (state `complete`, `at` 2026-10-16T14:17:57Z), so `read_journal()` there leaves a `~/.claude` label before that time unresolved unless a shutdown record's `login` resolves it. The readout attributes such an entry to claude2 from that journal, says so beside the row, and keeps it under `account unknown` only when it falls after the journal's `at` or the journal is missing. Since Phase 40, natedev holds the one role map: from its promotion on 2026-10-16 at about 11:05 EDT, every role change made under the login's own home on either machine is a line in natedev's `roles.jsonl`, with no field naming the machine that made it, while the Mac's own `groups.json` and `roles.jsonl` hold only its changes before then; move and shutdown records stay on the machine that made them. Since Phase 46, a process whose `HOME` is not the login's own home (a test's scratch home) reads and writes only that home's map on any machine. Before Phase 46 reached a Mac checkout, a test run there with a scratch `HOME` wrote into natedev's real map over ssh; a `roles.jsonl` line in that window whose `why` is a test fixture's (`original selection`, `checkpoint move`, `operator group move`, or another that no session or user wrote) is such a write: list it apart as a test write, never count it as a move. Never infer a move's machine from `roles.jsonl`. The Mac's 2026-10-16 setup changes (showrunners claude2 then claude1, units claude4, workers codex2 to codex1) are by hand, never refusals. Phase 41's live cutovers wrote a Codex `home_cutovers` row (codex2 into `~/.codex2`) on each machine: natedev at 2026-10-16T15:53:53Z, the Mac at 2026-10-16T16:00:43Z, each in that machine's own `config/accounts.json`; a `~/.codex` label in a record spanning that cutover resolves from that row, and stays unresolved where it does not reach.
 
-**Spec:** for the window T0 to T0 + 7 d, read `moves.jsonl`, the shutdown records and history, `roles.jsonl` and `readings.jsonl`, and run `accounts.py burn --since <T0> --until <T0 + 7 d>`. Report to the showrunner:
+**Spec:** for the window T0 to T0 + 7 d, on each machine (natedev and the Mac) run `moves.read_journal()` and shutdown's record readers on that machine, so each label resolves from that machine's own `config/accounts.json` rows and, on the Mac, its `cutover-home.json`; read natedev's `roles.jsonl` and `groups.json` for every role change from Phase 40's promotion on, and each machine's own `roles.jsonl` before it; join a group transition's `roles.jsonl` line to its members' `requested` and `SessionShutdown` records on either machine by `move_id`; and read each machine's `readings.jsonl`. Run `accounts.py burn` once per day of the window (`--since` and `--until` at each day's edges, each with an explicit UTC offset) for points per account per day; it prints one average for its whole window. In this window `burn` attributes no group (its role split ends at `UNIT_ROLE_ENDED_AT`, 2026-10-13, and it skips `group` lines), so take each group's intervals on an account from the `group` lines of natedev's `roles.jsonl` (and the Mac's before Phase 40) and split the per-day burn across them. Report to the showrunner:
 
 - moves per tool (Claude session, Codex workers) and per cause (weekly refusal, 5-hour refusal, credits off, by hand), a group move counted once per group transition apart from its per-session requests and confirmed outcomes, counted both per transition (one per `requested`, or per hand move) and per worker or session confirmed; a request with some workers confirmed and some failed is partial; each is confirmed against its record, and an unconfirmed or failed restart is marked, never counted as a move;
 - each time Codex work routed to Claude, counted apart from account moves and paired with its outcome by `fallback_at`: `routed back` is a completed recovery; `routing not restored` (`partial` or `failed`) is reported with its failed keys and never counted as a recovery; a routing with no outcome is open, its end unknown; an `owner: unknown` stays unknown;
@@ -476,7 +476,7 @@ Recommend whether more accounts are needed.
 
 **Workers:** nothing splits: the unit director writes the readout from the records; no worker opens.
 
-**Acceptance gate:** the readout cites its window, account identities, observed days, and the move, wait and no-room evidence. It tells unconfirmed or failed moves from completed ones, counts no `routing not restored` as a recovery, keeps each evidenced transition with a `home account unresolved` account in the counts with that account reported unknown (never read from today's login, no repair asked of the user), reports coverage gaps, and is in this plan and sent to the showrunner.
+**Acceptance gate:** the readout cites its window, account identities, observed days, and the move, wait and no-room evidence. It tells unconfirmed or failed moves from completed ones and workers skipped as ended (or of unknown eligibility) from failed continuations, counts no `routing not restored` as a recovery, keeps each evidenced transition with a `home account unresolved` account in the counts with that account reported unknown (never read from today's login, no repair asked of the user), reports coverage gaps (two readings of one account more than 10 minutes apart show as a gap, never as continuous coverage), and is in this plan and sent to the showrunner.
 
 ### Phase 10 — A home per Codex account  · status: done
 
@@ -613,7 +613,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Readings come from the usage store through `stored_reading`; a reading older than 10 minutes skips the candidate. An unresolved refusal in `~/.local/state/accounts/refusals.json` excludes the account whatever the saved percentages say.
 - The verb `accounts.py pick claude|codex [--exclude '<label>']... [--keep '<label>'] [--explain]` prints the label (exit 0) or `no <tool> account has room; the earliest reset is <time>` (exit 1); `--explain` adds a line per candidate with `picked`, `has room`, `refused at <time>` or its reason.
 - The unit role is gone: `role_account("unit")`, `role`/`env`/`exec unit` call `pick("claude", now)` and store nothing; a `unit` key in `config/accounts.json` is ignored. The `seats` role is unchanged.
-- `add_unit.py`, `add_showrunner.py` and `nightly_review.py` launch on the picked account (no 10% gate) and record `@claude_config_dir`/`@claude_model`. A showrunner resume keeps its account: `--account`, else `--config-dir` (resolved against the invoking cwd), else tmux `@claude_config_dir`, else a one-line refusal; promotion passes the unit's recorded dir.
+- `add_unit.py`, `add_showrunner.py` and `nightly_review.py` launch on the picked account (no 10% gate) and record `@claude_config_dir`/`@claude_model`. A showrunner resume keeps its account: `--account`, else `--config-dir` (resolved against the invoking cwd), else tmux `@claude_config_dir`, else a one-line refusal; promotion passes the unit's recorded dir. Superseded by herdr-adoption Phase 7: `add_unit.py` and `add_showrunner.py` launch in herdr and record neither option, `nightly_review.py` records none either, and a herdr showrunner resume with no `--account` or `--config-dir` takes `accounts.role_account("unit")`.
 - Whoami, notes and quota alerts cover every login a live session runs on; `unit_swap_line` is a move line with no swap command; the status table marks the account `pick claude` chooses now with `next`.
 
 **Files:**
@@ -1008,37 +1008,412 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 22
 
-#### Work Order
+#### As-built
 
-**Goal:** the status line shows each role and each account in its own color, and colors the token count and the 5-hour and weekly percentages green, yellow or red as they near their limits (the user, via the showrunner, 2026-10-15 16:4x EDT).
-
-**Constraints from prior phases:** `statusline.sh` is sourced by `settings.json`'s `statusLine` command with `statusline` set to its folder; it reads its inputs with shell builtins and ends by exec'ing one `jq` process over `statusline.jq` ("Account labels without a space" left the account field as `claude<N>`). It runs several times a second across all sessions, so it starts no other process. Line 1 is `<role> | <account> | <dir> | <tokens> | <model [effort]>`; line 2 is `5-hour <N>% left[ until <time>] | weekly <M>% left[ until <time>]`.
-
-**Spec:**
-
-- **Config:** new `config/statusline.conf`, `key=value` lines, `#` comments and blank lines ignored. Keys and the values it ships with:
-  - `role.showrunner=bright-magenta`, `role.unit-director=bright-blue`, `role.worker=bright-cyan` (a role's key is its text with spaces as hyphens; `unassigned` has no key and stays uncolored);
-  - `account.claude1=cyan`, `account.claude2=magenta`, `account.claude3=blue`, `account.claude4=bright-white` (keyed by the label as shown on the line);
-  - `level.ok=bright-green`, `level.warn=bright-yellow`, `level.alarm=bright-red`;
-  - `tokens.warn=80`, `tokens.alarm=90` (percent of the context window used);
-  - `left.warn=10`, `left.alarm=5` (percent left).
-  Color names are the eight ANSI names and their `bright-` forms (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`: SGR 30–37, bright 90–97). A header comment says what each key does. Green, yellow and red are used only for levels.
-- **Reading it:** `statusline.sh` passes `"$statusline/../../config/statusline.conf"` to jq as `--rawfile colors`, `/dev/null` when it is unreadable, still one process and no new builtin loop. `statusline.jq` parses it. A missing file, an unknown key, an unknown color name or a threshold that is not a number leaves that piece uncolored; nothing errors and the uncolored text is exactly today's line.
-- **Colors on the line:** each colored field is wrapped as `ESC[<code>m<text>ESC[0m`; the ` | ` separators, the directory, the model, the labels `5-hour` and `weekly` and the ` until <time>` parts stay uncolored.
-  - Role: its `role.*` color.
-  - Account: its `account.*` color.
-  - Tokens: `used = total_input_tokens * 100 / context_window_size` (both from `.context_window`; Claude Code 2.1.296 sets `total_input_tokens` to the current context, input plus cache, and `context_window_size` to the model's window). `level.alarm` when `used >= tokens.alarm`, `level.warn` when `used >= tokens.warn`, else `level.ok`. No positive window size: uncolored.
-  - `<N>% left` for 5-hour and for weekly, judged on the integer shown: `level.alarm` when `N <= left.alarm`, `level.warn` when `N <= left.warn`, else `level.ok`.
-- **Docs:** a `config/README.md` entry for `statusline.conf`; `statusline.jq`'s header comment names the colors and the config.
+- `config/statusline.conf` (`key=value`, `#` comments) holds the colors: `role.<role with hyphens>`, `account.<label>`, `level.ok|warn|alarm`, and the thresholds `tokens.warn|alarm` (percent of the window used, 80/90) and `left.warn|alarm` (percent left, 10/5). Colors are the eight ANSI names and their `bright-` forms. Shipped: showrunner bright magenta, unit director bright blue, worker bright cyan; claude1 cyan, claude2 magenta, claude3 blue, claude4 bright white; levels bright green, yellow, red. `unassigned` and an unlisted label stay uncolored.
+- `statusline.sh` passes the file as `--rawfile colors` (`/dev/null` when unreadable) to the same single jq process, and sets zsh `nonomatch` so an empty notifier glob no longer aborts the line. `statusline.jq` parses it once per render.
+- Only the role, the account, the token count and each `<N>% left` are wrapped (`ESC[<code>m…ESC[0m`). Tokens: `total_input_tokens * 100 / context_window_size`, unrounded, alarm at `>= tokens.alarm`, warn at `>= tokens.warn`. Percent left: judged on the integer shown, alarm at `<= left.alarm`, warn at `<= left.warn`. Claude Code 2.1.296 sets `total_input_tokens` to the current context (input plus cache) and `context_window_size` to the model's window.
+- A missing file, an unknown key or color, a bad threshold, or no positive window size leaves that piece uncolored; with the codes stripped the line equals the uncolored one.
 
 **Files:**
+- `config/statusline.conf` — new; `config/README.md` — its entry.
+- `scripts/statusline/statusline.sh`, `statusline.jq` — the colors.
+- `scripts/statusline/test_statusline.py` — each color, each threshold edge, the fallbacks, the stripped-line equality, and the settings command finding the config.
 
-- `config/statusline.conf` — new.
-- `config/README.md` — its entry.
-- `scripts/statusline/statusline.sh` — passes the config.
-- `scripts/statusline/statusline.jq` — parses the config, colors the fields.
-- `scripts/statusline/test_statusline.py` — tests.
+### Phase 29 — Status line follow-ups  · status: done
 
-**Workers:** impl writes the config, `config/README.md`, `statusline.sh` and `statusline.jq`; test writes `test_statusline.py`, reading the others.
+**Depends on:** Phase 28
 
-**Acceptance gate:** tests show each role and each account in its color and `unassigned` and an unknown account uncolored; the token level on each side of 80% and 90% (79/80, 89/90) and with no window size; each window's level at 11/10 and 6/5 percent left; a missing config, a bad color name and a non-numeric threshold giving the uncolored line; and, with ANSI codes stripped, both lines equal to today's output for the same input. The shipped config's thresholds and colors are the ones above. The suite and basedpyright pass, and a live run of the settings command over a sample status JSON shows the colors.
+#### As-built
+
+- Every role and account has a real color; none ships white, bright-white, black or bright-black. Besides the eight ANSI names and their `bright-` forms, `statusline.jq` accepts five named 256-color entries, written `ESC[38;5;<n>m`: `orange` 208, `purple` 141, `pink` 211, `teal` 30, `brown` 137. `config/statusline.conf` ships `account.claude4=orange` and `role.unassigned=purple`; `unassigned` takes its color from `role.unassigned` like any role, and with no key stays uncolored.
+- A unit director's role reads `unit director for <showrunner name>`. When `SHOWRUNNER_UNIT` is set and `PLAN_DELEGATE_TEAM_ROLE` is empty, `statusline.sh` reads `TARGET=session:<id>` from `${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$SHOWRUNNER_UNIT/conf`, then takes the first `${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}/<pid>.json` containing `"sessionId":"<id>"` whose pid is live (`kill -0`), with shell builtins only (`$(<file)` under zsh, `IFS= read -r` elsewhere). It passes the record text as `--arg showrunner` (empty when nothing matches); jq parses it with `try fromjson catch null` and uses a non-empty string `name`, else `unit director`. The whole text takes `role.unit-director`'s color. The name is read on every refresh, never stored, so a renamed showrunner shows at once; no other role looks anything up.
+- `/new_account` adds a Claude account's color after the nightly review step: with no `account.<label>=` line, it picks the first color in palette order (the sixteen ANSI names in `statusline.jq`'s order, then `orange`, `purple`, `pink`, `teal`, `brown`) that is not red, green or yellow in either form, not `black`, `white`, `bright-black` or `bright-white`, and used by no `account.` or `role.` line; else the first used by no `account.` line; else none. The line goes after the last `account.` line (at the end when there is none) through a temporary file chmodded to the original's mode, then a replace; every other line is unchanged. Step text `status line color <color> for <label>`; a rerun writes nothing; no color left or no config file is a done step saying the label stays uncolored; an unreadable or unwritable file is a `for you:` step naming the path and the error. With the shipped file, `claude5` gets `pink`, then `claude6` `teal`.
+
+**Files:**
+- `config/statusline.conf` — claude4 orange, `role.unassigned` purple; `config/README.md` — the five named colors and that `/new_account` adds the account line.
+- `scripts/statusline/statusline.sh` — the showrunner lookup; `statusline.jq` — the named colors, `unassigned`, `unit director for <name>`.
+- `scripts/accounts/new_account.py` — the color step; `commands/new_account.md` — one line on it.
+- `scripts/accounts/test_new_account.py` — pick order, placement, rerun, missing file, no color left, 0640 and 0600 kept.
+- `scripts/statusline/test_statusline.py` — zsh render with no notifier state, the named colors, every palette name rendering, the showrunner name (found, renamed, missing, dead pid, damaged record, a worker never looking, a showrunner on another account).
+
+**Gotchas:**
+- The record reaches jq as text, never through `--slurpfile`: a damaged record makes `--slurpfile` exit 2 and blank the whole line.
+- Every account's `sessions` folder links to `~/.claude/sessions` (`accounts.py` `ALWAYS_LINKED`), so the lookup finds a showrunner running on any account.
+- zsh's `read` reads byte by byte and cost about 3 ms per render; `$(<file)` does not.
+
+### Phase 30 — The accounts table shows only accounts  · status: done
+
+#### As-built
+
+- `KNOWN_PRIVATE_NAMES` in `scripts/accounts/accounts.py` includes `feedback` and `telemetry`; `_is_known_private` accepts the prefix `.claude.json.tmp.`. These are per-account, never linked, never reported.
+- `status_report` prints Claude unknown entries (`AccountStatus.unclassified`) and Codex unknown entries (`CodexStatus.unclassified`) only under `--detail`; the default table shows only accounts.
+- `_check_codex_home` does not count unknown entries, so `check codexN` passes a home whose only oddity is an unknown entry; an unreadable numbered home is still a problem.
+- `sweep_claude_temp_files(now)` opens `$HOME` and each real `~/.claudeN` with `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, lists each folder once, lstats and unlinks through `dir_fd`, deletes only regular `.claude.json.tmp.*` files strictly more than a day old, and skips every `OSError`. `agent_notes.update_alert_pass` calls it once per pass (the two-minute updater).
+
+**Files:**
+- `scripts/accounts/accounts.py` — private names and prefix, `--detail` gate, `CodexStatus.unclassified`, `_check_codex_home`, `sweep_claude_temp_files`.
+- `scripts/whoami/agent_notes.py` — `update_alert_pass` runs the sweep.
+- `docs/accounts.md` — default table shows only accounts; `--detail` shows unknown entries; the sweep.
+- `scripts/accounts/test_accounts.py`, `scripts/whoami/test_agent_notes.py` — classification, detail gating, sweep and updater tests.
+- `scripts/whoami/test_codex_alert_accounts.py` — the unchecked-target fixture fails its check through a private cache link, not an unknown entry.
+
+**Binds later work:** the sweep scans both `$HOME` (sessions on `~/.claude` write `$HOME/.claude.json.tmp.*`) and each `~/.claudeN` (its own `.claude.json` temps sit inside it); a fresh `~/.claudeN` shows no unknown-entry lines. `quota_alert` may recommend a Codex home that holds unknown entries.
+
+**Gotchas:** folders open without following links, so a `~/.claudeN` swapped for a link after discovery is never scanned.
+
+### Phase 31 — ~/.claude is a config home, not an account  · status: done
+
+**Depends on:** Phase 30
+
+#### As-built
+
+- `~/.claude` is never an account folder: no function returns it as a note's folder, the status table has no `~/.claude` row, and `check claude2` inspects `~/.claude2` like any `~/.claudeN`. A note whose `~/.claudeN` is missing reads "not set up".
+- Each machine changes over on its own. While `~/.claude` holds a login (`home_account_state() -> LegacyHomeLogin | ConfigOnlyHome`), a process with no `CLAUDE_CONFIG_DIR` reads as that login's account and the table prints `~/.claude holds a login; run accounts.py cutover-home` (on macOS the note names one `/login` in `~/.claude2` instead); once it holds none, such a process reads as no account everywhere and the status line shows no account piece. `account.process_config_dir(pid)` returns `ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread`, and every consumer handles all three.
+- `accounts.py exec <claudeN|units|showrunners>` launches on a numbered folder or a group's account; `prepared_account` and `account_prefix` never unset `CLAUDE_CONFIG_DIR`. Launchers that choose no account (`message/send.py`, `cli_agent/cli_agent.sh`, `agents/agent_exec.sh`, `agent_bg.sh`, the style-eval and berth_fix launchers) go through `account_for_unscoped_launch(environment) -> ClaudeLaunchAccount | LegacyHomeLaunch`: the caller's numbered folder, else the showrunners group's folder, else `LegacyHomeLaunch` while `~/.claude` still holds a login. Shell launchers share `scripts/agents/claude_account.sh`. herdr's unit, child-showrunner, standalone and restart launches keep their pane path and carry the resolver's `CLAUDE_CONFIG_DIR`.
+- `accounts.py cutover-home <label>` renames `.credentials.json` and the `oauthAccount` block of `$HOME/.claude.json` into `~/.claudeN` (both atomic, never copied, never printed), under the journal `~/.local/state/accounts/cutover-home.json` written before the first rename; a rerun finishes an interrupted run and `--undo` renames back. It refuses while any Claude process uses the affected folder (`--undo`: `~/.claudeN`), when the destination holds a login or an `oauthAccount`, when a process's argv is unreadable, and on macOS in both directions. It appends a dated `home_cutovers` entry (label, login, time) to `config/accounts.json`.
+- History resolves a record naming `default` or `~/.claude` from a login the record carries or from a `home_cutovers` entry dated after it, else leaves it unresolved; today's login never names a past record. `burn`, `_historical_roles`, `_unit_role_history`, `group_accounts`, `moves.py` and `shutdown/record.py` follow this, and a resume of such a record goes to that label's folder.
+- `$HOME/.claude.json` stays the seed and MCP baseline; the seed copies each project's trust entries into a new folder's `.claude.json`. On macOS `agent_accounts.claude_credentials` reads the keychain only for `~/.claude`; a numbered folder's keychain lookup is Phase 33's.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `cutover-home`, `exec`, `account_for_unscoped_launch`, the status note; `moves.py` — history resolution; `new_account.py`, `refusal_watch.py`.
+- `scripts/whoami/account.py` — tagged process result, `home_account_state`; `agent_accounts.py`, `agent_notes.py`, `quota_alert.py`, `whoami.py`.
+- `scripts/shutdown/` (`record.py`, `restart.py`, `inventory.py`, `settle.py`), `scripts/production/` (`add_unit.py`, `add_showrunner.py`, `rename.py`), `statusline.sh`, `ensure_git_filters.sh`, `herdr/trust_survey.py`, `notify/review.py`, `nightly_review.py` — no `~/.claude` account reads.
+- `scripts/agents/claude_account.sh` — shared shell launch resolver; `scripts/accounts/__init__.py`, `scripts/whoami/__init__.py` — repo-root imports.
+- `scripts/accounts/test_launch_accounts.py` — guard: every Claude launcher uses the resolver, native `start_agent(kind="claude")` launches included.
+- `docs/accounts.md`, `docs/as-built/` `shutdown-and-restart.md`, `herdr-adoption.md`, `production-rename.md`, `showrunner-automation.md`.
+
+**Binds later work:** the live cutover on natedev runs `cutover-home claude2` and first moves every Claude process with no account setting (the postmaster session, cwd `~/postmaster`), since the refusal covers it. The Mac cannot use `cutover-home`; making its `~/.claude` hold no login (keychain entry and `$HOME/.claude.json` `oauthAccount`) without `/logout` is an open gap. A hand-typed `claude` lands on the showrunners account only once its alias calls `accounts.py exec showrunners`.
+
+**Gotchas:**
+- `ps` flattens argv; the guard reads `/proc/<pid>/cmdline` on Linux and fails closed on unreadable argv.
+- Launcher tests that copy a script tree must copy `claude_account.sh`.
+- Two folders on one login break token refresh; `cutover-home` renames, never copies.
+
+### Phase 32 — Cutover on natedev: claude2 moves into ~/.claude2  · status: done
+
+#### As-built
+
+- On natedev, claude2's login lives in `~/.claude2` and `~/.claude` holds no login: no `.credentials.json`, no `oauthAccount` in `$HOME/.claude.json`. `accounts.py check claude2` passes, and the status table shows `~/.claude2` with claude2's login and usage and no legacy-home note.
+- The cutover journal (`~/.local/state/accounts/cutover-home.json`) reads complete, and `config/accounts.json` `home_cutovers` holds `{label: claude2, at: 2026-10-16T03:09:27Z}` (2026-10-15 23:09 EDT).
+- No Claude process runs on `~/.claude`. The postmaster session, the only one without an account setting, runs on claude1 after a scripted move (`accounts.py move postmaster claude1`). An unscoped launch (`account_for_unscoped_launch` with no `CLAUDE_CONFIG_DIR`) picks the showrunners group's folder.
+- `docs/accounts.md` carries the natedev line.
+
+**Gotchas:** `cutover-home --undo` leaves its `home_cutovers` row in place.
+
+### Phase 33 — Cutover on the Mac  · status: done
+
+#### As-built
+
+- On macOS, `accounts.py cutover-home <label>` refuses unless the numbered folder holds a login (its `.claude.json` `oauthAccount` and its keychain entry, checked by service name). It refuses on an account mismatch, compared in code and never printed, with nothing changed. It also refuses while a Claude process uses `~/.claude`; the Mac guard reads each candidate's native argv through `sysctl` `KERN_PROCARGS2` (`_mac_process_arguments`) and refuses when that argv cannot be read. It writes the journal, removes `oauthAccount` from `$HOME/.claude.json` keeping every other key, deletes `Claude Code-credentials` by service name last, and appends the dated `home_cutovers` record. A rerun finishes an interrupted run. `--undo` restores `oauthAccount` and says the keychain entry needs a `/login` in `~/.claude`; an undone journal lets a fresh forward cutover start.
+- `agent_accounts.claude_keychain_service` returns `Claude Code-credentials` when `CLAUDE_CONFIG_DIR` is unset or empty, else `Claude Code-credentials-<first 8 hex of sha256 of the NFC value>`; a named folder reads only its own entry and a missing one raises "usage credentials unavailable".
+- `swap workers codexN` prints `Workers moving <from> → <to>:` (dry run `Workers would move …`), then one line per switching worker: `showrunner · unit · worker → codexN`, marked `(mid-turn; switches when its turn ends)` when mid-turn; an unlisted holder shows its saved session name, else `unknown session (<run>)`.
+- `accounts.py exec codexN|workers [codex args]` resolves the home through `check_codex_target` (for `workers`, the account `role workers` selects), sets `CODEX_HOME` and execs `codex`; `--probe` is Claude-only.
+
+**Files:**
+- `scripts/accounts/accounts.py` — macOS cutover, Mac process guard, swap lines, Codex exec.
+- `scripts/whoami/agent_accounts.py` — keychain service names.
+- `scripts/agents/codex_mesh.py` — `WorkersRunSwitch` / `SwitchingWorker` from `retire_workers_servers`.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — the Mac step, natedev's cutover, Codex launch lines.
+
+**Gotchas:** no real Mac keychain or `sysctl` call has run in tests; `security` and the kernel read are stubbed.
+
+### Phase 34 — Cutover on the Mac: the live step  · status: done
+
+#### As-built
+
+- On the Mac, the showrunners group sits on claude2 (`move showrunners claude2`, by hand, 2026-10-16); units are not configured there. Codex stays on `~/.codex` (codex2, workers). The darwin `claude` alias (`accounts.py exec showrunners`, natedev's flags) went to the showrunner for `shell.nix`.
+- The user ran `cutover-home claude2` in a Terminal on the Mac on 2026-10-16 at 10:17 EDT: `~/.claude.json` has no `oauthAccount`, the journal reads `complete`, and the Mac's `config/accounts.json` holds its `home_cutovers` row. `docs/accounts.md` says `~/.claude` holds no login on either machine.
+- `_mac_login_keychain_visible()` in `scripts/accounts/accounts.py` reads `security list-keychains` (no domain: the search list `find-generic-password` uses). The forward Mac cutover refuses with `accounts: this session cannot see the Mac's login keychain; run cutover-home in a Terminal on the Mac` when `~/Library/Keychains/login.keychain-db` (or `login.keychain`) is not listed, before any keychain read and before the journal or an identity file changes; `--undo` and a rerun of a complete cutover skip it.
+
+**Files:**
+- `scripts/accounts/accounts.py` — the login-keychain check.
+- `scripts/accounts/test_cutover_home.py` — the fake keychain answers `list-keychains`; refusal, undo and `login.keychain` tests.
+- `docs/accounts.md` — the Mac cutover runs in a Terminal; `~/.claude` holds no login on either machine.
+
+**Gotchas:**
+- Over ssh the Mac's search list holds only `/Library/Keychains/System.keychain`, while `list-keychains -d user` still lists the login keychain; every keychain entry reads as absent. Claude usage readings take their token from the keychain, so claude2 reads `unavailable` from any ssh session.
+
+**Live check outstanding (with the user):** a claude2 usage reading (`accounts.py` in a Terminal on the Mac shows a weekly number for claude2), and a new `claude` landing in `~/.claude2` once the macrebuild brings the darwin alias.
+
+### Phase 35 — A workers swap moves running workers at once  · status: done
+
+#### As-built
+
+- `retire_workers_servers` (swap) and `command_signin_changed` interrupt every running worker on an outgoing server at once: each worker's account-move marker (`<worker>.account-move.json` in the run folder) is written first, then `turn/interrupt` goes through the one turn-interrupt helper (`_interrupt_turn`, shared with the `interrupt` verb, `steer` and `end`). All interrupts across all runs go out before any wait.
+- `_finish_run_moves` / `_wait_account_move_resumes` confirm every continuation against one shared deadline (`ACCOUNT_MOVE_RESUME_TIMEOUT_SECS`, 30 s). A worker whose `launcher_pid` is dead or absent gets a detached `codex_mesh.py resume-account-move --session-dir <run> --to <worker>`.
+- A waiting launcher that sees the marker clears it, posts `account moved to codexN; resumed`, and resumes the same thread on the new server with "Your turn was interrupted to move your Codex account; any command you had running was stopped with it, so run it again. Continue where you stopped." An interrupted turn without a marker keeps the user-stop handling. A pending `mesh_runs.py` result is consumed once under the pending-inbox lock, so the resume neither drops nor repeats it.
+- Swap lines end `, interrupted and resumed` for a mid-turn worker; a failed interrupt or resume names the reason and the resume command. The swap exits 0 once the role moved and 1 only when the role move fails. `--dry-run` prints the same lines and interrupts nothing. The holder notice and server log say running workers were interrupted and resumed on the new account.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — move marker, shared interrupt, launcher resume, `resume-account-move`, shared-deadline wait.
+- `scripts/accounts/accounts.py` — `_workers_swap_lines` suffixes.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — swap behavior.
+
+**Gotchas:**
+- The resume relies on no build surviving the interrupted turn: the continuation tells the worker its command stopped and to rerun it.
+- The detached resume claims the roster row keeping role, previous_role and lens (read from the agents ledger), with previous_status `failed`, so a rejected resume leaves the printed manual retry usable.
+
+### Phase 36 — A swap leaves ended sessions' workers alone  · status: done
+
+#### As-built
+
+- `_run_is_live(folder, holders)` in `codex_mesh.py`: a run with holders is live only while one of them is in `sessions.running_sessions()`, read per run under its lock; a run with no holder is live only while a roster `launcher_pid` is alive. The swap (`retire_workers_servers`) and the sign-in change both use it.
+- An ended run (`EndedWorkersRun`) gets no marker, interrupt, resume or holder notice. Its outgoing servers stop only through `_stop_unused`; a busy one stays running as `KeptWorkersServer` (pid, port, reason) with a watcher.
+- `codex_mesh.leftover_server_lines` is the one source of `N leftover servers from ended sessions, M stopped` with `left running:` lines, and the dry run's `…: M can be stopped, K would stay` with `would stay:` lines. `accounts.py` `_workers_swap_lines` folds rows per (holder, slot) through `FoldedWorkerRow` with ` ×N`; failed entries keep their own rows.
+- The sign-in change moves a live run only on its current record's server; retired old-sign-in servers count only for ended runs. `_start_watcher` holds `mesh-watcher-<pid>-<port>.lock` for the watcher's life and returns `ExistingServerWatcher` when one already runs.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — liveness, ended-run cleanup, leftover lines, watcher lock.
+- `scripts/accounts/accounts.py` — folded swap rows.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — ended-session line and folding.
+
+**Ruled out:** one row per holder for a run two holders share, because a worker belongs to its run.
+
+### Phase 37 — A folded swap row counts its mid-turn workers  · status: done
+
+#### As-built
+
+- `FoldedWorkerRow` in `scripts/accounts/accounts.py` counts mid-turn entries (`mid_turn_count`). `_workers_swap_lines` prints a single entry as `→ <target>, interrupted and resumed` when mid-turn, and a folded row as ` ×N`, then `, K interrupted and resumed` when K of its entries were mid-turn. Failed entries never fold.
+
+**Files:**
+- `scripts/accounts/accounts.py` — mid-turn count on folded rows.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — the count in the swap output description.
+
+### Phase 38 — Swap rows name a run's launching session  · status: done
+
+#### As-built
+
+- `_launcher_sessions(folder)` in `scripts/agents/codex_mesh.py` names a run with no holder by each live roster `launcher_pid`'s nearest ancestor that a running session record names, counting only records whose `procStart` matches the process. It reuses `process_table.snapshot` and, since Phase 39, `process_table.nearest_named`, so it works on Linux and macOS.
+- `WorkersRunSwitch` and `WorkersRunMove` carry `launcher_sessions`; the swap and the sign-in change fill it for live runs with no holder. Liveness, interrupts, resumes and leftover servers are unchanged.
+- `_workers_swap_lines` names and folds such a run like a holder (`showrunner · unit · worker`); `unknown session (<run folder>)` remains only when nothing resolves.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — launcher sessions.
+- `scripts/accounts/accounts.py` — naming from a launcher session.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — swap row naming.
+
+### Phase 39 — The accounts script has no import cycles  · status: done
+
+#### As-built
+
+- `process_table.nearest_named(process, table, names) -> str | None` is the one ancestry walk: the nearest ancestor (the process included) that `names` holds, `None` when the chain reaches none or loops. `codex_winddown.owner` is gone; `agent_counts` counts a `None` as `NO_SESSION`. `codex_mesh._launcher_sessions` imports only `process_table`, with no `sys.path` insertion.
+- `scripts/production/production_units.py` is the one home of the production doc's Units-table reading (`Refusal`, `cell_value`, `unit_rows`, `row_cells`, `unit_headings`, `unit_table`, `plan_cell_is_retired`, `worktree_is_linked`, `SessionMarks`, `unit_is_retired`, `live_unit_table`, `retired_units`). Every user imports from it, `add_unit` included; `roster` and `live_units` no longer import `add_unit`.
+- `scripts/notify/reply_asks.py` is the one home of the reply-question parser (`question_prose`, `ReplyAsks`, `reply_questions`, and the review-pool `user_reply_questions` and `peer_question_lead` taken from build-followups at 3a7f182c). `showrunner_footer` imports it, not `review`, which closed the chain accounts → shutdown.inventory → showrunner_footer → notify.review → accounts. `review` imports the parser from it.
+- Whole-project basedpyright lists no import cycle through `scripts/accounts/accounts.py`; behavior is unchanged.
+
+**Files:**
+- `scripts/message/process_table.py`, `scripts/production/codex_winddown.py`, `scripts/agents/codex_mesh.py` — the ancestry walk.
+- `scripts/production/production_units.py` and its importers across `scripts/production`, `scripts/message/roster.py`, `scripts/delegate/phase_table.py`, `scripts/nightly_review`, `scripts/bevy_upgrade` and `scripts/shutdown/restart.py` — the Units table.
+- `scripts/notify/reply_asks.py`, `scripts/notify/review.py`, `scripts/hooks/showrunner_footer.py` — the reply-question parser.
+
+### Phase 40 — One role map for both machines  · status: done
+
+#### As-built
+
+- natedev holds the one role map (Claude groups `showrunners`/`units` in `groups_file()`, the workers label in `accounts_config_file()`, history in `roles.jsonl`). `scripts/accounts/role_map.py` owns it: `read_role_map()` / `write_role_map(change)`, `ROLE_MAP_HOST = "natedev"` with `is_role_map_host()` by hostname (tests choose it), and `ssh_role_map()` as the only transport. Every writer (`move`/`move_group`, `swap`, `set-role`, `refusal_watch.py`, the Codex sign-in change) goes through `write_role_map`.
+- On the Mac, a write runs `accounts.py role-map-write` on natedev over `ssh natedev` with the same why, cause and move id; a failed one prints `accounts: natedev refused <role> → <label>` and changes nothing locally. A read runs `accounts.py role-map-read` once per command (`role_map_command`) and caches it at `~/.local/state/accounts/role_map_cache.json`; with natedev unreachable it uses the cache and prints `role map from <time in the user's zone>; natedev unreachable`, and with no cache it refuses with `accounts: cannot read role map from natedev; no usable map`.
+- A role on an account not set up or not logged in on this machine refuses every launch with `accounts: <role> is on <label>, which is not set up on this machine; <setup step>` (or `… not logged in …; <login step>`); status lists the same lines under the table. Nothing falls back to another account.
+- `agent_accounts.workers_home()` raises `RoleAccountUnavailable` when the map names no workers account; observing readers take `observe_workers_home()` → `Path | NoWorkersHome` (whoami prints it, agent_notes adds it to messages).
+
+**Files:**
+- `scripts/accounts/role_map.py` — the map, transport, cache and host constant.
+- `scripts/accounts/accounts.py` — wrappers, launch refusals, status lines, `role-map-read`/`role-map-write` CLI.
+- `scripts/whoami/agent_accounts.py` — `workers_home()` and `observe_workers_home()`.
+- `scripts/accounts/refusal_watch.py` — automatic moves through `write_role_map`.
+- quota_alert, agent_notes, five_hour, whoami, roster, codex_mesh, `agent_exec.sh` — workers home readers on the new boundary.
+- `scripts/accounts/test_role_map.py`, `scripts/accounts/test_accounts.py` — ssh faked: Mac write lands on natedev, Mac read, cache line, refusals.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — the one map, ssh write and read, cache line, refusals.
+
+**Binds later work:** role moves made on the Mac from 2026-10-16 on are lines in natedev's `roles.jsonl` with no field naming the machine; the Mac's own `groups.json`/`roles.jsonl` hold only its earlier moves, including the 2026-10-16 setup moves (showrunners claude2 → claude1, units claude4, workers codex2 → codex1), which are setup, not refusals ("Readout of the moves").
+
+**Gotchas:**
+- The Mac runs natedev's promoted `~/.claude` accounts.py over ssh, so it depends on natedev's promoted code; before promote, a Mac with no cache refuses role launches.
+- A remote write is checked against the Mac's accounts only; natedev accepts it without checking its own accounts, and natedev's launch then refuses loudly.
+- Before this phase the role writer rewrote `config/accounts.json` keeping only `workers`, which dropped the Mac's claude2 `home_cutovers` row on 2026-10-16; `role_map.write_role_map` keeps every key.
+
+### Phase 41 — Codex logins out of ~/.codex  · status: done
+
+#### As-built
+
+- `~/.codex` holds no login on either machine, as `~/.claude` holds none: codex2's `auth.json` lives in `~/.codex2`, beside `~/.codex1`. The `codex` executable run without `CODEX_HOME` is signed out; the `codex` alias (`accounts.py exec workers`) still selects the mapped numbered home. The cutover ran on natedev 2026-10-16 11:53 EDT and on the Mac 12:00 EDT; each machine's own `config/accounts.json` holds its Codex `home_cutovers` row.
+- `accounts.py cutover-home codexN` (`cutover_codex_home`) checks that `~/.codex` holds codexN's login (note login against `codex_email_on_disk`), links a missing `~/.codexN` through `_link_codex_home` (split from `_setup_codex_home`, so `setup` keeps its duplicate-login refusal and the cutover starts no Codex process), then renames `~/.codex/auth.json` to `~/.codexN/auth.json` and writes the `home_cutovers` row idempotently. `--undo` renames it back. `cutover_home` dispatches a Codex label before its macOS branch, so a Codex cutover runs no keychain check; the Claude forms are unchanged.
+- Journal `~/.local/state/accounts/cutover-codex-home.json` (`moving`, `complete`, `undoing`, `undone`) is written before the rename: a rerun finishes an interrupted move (after the rename, the history write or the undo rename, or with the source `auth.json` already gone), a changed source login behind a `moving` journal refuses, a rerun of a complete cutover does nothing, and `~/.codex` signed in again after a complete move takes a fresh cutover.
+- The cutover refuses before any change while a `codex` process runs with `CODEX_HOME` unset or set to the home that loses the login (`~/.codex` forward, `~/.codexN` on undo), and fails closed with `ProcessEnvironmentUnread` when an environment or the process listing cannot be read, naming each pid and its command and the step `stop it, then rerun cutover-home`. It never stops a process. `account.process_codex_home` reads the home: Linux from `/proc/<pid>/environ` (that key only), the Mac from the kernel argument record (`account.mac_process_record`, `_kern_procargs2`), which `accounts._mac_process_arguments` shares.
+- Status prints `~/.codex holds a login; run accounts.py cutover-home codexN` while `~/.codex` holds one and drops the `~/.codex` row from the account table once it holds none. History (`accounts.py` historical-label resolution and `moves.py`'s reader) resolves a `~/.codex` home spelling from the Codex `home_cutovers` row and leaves it unresolved where that evidence does not reach.
+
+**Files:**
+- `scripts/accounts/accounts.py` — the Codex cutover, its journal and refusal, the status line, historical-label resolution.
+- `scripts/accounts/moves.py` — `~/.codex` as a historical home resolved from the Codex row.
+- `scripts/whoami/account.py` — `process_codex_home` and the Mac kernel argument record reader.
+- `scripts/accounts/test_cutover_home.py` — the cutover, refusals, recovery, rerun, undo and status line against a temporary home with a fake process list.
+- `scripts/accounts/test_moves.py` — history across the Codex cutover.
+- `scripts/whoami/test_account.py` — the kernel argument record reader.
+- `scripts/accounts/test_accounts.py` — the status table without the signed-out `~/.codex` row.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — no login in `~/.codex`; the alias and the bare executable.
+
+**Binds later work:** Codex server cleanup on the Mac reads a process's Codex home with `account.process_codex_home` and never stops a `codex` inside an application bundle. Readout of the moves resolves a `~/.codex` label from the Codex `home_cutovers` row written at each machine's cutover.
+
+**Gotchas:**
+- `ps` text cannot separate argv from environment (a prompt carrying `CODEX_HOME=/x` would pass the guard), so the Mac never reads a process environment from `ps -E`.
+- macOS `ps -o ucomm=` pads the name with trailing spaces; strip before matching, and keep fake listings padded.
+- The Mac's ChatGPT desktop app runs its bundled `codex` (inside `ChatGPT.app`) on `~/.codex`: the cutover refuses until the app quits, and the app is signed out of `~/.codex` afterwards.
+- Codex rewrites `auth.json` on token refresh, so a process left on `~/.codex` would put a login back. `auth.json` is only renamed, never read, printed, copied or logged.
+
+### Phase 42 — Codex server cleanup on the Mac  · status: done
+
+**Depends on:** Phase 41
+
+#### As-built
+
+- The Mac judges Codex servers as natedev does: `sweep`, `sweep --stop`, the per-server idle watcher (`idle-stop`) and `signin-changed` reach the same verdicts on both machines. `_running_servers()` → `list[WebSocketServer]` (`pid`, `port`, `age_secs`) reads `ps -eo pid=,etime=,args=` on the Mac (`etime` parsed from `[[dd-]hh:]mm:ss`) and `etimes` on Linux; `_client_counts()` reads `lsof -nP -iTCP -sTCP:ESTABLISHED` on the Mac and `ss` on Linux; `_server_folder(pid)` reads `lsof -p <pid> -a -d 2 -Fn` on the Mac and `/proc/<pid>/fd/2` on Linux.
+- Every cleanup command goes through `_cleanup_command`, which raises `OSError` naming the command (never its output) on a missing, denied or timed-out (10 s) command, a non-zero exit or any stderr; `lsof`'s exit 1 with no output is an empty selection (zero clients, no log). A failed command refuses to judge: `sweep` prints `nothing judged` and exits 1, `idle-stop` and cleanup keep the server and print why.
+- The server folder is `MeshServerLog(folder) | NonMeshServerStderr | UnreadServerStderr(reason)`. An unread one becomes `UnreadServerOwnership(reason)` with a `ServerInUse` verdict, a named keep reason in `sweep`, `idle-stop` and `signin-changed`, never an unowned server. On the Mac an empty stderr selection counts as no mesh log only when `ps -o uid=` confirms the pid is this user's.
+- A WebSocket server or daemon whose executable sits inside an application bundle (`*.app/Contents/`, judged by `_process_executable`, the kernel's path, never argv[0]) is never judged unused or signalled; an unreadable executable path keeps the server.
+- `sweep` also lists Codex's own `app-server daemon`. `_running_daemons()` lists this user's `codex` processes (`ps -u <uid>`, `ucomm=` stripped on the Mac) and classifies each by `_process_identity` (`ProcessIdentity(pid, started, arguments, executable)`, start time read before and after) into `CodexDaemon | UnclassifiedCodexProcess | UnreadCodexProcess`; config flags before the subcommand are skipped, and an `exec` prompt naming a daemon stays unclassified. `_process_cleanup_verdict` judges a daemon unused only when its home (`account.process_codex_home`) is `~/.codex` and `~/.codex/auth.json` is confirmed absent; a numbered home, an unread environment, an existing login or an unconfirmed absence keeps it with that reason. The daemon line is `<pid>\tdaemon\t<label>\t<reason>\t~/.codex`, an unread record prints `<pid>\tunclassified\tkept\t<reason>\t-`, and the count line includes daemons.
+- `sweep --stop` stops an unused daemon with `_stop_daemon`: it snapshots the family (`_daemon_process_tree`, identities bound to two `process_table` snapshots), then SIGSTOPs the parent and its descendants to a fixed point, tracking members by identity so a reparented child stays tracked, and checks `_process_cleanup_verdict` before each STOP and again at the fixed point. It then SIGKILLs children before the parent, rechecking the parent's verdict and every member's identity and stopped state before each signal, and reports success only when every member is gone within `REAP_WAIT_SECS`. Any refusal prints `codex_mesh: daemon family not stopped: pid <pid>: <reason>`, and `_resume_daemon_family` sends SIGCONT, by pid plus start time, only to members this cleanup stopped (`FrozenDaemonMember(identity, stopped_by_cleanup)`); a member it cannot resume is named as "may still be stopped".
+- `account.MacProcessRecord` carries `executable: Path` from the kernel argument record. `role_map.write_role_map` keeps every other key of `config/accounts.json`, `home_cutovers` included.
+- Live, sweep judging only on 2026-10-16: natedev listed 15 servers in use and kept a daemon on `~/.codex1`; the Mac listed none.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — platform listing, client counts and server folder, the unread-ownership keep, daemon discovery, verdict and family stop.
+- `scripts/agents/test_codex_mesh.py` — faked `ps`/`lsof` for the Mac (`MacCleanupTests`), daemon verdicts (`CodexDaemonCleanupTests`), process state (`DaemonProcessStateTests`), freeze, kill and resume (`DaemonFamilySafetyTests`).
+- `scripts/whoami/account.py` — `MacProcessRecord.executable`.
+- `scripts/whoami/test_account.py` — the executable path read from the kernel record.
+- `scripts/accounts/test_role_map.py` — a workers change keeps `home_cutovers` and every other key.
+
+**Binds later work:** No Codex daemon descendant escapes the stop builds on `FrozenDaemonMember`, `_freeze_daemon_process`, `_resume_daemon_family`, `_daemon_process_tree`, `_process_identity` and `sessions.process_start`; any session sweep it adds checks `_process_cleanup_verdict` before SIGSTOP, and it states that a process that called `setsid` is out of reach. `_stop_daemon` takes no lock, and the daemon line's home column is fixed at `~/.codex`.
+
+**Gotchas:**
+- Codex `app-server --listen` calls `setsid`, so the daemon's session id does not cover its family; a process born and orphaned between two listings escapes snapshot ancestry and survives the stop.
+- macOS `ps -o ucomm=` pads the name with trailing spaces; strip before matching, and keep fake listings padded.
+- The ChatGPT desktop app's bundled `codex` runs on `~/.codex`; the bundle exclusion is what keeps it running.
+- The periodic `sweep --stop` on both machines is a nix job in the nixos repo (`nate.jobs.codex-mesh-sweep`, every 1800 s), not code in this repo.
+
+**Ruled out:** SIGTERM before SIGKILL — resuming a stopped process to let it handle TERM lets it fork again; re-listing the family by parent pid at kill time — it loses reparented children.
+
+### Phase 43 — Codex cutover finishes the first startup  · status: done
+
+**Depends on:** Phase 41
+
+#### As-built
+
+- `accounts._prepare_codex_home(label)` prints setup's wait line and runs `agent_accounts.prepare_codex_home` on the numbered home (`codex app-server --listen stdio://`, waiting up to `CODEX_HOME_PREPARATION_SECONDS`, 1200 s, for `initialize` while Codex builds its state database over the shared sessions). `setup codexN` (`_setup_codex_home`) and `cutover-home codexN` share it.
+- `cutover_codex_home` runs it after the login rename, the `home_cutovers` row and the `complete` journal write, and prints `<label> (~/.codexN) login moved; shared session index ready.` only once Codex answers `initialize`.
+- A failed preparation leaves the journal `complete` and raises `AccountsError` with one line: `accounts: ~/.codexN login moved, but its shared session index is not ready (<cause>); run accounts.py setup codexN to finish the index`. A rerun of a complete cutover and `--undo` run no preparation.
+- `docs/accounts.md`'s cutover section describes the first startup, its wait of up to 20 minutes, and the `setup codexN` recovery.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `_prepare_codex_home`, shared by setup and the Codex cutover.
+- `scripts/accounts/test_cutover_home.py` — with a faked preparation: login moved before preparation, the ready line, the failure line with the journal `complete`, a rerun after failure, undo without preparation.
+- `docs/accounts.md` — the cutover's first startup and recovery.
+
+**Gotchas:**
+- Preparation runs under the exclusive cutover lock for up to 1200 s, so an undo cannot rename the login back while Codex starts on it.
+- An interrupted backfill leaves `backfill_state.status = running`, and Codex holds startup for 15 minutes on that lease; a `codexN` run that meets a first backfill fails with "app server did not become ready", and `accounts.py setup codexN` repairs the home.
+- Tests fake `prepare_codex_home`; a suite run against the real one starts Codex.
+
+### Phase 44 — Shared links repair themselves  · status: done
+
+#### As-built
+
+- `_repair_shared_links(destination, source_dir, shared, folders)` runs before any judgment on setup, Codex home linking, `prepared_account`, `check_codex_target(..., repair=True)` and move targets (`_move_target`, `check_move_target`), so a launch never refuses on something repair fixes.
+- Declared folders (`ALWAYS_LINKED`, which now names every Claude folder created on demand including `shell-snapshots`; `CODEX_ALWAYS_LINKED` for Codex) are created private inside an existing shared home. A missing shared file and the shared home itself are never created.
+- Repair rules: a real entry moves into a missing shared target and is linked; an empty real folder is replaced by the link silently; a non-empty folder merges entry by entry when no name clashes; a clash leaves everything in place and prints a repair step naming the clashing entries; a real file refuses only when the shared target exists. Adoption and merge notices go to stderr.
+- Read-only judgment: `prepared_account_preview`, `check_codex_target(..., repair=False)` and `_inspect_account_directory(..., allow_shared_repair=True)` use `_shared_repair_problems` to count repairable entries as ready without touching disk (refusal-watch previews, automatic selection, `set_role`).
+- `accounts.py check` stays strict; a declared folder whose shared target is absent is skipped only when the account entry is absent or already the expected link.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `_repair_shared_links`, `_move_shared_entry`, `_shared_repair_problems`, `ALWAYS_LINKED`, `CODEX_ALWAYS_LINKED`, `prepared_account_preview`, `repair=` on target checks.
+- `scripts/accounts/refusal_watch.py` — previews through the read-only path.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py` — every repair case on scratch homes, Claude and Codex; a preview leaves both homes untouched.
+- `scripts/whoami/test_agent_notes.py`, `scripts/production/test_add_showrunner.py`, `scripts/shutdown/test_account_move.py` — fixtures follow the repair rules.
+
+**Gotchas:** `Path.rename` replaces a destination created after a clash check, so every move goes through `_move_shared_entry` (renameat2 `RENAME_NOREPLACE` on Linux, renamex_np `RENAME_EXCL` on macOS); a destination appearing mid-repair is a clash, and a losing concurrent repair accepts the winner's state. Any check reachable from `set_role` must pass `repair=False`, or it creates `~/.codex`. A move refused by its target prints one line, the first problem.
+
+### Phase 45 — No Codex daemon descendant escapes the stop  · status: done
+
+**Depends on:** Phase 42
+
+#### As-built
+
+- `_stop_daemon` takes the nonblocking `_daemon_stop_lock()` (`~/.local/state/codex-mesh/daemon-stop.lock`) and runs `_stop_daemon_locked`; a held lock keeps the family and states the reason.
+- `_own_process_table()` lists only this user's processes (`ps -u <uid> -o pid=,ppid=,args=`, split on the two numeric columns only); `_daemon_process_tree()` reads identities only for family members and swept-session candidates.
+- `_process_session(pid)` returns `ProcessSession | SessionGone | SessionUnread`, read once per candidate per table. After the freeze, every session led by a frozen member (`_frozen_daemon_sessions`) is swept to a fixed point before the kill; new processes join the family with exclusions checked before STOP. A session whose leader is outside the family is never swept; `SessionUnread` refuses the stop.
+- After the kill, a survivor in a swept session is reported by pid and the stop is not a success. The fixed-point deadline is `max(REAP_WAIT_SECS, 4 × slowest listing)`.
+- `_recover_kept_daemon` / `_recover_stopped_codex_members` read the whole family of a kept daemon (in use, signed in, refused or failed stop) or a stopped daemon: a stopped member of any name on `~/.codex` with no controlling terminal and unchanged identity is reported and, under `--stop`, resumed under the lock. A member with a terminal, an unread terminal or environment, a numbered home, or the bundled ChatGPT codex is reported as kept and never signalled.
+- The sweep's daemon line prints the daemon's own home via `_daemon_home` (from `account.process_codex_home`).
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — session reader, session sweep and survivor check in `_stop_daemon_locked`, candidate-only identity reads, the stop lock, stopped-member recovery, the daemon home column.
+- `scripts/agents/test_codex_mesh.py` — orphan found by session, survivor reported, exclusions before STOP, untracked-leader session never swept, stopped member resumed, daemon home column; `MeshCommandTests` isolates its run folder.
+
+**Gotchas:** `getsid` on an exited pid is `SessionGone`, never a refusal; match on the type, never the message. macOS `ps comm` is a full path with spaces, so the own-user table splits only pid and ppid. macOS `os.getsid` reads every own-user process, so the session sweep works on Darwin. A stopped process with a controlling terminal is a job-control stop and is never resumed. A descendant that calls `setsid` itself leaves every tracked session and is out of reach; the `_stop_daemon_locked` doc comment states this limit.
+
+**Ruled out:** resuming every stopped `~/.codex` process (wakes a user's Ctrl-Z job); sweeping a session whose leader is outside the family; reading identities for every process on the machine.
+
+### Phase 46 — Role map stays inside a test's home  · status: done
+
+**Depends on:** Phase 40
+
+#### As-built
+
+- `role_map.is_role_map_host()` is true on natedev by hostname and, on any machine, wherever `Path.home()` resolves differently from the password-database home for the current uid. Both paths are resolved before the comparison, so a symlinked alias of the login home is the login home; a resolve failure counts as a scratch home.
+- `_login_home()` returns `LoginHome(path) | LoginHomeUnread` from `pwd.getpwuid(os.getuid())`; an unread login home counts as a scratch home. Tests pin `_login_home` beside the hostname.
+- A scratch `HOME` holds its own map on every machine: `read_role_map()` reads its `groups.json` and `config/accounts.json`, `write_role_map()` writes those files and appends its `roles.jsonl`, no ssh runs and `role_map_cache.json` is never written.
+- The real `HOME` off natedev is unchanged: reads and writes go to natedev over ssh, a successful read refreshes the cache, and an unreachable natedev falls back to the cache. The remote side (`role-map-read`/`role-map-write`) is unchanged.
+
+**Files:**
+- `scripts/accounts/role_map.py` — `LoginHome`, `LoginHomeUnread`, `_login_home`, `is_role_map_host`.
+- `scripts/accounts/test_role_map.py` — scratch-home read and write stay local with no ssh and no cache change; a symlinked alias in either direction still reads remotely; an unread login home keeps reads and writes local; `setUp` pins the login home to the test `HOME` so the remote tests keep the remote path.
+
+**Gotchas:** ssh reads `~/.ssh` from the password-database home, not `$HOME`, so before this phase a scratch `HOME` on the Mac reached natedev's real map. `is_role_map_host()` is now true for a scratch home on any machine, so its name and the refusals that name natedev (`cannot read role map from natedev`, `could not write … on natedev` in `role_map.py`, `role map belongs on natedev` in `accounts.py`) overstate the local case; a follow-up renames it to `holds_role_map()` (or returns `LocalRoleMap | RemoteRoleMap`) and names the home in local refusals. `scripts/herdr/test_herdr_sessions.py` imports `herdr` at top level and needs `PYTHONPATH=<tree>:<tree>/scripts/herdr` to run alone. Suites that pin `is_role_map_host` stay valid.
+
+**Ruled out:** hostname alone decides who holds the map (a scratch `HOME` off natedev then reads and writes natedev's real map).
+
+### Phase 47 — Accounts status as JSON  · status: done
+
+**Depends on:** Phase 46
+
+#### As-built
+
+- `accounts.py status --json [--stored] [--with-login]` prints one object, `{"accounts": [...], "problems": [...]}`. Accounts follow the table's order; `problems` holds the note lines the table prints without `--detail`. Each account carries `label`, `tool` (`claude`/`codex`), `roles` (a list, because both groups may share an account; `["workers"]`/`["spare"]` for Codex), `weekly_left_percent`, `resets_at` and `read_at` (ISO 8601 UTC), `credits` (a number, `"unlimited"` or null; null for Claude) and `use_credits` (false for Claude; true for Codex unless its note says `use_credits: off`). Readings the table shows as `—`, `unavailable` or a setup step are null. `login` appears only with `--with-login` and adds no read.
+- One reader, `read_status(*, source, detail)`, returns a `StatusReading` of typed `StatusRow`s plus notes; `render_status_table` and `render_status_json` both draw from it, and `status_report` is the table renderer over that reader. A missing value is `StatusUnavailable(cell)`, which keeps the table's cell text and renders as JSON null.
+- `UsageSource = RefreshStaleUsage | StoredUsageOnly` chooses the usage reads; `role_map.RoleMapSource = FetchRoleMap | StoredRoleMap` chooses the role-map read, set for the command by the `role_map.stored_role_map()` context.
+- `--stored` (table or JSON) makes no live read and starts no subprocess. Off natedev it reads `role_map_cache.json` only: never ssh, never a cache write. With no cache, roles are empty, the problem line is in `problems`, and the command exits 0. Without `--stored`, an unreadable role map still refuses status with exit 1, for table and JSON.
+- `--json --detail` and `--with-login` without `--json` are usage errors.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `RefreshStaleUsage`, `StoredUsageOnly`, `UsageSource`, `StatusUnavailable`, `StatusRow`, `StatusReading`, `StatusAccountDocument`, `StatusDocument`, `read_status`, `_read_status`, `render_status_table`, `render_status_json`, the `status` flags.
+- `scripts/accounts/role_map.py` — `FetchRoleMap`, `StoredRoleMap`, `RoleMapSource`, `stored_role_map()`.
+- `docs/accounts.md` — "Every account in one table" documents the three flags, the JSON keys and the `--stored` cost rule.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — byte-identical table through the reader, the full JSON fixture, `--with-login`, equal live-read counts for table and JSON, `--stored` with every live read and subprocess patched to fail, and the cache-only role map off natedev.
+
+**Binds later work:** handler-enh-unit (cargo-handler's summary) and unit-board-unit (the accounts view) consume `status --json`; `--stored` is the cheap rerun form, 0.21 s with no ssh on the Mac real home.
+
+**Gotchas:** 32 failures in the accounts suites on the Mac predate this phase; a follow-up phase owns them.
+
+### Phase 48 — Account tests pass on the Mac  · status: done
+
+**Depends on:** Phase 47
+
+#### Work Order
+
+**Goal:** `scripts.accounts.test_accounts`, `test_role_map` and `test_cutover_home` pass on the Mac as they do on natedev; 32 tests fail there today (22 failures, 10 errors, the same on 36043d45).
+
+**Constraints from prior phases:** tests never touch live directories, never run ssh, and never read a real keychain, process or credential file. Since Phase 46 a scratch `HOME` holds its own role map on any machine. The production darwin branches (`_cutover_home_macos`, `_mac_oauth_account`, `_mac_process_arguments`, `MAC_HOME_LOGIN_STEP`, `account.mac_process_record`) are correct on the Mac and keep their own tests, which patch `sys.platform` to `"darwin"`.
+
+**Spec:** the cause is in the tests, not the code; production files do not change.
+1. `/tmp` is a symlink to `/private/tmp` on macOS, so a test that compares `path.resolve()` against a path built from the unresolved temporary directory fails (18 failures). Every test class resolves its temporary root once where it creates it (`Path(...TemporaryDirectory()).resolve()`, `test_accounts.py` module and class setups, `test_cutover_home.py` and `test_role_map.py` class setups), so every derived path is already resolved; no individual assertion changes.
+2. Tests that fake the Linux process and login reads (`/proc` environments, socketless Claude processes, `oauthAccount` in `~/.claude.json`) reach the darwin branch on the Mac and read the real process table or keychain (`cannot read process 321 arguments`, `cutover cannot establish the account identifier`; 10 errors, 3 failures). `HomeCutoverTests` pins `sys.platform` to `"linux"` in `setUp`, as the darwin classes pin `"darwin"`; a test inside it that needs darwin keeps patching it locally.
+3. `test_status_describes_accounts_without_creating_any` expects natedev's home step (`run accounts.py cutover-home`); pin `sys.platform` to `"linux"` for it, and assert the Mac's step (`MAC_HOME_LOGIN_STEP`) in a sibling case under `"darwin"`, so each platform's line is pinned on both machines.
+4. Any other test that depends on the machine it runs on gets the same treatment: pin the platform it fakes; never skip a test by platform.
+
+**Files:**
+- `scripts/accounts/test_accounts.py`
+- `scripts/accounts/test_cutover_home.py`
+- `scripts/accounts/test_role_map.py`
+
+**Workers:** one worker, `test`, owns all three files; nothing else changes.
+
+**Acceptance gate:** the three suites pass on natedev and on the Mac from a scratch copy of the tree with a scratch `HOME` (`python3 -m unittest scripts.accounts.test_accounts scripts.accounts.test_role_map scripts.accounts.test_cutover_home`), with the same test count on both; the merge gate is green.

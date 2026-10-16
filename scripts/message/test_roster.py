@@ -30,7 +30,7 @@ import remove_workers
 import roster
 import unit_runs
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
 import unit_lookup
@@ -168,6 +168,7 @@ class RosterTests(unittest.TestCase):
         pid: int | None = None,
         with_socket: bool = True,
         proc_start: str = "",
+        entrypoint: str = "cli",
     ) -> None:
         socket_path = self.sessions / f"{file_name}.sock"
         if with_socket:
@@ -189,6 +190,7 @@ class RosterTests(unittest.TestCase):
             "tmux": tmux,
             "cwd": str(cwd),
             "status": status,
+            "entrypoint": entrypoint,
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
@@ -781,6 +783,15 @@ class RosterTests(unittest.TestCase):
             str(self.home / "projects" / "free"), "ready",
         ))
 
+    def test_a_relay_named_like_a_session_is_left_out_of_the_roster(self) -> None:
+        # send.py's relay is a newer `claude -p` run started with `-n free-claude`.
+        self._write_session("relay", "free-claude", "sid-relay", self.home / "projects" / "relay",
+                            status="relaying", updated=9, entrypoint="sdk-cli")
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        named = [entry.session for entry in found.entries if entry.name == "free-claude"]
+        self.assertEqual(named, [roster.ClaudeSession("sid-free")])
+
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
         self._write_session(
             "reused", "phantom", "sid-phantom", self.home / "projects" / "ended",
@@ -910,6 +921,19 @@ class RosterTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("contract reviewer", entries)
+
+    def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
+        phase = self.director_run / "phases" / "4"
+        phase.mkdir(parents=True)
+        for name in ("review_status_adversary", "review_pid_adversary"):
+            _ = (self.director_run / name).rename(phase / name)
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        reviewer = entries["adversary reviewer"]
+        self.assertEqual(
+            (reviewer.kind, reviewer.assignment),
+            ("codex", roster.WorkerAssignment("review (adversary)", str(self.director_run))),
+        )
 
     def test_review_markers_without_a_process_add_no_rows_or_unattributed_sessions(self) -> None:
         _ = self.account_note(2)
@@ -1127,6 +1151,8 @@ class RosterTests(unittest.TestCase):
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
+        if argv[:2] == ["herdr", "--session"] and argv[3:] == ["server"]:
+            herdr_listener(path.parent, pid, argv[2], os.environ)
 
     def _herdr_sessions(self) -> dict[str, CommandResponse]:
         return {"--session default session list --json": {"code": 0, "stdout": json.dumps({
@@ -1317,9 +1343,27 @@ class RosterTests(unittest.TestCase):
             _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
         return home
 
+    def test_roster_keeps_one_home_identity_per_pass_and_refreshes_after_cutover(self) -> None:
+        _ = self.account_note(2, tool="claude")
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": "claude2@example.invalid"}}))
+
+        def cutover_during_process_read(_pid: int) -> account.NoAccountSetting:
+            _ = home_json.write_text("{}")
+            return account.NoAccountSetting()
+
+        with (mock.patch.object(account, "process_config_dir", side_effect=cutover_during_process_read),
+              mock.patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads):
+            before = self._entries()
+            after = self._entries()
+        for name in ("runner", "free-claude"):
+            self.assertEqual(before[name].account, roster.AccountLabel("claude2"))
+            self.assertIsInstance(after[name].account, roster.AccountUnread)
+        self.assertEqual(home_reads.call_count, 2)
+
     def test_claude_roster_account_comes_from_its_process_configuration(self) -> None:
         directory = self.account_note(3, tool="claude")
-        with mock.patch.object(account, "process_config_dir", return_value=directory):
+        with mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(directory)):
             entry = self._entries()["runner"]
         self.assertEqual(entry.account, roster.AccountLabel("claude3"))
 

@@ -141,10 +141,13 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             if recorded:
                 candidates = [Path(recorded)]
             else:
-                directory = Path(config) if config else (account.process_config_dir(pid) if pid > 0 else None)
-                if directory is None:
+                setting = (account.ConfiguredClaudeFolder(Path(config)) if config else
+                           account.process_account_directory(account.process_config_dir(pid)) if pid > 0 else
+                           account.NoAccountSetting())
+                if not isinstance(setting, account.ConfiguredClaudeFolder):
                     print(f"messages: account directory unavailable for {session}", file=sys.stderr)
                     continue
+                directory = setting.path
                 cwd = record.get("cwd", "")
                 candidates = ([directory / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / f"{session}.jsonl"]
                               if cwd else list((directory / "projects").glob(f"*/{session}.jsonl")))
@@ -241,18 +244,18 @@ def nightly_production() -> NightlyProduction | str:
     from scripts.production import showrunners
 
     if TYPE_CHECKING:
-        from scripts.production import add_unit
+        from scripts.production import production_units
     else:
-        import add_unit
+        import production_units
 
     found: list[NightlyProduction] = []
     for runner in showrunners.registered_showrunners():
         try:
-            rows = add_unit.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
-        except (OSError, UnicodeError, add_unit.Refusal):
+            rows = production_units.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
+        except (OSError, UnicodeError, production_units.Refusal):
             continue
-        if any(add_unit.cell_value(row.get("Unit", "")) == NIGHTLY_UNIT
-               and add_unit.cell_value(row.get("Plan", "")) == "permanent" for row in rows):
+        if any(production_units.cell_value(row.get("Unit", "")) == NIGHTLY_UNIT
+               and production_units.cell_value(row.get("Plan", "")) == "permanent" for row in rows):
             found.append(NightlyProduction(Path(runner["doc"]), runner["slug"]))
     if not found:
         return f"no running production has a permanent {NIGHTLY_UNIT} row; add it with add_unit.py {SESSION} --permanent"

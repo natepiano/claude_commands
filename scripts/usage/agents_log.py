@@ -173,7 +173,7 @@ def _review_lens(run: Path, name: str) -> Lens | None:
     worker_name = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
     log_name = re.compile(r"review_agent_(?:\d+_)?(" + "|".join(LENSES) + r")\.log")
     evidence_mtimes: dict[Lens, float] = {}
-    for path in sorted(run.glob("review_agent_*.log")):
+    for path in sorted([*run.glob("review_agent_*.log"), *run.glob("phases/*/review_agent_*.log")]):
         match = log_name.fullmatch(path.name)
         if match is None:
             continue

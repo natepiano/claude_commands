@@ -2,15 +2,18 @@
 """Print who manages whom among this machine's sessions, for cargo-handler's census.
 
 `--json` prints `{"schema": 1, "edges": [{"manager": ..., "member": ..., "role": ...}]}` and
-exits 0. A manager and a showrunner or unit director member are Claude Code session ids; a worker
-member is its Codex thread id, since a worker has no Claude session. The edges:
+exits 0. A manager and a showrunner, unit director or Claude worker member are Claude Code session
+ids; a Codex worker member is its thread id, since a Codex worker has no Claude session. The edges:
 
 - a showrunner to each child showrunner, role `showrunner`, from the showrunner parent files;
 - a showrunner to each unit director marked with its production, role `unit`;
-- a unit director to each worker of its run, with the worker's role from `mesh_roster.json`.
+- a unit director to each Codex worker of its run, with the worker's role from `mesh_roster.json`;
+- a unit director to each Claude worker of its run, its member that worker's Claude session id and
+  its role the one `board.sh roles` reports for its slot.
 
-Only local records are read, nothing over ssh, and an edge is printed only while both ends run
-on this machine: a unit whose showrunner is gone has none. cargo-handler polls this every 30
+Only local records are read, nothing over ssh. An edge is printed while its member runs on this
+machine; its manager may run on another one, since cargo-handler joins session ids across machines,
+so a showrunner is named by its production's update timer wherever it runs. cargo-handler polls this every 30
 seconds, so it never prompts and answers well under a second. A source that cannot be read
 leaves its edges out and says why on stderr.
 """
@@ -19,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -36,6 +40,9 @@ WORKER_ROLES: tuple[Role, ...] = ("impl", "test", "review", "fix")
 ENDED_STATUSES = frozenset({"ended", "failed"})
 ROSTER_FILE = "mesh_roster.json"
 SERVER_FILE = "mesh_server.json"
+# A Claude worker's short id and name, one `<id>\t<name>` line each, appended by agent_bg.sh.
+WORKER_LEDGER = "workers"
+BOARD = Path(__file__).resolve().parent.parent / "delegate" / "board.sh"
 
 
 class Edge(TypedDict):
@@ -56,8 +63,8 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def showrunner_sessions(running: set[str]) -> dict[str, str]:
-    """Each production slug to its showrunner's session id, while that session runs."""
+def showrunner_sessions() -> dict[str, str]:
+    """Each production slug to its showrunner's session id, from its update timer, wherever it runs."""
     found: dict[str, str] = {}
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         try:
@@ -66,15 +73,16 @@ def showrunner_sessions(running: set[str]) -> dict[str, str]:
             continue
         target = next((line.removeprefix("TARGET=") for line in lines if line.startswith("TARGET=")), "")
         session_id = target.removeprefix("session:") if target.startswith("session:") else ""
-        if session_id in running:
+        if session_id:
             found[instance.name.removeprefix("showrunner-")] = session_id
     return found
 
 
-def showrunner_edges(sessions: dict[str, str]) -> list[Edge]:
+def showrunner_edges(sessions: dict[str, str], running: set[str]) -> list[Edge]:
     return [
         Edge(manager=sessions[parent], member=sessions[child], role="showrunner")
         for child, parent in sorted(showrunners.edges(set(sessions)).items())
+        if sessions[child] in running
     ]
 
 
@@ -114,6 +122,65 @@ def _worker_role(name: str, entry: dict[str, object]) -> Role | None:
     return next((known for known in WORKER_ROLES if known in (role, suffix)), None)
 
 
+def _codex_edges(director: str, run: Path) -> list[Edge]:
+    edges: list[Edge] = []
+    for name, value in sorted(_json_object(run / ROSTER_FILE).items()):
+        entry = cast(dict[str, object], value) if isinstance(value, dict) else {}
+        thread = entry.get("thread_id")
+        role = _worker_role(name, entry)
+        if isinstance(thread, str) and thread and role and entry.get("status") not in ENDED_STATUSES:
+            edges.append(Edge(manager=director, member=thread, role=role))
+    return edges
+
+
+def _claude_workers(run: Path, running: set[str]) -> dict[str, str]:
+    """Each running Claude worker's session id to its slot: from its launch record, else from the
+    workers ledger, whose short id prefixes the session id and whose name ends with the slot."""
+    workers: dict[str, str] = {}
+    for path in sorted(run.glob("impl_worker_*.json")):
+        record = _json_object(path)
+        worker, slot = record.get("worker_id"), record.get("slot")
+        if record.get("family") == "claude" and isinstance(worker, str) and worker in running and isinstance(slot, str):
+            workers[worker] = slot
+    try:
+        ledger = (run / WORKER_LEDGER).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        ledger = []
+    for line in ledger:
+        short, _, name = line.partition("\t")
+        short = short.strip()
+        session = next((session for session in sorted(running) if short and session.startswith(short)), "")
+        if session and session not in workers:
+            workers[session] = name.strip().rpartition("-")[2]
+    return workers
+
+
+def _board_roles(run: Path) -> dict[str, str]:
+    """Each slot's role now, as `board.sh roles` reads it off the run's board.log."""
+    try:
+        shown = subprocess.run(["bash", str(BOARD), "roles", str(run)], capture_output=True, text=True,
+                               check=True, timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as error:
+        _warn(f"board roles unreadable for {run}: {error}")
+        return {}
+    return dict(line.split("\t", 1) for line in shown.stdout.splitlines() if "\t" in line)
+
+
+def _claude_edges(director: str, run: Path, running: set[str]) -> list[Edge]:
+    """A Claude-only run has no app-server, so these edges skip the server check."""
+    workers = _claude_workers(run, running)
+    if not workers:
+        return []
+    roles = _board_roles(run)
+    known: dict[str, Role] = {role: role for role in WORKER_ROLES}
+    edges: list[Edge] = []
+    for worker, slot in sorted(workers.items()):
+        role = known.get(roles.get(slot, ""))
+        if role:
+            edges.append(Edge(manager=director, member=worker, role=role))
+    return edges
+
+
 def worker_edges(running: set[str]) -> list[Edge]:
     edges: list[Edge] = []
     for active in unit_runs.active_dirs():
@@ -128,21 +195,16 @@ def worker_edges(running: set[str]) -> list[Edge]:
                 run = Path(marker.read_text(encoding="utf-8").splitlines()[0].strip())
             except (OSError, UnicodeError, IndexError):
                 continue
-            if not _server_running(run):
-                continue
-            for name, value in sorted(_json_object(run / ROSTER_FILE).items()):
-                entry = cast(dict[str, object], value) if isinstance(value, dict) else {}
-                thread = entry.get("thread_id")
-                role = _worker_role(name, entry)
-                if isinstance(thread, str) and thread and role and entry.get("status") not in ENDED_STATUSES:
-                    edges.append(Edge(manager=marker.name, member=thread, role=role))
+            if _server_running(run):
+                edges.extend(_codex_edges(marker.name, run))
+            edges.extend(_claude_edges(marker.name, run, running))
     return edges
 
 
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
-    sessions = showrunner_sessions(running)
-    return [*showrunner_edges(sessions), *unit_edges(sessions, running), *worker_edges(running)]
+    sessions = showrunner_sessions()
+    return [*showrunner_edges(sessions, running), *unit_edges(sessions, running), *worker_edges(running)]
 
 
 def main(argv: list[str]) -> int:

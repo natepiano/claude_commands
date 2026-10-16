@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
+from test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
 import remote
 
 
@@ -31,6 +31,7 @@ class RemoteTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        linux_process_fixture(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -69,6 +70,16 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         )
         del patch_dict_context
         self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
+
+    def test_failed_peer_restart_preserves_the_desktop_refusal_in_json_lines(self) -> None:
+        refusal = "the Mac desktop is not signed in: restart from the Mac"
+        payload = json.dumps({"machine": "Mac", "label": "claude2", "outcome": "partial",
+                              "lines": [refusal], "no_remote_control": [], "refused": []})
+        with patch.dict(os.environ, {"SHUTDOWN_TEST_OUTPUT": payload, "SHUTDOWN_TEST_REMOTE_STATUS": "1"}):
+            code, output = remote.run_remote(["up", "owner@example.com", "--here", "--json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(output, payload)
+        self.assertIn("up owner@example.com --here --json", self.invocation()["arguments"][-1])
 
     def invocation(self) -> SshInvocation:
         decoded = cast(object, json.loads(self.log.read_text(encoding="utf-8")))

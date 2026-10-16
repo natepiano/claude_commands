@@ -18,7 +18,7 @@ completes.
    beside one still running leaves that one open. Then run
    `progress_history.py start-phase --session-dir "${SESSION_DIR}"
    --phase-id <id> --phase-title <title> --work-order-file
-   "${SESSION_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
+   "${PHASE_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
 3. `~/.claude/config/agents.conf` owns delegate family/model/effort, one row
@@ -29,8 +29,8 @@ completes.
    State the assignment in the dispatch update in ordinary words: "opening 2
    writers: …" on the first phase, "continuing 2 writers: …" later.
 4. Take the partition and the opening from Workers and write one prompt per slot
-   under <WritePromptContract/>: `${SESSION_DIR}/implementation_prompt.md` for
-   `impl` and `test_prompt.md` for `test`. Only when the field is absent, partition per <TeamFilePartition/>
+   under <WritePromptContract/>: `${PHASE_DIR}/implementation_prompt.md` for
+   `impl` and `${PHASE_DIR}/test_prompt.md` for `test`. Only when the field is absent, partition per <TeamFilePartition/>
    yourself and say so in the dispatch update. Opening and follow-up prompts
    both carry the inline Three Gods sentence and the Type Design Contract or
    its allowed pointer.
@@ -44,19 +44,24 @@ completes.
    without `--to`. Later phases normally run:
 
    ```sh
-   implement.sh --to "<full impl worker name>" \
+   implement.sh --to "<full impl worker name>" --phase "<phase id>" \
      "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/implementation_prompt.md" impl \
+     "${PHASE_DIR}/implementation_prompt.md" impl \
      "<responsibility>" impl "<activity>" 0 impl
-   implement.sh --to "<full test worker name>" \
+   implement.sh --to "<full test worker name>" --phase "<phase id>" \
      "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/test_prompt.md" test \
+     "${PHASE_DIR}/test_prompt.md" test \
      "<responsibility>" test "<activity>" 0 test
    ```
 
+   Every launch, a slot's first included, carries `--phase "<phase id>"`: the
+   pass is stamped with that phase and the launcher writes its status, summary
+   and log to `${PHASE_DIR}`, so a phase running beside another never reads
+   that one's files.
+
    A worker assigned another role swaps both role words and nothing else — the
    open `test` worker continuing as a writer is
-   `implement.sh --to "<full test worker name>" "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
+   `implement.sh --to "<full test worker name>" --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" "${PHASE_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
    Responsibility follows <ProgressContract/>. **Both workers carry a pass
    kind**, so a team phase records two passes and stops being attributed to one
    agent. The kind is the work the worker was assigned and nothing more — it names,
@@ -67,7 +72,7 @@ completes.
    resolves, in `agents.conf` or in the ledger.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
-7. On completion, read `impl_status_impl` and `impl_status_test`; the phase is
+7. On completion, read `${PHASE_DIR}/impl_status_impl` and `impl_status_test`; the phase is
    done only when both are terminal. `implemented` on `impl` loads
    `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
    for what it completed and for findings it posted. If `impl` errors, apply <DelegateLaunchFailure/>

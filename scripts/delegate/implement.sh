@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # implement.sh — Invoke the configured delegate agent to implement code changes.
 #
-# Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task]
+# Usage: implement.sh [--to <worker>] [--phase <id>] <session_dir> [working_dir] [prompt_file] [task]
 #                     [role_description] [pass_kind] [pass_activity] [fix_pass]
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
@@ -52,22 +52,40 @@
 set -euo pipefail
 
 FOLLOW_TO=""
-if [[ "${1:-}" == "--to" ]]; then
-  FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}"
+# A phase running beside another names itself: start-pass stamps its pass with it, and its
+# per-role files go to <session_dir>/phases/<id>/.
+PHASE_ID=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --to) FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}" ;;
+    --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
+    *) echo "ERROR: unknown implement option '$1'." >&2; exit 2 ;;
+  esac
   shift 2
-fi
+done
 
 SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
+# Two phases running the same role would otherwise write one status, summary and log.
+# Run-wide files -- the board, heartbeat, recorder and ledger state, worker identities -- stay
+# in the session.
+ARTIFACT_DIR="${SESSION_DIR}"
+if [[ -n "${PHASE_ID}" ]]; then
+  # The directory keeps only the id's letters, digits, `.`, `_` and `-`: `ad hoc` is `adhoc`.
+  PHASE_DIR_NAME="${PHASE_ID//[^[:alnum:]._-]/}"
+  if [[ -z "${PHASE_DIR_NAME}" || "${PHASE_DIR_NAME}" == . || "${PHASE_DIR_NAME}" == .. ]]; then
+    echo "ERROR: phase id names no directory: ${PHASE_ID}" >&2
+    exit 2
+  fi
+  ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
 WORKING_DIR="${2:-$(pwd)}"
-PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
+PROMPT_FILE="${3:-${ARTIFACT_DIR}/implementation_prompt.md}"
 SUBTASK="${4:-impl}"
 ROLE_DESC="${5:-work order at ${PROMPT_FILE}}"
 PASS_KIND="${6:-}"
 PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
 TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, test, review) as its 9th argument}"
-# A phase running beside the current one names itself, so start-pass stamps this pass with it.
-PHASE_ID="${10:-}"
 
 # Every worker carries a kind, so an empty one is a dropped argument rather than a
 # choice. It used to be tolerated: the launcher skipped start-pass, ran the agent
@@ -147,15 +165,16 @@ fi
 # repo needs >= 3.10.
 PY="${SCRIPT_DIR}/../lib/py"
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
-SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
+mkdir -p "${ARTIFACT_DIR}"
+SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
 # the previous round's file sitting at exactly the path the board line points to.
-REPLY_FILE="${SESSION_DIR}/impl_reply${SLOT}.txt"
-STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
-LOG_FILE="${SESSION_DIR}/impl_agent${SLOT}.log"
-AGENT_FILE="${SESSION_DIR}/impl_agent${SLOT}"
-BG_ID_FILE="${SESSION_DIR}/impl_bg_id${SLOT}"
+REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
+STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
+LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
+AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
+BG_ID_FILE="${ARTIFACT_DIR}/impl_bg_id${SLOT}"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
@@ -437,7 +456,7 @@ export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 # codex_mesh.py launches it there instead. With codex_mesh=0 it falls back to
 # the plain launcher and coordinates through the board alone.
 if [[ -n "${FOLLOW_TO}" ]]; then
-  FOLLOW_MESSAGE="${SESSION_DIR}/impl_follow_message${SLOT}.$$.txt"
+  FOLLOW_MESSAGE="${ARTIFACT_DIR}/impl_follow_message${SLOT}.$$.txt"
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
   if [[ "${AGENT_FAMILY}" == "claude" ]]; then
@@ -556,7 +575,10 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
-    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}"; then
+    # The phase is named so a repair in an older open phase lands on its own
+    # ledger, not on the newest phase's.
+    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
+        ${PHASE_ID:+--phase "${PHASE_ID}"}; then
       echo "ERROR: unable to record the repair round as landed." >&2
       echo "error" > "${STATUS_FILE}"
       bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
@@ -585,7 +607,7 @@ else
   # failed may have left partial edits behind, and the launcher cannot tell.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
     "$PY" "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
-      --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
+      ${PHASE_ID:+--phase "${PHASE_ID}"} --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
       || { echo "ERROR: unable to record the repair round as abandoned." >&2; LEDGER_CODE=1; }
   fi
   echo "error" > "${STATUS_FILE}"

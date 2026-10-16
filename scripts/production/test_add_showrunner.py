@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""add_showrunner.py through its CLI, with stand-ins for tmux, systemd-run, the session records and the
+"""add_showrunner.py through its CLI, with fake herdr, legacy tmux, the session records and the
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 from scripts.accounts import accounts
+from scripts.production import add_showrunner
+import add_unit
+import showrunners
 import usage_store
+from scripts.herdr import herdr
+from scripts.herdr.fake_herdr import CommandResponse
 
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -79,6 +84,7 @@ class AddShowrunnerTests(unittest.TestCase):
     state: Path = Path()
     env: dict[str, str] = {}
     on_start: dict[str, str] = {}
+    herdr_overrides: dict[str, CommandResponse] = {}
     processes: list[subprocess.Popen[bytes]] = []
 
     @override
@@ -97,12 +103,19 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = (self.root / "sessions.py").write_text(SESSIONS, encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND, encoding="utf-8")
         self.on_start = {}
+        self.herdr_overrides = {}
         self.processes = []
         self.addCleanup(self.close_processes)
         self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")},
                     "HOME": str(self.root / "home"), "STUB_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "UNIT_LOOKUP_TMUX": str(bin_path / "tmux"),
+                    "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+                    "SYSTEMD_RUN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+                    "SYSTEMCTL": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+                    "HERDR_PROC": str(self.root / "proc"),
+                    "FAKE_HERDR_LOG": str(self.state / "herdr.jsonl"),
+                    "FAKE_HERDR_RESPONSES": str(self.state / "herdr-responses.json"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                     "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
@@ -126,6 +139,9 @@ class AddShowrunnerTests(unittest.TestCase):
         file.parent.mkdir(parents=True)
         _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
             "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         _ = self.configure_groups()
         self.timer("top", PARENT_SESSION)
         self.live(PARENT_SESSION)
@@ -187,7 +203,12 @@ class AddShowrunnerTests(unittest.TestCase):
         self.on_start[path] = text
         if registers:
             self.on_start[str(self.timer_conf(registers))] = self.timer_text(registers, session)
-        self.env["STUB_ON_START"] = json.dumps(self.on_start)
+        for destination in self.on_start:
+            Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        if registers and not self.timer_conf(registers).exists():
+            # Fake herdr writes files into existing folders. Before launch this
+            # timer belongs to an ended session, so it does not claim the child.
+            _ = self.timer_conf(registers).write_text(self.timer_text(registers, "not-started"))
 
     def sent_to(self) -> list[str]:
         path = self.root / "sent.jsonl"
@@ -197,9 +218,31 @@ class AddShowrunnerTests(unittest.TestCase):
         return [arguments[arguments.index("--to") + 1] for arguments in sent]
 
     def run_command(self, slug: str, *extra: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        self.prepare_herdr(slug, *extra)
         return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.doc(slug)),
                                "--model", "opus", "--effort", "high", *extra],
                               env=self.env, capture_output=True, text=True, check=False, cwd=cwd)
+
+    def prepare_herdr(self, slug: str, *extra: str) -> None:
+        """Fake herdr answers a launch of `slug`'s showrunner; the agent prompt brings it up."""
+        sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
+                    session_dir="/fixture", socket_path="/fixture/socket") for path in self.state.glob("live-*")]
+        responses: dict[str, CommandResponse | list[CommandResponse]] = {
+            "--session default session list --json": CommandResponse(code=0, stdout=json.dumps(
+                herdr.SessionListResult(sessions=sessions))),
+            f"--session {slug} status server": [CommandResponse(code=0, stdout="status: stopped\n"),
+                                               CommandResponse(code=0, stdout="status: running\n")],
+            f"--session {slug} workspace list": CommandResponse(
+                code=0, stdout=json.dumps({"result": {"workspaces": []}})),
+            f"--session {slug} pane list": CommandResponse(code=0, stdout=json.dumps({
+                "result": {"panes": [{"pane_id": "w1:p1", "label": slug}]}})),
+            "default": CommandResponse(code=0, stdout=json.dumps({"result": {"root_pane": {"pane_id": "w1:p1"}}})),
+        }
+        prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
+        responses[f"--session {slug} agent prompt w1:p1 {prompt}"] = CommandResponse(
+            code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{slug}"): ""})
+        responses.update(self.herdr_overrides)
+        _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
 
     def events(self, command: str) -> list[dict[str, object]]:
         path = self.state / "events.jsonl"
@@ -208,9 +251,15 @@ class AddShowrunnerTests(unittest.TestCase):
         records = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
         return [record for record in records if record["command"] == command]
 
-    def started(self) -> dict[str, object]:
-        return next(record for record in self.events("tmux")
-                    if cast(list[str], record["args"])[:1] == ["new-session"])
+    def herdr_calls(self) -> list[list[str]]:
+        path = Path(self.env["FAKE_HERDR_LOG"])
+        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def started(self) -> list[str]:
+        return next(row for row in self.herdr_calls() if row[2:4] == ["agent", "start"])
+
+    def opened(self) -> list[str]:
+        return next(row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"])
 
     def parent_of(self, slug: str) -> str:
         path = self.root / "showrunner" / slug / "parent"
@@ -220,30 +269,34 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("add_showrunner:", result.stderr)
         self.assertIn(cause, result.stderr)
-        self.assertEqual(self.events("systemd-run"), [])
+        self.assertFalse(any("workspace" in row or "server" in row or "agent" in row
+                             for row in self.herdr_calls()))
 
     def test_new_showrunner_launches_on_picked_default_account_and_attaches_it(self) -> None:
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines()[:2],
-                         ["started kid in tmux session kid", "kid now reports to top"])
+                         ["started kid: herdr session attach kid", "kid now reports to top"])
         self.assertEqual(self.parent_of("kid"), "top")
         # The parent ran the command and reads its output; only the child is told.
         self.assertEqual(self.sent_to(), [f"uds:{self.root / 'kid-session.sock'}"])
-        launch = cast(list[str], self.events("systemd-run")[0]["args"])
-        self.assertEqual(launch[:2], ["--user", "--scope"])
-        self.assertRegex(launch[2], r"^--unit=kid-\d+$")
-        args = cast(list[str], self.started()["args"])
-        self.assertEqual(args[:8], ["new-session", "-d", "-s", "kid", "-c", str(self.root / "kid-checkout"),
-                                    "zsh", "-ic"])
-        # No unit mark: a marked session would be relayed to as a unit of the parent.
-        self.assertNotIn("-e", args)
-        # No account prefix and no CLAUDE_* variable: it takes the main login, whatever the caller's units use.
-        self.assertEqual(args[8], "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude --model opus --effort high "
-                         + "--remote-control kid -n kid --settings '{\"disableAgentView\": true}' "
-                         + f"'/showrunner:produce {self.doc('kid')}'; exec zsh")
-        self.assertEqual(self.started()["claude_env"], [])
+        calls = self.herdr_calls()
+        self.assertIn(["--user", "--unit=herdr-kid.service", "--collect", self.env["HERDR_BIN"],
+                       "--session", "kid", "server"], calls)
+        opened = self.opened()
+        self.assertEqual(opened[:8], ["--session", "kid", "workspace", "create", "--label", "kid",
+                                     "--cwd", str(self.root / "kid-checkout")])
+        self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
+            "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
+            "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
+            "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
+        started = self.started()
+        self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
+            "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
+        self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]], [[
+            "--session", "kid", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
+        self.assertEqual(self.events("tmux"), [])
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
         self.starts("abc-123", registers="kid")
@@ -251,10 +304,11 @@ class AddShowrunnerTests(unittest.TestCase):
         elsewhere.mkdir()
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(elsewhere), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        args = cast(list[str], self.started()["args"])
-        self.assertEqual(args[5], str(elsewhere))
-        self.assertIn(" --resume abc-123 ", args[8])
-        self.assertIn(f"'/showrunner:produce {self.doc('kid')} resume'; exec zsh", args[8])
+        self.assertEqual(self.opened()[7], str(elsewhere))
+        args = self.started()
+        self.assertEqual(args[args.index("--resume") + 1], "abc-123")
+        self.assertIn(["--session", "kid", "agent", "prompt", "w1:p1",
+                       f"/showrunner:produce {self.doc('kid')} resume"], self.herdr_calls())
         alone = self.run_command("other", "--resume", "abc-123")
         self.assertEqual(alone.returncode, 2)
         self.assertIn("--resume and --cwd go together", alone.stderr)
@@ -295,9 +349,8 @@ class AddShowrunnerTests(unittest.TestCase):
         before = path.read_bytes()
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        command = cast(list[str], self.started()["args"])[-1]
-        self.assertIn("CLAUDE_CONFIG_DIR=", command)
-        self.assertIn(str(directory), command)
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
+        self.assertIn("CLAUDE_CODE_REMOTE_MEMORY_DIR=" + str(Path(self.env["HOME"]) / ".claude"), self.opened())
         self.assertEqual(path.read_bytes(), before)
 
     def test_unconfigured_showrunners_refuse_new_and_resume_without_group_write(self) -> None:
@@ -318,7 +371,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
     def test_new_showrunner_refuses_configured_account_with_wrong_login(self) -> None:
         """F006: a trusted directory cannot bypass the configured account's readiness."""
@@ -332,14 +385,28 @@ class AddShowrunnerTests(unittest.TestCase):
         self.refused(result, "logged in as other@example.invalid, not claude3")
         self.assertEqual(path.read_bytes(), before)
 
-    def test_new_showrunner_refuses_configured_account_with_wrong_shared_link(self) -> None:
-        """F006: new work prepares the configured directory before launching."""
+    def test_new_showrunner_repairs_a_wrong_shared_link_before_launching(self) -> None:
         directory = self.named_account()
         linked = directory / "projects"
         linked.unlink()
         linked.symlink_to(Path(self.env["HOME"]) / "missing-projects")
+        self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
-        self.refused(result, f"{linked} points to {Path(self.env['HOME']) / 'missing-projects'}, not {Path(self.env['HOME']) / '.claude/projects'}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(linked.resolve(), Path(self.env["HOME"]) / ".claude/projects")
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
+        self.assertEqual(self.parent_of("kid"), "top")
+
+    def test_new_showrunner_refuses_a_real_file_against_an_existing_shared_folder(self) -> None:
+        directory = self.named_account()
+        local = directory / "projects"
+        local.unlink()
+        _ = local.write_text("local projects data")
+        result = self.run_command("kid")
+        self.refused(result, f"{local} is a real file; move it aside or merge it into ~/.claude")
+        self.assertFalse(local.is_symlink())
+        self.assertEqual(local.read_text(), "local projects data")
 
     def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
         directory = self.named_account()
@@ -370,15 +437,14 @@ class AddShowrunnerTests(unittest.TestCase):
         self.refused(result, "claude2")
         self.assertNotIn("SECRET", result.stderr)
 
-    def test_resume_refuses_an_unrelated_tmux_name_collision_without_killing_it(self) -> None:
+    def test_resume_refuses_an_unrelated_herdr_name_collision_without_stopping_it(self) -> None:
         (self.state / "live-kid").touch()
         self.live("unrelated-conversation")
         result = self.run_command("kid", "--resume", "ended-conversation", "--cwd", str(self.root),
                                   "--account", "claude2")
-        self.refused(result, "a tmux session named kid is already live")
+        self.refused(result, "a herdr session named kid is already live")
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertFalse(any(cast(list[str], event["args"])[0] == "kill-session"
-                             for event in self.events("tmux")))
+        self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
         self.assertTrue((self.state / "live-kid").exists())
 
     def test_showrunner_resume_refuses_directory_outside_configured_account(self) -> None:
@@ -401,8 +467,8 @@ class AddShowrunnerTests(unittest.TestCase):
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", ".claude3", cwd=home)
         self.assertEqual(result.returncode, 0, result.stderr)
-        options = [cast(list[str], event["args"]) for event in self.events("tmux")]
-        self.assertIn(["set-option", "-t", "=kid:", "@claude_config_dir", str(directory)], options)
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
+        self.assertEqual(self.events("tmux"), [])
 
     def test_showrunner_config_directory_requires_resume_and_excludes_account(self) -> None:
         directory = Path(self.env["HOME"]) / "retained"
@@ -423,7 +489,60 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("abc-123", registers="kid")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
+
+    def resume_record(self, *, tmux: str = "") -> None:
+        _ = (self.root / "sessions/resume.json").write_text(json.dumps({
+            "pid": 991001,
+            "sessionId": "abc-123",
+            "name": "kid",
+            "messagingSocketPath": "",
+            "updatedAt": 1,
+            "tmux": tmux,
+        }))
+
+    def test_resume_uses_configured_showrunners_account_for_either_host(self) -> None:
+        directory = self.named_account()
+        child = add_unit.read_production(self.doc("kid"))
+        for tmux in ("", "kid:@1.%1"):
+            with self.subTest(tmux=tmux):
+                self.resume_record(tmux=tmux)
+                _ = (self.state / "kid@claude_config_dir").write_text("/wrong-account")
+                with patch.dict(os.environ, self.env, clear=True), \
+                        patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
+                    selected = add_showrunner.account_for_launch(child, "abc-123")
+                self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
+                role.assert_called_once_with("showrunner")
+                self.assertEqual(self.events("tmux"), [])
+
+    def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
+        child = add_unit.read_production(self.doc("kid"))
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(add_showrunner, "running", return_value=False), \
+                patch.object(showrunners, "descendants_of", return_value=[]), \
+                patch.object(add_showrunner, "herdr_session_running", return_value=False) as destination:
+            result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
+        self.assertIsNone(result)
+        destination.assert_called_once_with("kid")
+
+    def test_recorded_herdr_resume_without_an_account_passes_check_using_configured_group(self) -> None:
+        self.resume_record()
+        for pid, parent, argv, environment in (
+            (991000, 0, ["herdr", "--session", "kid", "server"], {}),
+            (991001, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1"}),
+        ):
+            process = Path(self.env["HERDR_PROC"]) / str(pid)
+            process.mkdir(parents=True)
+            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+            _ = (process / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+            _ = (process / "environ").write_bytes(
+                ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
+            )
+        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("check: ok", result.stdout)
+        self.assertEqual(self.events("tmux"), [])
+        self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_showrunner_refuses_explicit_account_different_from_configured_group(self) -> None:
         """F004: an explicit account must agree with the showrunners account."""
@@ -441,16 +560,78 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("abc-123", registers="kid")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude3")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def test_showrunner_launch_records_config_directory_and_model_on_its_tmux_session(self) -> None:
+    def test_showrunner_launch_carries_no_marks_or_caller_account_variables(self) -> None:
+        self.env["CLAUDE_CODE_OAUTH_TOKEN"] = "caller-token"
+        self.env["SHOWRUNNER_UNIT"] = "parent"
+        self.env["SHOWRUNNER_UNIT_ID"] = "parent-unit"
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        options = [cast(list[str], event["args"]) for event in self.events("tmux")
-                   if cast(list[str], event["args"])[:1] == ["set-option"]]
-        self.assertIn(["set-option", "-t", "=kid:", "@claude_config_dir", str(Path(self.env["HOME"]) / ".claude")], options)
-        self.assertIn(["set-option", "-t", "=kid:", "@claude_model", "opus"], options)
+        self.assertEqual(self.opened()[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
+            "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
+            "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
+            "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
+        self.assertNotIn("caller-token", json.dumps(self.herdr_calls()))
+        self.assertEqual(self.events("tmux"), [])
+
+    def test_showrunner_start_not_ready_returns_a_distinct_status_and_sends_no_prompt_or_key(self) -> None:
+        start = ("--session kid agent start kid --kind claude --pane w1:p1 --timeout 90000 -- "
+                 "--model opus --effort high --remote-control kid -n kid --settings "
+                 '{"disableAgentView": true}')
+        self.herdr_overrides[start] = CommandResponse(code=1, stdout=json.dumps({
+            "error": {"code": "agent_not_ready", "message": "permission dialog"}}))
+        screen = "Do you trust this folder?\n1. Yes\n2. No"
+        self.herdr_overrides["--session kid pane read w1:p1 --source visible"] = CommandResponse(
+            code=0, stdout=screen)
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, add_showrunner.SESSION_NOT_READY, result.stdout + result.stderr)
+        self.assertIn(screen, result.stderr)
+        self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"],
+                                        ["pane", "send-text"]) for row in self.herdr_calls()))
+        self.assertEqual(self.sent_to(), [])
+        self.assertEqual(self.parent_of("kid"), "")
+
+    def test_showrunner_start_failure_is_reported_without_attaching(self) -> None:
+        self.herdr_overrides["--session kid workspace create --label kid --cwd "
+            + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true"
+            + f" --env CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}"
+            + f" --env CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}"
+            + " --env HERDR_AGENT_PANE=1 --no-focus"] = CommandResponse(
+                code=1, stdout="", stderr="fixture could not open workspace")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("fixture could not open workspace", result.stderr)
+        self.assertFalse(any(row[2:4] == ["agent", "start"] for row in self.herdr_calls()))
+        self.assertEqual(self.parent_of("kid"), "")
+
+    def test_unreadable_herdr_inventory_refuses_before_starting_the_child(self) -> None:
+        self.herdr_overrides["--session default session list --json"] = CommandResponse(
+            code=1, stdout="", stderr="fixture cannot list herdr sessions")
+        result = self.run_command("kid")
+        self.refused(result, "herdr session list: fixture cannot list herdr sessions")
+        self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
+
+    def test_child_herdr_launch_does_not_require_a_tmux_binary(self) -> None:
+        self.env["UNIT_LOOKUP_TMUX"] = str(self.root / "missing-tmux")
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events("tmux"), [])
+
+    def test_child_refuses_a_server_that_appears_after_preflight(self) -> None:
+        self.herdr_overrides["--session kid status server"] = CommandResponse(
+            code=0, stdout="status: running\n")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("add_showrunner: herdr session kid is already taken", result.stderr)
+        self.assertEqual(self.herdr_calls(), [
+            ["--session", "default", "session", "list", "--json"],
+            ["--session", "kid", "status", "server"],
+        ])
+        self.assertEqual(self.parent_of("kid"), "")
+        self.assertEqual(self.sent_to(), [])
 
     def test_new_showrunner_zero_reading_without_refusal_can_launch(self) -> None:
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
@@ -462,7 +643,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("CLAUDE_CONFIG_DIR=", cast(list[str], self.started()["args"])[-1])
+        self.assertIn(f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}", self.opened())
 
     def test_a_timer_left_by_an_ended_session_does_not_stand_in_the_way(self) -> None:
         # The child ran before under this parent; its session ended, and its timer and its edge are still stored.
@@ -473,7 +654,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("abc-123")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["started kid in tmux session kid", "kid already reports to top"])
+        self.assertEqual(result.stdout.splitlines(), ["started kid: herdr session attach kid", "kid already reports to top"])
         self.assertEqual(self.sent_to(), [])
 
     def test_a_stored_timer_alone_is_not_a_showrunner_that_appeared(self) -> None:
@@ -488,6 +669,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertIn("kid has no running showrunner after 0 s, so it is not attached. Its session is still running",
                       result.stdout)
         self.assertIn("showrunners.py attach kid top", result.stdout)
+        self.assertIn("herdr session attach kid", result.stdout)
         self.assertTrue((self.state / "live-kid").exists())
         self.assertEqual(self.parent_of("kid"), "")
         self.assertEqual(self.sent_to(), [])
@@ -503,9 +685,9 @@ class AddShowrunnerTests(unittest.TestCase):
         count = self.root / "registry-failures"
         _ = (self.root / "flaky_sessions.py").write_text(
             "import os, pathlib, runpy, sys\n"
-            + f"count, conf = pathlib.Path({str(count)!r}), pathlib.Path({str(self.timer_conf('kid'))!r})\n"
+            + f"count, started = pathlib.Path({str(count)!r}), pathlib.Path({str(self.state / 'live-kid')!r})\n"
             + "seen = int(count.read_text()) if count.exists() else 0\n"
-            + f"if conf.exists() and seen < {failures}:\n"
+            + f"if started.exists() and seen < {failures}:\n"
             + "    count.write_text(str(seen + 1))\n"
             + "    print('one or more registry files could not be read', file=sys.stderr)\n"
             + "    raise SystemExit(3)\n"
@@ -524,6 +706,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.flaky_registry(1)
         self.env["ADD_SHOWRUNNER_WAIT_S"] = "300"
         self.starts("kid-session", registers="kid")
+        self.prepare_herdr("kid")
         polls = self.root / "polls.jsonl"
         program = f'''import json, sys, time
 from pathlib import Path
@@ -567,9 +750,9 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(),
                          f"check: ok — would start kid in {self.root / 'kid-checkout'} and attach it to top")
-        self.assertEqual(self.events("systemd-run"), [])
+        self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
         (self.state / "live-kid").touch()
-        self.refused(self.run_command("kid", "--check"), "a tmux session named kid is already live")
+        self.refused(self.run_command("kid", "--check"), "a herdr session named kid is already live")
 
     def test_each_refusal_names_its_cause_and_starts_nothing(self) -> None:
         notes = self.root / "notes.md"
@@ -583,7 +766,7 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         self.live("running-session")
         self.refused(self.run_command("running"), "running already has a running showrunner")
         (self.state / "live-kid").touch()
-        self.refused(self.run_command("kid"), "a tmux session named kid is already live")
+        self.refused(self.run_command("kid"), "a herdr session named kid is already live")
 
     def test_a_production_above_the_caller_is_refused(self) -> None:
         self.timer("middle", "middle-session")
@@ -601,8 +784,10 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         result = self.run_command("kid", "--check")
         self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on claude2. "
                      + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
-                     + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
+                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
+                     + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude")
         self.assertNotIn("SECRET", result.stdout + result.stderr)
+        self.assertEqual(self.herdr_calls(), [])
 
     def test_trust_comes_from_the_repository_root_or_a_worktrees_main_checkout(self) -> None:
         main = self.root / "main"
@@ -629,6 +814,7 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         result = self.run_command("kid", "--check")
         self.refused(result, f"kid: cannot read {self.root / 'claude.json'} to check Claude trust (JSONDecodeError)")
         self.assertNotIn("SECRET", result.stderr)
+        self.assertEqual(self.herdr_calls(), [])
 
     def test_a_session_that_runs_no_production_is_refused(self) -> None:
         self.env["CLAUDE_CODE_SESSION_ID"] = "no-such-session"

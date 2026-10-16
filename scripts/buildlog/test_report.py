@@ -403,7 +403,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
         _ = index.update()
         with closing(index.read_only()) as connection:
-            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)) + ["Mac copies: none started.", ""], mac)
             nextest_runs = cast(int, connection.execute(
                 "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
                 + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
@@ -436,7 +436,10 @@ class ReportTests(unittest.TestCase):
             step("other-day", host="Mac", started_at="2026-10-01T12:00:00Z"),
         )
         text = self.render()
-        self.assertEqual(self.section_lines(text, "### Mac"), ["### Mac", "", "No steps recorded on the Mac.", ""])
+        self.assertEqual(
+            self.section_lines(text, "### Mac"),
+            ["### Mac", "", "No steps recorded on the Mac.", "", "Mac copies: none started.", ""],
+        )
         self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
@@ -1488,6 +1491,87 @@ class ReportTests(unittest.TestCase):
         self.assertIn("No test matched on the Mac: 1 (hana)", section)
         self.assertLess(lines.index("### Test builds (temporary)"), start)
         self.assertLess(start, lines.index("### Tests per edit"))
+
+    def write_copy_day(self) -> None:
+        def at(minute: int) -> str:
+            return f"2026-10-02T12:{minute:02d}:00Z"
+
+        filtered = "test hana --filter a"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            *(call(f"ref-{number}", started_at=at(number), command=filtered) for number in range(3)),
+            call("natedev-won", started_at=at(3), command=filtered, mac="declined", mac_reason="busy", mac_s=1.0,
+                 copy="natedev_won", copy_s=20.0, copy_count=1, copy_natedev_s=60.0),
+            call("won-a", started_at=at(4), command=filtered, mac="failed", mac_reason="", mac_s=30.0,
+                 status=1, outcome="failed", target="mac", copy="won", copy_s=30.0, copy_count=1, copy_natedev_s=90.0),
+            call("gave-way", started_at=at(5), mac="declined", mac_reason="busy", mac_s=1.0,
+                 copy="gave_way", copy_s=15.0, copy_count=2, copy_natedev_s=40.0),
+            call("passed-full", started_at=at(6), package="beta", command="test beta", mac="declined",
+                 mac_reason="busy", mac_s=1.0, copy="passed_full", copy_s=50.0, copy_count=1, copy_natedev_s=80.0),
+            call("won-b", started_at=at(7), package="beta", command="test beta --filter x", mac="passed_filter",
+                 mac_reason="", mac_s=25.0, target="mac", copy="won", copy_s=25.0, copy_count=1, copy_natedev_s=100.0),
+            call("won-gamma", started_at=at(8), package="gamma", command="test gamma --filter y", mac="failed",
+                 mac_reason="", mac_s=10.0, status=1, outcome="failed", target="mac",
+                 copy="won", copy_s=10.0, copy_count=1, copy_natedev_s=500.0),
+            call("plain-filter", started_at=at(9), mac="passed_filter", mac_reason="", mac_s=12.0, target="mac"),
+            *(self.nextest_step(f"ref-{number}-step", f"ref-{number}", duration_s=duration)
+              for number, duration in enumerate((100.0, 120.0, 200.0))),
+            self.nextest_step("natedev-won-step", "natedev-won", duration_s=60.0),
+            self.nextest_step("won-a-stopped", "won-a", duration_s=90.0, status=143),
+            self.nextest_step("gave-way-step", "gave-way", duration_s=300.0),
+            self.nextest_step("passed-full-step", "passed-full", duration_s=400.0),
+            self.nextest_step("won-b-stopped", "won-b", duration_s=100.0, status=143),
+        )
+
+    def test_mac_copies_section_counts_outcomes_and_estimates_the_saving(self) -> None:
+        self.write_copy_day()
+        text = self.render()
+        lines = text.splitlines()
+        mac = self.section_lines(text, "### Mac")
+        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### Mac copies")
+        section = self.section_lines(text, "### Mac copies")
+        self.assertEqual(section[2], "| Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved"
+                         + " | Mac time on copies that did not win |")
+        self.assertEqual([line for line in section if line.startswith("| ")][1:], [
+            # beta: (400 - 100) from the package's one step, as the command has fewer than three.
+            "| beta | 2 | 1 | 0 | 0 | 1 | 5.0 min | 50.0 s |",
+            "| gamma | 1 | 1 | 0 | 0 | 0 | 0.0 s | — |",
+            # hana: the median of 100, 120 and 200 minus 90; the 60 s step ended before t.
+            "| hana | 4 | 1 | 1 | 1 | 0 | 30.0 s | 35.0 s |",
+        ])
+        self.assertTrue(any(line.startswith("Est. saved is an estimate:") for line in section))
+        lead = [line for line in lines[2:lines.index("### Waiting")] if line]
+        self.assertEqual(lead[-1], "Mac copies: 3 of 7 finished first, about 5.5 min saved (estimated).")
+        self.assertNotIn("Mac copies: none started.", text)
+
+    def test_copy_wins_are_not_natedev_runs_or_avoided_runs_or_failed_steps(self) -> None:
+        self.write_copy_day()
+        text = self.render()
+        targets = self.section_lines(text, "### Tests by target")
+        rows = {line.split("|")[1].strip(): [cell.strip() for cell in line.strip("|").split("|")]
+                for line in targets if line.startswith("| ") and not line.startswith("| Package")}
+        # hana: three references, the natedev win and the copy that gave way ran on natedev; won-a did not.
+        self.assertEqual(rows["hana"][5], "5")
+        self.assertEqual(rows["hana"][1:4], ["2", "1", "1"])
+        self.assertEqual(rows["beta"][5], "1")
+        avoided = next(line for line in targets if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 1 ", avoided)
+        nextest = self.section_lines(text, "### nextest")
+        self.assertTrue(any(line.startswith("| verify.sh (agents) | 8 | 0 |") for line in nextest))
+        self.assertNotIn("Failed steps:", text)
+        failures = self.section_lines(text, "### Summary: failures")
+        self.assertTrue(any(line.startswith("| nextest | 2 |") for line in failures))
+
+    def test_day_without_a_copy_says_none_started_and_has_no_lead_line(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("plain", mac="declined", mac_reason="busy", mac_s=1.0),
+            self.nextest_step("plain-step", "plain"),
+        )
+        text = self.render()
+        self.assertIn("Mac copies: none started.", text.splitlines())
+        self.assertNotIn("### Mac copies", text)
+        self.assertNotIn("finished first", text)
 
     def test_local_pass_pairs_only_nearest_failure_and_reports_its_reason(self) -> None:
         reason = "uses Linux filesystem semantics"

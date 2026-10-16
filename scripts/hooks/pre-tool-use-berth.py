@@ -12,9 +12,10 @@ Seats persist across phases and the mesh knows no phase, so each edited path goe
 phase that owns it (`phase_reservation.attribute`): the only open phase, else the one whose
 `files` list covers it. A path no single open phase owns refuses the edit.
 
-For a seat it runs `cargo-berth check <paths> --json` from the repository root under the
-director's session id, the same identity the director's own edits and drift use, once per
-owning phase. A clear answer allows the edit and, when it carries the acquired reservation,
+For a seat it runs `cargo-berth check <paths> --json` from the repository root once per owning
+phase, as that phase's berth session `<director session id>.phase-<phase>`, so two open phases
+hold separate reservations. A path a sibling phase already holds is allowed and records nothing:
+the engine leaves the session unmapped and names the sibling's reservation. A clear answer allows the edit and, when it carries the acquired reservation,
 writes `Active` into that phase's state file. An unenrolled repository is allowed. Every other
 answer, a missing engine or a timeout refuses the edit with the engine's reason: an unchecked
 edit can collide with a foreign reservation, where a refused one only costs the seat a retry.
@@ -83,15 +84,18 @@ def decide(raw: str) -> int:
     if attribution is not None and attribution.refused:
         return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
     groups = list(attribution.by_phase.items()) if attribution is not None else [(None, scopes)]
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for phase, phase_scopes in groups:
-        answer = phase_reservation.check(root, phase_scopes, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        berth_session = phase_reservation.phase_session_id(session_id, phase.phase) if phase else session_id
+        answer = phase_reservation.check(root, phase_scopes, berth_session)
         if answer.status == phase_reservation.UNCONFIGURED:
             return 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
-        if phase is not None and answer.acquisition is not None:
+        acquisition = phase_reservation.own_acquisition(answer, root, phases, session_id)
+        if phase is not None and acquisition is not None:
             try:
-                _ = phase_reservation.record_active(phase.directory, answer.acquisition)
+                _ = phase_reservation.record_active(phase.directory, acquisition)
             except OSError:
                 # The edit is protected either way; the checkpoint's backstop records Active.
                 pass

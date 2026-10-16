@@ -35,7 +35,9 @@ State:
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
   `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
-  merge commit subjects on `MERGE_BRANCH`, never from memory.
+  merge commit subjects on `MERGE_BRANCH`, never from memory. A
+  `chore(<slug>): rename unit <old> to <new>` commit carries the merges under
+  `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
   name less `-production.md`.
@@ -43,7 +45,7 @@ State:
 - `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
-  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`); a new question goes in the object's `question` field, and the reply carries the printed `reviewed question` text.
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply carries the printed `reviewed question` text.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -170,9 +172,11 @@ State:
     retires.
   - **Start a lower showrunner only with `/showrunner:add_showrunner
     <production doc>`**, never in your own pane and never as a unit. It gets
-    its own tmux session on the showrunner account and is attached to you
+    its own herdr session on the selected account and is attached to you
     once it runs. User, 2026-10-12: "top level (L1) showrunners should make
-    sure to use tmux to start lower level showrunners".
+    sure to use tmux to start lower level showrunners". With the user's
+    2026-10-13 move to herdr, `add_showrunner.py` opens each lower showrunner
+    in its own herdr session.
 - **What reaches the user:**
   - a unit director's `— decision:` that only the user can settle (**Designs
     and add-ons** below), shown in the unit director's words, with the answer
@@ -198,6 +202,9 @@ State:
     For add-ons, give each number `current`, `next` or `drop`: build it in
     this run, save it for later, or drop it. An add-on that fixes a wrong
     result is `current`.
+  - A unit's finished proposal is filed as a hanadocs issue through `/issue`,
+    with `proposed_by` and its proposed stars, and reaches the user only when
+    they ask (`/showrunner:proposal`).
   - Tell a unit what to do and change in its design without being asked, when
     you see a better answer.
   - Your answer goes as your own message. Never begin it `From the user (via
@@ -214,6 +221,13 @@ State:
   for one), where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. A root's n also counts
   every due item of every production below it (**Nested showrunners** above).
+  A change waiting for the user's check is never an open question: it goes on
+  the change review list through `/change_review` add, never into
+  `open_for_user` or the count, and the user asks for "change review" when
+  they want it (user, 2026-10-15).
+  When the user's answer needs research before they can finish it, remove the
+  item from `open_for_user` in that turn; it returns, in full, when the
+  research reports (user, 2026-10-15).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -327,7 +341,7 @@ State:
 Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 --production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
 the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
-last code checkpoint from first-parent merge history, and checks its tmux
+last code checkpoint from first-parent merge history, and checks its herdr or tmux
 session. Use its lines to restore state. <StartUpdates/> registers this session
 again and retargets the instance. A reboot needs nothing.
 
@@ -357,15 +371,16 @@ Then launch `review-unit` first:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
 It has an ordinary Units row, worktree and branch; its opening runs
 `/review:direct <absolute production doc path>`. Its standing phase stays
-`todo` and has no final checkpoint. Ask it for <ReviewPoolDailies/> at each
-dailies (`commands/review/direct.md`) and carry its tables and source warnings
-with the report.
+`todo` and has no final checkpoint. Each unit keeps one permanent reviewer per type, and every
+code review goes to it (`docs/production_format.md`, unit rule 16). Before
+you mark a unit `retired`, run `review_pool.py retire` for it
+(`docs/production_format.md`, Units).
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
 `<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
-per unit director: its session name and `tmux attach -t <session>`.
+per unit director: its session name and `herdr session attach <session>`.
 
 When a unit director is blocked on a full context, first read its pane with
 `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
@@ -490,6 +505,9 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
+| the user asks for "change review" or "the next change" | `/change_review` show; each verdict through <CloseChangeReview/> |
+| a change for the user to check that no checkpoint `Change-Review:` line carries | `/change_review` add |
+| a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
 | the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
 | the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, oldest first, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
@@ -576,12 +594,15 @@ notice to the unit director before any merge command runs:
    message to the unit director.
 
 <ChangeReviewFeatureLog>
-Run only when the production repository is `~/rust/hana` or
-`~/rust/hana_catalyst`, after `merge_checkpoint.py` accepts the merge.
+Run only for a project that closes out by change review, after
+`merge_checkpoint.py` accepts the merge: Hana (`~/rust/hana` or
+`~/rust/hana_catalyst`, project `hana`) and ~/.claude (project `claude`).
+Every other project closes out through `/validate_and_push`, so its merges
+add rows and no proposals.
 
 For each distinct user-visible result:
 
-1. Check the Hana live log for entries it replaces.
+1. Check the project's live log for entries it replaces.
 2. Take the rows `merge_checkpoint.py` added: its `change review: ok` line
    names each `C<n>` row it wrote under `## To review` in the list the
    production doc's **Change review** line names, one per `Change-Review:`
@@ -591,11 +612,13 @@ For each distinct user-visible result:
    whose rows are missing, which you add the same way.
 3. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
-   `--project hana`, every owning crate, kind, title, summary, current behavior,
+   `--project hana` or `--project claude`, every owning crate (claude has none), kind, title, summary, current behavior,
    check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
    from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
    `--unit`, and one `--old` per replaced live entry. When the merge has
-   several results, pass `--separate-result` for every row.
+   several results, pass `--separate-result` for every row. A row on hana's
+   list is the bare `C<n>`; a row on any other list names its showrunner,
+   `<showrunner>/C<n>` (`natedev/C3`).
 
 Several results get several rows. Internal-only work gets none; write
 `feature log: none — <reason>` to the production log. The merge is not complete
@@ -619,7 +642,7 @@ message.
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
    watch exits 3, the dailies `Review watch` topic needs the user, and every
-   build report (`/build:report`, every 4 hours) carries it and pushes again. Run
+   build report (`/build:report`) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
    When the production doc has a **Review pool** line, send `review-unit`
@@ -636,18 +659,29 @@ message.
 ---
 
 <CloseChangeReview>
-When the user gives a change-review verdict:
+When the user gives a change-review verdict, in any production. A verdict
+beginning `works` or `fine` lands the row; any other returns it to its unit.
 
-- A verdict beginning `works` or `fine` lands the row with `add --review
-  <row>`, or `supersede --review <row>` when its proposal has `--old`. Propose
-  a missing row first; correct wrong meaning by rerunning `propose` while it is
-  open.
-- Any other verdict runs `drop --review <row> --verdict "<verdict>"`. A fixing
-  merge gets a new row and proposal.
+1. **Feature log.** Only when the production's project closes out by change
+   review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
+   projects close out through `/validate_and_push`, so skip to step 2. The
+   review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
+   other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
+   is named for (`natedev/C3`).
+   - A landing row runs `add --review <id>`, or `supersede --review <id>` when
+     its proposal has `--old`. Propose a missing row first; correct wrong
+     meaning by rerunning `propose` while it is open.
+   - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
-A script failure leaves the row open. After success, move it to `## Reviewed`
-with verdict and date; a landed Change cell may use the printed note link.
-Report no separate feature-log message.
+   A script failure leaves the row open. Report no separate feature-log
+   message.
+2. **Move the row.** Run `/change_review` verdict with the row and the user's
+   words. It moves the row to `## Reviewed` with the verdict and date. A landed
+   row's Change cell may link the printed note.
+3. **Return it.** A row that returns goes to the unit that made it: send the
+   row, the change and the verdict. The merge commit its Merged cell names
+   gives the checkpoint, and so the unit. The fix comes back as a new row, with
+   a new proposal where step 1 applies.
 </CloseChangeReview>
 
 ---
@@ -856,8 +890,8 @@ it needs. Every other wait is yours to clear, and fast.
    what to run, and log the call. Each unit director runs its own cargo-berth
    commands. When a unit director sends an overlap, reply in that turn with the
    answer it records —
-   `--before`, `--after`, `--defer` or `--override` on the named holder — and a
-   one-line why.
+   `--before`, `--after`, `--defer` or `--override` on each named holder, all
+   in one claim — and a one-line why.
    1. The holding unit checkpoints what is green; merge it, and its
       reservations release.
    2. Release in batches: the holder releases what it is done with, you merge,
@@ -1162,7 +1196,7 @@ outside it too: wrap neither waits on it nor retires its worktree or branch.
    production's links in the showrunner tree, deletes its own footer, pause,
    open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
-   Leave tmux sessions for the user to close.
+   Leave herdr and tmux sessions for the user to close.
 </Wrap>
 
 ---

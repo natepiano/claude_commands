@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownTestCase
+from test_support import linux_process_fixture, ShutdownTestCase
 from account import Account
 import inventory
 import herdr
@@ -238,6 +238,7 @@ class StopTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        linux_process_fixture(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
@@ -751,8 +752,8 @@ class StopTests(ShutdownTestCase):
                 self.assertEqual(signals, [signal.SIGTERM] if state == "present" else [])
                 self.assertEqual(self.herdr_commands(), [
                     ["--session", "same-name-as-tmux", "server", "stop"],
-                    ["--user", "is-active", "herdr-same-name-as-tmux"],
-                    ["--user", "stop", "herdr-same-name-as-tmux"],
+                    ["--user", "is-active", "herdr-same-name-as-tmux.service"],
+                    ["--user", "stop", "herdr-same-name-as-tmux.service"],
                     ["--session", "default", "session", "list", "--json"],
                 ])
                 self.assertEqual(report["stop_issues"], [])
