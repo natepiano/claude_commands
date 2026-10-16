@@ -524,7 +524,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Ruled out:**
 - A trusted default start folder was ruled out because nothing records which trusted folder the user last worked in, and a session opened somewhere unasked is a worse surprise than one prompt.
 
-### Phase 18 — Crash recovery on the Mac  · status: todo
+### Phase 18 — Crash recovery on the Mac  · status: done
 
 **Depends on:** Phase 17
 
@@ -538,18 +538,57 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 1. `inventory.snapshot_inventory()` on Darwin reads no `/proc`: the boot identity from `sysctl kern.boottime` (or `kern.bootsessionuuid`), processes and environments through `herdr.py`'s `ps`/`lsof` paths, socket owners through `lsof`. A Mac snapshot of a healthy machine is complete; host loss is shown by a changed boot identity; anything it cannot read makes the snapshot partial and adds no entry for it. Tests fake `HERDR_PS`, `HERDR_LSOF` and the sysctl program.
 2. `restart._launch_codex_snapshot` on the Mac opens `Ghostty.app` attached to the restored herdr session, as `_herdr_window` does for Claude sessions; if the window fails to open, the session stays running and the line prints the attach command. Darwin argv and failure tests.
-3. Live check on the Mac with the user: a throwaway session, a snapshot, a simulated host loss, `agents restart` brings it back attached.
+3. The Mac starts background programs without launchd. `launchctl submit` records a job and never runs it on this Mac (measured 2026-10-16: no pid, no output, LastExitStatus 0), which hung the user's first Mac check and silently skipped the shutdown conductor and the Remote Control fixer. One shared helper, `scripts/lib/detached.py`, starts a program in its own session with stdin closed and output to a log, and returns only once the caller's readiness check passes while the child is still alive; a child that exits, fails to start, or is not ready in time fails in plain words, and a child that never became ready is stopped. The herdr server (ready: its session socket is held by our child; 10 s bound, the caller's timeout when smaller), the shutdown conductor and the Remote Control fixer (ready: their first sign of life; 15 s) all start through it on Darwin. Darwin stop is `herdr --session <name> server stop`. Linux `systemd-run` is unchanged. `herdr_sessions.py` exits 130 with one line on Ctrl-C and prints a start failure without a traceback (showrunner, 2026-10-16).
+4. The Mac process reader takes each executable from `ps -o comm=` (macOS prints `command=` unquoted, so `/Applications/Nix Apps/Ghostty.app/...` must not split at its space), and a process whose arguments macOS cannot read (`(codex)`) makes the snapshot partial and Codex liveness unknown, never absent.
 
 **Files:**
 - `scripts/shutdown/inventory.py` — Darwin snapshot.
 - `scripts/shutdown/test_inventory.py` — Darwin snapshot cases.
 - `scripts/shutdown/restart.py` — Codex restore window on the Mac.
 - `scripts/shutdown/test_restart.py` — that case.
+- `scripts/lib/detached.py` — the shared detached start (new).
+- `scripts/lib/test_detached.py` — its tests (new).
+- `scripts/herdr/herdr.py` — Mac server start, stop and process reader.
+- `scripts/herdr/test_herdr.py` — those cases.
+- `scripts/herdr/herdr_sessions.py` — quiet Ctrl-C and start failure.
+- `scripts/herdr/test_herdr_sessions.py` — those cases.
+- `scripts/shutdown/settle.py` — shutdown conductor start on the Mac.
+- `scripts/shutdown/test_settle.py` — that case.
+- `scripts/shutdown/remote_control.py` — Remote Control fixer start on the Mac.
+- `scripts/shutdown/test_remote_control.py` — that case.
 
-**Workers:** 2 writers.
+**Workers:** 3 writers.
 - `impl` — `inventory.py`, `test_inventory.py`.
-- `test` (opens as impl) — `restart.py`, `test_restart.py`.
+- `test` (opens as impl) — `restart.py`, `test_restart.py`; then `settle.py`, `remote_control.py` and their tests.
+- `fix2` — `detached.py`, `herdr.py`, `herdr_sessions.py` and their tests.
 
-**Constraints from prior phases:** `herdr._PLATFORM` is fixed at import; Darwin fakes are `LAUNCHCTL`, `HERDR_PS` and `HERDR_LSOF`; only the unit director runs the Mac suites and the live check. Phase 17 made both suites green on the Mac: a test that fakes `/proc` or systemd calls `test_support.linux_process_fixture` (pins `sys.platform` and `herdr._PLATFORM`), `ShutdownTestCase` pins the host name to `natedev`, and temp roots are `.resolve()`d because macOS `/tmp` is `/private/tmp`; a new Darwin test pins Darwin the same way and must pass on both machines.
+**Constraints from prior phases:** `herdr._PLATFORM` is fixed at import; Darwin fakes are `HERDR_PS` and `HERDR_LSOF` (Phase 18 removed the `LAUNCHCTL` server path); only the unit director runs the Mac suites and the live check. Phase 17 made both suites green on the Mac: a test that fakes `/proc` or systemd calls `test_support.linux_process_fixture` (pins `sys.platform` and `herdr._PLATFORM`), `ShutdownTestCase` pins the host name to `natedev`, and temp roots are `.resolve()`d because macOS `/tmp` is `/private/tmp`; a new Darwin test pins Darwin the same way and must pass on both machines.
 
-**Acceptance gate:** `merge_gate.py --tests-only` green on natedev; `scripts/herdr` and `scripts/shutdown` green on the Mac; `basedpyright scripts/herdr scripts/shutdown` clean; the Spec 3 live check passes.
+**Acceptance gate:** `merge_gate.py --tests-only` green on natedev; `scripts/herdr` and `scripts/shutdown` green on the Mac; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; a herdr session starts over ssh on the Mac from the pushed branch and survives the ssh exit.
+
+### Phase 19 — Crash recovery on the Mac, live check with the user  · status: todo
+
+**Depends on:** Phase 18
+
+**User sees:** before — Mac crash recovery is built and tested with fakes only; after — it is proven on the real Mac: a session lost to a simulated crash comes back attached with `agents restart`.
+
+#### Work Order
+
+**Goal:** prove Phase 18 on the real Mac with the user (split from Phase 18 so its code ships before the user is needed).
+
+**Spec:**
+
+1. The user's Mac check: `herdr_sessions.py start` in a Mac Ghostty window; over ssh the unit director confirms the server environment, that a second start is refused, and `agents down`/`agents restart --only <name> --here --no-alert`; the user confirms the reopened window shows the conversation.
+2. Crash recovery: a throwaway session, a snapshot, a simulated host loss, `agents restart` brings it back attached, Codex included.
+3. Any defect found is fixed here, with a test that fails without the fix.
+
+**Files:**
+- `scripts/shutdown/` — repairs the live checks call for.
+- `scripts/herdr/` — repairs the live checks call for.
+
+**Workers:** 1 writer, opened only if a live check finds a defect.
+- `impl` — the files a defect names.
+
+**Constraints from prior phases:** the Mac clone `~/scratch/herdr-mac` pulls the pushed branch; copying the worktree to the Mac is refused, so every Mac run is from a pushed commit. Throwaway sessions come from `accounts.py exec --probe`, are picked with `--only <name> --here --no-alert`, and every herdr command names `--session`.
+
+**Acceptance gate:** both live checks pass on the Mac; `merge_gate.py --tests-only` green on natedev and the Mac suites green if code changed.

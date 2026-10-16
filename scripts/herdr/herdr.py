@@ -9,7 +9,7 @@ HERDR_BIN_PATH, HERDR_ENV=1, HERDR_PANE_ID, HERDR_SESSION, HERDR_SOCKET_PATH,
 HERDR_TAB_ID, and HERDR_WORKSPACE_ID. Listening socket ownership identifies the
 session; ancestry and dedicated unit membership associate pane processes with it.
 On Darwin, ps supplies user processes and their environments; lsof identifies
-the bound session socket and process working directories. Launchd owns servers.
+the bound session socket and process working directories. Servers detach directly.
 All caller-supplied timeouts are integer milliseconds.
 """
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -25,7 +26,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast, override
+from typing import NamedTuple, NotRequired, TypedDict, cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 
 # Herdr requires agent-start timeouts strictly above this boundary.
@@ -779,27 +782,87 @@ def _clear_restored_workspaces(client: Herdr) -> None:
 
 
 def _server_unit_active(name: str) -> bool:
-    if _PLATFORM == "darwin":
-        return run_program([os.environ.get("LAUNCHCTL", "launchctl"), "list", server_unit(name)]).returncode == 0
     return run_program([
         os.environ.get("SYSTEMCTL", "systemctl"), "--user", "is-active", server_unit(name),
     ]).returncode == 0
 
 
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
-    if _PLATFORM == "darwin":
-        return run_program([os.environ.get("LAUNCHCTL", "launchctl"), "submit", "-l",
-                            server_unit(client.session), "--", *client.argv("server")])
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
         "--collect", *client.argv("server"),
     ])
 
 
+def _server_start_failure(name: str) -> HerdrFailure:
+    message = f"herdr server for {name} did not start"
+    log = _session_socket(name).with_name("herdr-server.log")
+    if log.exists():
+        message += f"; see {log}"
+    return HerdrFailure(message)
+
+
+def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> ServerCreated | ServerAdopted:
+    from detached import DetachedChildExited, DetachedStartFailure, start_detached
+
+    deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
+    try:
+        if server_answering(run_program(client.argv("status", "server"),
+                                        timeout=max(0.001, deadline - time.monotonic()))):
+            if exclusive:
+                raise SessionTaken(client.session)
+            return ServerAdopted()
+    except subprocess.TimeoutExpired:
+        pass
+    if time.monotonic() >= deadline:
+        raise _server_start_failure(client.session)
+    holders: set[int] = set()
+
+    def ready() -> bool:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            if server_answering(run_program(client.argv("status", "server"), timeout=remaining)):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                holders.update(listener.pid for listener in _darwin_bound_sockets(timeout=remaining)
+                               if listener.path == _session_socket(client.session))
+                return bool(holders)
+        except subprocess.TimeoutExpired:
+            pass
+        return False
+
+    try:
+        pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic())
+    except DetachedChildExited as error:
+        if holders and holders != {error.pid}:
+            if exclusive:
+                raise SessionTaken(client.session) from error
+            return ServerAdopted()
+        raise _server_start_failure(client.session) from error
+    except (DetachedStartFailure, HerdrFailure) as error:
+        raise _server_start_failure(client.session) from error
+    if holders != {pid}:
+        # Only our own child may be stopped; the other listener belongs to its launch.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if exclusive:
+            raise SessionTaken(client.session)
+        return ServerAdopted()
+    _clear_restored_workspaces(client)
+    return ServerCreated()
+
+
 def start_server(name: str, timeout_ms: int) -> ServerCreated | ServerAdopted:
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
+    if _PLATFORM == "darwin":
+        return _start_darwin_server(herdr, timeout_ms, exclusive=False)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
@@ -829,18 +892,19 @@ def start_new_server(name: str, timeout_ms: int) -> None:
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
+    if _PLATFORM == "darwin":
+        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True)
+        return
     deadline = time.monotonic() + timeout_ms / 1000
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
             raise SessionTaken(name)
     except subprocess.TimeoutExpired:
         pass
-    if _PLATFORM == "darwin" and _server_unit_active(name):
-        raise SessionTaken(name)
     created = _submit_server(herdr)
     if created.returncode:
         detail = (created.stdout + created.stderr).lower()
-        if "already exists" in detail or "already loaded" in detail or (_PLATFORM == "darwin" and _server_unit_active(name)):
+        if "already exists" in detail or "already loaded" in detail:
             raise SessionTaken(name)
         require_success(created, f"start {server_unit(name)}")
     while True:
@@ -863,13 +927,14 @@ def start_new_server(name: str, timeout_ms: int) -> None:
 def stop_session(name: str) -> None:
     _validate_session_name(name)
     herdr = Herdr(name)
+    if _PLATFORM == "darwin":
+        require_success(run_program(herdr.argv("server", "stop")), f"stop herdr session {name}")
+        return
     try:
         result = run_program(herdr.argv("server", "stop"))
     finally:
         if _server_unit_active(name):
-            command = ([os.environ.get("LAUNCHCTL", "launchctl"), "remove", server_unit(name)]
-                       if _PLATFORM == "darwin" else
-                       [os.environ.get("SYSTEMCTL", "systemctl"), "--user", "stop", server_unit(name)])
+            command = [os.environ.get("SYSTEMCTL", "systemctl"), "--user", "stop", server_unit(name)]
             require_success(run_program(command), f"stop {server_unit(name)}")
     require_success(result, f"stop herdr session {name}")
 
@@ -1025,16 +1090,44 @@ def _session_socket(name: str) -> Path:
     return session_directory / "herdr.sock"
 
 
+class DarwinProcessIdentity(NamedTuple):
+    """Registry-compatible birth time and controlling-terminal presence (0 or 1)."""
+
+    started: str
+    terminal: int
+
+
+def darwin_process_identity(pid: int) -> DarwinProcessIdentity:
+    result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "lstart=,tty=", "-p", str(pid)],
+                         timeout=5, environment={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    require_success(result, f"process {pid} identity")
+    fields = result.stdout.strip().rsplit(maxsplit=1)
+    if len(fields) != 2 or not re.fullmatch(
+            r"[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}", fields[0]):
+        raise HerdrFailure(f"process {pid}: cannot read start time and controlling terminal")
+    return DarwinProcessIdentity(fields[0], 0 if fields[1] in {"??", "?", "-"} else 1)
+
+
+def darwin_open_files(pid: int) -> list[Path]:
+    result = run_program([os.environ.get("HERDR_LSOF", "lsof"), "-a", "-p", str(pid), "-Fn"])
+    if result.returncode == 1 and not result.stdout and not result.stderr:
+        return []
+    require_success(result, f"process {pid} open files")
+    return [Path(field[1:]) for field in result.stdout.splitlines() if field.startswith("n/")]
+
+
 def darwin_process_environment(pid: int) -> dict[str, str]:
     """Read only the environment following a stable, separately read argv."""
     ps = os.environ.get("HERDR_PS", "ps")
     command = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
     require_success(command, f"process {pid} command")
+    arguments = command.stdout.rstrip("\r\n").lstrip()
+    if arguments.startswith("(") and arguments.endswith(")"):
+        raise HerdrFailure(f"process {pid}: arguments are unreadable")
     expanded = run_program([ps, "eww", "-o", "command=", "-p", str(pid)], timeout=5)
     require_success(expanded, f"process {pid} environment")
     confirmed = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
     require_success(confirmed, f"process {pid} command confirmation")
-    arguments = command.stdout.rstrip("\r\n").lstrip()
     text = expanded.stdout.rstrip("\r\n").lstrip()
     if not arguments or confirmed.stdout != command.stdout or not text.startswith(arguments):
         raise HerdrFailure(f"process {pid}: environment does not follow stable command")
@@ -1054,11 +1147,11 @@ class _BoundUnixSocket:
     path: Path
 
 
-def _darwin_bound_sockets() -> list[_BoundUnixSocket]:
+def _darwin_bound_sockets(*, timeout: float = 10.0) -> list[_BoundUnixSocket]:
     # Darwin lsof reports a bound Unix sun_path; unbound client endpoints have
     # arrow names. TCP state fields are not emitted for these Unix sockets.
     result = run_program([os.environ.get("HERDR_LSOF", "lsof"), "-n", "-P", "-a", "-U",
-                          "-u", str(os.getuid()), "-F", "pfn"])
+                          "-u", str(os.getuid()), "-F", "pfn"], timeout=timeout)
     # lsof exits 1 with no output when no files match.
     if result.returncode == 1 and not result.stdout and not result.stderr:
         return []
@@ -1288,16 +1381,39 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
 
 
 @dataclass(frozen=True)
+class ReadProcessArguments:
+    """The executable and parsed argument remainder from a readable command line."""
+
+    argv: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnreadableProcessArguments:
+    reason: str
+
+
+@dataclass(frozen=True)
 class _UserProcess:
     pid: int
     parent: int
-    arguments: tuple[str, ...]
+    executable: str
+    arguments: ReadProcessArguments | UnreadableProcessArguments
 
 
 def _darwin_processes() -> list[_UserProcess]:
     result = run_program([os.environ.get("HERDR_PS", "ps"), "-U", str(os.getuid()),
-                          "-o", "pid=,ppid=,uid=,command="])
+                          "-o", "pid=,ppid=,uid=,comm="])
     require_success(result, "user processes")
+    # Both fields can contain spaces. Separate batched columns retain an unambiguous
+    # executable boundary and keep unreadable or changed argv as an explicit state.
+    command_result = run_program([os.environ.get("HERDR_PS", "ps"), "-U", str(os.getuid()),
+                                  "-o", "pid=,command="])
+    require_success(command_result, "user process arguments")
+    commands: dict[int, str] = {}
+    for line in command_result.stdout.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) == 2 and fields[0].isdecimal():
+            commands[int(fields[0])] = fields[1]
     processes: list[_UserProcess] = []
     for line in result.stdout.splitlines():
         fields = line.split(maxsplit=3)
@@ -1306,12 +1422,16 @@ def _darwin_processes() -> list[_UserProcess]:
         pid, parent, uid = map(int, fields[:3])
         if uid != os.getuid() or pid <= 0:
             continue
-        try:
-            arguments = tuple(shlex.split(fields[3]))
-        except ValueError:
-            arguments = tuple(fields[3].split())
-        if arguments:
-            processes.append(_UserProcess(pid, parent, arguments))
+        executable = fields[3].rstrip()
+        command = commands.get(pid, "")
+        arguments: ReadProcessArguments | UnreadableProcessArguments = UnreadableProcessArguments(
+            f"process {pid}: arguments are unreadable or changed")
+        if command == executable or command.startswith(executable + " "):
+            try:
+                arguments = ReadProcessArguments((executable, *shlex.split(command[len(executable):])))
+            except ValueError:
+                pass
+        processes.append(_UserProcess(pid, parent, executable, arguments))
     return processes
 
 
@@ -1322,13 +1442,17 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
-        arguments = list(process.arguments)
+        if isinstance(process.arguments, UnreadableProcessArguments):
+            if Path(process.executable).name == "herdr":
+                return ClientsUnreadable(process.arguments.reason)
+            continue
+        arguments = list(process.arguments.argv)
         session, command = _herdr_command(arguments, "default")
         if session and not command:
             try:
                 environment = darwin_process_environment(process.pid)
-            except (HerdrFailure, subprocess.TimeoutExpired):
-                continue
+            except (HerdrFailure, subprocess.TimeoutExpired) as error:
+                return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
         if (session == name and not command) or command == ["session", "attach", name]:
             count += 1
@@ -1384,13 +1508,15 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     processes: list[HerdrProcess] = []
     for pid, session in sessions.items():
         try:
+            if isinstance(by_pid[pid].arguments, UnreadableProcessArguments):
+                continue
             environment = darwin_process_environment(pid)
             pane = environment.get("HERDR_PANE_ID", "")
             if not pane:
                 continue
             marks = {key: environment[key] for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID") if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
-                                          Path(by_pid[pid].arguments[0]).name, _darwin_process_cwd(pid)))
+                                          Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
     return processes

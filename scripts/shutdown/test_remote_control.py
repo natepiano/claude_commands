@@ -7,8 +7,8 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
-from contextlib import redirect_stdout
+from collections.abc import Callable, Sequence
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
@@ -16,9 +16,11 @@ from unittest.mock import patch
 from test_support import ShutdownSendLeaf, ShutdownTestCase
 from test_restart import entry, showrunner, top_level, unit
 import remote_control
+import herdr
 import sessions
 import session_pane
 import settle
+import detached
 from push_texts import RenderedPush
 from unit_lookup import TmuxPlace
 from herdr import AgentBlocked
@@ -80,7 +82,7 @@ class RemoteControlTests(ShutdownTestCase):
         super().setUp()
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.registry = self.root / "registry"
         self.registry.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -334,17 +336,62 @@ class RemoteControlTests(ShutdownTestCase):
 
     def test_detached_launch_carries_process_identity_unbuffered_python_and_who(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
-        for platform in ("linux", "darwin"):
-            with self.subTest(platform=platform), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch:
-                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
-            launch.assert_called_once()
-            argv = cast(list[str], launch.call_args.args[0])
-            self.assertEqual(argv[0], "launchctl" if platform == "darwin" else "systemd-run")
-            env = argv.index("env")
-            self.assertEqual(argv[env:], ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
+        with patch.object(sys, "platform", "linux"), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch:
+            remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
+        launch.assert_called_once()
+        argv = cast(list[str], launch.call_args.args[0])
+        self.assertEqual(argv[0], "systemd-run")
+        env = argv.index("env")
+        self.assertEqual(argv[env:], ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
+            str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
+            "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--session", "Owner"])
+        service = argv[argv.index("--unit") + 1]
+        self.assertEqual(service, "shutdown-remote-control-owner-identi-321")
+        self.assertTrue({"--user", "--collect", "--quiet", "--no-block"}.issubset(argv))
+
+    def test_darwin_fixer_launch_waits_for_its_start_line_and_preserves_process_identity(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
+        paths: list[Path] = []
+
+        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+            self.assertEqual(list(argv), ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
                 str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
                 "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--session", "Owner"])
-            service = argv[argv.index("-l" if platform == "darwin" else "--unit") + 1]
-            self.assertEqual(service, "shutdown-remote-control-owner-identi-321")
-            if platform == "linux":
-                self.assertTrue({"--user", "--collect", "--quiet", "--no-block"}.issubset(argv))
+            self.assertEqual(within, 15)
+            self.assertEqual(log.parent, self.root / "shutdown" / "logs")
+            self.assertNotIn(log, paths)
+            paths.append(log)
+            self.assertFalse(ready())
+            _ = log.write_text("unrelated output\n")
+            self.assertFalse(ready())
+            with (log.open("a") as output, redirect_stderr(output), redirect_stdout(io.StringIO()),
+                  patch.object(remote_control, "_fix", return_value=remote_control.AlreadyOn())):
+                _ = remote_control.fix("owner-identifier", 321, "original start", "trunk unit", "Owner")
+            self.assertTrue(ready(), "the child entry point must publish its startup line")
+            return 4321
+
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(detached, "start_detached", side_effect=start),
+              patch.object(subprocess, "run", side_effect=AssertionError("service manager used"))):
+            for _ in range(2):
+                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
+        self.assertEqual(len(paths), 2)
+
+    def test_darwin_fixer_failed_child_reports_service_and_keeps_its_log(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
+        paths: list[Path] = []
+
+        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+            del argv, within
+            self.assertFalse(ready())
+            paths.append(log)
+            _ = log.write_text("child import failed\n")
+            raise detached.DetachedStartFailure("child exited with status 1")
+
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(detached, "start_detached", side_effect=fail),
+              patch.object(subprocess, "run", side_effect=AssertionError("service manager used")),
+              self.assertRaisesRegex(RuntimeError,
+                  "could not start Remote Control fixer shutdown-remote-control-owner-identi-321: child exited with status 1")):
+            remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
+        self.assertEqual(paths[0].read_text(), "child import failed\n")

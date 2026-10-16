@@ -16,7 +16,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -26,6 +26,7 @@ from unittest.mock import Mock, call, patch
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 from launch_permission import NewWorkLaunchPurpose
 import inventory
+import herdr
 from fake_herdr import CommandResponse
 import record
 import sessions
@@ -34,6 +35,7 @@ from user_action import ActionRequired
 from push_texts import RenderedPush, render, catalog, render_entry
 import restart as restart_work
 import settle
+import detached
 import shutdown
 if TYPE_CHECKING:
     from ..notify import review
@@ -273,7 +275,7 @@ class SettleTests(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         context = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         del context
         _ = self.enterContext(patch.object(settle, "now_utc", return_value=NOW_UTC))
@@ -735,20 +737,73 @@ class SettleTests(ShutdownTestCase):
 
     def test_conductor_service_preserves_read_existing_snapshot_policy(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
-        for platform in ("linux", "darwin"):
-            for snapshot_policy in ("", "read existing"):
-                with (self.subTest(platform=platform, policy=snapshot_policy), patch.object(sys, "platform", platform),
-                      patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": snapshot_policy}),
-                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as launch):
-                    settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
-                launch.assert_called_once()
-                arguments = cast(list[str], launch.call_args.args[0])
-                self.assertEqual(arguments[0], "launchctl" if platform == "darwin" else "systemd-run")
-                python_index = arguments.index(sys.executable)
-                self.assertEqual(arguments[python_index - 2:], ["env", "PYTHONUNBUFFERED=1",
-                    sys.executable, "-u", str(settle.SHUTDOWN), "conduct", LOGIN])
-                if snapshot_policy:
-                    self.assertIn("REFUSAL_WATCH_INVENTORY=read existing", arguments[:python_index])
+        for snapshot_policy in ("", "read existing"):
+            with (self.subTest(policy=snapshot_policy), patch.object(sys, "platform", "linux"),
+                  patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": snapshot_policy}),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as launch):
+                settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
+            launch.assert_called_once()
+            arguments = cast(list[str], launch.call_args.args[0])
+            self.assertEqual(arguments[0], "systemd-run")
+            python_index = arguments.index(sys.executable)
+            self.assertEqual(arguments[python_index - 2:], ["env", "PYTHONUNBUFFERED=1",
+                sys.executable, "-u", str(settle.SHUTDOWN), "conduct", LOGIN])
+            if snapshot_policy:
+                self.assertIn("REFUSAL_WATCH_INVENTORY=read existing", arguments[:python_index])
+
+    def test_darwin_conductor_launch_waits_for_its_start_line_in_a_fresh_state_log(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
+        paths: list[Path] = []
+
+        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+            self.assertEqual(list(argv), ["env", "REFUSAL_WATCH_INVENTORY=read existing", "env",
+                "PYTHONUNBUFFERED=1", sys.executable, "-u", str(settle.SHUTDOWN), "conduct", LOGIN])
+            self.assertEqual(within, 15)
+            self.assertEqual(log.parent, self.root / "state" / "logs")
+            self.assertNotIn(log, paths)
+            paths.append(log)
+            self.assertFalse(ready())
+            _ = log.write_text("unrelated output\n")
+            self.assertFalse(ready())
+            @contextmanager
+            def already_running(login: str) -> Generator[record.ConductorAlreadyRunning, None, None]:
+                self.assertEqual(login, LOGIN)
+                yield record.ConductorAlreadyRunning()
+
+            with (log.open("a") as output, redirect_stderr(output),
+                  patch.object(record, "conductor_lock", side_effect=already_running)):
+                self.assertEqual(settle.conduct(LOGIN), 0)
+            self.assertTrue(ready(), "the child entry point must publish its startup line")
+            return 4321
+
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
+              patch.object(detached, "start_detached", side_effect=start),
+              patch.object(subprocess, "run", side_effect=AssertionError("service manager used"))):
+            for _ in range(2):
+                settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(record.all_account_holds(), [])
+
+    def test_darwin_conductor_failed_child_reports_service_and_keeps_its_log(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
+        paths: list[Path] = []
+
+        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+            del argv, within
+            self.assertFalse(ready())
+            paths.append(log)
+            _ = log.write_text("child import failed\n")
+            raise detached.DetachedStartFailure("child exited with status 1")
+
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(detached, "start_detached", side_effect=fail),
+              patch.object(subprocess, "run", side_effect=AssertionError("service manager used")),
+              self.assertRaisesRegex(RuntimeError,
+                  r"could not start shutdown conductor shutdown-claude2-.*: child exited with status 1")):
+            settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(paths[0].read_text(), "child import failed\n")
 
     def test_ghostty_transcript_refusal_enters_usage_hold_without_a_screen(self) -> None:
         owner = top_level("ghostty-refusal", "Ghostty owner")
@@ -2227,7 +2282,8 @@ class SettleTests(ShutdownTestCase):
 
     def test_conductor_changed_module_reexecs_service_argv_after_unlock_without_new_steps(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as service:
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as service):
             settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
         service_command = cast(list[str], service.call_args.args[0])
         python_index = service_command.index(sys.executable)

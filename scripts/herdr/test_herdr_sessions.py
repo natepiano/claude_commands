@@ -14,7 +14,7 @@ from contextlib import chdir, nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TypedDict, cast, override
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 import herdr
 import herdr_sessions
@@ -258,6 +258,17 @@ class HerdrSessionsTests(unittest.TestCase):
         with patch.object(os, "execvp", side_effect=OSError("attach failed")):
             self.assertEqual(self.call("attach", "target"), (3, "", "herdr_sessions: attach failed\n"))
 
+    def test_ctrl_c_during_list_and_attach_returns_130_with_one_line(self) -> None:
+        self.respond(["target"])
+        for owner, operation, arguments in (
+                (herdr, "live_sessions", ("list",)),
+                (herdr_sessions, "claude_names", ("list",)),
+                (herdr_sessions, "unit_roles", ("list",)),
+                (herdr_sessions, "registered_showrunners", ("list",)),
+                (os, "execvp", ("attach", "target"))):
+            with self.subTest(operation=operation), patch.object(owner, operation, side_effect=KeyboardInterrupt):
+                self.assertEqual(self.call(*arguments), (130, "", "herdr_sessions: stopped\n"))
+
     def test_usage_errors_do_not_call_herdr(self) -> None:
         for arguments in ((), ("unknown",), ("list", "extra"), ("attach",), ("attach", ""),
                           ("attach", "one", "extra")):
@@ -349,6 +360,38 @@ class StandaloneLaunchTests(unittest.TestCase):
             "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
         }))
         return directory
+
+    def test_ctrl_c_during_launch_returns_130_and_releases_the_barrier(self) -> None:
+        for verb, options in (("start", ["--name", "solo"]),
+                              ("resume", ["solo", "--session-id", "recorded"])):
+            for operation in ("start_new_server", "open_pane", "start_agent"):
+                self.log.unlink(missing_ok=True)
+                (self.proc / "net/unix").unlink(missing_ok=True)
+                self.destination("solo")
+                barrier = MagicMock()
+                release = Mock(return_value=False)
+                barrier.__exit__ = release
+                with (self.subTest(verb=verb, operation=operation),
+                      patch.object(launch_permission, "launch_barrier", return_value=barrier),
+                      patch.object(herdr, operation, side_effect=KeyboardInterrupt)):
+                    self.assertEqual(self.call(verb, *options, "--cwd", str(self.root)),
+                                     (130, "herdr_sessions: stopped\n"))
+                release.assert_called_once_with(None, None, None)
+                self.assertEqual(self.attachments, [])
+
+    def test_ctrl_c_before_launch_barrier_returns_130_without_starting_commands(self) -> None:
+        with patch.object(launch_permission, "launch_barrier", side_effect=KeyboardInterrupt):
+            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)),
+                             (130, "herdr_sessions: stopped\n"))
+        self.assertEqual(self.commands(), [])
+
+    def test_launch_server_failure_prints_only_its_message(self) -> None:
+        message = f"herdr server for solo did not start; see {self.root}/herdr-server.log"
+        with patch.object(herdr, "start_new_server", side_effect=herdr.HerdrFailure(message)):
+            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)),
+                             (1, f"herdr_sessions: {message}\n"))
+        self.assertEqual(self.attachments, [])
+        self.assertEqual(self.commands(), [])
 
     def test_start_after_cutover_uses_showrunners_account_for_pane_and_admission(self) -> None:
         directory = self.numbered_account()

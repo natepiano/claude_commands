@@ -195,7 +195,7 @@ def unit_roles() -> dict[str, str]:
     return roles
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
@@ -228,6 +228,14 @@ def main(argv: list[str]) -> int:
     except (herdr.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3
+
+
+def main(argv: list[str]) -> int:
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("herdr_sessions: stopped", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

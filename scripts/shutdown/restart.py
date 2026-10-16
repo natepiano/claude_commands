@@ -1038,8 +1038,16 @@ def _herdr_attach_command(name: str, cwd: str) -> str:
     return f"cd {shlex.quote(cwd)} && {shlex.join(argv)}; exec zsh"
 
 
+@dataclass(frozen=True)
+class CodexWindowRestore:
+    """A restored Codex session has no Claude shutdown record for window issues."""
+
+    machine: str
+    session_name: str
+
+
 def _herdr_window(
-    record: SessionShutdown, name: str, cwd: str, desktop: Desktop,
+    record: SessionShutdown | CodexWindowRestore, name: str, cwd: str, desktop: Desktop,
     desktop_state: DesktopLaunchState, *, dry_run: bool,
 ) -> None:
     """Report a failed attachment without turning a launched agent into another launch."""
@@ -1058,6 +1066,9 @@ def _herdr_window(
     except (OSError, subprocess.SubprocessError) as error:
         attach = shlex.join(["herdr", "session", "attach", name])
         issue = f"window not opened: {_error_reason(error)}; {attach}"
+        if isinstance(record, CodexWindowRestore):
+            print(f"{record.machine}: {record.session_name}: {issue}")
+            return
         print(f"{record['machine']}: {record['session']['name']} restart issue: {issue}")
         if not dry_run:
             def remember(current: SessionShutdown) -> None:
@@ -2011,6 +2022,10 @@ def _launch_codex_snapshot(
         if isinstance(clients, herdr.ClientsAttached):
             return
         if isinstance(clients, herdr.NoClientAttached):
+            if sys.platform == "darwin":
+                _herdr_window(CodexWindowRestore(snapshot["machine"], owner["name"]), name,
+                    owner["cwd"], DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)
+                return
             try:
                 _open_window(_herdr_attach_command(name, owner["cwd"]),
                     DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)

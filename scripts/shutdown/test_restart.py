@@ -1355,6 +1355,55 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(record.read_snapshot(snapshot["login"]), snapshot)
         self.assertIn("already running (pid 99001); skipped", output.getvalue())
 
+    def test_mac_codex_snapshot_opens_ghostty_attached_to_the_restored_session(self) -> None:
+        snapshot, saved, _, log = self.codex_recovery_fixture(attached=True)
+        commands = CommandRecorder()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(inventory, "codex_liveness", return_value=inventory.CodexGone()),
+              patch.object(herdr, "start_new_server") as server,
+              patch.object(herdr, "attached_clients", return_value=herdr.NoClientAttached()),
+              patch.object(restart, "_run", commands),
+              patch.object(restart, "_open_window", side_effect=AssertionError("Linux window opener used")),
+              patch.dict(os.environ, {"SHUTDOWN_OPEN": "fake-open"}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(snapshot["login"]), 0, output.getvalue())
+        name = "trusted-folder-codex-01f232c067f3d73a"
+        server.assert_called_once_with(name, 90_000)
+        self.assertEqual(commands.calls, [["fake-open", "-na", "/Applications/Nix Apps/Ghostty.app",
+            "--args", "-e", str(self.root / "fake-herdr"), "session", "attach", name]])
+        calls = self.herdr_calls(log)
+        start = next(row for row in calls if row[2:4] == ["agent", "start"])
+        self.assertEqual(start[start.index("--kind") + 1], "codex")
+        self.assertEqual(start[start.index("--") + 1:], ["resume", "codex-resume-id"])
+        opened = next(row for row in calls if row[2:4] == ["workspace", "create"])
+        self.assertIn("CODEX_HOME=" + saved["codex"]["home"], opened)
+        self.assertEqual(record.session_records(snapshot["login"]), [])
+
+    def test_mac_codex_window_failure_keeps_the_started_agent_and_prints_attach(self) -> None:
+        snapshot, _, _, log = self.codex_recovery_fixture(attached=True)
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(inventory, "codex_liveness", return_value=inventory.CodexGone()),
+              patch.object(herdr, "start_new_server") as server,
+              patch.object(herdr, "attached_clients", return_value=herdr.NoClientAttached()),
+              patch.object(herdr, "stop_session") as stop,
+              patch.object(restart, "_run", side_effect=OSError("Ghostty unavailable")) as window,
+              patch.object(restart, "_open_window", side_effect=AssertionError("Linux window opener used")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(snapshot["login"]), 0, output.getvalue())
+        name = "trusted-folder-codex-01f232c067f3d73a"
+        server.assert_called_once_with(name, 90_000)
+        window.assert_called_once()
+        stop.assert_not_called()
+        starts = [row for row in self.herdr_calls(log) if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertIn("window not opened: Ghostty unavailable; herdr session attach " + name, output.getvalue())
+        self.assertEqual(record.session_records(snapshot["login"]), [])
+        remaining = record.read_snapshot(snapshot["login"])
+        assert not isinstance(remaining, record.NoRecoverySnapshot)
+        self.assertEqual(remaining["sessions"], [])
+
     def test_codex_snapshot_occupied_name_refuses_before_pane_and_keeps_recovery_entry(self) -> None:
         snapshot, _saved, responses, log = self.codex_recovery_fixture()
         replies = cast(dict[str, object], json.loads(responses.read_text()))
