@@ -168,6 +168,14 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def test_elapsed_text_uses_seconds_minutes_hours_and_days(self) -> None:
+        cases = ((-1, "0s"), (0, "0s"), (59, "59s"), (60, "1m"),
+                 (3599, "59m"), (3600, "1h"), (86399, "23h"),
+                 (86400, "1d"), (172801, "2d"))
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(settle.elapsed_text(seconds), expected)
+
     def recovery(self, *identities: str) -> record.RecoverySnapshot:
         entries: list[record.SnapshotSession] = []
         for identity in identities:
@@ -191,18 +199,156 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(record.read_snapshot(LOGIN), saved)
         self.assertIn("session registry unreadable", error.getvalue())
         self.assertIn("production marks unreadable", error.getvalue())
+        attempts = record.read_snapshot_attempts()
+        assert not isinstance(attempts, record.NoSnapshotAttempt)
+        self.assertEqual(attempts["latest"]["kind"], "failed")
+        self.assertEqual(attempts["latest"].get("reasons"), ["session registry unreadable", "production marks unreadable"])
+        self.assertEqual(attempts["last_success"], {"kind": "not recorded"})
 
     def test_snapshot_command_retains_a_crash_confirmed_entry_during_an_empty_observation(self) -> None:
         _ = self.recovery("recoverable")
         with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
                 "natedev", {}, {})), patch.object(settle, "record_time", return_value=JANUARY),
+              patch.object(settle, "local_machine", return_value="snapshot-host"),
               redirect_stdout(io.StringIO())):
             self.assertEqual(shutdown.main(["snapshot"]), 0)
         saved = record.read_snapshot(LOGIN)
         assert not isinstance(saved, record.NoRecoverySnapshot)
         self.assertEqual(saved["taken_at"], JANUARY)
+        attempts = record.read_snapshot_attempts()
+        assert not isinstance(attempts, record.NoSnapshotAttempt)
+        self.assertEqual(attempts["machine"], "snapshot-host")
+        self.assertEqual(attempts["latest"], {"kind": "taken", "at": JANUARY, "accounts": 1})
+        self.assertEqual(attempts["last_success"], {"kind": "taken", "at": JANUARY})
         self.assertEqual([(item["session"]["session_id"], item["last_seen"], item["state"])
                           for item in saved["sessions"]], [("recoverable", OCTOBER, "unresolved")])
+
+    def test_snapshot_merge_errors_record_failure_and_keep_the_original_exit_code(self) -> None:
+        for failure in (record.InvalidRecord("invalid recovery file"), OSError("disk unavailable")):
+            with (self.subTest(failure=failure),
+                patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory("natedev", {}, {})),
+                patch.object(record, "merge_snapshots", side_effect=failure),
+                patch.object(settle, "record_time", return_value=OCTOBER),
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(shutdown.main(["snapshot"]), 1)
+            attempts = record.read_snapshot_attempts()
+            assert not isinstance(attempts, record.NoSnapshotAttempt)
+            self.assertEqual(attempts["latest"], {"kind": "failed", "at": OCTOBER, "reasons": [str(failure)]})
+            self.assertIn(str(failure), error.getvalue())
+
+    def test_snapshot_outcome_write_failure_keeps_success_and_partial_exit_codes(self) -> None:
+        observations = (inventory.CompleteInventory("natedev", {}, {}), inventory.PartialInventory(("registry failed",)))
+        for observed, expected in zip(observations, (0, 1)):
+            with (self.subTest(expected=expected),
+                patch.object(inventory, "snapshot_inventory", return_value=observed),
+                patch.object(record, "record_snapshot_attempt", side_effect=OSError("outcome disk full")),
+                redirect_stdout(io.StringIO()) as output,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(shutdown.main(["snapshot"]), expected)
+            self.assertIn("snapshot outcome not recorded: outcome disk full", error.getvalue())
+            if expected == 0:
+                self.assertIn("recovery snapshot saved for 0 accounts", output.getvalue())
+            else:
+                self.assertIn("snapshot incomplete: registry failed", error.getvalue())
+
+    def test_status_without_outcome_still_includes_existing_recovery_and_explicit_json_state(self) -> None:
+        _ = self.recovery("crashed")
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
+        self.assertIn("crashed-name: unresolved", output.getvalue())
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+        payload = cast(dict[str, object], json.loads(output.getvalue()))
+        self.assertEqual(payload["snapshot"], {"kind": "no outcome recorded"})
+        self.assertEqual(len(cast(list[object], payload["recovery"])), 1)
+
+    def test_status_reports_taken_then_failed_in_user_zone_only_under_the_local_machine(self) -> None:
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=OCTOBER, accounts=2), "natedev")
+        failed_at = "2026-10-09T21:50:10+00:00"
+        for failed in (False, True):
+            if failed:
+                record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=failed_at,
+                    reasons=["registry unreadable", "host unreadable"]), "natedev")
+            with (self.subTest(failed=failed),
+                patch.object(shutdown, "inventory", return_value=local),
+                patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
+                patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(kind="records", records=[])),
+                patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
+                patch.object(settle, "record_time", return_value=failed_at),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(shutdown.main(["status", LABEL]), 0)
+            text = output.getvalue()
+            line = "recovery snapshot: last taken 2026-10-09 17:49:10 EDT (1m ago)"
+            self.assertIn(line, text)
+            self.assertLess(text.index(line), text.index("Mac"))
+            self.assertEqual(text.count("recovery snapshot: last taken"), 1)
+            if failed:
+                self.assertIn("recovery snapshot failed 2026-10-09 17:50:10 EDT: registry unreadable; host unreadable", text)
+            else:
+                self.assertNotIn("recovery snapshot failed", text)
+            with patch.object(shutdown, "inventory", return_value=local), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+            payload = cast(dict[str, object], json.loads(output.getvalue()))
+            status = cast(dict[str, object], payload["snapshot"])
+            self.assertEqual(status["kind"], "recorded")
+            self.assertEqual(status["last_success"], {"kind": "taken", "at": OCTOBER})
+            self.assertEqual(cast(dict[str, object], status["latest"])["kind"], "failed" if failed else "taken")
+            self.assertEqual(payload["recovery"], [])
+
+    def test_json_status_accepts_a_remote_report_without_snapshot_metadata(self) -> None:
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=local),
+              patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        self.assertEqual(reports[0]["snapshot"], {"kind": "no outcome recorded"})
+        self.assertEqual(reports[0]["recovery"], [])
+        self.assertEqual(reports[1], remote)
+
+    def test_invalid_or_unreadable_snapshot_outcome_does_not_fail_status(self) -> None:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        self.state.mkdir(exist_ok=True)
+        _ = (self.state / "snapshot_attempt.json").write_text("{")
+        for as_json in (False, True):
+            with self.subTest(as_json=as_json), patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["status", LABEL, "--here", *(["--json"] if as_json else [])]), 0)
+            if as_json:
+                payload = cast(dict[str, object], json.loads(output.getvalue()))
+                status = cast(dict[str, object], payload["snapshot"])
+                self.assertEqual(status["kind"], "unreadable")
+                self.assertIn("cannot be read", str(status["error"]))
+            else:
+                self.assertIn("recovery snapshot: outcome unreadable:", output.getvalue())
+        with (patch.object(record, "read_snapshot_attempts", side_effect=OSError("permission denied")),
+              patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("outcome unreadable: permission denied", output.getvalue())
+
+    def test_codex_status_includes_snapshot_outcome_in_text_and_json(self) -> None:
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=OCTOBER, reasons=["Codex unreadable"]), "natedev")
+        selection = shutdown.TerminalAccountSelection((Account("codex", "codex-work", "codex-work"),))
+        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", "--here"]), 0)
+        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
+        self.assertIn("Codex unreadable", output.getvalue())
+        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        status = cast(dict[str, object], reports[0]["snapshot"])
+        self.assertEqual(status["last_success"], {"kind": "not recorded"})
+        self.assertEqual(status["latest"], {"kind": "failed", "at": OCTOBER, "reasons": ["Codex unreadable"]})
+        self.assertEqual(reports[0]["recovery"], [])
 
     def test_forget_removes_only_the_named_recovery_entry_and_keeps_shutdown_record(self) -> None:
         _ = self.recovery("first", "second")
