@@ -45,6 +45,7 @@
 | herdr-trust-unit | `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
 | herdr-panes-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr-panes | build-followups-herdr-panes | — | — |
 | nightly-review-unit | permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
+| style-unit | docs/plans/build-followups-style.md | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 
 ## Hub files
 
