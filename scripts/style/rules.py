@@ -23,7 +23,7 @@ RuleOrigin = Literal["global", "local"]
 class Rule:
     name: str
     path: Path
-    tier: Tier
+    tier: Tier | Literal["unclassified"]
     family: Family | None
     input_scope: InputScope
     mode_propose: bool
@@ -51,29 +51,42 @@ def _scalar(metadata: dict[str, list[str]], key: str, path: Path, default: str =
 
 def _load_rule(path: Path, origin: RuleOrigin) -> Rule:
     metadata = style_rules.parse_frontmatter(path)
-    tier = _scalar(metadata, "tier", path)
-    if tier not in ("A", "B", "C", "D", "E"):
-        raise RuleValidationError(path, "tier must be A, B, C, D or E")
-    mechanism = _scalar(metadata, "mechanism", path)
-    if (tier == "A") != (mechanism in ("clippy", "mend", "rustfmt")):
-        raise RuleValidationError(path, "tier A requires a clippy, mend or rustfmt mechanism, and vice versa")
-
-    family = _scalar(metadata, "family", path)
-    if (tier in ("B", "C", "D") or origin == "local") and not family:
-        raise RuleValidationError(path, "family is required for B, C, D and local rules")
-    if tier in ("A", "E") and family:
-        raise RuleValidationError(path, "family is forbidden for tier A and E")
-    if family and family not in ("names", "values", "types", "modules"):
-        raise RuleValidationError(path, "family must be names, values, types or modules")
-
-    input_scope = _scalar(metadata, "input_scope", path, "crate")
-    if input_scope not in ("file", "crate", "manifest"):
-        raise RuleValidationError(path, "input_scope must be file, crate or manifest")
-
     try:
         candidates = read_candidates_spec(path)
     except CandidatesSpecError as error:
         raise RuleValidationError(path, str(error)) from error
+
+    tier: Tier | Literal["unclassified"] = "unclassified"
+    family: Family | None = None
+    input_scope: InputScope = "crate"
+    has_classification = any(key in metadata for key in ("tier", "family", "input_scope"))
+    if origin == "local" or has_classification:
+        declared_tier = _scalar(metadata, "tier", path)
+        if declared_tier not in ("A", "B", "C", "D", "E"):
+            raise RuleValidationError(path, "tier must be A, B, C, D or E")
+        tier = declared_tier
+        mechanism = _scalar(metadata, "mechanism", path)
+        if (tier == "A") != (mechanism in ("clippy", "mend", "rustfmt")):
+            raise RuleValidationError(path, "tier A requires a clippy, mend or rustfmt mechanism, and vice versa")
+
+        declared_family = _scalar(metadata, "family", path)
+        if (tier in ("B", "C", "D") or origin == "local") and not declared_family:
+            raise RuleValidationError(path, "family is required for B, C, D and local rules")
+        if tier in ("A", "E") and declared_family:
+            raise RuleValidationError(path, "family is forbidden for tier A and E")
+        if declared_family:
+            if declared_family not in ("names", "values", "types", "modules"):
+                raise RuleValidationError(path, "family must be names, values, types or modules")
+            family = declared_family
+
+        declared_scope = _scalar(metadata, "input_scope", path, "crate")
+        if declared_scope not in ("file", "crate", "manifest"):
+            raise RuleValidationError(path, "input_scope must be file, crate or manifest")
+        input_scope = declared_scope
+
+        if candidates is not None and candidates.surface == "unclassified":
+            raise RuleValidationError(path, "classified rule's candidates.surface must be whole or partial")
+
     pre_filter = style_rules.read_pre_filter(path) or None
     if tier == "B" and candidates is None and pre_filter is None:
         raise RuleValidationError(path, "tier B requires candidates or pre_filter")
@@ -88,7 +101,7 @@ def _load_rule(path: Path, origin: RuleOrigin) -> Rule:
         name=path.stem,
         path=path,
         tier=tier,
-        family=family or None,
+        family=family,
         input_scope=input_scope,
         mode_propose=_scalar(metadata, "mode", path) == "propose",
         candidates=candidates,
@@ -101,6 +114,8 @@ def _load_rule(path: Path, origin: RuleOrigin) -> Rule:
 def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
     """Read every global rule, then root and member rules in a repository.
 
+    Global rules predating classification metadata remain unclassified.
+    Local rules and any declared classification metadata are validated.
     Use the loader's directory layout without its context-loading filters:
     this registry includes tool-enforced and Bevy rules for every repository.
     """
@@ -119,10 +134,10 @@ def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
 
 class RuleListing(TypedDict):
     name: str
-    tier: Tier
+    tier: Tier | Literal["unclassified"]
     family: Family | None
     input_scope: InputScope
-    surface: Literal["whole", "partial"] | None
+    surface: Literal["whole", "partial", "unclassified"] | None
 
 
 class ListArguments(argparse.Namespace):

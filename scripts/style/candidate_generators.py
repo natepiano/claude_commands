@@ -45,7 +45,7 @@ class CandidatesSpec:
     paths_exempt: tuple[str, ...] = ()
     structs: tuple[str, ...] = ()
     field_type_pattern: str = ""
-    surface: Literal["whole", "partial"] = "whole"
+    surface: Literal["whole", "partial", "unclassified"] = "unclassified"
     uncovered: str = ""
 
 
@@ -86,7 +86,8 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
     """Extract the `candidates:` block from a guideline's frontmatter.
 
     Sub-keys sit one indent level under `candidates:`; list values are inline
-    (`[a, b]`). Returns None when the guideline has no block.
+    (`[a, b]`). Returns None when the guideline has no block. Legacy blocks
+    without a surface declaration remain unclassified.
     """
     lines = style_path.read_text().splitlines()
     if not lines or lines[0].strip() != "---":
@@ -124,9 +125,12 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
     kind = str_value("kind")
     if not kind:
         raise CandidatesSpecError(f"{style_path}: candidates.kind is required")
-    surface = str_value("surface")
-    if surface not in ("whole", "partial"):
+    surface: Literal["whole", "partial", "unclassified"] = "unclassified"
+    declared_surface = str_value("surface")
+    if "surface" in values and declared_surface not in ("whole", "partial"):
         raise CandidatesSpecError(f"{style_path}: candidates.surface must be whole or partial")
+    if declared_surface in ("whole", "partial"):
+        surface = declared_surface
     uncovered = str_value("uncovered")
     if surface == "partial" and not uncovered.strip():
         raise CandidatesSpecError(f"{style_path}: partial candidates.surface requires uncovered")

@@ -146,7 +146,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** discovery through `load-rust-style.sh` — its filters drop tool-enforced and Bevy rules, so `load_rules` reads the directory layout directly; `surface: whole` for any generator — both candidates missed cases (unlisted registrations, bare-name trait counting).
 
-### Phase 3 — Missing rule metadata reads as unclassified  · status: todo
+### Phase 3 — Missing rule metadata reads as unclassified  · status: done
 **Depends on:** Phase 2
 
 #### Work Order

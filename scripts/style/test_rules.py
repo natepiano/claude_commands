@@ -89,9 +89,22 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(rule.pre_filter, "Some<")
 
     def test_candidate_metadata_errors_name_the_rule(self) -> None:
+        path = self.write_rule(
+            "invalid", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: item\n"
+        )
+        spec = read_candidates_spec(path)
+        if spec is None:
+            self.fail("The candidates block was not read")
+        self.assertEqual(spec.surface, "unclassified")
+        with self.assertRaises(rules.RuleValidationError) as missing_surface:
+            _ = rules.load_rules(None)
+        self.assertIn(str(path), str(missing_surface.exception))
+        self.assertIn("candidates.surface must be whole or partial", str(missing_surface.exception))
+
         declarations = (
-            ("kind: regex\n  pattern: item", "surface"),
             ("kind: regex\n  surface: uncertain", "surface"),
+            ("kind: regex\n  surface: ''", "surface"),
+            ("kind: regex\n  surface: unclassified", "surface"),
             ("kind: regex\n  surface: partial", "uncovered"),
             ("kind: regex\n  surface: partial\n  uncovered: ''", "uncovered"),
             ("surface: whole", "kind"),
@@ -108,13 +121,94 @@ class RuleTests(unittest.TestCase):
                     _ = rules.load_rules(None)
                 self.assertIn(str(path), str(raised_rule.exception))
 
-    def test_candidate_surface_must_be_inside_its_block(self) -> None:
+    def test_top_level_surface_does_not_classify_candidate_block(self) -> None:
         path = self.write_rule(
             "invalid", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: item\nsurface: whole\n"
         )
-        with self.assertRaises(CandidatesSpecError) as raised:
-            _ = read_candidates_spec(path)
-        self.assertIn("candidates.surface", str(raised.exception))
+        spec = read_candidates_spec(path)
+        if spec is None:
+            self.fail("The candidates block was not read")
+        self.assertEqual(spec.surface, "unclassified")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(None)
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("candidates.surface must be whole or partial", str(raised.exception))
+
+    def test_legacy_global_rules_load_and_list_as_unclassified(self) -> None:
+        _ = self.write_rule("listed", "mechanism: llm\ncandidates:\n  kind: regex\n  pattern: item\n")
+        _ = self.write_rule("read", "mechanism: llm\nmode: propose\npre_filter: 'Some<'\n")
+        _ = self.write_rule("tool", "mechanism: clippy\nmode: auto\n")
+        bare = self.global_dir / "bare.md"
+        _ = bare.write_text("# A rule without frontmatter\n")
+
+        loaded = {rule.name: rule for rule in rules.load_rules(None)}
+
+        self.assertEqual(set(loaded), {"bare", "listed", "read", "tool"})
+        self.assertEqual({rule.tier for rule in loaded.values()}, {"unclassified"})
+        self.assertEqual({rule.family for rule in loaded.values()}, {None})
+        self.assertEqual({rule.input_scope for rule in loaded.values()}, {"crate"})
+        self.assertEqual({rule.origin for rule in loaded.values()}, {"global"})
+        spec = loaded["listed"].candidates
+        if spec is None:
+            self.fail("The legacy listed rule lost its candidate declaration")
+        self.assertEqual((spec.kind, spec.pattern, spec.surface), ("regex", "item", "unclassified"))
+        self.assertEqual(loaded["read"].pre_filter, "Some<")
+        self.assertTrue(loaded["read"].mode_propose)
+        self.assertFalse(loaded["tool"].mode_propose)
+
+        environment = {**os.environ, "STYLE_HISTORY_NATE_STYLE_DIR": str(self.global_dir.parent)}
+        command = [sys.executable, str(Path(rules.__file__)), "list"]
+        text = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+        self.assertEqual(text.stdout.splitlines(), [
+            "name\ttier\tfamily\tinput_scope\tsurface",
+            "bare\tunclassified\t-\tcrate\t-",
+            "listed\tunclassified\t-\tcrate\tunclassified",
+            "read\tunclassified\t-\tcrate\t-",
+            "tool\tunclassified\t-\tcrate\t-",
+        ])
+        output = subprocess.run([*command, "--json"], env=environment, capture_output=True, text=True, check=True)
+        rows = cast(list[rules.RuleListing], json.loads(output.stdout))
+        self.assertEqual(rows, [
+            {"name": name, "tier": "unclassified", "family": None, "input_scope": "crate",
+             "surface": "unclassified" if name == "listed" else None}
+            for name in ("bare", "listed", "read", "tool")
+        ])
+
+    def test_incomplete_global_classification_still_requires_tier(self) -> None:
+        declarations = (
+            "family: names\n",
+            "input_scope: crate\n",
+            "input_scope: invalid\n",
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                path = self.write_rule("incomplete", "mechanism: llm\n" + declaration)
+                with self.assertRaises(rules.RuleValidationError) as raised:
+                    _ = rules.load_rules(None)
+                self.assertIn(str(path), str(raised.exception))
+                self.assertIn("tier", str(raised.exception))
+
+    def test_candidate_coverage_does_not_classify_a_global_rule(self) -> None:
+        declarations = (
+            ("  surface: whole\n", "whole", ""),
+            ("  surface: partial\n  uncovered: 'other sites'\n", "partial", "other sites"),
+            ("  uncovered: 'other sites'\n", "unclassified", "other sites"),
+        )
+        for declaration, expected_surface, expected_uncovered in declarations:
+            with self.subTest(declaration=declaration):
+                _ = self.write_rule(
+                    "listed", "mechanism: llm\ncandidates:\n  kind: regex\n  pattern: item\n" + declaration
+                )
+
+                rule, = rules.load_rules(None)
+
+                self.assertEqual(rule.tier, "unclassified")
+                self.assertIsNone(rule.family)
+                spec = rule.candidates
+                if spec is None:
+                    self.fail("The unclassified rule lost its candidate declaration")
+                self.assertEqual((spec.surface, spec.uncovered), (expected_surface, expected_uncovered))
 
     def test_nested_candidate_values_do_not_replace_top_level_rule_metadata(self) -> None:
         _ = self.write_rule(
@@ -185,13 +279,32 @@ class RuleTests(unittest.TestCase):
         local_dir = repo / "docs" / "member" / "style"
         local_dir.mkdir(parents=True)
         path = local_dir / "local.md"
-        for declaration, reason in (("family: names", "tier"), ("tier: C", "family")):
+        declarations = (
+            ("family: names", "tier"),
+            ("tier: C", "family"),
+            ("mechanism: llm\ncandidates:\n  kind: regex\n  pattern: item", "tier"),
+        )
+        for declaration, reason in declarations:
             with self.subTest(declaration=declaration):
                 _ = path.write_text(f"---\n{declaration}\n---\n# Local rule\n")
                 with self.assertRaises(rules.RuleValidationError) as raised:
                     _ = rules.load_rules(repo)
                 self.assertIn(str(path), str(raised.exception))
                 self.assertIn(reason, str(raised.exception))
+
+    def test_local_candidate_rules_require_a_declared_surface(self) -> None:
+        repo = self.root / "repo"
+        local_dir = repo / "docs" / "member" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "local.md"
+        _ = path.write_text(
+            "---\ntier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: item\n---\n# Local rule\n"
+        )
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("candidates.surface must be whole or partial", str(raised.exception))
 
     def test_blob_tracks_uncommitted_file_contents(self) -> None:
         path = self.write_rule("read", "tier: C\nfamily: types\n")

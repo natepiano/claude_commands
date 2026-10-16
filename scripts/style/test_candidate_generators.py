@@ -86,6 +86,37 @@ class CandidateGeneratorTests(unittest.TestCase):
         self.assertEqual({site.file for site in result.candidates}, {"src/lib.rs"})
         self.assertEqual(result.candidates[-1].text, "fn site_199() { value.unwrap(); }")
 
+    def test_legacy_surface_preserves_enumeration_and_rule_constraints(self) -> None:
+        rule = self.root / "rule.md"
+        _ = (self.root / "src" / "lib.rs").write_text(
+            "fn run() {\n    first.unwrap();\n    second.unwrap(); // approved\n}\n"
+        )
+        _ = (self.root / "outside.rs").write_text("outside.unwrap();\n")
+        declarations = (
+            ("", "unclassified"),
+            ("  surface: whole\n", "whole"),
+            ("  surface: partial\n  uncovered: 'other methods'\n", "partial"),
+        )
+        for declaration, expected_surface in declarations:
+            with self.subTest(surface=expected_surface):
+                _ = rule.write_text(
+                    "---\nmechanism: llm\ncandidates:\n  kind: regex\n"
+                    + declaration
+                    + "  pattern: 'unwrap\\('\n  exclude_pattern: approved\n  paths: [src]\n---\n"
+                )
+                spec = candidate_generators.read_candidates_spec(rule)
+                if spec is None:
+                    self.fail("The legacy candidates block was not read")
+
+                result = candidate_generators.enumerate_candidates(spec, self.root)
+
+                self.assertEqual(spec.surface, expected_surface)
+                self.assertEqual(
+                    [(site.file, site.line, site.text) for site in result.candidates],
+                    [("src/lib.rs", 2, "first.unwrap();")],
+                )
+                self.assertEqual(result.source, r"regex:unwrap\(")
+
 
 if __name__ == "__main__":
     _ = unittest.main()
