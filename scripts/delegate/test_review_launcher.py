@@ -482,9 +482,17 @@ else:
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         environment["REVIEW_POOL_STATE"] = str(self.root / "pool-state")
-        _ = environment.pop("REVIEW_LEASE", None)
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
+        mesh_runs = self.root / "mesh_runs_stub.py"
+        if not mesh_runs.exists():
+            _ = mesh_runs.write_text(
+                "import json, os, sys\n"
+                + "with open(os.environ['MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                + "    _ = calls.write(json.dumps(sys.argv[1:]) + '\\n')\n", encoding="utf-8")
+        environment["MESH_RUNS_SCRIPT"] = str(mesh_runs)
+        environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
         return environment
 
     def recorder(self, *arguments: str) -> None:
@@ -839,7 +847,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
-    def test_failed_pool_attempt_and_own_retry_leave_one_record_of_each_arm(self) -> None:
+    def test_failed_pool_attempt_and_own_retry_leave_one_record_each_and_ignore_review_lease(self) -> None:
         session = self.start_implementation("pool-retry")
         self.finish_implementation(session)
         environment = self.pool_fixture()
@@ -850,7 +858,6 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
         worker = self.open_worker(session)
-        environment["REVIEW_LEASE"] = "production/unit/3"
         retry = subprocess.run(self.review_command(session, "contract", "", worker), env=environment,
                                capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(retry.returncode, 0, retry.stderr)
@@ -859,7 +866,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(records["pool"]["status"], "error")
         self.assertEqual(records["own"]["status"], "reviewed")
         self.assertEqual(records["own"]["thread_id"], "thread-fixture")
-        self.assertEqual(records["own"]["unit"], "unit")
+        self.assertEqual((records["own"]["unit"], records["own"]["phase"]), ("", ""))
 
     def test_own_turn_records_survive_two_phases_in_the_same_session(self) -> None:
         session = self.start_implementation("two-phases")
@@ -995,7 +1002,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertFalse((self.root / "pool-calls.jsonl").exists())
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
 
-    def test_ui_pool_allocates_fresh_and_sends_each_shot_on_the_requested_check(self) -> None:
+    def test_ui_pool_allocates_without_a_reset_and_sends_each_shot_on_the_requested_check(self) -> None:
         session = self.start_implementation("ui-shots")
         self.finish_implementation(session)
         shots = [str(self.root / "shot one.png"), str(self.root / "café.png")]
@@ -1006,7 +1013,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                                 env=environment, capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
         allocation = self.call_records("pool-calls.jsonl")[0]
-        self.assertTrue(allocation["fresh"])
+        self.assertFalse(allocation["fresh"])
         self.assertEqual(allocation["type"], "ui")
         self.assertEqual(allocation["lens"], "ux")
         self.assertEqual(allocation["pass"], "2")
@@ -1028,12 +1035,12 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                                 env=environment, capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
-        self.assertTrue(self.call_records("pool-calls.jsonl")[0]["fresh"])
+        self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
         self.assertEqual((session / "review_status_ux").read_text().strip(), "error")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
-    def test_ui_pool_second_lease_turn_prepends_unit_memory_before_the_prompt(self) -> None:
+    def test_ui_pool_later_turn_sends_the_prompt_without_unit_memory(self) -> None:
         session = self.start_implementation("ui-memory")
         self.finish_implementation(session)
         _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
@@ -1046,11 +1053,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         result = subprocess.run(command, env=environment, capture_output=True,
                                 text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(),
-                         memory + "\n\n" + original)
-        self.assertEqual(Path(command[8]).read_text(), original)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
-                         ["allocate", "unit-memory", "release"])
+                         ["allocate", "release"])
         self.assertEqual(list(session.glob("review_message_*")), [])
 
     def test_ui_pool_missing_shots_file_records_error_without_allocation(self) -> None:
@@ -1343,12 +1348,11 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("adversary, contract, craft, ux", result.stderr)
 
-    def test_own_failed_closure_turn_records_lease_and_findings_count(self) -> None:
+    def test_own_failed_closure_turn_records_its_findings_count(self) -> None:
         session = self.start_implementation("own-failed")
         self.finish_implementation(session)
         worker = self.open_worker(session)
         environment = self.environment()
-        environment["REVIEW_LEASE"] = "production/unit/3"
         environment["STUB_TURN_FAILURE"] = "1"
         environment["STUB_FINDINGS"] = "1. Partial finding\n"
         command = self.review_command(session, "", "", worker)
@@ -1361,7 +1365,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(record["pass"], 2)
         self.assertEqual(record["raised"], 1)
         self.assertEqual(record["status"], "error")
-        self.assertEqual(record["phase"], "3")
+        self.assertEqual(record["phase"], "")
 
     def test_a_reviewer_that_finishes_before_delivery_records_no_pass(self) -> None:
         session_dir = self.start_implementation("early")
@@ -1568,6 +1572,15 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
+        calls = [cast(list[str], json.loads(line)) for line in
+                 (self.root / "mesh_runs_calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call[:5], ["start", "--session-dir", str(session_dir), "--to", worker])
+        self.assertEqual(call[call.index("--label") + 1], "final diff ready")
+        stage_two = Path(call[call.index("--done-message-file") + 1]).read_text(encoding="utf-8")
+        self.assertIn(f"Stage 2: the final diff is at {session_dir / 'final_diff_1.diff'}", stage_two)
+        self.assertIn(str(ready), call)
 
     def test_a_assigned_early_review_before_delivery_records_no_pass(self) -> None:
         session_dir = self.start_implementation("assigned-early")

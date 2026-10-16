@@ -50,6 +50,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
+    from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
 
 
@@ -546,7 +547,7 @@ class WorkersSwapDryRun:
 
 @dataclass(frozen=True)
 class WorkersSwapStarted:
-    """The workers role has moved; live turns finish on their existing server."""
+    """The workers role has moved; each interrupted worker reports its resume outcome."""
 
     lines: tuple[str, ...]
 
@@ -2999,42 +3000,37 @@ def codex_home_label(home: Path) -> str:
     return agent_accounts.codex_home_role_label(home)
 
 
-class SwitchingWorkerDetail(Protocol):
-    @property
-    def name(self) -> str: ...
-    @property
-    def mid_turn(self) -> bool: ...
+@dataclass(frozen=True)
+class FoldedWorkerRow:
+    index: int
+    context: str
+    mid_turn_count: int
+    count: int
 
 
-class WorkersRunSwitchDetail(Protocol):
-    @property
-    def folder(self) -> Path: ...
-    @property
-    def holders(self) -> tuple[str, ...]: ...
-    @property
-    def workers(self) -> Sequence[SwitchingWorkerDetail]: ...
-
-
-def _retire_workers_servers(home: Path, label: str, *, dry_run: bool) -> Sequence[WorkersRunSwitchDetail]:
+def _retire_workers_servers(home: Path, label: str, *, dry_run: bool) -> Sequence[WorkersRunSwitch]:
     from scripts.agents.codex_mesh import retire_workers_servers
 
     return retire_workers_servers(home, label, dry_run=dry_run)
 
 
-def _workers_swap_lines(switches: Sequence[WorkersRunSwitchDetail], previous: Path,
+def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
                         target: str, *, dry_run: bool) -> tuple[str, ...]:
+    from scripts.agents.codex_mesh import leftover_server_lines
     from scripts.message import roster, sessions
 
     old = agent_accounts.codex_account(previous)
     source = old.label + " → " if isinstance(old, agent_accounts.KnownCodexAccount) else ""
     lines = [f"Workers {'would move' if dry_run else 'moving'} {source}{target}:"]
-    if not switches:
-        return tuple(lines)
+    active = [switch for switch in switches if switch.workers]
+    if not active:
+        return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
     listing = roster.roster(os.environ, roster.ThisMachine())
     holders = {entry.session.session_id: entry for entry in listing.entries
                if isinstance(entry.session, roster.ClaudeSession)}
     saved_names: dict[str, str] = {}
-    if any(not any(session_id in holders for session_id in switch.holders) for switch in switches):
+    if any(not any(session_id in holders for session_id in (switch.holders or switch.launcher_sessions))
+           for switch in active):
         try:
             paths = sessions.sessions_dir().glob("*.json")
             records = [sessions.read_session(path) for path in paths]
@@ -3044,8 +3040,12 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitchDetail], previous: Pa
         for record in sorted(readable, key=lambda item: item["updatedAt"], reverse=True):
             if record["name"]:
                 _ = saved_names.setdefault(record["sessionId"], record["name"])
-    for switch in switches:
-        holder = next((holders[session_id] for session_id in switch.holders if session_id in holders), None)
+    folded: dict[tuple[str, str], FoldedWorkerRow] = {}
+    for switch in active:
+        naming_sessions = switch.holders or switch.launcher_sessions
+        holder_id = next((session_id for session_id in naming_sessions if session_id in holders),
+                         next(iter(naming_sessions), str(switch.folder)))
+        holder = holders.get(holder_id)
         parts: list[str] = []
         if holder is not None:
             if holder.machine != roster.machine_name():
@@ -3057,16 +3057,34 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitchDetail], previous: Pa
             parts.append(holder.director.unit if isinstance(holder.director, (roster.DirectsUnit, roster.UnderDirector))
                          and holder.director.unit else holder.name)
         else:
-            parts.append(next((saved_names[session_id] for session_id in switch.holders if session_id in saved_names),
+            parts.append(next((saved_names[session_id] for session_id in naming_sessions if session_id in saved_names),
                               f"unknown session ({switch.folder.name})"))
         for worker in switch.workers:
             stem = worker.name.removesuffix("-worker")
             slot = stem.rpartition("-")[2] or stem
             name = f"{slot}-worker"
             context = " · ".join([*parts, name])
-            suffix = " (mid-turn; switches when its turn ends)" if worker.mid_turn else ""
-            lines.append(f"  {context} → {target}{suffix}")
-    return tuple(lines)
+            if worker.failure:
+                lines.append(f"  {context} → {target}, {worker.failure}; resume with {worker.resume_command}")
+                continue
+            key = (holder_id, slot)
+            previous_row = folded.get(key, FoldedWorkerRow(len(lines), context, 0, 0))
+            row = replace(previous_row, mid_turn_count=previous_row.mid_turn_count + int(worker.mid_turn),
+                          count=previous_row.count + 1)
+            copies = f" ×{row.count}" if row.count > 1 else ""
+            if row.mid_turn_count == 0:
+                suffix = ""
+            elif row.count == 1:
+                suffix = ", interrupted and resumed"
+            else:
+                suffix = f", {row.mid_turn_count} interrupted and resumed"
+            line = f"  {row.context} → {target}{copies}{suffix}"
+            if row.index == len(lines):
+                lines.append(line)
+            else:
+                lines[row.index] = line
+            folded[key] = row
+    return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
 
 
 def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
@@ -3092,9 +3110,17 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     if dry_run:
         switches = _retire_workers_servers(target_home, account_label, dry_run=True)
         return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
-    _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
-    switches = _retire_workers_servers(target_home, account_label, dry_run=False)
-    return WorkersSwapStarted(_workers_swap_lines(switches, workers_home, account_label, dry_run=False))
+    try:
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
+    except OSError as error:
+        raise AccountsError(f"accounts: could not move the workers role: {error}") from error
+    try:
+        switches = _retire_workers_servers(target_home, account_label, dry_run=False)
+        lines = _workers_swap_lines(switches, workers_home, account_label, dry_run=False)
+    except (ConnectionError, OSError, SystemExit) as error:
+        lines = (f"Workers role now uses {account_label}; worker move failed: {error}. "
+                 + "Resume affected workers with codex_mesh.py resume-account-move --session-dir <run> --to <worker>.",)
+    return WorkersSwapStarted(lines)
 
 
 def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:

@@ -45,6 +45,43 @@ from account import ResolvedHistoryLabel, HistoricalAccountUnresolved
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
+_ROOT_METADATA = frozenset({"launch.lock", "snapshot_attempt.json", "snapshot_attempt.lock"})
+
+
+def _is_root_metadata(name: str) -> bool:
+    return name in _ROOT_METADATA or (name.startswith(".record.") and name.endswith(".tmp"))
+
+
+class SnapshotTaken(TypedDict):
+    kind: Literal["taken"]
+    at: str
+    accounts: int
+
+
+class SnapshotFailed(TypedDict):
+    kind: Literal["failed"]
+    at: str
+    reasons: list[str]
+
+
+class LastSuccessfulSnapshot(TypedDict):
+    kind: Literal["taken"]
+    at: str
+
+
+class NoSuccessfulSnapshotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
+class SnapshotAttempts(TypedDict):
+    machine: str
+    latest: SnapshotTaken | SnapshotFailed
+    last_success: LastSuccessfulSnapshot | NoSuccessfulSnapshotRecorded
+
+
+@dataclass(frozen=True)
+class NoSnapshotAttempt:
+    pass
 
 
 class HistoricalAccountResolver(Protocol):
@@ -1345,7 +1382,7 @@ def all_session_records() -> list[SessionShutdown]:
         raise InvalidRecord(f"{root} cannot be read: {error}") from error
     records: list[SessionShutdown] = []
     for directory in directories:
-        if directory.name == "launch.lock":
+        if _is_root_metadata(directory.name):
             _ = _regular_record(directory)
             continue
         records.extend(session_records(directory.name))
@@ -1514,7 +1551,7 @@ def all_account_holds() -> list[AccountHold]:
         raise InvalidRecord(f"{root} cannot be read: {error}") from error
     holds: list[AccountHold] = []
     for directory in directories:
-        if directory.name == "launch.lock":
+        if _is_root_metadata(directory.name):
             _ = _regular_record(directory)
             continue
         hold = account_hold(directory.name)
@@ -1934,6 +1971,61 @@ def parse_snapshot(value: object) -> RecoverySnapshot:
         raise InvalidRecord("snapshot.sessions must have unique nonempty session ids")
     values["sessions"] = entries
     return cast(RecoverySnapshot, cast(object, values))
+
+
+def _snapshot_outcome(value: object, place: str) -> SnapshotTaken | SnapshotFailed:
+    values = _mapping(value, place)
+    kind = _kind(values, place, frozenset({"taken", "failed"}))
+    at = _utc_time(_required(values, "at", place), f"{place}.at")
+    if kind == "failed":
+        return SnapshotFailed(kind="failed", at=at,
+            reasons=_strings(_required(values, "reasons", place), f"{place}.reasons"))
+    accounts = _required(values, "accounts", place)
+    if not isinstance(accounts, int) or isinstance(accounts, bool) or accounts < 0:
+        raise InvalidRecord(f"{place}.accounts must be a nonnegative integer")
+    return SnapshotTaken(kind="taken", at=at, accounts=accounts)
+
+
+def read_snapshot_attempts() -> SnapshotAttempts | NoSnapshotAttempt:
+    """Read the machine-local outcome without inferring whether snapshots exist."""
+    root = _state_root()
+    if not _record_directory(root):
+        return NoSnapshotAttempt()
+    path = root / "snapshot_attempt.json"
+    if not _regular_record(path):
+        return NoSnapshotAttempt()
+    values = _mapping(_read_json(path), str(path))
+    latest = _snapshot_outcome(_required(values, "latest", str(path)), "snapshot_attempt.latest")
+    success = _mapping(_required(values, "last_success", str(path)), "snapshot_attempt.last_success")
+    kind = _kind(success, "snapshot_attempt.last_success", frozenset({"taken", "not recorded"}))
+    last_success: LastSuccessfulSnapshot | NoSuccessfulSnapshotRecorded = NoSuccessfulSnapshotRecorded(kind="not recorded")
+    if kind == "taken":
+        last_success = LastSuccessfulSnapshot(kind="taken", at=_utc_time(
+            _required(success, "at", "snapshot_attempt.last_success"), "snapshot_attempt.last_success.at"))
+    return SnapshotAttempts(machine=_string(_required(values, "machine", str(path)), "snapshot_attempt.machine"),
+        latest=latest, last_success=last_success)
+
+
+def record_snapshot_attempt(outcome: SnapshotTaken | SnapshotFailed, machine: str) -> None:
+    """Replace the latest outcome under its own lock, retaining the last success."""
+    checked = _snapshot_outcome(outcome, "snapshot_attempt.latest")
+    root = _state_root()
+    _ = _record_directory(root, create=True)
+    lock = root / "snapshot_attempt.lock"
+    _ = _regular_record(lock)
+    with lock.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = read_snapshot_attempts()
+            last_success: LastSuccessfulSnapshot | NoSuccessfulSnapshotRecorded = (
+                NoSuccessfulSnapshotRecorded(kind="not recorded") if isinstance(previous, NoSnapshotAttempt)
+                else previous["last_success"])
+            if checked["kind"] == "taken":
+                last_success = LastSuccessfulSnapshot(kind="taken", at=checked["at"])
+            _write_record(root / "snapshot_attempt.json", SnapshotAttempts(
+                machine=machine, latest=checked, last_success=last_success))
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _snapshot_path(login: str) -> Path:

@@ -15,12 +15,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..delegate import phase_table
     from . import showrunners
-    from .add_unit import Refusal
+    from .production_units import Refusal
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.delegate import phase_table
     from scripts.production import showrunners
-    from scripts.production.add_unit import Refusal
+    from production_units import Refusal
 
 
 def prune_all() -> list[str]:

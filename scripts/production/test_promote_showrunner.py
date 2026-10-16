@@ -21,7 +21,8 @@ import unit_effort
 import unit_lookup
 import session_pane
 import herdr
-from add_unit import Production, Refusal, plan_cell_is_retired, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, plan_cell_is_retired, unit_table
 from scripts.accounts import accounts
 from scripts.herdr import herdr as trust_reader
 from scripts.whoami import account

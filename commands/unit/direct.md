@@ -100,16 +100,16 @@ later implementation, repair, and follow-up work with `implement.sh --to
 worker in the same role when the next assignment fits; otherwise move it, even
 mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
-When the production doc names a review pool and <ProductionUnit/>'s `arm`
-prints `pool`, send code reviews with
-`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`.
+When the production doc names a review pool, send code reviews with
+`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
+review resumes the unit's own reviewer, which is never reset.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
 Type Design Contract verbatim or by its allowed pointer under
 <WritePromptContract/>.
-For the pool arm of a production whose doc names a review pool, review
-prompts use <ReviewPromptContract/>'s standing-instructions line.
+In a production whose doc names a review pool, review prompts use
+<ReviewPromptContract/>'s standing-instructions line.
 
 Before follow-up work, the launcher attempts to compact a worker whose recorded
 context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
@@ -262,9 +262,7 @@ Applies to every implementation, test, fix, and review launcher.
    independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A finished launcher whose worker's summary or final answer begins
-   `Run request:` goes to <WorkerRunRequest/> before any other routing.
-7. A new-worker or follow-up launcher killed at its time limit leaves its Codex
+6. A new-worker or follow-up launcher killed at its time limit leaves its Codex
    worker running with no one watching. Arm a Monitor on
    `${SESSION_DIR}/board.log` until that worker
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
@@ -273,33 +271,21 @@ Applies to every implementation, test, fix, and review launcher.
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
-<WorkerRunRequest>
-Codex workers start no build, test, lint or verify run: a run started from a
-worker's shell dies when its turn ends. A worker that needs one ends its turn
-with a summary or final answer beginning `Run request:`, naming each command
-and its directory, per <WritePromptContract/> item 3. That launcher's status
-says nothing about the slot's work: the slot is not terminal and its pass
-continues.
-
-1. Run the requested commands as given, in the named directory, each as one
-   background command: Claude with `run_in_background: true`, Codex in a managed
-   terminal under <CodexDispatchWait/>; a `verify.sh` line follows
-   <BackgroundVerificationContract/>. The completion notice is the wait: never
-   poll, sleep, or check on it between notices.
-2. When it exits, write the exit code, the last 40 lines of output and the log
-   path (the one `verify.sh` names, else the task output file) to
-   `${PHASE_DIR}/run_result_<slot>.md`.
-3. Dispatch that file to the same worker as its next prompt, with the same
-   launcher, phase, task, kind and lens as the dispatch that asked:
-   `implement.sh --to <full worker name>` or `review.sh --to <full worker name>`.
-
-Requests from several workers run at once; each worker gets only its own results.
-</WorkerRunRequest>
+<WorkerRuns>
+A Codex worker runs only commands that finish within one call and never makes
+an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
+started with `mesh_runs.py start`, detaches and pushes its own result to the
+worker, per <WritePromptContract/> item 3. A live run keeps the worker's
+launcher attached, so the dispatch finishes only when the worker is done.
+Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
+a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
+launcher is attached carries the result to you: dispatch that seat
+(`implement.sh --to <full worker name>`) when it should act on it.
+</WorkerRuns>
 
 <DelegateLaunchFailure>
-When the production doc names a review pool, on a pool review's `error` export
-`REVIEW_LEASE=<slug>/<unit>/<phase>` and retry with
-`review.sh --to <full-worker-name>` for that review.
+When the production doc names a review pool, on a pool review's `error` retry
+with `review.sh --to <full-worker-name>` for that review.
 
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Workers launched
@@ -355,7 +341,7 @@ Codex only; no timer process:
    apply <ProgressContract/>, then poll the same session again.
 3. An initial launch or poll result with `exit_code` means the launcher finished.
    Clear `${DISPATCH_HANDLE}`, read the call site's status/result files, and
-   route to <WorkerRunRequest/>, review, synthesis, repair, smoke, or the next stage immediately in
+   route to review, synthesis, repair, smoke, or the next stage immediately in
    this turn. Do not end the turn between completion and routing.
 4. A user message may interrupt the poll. Answer it, retain the session handle,
    and resume this contract unless the user cancels or redirects the run. An
@@ -363,9 +349,9 @@ Codex only; no timer process:
    run <ReviewPendingAddOns/>.
 5. An early-launched reviewer occupies its own managed terminal under
    `REVIEW_DISPATCH_HANDLE`. Keep polling the primary dispatch session; each
-   timeout is also the <EarlyReviewArm/> evaluation point. The reviewer's
-   Stage 1 launcher finishes on its own; its Stage 2 is a new dispatch under
-   <EarlyReviewArm/>, waited on under this same contract.
+   timeout is also the <EarlyReviewArm/> evaluation point. After the primary
+   completes and the ready sentinel is written, poll the reviewer session under
+   this same contract.
 </CodexDispatchWait>
 
 <BackgroundVerificationContract>
@@ -876,7 +862,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
    sibling phase already holds is allowed and records nothing: the engine
    answers `left_unmapped` with the sibling's reservation. A Claude edit's hook
    protects the paths but writes no state, so a first touch of your own leaves
-   the state for the checkpoint backstop (<CheckpointCommit/> step 5). With two
+   the state for the checkpoint backstop (<CheckpointCommit/> step 5). That
+   edit checks under your bare session id, and cargo-berth maps its reservation
+   there, so the phase's own check later answers `left_unmapped` with it. With
+   one open phase, the hook and the backstop record that reservation as the
+   phase's `Active`. With two
    phases holding reservations, your own edit is refused as ambiguous until you
    name its phase: `cargo-berth check <path> --reservation <that phase's
    reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
@@ -934,8 +924,7 @@ file named by the delegate is visible; stop if not. Capture the diff and status.
 Launch the blind reviewer while the writer is still running, so both finish
 together instead of back to back. Evaluate only on a <ProgressContract/> tick,
 and arm only when all of these hold: an implementation or fix dispatch is
-active; the phase's review arm is not `pool` (a pool reviewer cannot be sent
-its Stage 2); `EARLY_REVIEW=none`; the completed dispatch would receive a delegate
+active; `EARLY_REVIEW=none`; the completed dispatch would receive a delegate
 review — <DualReview/> pass 1 or a closure review; **pass-internal** completion
 of that dispatch is at least 75%; and at least ten minutes of writer time still
 remain.
@@ -975,11 +964,10 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. When the production doc names a review pool and the phase's arm is `pool`,
-   select no worker. Otherwise select its worker under <TeamReview/>, save the
+4. When the production doc names a review pool, select no worker. Otherwise select its worker under <TeamReview/>, save the
    slot as `${EARLY_REVIEW_SLOT}`, and apply <RoleReassignment/> when the open
    worker's role changes; when every open worker is busy, name a new `review` worker
-   and keep it after the turn. On the pool arm, read `${EARLY_REVIEW_SLOT}`
+   and keep it after the turn. With a pool, read `${EARLY_REVIEW_SLOT}`
    when a cancel call needs it:
    the one line in `${PHASE_DIR}/review_slot_adversary` for pass 1, or
    `${PHASE_DIR}/review_slot` for a closure. A missing file means the launcher
@@ -994,7 +982,7 @@ At an eligible tick, in that same tick:
    launches at completion under <DualReview/> step 3.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does — with
    `--pool code --lease <slug>/<unit>/<phase>` when the production doc names
-   a review pool and the phase's arm is `pool`; otherwise with `--to` for an
+   a review pool; otherwise with `--to` for an
    open worker or `--slot "${EARLY_REVIEW_SLOT}"` for the new worker, and
    `adversary` as its lens for pass 1 — appending one extra final argument:
    `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
@@ -1023,9 +1011,8 @@ always may — early launch is opportunistic, never required.
 
 | Event | Required action |
 | --- | --- |
-| Reviewer ends Stage 1 | Expected: its turn ends with provisional findings and no verdict, and `review.sh` records no pass. Clear `${REVIEW_DISPATCH_HANDLE}`; keep `${EARLY_REVIEW_SLOT}` and `EARLY_REVIEW=launched`. |
-| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** Then send Stage 2: write `${PHASE_DIR}/review_prompt_${REVIEW_PASS}_adversary_stage2.md` (`Stage 2: the final diff is at <final diff path>.`, `_stage2.md` with no lens for a closure) and launch it as <DualReview/> step 3 does for an open worker, `--to` the full worker name of `${EARLY_REVIEW_SLOT}` from `worker_name.sh`, with no extra final argument. Save that handle as `${REVIEW_DISPATCH_HANDLE}`. |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; on the pool arm, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `review.sh`'s run then sends the reviewer its Stage 2. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; with a pool, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1169,9 +1156,9 @@ question, never on a path. Select its open worker under <TeamReview/>, post the
 <RoleReassignment/> handoff when its role changes, and launch it with
 `review.sh --to`; when every open worker is busy, open and retain a role-named
 review worker with `review.sh --slot review` instead.
-When the production doc names a review pool and the phase's arm is `pool`,
-use `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting
-an open worker.
+When the production doc names a review pool, use
+`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting an
+open worker.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
@@ -1288,17 +1275,18 @@ instructions name; with none, skip and say so in one line.
    with TaskStop. With `ui` listed, use this procedure on every check:
 
    - Let `<slug>` be the production doc's filename without `-production.md`.
-     Use the pool regardless of the phase's code-review arm. Count design
-     checks within the phase from `k=1`, including repairs and notice checks;
-     resume from the largest saved `ux_<phase>_<k>_*` name plus one.
+     Count design checks within the phase from `k=1`, including repairs and
+     notice checks; resume from the largest saved `ux_<phase>_<k>_*` name plus
+     one.
    - Write one full shot path per line to
      `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, using the next unused UX
      pass index in this session. Write the helper prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
      `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
-     in the background. The launcher resets the reviewer before each turn
-     and sends the unit's memory and every listed image.
+     in the background. The launcher resumes the unit's UI reviewer, sends
+     every listed image, and sends the unit's memory on that reviewer's
+     first turn only; its thread carries the memory after that.
    - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
      also start the fresh Claude helper with the prompt from its helper file
      and those shots;

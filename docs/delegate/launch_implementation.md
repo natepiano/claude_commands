@@ -73,8 +73,7 @@ completes.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
    apply <DispatchContract/> once for the whole team.
 7. On completion, read `${PHASE_DIR}/impl_status_impl` and `impl_status_test`; the phase is
-   done only when both are terminal. A slot whose summary begins `Run request:`
-   is not terminal: apply <WorkerRunRequest/> and wait for its next dispatch. `implemented` on `impl` loads
+   done only when both are terminal. `implemented` on `impl` loads
    `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
    for what it completed and for findings it posted. If `impl` errors, apply <DelegateLaunchFailure/>
    first — a worker that died in seconds is resolved there, not reported. A

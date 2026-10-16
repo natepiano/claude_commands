@@ -51,6 +51,11 @@ def empty_inventory(machine: str = "natedev") -> Inventory:
     }
 
 
+def empty_recovery_inventory() -> shutdown.RecoveryStatusInventory:
+    return shutdown.RecoveryStatusInventory(**empty_inventory(), recovery=[],
+        snapshot=shutdown.NoSnapshotOutcomeRecorded(kind="no outcome recorded"))
+
+
 def complete_session(*, host: object) -> dict[str, object]:
     return {
         "session_id": "11111111-1111-1111-1111-111111111111",
@@ -356,7 +361,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output,
-            json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
+            json.dumps([empty_recovery_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
 
@@ -382,7 +387,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output,
-            json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
+            json.dumps([empty_recovery_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
 
@@ -768,7 +773,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output,
-            json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
+            json.dumps([empty_recovery_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
 
@@ -782,7 +787,7 @@ else:
         self.assertEqual(
             output,
             json.dumps(
-                [empty_inventory(), {"machine": "Mac", "unreachable": True}],
+                [empty_recovery_inventory(), {"machine": "Mac", "unreachable": True}],
                 sort_keys=True,
             )
             + "\n",
@@ -963,6 +968,7 @@ else:
                 action_line("take out", "cancel", "failed, hana, nixos", machine),
                 action_line("stop now", "now", "failed, hana, nixos", machine),
                 action_line("bring back", "restart", "bevy, failed", machine),
+                *(["  recovery snapshot: no successful snapshot recorded"] if machine == "natedev" else []),
             ])
         self.assertEqual(output.getvalue().splitlines(), expected)
 
@@ -983,6 +989,7 @@ else:
             "  conductor ownership unavailable: cannot read lock",
             action_line("take out", "cancel", "hana, nixos"),
             action_line("stop now", "now", "hana, nixos"),
+            "  recovery snapshot: no successful snapshot recorded",
         ])
 
 

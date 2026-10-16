@@ -1,6 +1,6 @@
 # herdr on the Mac
 
-> **Status: IMPLEMENTATION PLAN — one phase, delegate-ready.** Moved out of `docs/plans/build-followups-herdr-adoption.md` (its Phase 13) by the showrunner, 2026-10-15. The herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
+> **Status: IMPLEMENTATION PLAN — one phase, delegate-ready.** Moved out of `docs/plans/build-followups-herdr-adoption.md` (its Phase 14) by the showrunner, 2026-10-15. The herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
 
 > **As-built disposition: update** — `docs/as-built/herdr-adoption.md` gains a "herdr on the Mac" section
 
@@ -12,7 +12,7 @@ The showrunner (build-followups), 2026-10-15: the Mac phase of the herdr adoptio
 
 ## Ordering
 
-**Starts after** the parent plan's Phase 11 (tmux removed from productions and sessions on Linux) has merged into build-followups. Phase 8 there adds `start_new_server`, `herdr_sessions.py` and `herdr-claude`; Phase 11 is the last change to `restart.py` and `herdr.py` before this one. Both machines share these scripts, so this unit merges build-followups before it starts.
+**Starts after** the parent plan's Phase 13 (tmux removed from productions and sessions on Linux) has merged into build-followups. Phase 8 there adds `start_new_server`, `herdr_sessions.py` and `herdr-claude`; Phase 13 is the last change to `restart.py` and `herdr.py` before this one. Both machines share these scripts, so this unit merges build-followups before it starts.
 
 ## Phases
 
@@ -50,6 +50,6 @@ The showrunner (build-followups), 2026-10-15: the Mac phase of the herdr adoptio
 - `impl` — `herdr.py`, `test_herdr.py`, `inventory.py`, `test_inventory.py`; hub: `scripts/herdr/herdr.py`.
 - `test` (opens as impl) — `restart.py`, `test_restart.py`.
 
-**Constraints from prior phases:** `herdr.py` runs servers as systemd user units on Linux (`start_server` adopts, `start_new_server` is exclusive) and finds places, clients and server environments through `/proc`; session names follow herdr's contract (`[A-Za-z0-9_.-]+`, at most 64 bytes, not `.` or `..`) and `server_unit` is `herdr-<name>`; `start_agent` takes `OpeningPrompt | NoOpeningPrompt`; `herdr_sessions.py start|resume|list|attach`; `restart.py` restarts ghostty and zed hosts into herdr on Linux through `_herdr_launch(parts, NewHerdrSession(name), ...)` and leaves `terminal` unchanged; `inventory._process_environment` parses Darwin environment after the argv prefix (Phase 6); tmux is gone from the session tools.
+**Constraints from prior phases:** `herdr.py` runs servers as systemd user units on Linux (`start_server` adopts, `start_new_server` is exclusive) and finds places, clients and server environments through `/proc`; session names follow herdr's contract (`[A-Za-z0-9_.-]+`, at most 64 bytes, not `.` or `..`) and `server_unit` is `herdr-<name>.service`; `start_agent` takes `OpeningPrompt | NoOpeningPrompt`; `herdr_sessions.py start|resume|list|attach`; `restart.py` restarts ghostty and zed hosts into herdr on Linux through `_herdr_launch(parts, NewHerdrSession(name), ...)` and leaves `terminal` unchanged; `inventory._process_environment` parses Darwin environment after the argv prefix (Phase 6); tmux is gone from the session tools.
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr` and `scripts/shutdown` green on natedev and on the Mac; `basedpyright scripts/herdr scripts/shutdown` prints `0 errors, 0 warnings`. The live check in Spec 5 passes.

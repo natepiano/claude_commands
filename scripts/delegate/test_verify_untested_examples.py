@@ -71,7 +71,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}
+                if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
+                                "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}
             },
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(self.root),

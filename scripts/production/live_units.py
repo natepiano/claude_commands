@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 import showrunners
 import unit_lookup
-from add_unit import Refusal, cell_value, live_unit_table
+from production_units import Refusal, cell_value, live_unit_table
 
 
 class LiveUnit(NamedTuple):

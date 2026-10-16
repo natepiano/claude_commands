@@ -47,7 +47,7 @@ class SessionLookupTests(ShutdownTestCase):
     def record(
         self, filename: str, *, pid: int | None = None, name: str = "agent",
         session_id: str = "session-1", socket_path: Path | None = None, updated: int = 1,
-        proc_start: str = "",
+        proc_start: str = "", entrypoint: str = "",
     ) -> None:
         data = {
             "pid": os.getpid() if pid is None else pid,
@@ -56,6 +56,7 @@ class SessionLookupTests(ShutdownTestCase):
             "messagingSocketPath": str(self.socket_path if socket_path is None else socket_path),
             "updatedAt": updated,
             "procStart": proc_start,
+            **({"entrypoint": entrypoint} if entrypoint else {}),
         }
         _ = (self.sessions / filename).write_text(json.dumps(data))
 
@@ -96,6 +97,25 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(self.run_cli("address", "session:sid-123").stdout, f"uds:{self.socket_path}\n")
         self.assertEqual(self.run_cli("id", "showrunner").stdout.strip(), "sid-123")
         self.assertEqual(self.run_cli("id", str(os.getpid())).stdout.strip(), "sid-123")
+
+    def test_a_relay_named_like_a_session_is_never_found_or_listed(self) -> None:
+        relay_socket = socket.socket(socket.AF_UNIX)
+        self.addCleanup(relay_socket.close)
+        relay_path = self.root / "relay.sock"
+        relay_socket.bind(str(relay_path))
+        self.record("session.json", name="natedev", session_id="sid-session", updated=10, entrypoint="cli")
+        # send.py's relay is a newer `claude -p` run started with `-n natedev`.
+        self.record("relay.json", name="natedev", session_id="sid-relay", socket_path=relay_path, updated=20,
+                    entrypoint="sdk-cli")
+        self.assertEqual(self.run_cli("address", "natedev").stdout, f"uds:{self.socket_path}\n")
+        self.assertEqual(self.run_cli("socket", "session:sid-relay").returncode, 1)
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            live = sessions.live_sessions()
+            running = sessions.running_sessions()
+        self.assertEqual([record["sessionId"] for record in live], ["sid-session"])
+        self.assertEqual([record["sessionId"] for record in running], ["sid-session"])
+        found = sessions.addressed("natedev", live)
+        self.assertEqual(found["sessionId"] if found else None, "sid-session")
 
     def test_newest_live_match_wins(self) -> None:
         other = socket.socket(socket.AF_UNIX)

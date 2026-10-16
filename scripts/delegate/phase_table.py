@@ -26,13 +26,8 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 from scripts.delegate import progress_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
-from scripts.production.add_unit import (
-    Production,
-    Refusal,
-    cell_value,
-    live_unit_table,
-    read_production,
-)
+from scripts.production.add_unit import Production, read_production
+from production_units import Refusal, cell_value, live_unit_table
 from scripts.production.merge_checkpoint import PromoteTo, promotion_from_doc
 
 
