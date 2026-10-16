@@ -604,3 +604,31 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Gotchas:** a locked or logged-out Mac makes Ghostty start with no child, so the window never starts the server. herdr relaunches session.json panes when a server starts. A session with a pending restart record is left out of snapshots. A herdr server started from an ssh login cannot read the keychain, so Claude comes back signed out.
 
 **Ruled out:** an ownership-token proof for a window-started server (gold plating; such a server is never stopped instead).
+
+### Phase 22 — Codex restores land in their conversation  · status: done
+
+**Depends on:** Phase 21
+
+**User sees:** before — a Codex session restored after a crash opens Codex's resume list, and with two or more sessions the user must remember which one was theirs; after — it opens straight into the conversation it left. A session that never talked still opens the resume list.
+
+#### Work Order
+
+**Goal:** a recovery snapshot records each Codex session's conversation id, so restart runs `codex resume <id>`.
+
+**Spec:**
+
+1. Measured cause (2026-10-16 18:11 EDT, Mac, Codex v0.163.0, `CODEX_HOME=~/.codex1`): a Codex that had answered one prompt was snapshotted as `CodexResumePicker`. The snapshot reads the id only from a rollout file the process holds open (`inventory.py`: Darwin `rollout()` through `herdr.darwin_open_files`, Linux `_codex_resume` through `/proc/<pid>/fd`), and Codex writes `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` and then closes it (mtime 18:10:59, nothing open at 18:11:20). The file's first line is `session_meta` with `payload.id`, `payload.cwd` and `payload.timestamp`; `CODEX_HOME/session_index.jsonl` also exists.
+2. When no rollout is open, find the id from the files on disk: the rollout under `<CODEX_HOME>/sessions` whose `session_meta` `cwd` equals the process cwd and whose session started at or after the process start. Exactly one match gives `CodexSessionId`; none gives `CodexResumePicker` (a session that never talked); more than one is ambiguous and also gives `CodexResumePicker`: the snapshot never picks one of several candidates. If `session_index.jsonl` gives a cheaper exact answer, use it instead and say why in the summary. An open rollout still wins. The same rule serves Darwin and Linux.
+3. Reading stays cheap: snapshots run often, so look only at day folders from the process start date on, and read only each candidate's first line.
+4. `restart.py` already runs `codex resume <id>` for `session id`; no change there unless a test shows otherwise.
+5. Live, on the Mac: the user starts `codex` in a probe pane and sends it one prompt; snapshot; `herdr --session <probe> server stop`; `shutdown.py restart --here --no-alert` over ssh; the restored Codex opens the conversation, not the list.
+
+**Files:**
+- `scripts/shutdown/inventory.py`, `scripts/shutdown/test_inventory.py` — id from the rollout files on disk.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — only if a change is needed.
+
+**Workers:** 1 writer, `test` (as impl).
+
+**Constraints from prior phases:** Mac restarts outside the desktop start herdr through the attach window and refuse with `the Mac desktop is locked or signed out: unlock it and restart` (Phase 21). Every herdr command names `--session`. The Mac clone `~/scratch/herdr-mac` pulls the pushed branch.
+
+**Acceptance gate:** tests that fail without the fix for: an id found on disk with no open rollout, none found (picker), two matches (picker), a rollout from before the process started ignored, an open rollout still preferred; `merge_gate.py --tests-only` green; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; Mac `scripts/shutdown` suite green; Spec 5 passes on the Mac.
