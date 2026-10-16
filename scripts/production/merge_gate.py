@@ -41,7 +41,7 @@ TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
     "mac_test", "usage", "bevy_upgrade", "production", "delegate", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline",
+    "model_study", "herdr", "notify", "statusline", "astra",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
 MODULE_MEMORY_MIB = 48
