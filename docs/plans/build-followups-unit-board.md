@@ -73,7 +73,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 **Gotchas:** readers place an ETA by `eta_phase_id`, never `phase_id` (which names the phase active when it was recorded). `HH:MM` means today only; a later-day ETA needs the full date.
 
-### Phase 2 — Predictions chain from the stated ETA  · status: todo
+### Phase 2 — Predictions chain from the stated ETA  · status: done
 **Depends on:** 1
 
 #### Work Order
