@@ -9,18 +9,21 @@ import re
 import shutil
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib"):
+for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
@@ -35,98 +38,80 @@ import unit_lookup
 from account import Account, label_for
 
 
-class PlanFromRunRecord(TypedDict):
-    kind: Literal["plan"]
-    path: str
+from session_types import (
+    KnownBoot as KnownBoot,
+    BootNotRecorded as BootNotRecorded,
+    CompleteInventory as CompleteInventory,
+    PartialInventory as PartialInventory,
+    InvalidInventory as InvalidInventory,
+    parse_session as parse_session,
+    wire_object as _wire_object,
+    wire_required as _wire_required,
+    wire_string as _wire_string,
+    wire_integer as _wire_integer,
+    wire_list as _wire_list,
+
+    PlanFromRunRecord as PlanFromRunRecord,
+    NoRunRecord as NoRunRecord,
+    UnitPlan as UnitPlan,
+    UnitHost as UnitHost,
+    TmuxPane as TmuxPane,
+    PaneNotRecorded as PaneNotRecorded,
+    TmuxSessionId as TmuxSessionId,
+    TmuxSessionIdNotRecorded as TmuxSessionIdNotRecorded,
+    TmuxServer as TmuxServer,
+    TmuxServerNotRecorded as TmuxServerNotRecorded,
+    TmuxHost as TmuxHost,
+    HerdrHost as HerdrHost,
+    NamedDesktop as NamedDesktop,
+    DesktopNotInSnapshot as DesktopNotInSnapshot,
+    Desktop as Desktop,
+    SupervisorIdentity as SupervisorIdentity,
+    NoSupervisor as NoSupervisor,
+    WindowHost as WindowHost,
+    TerminalHost as TerminalHost,
+    UnknownHost as UnknownHost,
+    Host as Host,
+    SessionHost as SessionHost,
+    OnBranch as OnBranch,
+    DetachedHead as DetachedHead,
+    Head as Head,
+    Tracking as Tracking,
+    NoUpstream as NoUpstream,
+    Upstream as Upstream,
+    GitCheckout as GitCheckout,
+    NotACheckout as NotACheckout,
+    CheckoutState as CheckoutState,
+    ModelName as ModelName,
+    NoReplyYet as NoReplyYet,
+    LastModel as LastModel,
+    DirectorOwner as DirectorOwner,
+    NoDirector as NoDirector,
+    WorkerOwner as WorkerOwner,
+    CodexServer as CodexServer,
+    SessionFields as SessionFields,
+    ShowrunnerSession as ShowrunnerSession,
+    UnitSession as UnitSession,
+    WorkerSession as WorkerSession,
+    TopLevelSession as TopLevelSession,
+    Session as Session,
+    ShowrunnerFooter as ShowrunnerFooter,
+    NoFooter as NoFooter,
+    TimerRestore as TimerRestore,
+    CodexSessionId as CodexSessionId,
+    CodexResumePicker as CodexResumePicker,
+    CodexLaunch as CodexLaunch,
+    SnapshotClaudeSession as SnapshotClaudeSession,
+    SnapshotCodexSession as SnapshotCodexSession,
+    SnapshotSession as SnapshotSession,
+    RecoveryHostProcess as RecoveryHostProcess,
+    RecoveryHostUnrecorded as RecoveryHostUnrecorded,
+)
 
 
-class NoRunRecord(TypedDict):
-    kind: Literal["no run record"]
-
-
-UnitPlan = PlanFromRunRecord | NoRunRecord
-
-
-class UnitHost(TypedDict):
-    kind: Literal["unit"]
-    production: str
-    unit: str
-    doc: str
-    session_name: str
-    session_host: Literal["tmux", "herdr"]
-    plan: UnitPlan
-
-
-class TmuxPane(TypedDict):
-    kind: Literal["pane"]
-    pane_id: str
-    pane_pid: int
-
-
-class PaneNotRecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class TmuxSessionId(TypedDict):
-    kind: Literal["session id"]
-    session_id: str
-
-
-class TmuxSessionIdNotRecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class TmuxServer(TypedDict):
-    kind: Literal["server"]
-    pid: int
-    started_at: int
-
-
-class TmuxServerNotRecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class TmuxHost(TypedDict):
-    kind: Literal["tmux"]
-    tmux_session: str
-    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded
-    server: TmuxServer | TmuxServerNotRecorded
-    pane: TmuxPane | PaneNotRecorded
-
-
-class HerdrHost(TypedDict):
-    kind: Literal["herdr"]
-    herdr_session: str
-    pane_id: str
-
-
-class NamedDesktop(TypedDict):
-    kind: Literal["named"]
-    name: str
-
-
-class DesktopNotInSnapshot(TypedDict):
-    kind: Literal["not in snapshot"]
-
-
-Desktop = NamedDesktop | DesktopNotInSnapshot
-
-
-class SupervisorIdentity(TypedDict):
-    kind: Literal["supervisor"]
-    pid: int
-    proc_start: str
-
-
-class NoSupervisor(TypedDict):
-    kind: Literal["no supervisor"]
-
-
-class WindowHost(TypedDict):
-    kind: Literal["ghostty", "zed"]
-    window_shell: int
-    desktop: Desktop
-    supervisor: NotRequired[SupervisorIdentity | NoSupervisor]
+def herdr_presentation(host: HerdrHost) -> Literal["attached window", "detached"]:
+    """Records made before window presentation was saved remain detached."""
+    return host.get("presentation", "detached")
 
 
 def supervisor_identity(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoSupervisor:
@@ -141,134 +126,6 @@ def live_supervisor(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoS
         return identity
     return NoSupervisor(kind="no supervisor")
 
-
-class TerminalHost(TypedDict):
-    kind: Literal["terminal"]
-    supervisor: NotRequired[SupervisorIdentity | NoSupervisor]
-
-
-class UnknownHost(TypedDict):
-    kind: Literal["unknown"]
-
-
-Host = UnitHost | TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
-SessionHost = TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
-
-
-class OnBranch(TypedDict):
-    kind: Literal["branch"]
-    name: str
-
-
-class DetachedHead(TypedDict):
-    kind: Literal["detached"]
-    commit: str
-
-
-Head = OnBranch | DetachedHead
-
-
-class Tracking(TypedDict):
-    kind: Literal["tracking"]
-    ahead: int
-
-
-class NoUpstream(TypedDict):
-    kind: Literal["no upstream"]
-
-
-Upstream = Tracking | NoUpstream
-
-
-class GitCheckout(TypedDict):
-    kind: Literal["git"]
-    path: str
-    head: Head
-    upstream: Upstream
-    dirty: list[str]
-
-
-class NotACheckout(TypedDict):
-    kind: Literal["not a checkout"]
-
-
-CheckoutState = GitCheckout | NotACheckout
-
-
-class ModelName(TypedDict):
-    kind: Literal["model"]
-    name: str
-
-
-class NoReplyYet(TypedDict):
-    kind: Literal["no reply yet"]
-
-
-LastModel = ModelName | NoReplyYet
-
-
-class DirectorOwner(TypedDict):
-    kind: Literal["director"]
-    session_id: str
-
-
-class NoDirector(TypedDict):
-    kind: Literal["no director"]
-
-
-WorkerOwner = DirectorOwner | NoDirector
-
-
-class CodexServer(TypedDict):
-    """A live Codex app-server owned by one Claude session's run folder."""
-
-    run_dir: str
-    pid: int
-    busy_workers: list[str]
-
-
-class SessionFields(TypedDict):
-    session_id: str
-    pid: int
-    proc_start: str
-    name: str
-    cwd: str
-    # Records from before account-directory capture use the default directory.
-    config_dir: NotRequired[str]
-    probe: bool
-    status: str
-    updated_at: int
-    model: LastModel
-    checkout: CheckoutState
-    run_dirs: list[str]
-    codex_servers: list[CodexServer]
-    timers: list[str]
-
-
-class ShowrunnerSession(SessionFields):
-    kind: Literal["showrunner"]
-    host: SessionHost
-    production: str
-    doc: str
-
-
-class UnitSession(SessionFields):
-    kind: Literal["unit"]
-    host: UnitHost
-
-
-class WorkerSession(SessionFields):
-    kind: Literal["worker"]
-    host: SessionHost
-    owner: WorkerOwner
-
-
-class TopLevelSession(SessionFields):
-    kind: Literal["top-level"]
-    host: SessionHost
-
-
-Session = ShowrunnerSession | UnitSession | WorkerSession | TopLevelSession
 
 
 @dataclass(frozen=True)
@@ -301,10 +158,6 @@ class Inventory(TypedDict):
     label: str
     sessions: list[Session]
     unattributed: list[UnattributedSession]
-
-
-class InvalidInventory(ValueError):
-    """An inventory value does not satisfy its wire contract."""
 
 
 class SessionFile(TypedDict, total=False):
@@ -353,415 +206,6 @@ class UnitMarks:
 DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
 SNAPSHOT_SESSION = re.compile(r"^`(.+)` · (\S+) · (.+?)\s*$")
 RESUME_ID = re.compile(r"(?:^|\s)--resume\s+['\"]?([^\s'\"]+)")
-
-
-def _wire_object(value: object, place: str) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise InvalidInventory(f"{place} must be an object")
-    return cast(dict[str, object], value)
-
-
-def _wire_required(data: dict[str, object], key: str, place: str) -> object:
-    if key not in data:
-        raise InvalidInventory(f"{place}.{key} is missing")
-    return data[key]
-
-
-def _wire_string(value: object, place: str) -> str:
-    if not isinstance(value, str):
-        raise InvalidInventory(f"{place} must be a string")
-    return value
-
-
-def _wire_integer(value: object, place: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise InvalidInventory(f"{place} must be an integer")
-    return value
-
-
-def _wire_strings(value: object, place: str) -> list[str]:
-    if not isinstance(value, list):
-        raise InvalidInventory(f"{place} must be a list")
-    values = cast(list[object], value)
-    if not all(isinstance(item, str) for item in values):
-        raise InvalidInventory(f"{place} must contain only strings")
-    return cast(list[str], values)
-
-
-def _wire_list(value: object, place: str) -> list[object]:
-    if not isinstance(value, list):
-        raise InvalidInventory(f"{place} must be a list")
-    return cast(list[object], value)
-
-
-def _wire_kind(data: dict[str, object], place: str) -> str:
-    return _wire_string(_wire_required(data, "kind", place), f"{place}.kind")
-
-
-def _parse_unit_plan(value: object, place: str) -> UnitPlan:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "plan":
-        return {
-            "kind": "plan",
-            "path": _wire_string(
-                _wire_required(data, "path", place), f"{place}.path"
-            ),
-        }
-    if kind == "no run record":
-        return {"kind": "no run record"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_desktop(value: object, place: str) -> Desktop:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "named":
-        return {
-            "kind": "named",
-            "name": _wire_string(
-                _wire_required(data, "name", place), f"{place}.name"
-            ),
-        }
-    if kind == "not in snapshot":
-        return {"kind": "not in snapshot"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_tmux_pane(value: object, place: str) -> TmuxPane | PaneNotRecorded:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "pane":
-        return {
-            "kind": "pane",
-            "pane_id": _wire_string(
-                _wire_required(data, "pane_id", place), f"{place}.pane_id"
-            ),
-            "pane_pid": _wire_integer(
-                _wire_required(data, "pane_pid", place), f"{place}.pane_pid"
-            ),
-        }
-    if kind == "not recorded":
-        return {"kind": "not recorded"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_tmux_session_ref(
-    value: object, place: str,
-) -> TmuxSessionId | TmuxSessionIdNotRecorded:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "session id":
-        session_id = _wire_string(
-            _wire_required(data, "session_id", place), f"{place}.session_id"
-        )
-        if re.fullmatch(r"\$[0-9]+", session_id) is None:
-            raise InvalidInventory(f"{place}.session_id is invalid")
-        return {"kind": "session id", "session_id": session_id}
-    if kind == "not recorded":
-        return {"kind": "not recorded"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_tmux_server(
-    value: object, place: str,
-) -> TmuxServer | TmuxServerNotRecorded:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "server":
-        if "pid" not in data:
-            return {"kind": "not recorded"}
-        return {
-            "kind": "server",
-            "pid": _wire_integer(data["pid"], f"{place}.pid"),
-            "started_at": _wire_integer(
-                _wire_required(data, "started_at", place), f"{place}.started_at"
-            ),
-        }
-    if kind == "not recorded":
-        return {"kind": "not recorded"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "unit" and allow_unit:
-        name_key = "tmux_session" if "tmux_session" in data and "session_name" not in data else "session_name"
-        session_host = data.get("session_host", "tmux")
-        if session_host not in ("tmux", "herdr"):
-            raise InvalidInventory(f"{place}.session_host is invalid")
-        return {
-            "kind": "unit",
-            "production": _wire_string(
-                _wire_required(data, "production", place), f"{place}.production"
-            ),
-            "unit": _wire_string(
-                _wire_required(data, "unit", place), f"{place}.unit"
-            ),
-            "doc": _wire_string(_wire_required(data, "doc", place), f"{place}.doc"),
-            "session_name": _wire_string(
-                _wire_required(data, name_key, place),
-                f"{place}.{name_key}",
-            ),
-            "session_host": session_host,
-            "plan": _parse_unit_plan(
-                _wire_required(data, "plan", place), f"{place}.plan"
-            ),
-        }
-    if kind == "herdr":
-        return {
-            "kind": "herdr",
-            "herdr_session": _wire_string(
-                _wire_required(data, "herdr_session", place), f"{place}.herdr_session"
-            ),
-            "pane_id": _wire_string(
-                _wire_required(data, "pane_id", place), f"{place}.pane_id"
-            ),
-        }
-    if kind == "tmux":
-        pane: TmuxPane | PaneNotRecorded = (
-            _parse_tmux_pane(data["pane"], f"{place}.pane")
-            if "pane" in data
-            else {"kind": "not recorded"}
-        )
-        return {
-            "kind": "tmux",
-            "tmux_session": _wire_string(
-                _wire_required(data, "tmux_session", place),
-                f"{place}.tmux_session",
-            ),
-            "pane": pane,
-            "session_ref": (
-                _parse_tmux_session_ref(data["session_ref"], f"{place}.session_ref")
-                if "session_ref" in data
-                else {"kind": "not recorded"}
-            ),
-            "server": (
-                _parse_tmux_server(data["server"], f"{place}.server")
-                if "server" in data
-                else {"kind": "not recorded"}
-            ),
-        }
-    if kind in {"ghostty", "zed"}:
-        window = {
-            "kind": kind,
-            "window_shell": _wire_integer(
-                _wire_required(data, "window_shell", place),
-                f"{place}.window_shell",
-            ),
-            "desktop": _parse_desktop(
-                _wire_required(data, "desktop", place), f"{place}.desktop"
-            ),
-            "supervisor": _parse_supervisor(data.get("supervisor"), f"{place}.supervisor"),
-        }
-        return cast(WindowHost, cast(object, window))
-    if kind == "terminal":
-        if "supervisor" in data:
-            return {"kind": "terminal", "supervisor": _parse_supervisor(
-                data["supervisor"], f"{place}.supervisor")}
-        return {"kind": "terminal"}
-    if kind == "unknown":
-        return {"kind": "unknown"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_supervisor(value: object, place: str) -> SupervisorIdentity | NoSupervisor:
-    if value is None:
-        return NoSupervisor(kind="no supervisor")
-    data = _wire_object(value, place)
-    kind = _wire_string(_wire_required(data, "kind", place), f"{place}.kind")
-    if kind == "no supervisor":
-        return NoSupervisor(kind="no supervisor")
-    if kind != "supervisor":
-        raise InvalidInventory(f"{place}.kind is invalid")
-    pid = _wire_integer(_wire_required(data, "pid", place), f"{place}.pid")
-    start = _wire_string(_wire_required(data, "proc_start", place), f"{place}.proc_start")
-    if pid <= 1 or not start:
-        raise InvalidInventory(f"{place} has no process identity")
-    return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start)
-
-
-def _parse_head(value: object, place: str) -> Head:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "branch":
-        return {
-            "kind": "branch",
-            "name": _wire_string(
-                _wire_required(data, "name", place), f"{place}.name"
-            ),
-        }
-    if kind == "detached":
-        return {
-            "kind": "detached",
-            "commit": _wire_string(
-                _wire_required(data, "commit", place), f"{place}.commit"
-            ),
-        }
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_upstream(value: object, place: str) -> Upstream:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "tracking":
-        return {
-            "kind": "tracking",
-            "ahead": _wire_integer(
-                _wire_required(data, "ahead", place), f"{place}.ahead"
-            ),
-        }
-    if kind == "no upstream":
-        return {"kind": "no upstream"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_checkout(value: object, place: str) -> CheckoutState:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "git":
-        return {
-            "kind": "git",
-            "path": _wire_string(
-                _wire_required(data, "path", place), f"{place}.path"
-            ),
-            "head": _parse_head(
-                _wire_required(data, "head", place), f"{place}.head"
-            ),
-            "upstream": _parse_upstream(
-                _wire_required(data, "upstream", place), f"{place}.upstream"
-            ),
-            "dirty": _wire_strings(
-                _wire_required(data, "dirty", place), f"{place}.dirty"
-            ),
-        }
-    if kind == "not a checkout":
-        return {"kind": "not a checkout"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_model(value: object, place: str) -> LastModel:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "model":
-        return {
-            "kind": "model",
-            "name": _wire_string(
-                _wire_required(data, "name", place), f"{place}.name"
-            ),
-        }
-    if kind == "no reply yet":
-        return {"kind": "no reply yet"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_owner(value: object, place: str) -> WorkerOwner:
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind == "director":
-        return {
-            "kind": "director",
-            "session_id": _wire_string(
-                _wire_required(data, "session_id", place), f"{place}.session_id"
-            ),
-        }
-    if kind == "no director":
-        return {"kind": "no director"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_codex_server(value: object, place: str) -> CodexServer:
-    data = _wire_object(value, place)
-    return {
-        "run_dir": _wire_string(
-            _wire_required(data, "run_dir", place), f"{place}.run_dir"
-        ),
-        "pid": _wire_integer(_wire_required(data, "pid", place), f"{place}.pid"),
-        "busy_workers": _wire_strings(
-            _wire_required(data, "busy_workers", place), f"{place}.busy_workers"
-        ),
-    }
-
-
-def parse_session(value: object, place: str, *, require_updated_at: bool = False) -> Session:
-    """Validate and return one session from an inventory or shutdown record."""
-    data = _wire_object(value, place)
-    kind = _wire_kind(data, place)
-    if kind not in {"showrunner", "unit", "worker", "top-level"}:
-        raise InvalidInventory(f"{place}.kind is invalid")
-    servers = [
-        _parse_codex_server(item, f"{place}.codex_servers[{index}]")
-        for index, item in enumerate(
-            _wire_list(
-                _wire_required(data, "codex_servers", place),
-                f"{place}.codex_servers",
-            )
-        )
-    ]
-    parsed: dict[str, object] = {
-        "kind": kind,
-        "session_id": _wire_string(
-            _wire_required(data, "session_id", place), f"{place}.session_id"
-        ),
-        "pid": _wire_integer(_wire_required(data, "pid", place), f"{place}.pid"),
-        "proc_start": _wire_string(
-            _wire_required(data, "proc_start", place), f"{place}.proc_start"
-        ),
-        "name": _wire_string(
-            _wire_required(data, "name", place), f"{place}.name"
-        ),
-        "cwd": _wire_string(_wire_required(data, "cwd", place), f"{place}.cwd"),
-        "status": _wire_string(
-            _wire_required(data, "status", place), f"{place}.status"
-        ),
-        # Old shutdown records predate this field; zero cannot answer a pause.
-        "updated_at": _wire_integer(
-            _wire_required(data, "updated_at", place) if require_updated_at else data.get("updated_at", 0),
-            f"{place}.updated_at",
-        ),
-        "model": _parse_model(
-            _wire_required(data, "model", place), f"{place}.model"
-        ),
-        "checkout": _parse_checkout(
-            _wire_required(data, "checkout", place), f"{place}.checkout"
-        ),
-        "run_dirs": _wire_strings(
-            _wire_required(data, "run_dirs", place), f"{place}.run_dirs"
-        ),
-        "codex_servers": servers,
-        "timers": _wire_strings(
-            _wire_required(data, "timers", place), f"{place}.timers"
-        ),
-    }
-    probe = data.get("probe", False)
-    if not isinstance(probe, bool):
-        raise InvalidInventory(f"{place}.probe must be a boolean")
-    parsed["probe"] = probe
-    if "config_dir" in data:
-        parsed["config_dir"] = _wire_string(
-            data["config_dir"], f"{place}.config_dir"
-        )
-    host = _parse_host(
-        _wire_required(data, "host", place), f"{place}.host", kind == "unit"
-    )
-    if kind == "unit" and host["kind"] != "unit":
-        raise InvalidInventory(f"{place}.host.kind is invalid")
-    if kind != "unit" and host["kind"] == "unit":
-        raise InvalidInventory(f"{place}.host.kind is invalid")
-    parsed["host"] = host
-    if kind == "showrunner":
-        parsed["production"] = _wire_string(
-            _wire_required(data, "production", place), f"{place}.production"
-        )
-        parsed["doc"] = _wire_string(
-            _wire_required(data, "doc", place), f"{place}.doc"
-        )
-    elif kind == "worker":
-        parsed["owner"] = _parse_owner(
-            _wire_required(data, "owner", place), f"{place}.owner"
-        )
-    return cast(Session, cast(object, parsed))
 
 
 def parse_inventory(text: str) -> Inventory:
@@ -884,14 +328,29 @@ class UnreadableSessionConfiguration:
 
 
 def _configuration_for_session(
-    pid: int,
+    pid: int, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> AttributedSessionConfiguration | UnreadableSessionConfiguration:
     """Keep account lookup at one boundary so an unreadable process stays unattributed."""
     try:
-        config_dir = account.process_config_dir(pid)
-        if config_dir is None:
+        return _configuration_from_setting(account.process_config_dir(pid), home_state)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return UnreadableSessionConfiguration()
+
+
+def _configuration_from_setting(
+    setting: account.ConfiguredClaudeFolder | account.NoAccountSetting | account.ProcessEnvironmentUnread,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
+) -> AttributedSessionConfiguration | UnreadableSessionConfiguration:
+    """Attribute one observed setting against this pass's shared home state."""
+    try:
+        setting = account.process_account_directory(setting, home_state=home_state)
+        if not isinstance(setting, account.ConfiguredClaudeFolder):
             return UnreadableSessionConfiguration()
-        attributed = account.claude_account(config_dir)
+        config_dir = setting.path
+        if config_dir == Path.home() / ".claude":
+            attributed = home_state.account if isinstance(home_state, account.LegacyHomeLogin) else None
+        else:
+            attributed = account.claude_account(config_dir)
         if attributed is None:
             return UnreadableSessionConfiguration()
         return AttributedSessionConfiguration(attributed, config_dir)
@@ -1332,7 +791,9 @@ def _host(
         )
     place = herdr.herdr_place_of(session.get("pid", 0))
     if isinstance(place, herdr.HerdrPlace):
-        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane}
+        clients = herdr.attached_clients(place.session)
+        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
+                "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
     desktop_name = desktops.get(session_id)
     desktop: Desktop = (
         {"kind": "named", "name": desktop_name}
@@ -1350,6 +811,7 @@ def _git(cwd: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
             text=True,
             timeout=10,
             check=False,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1490,12 +952,13 @@ def _listed_session(
     record: SessionFile,
     productions: dict[str, ProductionSession],
     units: dict[str, UnitMarks],
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> ListedSession | UnattributedSession:
     pid = record.get("pid", 0)
     name = _string(record.get("name"))
     if not _record_matches_process(record):
         return {"pid": pid, "name": name, "reason": "process start mismatch"}
-    attributed = _configuration_for_session(pid)
+    attributed = _configuration_for_session(pid, home_state)
     if isinstance(attributed, UnreadableSessionConfiguration):
         return {"pid": pid, "name": name, "reason": "account unreadable"}
     session_id = _string(record.get("sessionId"))
@@ -1526,12 +989,13 @@ def _listed_session(
 def listing(login: str | None = None, *,
             registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[ListedSession]:
     """List membership without inspecting transcripts, worktrees or host resources."""
+    home_state = account.home_account_state()
     timers = showrunner_registrations() if isinstance(registrations, str) else registrations
     productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
     units = _unit_sessions(timers.entries)
     found: list[ListedSession] = []
     for record in sessions.live_sessions():
-        entry = _listed_session(_session_file(record), productions, units)
+        entry = _listed_session(_session_file(record), productions, units, home_state)
         if isinstance(entry, ListedSession) and (
             login is None or entry.login.casefold() == login.casefold()
         ):
@@ -1545,6 +1009,7 @@ def inventory(
     *, refresh_desktops: bool = True,
 ) -> Inventory:
     """Return account sessions in ``only`` and their workers, or all when empty."""
+    home_state = account.home_account_state()
     records = [_session_file(record) for record in sessions.live_sessions()]
     timers = showrunner_registrations()
     productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
@@ -1559,7 +1024,7 @@ def inventory(
     worker_owners = _worker_owners(run_directories, session_ids)
     wanted_login = login.casefold()
     candidates = [
-        (record, _listed_session(record, productions, units))
+        (record, _listed_session(record, productions, units, home_state))
         for record in records
         if not only or _string(record.get("sessionId")) in only
         or worker_owners.get(_string(record.get("sessionId"))) in only
@@ -1584,60 +1049,9 @@ def inventory(
             continue
 
         session_id = entry.session_id
-        owner = worker_owners.get(session_id)
-        unit = units.get(session_id)
-        kind = entry.kind
-        directories = run_directories.get(session_id, [])
-        cwd = _string(record.get("cwd"))
-        common: dict[str, object] = {
-            "session_id": session_id,
-            "pid": entry.pid,
-            "proc_start": entry.proc_start,
-            "name": entry.name,
-            "cwd": cwd,
-            "config_dir": str(entry.config_dir),
-            "probe": _process_environment(entry.pid).get(PROBE_ENV) == "1",
-            "status": _string(record.get("status"), "unknown"),
-            "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
-            "model": _model(session_id, entry.config_dir),
-            "checkout": _checkout(cwd),
-            "run_dirs": [str(directory) for directory in directories],
-            "codex_servers": _codex_servers(directories),
-            "timers": _timers(session_id),
-        }
-        if kind == "showrunner":
-            value = {
-                **common,
-                "kind": "showrunner",
-                "host": _host(record, None, plans, desktops),
-                "production": entry.production,
-                "doc": entry.doc,
-            }
-        elif kind == "unit":
-            assert unit is not None
-            value = {
-                **common,
-                "kind": "unit",
-                "host": _host(record, unit, plans, desktops),
-            }
-        elif kind == "worker":
-            value = {
-                **common,
-                "kind": "worker",
-                "host": _host(record, None, plans, desktops),
-                "owner": (
-                    {"kind": "director", "session_id": owner}
-                    if owner is not None
-                    else {"kind": "no director"}
-                ),
-            }
-        else:
-            value = {
-                **common,
-                "kind": "top-level",
-                "host": _host(record, None, plans, desktops),
-            }
-        found.append(cast(Session, cast(object, value)))
+        found.append(_session_details(record, entry, directories=run_directories.get(session_id, []),
+            host=_host(record, units.get(session_id), plans, desktops), timers=_timers(session_id),
+            environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
 
     return {
         "machine": _machine(),
@@ -1646,3 +1060,488 @@ def inventory(
         "sessions": found,
         "unattributed": unattributed,
     }
+
+
+def _session_details(record: SessionFile, entry: ListedSession, *, directories: list[Path],
+                     host: Host, timers: list[str], environment: dict[str, str], worker_owner: WorkerOwner) -> Session:
+    cwd = _string(record.get("cwd"))
+    common: dict[str, object] = {
+        "session_id": entry.session_id, "pid": entry.pid, "proc_start": entry.proc_start,
+        "name": entry.name, "cwd": cwd, "config_dir": str(entry.config_dir),
+        "probe": environment.get(PROBE_ENV) == "1", "status": _string(record.get("status"), "unknown"),
+        "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
+        "model": _model(entry.session_id, entry.config_dir), "checkout": _checkout(cwd),
+        "run_dirs": [str(directory) for directory in directories],
+        "codex_servers": _codex_servers(directories), "timers": timers, "host": host,
+        "kind": entry.kind,
+    }
+    if entry.kind == "showrunner":
+        common.update(production=entry.production, doc=entry.doc)
+    elif entry.kind == "worker":
+        common["owner"] = worker_owner
+    return parse_session(common, "observed session", require_updated_at=True)
+
+
+class ObservationFailure(OSError):
+    """One required source could not establish a complete observation."""
+
+
+@dataclass(frozen=True)
+class _SnapshotTimers:
+    registrations: tuple[ShowrunnerRegistration, ...]
+    targets: dict[str, list[str]]
+    enabled: dict[str, bool]
+
+
+def _snapshot_timers() -> _SnapshotTimers:
+    root = _notifier_state_dir()
+    try:
+        instances = list(root.iterdir())
+    except FileNotFoundError:
+        return _SnapshotTimers((), {}, {})
+    registrations: list[ShowrunnerRegistration] = []
+    targets: dict[str, list[str]] = {}
+    enabled: dict[str, bool] = {}
+    for instance in instances:
+        if not stat.S_ISDIR(instance.stat().st_mode):
+            continue
+        conf = instance / "conf"
+        try:
+            fields = dict(line.split("=", 1) for line in conf.read_text().splitlines() if "=" in line)
+        except FileNotFoundError:
+            if instance.name.startswith("showrunner-"):
+                raise ObservationFailure(f"production registration: {conf} is missing") from None
+            continue
+        target = fields.get("TARGET", "")
+        if target.startswith("session:") and target[8:]:
+            targets.setdefault(target[8:], []).append(instance.name)
+        try:
+            enabled[instance.name] = "ENABLED=1" in (instance / "state").read_text().splitlines()
+        except FileNotFoundError:
+            enabled[instance.name] = False
+        if not instance.name.startswith("showrunner-"):
+            continue
+        try:
+            command = shlex.split(fields.get("CHECK", ""))
+            index = next(index for index, token in enumerate(command) if Path(token).name == "production_check.sh")
+            doc = Path(command[index + 1])
+            if not doc.is_absolute() or not target.startswith("session:") or not target[8:]:
+                raise ValueError("missing production doc or session target")
+            _ = doc.read_text()
+        except (StopIteration, IndexError, ValueError) as error:
+            raise ObservationFailure(f"production registration {conf}: {error}") from error
+        registrations.append(ShowrunnerRegistration(target[8:], instance.name.removeprefix("showrunner-"), str(doc)))
+    return _SnapshotTimers(tuple(registrations), targets, enabled)
+
+
+def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[TimerRestore]:
+    import showrunner_footer
+    try:
+        pause = conversation_pause.read_record(conversation_pause.record_path(owner["session_id"]))
+    except FileNotFoundError:
+        pause = conversation_pause.NoPauseRecord.ABSENT
+    restores: dict[str, TimerRestore] = {}
+    if isinstance(pause, conversation_pause.PauseRecord):
+        restore = not isinstance(pause.phase, conversation_pause.KeptOff)
+        for instance in pause.instances:
+            restores[instance] = TimerRestore(instance=instance, was_enabled=restore,
+                footer=NoFooter(kind="no footer"))
+        for slug in pause.footers:
+            instance = f"showrunner-{slug}"
+            timer = restores.setdefault(instance, TimerRestore(instance=instance,
+                was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
+            if restore:
+                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+    for instance in owner["timers"]:
+        timer = restores.setdefault(instance, TimerRestore(instance=instance,
+            was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
+        if instance.startswith("showrunner-") and isinstance(pause, conversation_pause.NoPauseRecord):
+            slug = instance.removeprefix("showrunner-")
+            try:
+                _ = showrunner_footer.switch_path(slug).stat()
+            except FileNotFoundError:
+                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+    return list(restores.values())
+
+
+def _snapshot_environment(process: Path) -> dict[str, str]:
+    return dict(os.fsdecode(item).split("=", 1) for item in process.joinpath("environ").read_bytes().split(b"\0")
+                if b"=" in item)
+
+
+def _snapshot_stat(process: Path) -> tuple[str, int]:
+    fields = process.joinpath("stat").read_bytes().rpartition(b")")[2].split()
+    try:
+        started = fields[19].decode("ascii")
+        if not started.isdecimal():
+            raise ValueError("invalid process start")
+        return started, int(fields[4])
+    except (IndexError, ValueError, UnicodeError) as error:
+        raise ObservationFailure(f"process liveness {process}: malformed stat") from error
+
+
+def _snapshot_tmux_hosts() -> dict[str, TmuxHost]:
+    found: dict[str, TmuxHost] = {}
+    for _, panes in unit_lookup.tmux_sessions().values():
+        for pane in panes:
+            name, session_ref, server, identity = _tmux_session(pane)
+            if not name:
+                raise ObservationFailure(f"tmux host {pane}: pane could not be resolved")
+            found[pane] = TmuxHost(kind="tmux", tmux_session=name, session_ref=session_ref,
+                                   server=server, pane=identity)
+    return found
+
+
+@dataclass(frozen=True)
+class _SnapshotHosts:
+    tmux: dict[str, TmuxHost]
+    native: dict[int, herdr.HerdrPlace]
+    presentation: dict[str, Literal["attached window", "detached"]]
+    desktops: dict[str, str]
+    servers: dict[str, RecoveryHostProcess] = field(default_factory=dict)
+
+
+def _snapshot_native_hosts() -> tuple[dict[int, herdr.HerdrPlace], dict[str, Literal["attached window", "detached"]]]:
+    running = herdr.live_sessions()
+    places = {process.pid: process.place for process in herdr.herdr_processes()}
+    presentation: dict[str, Literal["attached window", "detached"]] = {}
+    for session in running:
+        clients = herdr.attached_clients(session["name"])
+        if isinstance(clients, herdr.ClientsUnreadable):
+            raise ObservationFailure(f"herdr clients {session['name']}: {clients.detail}")
+        presentation[session["name"]] = "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"
+    return places, presentation
+
+
+def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts: _SnapshotHosts) -> SessionHost:
+    pane = environment.get("TMUX_PANE", "")
+    if pane:
+        if pane not in hosts.tmux:
+            raise ObservationFailure(f"tmux host for pid {pid}: {pane} is missing")
+        return hosts.tmux[pane]
+    if environment.get("HERDR_PANE_ID"):
+        place = hosts.native.get(pid)
+        if place is None or place.session not in hosts.presentation:
+            raise ObservationFailure(f"herdr host for pid {pid}: pane could not be resolved")
+        return HerdrHost(kind="herdr", herdr_session=place.session, pane_id=place.pane,
+                         presentation=hosts.presentation[place.session])
+    desktop: Desktop = (NamedDesktop(kind="named", name=hosts.desktops[session_id])
+                        if session_id in hosts.desktops else DesktopNotInSnapshot(kind="not in snapshot"))
+    host = _terminal_host(pid, desktop)
+    return host
+
+
+def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
+    every = unit_lookup.every_marked_unit(every_host=True)
+    if every.faults:
+        raise ObservationFailure("production unit marks: " + "; ".join(f"{slug}: {detail}" for slug, detail in every.faults.items()))
+    docs = {runner.slug: runner.doc for runner in timers.registrations}
+    units: dict[str, UnitMarks] = {}
+    for slug, marked in every.units.items():
+        for unit, row in marked.items():
+            if isinstance(row.claude, unit_lookup.ClaudeUnknown):
+                raise ObservationFailure(f"production {slug}/{unit}: {row.claude.reason}")
+            if not isinstance(row.claude, unit_lookup.LiveClaude):
+                raise ObservationFailure(f"production {slug}/{unit}: marked host has no independently confirmed Claude identity")
+            if slug not in docs:
+                raise ObservationFailure(f"production {slug}: live unit has no registered production doc")
+            units[row.claude.session_id] = UnitMarks(slug, unit, docs[slug], row.label,
+                "tmux" if isinstance(row.place, unit_lookup.TmuxPlace) else "herdr")
+    return units
+
+
+_CODEX_HEADLESS = frozenset({"exec", "app-server", "mcp", "mcp-server", "proto"})
+_CODEX_VALUE_OPTIONS = frozenset({"--config", "-c", "--model", "-m", "--profile", "-p", "--cd", "-C",
+                                  "--sandbox", "-s", "--ask-for-approval", "-a", "--enable", "--disable"})
+_ROLLOUT_ID = re.compile(r"^rollout-.*-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$")
+
+
+def _codex_interactive(arguments: list[str]) -> bool:
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in _CODEX_VALUE_OPTIONS:
+            index += 2
+        elif argument.startswith("-"):
+            index += 1
+        else:
+            return argument not in _CODEX_HEADLESS
+    return True
+
+
+class CodexDescriptorsUnreadable(ObservationFailure):
+    """The open-rollout identity could not be observed."""
+
+
+def _codex_resume(process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
+    try:
+        descriptors = list((process / "fd").iterdir())
+    except OSError as error:
+        raise CodexDescriptorsUnreadable(f"Codex descriptors {process}: {error}") from error
+    ids: set[str] = set()
+    for descriptor in descriptors:
+        try:
+            path = Path(os.readlink(descriptor))
+        except OSError:
+            continue
+        if not path.is_relative_to(home / "sessions"):
+            continue
+        match = _ROLLOUT_ID.fullmatch(path.name)
+        if match:
+            ids.add(match[1].lower())
+    if len(ids) > 1:
+        raise ObservationFailure(f"Codex rollout {process}: more than one open session id")
+    return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
+
+
+def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> dict[str, list[SnapshotSession]]:
+    found: dict[str, list[SnapshotSession]] = {}
+    homes: dict[str, Path] = {}
+    for process in processes:
+        try:
+            if process.stat().st_uid != os.getuid() or process.joinpath("comm").read_text().strip() != "codex":
+                continue
+            started, terminal = _snapshot_stat(process)
+            arguments = [os.fsdecode(item) for item in process.joinpath("cmdline").read_bytes().split(b"\0") if item]
+            if not terminal or not arguments or not _codex_interactive(arguments):
+                continue
+            environment = _snapshot_environment(process)
+            home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
+            try:
+                resume = _codex_resume(process, home)
+            except CodexDescriptorsUnreadable:
+                resume = CodexResumePicker(kind="picker")
+            identity = resume["session_id"] if resume["kind"] == "session id" else f"codex-{process.name}-{started}"
+            login = "codex-" + home.name.casefold()
+            if login in homes and homes[login] != home:
+                raise ObservationFailure(f"Codex home collision: {homes[login]} and {home}")
+            homes[login] = home
+            cwd = str(process.joinpath("cwd").resolve(strict=True))
+            owner = TopLevelSession(kind="top-level", session_id=identity, pid=int(process.name), proc_start=started,
+                name=f"codex-{process.name}", cwd=cwd, probe=False, status="unknown", updated_at=0,
+                model=NoReplyYet(kind="no reply yet"), checkout=_checkout(cwd), run_dirs=[], codex_servers=[], timers=[],
+                host=_snapshot_host(int(process.name), identity, environment, hosts))
+            found.setdefault(login, []).append(SnapshotCodexSession(agent="codex", session=owner,
+                codex=CodexLaunch(home=str(home), resume=resume), workers=[], timers=[], last_seen=at, state="running"))
+        except FileNotFoundError:
+            if process.exists():
+                raise ObservationFailure(f"Codex observation {process}: required process data is missing") from None
+    return found
+
+
+def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHostProcess | RecoveryHostUnrecorded:
+    """Save the terminal process identity while its ancestry is still available."""
+    host = owner["host"]
+    if host["kind"] == "herdr":
+        return hosts.servers.get(host["herdr_session"], RecoveryHostUnrecorded(kind="not recorded"))
+    if host["kind"] == "unit" and host["session_host"] == "herdr":
+        return hosts.servers.get(host["session_name"], RecoveryHostUnrecorded(kind="not recorded"))
+    if host["kind"] == "unit" and host["session_host"] == "tmux":
+        name = host["session_name"]
+        matching = next((place for place in hosts.tmux.values() if place["tmux_session"] == name), None)
+        if matching is not None:
+            host = matching
+    if host["kind"] == "tmux" and host["server"]["kind"] == "server":
+        pid = host["server"]["pid"]
+        started, _ = _snapshot_stat(Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid))
+        return RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
+    if host["kind"] not in {"ghostty", "zed", "terminal"}:
+        return RecoveryHostUnrecorded(kind="not recorded")
+    proc = Path(os.environ.get("HERDR_PROC", "/proc"))
+    current = owner["pid"]
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        process = proc / str(current)
+        try:
+            command = process.joinpath("comm").read_text().strip()
+            if terminal_kind(command) != "unknown":
+                started, _ = _snapshot_stat(process)
+                return RecoveryHostProcess(kind="process", pid=current, proc_start=started)
+            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
+            current = int(fields[1])
+        except FileNotFoundError:
+            if process.exists():
+                raise ObservationFailure(f"host ancestry {process}: required process data is missing") from None
+            break
+        except (IndexError, ValueError) as error:
+            raise ObservationFailure(f"host ancestry {process}: {error}") from error
+    return RecoveryHostUnrecorded(kind="not recorded")
+
+
+def _snapshot_gone_hosts(hosts: _SnapshotHosts, boot_id: str) -> frozenset[tuple[str, str]]:
+    """Positive host loss is distinct from an unavailable host identity."""
+    from record import all_snapshots
+    gone: set[tuple[str, str]] = set()
+    proc = Path(os.environ.get("HERDR_PROC", "/proc"))
+    for saved in all_snapshots():
+        for entry in saved["sessions"]:
+            if entry.get("boot_id") != boot_id or entry["state"] == "unresolved":
+                continue
+            host = entry["session"]["host"]
+            lost = False
+            identity = entry.get("host_process", RecoveryHostUnrecorded(kind="not recorded"))
+            if identity["kind"] == "process":
+                process = proc / str(identity["pid"])
+                try:
+                    started, _ = _snapshot_stat(process)
+                    lost = started != identity["proc_start"]
+                except FileNotFoundError:
+                    if process.exists():
+                        raise ObservationFailure(f"host process {identity['pid']}: stat is missing") from None
+                    lost = True
+            elif host["kind"] == "herdr":
+                lost = host["herdr_session"] not in hosts.presentation
+            elif host["kind"] == "unit" and host["session_host"] == "herdr":
+                lost = host["session_name"] not in hosts.presentation
+            if lost:
+                gone.add((saved["login"], entry["session"]["session_id"]))
+    return frozenset(gone)
+
+
+def snapshot_inventory() -> CompleteInventory | PartialInventory:
+    """Observe every account once, without changing timers, pauses or vault notes."""
+    failures: list[str] = []
+    registry = sessions.read_registry()
+    failures.extend(f"session registry: {path} is unreadable" for path in registry.unreadable)
+    try:
+        proc = Path(os.environ.get("HERDR_PROC", "/proc"))
+        boot_id = proc.joinpath("sys/kernel/random/boot_id").read_text().strip()
+        if not boot_id:
+            raise ObservationFailure("boot id is empty")
+        home_state = account.home_account_state()
+        timers = _snapshot_timers()
+        units = _snapshot_units(timers)
+        tmux = _snapshot_tmux_hosts()
+        native, presentation = _snapshot_native_hosts()
+        desktops = _snapshot_desktops(refresh=False)
+        processes = [path for path in proc.iterdir() if path.name.isdecimal()]
+        # Socket ownership also distinguishes a replacement with the same session name.
+        servers: dict[str, RecoveryHostProcess] = {}
+        for pid, name in herdr._live_server_processes(processes).items():  # pyright: ignore[reportPrivateUsage]
+            started, _ = _snapshot_stat(proc / str(pid))
+            servers[name] = RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
+        hosts = _SnapshotHosts(tmux, native, presentation, desktops, servers)
+        run_directories = _active_run_directories()
+        ids = {item.record["sessionId"] for item in registry.entries}
+        worker_owners = _worker_owners(run_directories, ids)
+        plans = _newest_unit_plans()
+        gone_hosts = _snapshot_gone_hosts(hosts, boot_id)
+    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        return PartialInventory(tuple([*failures, f"shared observations: {error}"]))
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    by_login: dict[str, list[Session]] = {}
+    labels: dict[str, str] = {}
+    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.registrations}
+    for item in registry.entries:
+        registered, details = item.record, item.details
+        process = proc / str(registered["pid"])
+        try:
+            started, _ = _snapshot_stat(process)
+            if registered.get("procStart") and registered.get("procStart") != started:
+                continue  # A positively different process is no longer this session.
+            if not registered.get("procStart"):
+                raise ObservationFailure(f"session {registered['sessionId']}: recorded process identity is missing")
+            data = cast(SessionFile, cast(object, {**registered, **details}))
+            environment = _snapshot_environment(process)
+            configured = environment.get("CLAUDE_CONFIG_DIR", "")
+            setting = account.ConfiguredClaudeFolder(Path(configured)) if configured else account.NoAccountSetting()
+            configuration = _configuration_from_setting(setting, home_state)
+            if isinstance(configuration, UnreadableSessionConfiguration):
+                raise ObservationFailure(f"account attribution pid {registered['pid']}: configuration is unreadable")
+            config, attributed = configuration.config_dir, configuration.account
+            production, unit = productions.get(registered["sessionId"]), units.get(registered["sessionId"])
+            kind: Literal["showrunner", "unit", "worker", "top-level"] = ("showrunner" if production else "unit" if unit else
+                "worker" if data.get("kind") == "bg" else "top-level")
+            entry = ListedSession(registered["sessionId"], registered["pid"], started, registered["name"], kind,
+                config, attributed.login.casefold(), production.slug if production else "", production.doc if production else "")
+            host: Host = (_host(data, unit, plans, desktops) if unit else
+                          _snapshot_host(entry.pid, entry.session_id, environment, hosts))
+            owner = _session_details(data, entry, directories=run_directories.get(entry.session_id, []), host=host,
+                timers=timers.targets.get(entry.session_id, []), environment=environment,
+                worker_owner=DirectorOwner(kind="director", session_id=worker_owners[entry.session_id]) if entry.session_id in worker_owners else NoDirector(kind="no director"))
+            by_login.setdefault(entry.login, []).append(owner)
+            labels[entry.login] = attributed.label
+        except FileNotFoundError as error:
+            if process.exists():
+                failures.append(f"session {registered['sessionId']}: {error}")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            failures.append(f"session {registered['sessionId']}: {error}")
+    snapshots: dict[str, list[SnapshotSession]] = {}
+    all_owners = [owner for owners in by_login.values() for owner in owners]
+    owner_ids = {owner["session_id"] for owner in all_owners if owner["kind"] != "worker"}
+    live_ids = [owner["session_id"] for owner in all_owners]
+    if len(live_ids) != len(set(live_ids)):
+        failures.append("session registry: duplicate live session identities")
+    for login, owners in by_login.items():
+        for owner in owners:
+            if owner["kind"] == "worker":
+                if owner["owner"]["kind"] != "director" or owner["owner"]["session_id"] not in owner_ids:
+                    failures.append(f"worker {owner['session_id']}: owner could not be established")
+                continue
+            try:
+                workers: list[Session] = [worker for worker in all_owners if worker["kind"] == "worker" and
+                           worker["owner"]["kind"] == "director" and worker["owner"]["session_id"] == owner["session_id"]]
+                snapshots.setdefault(login, []).append(SnapshotClaudeSession(agent="claude", session=owner,
+                    workers=workers, timers=_snapshot_timer_restores(owner, timers), last_seen=at, state="running",
+                    boot_id=boot_id, host_process=_snapshot_host_process(owner, hosts)))
+            except (OSError, ValueError) as error:
+                failures.append(f"timer/pause intent {owner['session_id']}: {error}")
+    try:
+        for login, entries in _snapshot_codex(processes, hosts, at).items():
+            for item in entries:
+                item["boot_id"] = boot_id
+                item["host_process"] = _snapshot_host_process(item["session"], hosts)
+            snapshots[login] = entries
+            labels[login] = login
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        failures.append(f"Codex observation: {error}")
+    return PartialInventory(tuple(failures)) if failures else CompleteInventory(_machine(), snapshots, labels, KnownBoot(boot_id), gone_hosts)
+
+
+@dataclass(frozen=True)
+class CodexLive:
+    pid: int
+
+
+@dataclass(frozen=True)
+class CodexGone:
+    """No current interactive Codex has the saved identity."""
+
+
+@dataclass(frozen=True)
+class CodexLivenessUnknown:
+    reason: str
+
+
+def codex_liveness(entry: SnapshotCodexSession) -> CodexLive | CodexGone | CodexLivenessUnknown:
+    """Check PID identity and rollout IDs independently of the saved account."""
+    proc = Path(os.environ.get("HERDR_PROC", "/proc"))
+    try:
+        processes = [path for path in proc.iterdir() if path.name.isdecimal()]
+    except OSError as error:
+        return CodexLivenessUnknown(str(error))
+    failure = ""
+    for process in processes:
+        try:
+            if process.stat().st_uid != os.getuid() or process.joinpath("comm").read_text().strip() != "codex":
+                continue
+            started, terminal = _snapshot_stat(process)
+            argv = [os.fsdecode(item) for item in process.joinpath("cmdline").read_bytes().split(b"\0") if item]
+            if not terminal or not argv or not _codex_interactive(argv):
+                continue
+            if int(process.name) == entry["session"]["pid"] and started == entry["session"]["proc_start"]:
+                return CodexLive(int(process.name))
+            if entry["codex"]["resume"]["kind"] != "session id":
+                continue
+            environment = _snapshot_environment(process)
+            home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
+            resume = _codex_resume(process, home)
+            if resume == entry["codex"]["resume"]:
+                return CodexLive(int(process.name))
+        except FileNotFoundError as error:
+            if process.exists():
+                failure = str(error)
+        except (OSError, ValueError) as error:
+            failure = str(error)
+    return CodexLivenessUnknown(failure) if failure else CodexGone()

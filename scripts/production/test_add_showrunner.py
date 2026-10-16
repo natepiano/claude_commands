@@ -139,6 +139,9 @@ class AddShowrunnerTests(unittest.TestCase):
         file.parent.mkdir(parents=True)
         _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
             "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         _ = self.configure_groups()
         self.timer("top", PARENT_SESSION)
         self.live(PARENT_SESSION)
@@ -279,12 +282,15 @@ class AddShowrunnerTests(unittest.TestCase):
         # The parent ran the command and reads its output; only the child is told.
         self.assertEqual(self.sent_to(), [f"uds:{self.root / 'kid-session.sock'}"])
         calls = self.herdr_calls()
-        self.assertIn(["--user", "--unit=herdr-kid", "--collect", self.env["HERDR_BIN"],
+        self.assertIn(["--user", "--unit=herdr-kid.service", "--collect", self.env["HERDR_BIN"],
                        "--session", "kid", "server"], calls)
         opened = self.opened()
         self.assertEqual(opened[:8], ["--session", "kid", "workspace", "create", "--label", "kid",
                                      "--cwd", str(self.root / "kid-checkout")])
-        self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true", "--no-focus"])
+        self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
+            "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
+            "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
+            "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
         started = self.started()
         self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
             "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
@@ -501,7 +507,7 @@ class AddShowrunnerTests(unittest.TestCase):
                 patch.object(add_showrunner, "running", return_value=False), \
                 patch.object(showrunners, "descendants_of", return_value=[]), \
                 patch.object(add_showrunner, "herdr_session_running", return_value=False) as destination:
-            result = add_showrunner.checked(child, "top")
+            result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
         self.assertIsNone(result)
         destination.assert_called_once_with("kid")
 
@@ -549,7 +555,10 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.opened()[8:], ["--env", "ENABLE_TOOL_SEARCH=true", "--no-focus"])
+        self.assertEqual(self.opened()[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
+            "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
+            "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
+            "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
         self.assertNotIn("caller-token", json.dumps(self.herdr_calls()))
         self.assertEqual(self.events("tmux"), [])
 
@@ -572,7 +581,10 @@ class AddShowrunnerTests(unittest.TestCase):
 
     def test_showrunner_start_failure_is_reported_without_attaching(self) -> None:
         self.herdr_overrides["--session kid workspace create --label kid --cwd "
-            + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true --no-focus"] = CommandResponse(
+            + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true"
+            + f" --env CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}"
+            + f" --env CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}"
+            + " --env HERDR_AGENT_PANE=1 --no-focus"] = CommandResponse(
                 code=1, stdout="", stderr="fixture could not open workspace")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -617,7 +629,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(any(value.startswith("CLAUDE_CONFIG_DIR=") for value in self.opened()))
+        self.assertIn(f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}", self.opened())
 
     def test_a_timer_left_by_an_ended_session_does_not_stand_in_the_way(self) -> None:
         # The child ran before under this parent; its session ended, and its timer and its edge are still stored.
@@ -758,7 +770,8 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         result = self.run_command("kid", "--check")
         self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on claude2. "
                      + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
-                     + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
+                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
+                     + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude")
         self.assertNotIn("SECRET", result.stdout + result.stderr)
         self.assertEqual(self.herdr_calls(), [])
 

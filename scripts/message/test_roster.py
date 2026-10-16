@@ -30,7 +30,7 @@ import remove_workers
 import roster
 import unit_runs
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
 import unit_lookup
@@ -1127,6 +1127,8 @@ class RosterTests(unittest.TestCase):
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
+        if argv[:2] == ["herdr", "--session"] and argv[3:] == ["server"]:
+            herdr_listener(path.parent, pid, argv[2], os.environ)
 
     def _herdr_sessions(self) -> dict[str, CommandResponse]:
         return {"--session default session list --json": {"code": 0, "stdout": json.dumps({
@@ -1317,9 +1319,27 @@ class RosterTests(unittest.TestCase):
             _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
         return home
 
+    def test_roster_keeps_one_home_identity_per_pass_and_refreshes_after_cutover(self) -> None:
+        _ = self.account_note(2, tool="claude")
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": "claude2@example.invalid"}}))
+
+        def cutover_during_process_read(_pid: int) -> account.NoAccountSetting:
+            _ = home_json.write_text("{}")
+            return account.NoAccountSetting()
+
+        with (mock.patch.object(account, "process_config_dir", side_effect=cutover_during_process_read),
+              mock.patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads):
+            before = self._entries()
+            after = self._entries()
+        for name in ("runner", "free-claude"):
+            self.assertEqual(before[name].account, roster.AccountLabel("claude2"))
+            self.assertIsInstance(after[name].account, roster.AccountUnread)
+        self.assertEqual(home_reads.call_count, 2)
+
     def test_claude_roster_account_comes_from_its_process_configuration(self) -> None:
         directory = self.account_note(3, tool="claude")
-        with mock.patch.object(account, "process_config_dir", return_value=directory):
+        with mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(directory)):
             entry = self._entries()["runner"]
         self.assertEqual(entry.account, roster.AccountLabel("claude3"))
 

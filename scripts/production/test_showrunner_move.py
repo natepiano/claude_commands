@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import showrunner_move
 from showrunner_move import MovesItself, NotMoved, Proven, Started
 from scripts.accounts import accounts
+from scripts.whoami import account
 from scripts.accounts.moves import MoveEntry
 from scripts.shutdown.record import SessionShutdown
 
@@ -45,7 +46,7 @@ class SettleTest(unittest.TestCase):
         with patch("showrunner_move.record.all_session_records", side_effect=lambda: next(reads)), \
              patch("showrunner_move.moves.read_moves", return_value=journal), \
              patch("showrunner_move.sessions.live_sessions", return_value=live()), \
-             patch("showrunner_move.account.process_config_dir", return_value=config_dir), \
+             patch("showrunner_move.account.process_config_dir", return_value=account.ConfiguredClaudeFolder(config_dir) if config_dir is not None else account.ProcessEnvironmentUnread("unreadable")), \
              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "the-showrunner"}):
             return showrunner_move.settle(Started(UNIT, "nightly-review"), TARGET, SINCE, deadline,
                                           clock=lambda: next(clock), sleep=lambda _: None)

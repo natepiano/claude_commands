@@ -720,6 +720,7 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
         at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
         lines.append(f"    {at} {step['kind']} {located_detail(record, step['detail'])}".rstrip())
     lines.extend(f"    {stop_issue_text(issue)}" for issue in record["stop_issues"])
+    lines.extend(f"    restart issue: {issue}" for issue in record.get("restart_issues", []))
     return lines
 
 
@@ -752,11 +753,10 @@ def begin(
     at = record_time()
     origin: store.RequestOrigin = ({"kind": "session", "session_id": requested_by}
                                    if requested_by else {"kind": "terminal"})
-    if not ids and isinstance(store.lookup_account_hold(login), store.AccountOpen):
-        store.set_account_hold(store.AccountHold(
-            login=login, label=report["label"], machine=report["machine"], requested_at=at,
-            request_id=request_id, requested_by=origin, then=then,
-        ))
+    store.register_account_hold_request(store.AccountHold(
+        login=login, label=report["label"], machine=report["machine"], requested_at=at,
+        request_id=request_id, requested_by=origin, then=then,
+    ), account_wide=not ids)
     added: list[SessionShutdown] = []
     for session in report["sessions"]:
         if session["kind"] == "worker":
@@ -806,6 +806,7 @@ def begin(
             continue
         added.append(saved)
         print(f"{session['name']}: added")
+    store.complete_account_hold_registration(login, request_id)
     return added
 
 
@@ -1620,9 +1621,10 @@ def _complete_stop_action(saved: SessionShutdown) -> None:
 
 def _clear_finished_hold(login: str, seen: dict[str, SessionShutdown]) -> None:
     outcome = store.lookup_account_hold(login)
-    if isinstance(outcome, store.AccountHeld) and any(saved["request_id"] == outcome.hold["request_id"]
-        and saved["progress"]["kind"] == "restarted" for saved in seen.values()
-    ):
+    if isinstance(outcome, store.AccountHeld) and (outcome.hold["then"] == "restart" or any(
+        saved["request_id"] == outcome.hold["request_id"] and saved["progress"]["kind"] == "restarted"
+        for saved in seen.values()
+    )):
         store.clear_finished_account_hold(login)
 
 
@@ -1746,7 +1748,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     archive(result)
 
             def start_launch(saved: SessionShutdown) -> None:
-                if saved["session"]["host"]["kind"] in {"ghostty", "zed", "terminal"}:
+                if restart_work.launches_window(saved["session"]["host"]):
                     try:
                         result = restart_work.relaunch_session(saved, dry_run=False, desktop_state=desktop)
                         accept_launch(saved, result)

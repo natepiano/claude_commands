@@ -86,6 +86,8 @@ import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
     import roster
+    from ..accounts import accounts
+    from ..whoami.account import named_account_environment
 import review  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
@@ -877,6 +879,17 @@ def relay(message: Message, timeout: float) -> Result:
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    if not TYPE_CHECKING:
+        from scripts.accounts import accounts
+        from scripts.whoami.account import named_account_environment
+
+    try:
+        selected = accounts.account_for_unscoped_launch(os.environ)
+    except accounts.AccountsError as error:
+        return Result("queued", str(error))
+    if not isinstance(selected, accounts.LegacyHomeLaunch):
+        env.update(named_account_environment(selected.dir))
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
     token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"

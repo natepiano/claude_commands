@@ -197,6 +197,9 @@ else:
   done
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/claude_account.sh"
+claude_launch_environment || exit 1
+
 # `claude --bg` runs the session in a spare process of one long-lived per-user
 # daemon, so the session inherits the environment of whichever launch started
 # the daemon, not this one's: on 2026-10-05 every unit's workers took one unit's

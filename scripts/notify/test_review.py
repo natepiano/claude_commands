@@ -129,10 +129,12 @@ class LocalReviewTests(unittest.TestCase):
         _ = (notes / "claude2.md").write_text("---\nlogin: reviewer@example.invalid\n---\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFY_STATE_DIR": str(self.root / "state")})))
+        self.assertEqual(accounts.setup("claude2"), [])
+        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
-        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.main_config_dir())))
+        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
         # Calls without an explicit fake must never start a reviewer or notifier.
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("real process")))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
@@ -1125,15 +1127,16 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(result.why, "timeout")
         self.assertEqual(elapsed[0], 90)
 
-    def test_default_account_cannot_use_the_callers_login(self) -> None:
+    def test_claude2_reviewer_uses_its_numbered_folder_instead_of_the_callers_login(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "writer token",
                                          "ANTHROPIC_API_KEY": "writer key", "CLAUDE_CONFIG_DIR": "writer config",
                                          "MESSAGE_TEST_KEEP": "kept"}):
             _ = review.review(self.draft, False, runner=runner)
         for call in runner.calls:
-            for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
+            for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
                 self.assertNotIn(key, call.environment)
+            self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
             self.assertEqual(call.environment["MESSAGE_TEST_KEEP"], "kept")
 
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:

@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, cast
 
 import showrunners
 from add_unit import Production, Refusal, read_production
@@ -34,13 +34,6 @@ from add_unit import tmux_live as tmux_live
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
-
-class DefaultClaudeConfiguration(NamedTuple):
-    """Trust comes from the default login's configuration."""
-
-
-_DEFAULT_CONFIGURATION = DefaultClaudeConfiguration()
-
 
 WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
 # The session registry has no notification interface; callers may choose its retry interval.
@@ -57,18 +50,18 @@ def running(slug: str) -> bool:
     return bool(showrunners.current_address(slug))
 
 
-def claude_json(config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> Path:
+def claude_json(config_dir: Path) -> Path:
     """The configuration of the account this launch will use."""
-    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or (config_dir / ".claude.json" if isinstance(config_dir, Path) and config_dir != Path.home() / ".claude" else Path.home() / ".claude.json"))
+    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or config_dir / ".claude.json")
 
 
-def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> None:
+def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path) -> None:
     """Check whether `child` can start; raise Refusal naming what is in the way.
 
     `ending` names a session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import NamedAccount, account_dir, home_account_label, main_config_dir, trust_command
+    from scripts.accounts.accounts import NamedAccount, account_dir, trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     if not caller:
@@ -84,15 +77,11 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if taken:
         raise Refusal(f"{child.slug} already has a running showrunner")
     folder = start_in or child.checkout
-    if isinstance(config_dir, Path) and config_dir != main_config_dir():
-        label = str(config_dir)
-        numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
-        if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
-            label = f"claude{numbered.group(1)}"
-        selected = NamedAccount(label, config_dir)
-    else:
-        label = home_account_label("claude")
-        selected = NamedAccount(label, main_config_dir())
+    label = str(config_dir)
+    numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
+    if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
+        label = f"claude{numbered.group(1)}"
+    selected = NamedAccount(label, config_dir)
     trust = claude_trust(folder, claude_json(config_dir))
     if isinstance(trust, UnreadableTrustFile):
         raise Refusal(f"{child.slug}: {trust}")
@@ -128,7 +117,6 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
 
 def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> None:
     """Start Claude in the child's named herdr session and prompt it once."""
-    from scripts.accounts import accounts
     from scripts.whoami.account import named_account_environment
 
     prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
@@ -137,12 +125,11 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
         arguments.extend(["--resume", resume])
     arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
     environment = {"ENABLE_TOOL_SEARCH": "true"}
-    if selected.dir != accounts.main_config_dir():
-        environment.update(named_account_environment(selected.dir))
+    environment.update(named_account_environment(selected.dir))
     herdr.start_new_server(child.slug, 90_000)
     pane = herdr.open_pane(child.slug, child.slug, str(cwd), environment)
     herdr.start_agent(child.slug, pane, kind="claude", agent_arguments=arguments,
-                      opening_prompt=prompt, timeout_ms=90_000)
+                      opening=herdr.OpeningPrompt(prompt), timeout_ms=90_000)
 
 
 def showrunner_appeared(slug: str) -> bool:

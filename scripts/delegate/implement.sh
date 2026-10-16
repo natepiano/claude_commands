@@ -575,7 +575,10 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
-    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}"; then
+    # The phase is named so a repair in an older open phase lands on its own
+    # ledger, not on the newest phase's.
+    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
+        ${PHASE_ID:+--phase "${PHASE_ID}"}; then
       echo "ERROR: unable to record the repair round as landed." >&2
       echo "error" > "${STATUS_FILE}"
       bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
@@ -604,7 +607,7 @@ else
   # failed may have left partial edits behind, and the launcher cannot tell.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
     "$PY" "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
-      --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
+      ${PHASE_ID:+--phase "${PHASE_ID}"} --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
       || { echo "ERROR: unable to record the repair round as abandoned." >&2; LEDGER_CODE=1; }
   fi
   echo "error" > "${STATUS_FILE}"

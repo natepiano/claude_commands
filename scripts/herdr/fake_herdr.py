@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
@@ -25,6 +26,24 @@ class CommandResponse(TypedDict):
     write_files: NotRequired[dict[str, str]]
     require_paths: NotRequired[list[str]]
     remove_paths: NotRequired[list[str]]
+
+
+def herdr_listener(proc: Path, pid: int, name: str, environment: Mapping[str, str]) -> None:
+    """Give a fake server ownership of its session's listening socket."""
+    fixture_home = Path(environment.get("HOME", str(Path.home())))
+    config = Path(environment.get("XDG_CONFIG_HOME") or fixture_home / ".config") / "herdr"
+    directory = config if name == "default" else config / "sessions" / name
+    table = proc / "net/unix"
+    table.parent.mkdir(parents=True, exist_ok=True)
+    line = f"0: 2 0 00010000 0001 01 {pid} {directory}/herdr.sock\n"
+    existing = table.read_text() if table.exists() else ""
+    if line not in existing.splitlines(keepends=True):
+        _ = table.write_text(existing + line)
+    descriptors = proc / str(pid) / "fd"
+    descriptors.mkdir(parents=True, exist_ok=True)
+    listener = descriptors / "3"
+    listener.unlink(missing_ok=True)
+    listener.symlink_to(f"socket:[{pid}]")
 
 
 def main(argv: list[str]) -> int:

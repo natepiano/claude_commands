@@ -61,12 +61,13 @@ class AccountMoveTests(ShutdownTestCase):
             "oauthAccount": {"emailAddress": "default@example.invalid"},
         }), encoding="utf-8")
         self.note("claude2", "default@example.invalid")
+        self.named_account("claude2", "default@example.invalid")
         self.named_account("claude1", "current@example.invalid")
         self.named_account("claude3", "target@example.invalid")
         self.owner = top_level("move-id", name="kept name", host=tmux_host("kept tmux"))
         self.owner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=self.live_registry))
-        _ = self.enterContext(patch.object(account, "process_config_dir", return_value=accounts.account_dir("claude1")))
+        _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=AssertionError("accounts must use the listing")))
         _ = self.enterContext(patch.object(inventory, "listing", side_effect=self.current_listing))
         at = datetime.now(timezone.utc)
@@ -202,12 +203,12 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_called_once()
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--to") + 1], target)
-        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / ".claude")
+        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / f".{target}")
 
-    def test_move_to_the_home_logins_note_number_uses_its_home(self) -> None:
+    def test_move_to_claude2_uses_its_numbered_folder(self) -> None:
         self.assert_move_to_the_home_number("claude2")
 
-    def test_move_to_a_named_directory_sharing_the_home_login_uses_its_home(self) -> None:
+    def test_move_to_a_named_directory_sharing_the_legacy_login_keeps_the_numbered_folder(self) -> None:
         self.named_account("claude4", "default@example.invalid")
         self.assert_move_to_the_home_number("claude4")
 

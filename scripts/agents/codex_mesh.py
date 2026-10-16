@@ -186,6 +186,16 @@ COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
 SERVER_START_TIMEOUT_SECS = 30
+# Codex compacts a thread on its own once its context passes this many tokens. Every request
+# re-reads the whole context, and threads left to Codex's default grew to 460K; a 200K cap cut a
+# replayed day of worker usage by 19% (user, 2026-10-15). A server started with another value is
+# retired at the next dispatch, so each worker moves to the new limit after its current turn.
+AUTO_COMPACT_TOKENS = 200_000
+# The longest one write_stdin call may block on a command a worker started, in milliseconds.
+# Codex's default ends a wait after a short time, so a worker waiting on a build made a model
+# call every few seconds; 68% of worker calls were such waits (2026-10-15). Not part of the
+# server record: an older server keeps its value until it retires for another reason.
+BACKGROUND_TERMINAL_MAX_TIMEOUT_MS = 300_000
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
@@ -236,6 +246,7 @@ class ServerRecord(TypedDict):
     port: int
     pid: int
     codex_home: NotRequired[str]
+    auto_compact_tokens: NotRequired[int]
 
 
 @dataclass(frozen=True)
@@ -1533,15 +1544,17 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
             recorded_home = server_record_home(record)
             matching_home = recorded_home == selected_home
             old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
-            if matching_home and not old_sign_in:
+            old_limit = record.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
+            if matching_home and not old_sign_in and not old_limit:
                 # The record's change time is when the server was last used; its watcher reads it.
                 os.utime(path)
                 return port, False
             # A sign-in change `signin-changed` did not catch. The workers still on this server keep
             # it until they let go; its watcher then stops it.
             _retire_record(session_dir, record)
-            cause = (f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
-                     else f"no longer serves the workers home {codex_home_display(selected_home)}")
+            cause = (f"no longer serves the workers home {codex_home_display(selected_home)}" if not matching_home
+                     else f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
+                     else f"compacts at another limit than {AUTO_COMPACT_TOKENS} tokens")
             _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
             if not _stop_unused_with_lock_held(None, pid, port):
                 _ = _start_watcher(session_dir, pid, port)
@@ -1554,13 +1567,16 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
     log_path = _session_path(session_dir, SERVER_LOG)
     with log_path.open("ab") as log_handle:
         process = subprocess.Popen(
-            ["codex", "-c", "thread_unload_delay_secs=0", "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
+            ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
+             "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
+             "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
             stdout=subprocess.DEVNULL,
             stderr=log_handle,
             start_new_session=True,
             env={**os.environ, "CODEX_HOME": str(workers_home)},
         )
-    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home)}
+    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
+                            "auto_compact_tokens": AUTO_COMPACT_TOKENS}
     try:
         deadline = time.time() + SERVER_START_TIMEOUT_SECS
         while time.time() < deadline:
@@ -4177,10 +4193,23 @@ def command_signin_changed(args: argparse.Namespace) -> int:
     return 0
 
 
-def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> list[str]:
+@dataclass(frozen=True)
+class SwitchingWorker:
+    name: str
+    mid_turn: bool
+
+
+@dataclass(frozen=True)
+class WorkersRunSwitch:
+    folder: Path
+    holders: tuple[str, ...]
+    workers: tuple[SwitchingWorker, ...]
+
+
+def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> tuple[WorkersRunSwitch, ...]:
     """Retire current run servers and notify each affected holder once."""
     notices: dict[str, list[str]] = {}
-    lines: list[str] = []
+    switches: list[WorkersRunSwitch] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
     for record_path in sorted(path for root in SWEEP_ROOTS for path in root.glob(f"*/{SERVER_FILE}")):
         folder = record_path.parent
@@ -4190,6 +4219,14 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
             if not isinstance(pid, int) or not isinstance(port, int) or not _pid_alive(pid):
                 continue
             previous_home = server_record_home(record)
+            if previous_home == workers_home:
+                continue
+            workers = tuple(
+                SwitchingWorker(name, _as_dict(entry).get("status") == "running")
+                for name, entry in sorted(_read_json_object(folder / ROSTER_FILE).items())
+                if _as_dict(entry).get("status") != "ended"
+            )
+            holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
             line = (
                 f"Workers account {'would move' if dry_run else 'changed'} at {at} to {label} "
                 + f"({codex_home_display(workers_home)}): run {folder.name}'s workers move from "
@@ -4201,8 +4238,8 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
                 _log_server(str(folder), line)
         if not dry_run and not _stop_unused(None, pid, port, RetiredRunServer(folder)):
             _ = _start_watcher(str(folder), pid, port)
-        lines.append(line)
-        for session_id in _marker_sessions(SWEEP_ROOTS, folder):
+        switches.append(WorkersRunSwitch(folder, holders, workers))
+        for session_id in holders:
             notices.setdefault(session_id, []).append(folder.name)
     if not dry_run:
         for session_id, runs in notices.items():
@@ -4212,7 +4249,7 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
                 + f"runs {', '.join(runs)} move at their next turn; working workers finish first. Continue dispatching as usual.",
                 CodexNoticeKind.WORKERS_CHANGED,
             )
-    return lines
+    return tuple(switches)
 
 
 def command_serve(args: argparse.Namespace) -> int:

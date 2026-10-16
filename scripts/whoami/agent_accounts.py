@@ -22,6 +22,7 @@ import asyncio
 import base64
 import binascii
 import http.client
+import hashlib
 import json
 import os
 import math
@@ -32,6 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
@@ -467,6 +469,25 @@ def claude_config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
 
+def claude_config_value(folder: Path) -> str:
+    """The exact directory value passed to Claude Code when selecting a folder."""
+    return str(folder)
+
+
+def claude_keychain_service(config_dir: Path | None = None) -> str:
+    """Claude Code's service for the selected folder, without reading its entry."""
+    if config_dir is None:
+        value = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not value:
+            return "Claude Code-credentials"
+    elif config_dir == Path.home() / ".claude":
+        return "Claude Code-credentials"
+    else:
+        value = claude_config_value(config_dir)
+    digest = hashlib.sha256(unicodedata.normalize("NFC", value).encode("utf-8")).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
 def claude_config_file(config_dir: Path | None = None) -> Path:
     """Claude Code's `.claude.json`: inside CLAUDE_CONFIG_DIR when set, else in home."""
     if config_dir is not None:
@@ -596,13 +617,12 @@ def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
     path = (claude_config_dir() if config_dir is None else config_dir) / ".credentials.json"
     if path.exists():
         return cast(ClaudeCredentials, json.loads(path.read_text()))
-    # Claude Code uses the macOS login keychain for its default configuration.
-    if sys.platform == "darwin" and (
-        config_dir == Path.home() / ".claude"
-        or (config_dir is None and "CLAUDE_CONFIG_DIR" not in os.environ)
-    ):
-        return cast(ClaudeCredentials, command_json(
-            "security", "find-generic-password", "-s", "Claude Code-credentials", "-w"))
+    if sys.platform == "darwin":
+        try:
+            return cast(ClaudeCredentials, command_json(
+                "security", "find-generic-password", "-s", claude_keychain_service(config_dir), "-w"))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            raise RuntimeError("usage credentials unavailable") from error
     raise RuntimeError("usage credentials unavailable")
 
 
@@ -639,7 +659,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
         else:
             environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
             if config_dir != Path.home() / ".claude":
-                environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
+                environment["CLAUDE_CONFIG_DIR"] = claude_config_value(config_dir)
             status = command_json("claude", "auth", "status", environment=environment)
         account = cast(ClaudeAuthStatus, status)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
@@ -999,9 +1019,11 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path) -> li
     """Live Claude directories and every Codex home, fetched concurrently."""
     homes = codex_homes(workers_home)
     directories = list(dict.fromkeys([
-        Path.home() / ".claude", *(named.directory for named in selection.named_accounts),
+        *(named.directory for named in selection.named_accounts),
         *selection.live_directories,
     ]))
+    if claude_on_disk(Path.home() / ".claude").email and Path.home() / ".claude" not in directories:
+        directories.append(Path.home() / ".claude")
     return list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
         *(codex_live(home) for home in homes),

@@ -15,7 +15,8 @@ Specification, team partition, boundaries, or verification on the strength of
 earlier work.
 
 Every review prompt carries sections 7 and 9 the same way, plus the role-switch
-opening in <ReviewPromptContract/>.
+opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
+3's `## Builds and tests` section verbatim.
 
 1. Role: write the requested code directly; do not ask questions. Name the
    slot this prompt is for and the role assigned by the Work Order's **Workers**
@@ -37,9 +38,31 @@ opening in <ReviewPromptContract/>.
    `load-rust-style.sh`; the unit director runs the style review in its main
    review each phase." Codex lists `rust_style` to every worker, which loads
    it unless told not to.
-3. Narration: before each activity, run
+3. Narration: when the activity changes — a new piece of work, or a run
+   handed to the unit director — run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
-   Use short present-tense text and never read the heartbeat file. Role
+   Use short present-tense text and never read the heartbeat file. Post
+   nothing while the activity stays the same. Every prompt to a Codex worker
+   carries this section verbatim, after section 2:
+
+   ```
+   ## Builds and tests
+
+   Start no build, test, lint, example or verify.sh run yourself, not even in
+   the background: a run started from your shell dies when your turn ends.
+   When you need one, end your turn. Begin your final answer, and the summary
+   file your prompt names if it names one, with `Run request:`, then each
+   exact command line and the directory to run it in. The unit director runs
+   it and sends you its exit code, its last lines and its log path as your
+   next message. Never poll, sleep, call `wait`, loop on a status file, or
+   post a waiting status.
+   ```
+
+   Every model call resends the worker's whole context, and on 2026-10-15
+   68% of worker calls were waits, sleeps and status posts. The unit
+   director's side is <WorkerRunRequest/> in `/unit:direct`. A Claude worker
+   gets no such section: it runs its commands with `run_in_background: true`
+   and ends its turn until the task notification arrives. Role
    changes: **before the first tool call in a new role** — taking a slice of
    the test work, standing down — run
    `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
@@ -114,7 +137,8 @@ The Verification section carries the applicable command lines and every
 delegate-facing rule from <VerificationContract/>, with nothing added around
 them. It must also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
-output has been read. A run that prints `PASS (recorded)` is that gate's result,
+output has been read. For a Codex worker, "run" means a `Run request:` per
+item 3: the final report waits for the results the unit director sends. A run that prints `PASS (recorded)` is that gate's result,
 and the log it names is the output to read; add `--no-cache` only to re-run a
 passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
 package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
