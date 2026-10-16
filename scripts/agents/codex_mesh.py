@@ -191,6 +191,11 @@ SERVER_START_TIMEOUT_SECS = 30
 # replayed day of worker usage by 19% (user, 2026-10-15). A server started with another value is
 # retired at the next dispatch, so each worker moves to the new limit after its current turn.
 AUTO_COMPACT_TOKENS = 200_000
+# The longest one write_stdin call may block on a command a worker started, in milliseconds.
+# Codex's default ends a wait after a short time, so a worker waiting on a build made a model
+# call every few seconds; 68% of worker calls were such waits (2026-10-15). Not part of the
+# server record: an older server keeps its value until it retires for another reason.
+BACKGROUND_TERMINAL_MAX_TIMEOUT_MS = 300_000
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
@@ -1563,6 +1568,7 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
     with log_path.open("ab") as log_handle:
         process = subprocess.Popen(
             ["codex", "-c", "thread_unload_delay_secs=0", "-c", f"model_auto_compact_token_limit={AUTO_COMPACT_TOKENS}",
+             "-c", f"background_terminal_max_timeout={BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
              "app-server", "--listen", f"ws://127.0.0.1:{chosen}"],
             stdout=subprocess.DEVNULL,
             stderr=log_handle,

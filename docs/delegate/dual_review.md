@@ -69,14 +69,16 @@ your own choices as an adversary would.
 
 In a run's own-worker review, the opening also gives the concrete
 `board.sh role ... review` command for the worker's first tool call. The reviewer
-narrates each activity as a short output line so the wrapper heartbeat remains
-live. It receives no
+narrates each change of activity as a short output line so the wrapper
+heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
 heartbeat path and never receives `${IMPL_SUMMARY}`. `review.sh` verifies that
 the working tree did not change.
 
 Do not repeat the implementer's listed verification or audit style. A reviewer
-may run one specific omitted check only when a plausible regression lies outside
-the listed gate, and must name that command. Broad reviews apply
+may ask for one specific omitted check only when a plausible regression lies
+outside the listed gate, and must name that command; a Codex reviewer asks
+through a `Run request:` per the `## Builds and tests` section of
+<WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
 
 For a pool review, the Three Gods and Type Design Contract sections each hold
@@ -114,6 +116,9 @@ count instead.
 
 ## Three Gods
 [the section of that name in <WritePromptContract/>, verbatim]
+
+## Builds and tests
+[the section of that name in <WritePromptContract/> item 3, verbatim; Codex reviewers only]
 
 ## Specification
 [implementer's Work Specification verbatim]
@@ -158,24 +163,26 @@ Stage 1 — arm, now: read the specification, the partial diff, and the
 surrounding code, callers, and consumers it touches. Draft provisional
 findings. Emit no verdict.
 
-Stage 2 — fire: poll for <ready sentinel path> (e.g. `test -e`, sleeping ~15s
-between checks), narrating each wait as one short output line. When it
-appears, read <final diff path> — it supersedes the partial snapshot — and
-review it in full, concentrating on hunks that changed since the snapshot.
-Reconcile your provisional findings against the final diff; drop any the final
-code resolves. Then answer the Review Questions and emit the normal numbered
-findings and verdict from the final diff only. If the sentinel has not
-appeared after 30 minutes, report that timeout and exit with an error instead
-of reviewing the partial diff.
+Then end your turn: your final answer is the provisional findings, headed
+`Stage 1 — provisional, no verdict`. Do not poll for the final diff, sleep or
+wait for it.
+
+Stage 2 — fire: when the implementation finishes, the unit director writes
+<final diff path> and sends it to you as your next message. Read it — it
+supersedes the partial snapshot — and review it in full, concentrating on
+hunks that changed since the snapshot. Reconcile your provisional findings
+against the final diff; drop any the final code resolves. Then answer the
+Review Questions and emit the normal numbered findings and verdict from the
+final diff only.
 ```
 </BroadReviewPrompt>
 
 <DualReview>
 1. If `EARLY_REVIEW=launched`, the `adversary` is already armed and
    `${REVIEW_PASS}` already incremented: apply <ReviewDiffContract/> to the
-   completed tree, deliver the final diff and ready sentinel per
-   <EarlyReviewArm/>, reset `EARLY_REVIEW=none`, and keep
-   `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
+   completed tree, deliver the final diff and ready sentinel and dispatch
+   that reviewer's Stage 2 per <EarlyReviewArm/>, reset `EARLY_REVIEW=none`,
+   and keep `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
@@ -287,6 +294,8 @@ contains only:
   or invariant of its changed symbols.
 - The `## Three Gods` section of <WritePromptContract/>, verbatim; a repair
   hunk that breaks one is a finding of the repair.
+- For a Codex reviewer, the `## Builds and tests` section of
+  <WritePromptContract/> item 3, verbatim.
 - The `## Type Design Contract` section using <WritePromptContract/> item 7's
   follow-up pointer.
 
@@ -298,9 +307,9 @@ Design questions.
 **Early form** (an <EarlyReviewArm/> launch only): the diff section holds the
 partial repair diff at launch, and the prompt opens with the same
 `## Implementation status` staging block as <BroadReviewPrompt/>'s early form —
-arm on the open ids, their surrounding code, and the partial diff; fire on the
-final path-limited diff when the ready sentinel appears; answer the questions
-from the final diff only.
+arm on the open ids, their surrounding code, and the partial diff, then end
+the turn; fire on the final path-limited diff when the unit director sends it;
+answer the questions from the final diff only.
 
 After the main pass agrees, record `accepted` for fixed, `still_open` for not
 fixed/unclear, or `reopened` with the invalidating hunk. Open any new defect
