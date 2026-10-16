@@ -1518,9 +1518,9 @@ class ProcessEnvironmentTests(unittest.TestCase):
         ]) as probe:
             environment = inventory._process_environment(42)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(environment, {"HERDR_PANE_ID": "w1:p1", "REAL_ENTRY": "value=with=equals"})
-        self.assertEqual(probe.call_args_list[0].args[0], ("ps", "-o", "command=", "-p", "42"))
-        self.assertEqual(probe.call_args_list[1].args[0], ("ps", "eww", "-o", "command=", "-p", "42"))
-        self.assertEqual(probe.call_args_list[2].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[0].args[0], ["ps", "-o", "command=", "-p", "42"])
+        self.assertEqual(probe.call_args_list[1].args[0], ["ps", "eww", "-o", "command=", "-p", "42"])
+        self.assertEqual(probe.call_args_list[2].args[0], ["ps", "-o", "command=", "-p", "42"])
         self.assertEqual(probe.call_count, 3)
 
     def test_darwin_environment_refuses_arguments_added_between_reads(self) -> None:

@@ -544,28 +544,125 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_forget_removes_only_the_named_recovery_entry_and_keeps_shutdown_record(self) -> None:
         _ = self.recovery("first", "second")
-        stopped = session_shutdown({"kind": "stopped", "at": OCTOBER}, "first")
+        stopped = session_shutdown({"kind": "stopped", "at": OCTOBER}, "unrelated")
         self.assertTrue(record.create_session(stopped))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(shutdown.main(["forget", "first-name"]), 0)
         saved = record.read_snapshot(LOGIN)
         assert not isinstance(saved, record.NoRecoverySnapshot)
         self.assertEqual([item["session"]["session_id"] for item in saved["sessions"]], ["second"])
-        self.assertEqual(record.find_session(LOGIN, "first"), stopped)
+        self.assertEqual(record.find_session(LOGIN, "unrelated"), stopped)
+
+    def test_forget_failed_restart_removes_it_from_status_and_bring_back(self) -> None:
+        failed = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="agent exited"), "failed-id")
+        failed["session"]["name"] = "leg2probe"
+        sibling = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER), "sibling-id")
+        sibling["session"]["name"] = "keep-me"
+        self.assertTrue(record.create_session(failed))
+        self.assertTrue(record.create_session(sibling))
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as before:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("leg2probe", before.getvalue())
+        self.assertIn("restart failed", before.getvalue())
+        self.assertIn("failed-id", before.getvalue())
+        with redirect_stdout(io.StringIO()) as forgotten:
+            self.assertEqual(shutdown.main(["forget", "failed-id", "--account", LABEL]), 0)
+        self.assertEqual(forgotten.getvalue(), "leg2probe: forgotten\n")
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as after:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertNotIn("leg2probe", after.getvalue())
+        self.assertNotIn("failed-id", after.getvalue())
+        self.assertNotIn("restart failed", after.getvalue())
+        self.assertIn("bring back:", after.getvalue())
+        self.assertIn("sibling-id", after.getvalue())
+        self.assertEqual(record.session_records(LOGIN), [sibling])
+
+    def test_forget_one_session_removes_both_its_snapshot_and_stopped_record(self) -> None:
+        _ = self.recovery("first", "second")
+        stopped = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER), "first")
+        self.assertTrue(record.create_session(stopped))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["forget", "first-name"]), 0)
+        self.assertEqual(output.getvalue(), "first-name: forgotten\n")
+        self.assertEqual(record.session_records(LOGIN), [])
+        snapshot = record.read_snapshot(LOGIN)
+        assert not isinstance(snapshot, record.NoRecoverySnapshot)
+        self.assertEqual([item["session"]["session_id"] for item in snapshot["sessions"]], ["second"])
+
+    def test_forget_ambiguous_shutdown_name_lists_matches_without_removing_either(self) -> None:
+        for identity in ("first-id", "second-id"):
+            saved = session_shutdown(record.SessionNeedsManualRestart(kind="manual restart", command="resume"), identity)
+            saved["session"]["name"] = "same-name"
+            self.assertTrue(record.create_session(saved))
+        before = record.session_records(LOGIN)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(shutdown.main(["forget", "same-name"]), 2)
+        self.assertIn("more than one local session", error.getvalue())
+        for identity in ("first-id", "second-id"):
+            self.assertIn(f"same-name ({identity})", error.getvalue())
+        self.assertEqual(record.session_records(LOGIN), before)
+
+    def test_forget_exact_shutdown_id_wins_over_another_sessions_name(self) -> None:
+        for identity, name in (("first-id", "second-id"), ("second-id", "second")):
+            saved = session_shutdown(record.SessionNeedsManualRestart(kind="manual restart", command="resume"), identity)
+            saved["session"]["name"] = name
+            self.assertTrue(record.create_session(saved))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(shutdown.main(["forget", "second-id"]), 0)
+        self.assertEqual([item["session"]["session_id"] for item in record.session_records(LOGIN)], ["first-id"])
+
+    def test_forget_does_not_remove_a_snapshot_while_its_shutdown_is_still_running(self) -> None:
+        snapshot = self.recovery("active")
+        active = session_shutdown(record.SessionRestarting(kind="restarting", at=OCTOBER,
+            prior=record.SessionStopped(kind="stopped", at=OCTOBER)), "active")
+        self.assertTrue(record.create_session(active))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(shutdown.main(["forget", "active"]), 1)
+        self.assertIn("cannot forget shutdown in progress (restarting)", error.getvalue())
+        self.assertEqual(record.read_snapshot(LOGIN), snapshot)
+        self.assertEqual(record.find_session(LOGIN, "active"), active)
 
     def test_forget_account_selector_retires_one_of_two_identical_cross_account_ids(self) -> None:
+        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
         original = self.recovery("shared-id")
         other: record.RecoverySnapshot = {**original, "login": "third@example.invalid", "label": "claude3"}
         record.write_snapshot(other)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
             self.assertEqual(shutdown.main(["forget", "shared-id"]), 2)
-        self.assertIn("more than one recovery session", error.getvalue())
+        self.assertIn("more than one local session", error.getvalue())
         with redirect_stdout(io.StringIO()):
             self.assertEqual(shutdown.main(["forget", "shared-id", "--account", "claude3"]), 0)
         self.assertEqual(record.read_snapshot(LOGIN), original)
         retired = record.read_snapshot("third@example.invalid")
         assert not isinstance(retired, record.NoRecoverySnapshot)
         self.assertEqual(retired["sessions"], [])
+
+    def test_forget_spaced_account_label_resolves_to_the_recorded_login(self) -> None:
+        _ = self.recovery("failed-id")
+        failed = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="agent exited"), "failed-id")
+        self.assertTrue(record.create_session(failed))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["forget", "--account", "claude 2", "failed-id"]), 0)
+        self.assertEqual(output.getvalue(), "failed-id-name: forgotten\n")
+        self.assertEqual(record.session_records(LOGIN), [])
+        snapshot = record.read_snapshot(LOGIN)
+        assert not isinstance(snapshot, record.NoRecoverySnapshot)
+        self.assertEqual(snapshot["sessions"], [])
+
+    def test_forget_unknown_account_uses_the_status_refusal_and_keeps_the_session(self) -> None:
+        saved = self.recovery("retained")
+        messages: list[str] = []
+        for arguments in (["status", "claude999", "--here"],
+                          ["forget", "retained", "--account", "claude999"]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(shutdown.main(arguments), 2)
+            messages.append(error.getvalue())
+        self.assertEqual(messages[1], messages[0])
+        self.assertIn("shutdown: unknown account claude999: give a note label such as claude2, or a login", messages[1])
+        self.assertEqual(record.read_snapshot(LOGIN), saved)
 
     def test_snapshot_only_name_is_not_a_down_now_cancel_or_status_selection(self) -> None:
         _ = self.recovery("crashed")

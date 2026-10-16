@@ -77,6 +77,7 @@ class HerdrTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.fake = self.root / "fake-herdr"
         source = Path(__file__).with_name("fake_herdr.py").read_text()
@@ -133,6 +134,226 @@ class HerdrTests(unittest.TestCase):
         directory = process / "fd"
         directory.mkdir(exist_ok=True)
         directory.joinpath(str(fd)).symlink_to(f"socket:[{inode}]")
+
+    def darwin(self) -> None:
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "darwin")))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "LAUNCHCTL": str(self.fake), "HERDR_PS": str(self.fake), "HERDR_LSOF": str(self.fake),
+        })))
+
+    def darwin_environment(self, pid: int, command: str, environment: str) -> None:
+        self.configure(["-o", "command=", "-p", str(pid)], command + "\n")
+        self.configure(["eww", "-o", "command=", "-p", str(pid)], command + " " + environment + "\n")
+
+    def darwin_sockets(self, text: str) -> None:
+        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"], text)
+
+    def test_darwin_starts_clear_restored_workspaces_only_after_launchd_owns_them(self) -> None:
+        self.darwin()
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__):
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+                self.responses["list herdr-fixture.service"] = ([
+                    {"stdout": "", "code": 1}, {"stdout": "", "code": 0}]
+                    if start is herdr.start_new_server else {"stdout": "", "code": 0})
+                self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+                    {"workspace_id": "w1"}, {"workspace_id": "w2"}]}}))
+                outcome = start("fixture", 10_000)
+                if start is herdr.start_server:
+                    self.assertIsInstance(outcome, herdr.ServerCreated)
+                calls = self.commands()
+                submission = ["submit", "-l", "herdr-fixture.service", "--", str(self.fake), "--session", "fixture", "server"]
+                self.assertIn(submission, calls)
+                self.assertEqual(calls[-4:], [
+                    ["list", "herdr-fixture.service"], ["--session", "fixture", "workspace", "list"],
+                    ["--session", "fixture", "workspace", "close", "w1"],
+                    ["--session", "fixture", "workspace", "close", "w2"]])
+                self.assertFalse(any("--user" in call for call in calls))
+
+    def test_darwin_adopts_an_answering_server_without_touching_launchd_or_layout(self) -> None:
+        self.darwin()
+        self.configure_herdr(["status", "server"], "status: running\n")
+        self.assertIsInstance(herdr.start_server("fixture", 10_000), herdr.ServerAdopted)
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]])
+
+    def test_darwin_exclusive_start_refuses_a_label_even_without_an_answering_socket(self) -> None:
+        self.darwin()
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        self.configure(["list", "herdr-fixture.service"], "held label\n")
+        with self.assertRaises(herdr.SessionTaken):
+            herdr.start_new_server("fixture", 10_000)
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"], ["list", "herdr-fixture.service"]])
+
+    def test_darwin_submit_race_reports_a_taken_label_without_clearing_it(self) -> None:
+        self.darwin()
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        self.responses["list herdr-fixture.service"] = [{"stdout": "", "code": 1}, {"stdout": "held", "code": 0}]
+        self.configure(["submit", "-l", "herdr-fixture.service", "--", str(self.fake), "--session", "fixture", "server"],
+                       code=1, stderr="launchd submission refused")
+        with self.assertRaises(herdr.SessionTaken):
+            herdr.start_new_server("fixture", 10_000)
+        self.assertFalse(any("workspace" in call for call in self.commands()))
+
+    def test_darwin_answering_server_with_no_owned_label_is_never_cleared(self) -> None:
+        self.darwin()
+        self.configure(["list", "herdr-fixture.service"], code=1)
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__):
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+                _ = self.responses_path.write_text(json.dumps(self.responses))
+                if start is herdr.start_new_server:
+                    with self.assertRaises(herdr.SessionTaken):
+                        _ = start("fixture", 10_000)
+                else:
+                    self.assertIsInstance(start("fixture", 10_000), herdr.ServerAdopted)
+                self.assertFalse(any("workspace" in call for call in self.commands()))
+
+    def test_darwin_stop_removes_only_the_named_launchd_label(self) -> None:
+        self.darwin()
+        herdr.stop_session("foo.service")
+        self.assertEqual(self.commands(), [["--session", "foo.service", "server", "stop"],
+            ["list", "herdr-foo.service.service"], ["remove", "herdr-foo.service.service"]])
+
+    def test_darwin_environment_uses_only_the_suffix_after_unchanged_arguments(self) -> None:
+        self.darwin()
+        command = 'claude --prompt "HERDR_PANE_ID=forged CLAUDE_CONFIG_DIR=/wrong"'
+        self.darwin_environment(42, command, "HERDR_PANE_ID=w1:p1 CLAUDE_CONFIG_DIR=/real account VALUE=a=b")
+        self.assertEqual(herdr.darwin_process_environment(42), {
+            "HERDR_PANE_ID": "w1:p1", "CLAUDE_CONFIG_DIR": "/real account", "VALUE": "a=b"})
+        self.darwin_environment(43, command, "")
+        self.assertEqual(herdr.darwin_process_environment(43), {})
+
+    def test_darwin_environment_refuses_a_changed_command_or_failed_ps(self) -> None:
+        self.darwin()
+        self.darwin_environment(42, "claude", "HERDR_PANE_ID=w1:p1")
+        self.responses["-o command= -p 42"] = [
+            {"stdout": "claude\n", "code": 0}, {"stdout": "claude HERDR_PANE_ID=forged\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        with self.assertRaisesRegex(herdr.HerdrFailure, "stable command"):
+            _ = herdr.darwin_process_environment(42)
+        self.configure(["-o", "command=", "-p", "42"], code=1, stderr="vanished")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "vanished"):
+            _ = herdr.darwin_process_environment(42)
+
+    def test_darwin_server_environment_uses_the_exact_listener_not_a_client(self) -> None:
+        self.darwin()
+        for name, directory in (("fixture", self.root / "config/herdr/sessions/fixture"),
+                                ("default", self.root / "config/herdr")):
+            with self.subTest(name=name):
+                self.darwin_sockets(f"p70\nf3\nn{directory}/herdr.sock\n" +
+                                    "p71\nf4\nn->0x1234\n")
+                self.darwin_environment(70, "herdr server", "ACCOUNT=kept CLAUDE_CONFIG_DIR=/named account")
+                self.darwin_environment(71, "herdr session attach fixture", "ACCOUNT=wrong")
+                self.assertEqual(herdr.server_environment(name), {"ACCOUNT": "kept", "CLAUDE_CONFIG_DIR": "/named account"})
+                self.assertNotIn(["eww", "-o", "command=", "-p", "71"], self.commands())
+
+    def test_darwin_server_environment_refuses_missing_ambiguous_or_unreadable_holders(self) -> None:
+        self.darwin()
+        path = self.root / "config/herdr/sessions/fixture/herdr.sock"
+        for sockets in ("", f"p70\nf3\nn{path}\np71\nf3\nn{path}\n"):
+            with self.subTest(sockets=sockets):
+                self.darwin_sockets(sockets)
+                with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket holder"):
+                    _ = herdr.server_environment("fixture")
+        self.darwin_sockets(f"p70\nf3\nn{path}\n")
+        self.configure(["-o", "command=", "-p", "70"], code=1, stderr="environment unavailable")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*environment unavailable"):
+            _ = herdr.server_environment("fixture")
+
+    def test_darwin_process_discovery_uses_sockets_uid_cwd_and_real_environment(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,command="],
+            f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
+            f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": []}}))
+        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 SHOWRUNNER_UNIT=prod SHOWRUNNER_UNIT_ID=unit")
+        self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
+        self.darwin_environment(74, "claude HERDR_PANE_ID=forged", "")
+        self.configure(["-o", "command=", "-p", "75"], code=1, stderr="vanished")
+        self.darwin_environment(76, "claude", "HERDR_PANE_ID=w1:p2")
+        self.configure(["-a", "-p", "71", "-d", "cwd", "-Fn"], "p71\nfcwd\nn/work folder\n")
+        self.configure(["-a", "-p", "72", "-d", "cwd", "-Fn"], "p72\nfcwd\nn/work folder\n")
+        self.configure(["-a", "-p", "76", "-d", "cwd", "-Fn"], code=1, stderr="gone")
+        rows = herdr.herdr_processes()
+        self.assertCountEqual(rows, [
+            herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "zsh", "/work folder"),
+            herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),
+            herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
+                               herdr.UnreadableCwd("process 76 cwd: gone"))])
+        self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+        self.assertEqual(herdr.herdr_place_of(74), herdr.NotInHerdr())
+        for pid in (73, 77):
+            self.assertNotIn(["eww", "-o", "command=", "-p", str(pid)], self.commands())
+
+    def test_darwin_live_marked_process_remains_placed_when_cwd_is_unreadable(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,command="],
+                       f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": []}}))
+        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 SHOWRUNNER_UNIT=prod SHOWRUNNER_UNIT_ID=unit")
+        self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
+        for output, code, error in (("", 1, "permission denied"), ("p72\nfcwd\n", 0, ""),
+                                    ("n/one\nn/two\n", 0, "")):
+            with self.subTest(output=output, code=code):
+                for pid in (71, 72):
+                    self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], output, code, error)
+                processes = {process.pid: process for process in herdr.herdr_processes()}
+                self.assertCountEqual(processes, [71, 72])
+                self.assertEqual(processes[71].marks, {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"})
+                for process in processes.values():
+                    self.assertIsInstance(process.working_directory, herdr.UnreadableCwd)
+                    self.assertEqual(process.place, herdr.HerdrPlace("writing", "w1:p1"))
+                self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_darwin_attached_clients_exclude_other_users_and_noninteractive_commands(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        commands = ["herdr session attach writing", "herdr --session writing", "herdr",
+                    "herdr --session writing server", "herdr --session writing pane read p1",
+                    "herdr --session writing agent list", "herdr --session writing status", "herdr session attach other"]
+        table = "".join(f"{80 + index} 1 {uid} {command}\n" for index, command in enumerate(commands))
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,command="], table + f"99 1 {uid + 1} herdr session attach writing\n")
+        self.darwin_environment(81, commands[1], "")
+        self.darwin_environment(82, "herdr", "HERDR_SESSION=writing")
+        self.assertEqual(herdr.attached_clients("writing"), herdr.ClientsAttached(3))
+        self.assertEqual(herdr.attached_clients("missing"), herdr.NoClientAttached())
+        for pid in (83, 84, 85, 86, 99):
+            self.assertNotIn(["eww", "-o", "command=", "-p", str(pid)], self.commands())
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,command="], code=1, stderr="cannot read processes")
+        self.assertIsInstance(herdr.attached_clients("writing"), herdr.ClientsUnreadable)
+
+    def test_darwin_handoff_finds_reparented_pane_shells_and_their_agents(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,command="],
+                       f"70 1 {uid} herdr server\n71 1 {uid} zsh\n72 71 {uid} claude\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1", "label": "kept"}]}}))
+        self.configure(["--session", "writing", "pane", "process-info", "--pane", "w1:p1"],
+                       json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
+        for pid, command in ((71, "zsh"), (72, "claude")):
+            self.darwin_environment(pid, command, "HERDR_PANE_ID=w1:p1")
+            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn/work\n")
+        self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
+        self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_darwin_unreadable_socket_listing_refuses_server_environment(self) -> None:
+        self.darwin()
+        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
+                       code=1, stderr="socket inspection denied")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket inspection denied"):
+            _ = herdr.server_environment("fixture")
+        self.assertEqual(herdr.herdr_processes(), [])
 
     def test_binary_missing_and_override(self) -> None:
         self.assertEqual(herdr.herdr_binary(), str(self.fake))

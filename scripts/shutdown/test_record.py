@@ -652,6 +652,71 @@ class SessionRecordTests(ShutdownTestCase):
             record.archive_session("owner@example.com", "missing")
         self.assertFalse(self.directory.exists())
 
+    def test_forget_archives_abandoned_restores_under_the_account_lock_and_keeps_the_hold(self) -> None:
+        held = account_hold()
+        record.set_account_hold(held)
+        sibling = session_shutdown(9)
+        self.assertTrue(record.create_session(sibling))
+        progress: tuple[record.SessionProgress, ...] = (
+            record.SessionRestartFailed(kind="restart failed", at=NOW, reason="agent exited"),
+            record.SessionNeedsManualRestart(kind="manual restart", command="resume"),
+            record.SessionStopped(kind="stopped", at=NOW),
+            record.SessionAlreadyGone(kind="already gone", at=NOW),
+            record.ProcessIdentityLost(kind="process identity lost", at=NOW),
+        )
+        replace = os.replace
+
+        def archive(source: Path, target: Path) -> None:
+            with (self.directory / "lock").open("a+") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            replace(source, target)
+
+        for number, state in enumerate(progress, 1):
+            with self.subTest(kind=state["kind"]):
+                saved = session_shutdown(number, progress=state)
+                self.assertTrue(record.create_session(saved))
+                with patch.object(os, "replace", side_effect=archive):
+                    result = record.forget_session(saved["login"], saved["session"]["session_id"], "natedev")
+                self.assertIsInstance(result, record.SessionForgotten)
+                self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
+                archived = self.directory / "history" / f"{NOW}-session-{number}.json"
+                self.assertEqual(json.loads(archived.read_text()), saved)
+        self.assertEqual(record.session_records(held["login"]), [sibling])
+        self.assertEqual(record.account_hold(held["login"]), held)
+
+    def test_forget_rechecks_progress_and_retains_in_progress_or_foreign_records(self) -> None:
+        states: tuple[record.SessionProgress, ...] = (
+            record.SessionWaiting(kind="waiting"),
+            record.SessionStopping(kind="stopping", at=NOW),
+            record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW)),
+            record.SessionRestoredTimersPending(kind="timers pending", at=NOW, timers=[]),
+        )
+        for number, progress in enumerate(states, 1):
+            saved = session_shutdown(number, progress=progress)
+            self.assertTrue(record.create_session(saved))
+            with self.subTest(kind=progress["kind"]):
+                self.assertIsInstance(record.forget_session(saved["login"], saved["session"]["session_id"], "natedev"), record.SessionRetained)
+                self.assertEqual(record.find_session(saved["login"], saved["session"]["session_id"]), saved)
+        foreign = session_shutdown(9, progress=record.SessionStopped(kind="stopped", at=NOW))
+        foreign["machine"] = "Mac"
+        self.assertTrue(record.create_session(foreign))
+        self.assertIsInstance(record.forget_session(foreign["login"], "session-9", "natedev"), record.SessionRetained)
+        self.assertEqual(record.find_session(foreign["login"], "session-9"), foreign)
+        self.assertFalse((self.directory / "history").exists())
+
+    def test_forget_legacy_restore_does_not_reappear_and_preserves_siblings_and_hold(self) -> None:
+        old = shutdown_record(state="restart partial",
+            progress=record.SessionRestartFailed(kind="restart failed", at=NOW, reason="not live"))
+        old["entries"].append(entry(number=2))
+        write_old(old)
+        held = record.account_hold(old["login"])
+        outcome = record.forget_session(old["login"], "session-1", "natedev")
+        self.assertIsInstance(outcome, record.SessionForgotten)
+        self.assertEqual([saved["session"]["session_id"] for saved in record.session_records(old["login"])], ["session-2"])
+        self.assertEqual(record.account_hold(old["login"]), held)
+        self.assertIsInstance(record.forget_session(old["login"], "session-1", "natedev"), record.NoShutdown)
+
     def test_session_records_hold_file_persists_without_any_session(self) -> None:
         hold = account_hold("Owner@Example.com")
         record.set_account_hold(hold)

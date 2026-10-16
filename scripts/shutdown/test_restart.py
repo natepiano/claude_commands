@@ -297,10 +297,14 @@ class RestartTests(ShutdownTestCase):
     state_root: Path = Path()
     desktop_state: restart.DesktopLaunchState = restart.DesktopLaunchState()
     account = Account("claude", LOGIN, LABEL)
+    conversation_lookup = staticmethod(restart._conversation_launch)  # pyright: ignore[reportPrivateUsage]
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        # Default fixtures model Linux; Mac cases override dispatch locally.
+        _ = cast(object, self.enterContext(patch.object(sys, "platform", "linux")))
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.desktop_state = restart.DesktopLaunchState()
         self.addCleanup(self.desktop_state.restore, dry_run=True)
@@ -323,6 +327,8 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(accounts.setup("claude2"), [])
         _ = (self.root / ".claude2/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
         self.configure_groups()
+        # Existing restart fixtures represent sessions with saved conversations.
+        _ = self.enterContext(patch.object(restart, "_conversation_launch", return_value=restart.ResumeConversation()))
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
 
@@ -936,31 +942,148 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(timestamp.microsecond, 0)
         self.assertEqual(list(destination.parent.iterdir()), [destination])
 
-    def test_mac_supervised_terminal_restart_requests_in_place_and_lost_supervisor_opens_window(self) -> None:
-        owner = top_level("mac-supervised", host=inventory.TerminalHost(
-            kind="terminal", supervisor=inventory.SupervisorIdentity(
-                kind="supervisor", pid=902, proc_start="supervisor-start")))
-        destination = self.state_root / "relaunch/902.json"
-        with (patch.object(sys, "platform", "darwin"),
-              patch.object(inventory, "_process_start", return_value="supervisor-start"),
-              patch.object(restart, "_run", side_effect=AssertionError("in-place restart opens a window"))):
-            launched = restart._launch_session(entry(owner), "resume on Mac", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        self.assertIsInstance(launched, restart.SessionLaunched)
-        request = cast(dict[str, object], json.loads(destination.read_text()))
-        argv = cast(list[str], request["argv"])
-        self.assertEqual(argv[argv.index("--resume") + 1], owner["session_id"])
-        self.assertEqual(argv[-1], "resume on Mac")
-        self.assertEqual(self.desktop_state.started_windows, 0)
-        destination.unlink()
+    def test_mac_terminal_without_live_supervisor_resumes_in_herdr_and_opens_ghostty_attach(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        owner["host"] = inventory.TerminalHost(kind="terminal",
+            supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                proc_start="supervisor-start"))
+        saved = entry(owner)
+        self.create([saved])
+        before = record.session_records(LOGIN)
+        self.allow_new_herdr_server(responses, "kept-name")
+        prompt = "Resume this work.\nKeep 'quotes' and $(literal)."
         commands = CommandRecorder()
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(inventory, "_process_start", return_value="reused-pid"),
-              patch.object(restart, "_run", commands)):
-            launched = restart._launch_session(entry(owner), "resume on Mac", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        self.assertIsInstance(launched, restart.SessionLaunched)
-        self.assertEqual(commands.calls[0][:3], ["open", "-na", "/Applications/Nix Apps/Ghostty.app"])
+              patch.object(inventory, "_process_start", return_value="reused-supervisor-pid"),
+              patch.object(herdr, "start_new_server") as server,
+              patch.object(relaunch, "write_request") as supervisor,
+              patch.object(restart, "_run", commands),
+              patch.object(conversation_pause, "record_scheduled_prompts",
+                  wraps=conversation_pause.record_scheduled_prompts) as scheduled):
+            result = restart._launch_session(saved, prompt, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        server.assert_called_once_with("kept-name", 90_000)
+        supervisor.assert_not_called()
+        scheduled.assert_called_once_with("resume-id", (prompt,))
+        calls = self.herdr_calls(log)
+        opened = next(row for row in calls if row[2:4] == ["workspace", "create"])
+        self.assertEqual(opened[opened.index("--cwd") + 1], owner["cwd"])
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(self.root / ".claude3"), opened)
+        self.assertIn("CLAUDE_CODE_REMOTE_MEMORY_DIR=" + str(self.root / ".claude"), opened)
+        self.assertIn("HERDR_AGENT_PANE=1", opened)
+        starts = [row for row in calls if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--") + 1:], [
+            "--resume", "resume-id", "-n", "kept name", "--remote-control", "kept name",
+            "--model", "opus", "--settings", '{"disableAgentView": true}'])
+        self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]],
+            [["--session", "kept-name", "agent", "prompt", "w2:p1", prompt]])
+        self.assertEqual(commands.calls, [["open", "-na", "/Applications/Nix Apps/Ghostty.app",
+            "--args", "-e", str(self.root / "fake-herdr"), "session", "attach", "kept-name"]])
         self.assertEqual(self.desktop_state.started_windows, 1)
-        self.assertFalse(destination.exists())
+        self.assertEqual(record.session_records(LOGIN), before)
+
+    def test_mac_terminal_live_supervisor_attaches_after_in_process_prompt_delivery(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        owner["host"] = inventory.TerminalHost(kind="terminal",
+            supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                proc_start="supervisor-start"))
+        self.allow_new_herdr_server(responses, "kept-name")
+        prompt = "Resume in the same window.\nKeep the opening prompt intact."
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(herdr, "start_new_server") as server,
+              patch.object(restart, "_run", side_effect=AssertionError("supervised restart opened a window")),
+              patch.object(conversation_pause, "record_scheduled_prompts",
+                  wraps=conversation_pause.record_scheduled_prompts) as scheduled):
+            result = restart._launch_session(entry(owner), prompt, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        server.assert_called_once_with("kept-name", 90_000)
+        request = cast(relaunch.RelaunchRequest, json.loads(relaunch.request_path(902).read_text()))
+        self.assertEqual(request["argv"], [str(self.root / "fake-herdr"), "session", "attach", "kept-name"])
+        self.assertEqual(request["cwd"], owner["cwd"])
+        self.assertEqual(request["environment"], {})
+        self.assertEqual(request["unset"], [])
+        self.assertEqual(self.desktop_state.started_windows, 0)
+        calls = self.herdr_calls(log)
+        self.assertEqual(len([row for row in calls if row[2:4] == ["agent", "start"]]), 1)
+        self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]],
+            [["--session", "kept-name", "agent", "prompt", "w2:p1", prompt]])
+        scheduled.assert_called_once_with("resume-id", (prompt,))
+
+    def test_mac_terminal_dry_run_previews_herdr_and_attach_without_launch_or_record_changes(self) -> None:
+        saved = entry(top_level("mac-preview", host=inventory.TerminalHost(kind="terminal")))
+        self.create([saved])
+        before = self.files()
+        output = io.StringIO()
+        commands = CommandRecorder()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.dict(os.environ, {"HERDR_BIN": "/test tools/herdr"}),
+              patch.object(herdr, "start_new_server") as server,
+              patch.object(herdr, "open_pane") as pane,
+              patch.object(herdr.Herdr, "start_agent") as agent,
+              patch.object(restart, "_run", commands), redirect_stdout(output)):
+            _ = restart._launch_session(saved, "resume", self.desktop_state, dry_run=True)  # pyright: ignore[reportPrivateUsage]
+        server.assert_not_called()
+        pane.assert_not_called()
+        agent.assert_not_called()
+        self.assertIn("herdr mac-preview: resume mac-preview in a new pane", output.getvalue())
+        self.assertEqual(commands.calls, [["open", "-na", "/Applications/Nix Apps/Ghostty.app",
+            "--args", "-e", "/test tools/herdr", "session", "attach", "mac-preview"]])
+        self.assertEqual(self.files(), before)
+
+    def test_mac_terminal_refuses_unreadable_or_inherited_server_environment_before_pane_or_window(self) -> None:
+        owner, _responses, _log = self.herdr_restart_fixture()
+        owner["host"] = inventory.TerminalHost(kind="terminal")
+        for environment in ({"CLAUDE_CODE_OAUTH_TOKEN": "server-value"}, herdr.HerdrFailure("environment unreadable")):
+            with (self.subTest(environment=environment),
+                  patch.object(sys, "platform", "darwin"),
+                  patch.object(herdr, "start_new_server"),
+                  patch.object(herdr, "server_environment") as read,
+                  patch.object(herdr, "open_pane") as pane,
+                  patch.object(herdr.Herdr, "start_agent") as agent,
+                  patch.object(restart, "_run") as window):
+                if isinstance(environment, herdr.HerdrFailure):
+                    read.side_effect = environment
+                    reason = "environment unreadable"
+                else:
+                    read.return_value = environment
+                    reason = "carries CLAUDE_CODE_OAUTH_TOKEN"
+                with self.assertRaisesRegex(OSError, reason):
+                    _ = restart._launch_session(entry(owner), "resume", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                read.assert_called_once_with("kept-name")
+                pane.assert_not_called()
+                agent.assert_not_called()
+                window.assert_not_called()
+
+    def test_mac_terminal_occupied_name_refuses_before_pane_agent_or_window(self) -> None:
+        owner, _responses, _log = self.herdr_restart_fixture()
+        owner["host"] = inventory.TerminalHost(kind="terminal")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(herdr, "start_new_server", side_effect=herdr.SessionTaken("kept-name")) as server,
+              patch.object(herdr, "open_pane") as pane,
+              patch.object(herdr.Herdr, "start_agent") as agent,
+              patch.object(restart, "_run") as window,
+              self.assertRaisesRegex(restart.HerdrDestinationTaken, "kept-name")):
+            _ = restart._launch_session(entry(owner), "resume", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        server.assert_called_once_with("kept-name", 90_000)
+        pane.assert_not_called()
+        agent.assert_not_called()
+        window.assert_not_called()
+
+    def test_mac_terminal_agent_exit_stops_its_new_server_without_opening_a_window(self) -> None:
+        owner, _responses, _log = self.herdr_restart_fixture()
+        owner["host"] = inventory.TerminalHost(kind="terminal")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(herdr, "start_new_server"),
+              patch.object(herdr.Herdr, "agents", return_value=[]),
+              patch.object(herdr.Herdr, "start_agent", side_effect=herdr.AgentExited("kept-name", "w2:p1")),
+              patch.object(herdr, "stop_session") as stop,
+              patch.object(restart, "_run") as window,
+              self.assertRaisesRegex(OSError, "agent process exited before startup completed")):
+            _ = restart._launch_session(entry(owner), "resume", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        stop.assert_called_once_with("kept-name")
+        window.assert_not_called()
 
     def test_missing_or_reused_supervisor_opens_window_on_recorded_desktop(self) -> None:
         for actual_start in ("", "reused-pid"):
@@ -1066,12 +1189,20 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(failed["move_id"], saved["request_id"])
         self.assertEqual(failed["reason"], "manual restart")
 
-    def test_move_target_reopens_terminal_through_accounts_exec(self) -> None:
+    def test_mac_terminal_move_uses_target_account_in_herdr_and_opens_only_attach(self) -> None:
         owner = top_level("move-terminal", host=inventory.TerminalHost(kind="terminal"))
-        with patch.object(sys, "platform", "darwin"):
+        with (patch.object(sys, "platform", "darwin"),
+              patch.dict(os.environ, {"HERDR_BIN": "/test tools/herdr"}),
+              patch.object(restart, "_herdr_launch") as launch):
             commands, _ = self.moved_restart(owner)
-        launch = next(argv for argv in commands if argv[:1] == ["open"])
-        self.assert_move_resume(launch[-1], owner)
+        parts = cast(restart.ResumeParts, launch.call_args.args[0])
+        self.assertEqual(parts.account, restart.MoveResumeAccount("claude3"))
+        self.assertEqual(parts.claude_arguments[:2], ("--resume", "move-terminal"))
+        self.assertIn("You were moved from claude2 to claude3", parts.opening_prompt)
+        self.assertEqual(launch.call_args.args[1], restart.NewHerdrSession("move-terminal"))
+        self.assertEqual([argv for argv in commands if argv[:1] == ["open"]], [[
+            "open", "-na", "/Applications/Nix Apps/Ghostty.app", "--args", "-e",
+            "/test tools/herdr", "session", "attach", "move-terminal"]])
 
     def test_move_target_unknown_host_prints_one_manual_restart_line(self) -> None:
         owner = top_level("move-manual", name="kept name")
@@ -1267,6 +1398,21 @@ class RestartTests(ShutdownTestCase):
         self.assertTrue(any(row[2:4] == ["workspace", "create"] for row in self.herdr_calls(log)))
         self.assertEqual(record.read_snapshot(snapshot["login"]), snapshot)
         self.assertIn(saved["session"]["name"], output.getvalue())
+
+    def test_linux_restart_fixture_on_a_darwin_host_runs_only_fake_service_commands(self) -> None:
+        run_program = herdr.run_program
+
+        def only_fakes(argv: list[str], timeout: float = 10.0, *,
+                       environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertNotIn(Path(argv[0]).name, {"launchctl", "systemctl", "systemd-run"})
+            return run_program(argv, timeout, environment=environment)
+
+        result = unittest.TestResult()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(herdr, "run_program", side_effect=only_fakes)):
+            _ = RestartTests("test_tmux_standalone_migrates_conversation_account_model_and_one_prompt").run(result)
+        self.assertTrue(result.wasSuccessful(), str(result.errors + result.failures))
 
     def test_tmux_standalone_migrates_conversation_account_model_and_one_prompt(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -1471,6 +1617,60 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]],
                          [["--session", "writing", "agent", "prompt", "w2:p1", prompt]])
         self.assertEqual(conversation_pause.read_scheduled_prompts("resume-id"), (prompt,))
+
+    def test_missing_conversation_starts_with_the_same_id_and_reports_the_fresh_start(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        with (patch.object(restart, "_conversation_launch", self.conversation_lookup),
+              redirect_stdout(io.StringIO()) as output):
+            result = restart._launch_session(entry(owner), "Continue here.", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        calls = self.herdr_calls(log)
+        start = next(row for row in calls if row[2:4] == ["agent", "start"])
+        self.assertEqual(start[start.index("--") + 1:], [
+            "--session-id", "resume-id", "-n", "kept name", "--remote-control", "kept name",
+            "--model", "opus", "--settings", '{"disableAgentView": true}'])
+        self.assertEqual(output.getvalue().splitlines(), [
+            "kept name: no conversation to resume; started a new one",
+            "herdr session attach writing"])
+
+    def test_existing_conversation_in_the_launch_account_still_resumes(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        projects = Path(owner.get("config_dir", "")) / "projects" / "encoded-folder"
+        projects.mkdir(parents=True)
+        _ = (projects / "resume-id.jsonl").write_text('{"type":"user"}\n')
+        with (patch.object(restart, "_conversation_launch", self.conversation_lookup),
+              redirect_stdout(io.StringIO()) as output):
+            _ = restart._launch_session(entry(owner), "Continue here.", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        start = next(row for row in self.herdr_calls(log) if row[2:4] == ["agent", "start"])
+        self.assertEqual(start[start.index("--") + 1:start.index("--") + 3], ["--resume", "resume-id"])
+        self.assertNotIn("--session-id", start)
+        self.assertNotIn("no conversation to resume", output.getvalue())
+
+    def test_account_move_uses_the_target_transcript_instead_of_the_source(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        # Numbered accounts normally share projects; isolate the old source here.
+        source_projects = Path(owner.get("config_dir", "")) / "projects"
+        source_projects.unlink()
+        source = source_projects / "source-folder"
+        source.mkdir(parents=True)
+        _ = (source / "resume-id.jsonl").write_text('{"type":"user"}\n')
+        target = self.root / ".claude2"
+        _ = (target / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": LOGIN},
+            "projects": {owner["cwd"]: {"hasTrustDialogAccepted": True}}}))
+        saved = entry(owner)
+        saved["target"] = "claude2"
+        with (patch.object(restart, "_conversation_launch", self.conversation_lookup),
+              redirect_stdout(io.StringIO()) as output):
+            _ = restart._launch_session(saved, "Account move.", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            projects = target / "projects" / "target-folder"
+            projects.mkdir(parents=True)
+            _ = (projects / "resume-id.jsonl").write_text('{"type":"user"}\n')
+            _ = restart._launch_session(saved, "Account move.", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        starts = [row for row in self.herdr_calls(log) if row[2:4] == ["agent", "start"]]
+        self.assertEqual([row[row.index("--") + 1:row.index("--") + 3] for row in starts],
+            [["--session-id", "resume-id"], ["--resume", "resume-id"]])
+        self.assertEqual(output.getvalue().count("no conversation to resume; started a new one"), 1)
 
     def test_herdr_restart_refuses_a_pane_with_a_live_agent(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -2547,15 +2747,9 @@ class RestartTests(ShutdownTestCase):
         restored = entry(top_level('quoted-id', name=name, cwd=str(cwd), model=inventory.ModelName(kind='model', name=model), host=inventory.TerminalHost(kind='terminal')), where=record.WhereSaid(kind='said', text=where, at=STOPPED))
         config_dir = str(self.root / ".claude3")
         restored['session']['config_dir'] = config_dir
-        saved = records_for_test([restored])
-        self.create(saved)
-        output = io.StringIO()
-        with patch.object(sys, 'platform', 'darwin'), patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), patch('subprocess.run', return_value=subprocess.CompletedProcess(['kdotool', 'get_desktop'], 0, '1\n', '')), redirect_stdout(output):
-            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        note = restart.restart_note(restored, RESTARTED)
+        resume_command = restart._resume_command(restored['session'], note, login=LOGIN, at=STOPPED)  # pyright: ignore[reportPrivateUsage]
         memory_base = str(Path.home() / '.claude')
-        launch_line = next((line for line in output.getvalue().splitlines() if 'Ghostty.app' in line))
-        outer = shlex.split(launch_line)
-        resume_command = outer[outer.index('-ic') + 1]
         binary = self.root / 'bin'
         binary.mkdir()
         argv_log = self.root / 'claude-argv.json'
@@ -2573,7 +2767,6 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual((self.root / 'claude-config-dir').read_text(encoding='utf-8'), config_dir)
         self.assertEqual((self.root / 'claude-memory-dir').read_text(encoding='utf-8'), memory_base)
         actual = cast(list[str], cast(object, json.loads(argv_log.read_text(encoding='utf-8'))))
-        note = restart.restart_note(restored, RESTARTED)
         self.assertEqual(actual, ['--resume', 'quoted-id', '-n', name, '--remote-control', name, '--model', model, '--settings', '{"disableAgentView": true}', note])
 
     def test_confirmation_keeps_only_final_poll_records_for_remote_control(self) -> None:
@@ -3630,7 +3823,7 @@ class RestartTests(ShutdownTestCase):
     def files(self) -> dict[str, bytes]:
         return {str(path.relative_to(self.state_root)): path.read_bytes() for path in self.state_root.rglob("*") if path.is_file()}
 
-    def test_restart_dry_run_fixture_preserves_output_and_files(self) -> None:
+    def test_linux_restart_dry_run_fixture_preserves_output_and_files(self) -> None:
         saved = [
             entry(top_level("zeta", host=inventory.TerminalHost(kind="terminal"))),
             entry(top_level("alpha", host=inventory.TerminalHost(kind="terminal"))),
@@ -3641,18 +3834,16 @@ class RestartTests(ShutdownTestCase):
         output = io.StringIO()
         def resume(parts: restart.ResumeParts) -> str:
             return f"claude --resume {parts.claude_arguments[1]}"
-        with patch.object(restart, "_resume_shell", side_effect=resume), patch.object(restart, "_live_session_ids", return_value=frozenset()), redirect_stdout(output):
+        with patch.object(sys, "platform", "linux"), patch.object(restart, "_resume_shell", side_effect=resume), patch.object(restart, "_live_session_ids", return_value=frozenset()), redirect_stdout(output):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         self.assertEqual(output.getvalue().replace(str(restart.SCRIPTS), "<scripts>").splitlines(), [
             "alpha: from shutdown record", "manual: from shutdown record", "zeta: from shutdown record",
             f"{sys.executable} <scripts>/message/send.py retire --to session:alpha --from shutdown --key shutdown-owner@example.com-alpha",
-            ("manual restart alpha: claude --resume alpha" if sys.platform == "linux" else
-             "open -na '/Applications/Nix Apps/Ghostty.app' --args -e zsh -ic 'claude --resume alpha'"),
+            "manual restart alpha: claude --resume alpha",
             f"{sys.executable} <scripts>/message/send.py retire --to session:manual --from shutdown --key shutdown-owner@example.com-manual",
             "manual restart manual: claude --resume manual",
             f"{sys.executable} <scripts>/message/send.py retire --to session:zeta --from shutdown --key shutdown-owner@example.com-zeta",
-            ("manual restart zeta: claude --resume zeta" if sys.platform == "linux" else
-             "open -na '/Applications/Nix Apps/Ghostty.app' --args -e zsh -ic 'claude --resume zeta'"),
+            "manual restart zeta: claude --resume zeta",
         ])
         self.assertEqual(self.files(), before)
 

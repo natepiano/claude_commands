@@ -1768,6 +1768,38 @@ class SessionRetained:
     record: SessionShutdown
 
 
+@dataclass(frozen=True)
+class SessionForgotten:
+    record: SessionShutdown
+
+
+def forget_session(login: str, session_id: str, machine: str) -> SessionForgotten | SessionRetained | NoShutdown:
+    """Archive an abandoned restore, rechecking its progress under the account lock."""
+    if _existing_account_directory(login) is None:
+        return NoShutdown()
+    # Preserve legacy holds and retire old copies so they cannot reappear after archive.
+    _ = migrate(login)
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "sessions" / _session_filename(session_id)
+        if not _regular_record(path):
+            return NoShutdown()
+        saved = _session_shutdown(_read_json(path), str(path))
+        _check_account(login, saved["login"], path)
+        if saved["session"]["session_id"] != session_id:
+            raise InvalidRecord(f"{path} is used by a different session id")
+        if saved["machine"].casefold() != machine.casefold() or saved["progress"]["kind"] not in {
+            "stopped", "already gone", "process identity lost", "restart failed", "manual restart",
+        }:
+            return SessionRetained(saved)
+        history = directory / "history"
+        _ = _record_directory(history, create=True)
+        target = history / f"{saved['requested_at']}-{path.name}"
+        if _lstat(target) is not None:
+            raise InvalidRecord(f"{target} already exists")
+        os.replace(path, target)
+        return SessionForgotten(saved)
+
+
 def withdraw_session(
     login: str, session_id: str, restore_and_notify: Callable[[SessionShutdown], None]
 ) -> SessionWithdrawn | SessionRetained:

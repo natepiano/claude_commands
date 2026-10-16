@@ -334,7 +334,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 13 — Remove tmux from productions and sessions on Linux  · status: todo
 
-**Depends on:** Phase 12
+**Depends on:** Phase 12, Phase 14
 
 **Blocked by:** `shutdown.py tmux-free` (Phase 12), run from the installed tree on natedev with tmux on PATH, prints `nothing needs tmux` and exits 0: `tmux list-sessions` lists no session or reports no server, `herdr.live_sessions()` answers, and one `snapshot_inventory()` is complete with no owner or worker on a tmux, tmux-unit or unknown host.
 
@@ -442,6 +442,73 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Acceptance gate:** `merge_gate.py --tests-only` green (it covers `scripts/delegate`, `scripts/production`, `scripts/shutdown`, `scripts/message`, `scripts/hooks`, `scripts/nightly_review` and `scripts/herdr`); `basedpyright scripts/production scripts/shutdown scripts/message scripts/hooks scripts/nightly_review scripts/herdr` prints `0 errors, 0 warnings`; `grep -rln tmux scripts/production scripts/shutdown scripts/message scripts/delegate scripts/hooks commands/showrunner commands/producer commands/shutdown.md docs/production_format.md docs/as-built` names only lines kept on purpose, each listed in the phase report: legacy-record parsing and its manual commands, the `tmux` field of `sessions.SessionRecord` (Claude's wire format), the `/exit` guard in `pre-tool-use-showrunner-move-guard.py`, the old `tmux <name>,` log form in `waiting.py` 514–515, the user quotes in `add_showrunner.md` and `produce.md`, `herdr-trial.md`, earlyoom's tmux server line in `build-memory-admission.md`, and the recorded data in `director-model-study-results.json`. Tests cover legacy hosts and leftovers in records and snapshots through parsing, `status`, `now` and restart, never as herdr names and never cleared silently. The phase report quotes `tmux-free`'s passing output (`nothing needs tmux`, exit 0), run from the installed tree before dispatch.
 
-### Phase 14 — herdr on the Mac  · status: moved
+### Phase 14 — herdr on the Mac  · status: done
 
-Moved to its own unit (showrunner, 2026-10-15): `docs/plans/build-followups-herdr-mac.md`. It starts after Phase 13 merges.
+**Depends on:** Phase 8, Phase 12
+
+Runs before Phase 13 (showrunner, 2026-10-16: tmux removal waits on sessions moving, so the Mac goes first); folded back from `docs/plans/build-followups-herdr-mac.md`, which is deleted.
+
+**User sees:** before — Mac standalones run straight in Ghostty windows, and Mac sessions have no herdr; after — `herdr-claude` on the Mac opens a standalone in its own herdr session, and a Mac restart brings sessions back in herdr in a Ghostty window attached to them.
+
+#### Work Order
+
+**Goal:** the herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
+
+**Spec:**
+
+1. `herdr.py` server control on Darwin; Linux keeps systemd. The platform is chosen once by `sys.platform`; tests cover both with fake programs (`LAUNCHCTL` env names the program).
+   - Both the adopting `start_server` and the exclusive `start_new_server` use `launchctl submit -l <server_unit> -- <herdr> --session <name> server`; `stop_session` uses `launchctl remove <server_unit>`. Each keeps its service-ownership check (today `_server_unit_active` runs `systemctl --user is-active`; on Darwin `launchctl list <server_unit>`) and restored-workspace clearing (`_clear_restored_workspaces`). `start_new_server` raises `SessionTaken` for a label launchd already holds or a server it did not start.
+   - `server_environment(name)` (696) reads `/proc/net/unix` to find the process listening on the session's `herdr.sock`; `_herdr_launch` calls it on every herdr restart (restart.py 1068). The Darwin form finds that listener through `lsof` (`HERDR_LSOF`) and reads its environment through Spec 2's `ps eww` parse. It is verified on the Mac (Spec 5) before Mac herdr restart is enabled; until then a Mac `terminal` host keeps today's path. An unreadable environment and a server carrying a must-be-unset variable stay refusals.
+2. `herdr_place_of`, `herdr_processes` and `attached_clients` on Darwin read processes through `ps` (`HERDR_PS` names the program for tests; the Mac has no `/proc`):
+   - Only the current user's processes (`ps -U <uid> -o pid=,ppid=,uid=,command=`), each row's uid checked again.
+   - Environment through Phase 6's rule: the `ps eww` text after the process's own `ps -o command=` argv, so argument text such as `HERDR_PANE_ID=w1:p1` in a prompt never counts. `herdr.py` holds that parse; `inventory._process_environment`'s Darwin branch calls it, so the rule lives once.
+   - `cwd` per process from `lsof -a -p <pid> -d cwd -Fn` (`HERDR_LSOF` names it).
+   - A process that vanishes between calls, or whose call fails, is skipped.
+3. `restart.py` `terminal` host on the Mac restarts into herdr in-process (`_herdr_launch` with `NewHerdrSession` and the full `ResumeParts`, as Linux window hosts do) and opens `Ghostty.app` with `-e herdr session attach <name>`.
+4. **Outside this repo (the showrunner's, in `~/nixos`, nix-darwin only; no worker makes these):** herdr in the Mac's packages; `herdr-claude` and the `continue` alias already sit in `modules/common/shell.nix` (shared with natedev, added in Phase 8).
+5. Live check on the Mac (needs the user at the Mac for the Ghostty window): `herdr-claude --name herdr-mac-check`; `server_environment("herdr-mac-check")` returns the server's environment; a second `herdr-claude --name herdr-mac-check` is refused; `/shutdown --only herdr-mac-check --restart`, the conversation comes back attached. Remove the check session afterwards.
+6. Added by the showrunner 2026-10-16 after the natedev Ghostty live check: a restart whose session has no transcript (it never got a prompt) starts it fresh under the same session id (`claude --session-id`) and prints `<name>: no conversation to resume; started a new one`; `shutdown.py forget [--account <label>] <name or id>` also retires a stopped or failed entry from the local shutdown record, so `agents status` stops offering a bring-back that cannot work, and `--account` resolves the label as the other verbs do.
+
+**Files:**
+- `scripts/herdr/herdr.py` — launchd for both server starts and stop, ownership check, `ps` and `lsof` paths, Darwin environment parse, Darwin `server_environment`.
+- `scripts/herdr/test_herdr.py` — Darwin cases: adopting and exclusive starts, a taken label, restored workspaces cleared, UID filtering, cwd, vanished processes, argument text with fake environment assignments, server environment found by its socket and unreadable.
+- `scripts/shutdown/inventory.py` — Darwin environment through `herdr.py`.
+- `scripts/shutdown/test_inventory.py` — follows.
+- `scripts/shutdown/restart.py` — Mac terminal host into herdr.
+- `scripts/shutdown/test_restart.py` — that case.
+- `scripts/shutdown/shutdown.py`, `scripts/shutdown/record.py` — `forget` reaches shutdown records (Spec 6).
+- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_record.py` — follow.
+
+**Workers:** 2 writers (no test lane; `test` opens as impl); split the library and inventory against restart.
+- `impl` — `herdr.py`, `test_herdr.py`, `inventory.py`, `test_inventory.py`; hub: `scripts/herdr/herdr.py`.
+- `test` (opens as impl) — `restart.py`, `test_restart.py`.
+
+**Constraints from prior phases:** `herdr.py` runs servers as systemd user units on Linux (`start_server` adopts, `start_new_server` is exclusive) and finds places, clients and server environments through `/proc`; session names follow herdr's contract (`[A-Za-z0-9_.-]+`, at most 64 bytes, not `.` or `..`) and `server_unit` is `herdr-<name>.service`; `start_agent` takes `OpeningPrompt | NoOpeningPrompt`; `herdr_sessions.py start|resume|list|attach`; `restart.py` restarts ghostty and zed hosts into herdr on Linux through `_herdr_launch(parts, NewHerdrSession(name), ...)` and leaves `terminal` unchanged; `inventory._process_environment` parses Darwin environment after the argv prefix (Phase 6); tmux code is still present (Phase 13 removes it after this phase); the Mac has no tmux, so a Mac change never touches the tmux branches, and Phase 13 removes them beside the launchd code this phase adds. Since that plan was written, Phases 9–12 added crash restore from snapshots (`materialize_snapshot`, `RecoveryCrashCheck`), the snapshot outcome in `agents status`, tmux standalone migration through `_herdr_launch`, `shutdown.py tmux-free` and `restart` exit status; line numbers cited in this Work Order predate them, so find functions by name.
+
+**Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr` and `scripts/shutdown` green on natedev and on the Mac; `basedpyright scripts/herdr scripts/shutdown` prints `0 errors, 0 warnings`. The live check in Spec 5 passes. The Mac half (Mac tests and Spec 5) runs from the pushed checkpoint, because the Mac gets this branch only through origin; the showrunner holds the merge until it passes, and a failure becomes a follow-up phase.
+
+
+### Phase 15 — herdr sessions across machines  · status: todo
+
+**Depends on:** Phase 14
+
+**User sees:** before — herdr sessions on natedev and on the Mac are separate; each machine sees only its own. After — from either machine, the user can bring a session from the other machine into reach and attach to it, kept simple: adding a session from the other machine may be a manual step the user takes per session.
+
+#### Work Order
+
+**Goal:** the simplest working way to reach a herdr session on the other machine from this one, found by research first and kept small (user, 2026-10-16: "it's fine if it does research and i don't want it to be overly complicated - it can be the case that i manually add sessions that i want from another system").
+
+**Spec:**
+
+1. Research first (the unit director, before any worker): what herdr itself offers for remote or ssh attach (its docs and `herdr --help` on both machines), and whether `ssh -t <host> herdr --session <name> session attach` works from a Ghostty window on each machine. Record the findings and the chosen design in this Work Order before dispatch; the showrunner settles the design. First finding (natedev, herdr 0.9.0, 2026-10-16): herdr has its own remote attach, `herdr --remote <ssh-target> [--session <name>]`, and saved SSH machines (`herdr machine add|list|remove|enable|disable`; `add` prepares the remote herdr server). Still to check once the Mac has herdr: whether a saved machine's sessions show up in the local herdr, and whether `--remote` works both ways from Ghostty. If it does, the design is a thin wrapper or no code at all.
+2. Default design unless research finds a simpler one: `herdr_sessions.py` gains a manual way to name a remote session (for example `herdr_sessions.py add-remote <host> <name>`, kept in a small per-machine file), `list` shows those remote entries beside local sessions with their host, and `attach <name>` runs the ssh attach for a remote entry. No automatic mirroring, no background sync.
+3. Live check on both machines: attach from natedev to a Mac session and from the Mac to a natedev session.
+
+**Files:**
+- `scripts/herdr/herdr_sessions.py` — remote entries, list, attach.
+- `scripts/herdr/test_herdr_sessions.py` — remote entry add, list, ssh attach argv.
+
+**Workers:** 1 writer.
+- `impl` — `herdr_sessions.py`, `test_herdr_sessions.py`.
+
+**Acceptance gate:** `merge_gate.py --tests-only` green; `basedpyright scripts/herdr` prints `0 errors, 0 warnings`; the Spec 3 live check passes both ways.

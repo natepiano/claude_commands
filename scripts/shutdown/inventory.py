@@ -515,45 +515,9 @@ def _newest_unit_plans() -> dict[str, str]:
 def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         try:
-            command = subprocess.run(
-                ("ps", "-o", "command=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if command.returncode:
-                return {}
-            result = subprocess.run(
-                ("ps", "eww", "-o", "command=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if result.returncode:
-                return {}
-            confirmed_command = subprocess.run(
-                ("ps", "-o", "command=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            return herdr.darwin_process_environment(pid)
+        except (herdr.HerdrFailure, subprocess.TimeoutExpired):
             return {}
-        if confirmed_command.returncode or confirmed_command.stdout != command.stdout:
-            return {}
-        arguments = command.stdout.rstrip("\r\n").lstrip()
-        with_environment = result.stdout.rstrip("\r\n").lstrip()
-        if not arguments or not with_environment.startswith(arguments):
-            return {}
-        environment_text = with_environment[len(arguments):]
-        if environment_text and not environment_text[0].isspace():
-            return {}
-        tokens = environment_text.split()
-        pairs = (token.split("=", 1) for token in tokens if "=" in token)
-        return {name: value for name, value in pairs}
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
