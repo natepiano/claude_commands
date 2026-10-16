@@ -22,12 +22,13 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
+for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import Account
 import conversation_pause
 import detached
+import herdr
 import note_file
 from inventory import Inventory, Session, inventory
 from launch_permission import shutdown_state_root
@@ -1729,13 +1730,14 @@ def conduct(login: str) -> int:
     fingerprint = _module_fingerprint()
     for line in store.migrate(login):
         print(line)
+    session_kind = herdr.security_session()
     archived: dict[str, SessionShutdown] = {}
     while True:
         with store.conductor_lock(login) as ownership:
             if isinstance(ownership, store.ConductorAlreadyRunning):
                 return 0
             archived.update(_read_conduct_archive(login))
-            outcome = _conduct_owned(login, archived, fingerprint)
+            outcome = _conduct_owned(login, archived, fingerprint, session_kind)
             if isinstance(outcome, _ReloadRequested):
                 _write_conduct_archive(login, archived)
         if isinstance(outcome, _ReloadRequested):
@@ -1749,7 +1751,7 @@ def conduct(login: str) -> int:
 
 
 def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
-                   fingerprint: _ModuleFingerprint) -> _ConductorFinished | _ReloadRequested:
+                   fingerprint: _ModuleFingerprint, session_kind: herdr.SecuritySession) -> _ConductorFinished | _ReloadRequested:
     """Advance one locked account while long actions run independently."""
     import restart as restart_work
 
@@ -1757,7 +1759,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
         if _archive_finished(saved):
             archived[saved["session"]["session_id"]] = saved
 
-    desktop = restart_work.DesktopLaunchState()
+    desktop = restart_work.DesktopLaunchState(session_kind=session_kind)
     pending: dict[str, PendingSessionAction] = {}
     confirmations: list[PendingRegistryConfirmation] = []
     launched: list[SessionShutdown] = []
