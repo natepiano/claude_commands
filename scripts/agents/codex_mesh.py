@@ -4187,10 +4187,23 @@ def command_signin_changed(args: argparse.Namespace) -> int:
     return 0
 
 
-def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> list[str]:
+@dataclass(frozen=True)
+class SwitchingWorker:
+    name: str
+    mid_turn: bool
+
+
+@dataclass(frozen=True)
+class WorkersRunSwitch:
+    folder: Path
+    holders: tuple[str, ...]
+    workers: tuple[SwitchingWorker, ...]
+
+
+def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> tuple[WorkersRunSwitch, ...]:
     """Retire current run servers and notify each affected holder once."""
     notices: dict[str, list[str]] = {}
-    lines: list[str] = []
+    switches: list[WorkersRunSwitch] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
     for record_path in sorted(path for root in SWEEP_ROOTS for path in root.glob(f"*/{SERVER_FILE}")):
         folder = record_path.parent
@@ -4200,6 +4213,14 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
             if not isinstance(pid, int) or not isinstance(port, int) or not _pid_alive(pid):
                 continue
             previous_home = server_record_home(record)
+            if previous_home == workers_home:
+                continue
+            workers = tuple(
+                SwitchingWorker(name, _as_dict(entry).get("status") == "running")
+                for name, entry in sorted(_read_json_object(folder / ROSTER_FILE).items())
+                if _as_dict(entry).get("status") != "ended"
+            )
+            holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
             line = (
                 f"Workers account {'would move' if dry_run else 'changed'} at {at} to {label} "
                 + f"({codex_home_display(workers_home)}): run {folder.name}'s workers move from "
@@ -4211,8 +4232,8 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
                 _log_server(str(folder), line)
         if not dry_run and not _stop_unused(None, pid, port, RetiredRunServer(folder)):
             _ = _start_watcher(str(folder), pid, port)
-        lines.append(line)
-        for session_id in _marker_sessions(SWEEP_ROOTS, folder):
+        switches.append(WorkersRunSwitch(folder, holders, workers))
+        for session_id in holders:
             notices.setdefault(session_id, []).append(folder.name)
     if not dry_run:
         for session_id, runs in notices.items():
@@ -4222,7 +4243,7 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
                 + f"runs {', '.join(runs)} move at their next turn; working workers finish first. Continue dispatching as usual.",
                 CodexNoticeKind.WORKERS_CHANGED,
             )
-    return lines
+    return tuple(switches)
 
 
 def command_serve(args: argparse.Namespace) -> int:

@@ -16,7 +16,7 @@ from typing import Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.whoami.agent_accounts import claude_config_dir, claude_on_disk, codex_email_on_disk, codex_home  # noqa: E402
+from scripts.whoami.agent_accounts import claude_config_dir, claude_config_value, claude_on_disk, codex_email_on_disk, codex_home  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
 
 # Package and sibling callers share process readers and identity outcomes.
@@ -137,7 +137,7 @@ NAMED_ACCOUNT_VARIABLES = ("CLAUDE_CONFIG_DIR", MEMORY_BASE_VARIABLE)
 def named_account_environment(config_dir: Path) -> dict[str, str]:
     """The variables that start Claude Code on a named account's directory."""
     return {
-        "CLAUDE_CONFIG_DIR": str(config_dir),
+        "CLAUDE_CONFIG_DIR": claude_config_value(config_dir),
         MEMORY_BASE_VARIABLE: str(_default_claude_config_dir()),
     }
 
