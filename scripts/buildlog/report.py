@@ -428,7 +428,7 @@ def fetch(connection: sqlite3.Connection, sql: str, *params: object) -> list[Row
 
 def natedev_call_predicate(call: str = "calls") -> str:
     """SQL leaving out calls whose test command completed on the Mac."""
-    return f"coalesce({call}.mac, '') NOT IN ('failed', 'passed_filter')"
+    return f"coalesce({call}.mac, '') NOT IN ('failed', 'passed_filter', 'passed_full')"
 
 
 def kinds(connection: sqlite3.Connection, day: str) -> list[str]:
@@ -1374,7 +1374,7 @@ def tests_by_target_lines(calls: Sequence[ReportedTestCall]) -> list[str]:
         if isinstance(call.offload, MacRunCompleted)
         and call.copy != COPY_WON
         and (
-            call.offload.outcome == "passed_filter"
+            call.offload.outcome in ("passed_filter", "passed_full")
             or call.offload.outcome == "failed"
             and call.call_id not in matched_failures
         )

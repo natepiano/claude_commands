@@ -140,7 +140,7 @@ CALL_COLUMNS: list[Column] = [
     ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
     ("wait_s", "INTEGER", "seconds from script start until the run began"),
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
-    ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
+    ("mac", "TEXT", "passed (natedev confirmed it; before 2026-10-16), passed_filter, passed_full (ended the call), failed, lost or declined when Mac offload ran or was considered"),
     ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
     ("mac_holder", "TEXT", "busy decline: the claim what, leftovers or unreadable; NULL in old rows"),
     (
@@ -154,7 +154,7 @@ CALL_COLUMNS: list[Column] = [
     (
         "copy",
         "TEXT",
-        "Mac copy of a still-compiling natedev test: won, natedev_won, passed_full, gave_way, declined or lost"
+        "Mac copy of a still-compiling natedev test: won, natedev_won, gave_way, declined or lost (passed_full before 2026-10-16)"
         + " (the last copy's outcome); empty when no copy started, NULL in old rows",
     ),
     ("copy_s", "REAL", "seconds Mac copies of this call held the Mac, every copy summed"),

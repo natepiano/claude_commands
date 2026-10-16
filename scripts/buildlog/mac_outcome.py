@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, cast
 
-MacRunOutcome = Literal["passed", "passed_filter", "failed"]
+MacRunOutcome = Literal["passed", "passed_filter", "passed_full", "failed"]
 OffloadDeclineReason = Literal[
     "off", "repo", "linux_only", "backoff", "blocked", "busy", "state",
     "unreachable", "mac_busy", "battery", "disk", "copy",
@@ -121,7 +121,7 @@ def offload_record(
     duration = offload_seconds(seconds_value)
     if isinstance(duration, DurationNotRecorded):
         return UNRECOGNIZED_OFFLOAD_RECORD
-    if mac in ("passed", "passed_filter", "failed") and reason in (None, ""):
+    if mac in ("passed", "passed_filter", "passed_full", "failed") and reason in (None, ""):
         return MacRunCompleted(mac, duration)
     if mac == "lost" and reason in (None, ""):
         return MacRunLost(duration)

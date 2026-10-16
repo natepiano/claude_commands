@@ -179,19 +179,18 @@ class CopyResultTests(unittest.TestCase):
     def test_each_runner_ending_maps_to_one_outcome(self) -> None:
         words = copy_watch.MacWords
         failed, passed = words("failed", "", "1.0"), words("passed", "", "1.0")
-        self.assertIsInstance(copy_watch.copy_result(failed, 42, False), copy_watch.CopyWin)
-        self.assertIsInstance(copy_watch.copy_result(passed, 0, True), copy_watch.CopyWin)
+        self.assertIsInstance(copy_watch.copy_result(failed, 42), copy_watch.CopyWin)
+        self.assertIsInstance(copy_watch.copy_result(passed, 0), copy_watch.CopyWin)
         ended = {
-            "full pass": (copy_watch.copy_result(passed, 0, False), ("passed_full", True)),
-            "stopped by a new test": (copy_watch.copy_result(None, 143, True), ("gave_way", False)),
-            "no result": (copy_watch.copy_result(None, 75, False), ("lost", False)),
-            "pass with a failing status": (copy_watch.copy_result(passed, 1, True), ("lost", False)),
-            "failure with status 0": (copy_watch.copy_result(failed, 0, True), ("lost", False)),
-            "lost": (copy_watch.copy_result(words("lost", "", "1"), 75, False), ("lost", False)),
-            "busy": (copy_watch.copy_result(words("declined", "busy", "0"), 75, False), ("declined", False)),
-            "no tests": (copy_watch.copy_result(words("declined", "no_tests", "0"), 75, False),
+            "stopped by a new test": (copy_watch.copy_result(None, 143), ("gave_way", False)),
+            "no result": (copy_watch.copy_result(None, 75), ("lost", False)),
+            "pass with a failing status": (copy_watch.copy_result(passed, 1), ("lost", False)),
+            "failure with status 0": (copy_watch.copy_result(failed, 0), ("lost", False)),
+            "lost": (copy_watch.copy_result(words("lost", "", "1"), 75), ("lost", False)),
+            "busy": (copy_watch.copy_result(words("declined", "busy", "0"), 75), ("declined", False)),
+            "no tests": (copy_watch.copy_result(words("declined", "no_tests", "0"), 75),
                          ("declined", True)),
-            "linux only": (copy_watch.copy_result(words("declined", "linux_only", "0"), 75, False),
+            "linux only": (copy_watch.copy_result(words("declined", "linux_only", "0"), 75),
                            ("declined", True)),
         }
         for name, (result, expected) in ended.items():
@@ -203,7 +202,7 @@ class CopyResultTests(unittest.TestCase):
 class StopTests(unittest.TestCase):
     def test_a_copy_that_ended_before_verifys_term_keeps_its_outcome_unless_it_won(self) -> None:
         cases = {
-            "full pass": ("passed", 0, "passed_full"),
+            "pass that stopped nothing": ("passed", 0, "natedev_won"),
             "busy decline": ("declined", 75, "declined"),
             "failure that stopped nothing": ("failed", 42, "natedev_won"),
         }
@@ -418,19 +417,15 @@ class CopyWatchProcessTests(unittest.TestCase):
                          ("won", "passed", "0", "1"))
         self.assertIn("--filter-run", self.runner_events()[0])
 
-    def test_full_copy_pass_leaves_natedev_running_and_starts_no_other_copy(self) -> None:
+    def test_full_copy_pass_first_wins(self) -> None:
         step = self.start_step()
         self.start_watcher("passed")
         self.compile_and_wait_for_copies(1)
-        time.sleep(SETTLE_S)
-        self.assertIsNone(step.poll())
-        self.assertFalse(self.candidate().exists())
-        values = self.finish_watcher(terminate=True)
-        self.assertEqual(len(self.runner_events()), 1)
-        self.assertEqual((values["copy"], values["copy_count"]), ("passed_full", "1"))
-        self.assertNotIn("stopped_natedev", values)
-        self.assertIsNone(step.poll())
-        self.assertFalse(Path(f"{self.info}.stopped").exists())
+        values = self.finish_watcher(terminate=False)
+        self.assertEqual(step.wait(timeout=HANG_GUARD_S), 143)
+        self.assertEqual((values["copy"], values["mac"], values["runner_status"], values["stopped_natedev"]),
+                         ("won", "passed", "0", "1"))
+        self.assertNotIn("--filter-run", self.runner_events()[0])
 
     def test_natedev_first_stops_the_running_copy(self) -> None:
         step = self.start_step()
