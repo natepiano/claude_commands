@@ -274,7 +274,7 @@ from the style guide outright (decision 1), so there is no lint wiring step
 and no mechanism flips.
 
 **Generator placement:** parse-class generators live in a new sibling module
-`~/.claude/scripts/fix/candidate_generators.py`, imported by
+`~/.claude/scripts/style/candidate_generators.py`, imported by
 `style_history.py`. Single entry point
 `enumerate_candidates(unit, project_dir) -> list[Candidate]`, dispatched on
 the unit's `candidates.kind` frontmatter — so `next-unit` and `record-unit`
@@ -308,7 +308,7 @@ wiring in `style_history.py` (`next-unit` attaches `candidates`/
 refuses undispositioned records with exit 3; zero-candidate units free-skip
 with `skipped_by: candidates`; new `enumerate-candidates` debug subcommand).
 `/style_eval` documents the judge-only protocol and the `dispositions` array.
-Generator output above `MAX_CANDIDATES = 150` is a loud config error.
+Generators return all sites; the style ticket splitter owns the 150-site limit.
 
 Smoke-tested every generator against nateroids, obsidian_knife, cargo-mend,
 cargo-port, hana, and bevy_brp_bevy_update. Deviations from the audit's

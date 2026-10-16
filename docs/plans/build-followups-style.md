@@ -15,6 +15,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 ## Delegation Context
 
 - **Project:** `~/.claude` (claude_commands), worktree `/home/natepiano/worktrees/claude-build-followups-style`, branch `build-followups-style`. Every Work Order runs in that worktree. This plan builds the style showrunner (design: `~/.local/state/plan-backlog/2026-10-16-style-showrunner.md`, revision 3).
+- **Project started:** 2026-10-16T19:43:43.983+00:00
 - **Stack:** Python ≥3.10 through `~/.claude/scripts/lib/py` (natedev has 3.13; the Mac is older); basedpyright 1.39; stdlib `sqlite3` (as in `scripts/buildlog/index.py`); markdown command and doc files; zsh/bash scripts; nix in `/etc/nixos`; Rust read only (the cargo-berth source at `~/rust/cargo-liner/crates/cargo-berth/src`). Style rules are markdown with YAML-like frontmatter in `~/rust/nate_style/rust/*.md` (a separate git repo on `main`; other sessions leave uncommitted files there).
 - **Layout:**
   - `scripts/fix/` — the fix pipeline; retired in Phase 12 except the pieces Phase 1 moves.
@@ -99,7 +100,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
      must be renumbered, add an old→new mapping note to the doc.
      Full procedure: /plan:to_phased_plan → <PhaseNumbering/>. -->
 
-### Phase 1 — Move the kept style scripts into scripts/style  · status: todo
+### Phase 1 — Move the kept style scripts into scripts/style  · status: done
 **Depends on:** none
 
 #### Work Order
