@@ -253,6 +253,7 @@ class OffloadRequest:
     result: ResultDestination
     nextest_words: tuple[str, ...]
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
+    copy: bool = False
 
 
 @dataclass(frozen=True)
@@ -490,6 +491,7 @@ class CliArguments(argparse.Namespace):
         self.result: str | None = None
         self.settings: str = ""
         self.last_decline: str = ""
+        self.copy: bool = False
         self.nextest_words: list[str] = []
 
 
@@ -856,6 +858,7 @@ def parse_probe(output: str) -> ProbeResult:
 
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
+    copy_words = ["--copy"] if request.copy else []
     return [
         sys.executable,
         str(Path(__file__).with_name("mac_test.py")),
@@ -868,6 +871,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         str(request.repo_root),
         "--remote",
         config.host,
+        *copy_words,
     ]
 
 
@@ -1248,11 +1252,12 @@ def claimed_run(
         if isinstance(copied, TreeCopyFailed):
             return declined("copy", started)
         copy_seconds = elapsed_seconds(copy_started)
-        print(
-            "mac_test: running on the Mac "
-            + f"(macOS, host {probe.hostname}); tree copied in {copy_seconds:.1f} s",
-            flush=True,
+        running = (
+            f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
+            if request.copy
+            else f"running on the Mac (macOS, host {probe.hostname})"
         )
+        print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         release_allowed = False
         remote_status = controller.stream_mac_run(
             [
@@ -1372,6 +1377,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
+    _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--result")
     _ = run.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
@@ -1393,6 +1399,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         result=result_destination(arguments.result),
         nextest_words=tuple(words),
         last_decline=last_decline,
+        copy=arguments.copy,
     )
 
 

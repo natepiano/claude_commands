@@ -183,6 +183,11 @@ run() {
         ) &
         RUN_STEP_PID=$!
         if [[ "$monitor" == 0 ]]; then set +m; fi
+        # The Mac copy watcher (copy_watch.py) reads the step's group and log here.
+        if [[ -n "${VERIFY_STEP_INFO_FILE:-}" ]]; then
+            printf 'pgid=%s\nlog=%s\n' "$RUN_STEP_PID" "$step_log" > "$VERIFY_STEP_INFO_FILE.new"
+            mv -f "$VERIFY_STEP_INFO_FILE.new" "$VERIFY_STEP_INFO_FILE"
+        fi
         if wait "$RUN_STEP_PID"; then
             RUN_STEP_PID=""
             RUN_LAST_ATTEMPT_KILLED=0
@@ -191,6 +196,11 @@ run() {
         else
             status=$?
             RUN_STEP_PID=""
+        fi
+        # A Mac copy that finished first stopped this step: no memory retry.
+        if [[ -n "${VERIFY_STEP_INFO_FILE:-}" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
+            rm -f "$step_log"
+            return "$status"
         fi
         ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
         RUN_LAST_ATTEMPT_KILLED=0
@@ -651,6 +661,8 @@ fi
 # the call record note_event writes.
 export BUILDLOG_CALLER=verify
 export BUILDLOG_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+# The newest call wins a Mac copy (copy_watch.py); bash 3.2 has no EPOCHREALTIME.
+VERIFY_CALL_STARTED="${EPOCHREALTIME:-$(date +%s)}"
 export BUILDLOG_HOLD_PID=$$
 export BUILDLOG_HOLD_WAIT_S=0
 HOLD_WAIT_DIR=""
@@ -714,6 +726,13 @@ BUILDLOG_MAC=""
 BUILDLOG_MAC_HOLDER=""
 BUILDLOG_MAC_REASON=""
 BUILDLOG_MAC_S=""
+# The Mac copy of a natedev run (copy_watch.py): the last outcome word, the
+# copies started and the seconds they held the Mac across leave-hook passes,
+# and how long natedev's step had run when the call's result was decided.
+BUILDLOG_MAC_COPY=""
+BUILDLOG_MAC_COPY_S=""
+BUILDLOG_MAC_COPY_COUNT=""
+BUILDLOG_MAC_COPY_NATEDEV_S=""
 export BUILDLOG_TARGET=""
 if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
     FILTER_RUN=1
@@ -771,13 +790,21 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
+        BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
+        BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" \
+        "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
 
 MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
 MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
+MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
+COPY_WATCH_PID=""
+COPY_WATCH_DIR=""
+VERIFY_STEP_INFO_FILE=""
+COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
 MAC_RESULT_FILE=""
 MAC_RUNNER_PID=""
 # The Mac settings a local test may still leave for (run_local_test): a Mac
@@ -1027,23 +1054,122 @@ route_test() {
     done
 }
 
+# Starts copy_watch.py beside the natedev step run() is about to start: while
+# the step compiles, it may run a copy of the same test on the Mac, and the
+# first result wins (see docs/as-built/mac-test-offload.md).
+start_copy_watch() {
+    COPY_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-copy.XXXXXX")"
+    VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
+    local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
+        --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
+        --repo-root "$(git rev-parse --show-toplevel)" --package "$PKG"
+        --call-id "$BUILDLOG_CALL_ID" --call-started "$VERIFY_CALL_STARTED")
+    if [[ "$FILTER_RUN" -eq 1 ]]; then
+        watch_args+=(--filter-run)
+    fi
+    "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
+    COPY_WATCH_PID=$!
+}
+
+# Stops the watcher, which stops a copy still running, and reads its result
+# into COPY_* and the call's BUILDLOG_MAC_COPY* words. Safe to call twice.
+stop_copy_watch() {
+    local line copy_s="" copy_count="" natedev_s=""
+    COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
+    [[ -n "$COPY_WATCH_PID" ]] || return 0
+    kill -TERM "$COPY_WATCH_PID" 2>/dev/null || true
+    wait "$COPY_WATCH_PID" 2>/dev/null || true
+    COPY_WATCH_PID=""
+    if [[ -f "$COPY_WATCH_DIR/result" ]]; then
+        while IFS= read -r line; do
+            case "$line" in
+                copy=*) COPY_WORD="${line#copy=}" ;;
+                copy_s=*) copy_s="${line#copy_s=}" ;;
+                copy_count=*) copy_count="${line#copy_count=}" ;;
+                natedev_s_at_end=*) natedev_s="${line#natedev_s_at_end=}" ;;
+                mac=*) COPY_MAC="${line#mac=}" ;;
+                reason=*) COPY_REASON="${line#reason=}" ;;
+                seconds=*) COPY_SECONDS="${line#seconds=}" ;;
+                runner_status=*) COPY_RUNNER_STATUS="${line#runner_status=}" ;;
+                stopped_natedev=*) COPY_STOPPED="${line#stopped_natedev=}" ;;
+            esac
+        done < "$COPY_WATCH_DIR/result"
+    fi
+    rm -rf "$COPY_WATCH_DIR"
+    COPY_WATCH_DIR="" VERIFY_STEP_INFO_FILE=""
+    if [[ -n "$COPY_WORD" && "$copy_count" =~ ^[0-9]+$ && "$copy_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        BUILDLOG_MAC_COPY="$COPY_WORD"
+        BUILDLOG_MAC_COPY_COUNT=$(( ${BUILDLOG_MAC_COPY_COUNT:-0} + copy_count ))
+        BUILDLOG_MAC_COPY_S="$(LC_ALL=C awk -v total="${BUILDLOG_MAC_COPY_S:-0}" -v more="$copy_s" \
+            'BEGIN { printf "%.3f", total + more }')"
+        if [[ -n "$natedev_s" ]]; then
+            BUILDLOG_MAC_COPY_NATEDEV_S="$natedev_s"
+        fi
+    else
+        COPY_WORD=""
+    fi
+}
+
+# The Mac copy finished first and stopped the natedev step: end the call as
+# try_mac_test ends it for a Mac failure or a filtered Mac pass. A Mac pass
+# never becomes natedev's pass record, so the run log goes first.
+finish_copy_win() {
+    BUILDLOG_MAC="$COPY_MAC"
+    BUILDLOG_MAC_REASON="$COPY_REASON"
+    BUILDLOG_MAC_S="$COPY_SECONDS"
+    BUILDLOG_MAC_HOLDER=""
+    export BUILDLOG_TARGET=mac
+    if [[ -n "$RUN_LOG" ]]; then
+        rm -f "$RUN_LOG"
+        RUN_LOG=""
+    fi
+    if [[ "$COPY_MAC" == failed ]]; then
+        note_event failed "${SECONDS}" 0 "" 0 "$COPY_RUNNER_STATUS"
+        exit "$COPY_RUNNER_STATUS"
+    fi
+    BUILDLOG_MAC=passed_filter
+    echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
+    note_event ran "${SECONDS}" 0 "" 0 0
+    exit 0
+}
+
 # Runs the tests on natedev. While MAC_LEAVE_SETTINGS names a Mac, a run held
 # in the memory wait leaves once mac_test.py free-now says that Mac is free,
 # and its Mac result counts as one from route_test: a failure or a filtered
 # pass ends the call; busy or blocked waits here again, still free to leave; a
-# full pass, a lost run or another decline runs here with no way out.
+# full pass, a lost run or another decline runs here with no way out. Once the
+# step compiles, copy_watch.py may run a copy on the Mac; a copy failure or
+# filtered pass that finishes first ends the call (finish_copy_win).
 run_local_test() {
-    local status hook
+    local status hook copy_watch
     while true; do
         hook=""
+        copy_watch=0
         if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
             hook="$(printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$MAC_LEAVE_SETTINGS" \
                 --repo-root "$(git rev-parse --show-toplevel)")"
+            if [[ -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
+                copy_watch=1
+            fi
         fi
         export BUILDLOG_TARGET=natedev
         echo "verify.sh: running on natedev"
         status=0
+        if [[ "$copy_watch" -eq 1 ]]; then
+            start_copy_watch
+        fi
         LINT_QUEUE_LEAVE_HOOK="$hook" run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+        if [[ "$copy_watch" -eq 1 ]]; then
+            stop_copy_watch
+            if [[ "$COPY_WORD" == won ]]; then
+                if [[ "$COPY_STOPPED" == 1 && "$status" -ne 0 \
+                      && ( "$COPY_MAC" == failed || ( "$COPY_MAC" == passed && "$FILTER_RUN" -eq 1 ) ) ]]; then
+                    finish_copy_win
+                fi
+                # natedev ended before the stop reached it: its result stands.
+                BUILDLOG_MAC_COPY=natedev_won
+            fi
+        fi
         if [[ -z "$hook" || "$status" -ne "$LINT_LEFT_QUEUE_STATUS" ]]; then
             return "$status"
         fi
@@ -1408,6 +1534,7 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
+    stop_copy_watch || true
     if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
     finish_run "${status}" || true
     # finish_run notes only a run with a record log; every other call is noted
