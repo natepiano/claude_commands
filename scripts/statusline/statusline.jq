@@ -128,7 +128,10 @@ def usage($config; $label; $window; $fmt):
     + (if ($reset | type) == "number" then " until " + ($reset | user_time($fmt)) else "" end);
 
 ($ARGS.named.colors // "" | color_config) as $colors
-| ($ARGS.named.account // "") as $account
+| (if ($ARGS.named.legacy_home // "") == "1" then
+     ($ARGS.named.home_config // "" | try (fromjson | .oauthAccount.emailAddress // "") catch "") as $login
+     | if ($login | type) == "string" and $login != "" then ($ARGS.named.account // "") else "" end
+   else ($ARGS.named.account // "") end) as $account
 | ($ARGS.named.showrunner // "" | try fromjson catch null
    | if type == "object" then .name else null end
    | if type == "string" and . != "" then . else null end) as $showrunner_name

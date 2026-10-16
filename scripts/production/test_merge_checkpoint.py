@@ -542,7 +542,8 @@ class MergeCheckpointTests(unittest.TestCase):
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("change review: ok — the production keeps no change-review list", result.process.stdout)
+        self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
+                      result.process.stdout)
 
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""

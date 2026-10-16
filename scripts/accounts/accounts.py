@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import fcntl
 import json
 import math
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -34,6 +35,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 import account  # noqa: E402
+from account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 import agent_accounts  # noqa: E402
@@ -155,6 +157,8 @@ KNOWN_PRIVATE_NAMES = frozenset(
         "jobs",
         "backups",
         "cache",
+        "feedback",
+        "telemetry",
         ".last-cleanup",
     }
 )
@@ -405,6 +409,7 @@ class CodexStatus:
     login: str
     role: str
     problems: tuple[str, ...]
+    unclassified: tuple[str, ...]
     startup: agent_accounts.CodexStartupStatus = field(default_factory=agent_accounts.NoCodexStartupFailure)
 
 
@@ -770,12 +775,6 @@ def _shared_link_problems(
     return problems
 
 
-def _login_problem(config_dir: Path) -> list[str]:
-    if isinstance(account_identity(config_dir), agent_accounts.UnreadableIdentity):
-        return [f"accounts: {config_dir} is not logged in"]
-    return []
-
-
 def _directory_identity(config_dir: Path) -> ClaudeDirectoryIdentity:
     path = agent_accounts.claude_config_file(config_dir)
     try:
@@ -905,9 +904,7 @@ def check(label: str) -> list[str]:
         return _check_codex_home(label, _workers_home())
     parsed = numbered_account_label(label, "claude")
     expected = _account_note(parsed.label)
-    directory = _claude_directory_for_note(parsed, expected)
-    if directory == main_config_dir():
-        return _login_problem(directory)
+    directory = account_dir(parsed.label)
     return list(_inspect_account_directory(NamedAccount(label, directory), expected).problems)
 
 
@@ -1000,10 +997,8 @@ def _check_codex_home(label: str, workers_home: Path) -> list[str]:
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
-            unknown = sorted(entry.name for entry in destination.iterdir()
-                             if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES)
-            if unknown:
-                problems.append(f"{folder}: unclassified: {', '.join(unknown)}")
+            with os.scandir(destination):
+                pass
         except OSError as error:
             problems.append(f"accounts: could not inspect {destination}: {error}")
     expected = _account_note(label)
@@ -1055,21 +1050,16 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
     label = note_file.canonical_label(label)
     try:
         refuse_default(label)
-        if label in ("unit", "showrunner"):
-            selected = role_account(label)
+        if label in ("unit", "showrunner", "units", "showrunners"):
+            selected = role_account("unit" if label in ("unit", "units") else "showrunner")
             expected = _account_note(selected.label)
         else:
             parsed = numbered_account_label(label, "claude")
             expected = _account_note(parsed.label)
-            selected = NamedAccount(parsed.label, _claude_directory_for_note(parsed, expected))
+            selected = NamedAccount(parsed.label, account_dir(parsed.label))
     except AccountsError as error:
         return AccountRefused(str(error))
     remove = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
-    if selected.dir == main_config_dir():
-        problems = check(selected.label) if resume else _login_problem(selected.dir)
-        if problems:
-            return AccountRefused(problems[0])
-        return PreparedAccount({}, remove | frozenset(account.NAMED_ACCOUNT_VARIABLES))
     readiness = _inspect_account_directory(selected, expected)
     if isinstance(readiness, AccountDirectoryNotSetUp):
         return AccountRefused(
@@ -1082,9 +1072,25 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
+def _exec_codex_account(label: str, arguments: list[str]) -> None:
+    """Launch Codex on a checked account, including the stored workers selection."""
+    selected_label = role_account("workers").label if label == "workers" else label
+    target = check_codex_target(selected_label, _workers_home())
+    environment = {**os.environ, "CODEX_HOME": str(target.home)}
+    try:
+        os.execvpe("codex", ["codex", *arguments], environment)
+    except OSError as error:
+        raise AccountsError(f"accounts: could not start codex: {error}") from error
+
+
 def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
-    """Replace this process with Claude on the selected, safe directory."""
+    """Replace this process with the selected Claude or Codex account."""
     label = note_file.canonical_label(label)
+    if label == "workers" or _label_is(label, "codex"):
+        if probe:
+            raise AccountsError("accounts: --probe is only supported for Claude accounts")
+        _exec_codex_account(label, arguments)
+        return
     prepared = prepared_account(label, resume="--resume" in arguments)
     if isinstance(prepared, AccountRefused):
         raise AccountsError(prepared.reason)
@@ -1188,19 +1194,38 @@ def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: boo
     return selected
 
 
+@dataclass(frozen=True)
+class LegacyHomeLaunch:
+    """This machine still launches unscoped Claude with no account setting."""
+
+
+def account_for_unscoped_launch(environment: Mapping[str, str]) -> ClaudeLaunchAccount | LegacyHomeLaunch:
+    """Retain an uncut legacy home, otherwise choose the caller or showrunners."""
+    configured = environment.get("CLAUDE_CONFIG_DIR", "")
+    if not configured:
+        if account.claude_account(main_config_dir()) is not None:
+            return LegacyHomeLaunch()
+        return account_for_group_launch("showrunner", resume=False)
+    identity = account_identity(Path(configured).expanduser())
+    if not isinstance(identity, agent_accounts.NumberedAccount):
+        raise AccountsError("accounts: caller has no numbered Claude account")
+    directory = claude_account_dir(identity.label)
+    prepared = prepared_account(identity.label, resume=False)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    return NamedAccount(identity.label, directory)
+
+
 def account_prefix(selected: AccountSelection) -> str:
     """Return the shell assignment for an already selected account."""
     if isinstance(selected, CodexWorkersAccount):
         return f"CODEX_HOME={shlex.quote(str(selected.home))}"
-    return "" if selected.dir == main_config_dir() else account.named_account_prefix(selected.dir)
+    return account.named_account_prefix(selected.dir)
 
 
 def trust_command(folder: Path, selected: ClaudeLaunchAccount) -> str:
     """The command the user runs to accept trust, then type /exit in Claude."""
-    if selected.dir == main_config_dir():
-        prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in account.NAMED_ACCOUNT_VARIABLES)
-    else:
-        prefix = account_prefix(selected).strip()
+    prefix = account_prefix(selected).strip()
     return f"cd {shlex.quote(str(folder))} && {prefix} claude"
 
 
@@ -1241,7 +1266,7 @@ def home_account_label(tool: Literal["claude", "codex"]) -> str:
 
 def unnoted_home_line(home: Path, login: str) -> str:
     tool = "codex" if home.name.startswith(".codex") else "claude"
-    return (f"~/.{tool} — no account note, not selectable: "
+    return (f"~/{home.name} — no account note, not selectable: "
             f"add ~/rust/hanadocs/agents/{tool}N.md with login: {login}")
 
 
@@ -1273,32 +1298,11 @@ def numbered_account_label(label: str, tool: Literal["claude", "codex"]) -> note
 
 def claude_account_dir(label: str) -> Path:
     """Resolve a numbered Claude note to the directory holding that login."""
-    if label == "~/.claude":
-        identity = account_identity(main_config_dir())
-        login = identity.login if isinstance(identity, agent_accounts.UnnotedLogin) else "unreadable"
-        raise AccountsError("accounts: " + unnoted_home_line(main_config_dir(), login))
     parsed = numbered_account_label(label, "claude")
     expected = _account_note(parsed.label)
     if not isinstance(expected, ExpectedAccountLogin):
-        problem = expected.problem
-        if isinstance(expected, MissingAccountNote):
-            identity = account_identity(main_config_dir())
-            if isinstance(identity, agent_accounts.UnnotedLogin):
-                problem += "\naccounts: " + unnoted_home_line(identity.home, identity.login)
-        raise AccountsError(problem)
-    return _claude_directory_for_note(parsed, expected)
-
-
-def _claude_directory_for_note(label: note_file.NumberedAccountLabel, expected: AccountNote) -> Path:
-    """Use the same expected-login snapshot for alias resolution and readiness."""
-    numbered = accounts_home() / f".claude{label.number}"
-    home = _directory_identity(main_config_dir())
-    if isinstance(home, ClaudeDirectoryLogin):
-        if isinstance(expected, ExpectedAccountLogin) and expected.login.casefold() == home.login.casefold():
-            return main_config_dir()
-        if not numbered.exists() and not _label_is(account.label_for("claude", home.login), "claude"):
-            raise AccountsError("accounts: " + unnoted_home_line(main_config_dir(), home.login))
-    return numbered
+        raise AccountsError(expected.problem)
+    return account_dir(parsed.label)
 
 
 def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
@@ -1306,6 +1310,10 @@ def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
     from scripts.message import sessions
 
     default = account_identity(main_config_dir())
+    home_state = (account.LegacyHomeLogin(account.Account("claude", default.login,
+                  default.label if isinstance(default, agent_accounts.NumberedAccount) else default.login))
+                  if isinstance(default, (agent_accounts.NumberedAccount, agent_accounts.UnnotedLogin))
+                  else account.ConfigOnlyHome())
     named_accounts: list[agent_accounts.CheckedNamedClaudeAccount] = []
     for named in checked_named_accounts():
         identity = account_identity(named.dir)
@@ -1314,8 +1322,9 @@ def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
     live_logins: set[str] = set()
     live_directories: dict[Path, None] = {}
     for session in sessions.live_sessions():
-        identity = account.account_of(session["pid"])
-        directory = account.process_config_dir(session["pid"])
+        identity = account.account_of(session["pid"], home_state=home_state)
+        setting = account.process_account_directory(account.process_config_dir(session["pid"]), home_state=home_state)
+        directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         if identity is not None:
             live_logins.add(identity.login.casefold())
         if directory is not None:
@@ -1389,7 +1398,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
     keep = KeepAccount(numbered_account_label(keep.label, tool).label) if isinstance(keep, KeepAccount) else keep
     candidates: list[tuple[str, Path, str]] = []
     if tool == "claude":
-        directories = [(home_account_label("claude"), main_config_dir()), *((note_file.canonical_label(item.label), item.dir) for item in checked_named_accounts())]
+        directories = [(note_file.canonical_label(item.label), item.dir) for item in checked_named_accounts()]
         for label, directory in directories:
             try:
                 if claude_account_dir(label) != directory or check(label):
@@ -1474,7 +1483,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
                 allowance_available.add(label)
         reasons.append(PickReason(label, weekly, five, reason))
     if not any_fresh:
-        default_label = home_account_label(tool)
+        default_label = home_account_label(tool) if tool == "codex" else (fallback[0].label if fallback else "")
         preferred = keep.label if isinstance(keep, KeepAccount) else default_label
         choices = [item for label in dict.fromkeys((preferred, default_label))
                    for item in fallback if (agent_accounts.codex_home_matches_label(item.dir, label)
@@ -1673,7 +1682,7 @@ def _stored_groups() -> StoredGroupSelections:
                     raise AccountsError(f"accounts: {path} has an invalid {group} reset") from error
         if not isinstance(label, str):
             raise AccountsError(f"accounts: {path} has an invalid {group} account")
-        if label != "default":
+        if label not in ("default", "~/.claude"):
             _ = numbered_account_label(label, "claude")
         result[group] = cast(str | StoredGroupSelection, value)
     return result
@@ -1720,9 +1729,9 @@ def session_account_label(session: ListedSession) -> str:
 
 
 def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
-    """Exclude every alias of an account, including the default directory."""
+    """Exclude the numbered accounts matching these live logins."""
     labels: set[str] = set()
-    for directory in [main_config_dir(), *(item.dir for item in checked_named_accounts())]:
+    for directory in (item.dir for item in checked_named_accounts()):
         identity = account_identity(directory)
         if isinstance(identity, agent_accounts.NumberedAccount) and identity.login.casefold() in logins:
             labels.add(identity.label)
@@ -1833,7 +1842,37 @@ def group_accounts() -> GroupAccounts:
         if isinstance(selection, GroupNotConfigured):
             continue
         label = selection["label"] if isinstance(selection, dict) else selection
-        result[group] = home_account_label("claude") if label == "default" else note_file.canonical_label(label)
+        stamp = ""
+        login = ""
+        evidence_label = label
+        if label in ("default", "~/.claude"):
+            try:
+                for line in roles_history_file().read_text(encoding="utf-8").splitlines():
+                    decoded = cast(object, json.loads(line))
+                    if not isinstance(decoded, dict):
+                        continue
+                    row = cast(dict[str, object], decoded)
+                    if row.get("group") != group and not (group == "units" and row.get("role") == "unit"):
+                        continue
+                    # Only the last assignment is in force; an earlier home
+                    # assignment cannot name a later, unrelated selection.
+                    stamp = ""
+                    login = ""
+                    evidence_label = label
+                    if row.get("label") != label:
+                        continue
+                    at, held_login = row.get("at"), row.get("login")
+                    if isinstance(at, str):
+                        stamp = at
+                    if isinstance(held_login, str):
+                        login = held_login
+                    recorded_label = row.get("account_label")
+                    if isinstance(recorded_label, str) and _label_is(recorded_label, "claude"):
+                        evidence_label = recorded_label
+            except (OSError, ValueError):
+                pass
+        resolved = resolve_history_label(evidence_label, stamp, login=login)
+        result[group] = resolved.label if isinstance(resolved, ResolvedHistoryLabel) else "home account unresolved"
     return result
 
 
@@ -1937,7 +1976,9 @@ def _quota_observations() -> dict[str, list[WeeklyQuotaObservation]]:
                 or not math.isfinite(left) or not 0 <= left <= 100
             ):
                 continue
-            label = note_file.canonical_label(label)
+            login = values.get("login", "")
+            resolved = resolve_history_label(label, stamp, login=login if isinstance(login, str) else "")
+            label = resolved.label if isinstance(resolved, ResolvedHistoryLabel) else "home account unresolved"
             wire: QuotaReading = {"account": label, "at": stamp, "remaining": float(left)}
             at = datetime.fromisoformat(wire["at"])
             if at.tzinfo is None:
@@ -1952,7 +1993,44 @@ def _quota_observations() -> dict[str, list[WeeklyQuotaObservation]]:
     }
 
 
-def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
+def resolve_history_label(label: str, at: str, *, login: str = "") -> ResolvedHistoryLabel | HistoricalAccountUnresolved:
+    """Resolve a historical home from its own login or a dated cutover only."""
+    parsed = note_file.parse_account_label(label)
+    if isinstance(parsed, note_file.NumberedAccountLabel):
+        return ResolvedHistoryLabel(parsed.label)
+    if label not in ("default", "~/.claude", str(main_config_dir())):
+        return HistoricalAccountUnresolved()
+    if login:
+        parsed = note_file.parse_account_label(account.label_for("claude", login))
+        if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "claude":
+            return ResolvedHistoryLabel(parsed.label)
+    try:
+        rows = _read_json_object(accounts_config_file()).get("home_cutovers", [])
+        stamp = datetime.fromisoformat(at)
+        if stamp.tzinfo is None or not isinstance(rows, list):
+            return HistoricalAccountUnresolved()
+        evidence: list[tuple[datetime, str]] = []
+        for item in cast(list[object], rows):
+            if not isinstance(item, dict):
+                continue
+            row = cast(dict[str, object], item)
+            boundary, number = row.get("at"), row.get("label")
+            if not isinstance(boundary, str) or not isinstance(number, str):
+                continue
+            end = datetime.fromisoformat(boundary)
+            parsed = note_file.parse_account_label(number)
+            if (end.tzinfo is not None and stamp < end
+                    and (not login or row.get("login") == login)
+                    and isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "claude"):
+                evidence.append((end, parsed.label))
+        if evidence:
+            return ResolvedHistoryLabel(min(evidence)[1])
+    except (OSError, ValueError, TypeError):
+        pass
+    return HistoricalAccountUnresolved()
+
+
+def _unit_role_history() -> list[UnitRoleAssignment]:
     path = roles_history_file()
     try:
         lines = worker_names.role_history_lines(path)
@@ -1961,7 +2039,6 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
     except (OSError, UnicodeError) as error:
         raise AccountsError(f"accounts: could not read {path}: {error}") from error
     history: list[UnitRoleAssignment] = []
-    note_labels: dict[str, str] = {default_label: default_label} if default_label else {}
     for index, line in enumerate(lines, 1):
         try:
             decoded = cast(object, json.loads(line))
@@ -1976,33 +2053,16 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
             label, stamp = values.get("label"), values.get("at")
             if not isinstance(label, str) or not isinstance(stamp, str):
                 raise ValueError("invalid label or timestamp")
-            if label == "default" and role == "unit" and not default_label and "account_label" not in values:
-                raise ValueError("account identity for ~/.claude is unreadable")
-            label = (default_label or note_file.canonical_label(cast(str, values.get("account_label", "~/.claude")))
-                     if role == "unit" else home_account_label("codex")) if label == "default" else note_file.canonical_label(label)
-            if _label_is(label, "claude" if role == "unit" else "codex"):
-                _ = account_dir(label) if role == "unit" else codex_setup_home(label)
+            _ = _iso_time(stamp, "role time")
             if role == "workers":
-                _ = _iso_time(stamp, "role time")
-                if "account_label" in values and not isinstance(values["account_label"], str):
-                    raise ValueError("invalid account_label")
                 continue
-            if "account_label" in values:
-                account_label = values["account_label"]
-                if not isinstance(account_label, str) or not account_label:
-                    raise ValueError("invalid account_label")
-                wire: HistoricalRoleChange = RoleChange(
-                    at=stamp, role="unit", label=label, account_label=default_label if account_label == "default" else note_file.canonical_label(account_label),
-                )
-                account_label = wire["account_label"]
-            else:
-                wire = LegacyRoleChange(at=stamp, role="unit", label=label)
-                if label not in note_labels:
-                    identity = account_identity(account_dir(label))
-                    if not isinstance(identity, agent_accounts.NumberedAccount):
-                        raise ValueError(f"account identity for {label} is unreadable")
-                    note_labels[label] = identity.label
-                account_label = note_labels[label]
+            evidence = values.get("account_label", label)
+            if not isinstance(evidence, str):
+                raise ValueError("invalid account_label")
+            login = values.get("login", "")
+            resolved = resolve_history_label(evidence, stamp, login=login if isinstance(login, str) else "")
+            account_label = resolved.label if isinstance(resolved, ResolvedHistoryLabel) else "home account unresolved"
+            wire = LegacyRoleChange(at=stamp, role="unit", label=label)
             history.append(UnitRoleAssignment(_iso_time(wire["at"], "role time"), note_file.canonical_label(account_label)))
         except (ValueError, TypeError) as error:
             raise AccountsError(f"accounts: {path}:{index}: invalid role change: {error}") from error
@@ -2014,12 +2074,13 @@ UNIT_ROLE_ENDED_AT = datetime(2026, 10, 13, tzinfo=timezone.utc)
 
 
 def _historical_roles(
-    label: str, at: datetime, default_label: str, history: list[UnitRoleAssignment],
-    fallback_unit: str,
+    label: str, at: datetime, history: list[UnitRoleAssignment],
 ) -> tuple[agent_accounts.ClaudeRole, ...]:
     if at >= UNIT_ROLE_ENDED_AT:
         return ()
-    unit_label = default_label if history else fallback_unit
+    home = resolve_history_label("default", at.isoformat())
+    default_label = home.label if isinstance(home, ResolvedHistoryLabel) else ""
+    unit_label = default_label
     for assignment in history:
         if assignment.at > at:
             break
@@ -2041,11 +2102,7 @@ def burn(since: datetime, until: datetime) -> list[AccountRoleBurn]:
     """
     if since.tzinfo is None or until.tzinfo is None or until <= since:
         raise AccountsError("accounts: burn requires an increasing, timezone-aware window")
-    selection = claude_account_selection()
-    default = selection.home_directory_account
-    default_label = default.label if isinstance(default, agent_accounts.NumberedAccount) else ""
-    history = _unit_role_history(default_label)
-    fallback_unit = default_label
+    history = _unit_role_history()
     totals: dict[tuple[str, tuple[agent_accounts.ClaudeRole, ...]], tuple[float, float]] = {}
     for label, observations in _quota_observations().items():
         for before, after in zip(observations, observations[1:]):
@@ -2062,7 +2119,7 @@ def burn(since: datetime, until: datetime) -> list[AccountRoleBurn]:
                 span = (right - left).total_seconds()
                 if span <= 0:
                     continue
-                roles = _historical_roles(label, left, default_label, history, fallback_unit)
+                roles = _historical_roles(label, left, history)
                 key = (label, roles)
                 points, observed_seconds = totals.get(key, (0.0, 0.0))
                 totals[key] = (points + rate * span, observed_seconds + span)
@@ -2096,6 +2153,333 @@ def _atomic_write(path: Path, contents: str) -> None:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+class HomeCutoverEvidence(TypedDict):
+    label: str
+    login: str
+    at: str
+
+
+class HomeCutover(HomeCutoverEvidence):
+    state: Literal["moving", "complete", "undoing", "undone"]
+
+
+class MacHomeCutover(HomeCutover):
+    platform: Literal["darwin"]
+    oauthAccount: dict[str, object]
+
+
+def _record_home_cutover(journal: HomeCutover) -> None:
+    with _roles_lock():
+        configuration = _read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
+        rows = configuration.get("home_cutovers", [])
+        if not isinstance(rows, list):
+            raise AccountsError("accounts: invalid home_cutovers history")
+        history = cast(list[object], rows)
+        evidence = HomeCutoverEvidence(label=journal["label"], login=journal["login"], at=journal["at"])
+        if evidence not in history:
+            history.append(evidence)
+        configuration["home_cutovers"] = history
+        _atomic_write(accounts_config_file(), json.dumps(configuration) + "\n")
+
+
+def _mac_process_arguments(pid: int) -> list[str]:
+    """Read the kernel's NUL-separated argv, preserving spaces and prompt quotes."""
+    # KERN_PROCARGS2 returns argc, the executable path, padding, then argv.
+    query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    size = ctypes.c_size_t(ctypes.sizeof(buffer))
+    sysctl = cast(Callable[[object, int, object, object, object, int], int],
+                  ctypes.CDLL(None, use_errno=True).sysctl)
+    if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+    payload = buffer.raw[:size.value]
+    count = int.from_bytes(payload[:4], sys.byteorder, signed=True)
+    executable_end = payload.find(b"\0", 4)
+    if count <= 0 or executable_end < 0:
+        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+    arguments = payload[executable_end + 1:].lstrip(b"\0").split(b"\0")
+    if len(arguments) <= count or not arguments[0]:
+        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+    return [os.fsdecode(word) for word in arguments[:count]]
+
+
+def _claude_process_ids() -> list[int]:
+    """Every Claude Code process owned by this user, including socketless ones."""
+    try:
+        listing = subprocess.run(
+            ("ps", "-u", str(os.getuid()), "-o", "pid=,comm=,args="),
+            capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AccountsError("accounts: cannot list Claude processes; no identity moved") from error
+    found: list[int] = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        pid = int(fields[0])
+        command = Path(fields[1]).name
+        # ps flattens argv without quoting. Never shell-parse user prompt text.
+        arguments = fields[2].split() if len(fields) == 3 else []
+        runtime = command in ("node", "nodejs", "bun")
+        if not (command == "claude" or runtime
+                or arguments and Path(arguments[0]).name == "claude"):
+            continue
+        if sys.platform == "linux":
+            try:
+                raw_arguments = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except OSError as error:
+                raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved") from error
+            if not raw_arguments.endswith(b"\0") or not raw_arguments.removesuffix(b"\0"):
+                raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+            arguments = [os.fsdecode(word) for word in raw_arguments.removesuffix(b"\0").split(b"\0")]
+        elif sys.platform == "darwin":
+            arguments = _mac_process_arguments(pid)
+        if (command == "claude"
+                or arguments and Path(arguments[0]).name == "claude"
+                or runtime and any(
+                    word.endswith("/@anthropic-ai/claude-code/cli.js") for word in arguments)):
+            found.append(pid)
+    return found
+
+
+def _cutover_session_check(folder: Path) -> None:
+    for pid in _claude_process_ids():
+        setting = account.process_config_dir(pid)
+        if isinstance(setting, account.ProcessEnvironmentUnread):
+            raise AccountsError("accounts: cannot establish the account of a live session")
+        selected = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else main_config_dir()
+        if selected.expanduser().resolve() == folder.resolve():
+            raise AccountsError(f"accounts: a live session uses {folder}; stop it before cutover-home")
+
+
+MAC_HOME_LOGIN_STEP = "Mac's own step: one /login in ~/.claude2, never /logout"
+
+
+def _mac_keychain_has_entry(folder: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ("security", "find-generic-password", "-s", agent_accounts.claude_keychain_service(folder)),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AccountsError("accounts: cannot check the keychain entry") from error
+    if result.returncode == 44:
+        return False
+    if result.returncode:
+        raise AccountsError("accounts: cannot check the keychain entry")
+    return True
+
+
+def _delete_legacy_keychain_entry() -> None:
+    try:
+        result = subprocess.run(
+            ("security", "delete-generic-password", "-s", agent_accounts.claude_keychain_service(main_config_dir())),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AccountsError("accounts: cannot delete the legacy keychain entry; rerun cutover-home") from error
+    # errSecItemNotFound (44) also finishes a deletion interrupted before journalling.
+    if result.returncode not in (0, 44):
+        raise AccountsError("accounts: cannot delete the legacy keychain entry; rerun cutover-home")
+
+
+def _mac_oauth_account(values: dict[str, object]) -> dict[str, object]:
+    raw = values.get("oauthAccount")
+    if not isinstance(raw, dict):
+        raise AccountsError("accounts: cutover requires an oauthAccount in both homes")
+    identity = cast(dict[str, object], raw)
+    identifier = identity.get("accountUuid")
+    if not isinstance(identifier, str) or not identifier:
+        raise AccountsError("accounts: cutover cannot establish the account identifier")
+    return identity
+
+
+def _cutover_home_macos(label: str, *, undo: bool) -> None:
+    """Retire the legacy login only after the user's numbered login is verified."""
+    path = accounts_home() / ".local/state/accounts/cutover-home.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if path.is_symlink():
+            raise AccountsError("accounts: cutover journal must not be a link")
+        raw = _read_json_object(path) if path.exists() else {}
+        if raw and raw.get("platform") != "darwin":
+            raise AccountsError("accounts: finish the recorded cutover on its original platform")
+        if raw:
+            if (not all(isinstance(raw.get(key), str) and raw[key] for key in ("label", "login", "at"))
+                    or raw.get("state") not in ("moving", "complete", "undoing", "undone")):
+                raise AccountsError("accounts: cutover journal is unreadable; no identity changed")
+            _ = _mac_oauth_account(raw)
+            recorded = cast(MacHomeCutover, cast(object, raw))
+            if label and numbered_account_label(label, "claude").label != recorded["label"]:
+                raise AccountsError("accounts: finish or undo the recorded cutover first")
+            label = recorded["label"]
+            if not undo and recorded["state"] == "undone":
+                raw = {}
+        else:
+            if undo:
+                raise AccountsError("accounts: no cutover to undo")
+            label = numbered_account_label(label, "claude").label
+        destination = account_dir(label)
+        _cutover_session_check(destination if undo else main_config_dir())
+        seed_path = accounts_home() / ".claude.json"
+        numbered_path = destination / ".claude.json"
+        if any(item.is_symlink() for item in (main_config_dir(), destination, seed_path, numbered_path)):
+            raise AccountsError("accounts: cutover homes and identity files must not be links")
+        seed = _read_json_object(seed_path)
+        if raw:
+            journal = cast(MacHomeCutover, cast(object, raw))
+        else:
+            source = _mac_oauth_account(seed)
+            source_login = source.get("emailAddress")
+            if not isinstance(source_login, str) or not source_login:
+                raise AccountsError("accounts: cutover-home requires a readable home login")
+            journal = MacHomeCutover(label=label, login=source_login, at=datetime.now(timezone.utc).isoformat(),
+                                     state="moving", platform="darwin", oauthAccount=source)
+        if undo:
+            if journal["state"] != "undone":
+                if "oauthAccount" in seed and seed["oauthAccount"] != journal["oauthAccount"]:
+                    raise AccountsError("accounts: ~/.claude already holds another login")
+                journal["state"] = "undoing"
+                _atomic_write(path, json.dumps(journal) + "\n")
+                seed["oauthAccount"] = journal["oauthAccount"]
+                _atomic_write(seed_path, json.dumps(seed) + "\n")
+                journal["state"] = "undone"
+                _atomic_write(path, json.dumps(journal) + "\n")
+            print("accounts: restored home identity; the keychain entry needs one /login in ~/.claude (never /logout)")
+            return
+        if journal["state"] == "complete":
+            return
+        if journal["state"] == "undoing":
+            raise AccountsError("accounts: finish undo before starting again")
+        expected = _account_note(journal["label"])
+        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        numbered_oauth = _mac_oauth_account(numbered)
+        source_oauth = journal["oauthAccount"]
+        if source_oauth["accountUuid"] != numbered_oauth["accountUuid"]:
+            raise AccountsError("accounts: the numbered login is not the same account as the legacy login")
+        login = source_oauth.get("emailAddress")
+        if (not isinstance(expected, ExpectedAccountLogin) or not isinstance(login, str)
+                or expected.login.casefold() != login.casefold()):
+            raise AccountsError("accounts: cutover-home requires a matching account note and home login")
+        if not _mac_keychain_has_entry(destination):
+            raise AccountsError("accounts: the numbered keychain entry is missing; complete its /login first")
+        if not raw:
+            _atomic_write(path, json.dumps(journal) + "\n")
+        if "oauthAccount" in seed:
+            if _mac_oauth_account(seed) != source_oauth:
+                raise AccountsError("accounts: ~/.claude now holds another login")
+            del seed["oauthAccount"]
+            _atomic_write(seed_path, json.dumps(seed) + "\n")
+        if _mac_keychain_has_entry(main_config_dir()):
+            _delete_legacy_keychain_entry()
+        _record_home_cutover(journal)
+        journal["state"] = "complete"
+        _atomic_write(path, json.dumps(journal) + "\n")
+
+
+def cutover_home(label: str = "", *, undo: bool = False) -> None:
+    """Move the legacy home identity, retaining a recoverable intent before mutation.
+
+    Credentials are only renamed. The identity block moves between atomic JSON
+    replacements; the journal lets either direction resume after any replacement.
+    """
+    if sys.platform == "darwin":
+        _cutover_home_macos(label, undo=undo)
+        return
+    path = accounts_home() / ".local/state/accounts/cutover-home.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            raw = _read_json_object(path)
+        except FileNotFoundError:
+            raw = {}
+        if raw and not undo and raw.get("state") in ("complete", "undone"):
+            identity = _directory_identity(main_config_dir())
+            if isinstance(identity, ClaudeDirectoryLogin):
+                raw = {}
+        if raw:
+            if (not all(isinstance(raw.get(key), str) and raw[key] for key in ("label", "login", "at"))
+                    or raw.get("state") not in ("moving", "complete", "undoing", "undone")):
+                raise AccountsError("accounts: cutover journal is unreadable; no identity moved")
+            journal = cast(HomeCutover, cast(object, raw))
+            if label and numbered_account_label(label, "claude").label != journal["label"]:
+                raise AccountsError("accounts: finish or undo the recorded cutover first")
+        else:
+            if undo:
+                raise AccountsError("accounts: no cutover to undo")
+            label = numbered_account_label(label, "claude").label
+            expected = _account_note(label)
+            identity = _directory_identity(main_config_dir())
+            if not isinstance(expected, ExpectedAccountLogin) or not isinstance(identity, ClaudeDirectoryLogin):
+                raise AccountsError("accounts: cutover-home requires a readable account note and home login")
+            if expected.login.casefold() != identity.login.casefold():
+                raise AccountsError(f"accounts: ~/.claude does not hold {label}'s login")
+            journal = HomeCutover(label=label, login=identity.login,
+                                  at=datetime.now(timezone.utc).isoformat(), state="moving")
+        destination = account_dir(journal["label"])
+        _cutover_session_check(destination if undo else main_config_dir())
+        if destination.is_symlink() or main_config_dir().is_symlink():
+            raise AccountsError("accounts: cutover homes must be real directories")
+        seed_path = accounts_home() / ".claude.json"
+        numbered_path = destination / ".claude.json"
+        seed = _read_json_object(seed_path)
+        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        home_credentials = main_config_dir() / ".credentials.json"
+        numbered_credentials = destination / ".credentials.json"
+        if any(item.is_symlink() for item in (seed_path, numbered_path, home_credentials, numbered_credentials)):
+            raise AccountsError("accounts: cutover identity files must not be links")
+        if not raw:
+            if "oauthAccount" in numbered or numbered_credentials.exists():
+                raise AccountsError(f"accounts: {destination} already holds a login or oauthAccount")
+            _atomic_write(path, json.dumps(journal) + "\n")
+        if undo:
+            if journal["state"] == "undone":
+                return
+            home_identity = _directory_identity(main_config_dir())
+            if (isinstance(home_identity, ClaudeDirectoryLogin)
+                    and home_identity.login.casefold() != journal["login"].casefold()):
+                raise AccountsError("accounts: ~/.claude already holds another login")
+            if ("oauthAccount" in seed and "oauthAccount" in numbered
+                    and seed["oauthAccount"] != numbered["oauthAccount"]):
+                raise AccountsError("accounts: ~/.claude already holds another login")
+            if home_credentials.exists() and numbered_credentials.exists():
+                raise AccountsError("accounts: both homes hold credentials; refusing to overwrite")
+            journal["state"] = "undoing"
+            _atomic_write(path, json.dumps(journal) + "\n")
+            if "oauthAccount" in numbered:
+                seed["oauthAccount"] = numbered["oauthAccount"]
+                _atomic_write(seed_path, json.dumps(seed) + "\n")
+                del numbered["oauthAccount"]
+                _atomic_write(numbered_path, json.dumps(numbered) + "\n")
+            if numbered_credentials.exists():
+                _ = numbered_credentials.rename(home_credentials)
+            journal["state"] = "undone"
+            _atomic_write(path, json.dumps(journal) + "\n")
+            return
+        if journal["state"] == "complete":
+            return
+        if journal["state"] in ("undone", "undoing"):
+            raise AccountsError("accounts: cutover was undone; finish undo before starting again")
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if "oauthAccount" in seed:
+            if "oauthAccount" in numbered and numbered["oauthAccount"] != seed["oauthAccount"]:
+                raise AccountsError("accounts: destination holds another oauthAccount")
+            numbered = {**_filtered_seed(seed), **numbered, "oauthAccount": seed["oauthAccount"]}
+            _atomic_write(numbered_path, json.dumps(numbered) + "\n")
+            del seed["oauthAccount"]
+            _atomic_write(seed_path, json.dumps(seed) + "\n")
+        if home_credentials.exists():
+            if numbered_credentials.exists():
+                raise AccountsError("accounts: destination already holds credentials")
+            _ = home_credentials.rename(numbered_credentials)
+        _record_home_cutover(journal)
+        journal["state"] = "complete"
+        _atomic_write(path, json.dumps(journal) + "\n")
 
 
 def _append_role_change(role: str, label: str, account_label: str) -> None:
@@ -2593,7 +2977,9 @@ def check_codex_target(label: str, workers_home: Path) -> SelectableCodexAccount
     identity = agent_accounts.codex_account(home)
     if not isinstance(identity, agent_accounts.KnownCodexAccount):
         login = _codex_home_login(home)
-        home_login = _codex_home_login(accounts_home() / ".codex")
+        legacy_home = accounts_home() / ".codex"
+        noted_legacy = isinstance(agent_accounts.codex_account(legacy_home), agent_accounts.KnownCodexAccount)
+        home_login = "" if noted_legacy else _codex_home_login(legacy_home)
         if login or home_login and not home.exists():
             raise AccountsError("accounts: " + unnoted_home_line(home if login else accounts_home() / ".codex", login or home_login))
     problems = _check_codex_home(label, workers_home)
@@ -2613,10 +2999,74 @@ def codex_home_label(home: Path) -> str:
     return agent_accounts.codex_home_role_label(home)
 
 
-def _retire_workers_servers(home: Path, label: str, *, dry_run: bool) -> list[str]:
+class SwitchingWorkerDetail(Protocol):
+    @property
+    def name(self) -> str: ...
+    @property
+    def mid_turn(self) -> bool: ...
+
+
+class WorkersRunSwitchDetail(Protocol):
+    @property
+    def folder(self) -> Path: ...
+    @property
+    def holders(self) -> tuple[str, ...]: ...
+    @property
+    def workers(self) -> Sequence[SwitchingWorkerDetail]: ...
+
+
+def _retire_workers_servers(home: Path, label: str, *, dry_run: bool) -> Sequence[WorkersRunSwitchDetail]:
     from scripts.agents.codex_mesh import retire_workers_servers
 
     return retire_workers_servers(home, label, dry_run=dry_run)
+
+
+def _workers_swap_lines(switches: Sequence[WorkersRunSwitchDetail], previous: Path,
+                        target: str, *, dry_run: bool) -> tuple[str, ...]:
+    from scripts.message import roster, sessions
+
+    old = agent_accounts.codex_account(previous)
+    source = old.label + " → " if isinstance(old, agent_accounts.KnownCodexAccount) else ""
+    lines = [f"Workers {'would move' if dry_run else 'moving'} {source}{target}:"]
+    if not switches:
+        return tuple(lines)
+    listing = roster.roster(os.environ, roster.ThisMachine())
+    holders = {entry.session.session_id: entry for entry in listing.entries
+               if isinstance(entry.session, roster.ClaudeSession)}
+    saved_names: dict[str, str] = {}
+    if any(not any(session_id in holders for session_id in switch.holders) for switch in switches):
+        try:
+            paths = sessions.sessions_dir().glob("*.json")
+            records = [sessions.read_session(path) for path in paths]
+        except OSError:
+            records = []
+        readable = [record for record in records if not isinstance(record, sessions.UnreadableSessionRecord)]
+        for record in sorted(readable, key=lambda item: item["updatedAt"], reverse=True):
+            if record["name"]:
+                _ = saved_names.setdefault(record["sessionId"], record["name"])
+    for switch in switches:
+        holder = next((holders[session_id] for session_id in switch.holders if session_id in holders), None)
+        parts: list[str] = []
+        if holder is not None:
+            if holder.machine != roster.machine_name():
+                parts.append(holder.machine)
+            if isinstance(holder.showrunner, roster.UnderShowrunner):
+                parts.append(holder.showrunner.name)
+            elif isinstance(holder.showrunner, (roster.RunsProduction, roster.ProductionWithoutRunningShowrunner)):
+                parts.append(holder.showrunner.production)
+            parts.append(holder.director.unit if isinstance(holder.director, (roster.DirectsUnit, roster.UnderDirector))
+                         and holder.director.unit else holder.name)
+        else:
+            parts.append(next((saved_names[session_id] for session_id in switch.holders if session_id in saved_names),
+                              f"unknown session ({switch.folder.name})"))
+        for worker in switch.workers:
+            stem = worker.name.removesuffix("-worker")
+            slot = stem.rpartition("-")[2] or stem
+            name = f"{slot}-worker"
+            context = " · ".join([*parts, name])
+            suffix = " (mid-turn; switches when its turn ends)" if worker.mid_turn else ""
+            lines.append(f"  {context} → {target}{suffix}")
+    return tuple(lines)
 
 
 def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
@@ -2640,15 +3090,11 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     if isinstance(readiness, agent_accounts.CodexWorkUnknown):
         raise AccountsError(f"accounts: cannot use {account_label} ({_codex_folder(target_home)}): {readiness.problem}")
     if dry_run:
-        lines = _retire_workers_servers(target_home, account_label, dry_run=True)
-        return WorkersSwapDryRun(tuple([
-            f"Would move workers to {account_label} ({_codex_folder(target_home)}); live turns finish first.", *lines,
-        ]))
+        switches = _retire_workers_servers(target_home, account_label, dry_run=True)
+        return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
     _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
-    lines = _retire_workers_servers(target_home, account_label, dry_run=False)
-    return WorkersSwapStarted(tuple([
-        f"Workers now use {account_label} ({_codex_folder(target_home)}); working workers move at their next turn.", *lines,
-    ]))
+    switches = _retire_workers_servers(target_home, account_label, dry_run=False)
+    return WorkersSwapStarted(_workers_swap_lines(switches, workers_home, account_label, dry_run=False))
 
 
 def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:
@@ -2664,7 +3110,41 @@ def _is_known_private(name: str) -> bool:
         name in KNOWN_PRIVATE_NAMES
         or name.startswith("daemon-auth-")
         or name.startswith(".oauth_refresh.lock")
+        or name.startswith(".claude.json.tmp.")
     )
+
+
+def sweep_claude_temp_files(now: datetime) -> None:
+    """Remove only regular atomic-write remnants older than a day, without following links."""
+    home = accounts_home()
+    folders = [home]
+    stale_before = (now - timedelta(days=1)).timestamp()
+    for folder in folders:
+        try:
+            descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    try:
+                        if (folder == home and re.fullmatch(r"\.claude[1-9][0-9]*", entry.name)
+                                and entry.is_dir(follow_symlinks=False)):
+                            folders.append(folder / entry.name)
+                        if not entry.name.startswith(".claude.json.tmp."):
+                            continue
+                        metadata = os.lstat(entry.name, dir_fd=descriptor)
+                        if stat.S_ISREG(metadata.st_mode) and metadata.st_mtime < stale_before:
+                            os.unlink(entry.name, dir_fd=descriptor)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _unclassified(config_dir: Path) -> tuple[str, ...]:
@@ -2707,36 +3187,30 @@ def _existing_named_accounts() -> list[NamedAccount]:
     return sorted(accounts, key=lambda account: _label_number(account.label))
 
 
-def _status_for(config_dir: Path, folder: str, named: NamedAccount | None, problems: list[str]) -> AccountStatus:
+def _status_for(config_dir: Path, folder: str, named: NamedAccount, problems: list[str]) -> AccountStatus:
     baseline = _mcp_server_names(accounts_home() / ".claude.json")
     account_is_safe_to_inspect = not config_dir.is_symlink() and not (
-        named is not None and (config_dir / ".claude.json").is_symlink()
+        (config_dir / ".claude.json").is_symlink()
     )
     # A named folder keeps its own label whatever login it holds; `problems` names a mismatch.
-    label = named.label if named is not None else NO_VALUE
+    label = named.label
     login = ""
     if account_is_safe_to_inspect:
         identity = account_identity(config_dir)
         if isinstance(identity, (agent_accounts.NumberedAccount, agent_accounts.UnnotedLogin)):
             login = identity.login
-            if named is None and isinstance(identity, agent_accounts.NumberedAccount):
-                label = identity.label
             if isinstance(identity, agent_accounts.UnnotedLogin):
                 problems.append(unnoted_home_line(config_dir, identity.login))
-        config_file = (
-            accounts_home() / ".claude.json"
-            if config_dir == main_config_dir()
-            else config_dir / ".claude.json"
-        )
+        config_file = config_dir / ".claude.json"
         current = _mcp_server_names(config_file)
-        unclassified = _unclassified(config_dir) if named is not None else ()
+        unclassified = _unclassified(config_dir)
     else:
         current = baseline
         unclassified = ()
     return AccountStatus(
         folder=folder,
         config_dir=config_dir,
-        is_named_account=named is not None,
+        is_named_account=True,
         is_set_up=True,
         account_is_safe_to_inspect=account_is_safe_to_inspect,
         label=label,
@@ -2764,25 +3238,14 @@ def _noted_labels() -> set[str]:
 
 
 def account_statuses() -> list[AccountStatus]:
-    """Inspect the default account, every named account on disk, and every noted account that no folder holds."""
-    default_dir = main_config_dir()
-    default_problems: list[str] = []
-    if not default_dir.exists():
-        default_problems.append(f"accounts: {default_dir} is missing")
-    elif not default_dir.is_dir():
-        default_problems.append(f"accounts: {default_dir} is not a directory")
-    else:
-        default_problems.extend(_login_problem(default_dir))
-    statuses = [_status_for(default_dir, "~/.claude", None, default_problems)]
+    """Inspect numbered folders and show noted accounts not yet set up."""
+    statuses: list[AccountStatus] = []
     on_disk = {named.label: named for named in _existing_named_accounts()}
     for label in sorted({*on_disk, *_noted_labels()}, key=_label_number):
         folder = f"~/.claude{_label_number(label)}"
         named = on_disk.get(label)
         if named is not None:
             statuses.append(_status_for(named.dir, folder, named, check(label)))
-            continue
-        if label == statuses[0].label:
-            # The default folder holds this account; a second row would repeat its label.
             continue
         statuses.append(AccountStatus(
             folder=folder,
@@ -2819,9 +3282,18 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
             expected = _account_note(intended)
             hint = intended if isinstance(expected, ExpectedAccountLogin) else label
             problems.append(f"accounts: sign in as {hint} at {folder}")
+        unclassified: tuple[str, ...] = ()
+        if match and safe:
+            try:
+                unclassified = tuple(sorted(entry.name for entry in home.iterdir()
+                    if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES))
+            except OSError as error:
+                problem = f"accounts: could not inspect {home}: {error}"
+                if problem not in problems:
+                    problems.append(problem)
         statuses.append(CodexStatus(
             folder, home, True, safe, NO_VALUE if label == login else label, login,
-            CODEX_ROLE if home == workers_home else "spare", tuple(problems),
+            CODEX_ROLE if home == workers_home else "spare", tuple(problems), unclassified,
         ))
     held_logins = {status.login.casefold() for status in statuses if status.login}
     noted = sorted(
@@ -2837,7 +3309,7 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
             continue
         problems = tuple(_check_codex_home(label, workers_home)) if os.path.lexists(home) else ()
         statuses.append(CodexStatus(
-            f"~/{home.name}", home, False, not home.is_symlink(), label, "", NO_VALUE, problems,
+            f"~/{home.name}", home, False, not home.is_symlink(), label, "", NO_VALUE, problems, (),
         ))
     return statuses
 
@@ -3003,10 +3475,10 @@ def _render_table(rows: list[tuple[str, ...]]) -> str:
     ])
 
 
-def _status_notes(status: AccountStatus) -> list[str]:
+def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
     """What is wrong or unusual in one folder. Nothing for a folder in order."""
     notes = list(status.problems)
-    if status.unclassified:
+    if detail and status.unclassified:
         notes.append(f"{status.folder}: unclassified: {', '.join(status.unclassified)}")
     mcp_differences = [
         *(f"- {name}" for name in status.missing_mcp_servers),
@@ -3020,7 +3492,7 @@ def _status_notes(status: AccountStatus) -> list[str]:
 def status_report(*, detail: bool = False) -> str:
     """One table row per account folder, then one line for each thing wrong in a folder.
 
-    With `detail`, also each live session, the Codex workers and the recent moves.
+    With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
     """
     statuses = account_statuses()
     selected_workers = role_account("workers")
@@ -3045,8 +3517,15 @@ def status_report(*, detail: bool = False) -> str:
         *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
         *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
     ])
-    notes = [*(note for status in statuses for note in _status_notes(status)),
-             *(problem for status in codex for problem in status.problems)]
+    home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
+    notes = [
+        *([f"~/.claude holds a login; {home_step}"]
+          if account.claude_account(main_config_dir()) is not None else []),
+        *(note for status in statuses for note in _status_notes(status, detail=detail)),
+        *(problem for status in codex for problem in status.problems),
+        *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
+          for status in codex if detail and status.unclassified),
+    ]
     summary = [group_status_line(groups), table, "", *notes]
     if not detail:
         return "\n".join(summary)
@@ -3068,8 +3547,10 @@ def _live_status_lines(groups: GroupAccounts) -> list[str]:
               if not session_on_account(item, label)}
     lines: list[str] = []
     live = sessions.live_sessions()
+    home_state = account.home_account_state()
     for session in live:
-        directory = account.process_config_dir(session["pid"])
+        setting = account.process_account_directory(account.process_config_dir(session["pid"]), home_state=home_state)
+        directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         identity = account_identity(directory) if directory is not None else agent_accounts.UnreadableIdentity(main_config_dir(), "account unreadable")
         label = identity.label if isinstance(identity, agent_accounts.NumberedAccount) else "account unreadable"
         suffix = f"; moving to {moving[session['sessionId']]}" if session["sessionId"] in moving else ""
@@ -3201,6 +3682,9 @@ def _parser() -> argparse.ArgumentParser:
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
+    cutover = commands.add_parser("cutover-home")
+    _ = cutover.add_argument("label", nargs="?", default="")
+    _ = cutover.add_argument("--undo", action="store_true")
     _ = commands.add_parser("status")
     placer = commands.add_parser("placement")
     _ = placer.add_argument("--explain", action="store_true")
@@ -3242,6 +3726,12 @@ def main(argv: list[str]) -> int:
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
+        if options.action == "cutover-home":
+            try:
+                cutover_home(options.label, undo=bool(getattr(options, "undo", False)))
+            except (OSError, ValueError) as error:
+                raise AccountsError(f"accounts: cutover-home: {error}") from error
+            return 0
         if options.detail and options.action != "status":
             raise AccountsError("--detail goes only with no action")
         if options.action == "placement":

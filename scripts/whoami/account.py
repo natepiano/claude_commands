@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from agent_accounts import claude_config_dir, claude_on_disk, codex_email_on_disk, codex_home
-import note_file
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.whoami.agent_accounts import claude_config_dir, claude_config_value, claude_on_disk, codex_email_on_disk, codex_home  # noqa: E402
+from scripts.whoami import note_file  # noqa: E402
 
 # Package and sibling callers share process readers and identity outcomes.
 if __name__ == "account":
@@ -29,6 +31,16 @@ class Account:
     tool: Literal["claude", "codex"]
     login: str
     label: str
+
+
+@dataclass(frozen=True)
+class ResolvedHistoryLabel:
+    label: str
+
+
+@dataclass(frozen=True)
+class HistoricalAccountUnresolved:
+    """This record contains no evidence of its home's numbered account."""
 
 
 class UnreadableAccount(Exception):
@@ -125,7 +137,7 @@ NAMED_ACCOUNT_VARIABLES = ("CLAUDE_CONFIG_DIR", MEMORY_BASE_VARIABLE)
 def named_account_environment(config_dir: Path) -> dict[str, str]:
     """The variables that start Claude Code on a named account's directory."""
     return {
-        "CLAUDE_CONFIG_DIR": str(config_dir),
+        "CLAUDE_CONFIG_DIR": claude_config_value(config_dir),
         MEMORY_BASE_VARIABLE: str(_default_claude_config_dir()),
     }
 
@@ -138,25 +150,35 @@ def named_account_prefix(config_dir: Path) -> str:
     )
 
 
-def parse_darwin_config_dir(output: str, expected_uid: int) -> Path | None:
+@dataclass(frozen=True)
+class ConfiguredClaudeFolder:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoAccountSetting:
+    """The readable environment does not select a Claude account folder."""
+
+
+def parse_darwin_config_dir(output: str, expected_uid: int) -> ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread:
     """Extract a config dir when `ps eww` exposed our process environment."""
     fields = output.split(maxsplit=1)
     if len(fields) != 2 or fields[0] != str(expected_uid):
-        return None
+        return ProcessEnvironmentUnread("process environment could not be read")
 
     process_text = fields[1]
     if not any(token.startswith("HOME=") for token in process_text.split()):
-        return None
+        return ProcessEnvironmentUnread("process environment could not be read")
 
     prefix = "CLAUDE_CONFIG_DIR="
     for token in reversed(process_text.split()):
         if token.startswith(prefix):
-            return Path(token.removeprefix(prefix))
-    return _default_claude_config_dir()
+            return ConfiguredClaudeFolder(Path(token.removeprefix(prefix))) if token.removeprefix(prefix) else NoAccountSetting()
+    return NoAccountSetting()
 
 
-def process_config_dir(pid: int) -> Path | None:
-    """A process's Claude config directory, or None when its environment is unreadable."""
+def process_config_dir(pid: int) -> ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread:
+    """Keep an absent account setting distinct from an unreadable environment."""
     if sys.platform == "darwin":
         try:
             result = subprocess.run(
@@ -166,20 +188,20 @@ def process_config_dir(pid: int) -> Path | None:
                 timeout=5,
             )
             if result.returncode:
-                return None
+                return ProcessEnvironmentUnread("process environment could not be read")
             return parse_darwin_config_dir(result.stdout, os.getuid())
         except (OSError, subprocess.TimeoutExpired):
-            return None
+            return ProcessEnvironmentUnread("process environment could not be read")
 
     try:
         environment = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
-        return None
+        return ProcessEnvironmentUnread("process environment could not be read")
     prefix = b"CLAUDE_CONFIG_DIR="
     for entry in environment.split(b"\0"):
         if entry.startswith(prefix):
-            return Path(os.fsdecode(entry.removeprefix(prefix)))
-    return _default_claude_config_dir()
+            return ConfiguredClaudeFolder(Path(os.fsdecode(entry.removeprefix(prefix)))) if entry.removeprefix(prefix) else NoAccountSetting()
+    return NoAccountSetting()
 
 
 
@@ -228,10 +250,51 @@ def process_codex_home(pid: int) -> ProcessCodexHome | ProcessWithoutCodexHome |
     return ProcessWithoutCodexHome()
 
 
-def account_of(pid: int) -> Account | None:
-    """The Claude account of a process whose environment can be read."""
-    config_dir = process_config_dir(pid)
-    return None if config_dir is None else claude_account(config_dir)
+@dataclass(frozen=True)
+class LegacyHomeLogin:
+    """The shared home still holds this login for a process-attribution pass."""
+
+    account: Account
+
+
+@dataclass(frozen=True)
+class ConfigOnlyHome:
+    """The shared configuration home has no readable account login."""
+
+
+@dataclass(frozen=True)
+class HomeAccountUnchecked:
+    """A single-process caller has not read the shared home's state yet."""
+
+
+_HOME_ACCOUNT_UNCHECKED = HomeAccountUnchecked()
+
+
+def home_account_state() -> LegacyHomeLogin | ConfigOnlyHome:
+    """Read the legacy home once for a pass that attributes several processes."""
+    identity = claude_account(_default_claude_config_dir())
+    return LegacyHomeLogin(identity) if identity is not None else ConfigOnlyHome()
+
+
+def process_account_directory(setting: ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread, *,
+                              home_state: LegacyHomeLogin | ConfigOnlyHome | HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED
+                              ) -> ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread:
+    """Retain a legacy home session only until this machine has cut over."""
+    if isinstance(setting, NoAccountSetting):
+        state = home_account_state() if isinstance(home_state, HomeAccountUnchecked) else home_state
+        if isinstance(state, LegacyHomeLogin):
+            return ConfiguredClaudeFolder(_default_claude_config_dir())
+    return setting
+
+
+def account_of(pid: int, *, home_state: LegacyHomeLogin | ConfigOnlyHome | HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED) -> Account | None:
+    """The login selected by a readable process, including pre-cutover sessions."""
+    setting = process_config_dir(pid)
+    state = home_account_state() if isinstance(setting, NoAccountSetting) and isinstance(home_state, HomeAccountUnchecked) else home_state
+    setting = process_account_directory(setting, home_state=state)
+    if isinstance(setting, ConfiguredClaudeFolder) and setting.path == _default_claude_config_dir() and isinstance(state, LegacyHomeLogin):
+        return state.account
+    return claude_account(setting.path) if isinstance(setting, ConfiguredClaudeFolder) else None
 
 
 def write_label(config_dir: Path, account: Account) -> None:

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
 
@@ -285,6 +286,36 @@ class SessionLookupTests(ShutdownTestCase):
         for args in ((), ("socket",), ("address",), ("id",), ("unknown", "agent")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
 
+    def test_registry_read_reports_directory_failure_instead_of_empty_success(self) -> None:
+        original = Path.iterdir
+
+        def paths(path: Path) -> Iterator[Path]:
+            if path == self.sessions:
+                raise PermissionError("registry denied")
+            return original(path)
+
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), mock.patch.object(Path, "iterdir", paths):
+            read = sessions.read_registry()
+            self.assertEqual(read.unreadable, (self.sessions,))
+            self.assertEqual(read.entries, ())
+            self.assertEqual(sessions.live_sessions(), [])
+
+    def test_registry_read_keeps_good_records_and_names_each_bad_record(self) -> None:
+        self.record("good.json", name="kept")
+        good = self.sessions / "good.json"
+        contents = cast(dict[str, object], json.loads(good.read_text()))
+        contents["cwd"], contents["status"] = "/kept-folder", "idle"
+        _ = good.write_text(json.dumps(contents))
+        broken = self.sessions / "bad.json"
+        _ = broken.write_text("{broken")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            read = sessions.read_registry()
+            self.assertEqual([item.record["name"] for item in read.entries], ["kept"])
+            self.assertEqual(read.unreadable, (broken,))
+            self.assertEqual(read.entries[0].details.get("cwd"), "/kept-folder")
+            self.assertEqual(read.entries[0].details.get("status"), "idle")
+            self.assertEqual([item["name"] for item in sessions.live_sessions()], ["kept"])
+
 
 class ProcessStartTests(ShutdownTestCase):
     def test_linux_start_survives_a_process_name_cut_inside_a_utf8_character(self) -> None:
@@ -344,3 +375,5 @@ class ProcessStartTests(ShutdownTestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+

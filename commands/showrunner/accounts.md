@@ -1,6 +1,6 @@
 ---
 description: Show account groups, move a group or ad hoc session, or swap Codex workers.
-argument-hint: '[--detail | pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | role workers | set-role workers codexN | swap workers codexN [--dry-run]]'
+argument-hint: '[--detail | exec claudeN|codexN|units|showrunners|workers [args…] | pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | role workers | set-role workers codexN | swap workers codexN [--dry-run]]'
 ---
 
 # Accounts
@@ -17,6 +17,7 @@ and print its output exactly as it comes, with nothing added.
 - Claude sessions refused by the provider move automatically on the notes timer;
   the shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup claudeN`: builds the folder and prints how to log in.
+- `exec claudeN|codexN|units|showrunners|workers [args…]`: starts Claude or Codex on that account or group's selection, passing arguments unchanged; `--probe` before the label is Claude-only.
 - `setup codexN`: links the home, finishes its first startup (up to 20 minutes: run it in the background), then prints the login command.
   Keep `CODEX_HOME` on it: without it, `codex login` signs `~/.codex` out and in, stopping workers using that home.
 - `pick claude|codex [--explain]`: picks room with the soonest weekly reset; `--keep <label>` keeps a working account, and repeated `--exclude <label>` skips accounts.
@@ -29,7 +30,7 @@ and print its output exactly as it comes, with nothing added.
 - Codex numbers name logins, including a login held in `~/.codex`; setup still uses `~/.codexN`. Each Codex note has `use_credits: on|off` (absent means on); off removes paid-credit room at an exhausted window. Weekly 0% sends one phone/showrunner notice; on stays with hourly forecasts, off prefers weekly room, then another account’s paid credits; no destination or a failed move sends Codex work to Claude until the earliest refill.
 - `role workers` shows the selection; `set-role workers codexN` selects future turns.
 - `swap workers codexN [--dry-run]` checks usage and moves every run at its next turn;
-  working workers finish first. A number resolves to the home holding its note’s login, including `~/.codex`.
+  prints `Workers moving <source> → <target>:` (`Workers would move` for previews), then one machine · unit · worker → target line per switching worker, marking mid-turn workers. A number resolves to the home holding its note’s login, including `~/.codex`.
 
 Changing the login in `~/.claude` remains `/login` in a `~/.claude` session.
 User's guide: `~/.claude/docs/accounts.md`.

@@ -326,6 +326,26 @@ class RoleTests(unittest.TestCase):
         directory.mkdir(parents=True)
         _ = (directory / "conf").write_text(f"TARGET={target}\nEVERY=600\n", encoding="utf-8")
 
+    def test_home_account_label_disappears_after_cutover_even_with_a_stale_cache(self) -> None:
+        config = self.home / ".claude"
+        config.mkdir()
+        _ = (config / "account-label").write_text("claude2\n", encoding="utf-8")
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertIn(" | claude2 | ", ANSI.sub("", self.command_lines({}, shell=shell)[0]))
+        for content in ("{}", "not JSON", "[]", "42"):
+            _ = home_json.write_text(content)
+            for shell in SHELLS:
+                with self.subTest(home_identity=content, shell=shell):
+                    self.assertNotIn("claude2", ANSI.sub("", self.command_lines({}, shell=shell)[0]))
+        home_json.unlink()
+        home_json.mkdir()
+        for shell in SHELLS:
+            with self.subTest(home_identity="directory", shell=shell):
+                self.assertNotIn("claude2", ANSI.sub("", self.command_lines({}, shell=shell)[0]))
+
     def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
         return ANSI.sub("", self.command_lines({"session_id": session_id}, **marks)[0])
 

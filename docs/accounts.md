@@ -8,11 +8,11 @@ The status line's first row shows this session's account label, after its role. 
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows Claude accounts in use used by the login in `~/.claude` or local live sessions, omitting unused Claude accounts. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
+`/whoami` shows Claude accounts used by local live sessions, omitting unused Claude accounts. Before this machine cuts over, its legacy `~/.claude` login is also included. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
 
 ## Every account in one table
 
-`/showrunner:accounts` prints one table: a row for `~/.claude` and each `~/.claudeN`, logged in or not, then a row for `~/.codex` and each `~/.codexN`. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:
+`/showrunner:accounts` prints one table: a row for each numbered `~/.claudeN`, logged in or not; `~/.claude` is the shared config home and has no account row, then a row for `~/.codex` and each `~/.codexN`. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
@@ -30,7 +30,7 @@ The status line's first row shows this session's account label, after its role. 
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows `workers` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
-Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
+Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
 ## Starting a session
 
@@ -38,22 +38,30 @@ Run these in a terminal:
 
 | Command | Account |
 | --- | --- |
-| `claude` | `~/.claude` (today claudeN, the number of its login’s note). |
+| `claude` | The configured showrunners account, through `accounts.py exec showrunners` after the shell alias is updated. |
 | `claude-unit` | The configured units account. |
 | `claude1` | claude1 |
 | `claude2` | claude2 |
 | `claude3` | claude3 |
+| `codex` | The configured workers account, through `accounts.py exec workers` after the shell alias is updated. |
+| `codex1` | codex1 |
+| `codex2` | codex2 |
 
 These aliases come from natedev's shell configuration after a rebuild; the Mac has none. In a shell without them, run:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude3
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec unit
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec showrunners
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex1
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex2
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec workers
 ```
 
-Arguments after the label pass through to `claude`. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
+For Claude labels and groups, arguments pass through to `claude`. Every Claude launch sets `CLAUDE_CONFIG_DIR` to a numbered folder; claude2 uses `~/.claude2` just like the other accounts. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
 
-Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. Each unit launch saves its config directory and model on tmux for observation; that directory no longer chooses a resume account. A numbered selection whose login matches `~/.claude` runs there, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. The same launch removes any inherited OAuth token. Commands accept account numbers only; `default` refuses and reports each home’s current number.
+For `codexN` or `workers`, arguments pass through to `codex` and the launch sets `CODEX_HOME` to the home holding that account's login: today codex2 uses `~/.codex` and codex1 uses `~/.codex1`. The `codex1`, `codex2` and bare `codex` aliases are being added to the shell configuration; bare `codex` will follow `exec workers`. `--probe` applies only to Claude accounts.
+
+Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. New unit launches use herdr panes carrying the selected account variables; legacy tmux options remain available for observation and model recovery, and never choose a resume account. Every selected account runs in its own numbered folder, with the shared memory directory set to `~/.claude`. The launch removes any inherited OAuth token. Commands accept account numbers and the launch groups; `default` refuses.
 
 A missing directory refuses without starting Claude, for example:
 
@@ -78,7 +86,7 @@ The second one is why memory writes do not ask. Claude Code saves a memory file 
 
 Each directory holds one login. `/login` or `/logout` inside a session changes it for every session using that directory.
 
-To switch `~/.claude`'s account, start `claude`, then run `/login`, as today. Do not do this in a `claude-unit` or `claudeN` session.
+`~/.claude` stores shared configuration and projects, rather than an account. Renew a login inside its numbered folder. `$HOME/.claude.json` remains the seed for new folders and the MCP baseline; setup copies project trust entries without the login.
 
 To renew or fix a named account, start its alias, then `/login` as that account. For claude3:
 
@@ -108,6 +116,34 @@ env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
 ```
 
 Never `/logout` in a unit director's session: every unit on that account stops working. After any login, run `/showrunner:accounts`; every directory must match its label.
+
+## Moving the legacy home login
+
+Each machine cuts over separately. While `~/.claude` still holds a login, processes without `CLAUDE_CONFIG_DIR` retain that login's attribution and status prints `~/.claude holds a login; run accounts.py cutover-home`. After cutover they have no account; a stale status-line label does not identify them. Unscoped helpers, including the message relay, retain the legacy launch without an account setting until this machine cuts over. Afterwards they keep the caller’s numbered folder or select the showrunners group.
+
+On Linux, in a terminal after its legacy sessions have stopped:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
+```
+
+On Linux this moves the login into `~/.claude2` by rename, refuses an occupied destination and live legacy sessions, and journals the operation before moving identity files. Rerun after an interruption to finish. `cutover-home --undo` reverses it after sessions on the destination stop. No live cutover is part of installing this code. natedev cut over on 2026-10-15: there `~/.claude` holds no login and claude2's login lives in `~/.claude2`. The Mac keeps its current home-login attribution until its own cutover.
+
+For the Mac's separate step, the director first prepares `~/.claude2` and arranges for legacy sessions to stop. The user launches that numbered account and runs `/login` once inside it:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude2
+```
+
+After the new login is checked, exit that session and run:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
+```
+
+The command checks that the new and legacy logins are the same account before changing anything. It keeps the shared seed's other settings, removes its `oauthAccount`, and removes only the old local `Claude Code-credentials` keychain copy by service name. The server login is untouched. Never `/logout`. Named-folder usage readings use that folder's own keychain entry and never fall back to the old copy. An interrupted cutover can be finished by rerunning the command. On the Mac, `--undo` restores the home identity settings; signing in to `~/.claude` again requires `/login`, as its output explains.
+
+Historical `default` or `~/.claude` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
 
 ## Move a session
 
@@ -216,7 +252,7 @@ CODEX_HOME=~/.codex1 codex login
 
 Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its workers unable to work until login finishes; workers use that home unless their role names another.
 
-Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check codex1`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
+Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check codex1`. Problems under the table name missing, broken or replaced shared links, the wrong login, or a login held by another home; `--detail` also lists unknown entries. Keep each login in one home: two homes on one login break token refresh.
 
 The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share `~/.codex`'s hooks.
 
@@ -283,7 +319,5 @@ Set `use_credits: on` or `use_credits: off` in each Codex note. Missing values m
 Account notes use numbered filenames such as `claude1.md` and `codex2.md`; their labels are `claude1` and `codex2`. The updater renames old filenames on its first pass, preserving bodies and modes. If both names exist it reports them and reads the numbered file. Each note carries a `role` list, a `sessions` count and a `## Live sessions` table from the roster on both machines. Live rows carry no timestamp. An unreachable or older peer keeps its last rows marked `last seen <time>`; these rows do not count in `sessions`. The updater records successful machine observations in `~/.local/state/agent-notes/sessions_seen.json`, outside the vault. A kept row retains its last-seen marker, or takes the machine's saved time, a legacy hidden observation comment, or `unknown`, in that order. Unread identities appear below the table as live sessions not attributed to an account. Legacy spaced labels remain accepted as input and are printed without spaces. Notes list by tool and account number.
 
 
-A signed-in home without a matching account note is never selectable. Status prints
-`~/.claude — no account note, not selectable: add ~/rust/hanadocs/agents/claudeN.md with login: <login>`
-or the corresponding `~/.codex` / `codexN.md` line. Add its numbered note before selecting it;
+A signed-in numbered home without a matching account note is never selectable. Status names the numbered folder and missing note; the corresponding `~/.codex` / `codexN.md` line remains for a Codex home. Add its numbered note before selecting it;
 an unrelated numbered account remains usable.

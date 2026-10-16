@@ -333,7 +333,7 @@ class MeshCommandTests(unittest.TestCase):
         self.start_args_timeout = 300.0
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
-            json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home())}),
+            json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}),
             encoding="utf-8",
         )
         self.patches = contextlib.ExitStack()
@@ -2480,7 +2480,7 @@ class MeshCommandTests(unittest.TestCase):
         _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (notes / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected),
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
         }))
         _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
         return agent_accounts.KnownCodexAccount(selected, login, "codex2")
@@ -2575,7 +2575,7 @@ class MeshCommandTests(unittest.TestCase):
             if request.get("method") == "turn/start":
                 self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
                 _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                    "port": self.server.port, "pid": os.getpid() + 1, "codex_home": str(next_home),
+                    "port": self.server.port, "pid": os.getpid() + 1, "codex_home": str(next_home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
                 }))
                 return self.quota_completion(request)
             return original(request)
@@ -2755,13 +2755,13 @@ class MeshCommandTests(unittest.TestCase):
         _ = (source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{source_claims}.signature"}}))
         _ = (home / "codex9.md").write_text(f"---\nlogin: {source_login}\n---\n")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"),
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
         }))
         new = StubAppServer(self.respond)
         _ = self.patches.callback(new.close)
         def start(session_dir: str, *_args: object) -> int:
             _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                "port": new.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()),
+                "port": new.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
             }))
             return new.port
         _ = self.patches.enter_context(patch.object(codex_mesh, "_start_server", side_effect=start))
@@ -2897,7 +2897,7 @@ class MeshCommandTests(unittest.TestCase):
         def start(session_dir: str, home: Path) -> int:
             server = rejected if home == target else recovered
             _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
-                "port": server.port, "pid": os.getpid(), "codex_home": str(home),
+                "port": server.port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
             }))
             return server.port
         def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str) -> None:
@@ -3016,7 +3016,7 @@ class MeshCommandTests(unittest.TestCase):
         source, destination = (numbered, default) if default_destination else (default, numbered)
         source_label, destination_label = ("codex1", "default") if default_destination else ("default", "codex1")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "port": self.server.port, "pid": os.getpid(), "codex_home": str(source),
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(source), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
         }))
         evidence = accounts.roles_history_file()
         evidence.parent.mkdir(parents=True, exist_ok=True)
@@ -4181,7 +4181,7 @@ class MeshCommandTests(unittest.TestCase):
         target, new = self.prepare_workers_move()
         self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
-            "pid": 123456, "port": self.server.port, "codex_home": str(target.parent / ".codex"),
+            "pid": 123456, "port": self.server.port, "codex_home": str(target.parent / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
         }))
         alive = [True]
         def running(pid: int) -> bool:
@@ -5035,6 +5035,8 @@ class SweepTests(unittest.TestCase):
         commands = (
             ["codex", "app-server", "--listen", "ws://127.0.0.1:47165"],
             ["codex", "-c", "thread_unload_delay_secs=0", "app-server", "--listen", "ws://127.0.0.1:47165"],
+            ["codex", "-c", "thread_unload_delay_secs=0", "-c", "model_auto_compact_token_limit=200000",
+             "app-server", "--listen", "ws://127.0.0.1:47165"],
         )
         for command in commands:
             with self.subTest(command=command), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "111 7200 " + " ".join(command) + "\n", "")):
@@ -5635,7 +5637,7 @@ class SignInChangeTests(unittest.TestCase):
                 for run, (port, process) in {"run-a": (4001, old), "run-b": (4002, new)}.items():
                     (root / run).mkdir()
                     _ = (root / run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": port, "pid": process.pid,
-                        "codex_home": str(agent_accounts.workers_home())}))
+                        "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
                 (root / "run-c").mkdir()
                 _ = (root / "active" / "session-a").write_text(f"{root / 'run-a'}\n")
                 starts = {old.pid: 1000.0, new.pid: 3000.0}
@@ -5663,7 +5665,7 @@ class SignInChangeTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "run-a").mkdir()
                 _ = (root / "run-a" / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": old.pid,
-                    "codex_home": str(agent_accounts.workers_home())}))
+                    "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
                 told, watched = self.signin_changed(root, {old.pid: 1000.0}, stops=True)
                 # No run-active marker names it, so there is no one to tell.
                 self.assertEqual((told, watched), ([], []))
@@ -5920,7 +5922,7 @@ class WorkersHomeTests(unittest.TestCase):
         return home
 
     def record(self, home: Path, port: int = 4001) -> None:
-        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": port, "pid": os.getpid(), "codex_home": str(home)}))
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
 
     def writer_process_is_live(self, pid: int) -> bool:
         return pid == os.getpid()
@@ -5936,10 +5938,12 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertEqual(port, 4001)
         command = cast(list[str], launch.call_args.args[0])
         self.assertIn("thread_unload_delay_secs=0", command)
+        self.assertIn(f"model_auto_compact_token_limit={codex_mesh.AUTO_COMPACT_TOKENS}", command)
         environment = cast(dict[str, str], launch.call_args.kwargs["env"])
         self.assertEqual(environment["CODEX_HOME"], str(home))
         record = cast(dict[str, object], json.loads((self.session_dir / codex_mesh.SERVER_FILE).read_text()))
         self.assertEqual(record["codex_home"], str(home))
+        self.assertEqual(record["auto_compact_tokens"], codex_mesh.AUTO_COMPACT_TOKENS)
 
     def test_home_change_retires_server_even_when_sign_in_timestamps_are_unchanged(self) -> None:
         home = self.select()
@@ -5962,7 +5966,7 @@ class WorkersHomeTests(unittest.TestCase):
 
     def test_legacy_server_is_kept_when_role_stays_default_and_sign_in_is_current(self) -> None:
         record = self.session_dir / codex_mesh.SERVER_FILE
-        _ = record.write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
+        _ = record.write_text(json.dumps({"port": 4001, "pid": os.getpid(), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
         before = record.read_bytes()
         with patch.dict(os.environ, {"CODEX_HOME": str(self.home / "caller")}), patch.object(codex_mesh, "_holds_old_sign_in", return_value=False) as identity, patch.object(codex_mesh, "_start_server") as start, patch.object(codex_mesh, "_stop_unused_with_lock_held") as stop:
             self.assertEqual(codex_mesh.ensure_server(str(self.session_dir)), (4001, False))
@@ -5971,6 +5975,20 @@ class WorkersHomeTests(unittest.TestCase):
         stop.assert_not_called()
         self.assertEqual(record.read_bytes(), before)
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
+
+    def test_server_started_without_the_compaction_limit_is_retired_without_stopping_live_turns(self) -> None:
+        home = self.select()
+        for recorded in ({"port": 4001, "pid": os.getpid(), "codex_home": str(home)},
+                         {"port": 4001, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": 100_000}):
+            with self.subTest(recorded=recorded):
+                _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps(recorded))
+                with patch.object(codex_mesh, "_holds_old_sign_in", return_value=False), patch.object(codex_mesh, "_start_server", return_value=4002) as start, patch.object(codex_mesh, "_start_watcher"), patch.object(os, "kill") as signal:
+                    self.assertEqual(codex_mesh.ensure_server(str(self.session_dir)), (4002, True))
+                start.assert_called_once()
+                self.assertTrue(all(invocation.args[1] == 0 for invocation in signal.call_args_list))
+                retired = cast(dict[str, object], json.loads((self.session_dir / codex_mesh.RETIRED_FILE).read_text()))
+                self.assertIn("4001", str(retired))
+                (self.session_dir / codex_mesh.RETIRED_FILE).unlink()
 
     def test_sign_in_notice_retires_legacy_server_when_default_sign_in_is_newer(self) -> None:
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
@@ -6000,8 +6018,10 @@ class WorkersHomeTests(unittest.TestCase):
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
         with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_stop_unused", return_value=True):
             lines = codex_mesh.retire_workers_servers(home, "codex1")
-        self.assertIn("move from ~/.codex at their next turn", "\n".join(lines))
-        self.assertIn("codex1 (~/.codex1)", "\n".join(lines))
+        self.assertEqual([line.folder for line in lines], [self.session_dir])
+        log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
+        self.assertIn("move from ~/.codex at their next turn", log)
+        self.assertIn("codex1 (~/.codex1)", log)
 
     def test_unsubscribe_not_loaded_proves_release_without_another_state_read(self) -> None:
         class UnloadedClient:
@@ -6045,7 +6065,7 @@ class WorkersHomeTests(unittest.TestCase):
         other_run = self.session_dir.parent / "other-run"
         other_run.mkdir()
         self.record(selected)
-        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex")}))
+        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}), patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000), patch.object(codex_mesh, "_server_started_at", return_value=1000), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(self.session_dir.parent))), 0)
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
@@ -6058,7 +6078,7 @@ class WorkersHomeTests(unittest.TestCase):
         other_run = root / "other-run"
         other_run.mkdir()
         self.record(self.home / ".codex")
-        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex")}))
+        _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}))
         _ = (root / "active" / "director-one").write_text(str(self.session_dir) + "\n")
         _ = (root / "active" / "director-two").write_text(str(other_run) + "\n")
         with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder") as notify:
@@ -6218,7 +6238,9 @@ class WorkersHomeTests(unittest.TestCase):
                 self.record(self.home / ".codex")
                 with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "user_zone", return_value=zone), patch.object(codex_mesh, "_stop_unused", return_value=True):
                     lines = codex_mesh.retire_workers_servers(home, "codex1")
-                self.assertIn(datetime.now().astimezone(zone).strftime("%H:%M %Z"), "\n".join(lines))
+                self.assertTrue(lines)
+                self.assertIn(datetime.now().astimezone(zone).strftime("%H:%M %Z"),
+                              (self.session_dir / codex_mesh.SERVER_LOG).read_text())
 
     def test_swap_dry_run_lists_runs_without_retiring_or_notifying(self) -> None:
         home = self.select()
@@ -6229,10 +6251,41 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertEqual((self.session_dir / codex_mesh.SERVER_FILE).read_bytes(), before)
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
         self.assertTrue(lines)
-        self.assertIn("codex1", "\n".join(lines))
-        self.assertIn("~/.codex1", "\n".join(lines))
+        self.assertEqual([line.folder for line in lines], [self.session_dir])
         watch.assert_not_called()
         notify.assert_not_called()
+
+    def test_swap_returns_worker_states_and_marker_holders_while_preserving_notices(self) -> None:
+        home = self.select()
+        root = self.session_dir.parent
+        active = root / "active"
+        active.mkdir()
+        _ = (active / "holder-id").write_text(str(self.session_dir) + "\n")
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "project-impl": {"thread_id": "a", "status": "done"},
+            "project-review": {"thread_id": "b", "status": "running", "turn_id": "turn-b"},
+            "project-ended": {"thread_id": "c", "status": "ended"},
+        }))
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.record(self.home / ".codex")
+                with (patch.object(codex_mesh, "SWEEP_ROOTS", (root,)),
+                      patch.object(codex_mesh, "_stop_unused", return_value=True),
+                      patch.object(codex_mesh, "_notify_holder") as notify):
+                    result = codex_mesh.retire_workers_servers(home, "codex1", dry_run=dry_run)
+                self.assertEqual(result, (codex_mesh.WorkersRunSwitch(self.session_dir, ("holder-id",), (
+                    codex_mesh.SwitchingWorker("project-impl", False),
+                    codex_mesh.SwitchingWorker("project-review", True),
+                )),))
+                if dry_run:
+                    notify.assert_not_called()
+                else:
+                    self.assertEqual(notify.call_args.args[0], "holder-id")
+                    notice = cast(str, notify.call_args.args[1])
+                    self.assertIn("Continue dispatching as usual.", notice)
+                    self.assertIn(self.session_dir.name, notice)
+                    self.assertIn("Continue dispatching as usual.",
+                                  (self.session_dir / codex_mesh.SERVER_LOG).read_text())
 
 
 class ServerRecordTests(unittest.TestCase):
@@ -6291,7 +6344,7 @@ class ServerRecordTests(unittest.TestCase):
 
     def write_server(self, port: int, pid: int) -> None:
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
-            json.dumps({"port": port, "pid": pid, "codex_home": str(agent_accounts.workers_home())}), encoding="utf-8"
+            json.dumps({"port": port, "pid": pid, "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}), encoding="utf-8"
         )
 
     def retired_ports(self) -> list[object]:

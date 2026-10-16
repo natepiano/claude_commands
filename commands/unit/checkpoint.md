@@ -101,6 +101,8 @@ Loop/verbose only:
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what you see change> | <how to check it>`, one line per
    visible change, or `Change-Review: none — <why nothing visible changes>`.
+   A change the user can check outside the app counts as visible too: a
+   table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;
    the merge turns each visible line into a row on the change-review list.
 

@@ -131,7 +131,7 @@ class NightlyReviewTests(unittest.TestCase):
             name="natedev", sessionId="sid", cwd="/work", pid=42)))
         with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
-              mock.patch.object(account, "process_config_dir", return_value=config) as directory):
+              mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(config)) as directory):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
         directory.assert_called_once_with(42)
 
