@@ -1076,10 +1076,11 @@ class AgentNotesTests(unittest.TestCase):
         named = self.root / ".claude3"
         named.mkdir()
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(agent_accounts, "command_json") as command):
+              patch.object(agent_accounts, "command_json", side_effect=RuntimeError("unavailable")) as command):
             with self.assertRaisesRegex(RuntimeError, "usage credentials unavailable"):
                 _ = agent_accounts.claude_credentials(named)
-        command.assert_not_called()
+        command.assert_called_once_with("security", "find-generic-password", "-s",
+                                        agent_accounts.claude_keychain_service(named), "-w")
 
     def test_explicit_default_credentials_use_the_keychain_even_from_a_named_shell(self) -> None:
         with (patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3")}),

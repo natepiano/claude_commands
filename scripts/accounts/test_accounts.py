@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import accounts, refusals
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
+from scripts.message import roster
 from scripts.accounts import moves, worker_names
 import account
 import agent_accounts
@@ -1046,6 +1047,68 @@ class AccountsTests(unittest.TestCase):
         with patch.object(os, "execvpe", side_effect=FileNotFoundError("fixture executable missing")):
             result = self.run_cli("exec", "claude2")
         self.assertEqual(result, (2, "", "accounts: could not start claude: fixture executable missing\n"))
+
+    def test_exec_codex_labels_use_the_home_holding_each_login_and_preserve_arguments(self) -> None:
+        home, numbered = self.workers_fixture()
+        arguments = ["resume", "conversation id", "--model", "model-name", "--", "quoted argument"]
+        for label, directory in (("codex1", numbered), ("codex2", home)):
+            with self.subTest(label=label), patch.dict(os.environ, {
+                "CODEX_HOME": str(self.root / "inherited"), "PRESERVED_MARKER": "keep",
+            }), patch.object(sys.stdin, "isatty", return_value=True), patch.object(os, "execvpe") as launch:
+                self.assertEqual(self.run_cli("exec", label, *arguments), (0, "", ""))
+                launch.assert_called_once_with("codex", ["codex", *arguments],
+                    {**os.environ, "CODEX_HOME": str(directory)})
+
+    def test_exec_workers_follows_the_stored_selection_instead_of_the_callers_home(self) -> None:
+        home, numbered = self.workers_fixture()
+        for label, directory in (("codex1", numbered), ("codex2", home)):
+            with self.subTest(label=label):
+                self.assertEqual(self.run_cli("set-role", "workers", label), (0, "", ""))
+                with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}), patch.object(os, "execvpe") as launch:
+                    self.assertEqual(self.run_cli("exec", "workers", "--version"), (0, "", ""))
+                    launch.assert_called_once_with("codex", ["codex", "--version"],
+                        {**os.environ, "CODEX_HOME": str(directory)})
+
+    def test_exec_unknown_codex_account_refuses_without_starting_a_process(self) -> None:
+        with patch.object(os, "execvpe") as launch:
+            code, output, error = self.run_cli("exec", "codex99")
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("accounts: cannot select codex99 (~/.codex99): ~/.codex99 is missing", error)
+        launch.assert_not_called()
+
+    def test_exec_unknown_codex_account_beside_a_noted_home_names_only_the_missing_home(self) -> None:
+        _ = self.workers_fixture()
+        with patch.object(os, "execvpe") as launch:
+            code, output, error = self.run_cli("exec", "codex99")
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("accounts: cannot select codex99 (~/.codex99): ~/.codex99 is missing", error)
+        self.assertNotIn("@", error)
+        launch.assert_not_called()
+
+    def test_exec_signed_out_codex_home_uses_the_selection_refusal_without_exec(self) -> None:
+        _, numbered = self.workers_fixture()
+        (numbered / "auth.json").unlink()
+        with patch.object(os, "execvpe") as launch:
+            code, output, error = self.run_cli("exec", "codex1")
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("accounts: cannot select codex1 (~/.codex1): ~/.codex1 is not logged in", error)
+        launch.assert_not_called()
+
+    def test_exec_codex_rejects_the_claude_probe_option(self) -> None:
+        _ = self.workers_fixture()
+        for label in ("codex1", "workers"):
+            with self.subTest(label=label), patch.object(os, "execvpe") as launch:
+                code, output, error = self.run_cli("exec", "--probe", label)
+                self.assertEqual((code, output), (2, ""))
+                self.assertIn("--probe", error)
+                self.assertIn("Claude", error)
+                launch.assert_not_called()
+
+    def test_exec_reports_an_unavailable_codex_executable_with_exit_two(self) -> None:
+        _ = self.workers_fixture()
+        with patch.object(os, "execvpe", side_effect=FileNotFoundError("fixture executable missing")):
+            result = self.run_cli("exec", "codex1")
+        self.assertEqual(result, (2, "", "accounts: could not start codex: fixture executable missing\n"))
 
     def test_check_wrong_login_or_missing_note_removes_the_named_account_and_unit_role(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -2821,13 +2884,70 @@ class AccountsTests(unittest.TestCase):
     def test_workers_swap_dry_run_names_target_and_preserves_roles_and_history(self) -> None:
         _, target = self.workers_fixture()
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_workers_servers", return_value=["unit-one would move"]) as retire:
+        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
             result, stdout, stderr = self.run_cli("swap", "workers", "codex1", "--dry-run")
         self.assertEqual((result, stderr), (0, ""))
         self.assertIn("codex1", stdout)
-        self.assertIn("~/.codex1", stdout)
+        self.assertEqual(stdout, "Workers would move codex2 → codex1:\n")
         self.assertEqual(self.role_files(), before)
         retire.assert_called_once_with(target, "codex1", dry_run=True)
+
+    def test_workers_swap_names_each_switching_worker_and_its_production_for_both_modes(self) -> None:
+        def holder(session: str, machine: str, unit: str, name: str) -> roster.RosterEntry:
+            return roster.RosterEntry(
+                machine=machine, kind="claude", role="unit director", name=name, status="running",
+                reach=roster.Messageable(f"session:{session}"), cwd="",
+                showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
+                director=roster.DirectsUnit(unit) if unit else roster.NoDirector(),
+                assignment=roster.NotAWorker(), session=roster.ClaudeSession(session))
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                _ = self.workers_fixture()
+                switches = (
+                    codex_mesh.WorkersRunSwitch(self.root / "private-run-a", ("director-a",), (
+                        codex_mesh.SwitchingWorker("claude-build-two-accounts-impl", False),)),
+                    codex_mesh.WorkersRunSwitch(self.root / "private-run-b", ("director-b",), (
+                        codex_mesh.SwitchingWorker("claude-build-herdr-trial-review", True),)),
+                    codex_mesh.WorkersRunSwitch(self.root / "private-run-c", ("freestanding",), (
+                        codex_mesh.SwitchingWorker("project-test-worker", False),)),
+                    codex_mesh.WorkersRunSwitch(self.root / "orphan-run", ("missing",), (
+                        codex_mesh.SwitchingWorker("project-fix", False),)),
+                )
+                snapshot = roster.Roster([
+                    holder("director-a", "here", "two-accounts", "director-a"),
+                    holder("director-b", "macbook", "herdr-trial", "director-b"),
+                    holder("freestanding", "here", "", "scratch session"),
+                ], [])
+                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
+                      patch.object(roster, "roster", return_value=snapshot),
+                      patch.object(roster, "machine_name", return_value="here")):
+                    code, stdout, stderr = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual((code, stderr), (0, ""))
+                header = "Workers would move" if dry_run else "Workers moving"
+                self.assertEqual(stdout, f"{header} codex2 → codex1:\n" +
+                    "  natedev · two-accounts · impl-worker → codex1\n" +
+                    "  macbook · natedev · herdr-trial · review-worker → codex1 (mid-turn; switches when its turn ends)\n" +
+                    "  natedev · scratch session · test-worker → codex1\n" +
+                    "  unknown session (orphan-run) · fix-worker → codex1\n")
+                self.assertNotIn("private-run", stdout)
+
+    def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
+        records = self.home / ".claude/sessions"
+        records.mkdir(parents=True, exist_ok=True)
+        _ = (records / "321.json").write_text(json.dumps({
+            "pid": 321, "sessionId": "missing-holder", "name": "saved director",
+            "messagingSocketPath": "", "updatedAt": 10}))
+        switches = (codex_mesh.WorkersRunSwitch(self.root / "private-run", ("missing-holder",), (
+            codex_mesh.SwitchingWorker("project-impl", False),)),)
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                _ = self.workers_fixture()
+                with (patch.object(roster, "roster", return_value=roster.Roster([], [])),
+                      patch.object(codex_mesh, "retire_workers_servers", return_value=switches)):
+                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(output.splitlines()[1:], ["  saved director · impl-worker → codex1"])
+                self.assertNotIn("private-run", output)
 
     def test_numbered_workers_target_selects_the_login_in_the_home_directory(self) -> None:
         default, _ = self.workers_fixture()
@@ -2839,7 +2959,7 @@ class AccountsTests(unittest.TestCase):
         with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
             code, stdout, stderr = self.run_cli("swap", "workers", "codex2", "--dry-run")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("codex2 (~/.codex)", stdout)
+        self.assertEqual(stdout, "Workers would move codex1 → codex2:\n")
         self.assertEqual(self.role_files(), before)
         retire.assert_called_once_with(default, "codex2", dry_run=True)
         self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
@@ -2868,16 +2988,16 @@ class AccountsTests(unittest.TestCase):
     def test_workers_swap_writes_role_before_retiring_servers(self) -> None:
         _, target = self.workers_fixture()
         observed: list[Path] = []
-        def retire(home: Path, label: str, dry_run: bool = False) -> list[str]:
+        def retire(home: Path, label: str, dry_run: bool = False) -> tuple[codex_mesh.WorkersRunSwitch, ...]:
             self.assertFalse(dry_run)
             self.assertEqual((home, label), (target, "codex1"))
             observed.append(agent_accounts.workers_home())
-            return ["unit-one: codex1 (~/.codex1); current turn finishes, next turn moves"]
+            return ()
         with patch.object(codex_mesh, "retire_workers_servers", side_effect=retire):
             result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertEqual((result, stderr), (0, ""))
         self.assertEqual(observed, [target])
-        self.assertIn("unit-one", stdout)
+        self.assertEqual(stdout, "Workers moving codex2 → codex1:\n")
         self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
 
     def test_workers_swap_refuses_current_role_without_mutation(self) -> None:

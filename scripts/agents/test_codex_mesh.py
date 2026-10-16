@@ -6000,8 +6000,10 @@ class WorkersHomeTests(unittest.TestCase):
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
         with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_stop_unused", return_value=True):
             lines = codex_mesh.retire_workers_servers(home, "codex1")
-        self.assertIn("move from ~/.codex at their next turn", "\n".join(lines))
-        self.assertIn("codex1 (~/.codex1)", "\n".join(lines))
+        self.assertEqual([line.folder for line in lines], [self.session_dir])
+        log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
+        self.assertIn("move from ~/.codex at their next turn", log)
+        self.assertIn("codex1 (~/.codex1)", log)
 
     def test_unsubscribe_not_loaded_proves_release_without_another_state_read(self) -> None:
         class UnloadedClient:
@@ -6218,7 +6220,9 @@ class WorkersHomeTests(unittest.TestCase):
                 self.record(self.home / ".codex")
                 with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "user_zone", return_value=zone), patch.object(codex_mesh, "_stop_unused", return_value=True):
                     lines = codex_mesh.retire_workers_servers(home, "codex1")
-                self.assertIn(datetime.now().astimezone(zone).strftime("%H:%M %Z"), "\n".join(lines))
+                self.assertTrue(lines)
+                self.assertIn(datetime.now().astimezone(zone).strftime("%H:%M %Z"),
+                              (self.session_dir / codex_mesh.SERVER_LOG).read_text())
 
     def test_swap_dry_run_lists_runs_without_retiring_or_notifying(self) -> None:
         home = self.select()
@@ -6229,10 +6233,41 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertEqual((self.session_dir / codex_mesh.SERVER_FILE).read_bytes(), before)
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
         self.assertTrue(lines)
-        self.assertIn("codex1", "\n".join(lines))
-        self.assertIn("~/.codex1", "\n".join(lines))
+        self.assertEqual([line.folder for line in lines], [self.session_dir])
         watch.assert_not_called()
         notify.assert_not_called()
+
+    def test_swap_returns_worker_states_and_marker_holders_while_preserving_notices(self) -> None:
+        home = self.select()
+        root = self.session_dir.parent
+        active = root / "active"
+        active.mkdir()
+        _ = (active / "holder-id").write_text(str(self.session_dir) + "\n")
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "project-impl": {"thread_id": "a", "status": "done"},
+            "project-review": {"thread_id": "b", "status": "running", "turn_id": "turn-b"},
+            "project-ended": {"thread_id": "c", "status": "ended"},
+        }))
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.record(self.home / ".codex")
+                with (patch.object(codex_mesh, "SWEEP_ROOTS", (root,)),
+                      patch.object(codex_mesh, "_stop_unused", return_value=True),
+                      patch.object(codex_mesh, "_notify_holder") as notify):
+                    result = codex_mesh.retire_workers_servers(home, "codex1", dry_run=dry_run)
+                self.assertEqual(result, (codex_mesh.WorkersRunSwitch(self.session_dir, ("holder-id",), (
+                    codex_mesh.SwitchingWorker("project-impl", False),
+                    codex_mesh.SwitchingWorker("project-review", True),
+                )),))
+                if dry_run:
+                    notify.assert_not_called()
+                else:
+                    self.assertEqual(notify.call_args.args[0], "holder-id")
+                    notice = cast(str, notify.call_args.args[1])
+                    self.assertIn("Continue dispatching as usual.", notice)
+                    self.assertIn(self.session_dir.name, notice)
+                    self.assertIn("Continue dispatching as usual.",
+                                  (self.session_dir / codex_mesh.SERVER_LOG).read_text())
 
 
 class ServerRecordTests(unittest.TestCase):
