@@ -5094,6 +5094,43 @@ def command_fork(args: argparse.Namespace) -> int:
             client.close()
 
 
+def command_set_instructions(args: argparse.Namespace) -> int:
+    """Point an idle reviewer's standing prompt at a new file; its next resume sends that file.
+
+    The thread and its turns stay. A reviewer that is busy or not followable is refused (exit 2),
+    so a turn already running keeps the prompt it started with.
+    """
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "to"))
+    instructions = Path(_as_str(_attr(args, "instructions_file"))).resolve()
+    if not instructions.is_file():
+        print(f"codex_mesh: {name}: no instructions file at {instructions}", file=sys.stderr)
+        return 1
+    state = _lookup_state(session_dir, name)
+    if not isinstance(state, FollowableThread):
+        reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
+        print(f"codex_mesh: {name}: {reason}; instructions unchanged", file=sys.stderr)
+        return 2
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        if entry.get("thread_id") != state.thread_id or entry.get("status") != "done":
+            print(f"codex_mesh: {name}: worker changed while setting instructions; instructions unchanged",
+                  file=sys.stderr)
+            return 2
+        entry["instructions_file"] = str(instructions)
+        _advance_roster_revision(entry)
+        roster[name] = entry
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        handle.flush()
+    return 0
+
+
 def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_pid: int) -> bool:
     """Clear context only while reset still owns this thread's worker claim."""
     path = _session_path(session_dir, ROSTER_FILE)
@@ -5257,6 +5294,12 @@ def main(argv: list[str] | None = None) -> int:
     _ = fork.add_argument("--from", dest="from_name", required=True)
     _ = fork.add_argument("--name", required=True)
     fork.set_defaults(handler=command_fork)
+
+    set_instructions = subparsers.add_parser("set-instructions", help="point an idle reviewer at a new standing prompt")
+    _ = set_instructions.add_argument("--session-dir", required=True)
+    _ = set_instructions.add_argument("--to", required=True)
+    _ = set_instructions.add_argument("--instructions-file", required=True)
+    set_instructions.set_defaults(handler=command_set_instructions)
 
     reset = subparsers.add_parser("reset", help="remove all turns from an idle reviewer")
     _ = reset.add_argument("--session-dir", required=True)
