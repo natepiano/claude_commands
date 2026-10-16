@@ -429,7 +429,7 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 VERSION_RE = re.compile(
     r"^(?:Unreleased|\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$"
 )
-# A bare row is a row of Hana's list; a row of a production's own list names it: build-followups/C3.
+# A bare row is a row of hana's list; a row of another showrunner's list names it: natedev/C3.
 REVIEW_ROW_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_-]*/)?[AC]\d+$")
 BODY_SECTION_HEADINGS = frozenset({"## See it", "## Evidence"})
 UNSAFE_BARE_SCALAR_PREFIXES = frozenset("-?:,[]{}#&*!|>'\"%@`")

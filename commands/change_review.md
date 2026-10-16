@@ -1,11 +1,13 @@
 ---
-description: Add a change for the user to check to the production's change review list, walk the list when the user asks for "change review", and record their verdicts.
+description: Add a change for the user to check to the top-level showrunner's change review list, walk the list when the user asks for "change review", and record their verdicts.
 ---
 
 # Change review
 
-Every production keeps a list of changes waiting for the user's check: the file
-its production doc's **Change review** line names. Merges add a row for each
+Each top-level showrunner keeps one list of changes waiting for the user's
+check, named for it: `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
+such as `change-review - natedev.md`. A child production's rows go to its
+root's list. Merges add a row for each
 `Change-Review:` line in a checkpoint. This skill adds the rest, shows the list
 when the user asks, and records verdicts. Unit directors and showrunners use it.
 
@@ -19,17 +21,23 @@ On exit 1 report its one line.
 
 ## Find the list
 
-`list-path` prints the list's path; pass it as `--list` to every other action.
+Every action finds the list from its production, written `<production>` below:
 
-- A showrunner runs `list-path` alone: it finds the production from this
+- A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
   timer passes `--production <doc>`.
-- A unit director runs `list-path --production <doc>`, with the doc its plan
-  header's `> **Production:**` line names.
+- A unit director passes `--production <doc>`, with the doc its plan header's
+  `> **Production:**` line names.
 
-A production doc without a Change review line has no list: say so in one
-line. The showrunner adds the line (`~/.claude/docs/production_format.md`). A
-missing list file is created on its first row.
+The list is named for the production's top-level showrunner while it runs, and
+otherwise is the path the doc's **Change review** line names. `list-path`
+prints it and `showrunner` prints the name. A production doc without a Change
+review line has no list: say so in one line. The showrunner adds the line
+(`~/.claude/docs/production_format.md`). A missing list file is created on its
+first row, with its frontmatter.
+
+Every write sets the list's `date_modified` and adds the production's doc to
+its `productions`, so the list's frontmatter names every production it holds.
 
 Every write commits the list itself when it sits in a git repository, so never
 commit it by hand. A `written but not committed` warning needs nothing: the
@@ -45,7 +53,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add --list <list> --change "<what the user sees change>" --check "<how to check it>" [--merged <hash>]
+… add <production> --change "<what the user sees change>" --check "<how to check it>" [--merged <hash>]
 ```
 
 One row per change. Each part is one line in plain words. Pass `--merged` when
@@ -53,7 +61,7 @@ a commit holds the change. It prints the new row's id, such as `C12`.
 
 ## show
 
-Only when the user asks for "change review". Run `show --list <list>`. It
+Only when the user asks for "change review". Run `show <production>`. It
 prints each row to review: its id and change, how to check it, and when it
 merged, or `nothing to review`. Walk the rows one at a time, in order. For each,
 say what changed and how to check it in plain words, then wait for the user's
@@ -67,7 +75,7 @@ feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
 there leaves the row open. Then:
 
 ```sh
-… verdict --list <list> --row C<n> --verdict "<the user's words>"
+… verdict <production> --row C<n> --verdict "<the user's words>"
 ```
 
 It moves the row to `## Reviewed` with the verdict and today's date, and prints
