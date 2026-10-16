@@ -41,6 +41,26 @@ def _attach(name: str) -> None:
     os.execvp(binary, [binary, "session", "attach", name])
 
 
+def _launch_rerun(verb: str, options: LaunchOptions, folder: Path, claude_arguments: list[str]) -> str:
+    command = [sys.executable, str(Path(__file__).resolve()), verb]
+    if options.name is not None:
+        command.extend(["--name", options.name] if verb == "start" else [options.name])
+    command.extend(["--cwd", str(folder)])
+    if verb == "resume":
+        command.extend(["--session-id", options.session_id])
+        if options.config_dir:
+            command.extend(["--config-dir", str(Path(options.config_dir).expanduser().resolve())])
+        if options.restore:
+            command.append("--restore")
+        if options.prompt_file:
+            command.extend(["--prompt-file", str(Path(options.prompt_file).resolve())])
+        if options.attach:
+            command.append("--attach")
+    if claude_arguments:
+        command.extend(["--", *claude_arguments])
+    return shlex.join(command)
+
+
 def _launch(verb: str, arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=f"herdr_sessions.py {verb}")
     if verb == "start":
@@ -85,7 +105,13 @@ def _launch(verb: str, arguments: list[str]) -> int:
                          + "-u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude"
                          if isinstance(selected, accounts.LegacyHomeLaunch)
                          else accounts.trust_command(folder, selected))
-        print(f"herdr_sessions: {reason}. Run: {trust_command}", file=sys.stderr)
+        if isinstance(trust, herdr.UnreadableTrustFile):
+            print(f"herdr_sessions: {reason}. Run: {trust_command}", file=sys.stderr)
+        else:
+            rerun = _launch_rerun(verb, options, folder, claude_arguments)
+            print(f"herdr_sessions: {reason}.\n"
+                  + "Paste this, accept Claude's trust prompt, then exit Claude; the session then starts:\n"
+                  + f"{trust_command} && {rerun}", file=sys.stderr)
         return 1
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:
@@ -169,7 +195,7 @@ def unit_roles() -> dict[str, str]:
     return roles
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
@@ -202,6 +228,14 @@ def main(argv: list[str]) -> int:
     except (herdr.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3
+
+
+def main(argv: list[str]) -> int:
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("herdr_sessions: stopped", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

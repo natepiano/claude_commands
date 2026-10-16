@@ -318,6 +318,7 @@ else:
     def test_unreadable_own_account_exits_two(self) -> None:
         errors = io.StringIO()
         with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "current-session"}),
             redirect_stderr(errors),
             patch.object(
                 shutdown,

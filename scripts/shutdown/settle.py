@@ -27,6 +27,7 @@ for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
 
 from account import Account
 import conversation_pause
+import detached
 import note_file
 from inventory import Inventory, Session, inventory
 from launch_permission import shutdown_state_root
@@ -1172,8 +1173,23 @@ def _launch_conductor(login: str, label: str) -> None:
     if os.environ.get("REFUSAL_WATCH_INVENTORY") == "read existing":
         # Service managers do not inherit the caller's environment automatically.
         command = ["env", "REFUSAL_WATCH_INVENTORY=read existing", *command]
-    launch = (["launchctl", "submit", "-l", service, "--", *command] if sys.platform == "darwin"
-              else ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command])
+    if sys.platform == "darwin":
+        try:
+            logs = shutdown_state_root() / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=logs, prefix=service + "-", suffix=".log", delete=False) as output:
+                log = Path(output.name)
+        except OSError as error:
+            raise RuntimeError(f"could not start shutdown conductor {service}: {error}") from error
+        try:
+            _ = detached.start_detached(command, within=15,
+                ready=lambda: "shutdown conductor started\n" in log.read_text(encoding="utf-8"),
+                output=detached.AppendLog(log),
+                environment=detached.ExplicitEnvironment({**os.environ, detached.STARTUP_SIGNAL_ENV: "1"}))
+        except (detached.DetachedStartFailure, OSError) as error:
+            raise RuntimeError(f"could not start shutdown conductor {service}: {error}; log: {log}") from error
+        return
+    launch = ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command]
     result = subprocess.run(launch, check=False, timeout=15)
     if result.returncode != 0:
         raise RuntimeError(f"could not start shutdown conductor {service}")
@@ -1708,6 +1724,8 @@ def _write_conduct_archive(login: str, archived: dict[str, SessionShutdown]) -> 
 
 def conduct(login: str) -> int:
     """Keep an owner available for work added while a conductor releases its lock."""
+    if os.environ.pop(detached.STARTUP_SIGNAL_ENV, "") == "1":
+        print("shutdown conductor started", file=sys.stderr, flush=True)
     fingerprint = _module_fingerprint()
     for line in store.migrate(login):
         print(line)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import shlex
+import socket
+import sys
 import unittest
 from enum import StrEnum
 from types import ModuleType
@@ -12,6 +14,7 @@ from unittest.mock import patch
 import remote
 import remote_control
 import restart
+import herdr
 import settle
 import shutdown
 import sessions
@@ -60,6 +63,12 @@ def registry_confirmation(ids: frozenset[str]) -> restart.RegistryConfirmation:
         for index, identity in enumerate(sorted(ids))))
 
 
+def linux_process_fixture(test: unittest.TestCase) -> None:
+    """Select the platform modeled by proc trees and systemd stand-ins."""
+    _ = cast(object, test.enterContext(patch.object(sys, "platform", "linux")))
+    _ = cast(object, test.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
+
+
 class ShutdownTestCase(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -68,6 +77,8 @@ class ShutdownTestCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # Records and reports in these fixtures belong to natedev.
+        _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         self._send_leaf_hits.clear()
         # Run after patch cleanups, so caught assertions still fail the test.
         self.addCleanup(self._fail_send_leaf_hits)
