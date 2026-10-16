@@ -413,7 +413,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if isinstance(identity := accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir())))),
                       agent_accounts.NumberedAccount))
     tick_excluded = accounts.account_labels_for_logins(tick_logins)
-    # Preparation is a read-only gate: a broken destination changes no group or refusal state.
+    # Preview preparation judges repairs without changing any account content.
     for session in owners:
         group_name = accounts.session_group(session)
         if group_name == "ungrouped":
@@ -455,7 +455,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         chosen = accounts.placement(group_name, now, exclude=tick_excluded)
         if not isinstance(chosen.reason, accounts.GroupNoRoom):
             assert isinstance(chosen.label, str)
-            prepared = accounts.prepared_account(chosen.label, resume=True)
+            prepared = (accounts.prepared_account_preview(chosen.label, resume=True) if dry_run
+                        else accounts.prepared_account(chosen.label, resume=True))
             if isinstance(prepared, accounts.AccountRefused):
                 blocked_groups.add(group_name)
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
@@ -660,7 +661,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if held is not None and not refusals.resolved(held, refusals.stored_reading("claude", identity.login, now), now):
                 lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
                 continue
-            prepared = accounts.prepared_account(target, resume=True)
+            prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
+                        else accounts.prepared_account(target, resume=True))
             if isinstance(prepared, accounts.AccountRefused):
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
                 continue
