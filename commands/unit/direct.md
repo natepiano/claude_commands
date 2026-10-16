@@ -584,6 +584,14 @@ launcher writes its files to that phase's `${PHASE_DIR}`.
 </PassOwnership>
 
 <ProgressContract>
+Before stating any ETA in a message, reply or notice, record it with
+`progress_history.py eta --session-dir "${SESSION_DIR}" --time <HH:MM> --basis stated`
+(`--basis checkpoint` for checkpoint notices, `--basis eta-command` for
+`/unit:eta` and `/unit:eta_breakdown`). Add `--phase-id <id>` when it names a
+phase other than the active one. `<HH:MM>` means today in the user's zone; an
+ETA on a later day takes `<YYYY-MM-DDTHH:MM>`. State the time the recorder
+printed.
+
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
 The key sets the Codex poll timeout and a Claude unit's notifier interval.

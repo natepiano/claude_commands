@@ -19,6 +19,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.delegate import phase_table
+from scripts.delegate.recorder_fixture import invoke_recorder
 from scripts.production import fake_showrunner, fake_tmux, showrunners
 
 
@@ -576,7 +577,7 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assert_epoch(record.plan_finish.at, 1_400)
 
-    def test_stated_eta_wins_over_a_later_progress_report(self) -> None:
+    def test_legacy_stated_eta_wins_over_a_later_progress_report(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
         _ = self.write_run(
             "current",
@@ -615,6 +616,63 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(current.eta.basis, "three checks remain")
         assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
         self.assert_epoch(current.first_stated.time, 1_500)
+
+    def test_checkpoint_eta_applies_to_its_named_phase_after_that_phase_starts(self) -> None:
+        self.write_plan(
+            plan_text(
+                "## Delegation Context",
+                "",
+                "- **Project:** Checkpoint ETA fixture",
+                "",
+                "### Phase 2 — Current delivery  · status: todo",
+                "",
+                "### Phase 3 — Next delivery  · status: todo",
+            )
+        )
+
+        def record(at: int, command: str, *arguments: str) -> None:
+            environment = {
+                **self.environment(at),
+                "HOME": str(self.root),
+                "USER_ZONE": "UTC",
+                "PLAN_DELEGATE_SYNC_WRITES": "0",
+            }
+            _ = environment.pop("CODEX_THREAD_ID", None)
+            _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+            result = invoke_recorder(
+                [command, "--session-dir", str(self.session_dir), *arguments],
+                environment,
+                self.working_dir,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        record(
+            900, "start-run", "--working-dir", str(self.working_dir),
+            "--plan-doc", str(self.plan), "--main-model", "fixture-model",
+        )
+        record(1_000, "start-phase", "--phase-id", "2", "--phase-title", "Current delivery")
+        record(1_050, "eta", "--phase-id", "3", "--time", "00:30", "--basis", "checkpoint")
+
+        previous = self.build(1_060).current
+
+        assert isinstance(previous, phase_table.OpenPhase)
+        self.assertEqual(previous.phase, "2")
+        self.assertIsInstance(previous.eta, phase_table.EtaUnavailable)
+        self.assertIsInstance(previous.first_stated, phase_table.EtaNeverStated)
+
+        record(1_100, "finish-phase", "--status", "completed")
+        record(1_150, "start-phase", "--phase-id", "3", "--phase-title", "Next delivery")
+
+        current = self.build(1_200).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual(current.phase, "3")
+        assert isinstance(current.eta, phase_table.StatedEta)
+        self.assert_epoch(current.eta.time, 1_800)
+        self.assert_epoch(current.eta.stated_at, 1_050)
+        self.assertEqual(current.eta.basis, "checkpoint")
+        assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
+        self.assert_epoch(current.first_stated.time, 1_800)
 
     def test_passed_stated_eta_yields_to_projection_and_keeps_first(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))

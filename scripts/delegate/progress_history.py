@@ -400,6 +400,10 @@ def _refuse_eta(message: str) -> NoReturn:
 
 
 def _local_eta_epoch(value: str, option: str) -> float:
+    zone = user_zone()
+    if re.fullmatch(r"\d{2}:\d{2}", value):
+        today = datetime.fromtimestamp(now_epoch(), zone)
+        value = f"{today:%Y-%m-%d}T{value}"
     layout = "%Y-%m-%dT%H:%M"
     try:
         parsed = datetime.strptime(value, layout)
@@ -407,7 +411,6 @@ def _local_eta_epoch(value: str, option: str) -> float:
         _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
     if parsed.strftime(layout) != value:
         _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
-    zone = user_zone()
     epoch = parsed.replace(tzinfo=zone).timestamp()
     if datetime.fromtimestamp(epoch, zone).strftime(layout) != value:
         _refuse_eta(f"{option} is a time the local clock skips")
@@ -4507,8 +4510,11 @@ def _eta(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
-        _refuse_eta("An active phase is required to record an ETA")
+    phase_id = _optional_arg(args, "phase_id").strip()
+    if not phase_id:
+        if phase is None or _string(phase.get("status")) != "active":
+            _refuse_eta("An active phase is required to record an ETA")
+        phase_id = _string(phase.get("id"))
     basis = _arg_string(args, "basis").strip()
     if not basis:
         _refuse_eta("--basis must not be blank")
@@ -4524,7 +4530,7 @@ def _eta(args: argparse.Namespace) -> None:
         _refuse_eta("--earliest and --latest must be supplied together")
 
     event = _event(state, "eta_stated", now)
-    event.update({"eta_at": eta_at, "basis": basis})
+    event.update({"eta_at": eta_at, "basis": basis, "eta_phase_id": phase_id})
     if earliest_text and latest_text:
         earliest_at = _local_eta_epoch(earliest_text, "--earliest")
         latest_at = _local_eta_epoch(latest_text, "--latest")
@@ -4890,6 +4896,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     eta = subparsers.add_parser("eta")
     _ = eta.add_argument("--session-dir", required=True)
+    _ = eta.add_argument("--phase-id", default="")
     _ = eta.add_argument("--time", required=True)
     _ = eta.add_argument("--earliest", default="")
     _ = eta.add_argument("--latest", default="")
