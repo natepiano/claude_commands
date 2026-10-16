@@ -537,6 +537,42 @@ class WaitLocalTests(IsolatedTargetTest):
         self.assertIsInstance(decision, build_hold.AdmittedTurn)
         self.assertTrue((self.holders / "hana").exists())
 
+    def leave_wait(self, leave_hook: str) -> tuple[int, str]:
+        errors = io.StringIO()
+        with mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
+             mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN), \
+             redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            code = build_targets.command_wait_local("call-a", pid=os.getpid(), leave_hook=leave_hook)
+        return code, errors.getvalue()
+
+    def count_sleep(self, _seconds: float) -> None:
+        self.sleeps += 1
+
+    def test_held_call_leaves_for_a_free_mac_after_one_poll_and_gives_up_its_turn(self) -> None:
+        self.begin_hold()
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=self.count_sleep):
+            code, errors = self.leave_wait("exit 0")
+        self.assertEqual(code, build_targets.LEFT_QUEUE_STATUS, errors)
+        self.assertEqual(self.sleeps, 1)
+        self.assertIn("verify.sh: the Mac is free: leaving natedev's hold wait to run there.", errors)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual([call for entry in cycle["entries"] for call in entry.get("calls", [])], [])
+        self.assertTrue((self.root / "wait-seconds").read_text().strip())
+
+    def test_held_call_with_a_busy_or_blocked_mac_waits_for_natedev_release(self) -> None:
+        self.begin_hold()
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=self.release_turn):
+            code, errors = self.leave_wait("exit 1")
+        self.assertEqual(code, 0, errors)
+        self.assertNotIn("the Mac is free", errors)
+        self.assertIsInstance(build_hold.read_admission("verify:call-a", "call-a"), build_hold.AdmittedTurn)
+
+    def test_unheld_call_never_runs_the_leave_hook(self) -> None:
+        marker = self.root / "hook-ran"
+        self.assertEqual(self.leave_wait(f"touch {marker}"), (0, ""))
+        self.assertFalse(marker.exists())
+
     def test_waiting_line_collapses_holder_and_reason_whitespace(self) -> None:
         self.begin_hold()
         holder = targets.Held(" hana\nteam ", " render\nchecks ", SINCE, targets.UntilReleased())

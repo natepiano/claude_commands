@@ -1271,6 +1271,40 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
                          (42, "failed", "", 3.25))
 
+    def test_hold_that_lands_during_the_memory_wait_still_leaves_for_a_freed_mac(self) -> None:
+        meminfo = self.hold_memory()
+        mac_free = self.runner_state / "mac-free"
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
+            "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
+        with self.hold_environment():
+            _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
+                                      "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+        cycle_path = self.root / "release" / cycle["id"] / "cycle.json"
+
+        def waiting_on_the_hold() -> bool:
+            entries = cast(build_hold.HoldCycle, json.loads(cycle_path.read_text()))["entries"]
+            return any(entry["calls"] for entry in entries)
+
+        # Memory frees while natedev is held: the step moves to the hold wait,
+        # where the Mac is still busy.
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
+        self.wait_until(waiting_on_the_hold, "the hold wait", (process,))
+        self.assertEqual(len(self.runner_events()), 1)
+        _ = mac_free.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 42, output + errors)
+        self.assertIn("leaving natedev's hold wait to run there", output + errors)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assert_no_pending_calls(cycle_path)
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertEqual(self.last_call()["mac"], "failed")
+
     def test_mac_busy_again_after_leaving_returns_to_the_local_wait(self) -> None:
         meminfo = self.hold_memory()
         process = self.start_verify("test", "sample", "--no-cache", extra={
