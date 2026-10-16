@@ -1143,30 +1143,64 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 35 — A workers swap moves running workers at once  · status: done
 
-**Depends on:** Phase 33
+#### As-built
+
+- `retire_workers_servers` (swap) and `command_signin_changed` interrupt every running worker on an outgoing server at once: each worker's account-move marker (`<worker>.account-move.json` in the run folder) is written first, then `turn/interrupt` goes through the one turn-interrupt helper (`_interrupt_turn`, shared with the `interrupt` verb, `steer` and `end`). All interrupts across all runs go out before any wait.
+- `_finish_run_moves` / `_wait_account_move_resumes` confirm every continuation against one shared deadline (`ACCOUNT_MOVE_RESUME_TIMEOUT_SECS`, 30 s). A worker whose `launcher_pid` is dead or absent gets a detached `codex_mesh.py resume-account-move --session-dir <run> --to <worker>`.
+- A waiting launcher that sees the marker clears it, posts `account moved to codexN; resumed`, and resumes the same thread on the new server with "Your turn was interrupted to move your Codex account; any command you had running was stopped with it, so run it again. Continue where you stopped." An interrupted turn without a marker keeps the user-stop handling. A pending `mesh_runs.py` result is consumed once under the pending-inbox lock, so the resume neither drops nor repeats it.
+- Swap lines end `, interrupted and resumed` for a mid-turn worker; a failed interrupt or resume names the reason and the resume command. The swap exits 0 once the role moved and 1 only when the role move fails. `--dry-run` prints the same lines and interrupts nothing. The holder notice and server log say running workers were interrupted and resumed on the new account.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — move marker, shared interrupt, launcher resume, `resume-account-move`, shared-deadline wait.
+- `scripts/accounts/accounts.py` — `_workers_swap_lines` suffixes.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — swap behavior.
+
+**Gotchas:**
+- The resume relies on no build surviving the interrupted turn: the continuation tells the worker its command stopped and to rerun it.
+- The detached resume claims the roster row keeping role, previous_role and lens (read from the agents ledger), with previous_status `failed`, so a rejected resume leaves the printed manual retry usable.
+
+### Phase 36 — A swap leaves ended sessions' workers alone  · status: todo
+
+**Depends on:** Phase 35
 
 #### Work Order
 
-**Goal:** `accounts.py swap workers codexN` moves every worker at once, a worker mid-turn included: its turn on the old account is interrupted and the same thread resumes on the new account straight away, so no work waits hours on a long turn. User, 2026-10-15: "we need to not do this wait until a turn is done if it means we could be waiting for hours… it is fine to end a worker and have it resume, it costs very little."
+**Goal:** a workers swap or Codex sign-in change touches only workers some live session is waiting on. Workers of ended sessions are never interrupted or resumed, since resuming them spends credits on work nobody reads. Their rows leave the output, and their leftover app-servers are stopped. Showrunner, 2026-10-16: "a swap must never interrupt or resume a worker whose unit session is gone".
 
-**Constraints from prior phases:** `codex_mesh.retire_workers_servers` retires each run's app-server whose home is not the workers home and returns `WorkersRunSwitch` with `SwitchingWorker(name, mid_turn)`; today a running worker keeps the old server until its turn ends (22:32 on 2026-10-15: workers stayed on codex2 for more than an hour). `accounts._workers_swap_lines` prints one line per worker, `showrunner · unit · worker → codexN`, with a `(mid-turn; switches when its turn ends)` suffix. The launcher's turn loop already resumes a thread on the run's current server with `_start_workers_turn(..., "Continue where you stopped.")` after a context overflow; `_move_resident` moves a thread to the current server. The roster records each worker's `launcher_pid`. The codex sign-in change path (`command_sign_in_changed`) also leaves a worker mid-turn on the old server until its turn ends.
+**Constraints from prior phases:**
+
+- `codex_mesh.retire_workers_servers` (swap) and `command_signin_changed` (sign-in change) collect one `WorkersRunMove` per run folder whose recorded server's home is outgoing. They interrupt running workers through `_switch_run_workers` → `_interrupt_worker_for_account_move`, then confirm resumes in `_finish_run_moves`.
+- A run's holders are `_marker_sessions(roots, folder)`: the run-active markers under `<root>/active`, each named for a session id.
+- `scripts.message.sessions.running_sessions()` returns every running session record (process-validated, sockets not required), with a `sessionId` field; `live_sessions()` would wrongly drop a running session without a socket. The roster's `launcher_pid` shows whether a launcher still waits; a launcher's turn loop never checks its holder.
+- `command_signin_changed` scans only current server records (`*/mesh_server.json`), while the swap scans current and retired ones (`mesh_server.json`, `mesh_retired.json`).
+- `_stop_unused(None, pid, port, RetiredRunServer(folder))` stops a server only when a second look finds it unused. For a retired server, unused means no client and no conversation mid-turn (`_sweep_verdict`). It never kills by any other path.
+- `accounts._workers_swap_lines` prints one row per roster entry. It shortens each name to `<slot>-worker`, so one run folder whose roster holds several plans' workers prints the same row several times. A holder it cannot name prints as `unknown session (<run folder>)`.
+- A live `swap workers codex2 --dry-run` on 2026-10-16 printed 52 rows, most of them from ended sessions.
 
 **Spec:**
 
-1. A non-dry-run swap interrupts each running worker's turn on the retired server with `turn/interrupt` (the same call `steer` and `end` use, through a shared helper), after recording, per worker, that the interrupt is an account move (a marker in the run folder the launcher reads; never a field the launcher could mistake for a user stop).
-2. A launcher watching that worker sees the interrupted turn, finds the move marker, clears it, posts one board line (`account moved to codexN; resumed`), and resumes the same thread on the run's new server with one continuation turn whose text is `Your turn was interrupted to move your Codex account; any command you had running was stopped with it, so run it again. Continue where you stopped.`, then keeps waiting as before; nothing relies on a command surviving the interrupted turn; its pass and the director's wait are unchanged. An interrupted turn without the marker keeps today's handling.
-3. A running worker whose launcher is gone (no live `launcher_pid`) is resumed by the swap itself, with a detached continuation on the new server carrying the same text; it is never left interrupted with nobody resuming it.
-4. Output: one line per worker, `showrunner · unit · worker → codexN, interrupted and resumed` for a worker that was mid-turn, the current line for an idle one. `--dry-run` prints the same lines and interrupts nothing. A worker whose interrupt or resume fails gets its own line naming what failed and the command that resumes it by hand; the swap still exits 0 after moving the role, and exits 1 only when it could not move the role.
-5. The holder notice (`_notify_holder`, kind workers-changed) says running workers were interrupted and resumed on the new account; the server log line drops "a working worker finishes first".
-6. The sign-in change path uses the same interrupt-and-resume for a worker mid-turn on a server holding the old sign-in.
-7. `docs/accounts.md` and `commands/showrunner/accounts.md` describe the new swap behavior and output.
+1. **Live and ended runs.** A run with holders is live when any holder is a running session (`running_sessions()`); when every holder has died it is ended, even if a launcher survives. A run with no holder at all is live only while some roster worker's `launcher_pid` is alive. Every other run is ended. The check is one helper in codex_mesh, used by both the swap and the sign-in change.
+2. **No interrupt or resume.** An ended run's workers are never interrupted, never resumed, and never sent a detached resume. No marker is written for them, and their holders get no notice.
+3. **Stop leftover servers.** A non-dry-run swap or sign-in change retires an ended run's outgoing server record, as it does today. It then stops each of that run's outgoing servers through `_stop_unused` only. The sign-in change also finds ended runs whose only server holding the old sign-in is a retired one, as the swap does. A server it does not stop, such as one with a conversation mid-turn, is left running and named.
+4. **Output.** Ended runs get no rows. In their place comes one line: `N leftover servers from ended sessions`, plus `, M stopped` for a real run. A server that was kept gets its own line, `left running: <pid> on port <port> (<run folder>): <reason>`. `--dry-run` prints `N leftover servers from ended sessions: M can be stopped, K would stay` plus one `would stay:` line per busy server with its reason, and stops nothing.
+5. **One row per worker.** Rows fold to one per distinct `(holder, slot)`. Where a fold hides several roster entries, the row ends with ` ×N`. A row that folds a mid-turn worker keeps `, interrupted and resumed`. A failure never folds away: every failed entry keeps its own reason and resume command.
+6. **Docs.** `docs/accounts.md` and `commands/showrunner/accounts.md` describe the ended-session line and the folding.
 
 **Files:**
 
-- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — interrupt, move marker, launcher resume, detached resume, notices.
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — swap lines.
+- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — the live-run test, skipping ended runs, stopping leftover servers, and the ended-run counts on `WorkersRunSwitch`.
+- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — the folded rows and the leftover-servers line.
 - `docs/accounts.md`, `commands/showrunner/accounts.md` — swap text.
 
-**Workers:** `impl` (codex_mesh), `test` (tests in both test files and the accounts lines).
+**Workers:** `impl` (codex_mesh), `test` (both test files and the accounts swap lines).
 
-**Acceptance gate:** a test drives a fake app-server with a worker mid-turn and a waiting launcher: the swap interrupts the turn, the launcher resumes the same thread on the new server with one continuation and finishes its pass normally; a second test with no live launcher shows the swap's own resume; `swap workers codexN --dry-run` prints `, interrupted and resumed` for a mid-turn worker and interrupts nothing; merge_gate `--tests-only` is green.
+**Acceptance gate:**
+
+- One test sets up a fake app-server with two runs, one with a live holder and one ended, each with a worker mid-turn. The swap interrupts and resumes only the live run's worker. The ended run gets no marker, no interrupt and no resume, and its idle server is stopped through `_stop_unused`.
+- A second test gives an ended run a conversation mid-turn. Its server is left running and named, and a dry run reports it as staying.
+- A dead holder with a surviving launcher is ended; a running holder without a messaging socket is live and still gets its resume.
+- A sign-in change stops an ended run's retired-only old-sign-in server.
+- A fold of a resumed worker and two failed ones keeps both failures' reasons and resume commands.
+- The same coverage exists for the sign-in change.
+- `--dry-run` prints the leftover line and folded rows, and stops and interrupts nothing.
+- merge_gate `--tests-only` is green.
