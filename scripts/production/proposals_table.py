@@ -32,7 +32,7 @@ from issues import Issue, open_issues
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import phase_table
-import progress_history
+from scripts.delegate import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import unit_runs
@@ -185,7 +185,7 @@ def unit_plans(plan: Path) -> list[Path]:
 def unit_add_on_rows(unit: str, plan: Path) -> list[Row]:
     rows: list[Row] = []
     for path in unit_plans(plan):
-        for run in progress_history.plan_runs(path):
+        for run in plan_history.plan_runs(path):
             rows.extend(row for root in SESSION_ROOTS for row in add_on_rows(unit, root / run.stem / PENDING_NAME))
     return rows
 

@@ -86,9 +86,10 @@ def _extract_wikilink(raw: str) -> str:
 def parse_frontmatter(path: Path) -> dict[str, list[str]]:
     tags: list[str] = []
     see_also: list[str] = []
+    metadata = {"tags": tags, "see_also": see_also}
     lines = path.read_text().splitlines()
     if not lines or lines[0].strip() != "---":
-        return {"tags": tags, "see_also": see_also}
+        return metadata
     current_key = ""
     for line in lines[1:]:
         stripped = line.strip()
@@ -111,6 +112,10 @@ def parse_frontmatter(path: Path) -> dict[str, list[str]]:
         key, _, value = stripped.partition(":")
         key = key.strip()
         value = value.strip()
+        if line == line.lstrip() and key in ("tier", "family", "input_scope", "mechanism", "mode"):
+            if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+                value = value[1:-1]
+            metadata[key] = [value]
         if key == "tags":
             current_key = "tags" if not value else ""
         elif key == "see_also":
@@ -123,7 +128,7 @@ def parse_frontmatter(path: Path) -> dict[str, list[str]]:
                 current_key = "see_also"
         else:
             current_key = ""
-    return {"tags": tags, "see_also": see_also}
+    return metadata
 
 
 def extract_title(path: Path) -> str:
@@ -146,7 +151,7 @@ def read_pre_filter(path: Path) -> str:
         stripped = line.strip()
         if stripped == "---":
             break
-        if not stripped.startswith("pre_filter:"):
+        if not line.startswith("pre_filter:"):
             continue
         value = stripped.split(":", 1)[1].strip()
         if (value.startswith("'") and value.endswith("'")) or (
