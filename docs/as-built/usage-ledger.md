@@ -43,7 +43,7 @@ Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/
 
 1. Takes an exclusive, non-blocking `fcntl.flock` on `<db>.lock`. A second pass beside a running one prints `usage collect: another pass is running` and exits 0.
 2. `check_store_key_version(db)`: a store stamped 1 through 7 raises `StorePredatesFileNamedCodexKeys`, and `main` prints `collect: store version <n> predates file-named Codex keys; delete <db> and run the collector again to rebuild it` and exits 1. This check runs before any statement that writes.
-3. `PRAGMA synchronous=FULL` (`--durability off`, `LedgerDurability.DISPOSABLE`, sets `OFF` for a disposable test ledger; the default is `full`, `DURABLE`), `PRAGMA journal_mode=WAL`, the `SCHEMA` script, then `migrate_store(db)`, which deletes every `cursors` row and stamps `user_version` 8 on a new store.
+3. `PRAGMA synchronous=FULL` (`--durability off`, `LedgerDurability.DISPOSABLE`, sets `OFF` for a disposable test ledger; the default is `full`, `DURABLE`), `PRAGMA journal_mode=WAL`, the `SCHEMA` script, then `migrate_store(db)`. On a store below `STORE_VERSION` (9) it renames stored `account_role_changes` rows with role `seats` to `workers` (version 8 to 9), deletes every `cursors` row and stamps `user_version` 9.
 4. `collect_local`: Claude transcripts, Codex rollouts and run-history files on this machine, then the role log and `reattribute`.
 5. `collect_mac` (or, under `--no-mac`, every Mac source stored as `skipped`).
 6. `outcomes.collect`: baseline readings, live readings, account role changes and checkpoints, natedev only.
@@ -59,7 +59,7 @@ Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/
 
 **Token classes.** Claude: `input`, `cache_write_5m`, `cache_write_1h` (cache creation beyond the two `ephemeral_*` classes counts as 5-minute), `cache_read`, `output`. Codex: uncached input is `input`, cached input is `cache_read`, cache writes are 0. `before_first_edit` is 1 until the agent's first `Edit`, `Write` or `NotebookEdit` call (Claude) or the first record `is_edit` accepts (Codex), and the message holding that call is 0.
 
-### Store: `<state_dir()>/usage.db`, `PRAGMA user_version` 8
+### Store: `<state_dir()>/usage.db`, `PRAGMA user_version` 9
 
 Every stored time is UTC ISO-8601 text ending `+00:00`.
 
