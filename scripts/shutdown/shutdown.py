@@ -606,32 +606,60 @@ def _snapshot_outcome_lines(status: SnapshotStatus) -> list[str]:
     return lines
 
 
+@dataclass
+class ForgetCandidate:
+    login: str
+    label: str
+    session_id: str
+    name: str
+    names: set[str]
+
+
 def _forget(text: str, account: str = "") -> int:
-    candidates: list[tuple[recovery_store.RecoverySnapshot, recovery_store.SnapshotSession]] = []
+    if account:
+        try:
+            account = _selected_account(account).login
+        except (UnreadableAccount, UnknownAccountName) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 2
+    candidates: dict[tuple[str, str], ForgetCandidate] = {}
+    machine = settle.local_machine()
+
+    def add(login: str, label: str, owner: Session) -> None:
+        if account and account.casefold() != login.casefold():
+            return
+        key = (login.casefold(), owner["session_id"])
+        names = {owner["session_id"], owner["name"]}
+        host = owner["host"]
+        if host["kind"] == "herdr":
+            names.add(host["herdr_session"])
+        if key in candidates:
+            candidates[key].names.update(names)
+        else:
+            candidates[key] = ForgetCandidate(login, label, owner["session_id"], owner["name"], names)
+
     for snapshot in recovery_store.all_snapshots():
-        if account and account.casefold() not in {snapshot["login"].casefold(), snapshot["label"].casefold()}:
+        if snapshot["machine"].casefold() != machine.casefold():
             continue
         for item in snapshot["sessions"]:
-            owner = item["session"]
-            host = owner["host"]
-            names = {owner["session_id"], owner["name"]}
-            if host["kind"] == "herdr":
-                names.add(host["herdr_session"])
-            if text in names:
-                candidates.append((snapshot, item))
-    exact = [(snapshot, item) for snapshot, item in candidates if item["session"]["session_id"] == text]
-    matches = exact or candidates
+            add(snapshot["login"], snapshot["label"], item["session"])
+    for saved in all_session_records():
+        if saved["machine"].casefold() == machine.casefold():
+            add(saved["login"], saved["label"], saved["session"])
+    exact = [item for item in candidates.values() if item.session_id == text]
+    matches = exact or [item for item in candidates.values() if text in item.names]
     if len(matches) != 1:
-        print(f"forget: {text} matches {'no recovery session' if not matches else 'more than one recovery session'}", file=sys.stderr)
-        for snapshot, item in matches:
-            print(f"  {snapshot['label']}: {item['session']['name']} ({item['session']['session_id']})", file=sys.stderr)
+        print(f"forget: {text} matches {'no local session' if not matches else 'more than one local session'}", file=sys.stderr)
+        for item in matches:
+            print(f"  {item.label}: {item.name} ({item.session_id})", file=sys.stderr)
         return 2
-    snapshot, item = matches[0]
-    outcome = recovery_store.acknowledge_snapshot(snapshot["login"], item["session"]["session_id"])
-    if isinstance(outcome, recovery_store.SnapshotAlreadyAbsent):
-        print(f"{text}: recovery entry already removed")
-    else:
-        print(f"{item['session']['name']}: recovery entry forgotten")
+    item = matches[0]
+    outcome = recovery_store.forget_session(item.login, item.session_id, machine)
+    if isinstance(outcome, recovery_store.SessionRetained):
+        print(f"forget: {item.name}: cannot forget shutdown in progress ({outcome.record['progress']['kind']})", file=sys.stderr)
+        return 1
+    _ = recovery_store.acknowledge_snapshot(item.login, item.session_id)
+    print(f"{item.name}: forgotten")
     return 0
 
 
@@ -878,9 +906,9 @@ def main(arguments: list[str] | None = None) -> int:
     )
     _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
     _ = commands.add_parser("tmux-free", help="check whether anything local still needs tmux")
-    forget = commands.add_parser("forget", help="retire one local recovery snapshot entry")
+    forget = commands.add_parser("forget", help="forget one local recovery entry or stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
-    _ = forget.add_argument("--account", help="account login or label containing this recovery entry")
+    _ = forget.add_argument("--account", help="account login or label containing this session")
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
     _ = down.add_argument("--here", action="store_true")

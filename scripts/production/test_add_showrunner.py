@@ -385,14 +385,28 @@ class AddShowrunnerTests(unittest.TestCase):
         self.refused(result, "logged in as other@example.invalid, not claude3")
         self.assertEqual(path.read_bytes(), before)
 
-    def test_new_showrunner_refuses_configured_account_with_wrong_shared_link(self) -> None:
-        """F006: new work prepares the configured directory before launching."""
+    def test_new_showrunner_repairs_a_wrong_shared_link_before_launching(self) -> None:
         directory = self.named_account()
         linked = directory / "projects"
         linked.unlink()
         linked.symlink_to(Path(self.env["HOME"]) / "missing-projects")
+        self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
-        self.refused(result, f"{linked} points to {Path(self.env['HOME']) / 'missing-projects'}, not {Path(self.env['HOME']) / '.claude/projects'}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(linked.resolve(), Path(self.env["HOME"]) / ".claude/projects")
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
+        self.assertEqual(self.parent_of("kid"), "top")
+
+    def test_new_showrunner_refuses_a_real_file_against_an_existing_shared_folder(self) -> None:
+        directory = self.named_account()
+        local = directory / "projects"
+        local.unlink()
+        _ = local.write_text("local projects data")
+        result = self.run_command("kid")
+        self.refused(result, f"{local} is a real file; move it aside or merge it into ~/.claude")
+        self.assertFalse(local.is_symlink())
+        self.assertEqual(local.read_text(), "local projects data")
 
     def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
         directory = self.named_account()

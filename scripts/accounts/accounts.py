@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -17,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -130,7 +132,15 @@ CODEX_PRIVATE_NAMES = frozenset({
       for suffix in ("", "-wal", "-shm")),
 })
 
-ALWAYS_LINKED = frozenset({"projects", "sessions"})
+ALWAYS_LINKED = frozenset({
+    "commands", "skills", "agents", "output-styles", "plugins", "projects", "sessions",
+    "plans", "todos", "tasks", "teams", "file-history", "shell-snapshots", "session-env",
+    "paste-cache", "uploads",
+})
+CODEX_ALWAYS_LINKED = frozenset({"skills", "rules", "plugins", "sessions", "archived_sessions"})
+AT_FDCWD = -100  # Linux: resolve relative paths from the current directory.
+RENAME_NOREPLACE = 1  # Linux renameat2: refuse an existing destination.
+RENAME_EXCL = 4  # macOS renamex_np: refuse an existing destination.
 TOP_LEVEL_SEED_KEYS = (
     "hasCompletedOnboarding",
     "lastOnboardingVersion",
@@ -602,15 +612,161 @@ def _real_entry_problem(path: Path, shared_home: str = "~/.claude") -> str:
     )
 
 
+def _move_shared_entry(source: Path, destination: Path) -> None:
+    """Move shared content atomically without ever replacing another entry."""
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        if sys.platform.startswith("linux"):
+            rename = cast(Callable[[int, bytes, int, bytes, int], int], library.renameat2)
+            result = rename(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE)
+        elif sys.platform == "darwin":
+            rename_exclusive = cast(Callable[[bytes, bytes, int], int], library.renamex_np)
+            result = rename_exclusive(os.fsencode(source), os.fsencode(destination), RENAME_EXCL)
+        else:
+            raise OSError(errno.ENOTSUP, "atomic no-replace moves are unavailable")
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "atomic no-replace moves are unavailable") from error
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(destination))
+
+
+def _shared_clash_problem(path: Path, target: Path, names: Sequence[str]) -> str:
+    return (f"accounts: repair {path}: resolve clashing entries {', '.join(sorted(names))} "
+            + f"with {target}, then rerun")
+
+
+def _folder_merge_problem(path: Path, target: Path) -> str:
+    if not target.is_dir():
+        return f"accounts: repair {path}: move its contents into a shared folder at {target}, then rerun"
+    clashes = [entry.name for entry in path.iterdir() if os.path.lexists(target / entry.name)]
+    return _shared_clash_problem(path, target, clashes) if clashes else ""
+
+
+def _shared_move_problem(path: Path, target: Path, error: OSError) -> str:
+    if error.errno in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP}:
+        return (f"accounts: repair {path}: atomic no-replace moves to {target} are unavailable; "
+                + "move the entries without replacing shared content, then rerun")
+    return f"accounts: repair {path}: could not move into {target}: {error}; then rerun"
+
+
 def _repair_link(path: Path, target: Path, shared_home: str = "~/.claude") -> list[str]:
-    if path.is_symlink():
+    try:
+        if path.is_symlink():
+            if _is_expected_link(path, target):
+                return []
+            path.unlink()
+        elif path.exists():
+            if not os.path.lexists(target):
+                try:
+                    _move_shared_entry(path, target)
+                except OSError as error:
+                    if _is_expected_link(path, target):
+                        return []
+                    return [_shared_clash_problem(path, target, (path.name,)) if isinstance(error, FileExistsError)
+                            else _shared_move_problem(path, target, error)]
+                path.symlink_to(target, target_is_directory=target.is_dir())
+                print(f"accounts: moved {path} into {target} and linked it", file=sys.stderr)
+                return []
+            if not path.is_dir():
+                return [_real_entry_problem(path, shared_home)]
+            entries = sorted(path.iterdir())
+            if entries:
+                problem = _folder_merge_problem(path, target)
+                if problem:
+                    return [problem]
+                moved: list[str] = []
+                for entry in entries:
+                    try:
+                        _move_shared_entry(entry, target / entry.name)
+                    except OSError as error:
+                        if _is_expected_link(path, target):
+                            return []
+                        problem = (_shared_clash_problem(path, target, (entry.name,))
+                                   if isinstance(error, FileExistsError)
+                                   else _shared_move_problem(path, target, error))
+                        if moved:
+                            remaining = ", ".join(item.name for item in entries if item.name not in moved)
+                            problem += (f"; already moved {', '.join(moved)} into {target}; "
+                                        + f"remaining in {path}: {remaining}; rerun to finish")
+                        return [problem]
+                    moved.append(entry.name)
+                path.rmdir()
+                path.symlink_to(target, target_is_directory=True)
+                print(f"accounts: merged {path} into {target} and linked it", file=sys.stderr)
+                return []
+            path.rmdir()
+        path.symlink_to(target, target_is_directory=target.is_dir())
+        return []
+    except OSError:
         if _is_expected_link(path, target):
             return []
-        path.unlink()
-    elif path.exists():
-        return [_real_entry_problem(path, shared_home)]
-    path.symlink_to(target, target_is_directory=target.is_dir())
-    return []
+        raise
+
+
+def _shared_repair_problems(
+    destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+) -> list[str]:
+    """Judge shared entries without performing any of their possible repairs."""
+    if not source_dir.is_dir():
+        return _shared_link_problems(destination, source_dir, shared, folders)
+    problems: list[str] = []
+    for name in shared:
+        path, target = destination / name, source_dir / name
+        try:
+            if target.is_symlink() and not target.exists():
+                problems.extend(_shared_link_problems(destination, source_dir, (name,), frozenset()))
+                continue
+            if path.is_symlink():
+                if (not os.path.lexists(target) and name not in folders
+                        and not _is_expected_link(path, target)):
+                    problems.extend(_shared_link_problems(destination, source_dir, (name,), frozenset()))
+                continue
+            if not path.exists() or not os.path.lexists(target):
+                continue
+            if not path.is_dir():
+                problems.append(_real_entry_problem(path, f"~/{source_dir.name}"))
+            elif any(path.iterdir()):
+                problem = _folder_merge_problem(path, target)
+                if problem:
+                    problems.append(problem)
+        except OSError as error:
+            problems.append(f"accounts: could not inspect {path}: {error}")
+    return problems
+
+
+def _repair_shared_links(
+    destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+) -> list[str]:
+    """Repair entries inside an existing shared home; never create an empty shared file."""
+    if (destination == source_dir or destination.is_symlink() or not destination.is_dir()
+            or not source_dir.is_dir()):
+        return []
+    problems: list[str] = []
+    for name in shared:
+        target = source_dir / name
+        path = destination / name
+        try:
+            if not os.path.lexists(target):
+                if path.exists() and not path.is_symlink():
+                    problems.extend(_repair_link(path, target, f"~/{source_dir.name}"))
+                    continue
+                if name in folders:
+                    target.mkdir(mode=0o700, exist_ok=True)
+                    target.chmod(0o700)
+                else:
+                    if _is_expected_link(path, target):
+                        try:
+                            path.unlink()
+                        except OSError:
+                            if os.path.lexists(path):
+                                raise
+                    continue
+            problems.extend(_repair_link(path, target, f"~/{source_dir.name}"))
+        except OSError as error:
+            if not _is_expected_link(path, target):
+                problems.append(f"accounts: could not link {path}: {error}")
+    return problems
 
 
 def _identity_link_problems(
@@ -701,27 +857,9 @@ def setup(label: str) -> list[str]:
     problems.extend(
         _identity_link_problems(destination, IDENTITY_ENTRIES_NOT_SEEDED)
     )
-    source_dir = main_config_dir().absolute()
-    for name in SHARED:
-        target = source_dir / name
-        if name in ALWAYS_LINKED and not target.exists():
-            try:
-                target.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                problems.append(f"accounts: could not create {target}: {error}")
-                continue
-        if name not in ALWAYS_LINKED and not os.path.lexists(target):
-            path = destination / name
-            try:
-                if _is_expected_link(path, target):
-                    path.unlink()
-            except OSError as error:
-                problems.append(f"accounts: could not remove {path}: {error}")
-            continue
-        try:
-            problems.extend(_repair_link(destination / name, target))
-        except OSError as error:
-            problems.append(f"accounts: could not link {destination / name}: {error}")
+    problems.extend(_repair_shared_links(
+        destination, main_config_dir().absolute(), SHARED, ALWAYS_LINKED,
+    ))
 
     problems.extend(_seed_config(destination / ".claude.json"))
     return problems
@@ -738,6 +876,9 @@ def _shared_link_problems(
     for name in shared:
         target = source_dir / name
         path = destination / name
+        if name in required and not os.path.lexists(target) and (
+                not os.path.lexists(path) or _is_expected_link(path, target)):
+            continue
         if name not in required and not os.path.lexists(target) and not os.path.lexists(path):
             continue
         if path.is_symlink():
@@ -823,7 +964,9 @@ def account_directory_readiness(label: str) -> AccountDirectoryReadiness:
     return _inspect_account_directory(selected, _account_note(label))
 
 
-def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) -> AccountDirectoryReadiness:
+def _inspect_account_directory(
+    selected: NamedAccount, expected: AccountNote, *, allow_shared_repair: bool = False,
+) -> AccountDirectoryReadiness:
     label = selected.label
     destination = selected.dir
     if destination.is_symlink():
@@ -839,7 +982,9 @@ def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) ->
     except OSError as error:
         return AccountDirectoryUnreadable((f"accounts: could not inspect {destination}: {error}",))
     identity_problems = _identity_link_problems(destination)
-    links = [*identity_problems, *_link_problems(destination)]
+    shared_problems = (_shared_repair_problems(destination, main_config_dir().absolute(), SHARED, ALWAYS_LINKED)
+                       if allow_shared_repair else _link_problems(destination))
+    links = [*identity_problems, *shared_problems]
     private_problems = _private_identity_problems(destination)
     problems = [*links, *private_problems]
     # Do not follow an unsafe identity link, even while collecting diagnostics.
@@ -904,16 +1049,21 @@ def _setup_codex_home(label: str) -> list[str]:
             ]
     problems = _link_codex_home(label)
     if not problems:
-        print(
-            f"Wait for {label} ({_codex_folder(destination)}) to finish its shared session index "
-            + "and answer initialize; an interrupted index can hold startup for 15 minutes, "
-            + f"then indexing must finish; limit {agent_accounts.CODEX_HOME_PREPARATION_SECONDS / 60:g} minutes.",
-            flush=True,
-        )
-        prepared = asyncio.run(agent_accounts.prepare_codex_home(destination))
+        prepared = _prepare_codex_home(label)
         if isinstance(prepared, agent_accounts.CodexHomePreparationFailed):
             problems.append(f"accounts: {prepared.problem}")
     return problems
+
+
+def _prepare_codex_home(label: str) -> agent_accounts.CodexHomePreparation:
+    destination = codex_setup_home(label)
+    print(
+        f"Wait for {label} ({_codex_folder(destination)}) to finish its shared session index "
+        + "and answer initialize; an interrupted index can hold startup for 15 minutes, "
+        + f"then indexing must finish; limit {agent_accounts.CODEX_HOME_PREPARATION_SECONDS / 60:g} minutes.",
+        flush=True,
+    )
+    return asyncio.run(agent_accounts.prepare_codex_home(destination))
 
 
 def _link_codex_home(label: str) -> list[str]:
@@ -929,19 +1079,9 @@ def _link_codex_home(label: str) -> list[str]:
     except OSError as error:
         return [f"accounts: could not create {destination}: {error}"]
     problems = _codex_private_link_problems(destination)
-    source = (accounts_home() / ".codex").absolute()
-    for name in CODEX_SHARED:
-        target = source / name
-        path = destination / name
-        try:
-            if target.exists():
-                problems.extend(_repair_link(path, target, "~/.codex"))
-            elif _is_expected_link(path, target):
-                path.unlink()
-            elif os.path.lexists(path):
-                problems.append(f"accounts: {path} has no shared entry in ~/.codex")
-        except OSError as error:
-            problems.append(f"accounts: could not link {path}: {error}")
+    problems.extend(_repair_shared_links(
+        destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+    ))
     return problems
 
 
@@ -972,7 +1112,9 @@ def _codex_folder(home: Path) -> str:
     return f"~/{home.relative_to(accounts_home())}" if home.is_relative_to(accounts_home()) else str(home)
 
 
-def _check_codex_home(label: str, workers_home: Path) -> list[str]:
+def _check_codex_home(
+    label: str, workers_home: Path, *, allow_shared_repair: bool = False,
+) -> list[str]:
     destination = _codex_account_home(label)
     folder = _codex_folder(destination)
     if destination.is_symlink():
@@ -982,8 +1124,10 @@ def _check_codex_home(label: str, workers_home: Path) -> list[str]:
     if not destination.is_dir():
         return [f"accounts: {folder} is not a directory"]
     problems = (_check_default_codex_home(workers_home) if destination == accounts_home() / ".codex"
+                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED)
+                if allow_shared_repair
                 else _shared_link_problems(destination, (accounts_home() / ".codex").absolute(),
-                                           CODEX_SHARED, frozenset()))
+                                           CODEX_SHARED, CODEX_ALWAYS_LINKED))
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
@@ -1036,7 +1180,16 @@ class AccountRefused:
 
 
 def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused:
-    """Prepare a numbered account without inheriting another login's environment."""
+    """Repair and prepare a numbered account for an actual launch."""
+    return _prepared_account(label, resume=resume, repair=True)
+
+
+def prepared_account_preview(label: str, *, resume: bool) -> PreparedAccount | AccountRefused:
+    """Judge a launch after possible repairs without changing the account."""
+    return _prepared_account(label, resume=resume, repair=False)
+
+
+def _prepared_account(label: str, *, resume: bool, repair: bool) -> PreparedAccount | AccountRefused:
     label = note_file.canonical_label(label)
     try:
         refuse_default(label)
@@ -1050,7 +1203,11 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
     except AccountsError as error:
         return AccountRefused(str(error))
     remove = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
-    readiness = _inspect_account_directory(selected, expected)
+    if repair:
+        problems = _repair_shared_links(selected.dir, main_config_dir().absolute(), SHARED, ALWAYS_LINKED)
+        if problems:
+            return AccountRefused(problems[0])
+    readiness = _inspect_account_directory(selected, expected, allow_shared_repair=not repair)
     if isinstance(readiness, AccountDirectoryNotSetUp):
         return AccountRefused(
             f'accounts: ~/.claude{_label_number(selected.label)} is not set up; /showrunner:accounts setup "{selected.label}" first'
@@ -1228,7 +1385,10 @@ def multiple_accounts_configured() -> bool:
 
 def checked_named_accounts() -> list[NamedAccount]:
     """Every existing named account fit for a live reading or launch."""
-    return [named for named in _existing_named_accounts() if not check(named.label)]
+    return [named for named in _existing_named_accounts()
+            if isinstance(_inspect_account_directory(
+                named, _account_note(named.label), allow_shared_repair=True,
+            ), AccountDirectoryReady)]
 
 
 def account_identity(config_dir: Path) -> agent_accounts.AccountIdentity:
@@ -1388,7 +1548,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         directories = [(note_file.canonical_label(item.label), item.dir) for item in checked_named_accounts()]
         for label, directory in directories:
             try:
-                if claude_account_dir(label) != directory or check(label):
+                if claude_account_dir(label) != directory:
                     continue
             except AccountsError:
                 continue
@@ -1403,7 +1563,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
             elif _codex_account_home(label) != home:
                 # A duplicate login must not reintroduce an excluded home or change the swap destination.
                 continue
-            problems = check(label)
+            problems = _check_codex_home(label, accounts_home() / ".codex", allow_shared_repair=True)
             # Duplicate homes are one picker candidate; safety checks still reject other defects.
             if any("two homes on one login" not in problem and "keep each login in one home" not in problem for problem in problems):
                 continue
@@ -2418,6 +2578,13 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
         _record_home_cutover(journal)
         journal["state"] = "complete"
         _atomic_write(path, json.dumps(journal) + "\n")
+        prepared = _prepare_codex_home(label)
+        if isinstance(prepared, agent_accounts.CodexHomePreparationFailed):
+            raise AccountsError(
+                f"accounts: {_codex_folder(destination)} login moved, but its shared session index is not ready "
+                + f"({prepared.problem}); run accounts.py setup {label} to finish the index"
+            )
+        print(f"{label} ({_codex_folder(destination)}) login moved; shared session index ready.")
 
 
 def cutover_home(label: str = "", *, undo: bool = False) -> None:
@@ -2547,7 +2714,7 @@ def set_role(role: str, label: str) -> None:
         if not role_map.is_role_map_host():
             _write_role(role, numbered_account_label(label, "codex").label)
             return
-        target = check_codex_target(label, accounts_home() / ".codex")
+        target = check_codex_target(label, accounts_home() / ".codex", repair=False)
         _ = _write_role(role, target.label if _label_is(target.label, "codex") else label)
         return
     raise AccountsError(UNIT_ROLE_GONE)
@@ -2729,16 +2896,17 @@ class GroupMoveStarted:
     returncode: int
 
 
-def _move_target(target: str) -> agent_accounts.NumberedAccount | MoveRefused:
+def _move_target(target: str, *, repair: bool = True) -> agent_accounts.NumberedAccount | MoveRefused:
     target = note_file.canonical_label(target)
     try:
         refuse_default(target)
+        prepared = (prepared_account(target, resume=True) if repair
+                    else prepared_account_preview(target, resume=True))
+        if isinstance(prepared, AccountRefused):
+            return MoveRefused(prepared.reason.partition("\n")[0])
         destination = account_identity(claude_account_dir(target))
-        problems = check(target)
     except AccountsError as error:
-        return MoveRefused(str(error))
-    if problems:
-        return MoveRefused(problems[0])
+        return MoveRefused(str(error).partition("\n")[0])
     if not isinstance(destination, agent_accounts.NumberedAccount):
         return MoveRefused(f"account identity for {target} is unreadable")
     return destination
@@ -2756,9 +2924,9 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
-def check_move_target(target: str, now: datetime) -> MoveTargetReady | MoveRefused:
+def check_move_target(target: str, now: datetime, *, repair: bool = True) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
-    destination = _move_target(target)
+    destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
     reading = refusals.stored_reading("claude", destination.login, now)
@@ -2850,7 +3018,7 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     target = note_file.canonical_label(target)
     now = datetime.now(timezone.utc)
-    checked = check_move_target(target, now)
+    checked = check_move_target(target, now, repair=not dry_run)
     if isinstance(checked, MoveRefused):
         return checked
     if TYPE_CHECKING:
@@ -2911,7 +3079,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         record = import_module("record")
     try:
         now = datetime.now(timezone.utc)
-        checked = check_move_target(target, now)
+        checked = check_move_target(target, now, repair=not dry_run)
         if isinstance(checked, MoveRefused):
             return checked
         live = inventory.listing()
@@ -2944,10 +3112,15 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         return MoveRefused(str(error))
 
 
-def check_codex_target(label: str, workers_home: Path) -> SelectableCodexAccount:
+def check_codex_target(label: str, workers_home: Path, *, repair: bool = True) -> SelectableCodexAccount:
     label = note_file.canonical_label(label)
     refuse_default(label)
     home = _codex_account_home(label)
+    problems = (_repair_shared_links if repair else _shared_repair_problems)(
+        home, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+    )
+    if problems:
+        raise AccountsError(problems[0])
     if home.is_symlink() or (home / "auth.json").is_symlink():
         problems = _check_codex_home(label, workers_home)
         raise AccountsError(problems[0])
@@ -2959,7 +3132,7 @@ def check_codex_target(label: str, workers_home: Path) -> SelectableCodexAccount
         home_login = "" if noted_legacy else _codex_home_login(legacy_home)
         if login or home_login and not home.exists():
             raise AccountsError("accounts: " + unnoted_home_line(home if login else accounts_home() / ".codex", login or home_login))
-    problems = _check_codex_home(label, workers_home)
+    problems = _check_codex_home(label, workers_home, allow_shared_repair=not repair)
     if problems:
         problem = problems[0].removeprefix("accounts: ")
         raise AccountsError(f"accounts: cannot select {label} ({_codex_folder(home)}): {problem}")

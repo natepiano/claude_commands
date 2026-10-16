@@ -7,6 +7,8 @@ from scripts.whoami.note_file import note_name
 import io
 from importlib import import_module
 import base64
+import ctypes
+import errno
 import fcntl
 import json
 import os
@@ -711,23 +713,23 @@ class AccountsTests(unittest.TestCase):
                     prepare.assert_called_once_with("claude3", resume=resume)
         self.assertEqual(path.read_bytes(), before)
 
-    def test_prepared_account_broken_links_refuse_even_when_logged_out(self) -> None:
+    def test_prepared_account_repairs_broken_folder_links_even_when_logged_out(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
         _ = (accounts.account_dir("claude3") / ".claude.json").write_text("{}")
         (self.main_dir / "projects").rmdir()
         result = accounts.prepared_account("claude3", resume=False)
-        self.assertIsInstance(result, accounts.AccountRefused)
-        assert isinstance(result, accounts.AccountRefused)
-        self.assertEqual(result.reason, f"accounts: {accounts.account_dir('claude3') / 'projects'} is broken")
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        self.assertTrue((self.main_dir / "projects").is_dir())
+        self.assertEqual((accounts.account_dir("claude3") / "projects").resolve(), self.main_dir / "projects")
 
-    def test_prepared_account_former_home_number_checks_its_own_directory_on_resume(self) -> None:
+    def test_prepared_account_former_home_number_repairs_its_own_directory_on_resume(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         (accounts.account_dir("claude2") / "projects").unlink()
         result = accounts.prepared_account("claude2", resume=True)
-        self.assertIsInstance(result, accounts.AccountRefused)
-        assert isinstance(result, accounts.AccountRefused)
-        self.assertIn(str(accounts.account_dir("claude2") / "projects"), result.reason)
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        self.assertTrue((accounts.account_dir("claude2") / "projects").is_symlink())
+        self.assertEqual((accounts.account_dir("claude2") / "projects").resolve(), self.main_dir / "projects")
 
     def test_prepared_account_default_without_resume_removes_named_variables_without_check(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -881,20 +883,22 @@ class AccountsTests(unittest.TestCase):
         self.assertIn(line, result[1])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.UnnotedLogin(self.home / ".claude3", "other@example.invalid"))
 
-    def test_exec_refuses_broken_shared_links_even_when_logged_out(self) -> None:
+    def test_exec_repairs_broken_shared_links_before_launching_a_logged_out_account(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
         _ = (accounts.account_dir("claude3") / ".claude.json").write_text("{}")
-        (self.main_dir / "projects").rmdir()
+        (accounts.account_dir("claude3") / "projects").unlink()
         readiness = accounts.account_directory_readiness("claude3")
         self.assertIsInstance(readiness, accounts.AccountDirectoryBrokenLinks)
         with patch.object(os, "execvpe") as launch:
             result = self.run_cli("exec", "claude3")
-        self.assertEqual(result, (2, "", f"accounts: {accounts.account_dir('claude3') / 'projects'} is broken\n"))
-        launch.assert_not_called()
+        self.assertEqual(result, (0, "", ""))
+        launch.assert_called_once()
+        self.assertTrue((self.main_dir / "projects").is_dir())
+        self.assertEqual((accounts.account_dir("claude3") / "projects").resolve(), self.main_dir / "projects")
         self.assertIn("not logged in", "\n".join(readiness.problems))
 
-    def test_removed_optional_shared_source_refuses_check_and_exec(self) -> None:
+    def test_removed_optional_shared_source_is_reported_by_check_and_repaired_by_exec(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         source = self.main_dir / "settings.json"
         _ = source.write_text("{}", encoding="utf-8")
@@ -905,9 +909,11 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.check("claude3"), [problem])
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryBrokenLinks)
         with patch.object(os, "execvpe") as launch:
-            self.assertEqual(self.run_cli("exec", "claude3"), (2, "", problem + "\n"))
-        launch.assert_not_called()
-        self.assertEqual([selected.label for selected in accounts.checked_named_accounts()], ["claude2"])
+            self.assertEqual(self.run_cli("exec", "claude3"), (0, "", ""))
+        launch.assert_called_once()
+        self.assertFalse(os.path.lexists(linked))
+        self.assertFalse(source.exists())
+        self.assertEqual([selected.label for selected in accounts.checked_named_accounts()], ["claude2", "claude3"])
 
     def test_exec_refuses_linked_directory_and_identity_files(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1251,6 +1257,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
         (accounts.account_dir("claude3") / "projects").unlink()
+        _ = (accounts.account_dir("claude3") / "projects").write_text("cannot replace existing shared folder")
         self.assertEqual([selected.label for selected in accounts.checked_named_accounts()], ["claude2"])
         self.assertEqual([selected.label for selected in accounts.claude_account_selection().named_accounts], ["claude2"])
 
@@ -1507,7 +1514,8 @@ class AccountsTests(unittest.TestCase):
             link = account_dir / entry
             self.assertTrue(link.is_symlink(), entry)
             self.assertEqual(os.readlink(link), str(self.main_dir / entry))
-        self.assertFalse((account_dir / "skills").exists())
+        self.assertTrue((account_dir / "skills").is_symlink())
+        self.assertEqual((self.main_dir / "skills").stat().st_mode & 0o777, 0o700)
 
         seeded_path = account_dir / ".claude.json"
         self.assertEqual(seeded_path.stat().st_mode & 0o777, 0o600)
@@ -1546,6 +1554,461 @@ class AccountsTests(unittest.TestCase):
             },
         )
 
+    def shared_repair_fixture(self, tool: str) -> tuple[Path, Path]:
+        if tool == "claude":
+            self.login_directory("claude3", "repair@example.invalid")
+            (accounts.account_dir("claude3") / "skills").unlink()
+            (self.main_dir / "skills").rmdir()
+            return accounts.account_dir("claude3"), self.main_dir
+        shared = self.home / ".codex"
+        shared.mkdir()
+        destination = self.home / ".codex3"
+        self.write_note("codex3", "repair@example.invalid")
+        self.codex_login("repair@example.invalid", destination)
+        return destination, shared
+
+    def assert_shared_launch_ready(self, tool: str) -> None:
+        if tool == "claude":
+            self.assertIsInstance(accounts.prepared_account("claude3", resume=True), accounts.PreparedAccount)
+        else:
+            selected = accounts.check_codex_target("codex3", self.home / ".codex")
+            self.assertEqual(selected.home, self.home / ".codex3")
+
+    def test_launch_repairs_missing_and_wrong_links_after_another_account_creates_a_shared_target(self) -> None:
+        for tool, name in (("claude", "settings.json"), ("codex", "config.toml")):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                first = self.home / f".{tool}4"
+                self.assertFalse((shared / "skills").exists())
+                self.assertFalse(os.path.lexists(destination / "skills"))
+                if tool == "claude":
+                    self.login_directory("claude4", "first@example.invalid")
+                else:
+                    self.write_note("codex4", "first@example.invalid")
+                    self.codex_login("first@example.invalid", first)
+                source = shared / name
+                _ = source.write_text("shared settings")
+                if tool == "claude":
+                    self.assertIsInstance(accounts.prepared_account("claude4", resume=True), accounts.PreparedAccount)
+                else:
+                    self.assertEqual(accounts.check_codex_target("codex4", shared).home, first)
+                self.assertTrue((first / name).is_symlink())
+                self.assertTrue((shared / "skills").is_dir())
+                self.assertFalse((destination / name).exists())
+                self.assert_shared_launch_ready(tool)
+                self.assertEqual((destination / name).resolve(), source)
+                self.assertTrue((destination / "skills").is_symlink())
+                self.assertEqual((destination / "skills").resolve(), shared / "skills")
+                (destination / name).unlink()
+                wrong = self.root / f"wrong-{tool}"
+                _ = wrong.write_text("outside data")
+                (destination / name).symlink_to(wrong)
+                self.assert_shared_launch_ready(tool)
+                self.assertEqual((destination / name).resolve(), source)
+                self.assertEqual(wrong.read_text(), "outside data")
+
+    def test_adoption_keeps_a_shared_file_created_after_the_absence_check(self) -> None:
+        destination, shared = self.shared_repair_fixture("claude")
+        local = destination / "settings.json"
+        target = shared / "settings.json"
+        _ = local.write_bytes(b"local settings\x00kept")
+        concurrent = b"concurrent shared settings\x00kept"
+        lexists = os.path.lexists
+
+        def appeared(path: str | os.PathLike[str]) -> bool:
+            exists = lexists(path)
+            if Path(path) == target and not exists:
+                _ = target.write_bytes(concurrent)
+            return exists
+
+        with patch.object(os.path, "lexists", side_effect=appeared):
+            problems = accounts._repair_link(local, target)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(target.read_bytes(), concurrent)
+        self.assertEqual(local.read_bytes(), b"local settings\x00kept")
+        self.assertFalse(local.is_symlink())
+        self.assertEqual(len(problems), 1)
+        self.assertIn("resolve clashing entries settings.json", problems[0])
+        self.assertIn(str(local), problems[0])
+
+    def test_merge_keeps_a_shared_entry_created_after_the_clash_check(self) -> None:
+        destination, shared = self.shared_repair_fixture("claude")
+        local = destination / "skills"
+        target = shared / "skills"
+        local.mkdir()
+        target.mkdir()
+        _ = (local / "new-skill").write_bytes(b"local skill\x00kept")
+        concurrent = b"concurrent shared skill\x00kept"
+        check = accounts._folder_merge_problem  # pyright: ignore[reportPrivateUsage]
+
+        def appeared(path: Path, shared_target: Path) -> str:
+            problem = check(path, shared_target)
+            _ = (shared_target / "new-skill").write_bytes(concurrent)
+            return problem
+
+        with patch.object(accounts, "_folder_merge_problem", side_effect=appeared):
+            problems = accounts._repair_link(local, target)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((target / "new-skill").read_bytes(), concurrent)
+        self.assertEqual((local / "new-skill").read_bytes(), b"local skill\x00kept")
+        self.assertFalse(local.is_symlink())
+        self.assertEqual(len(problems), 1)
+        self.assertIn("resolve clashing entries new-skill", problems[0])
+
+    def test_atomic_shared_move_refuses_existing_files_and_empty_folders(self) -> None:
+        for kind in ("file", "folder"):
+            with self.subTest(kind=kind):
+                local = self.root / f"local-{kind}"
+                target = self.root / f"shared-{kind}"
+                if kind == "file":
+                    _ = local.write_bytes(b"local bytes\x00")
+                    _ = target.write_bytes(b"shared bytes\x00")
+                else:
+                    local.mkdir()
+                    _ = (local / "kept").write_bytes(b"local folder entry")
+                    target.mkdir()
+                before = (local.stat().st_ino, target.stat().st_ino)
+                with self.assertRaises(FileExistsError):
+                    accounts._move_shared_entry(local, target)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual((local.stat().st_ino, target.stat().st_ino), before)
+                if kind == "file":
+                    self.assertEqual(local.read_bytes(), b"local bytes\x00")
+                    self.assertEqual(target.read_bytes(), b"shared bytes\x00")
+                else:
+                    self.assertEqual((local / "kept").read_bytes(), b"local folder entry")
+                    self.assertEqual(list(target.iterdir()), [])
+
+    def test_partial_merge_preserves_moved_entries_and_can_finish_after_the_clash_is_resolved(self) -> None:
+        destination, shared = self.shared_repair_fixture("claude")
+        local, target = destination / "skills", shared / "skills"
+        local.mkdir()
+        target.mkdir()
+        for name in ("a-first", "b-second"):
+            _ = (local / name).write_text(name)
+        move = accounts._move_shared_entry  # pyright: ignore[reportPrivateUsage]
+
+        def appeared(source: Path, shared_target: Path) -> None:
+            if source.name == "b-second":
+                _ = shared_target.write_text("concurrent shared entry")
+            move(source, shared_target)
+
+        with patch.object(accounts, "_move_shared_entry", side_effect=appeared):
+            problems = accounts._repair_link(local, target)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((target / "a-first").read_text(), "a-first")
+        self.assertFalse((local / "a-first").exists())
+        self.assertEqual((target / "b-second").read_text(), "concurrent shared entry")
+        self.assertEqual((local / "b-second").read_text(), "b-second")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("already moved a-first", problems[0])
+        self.assertIn("remaining", problems[0])
+        self.assertIn("b-second", problems[0])
+        self.assertIn("rerun", problems[0])
+        (target / "b-second").unlink()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(accounts._repair_link(local, target), [])  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(local.is_symlink())
+        self.assertEqual((target / "b-second").read_text(), "b-second")
+
+    def test_mac_atomic_move_uses_exclusive_rename_and_preserves_the_collision(self) -> None:
+        local, target = self.root / "local entry", self.root / "shared entry"
+        _ = local.write_bytes(b"local bytes")
+        calls: list[tuple[bytes, bytes, int]] = []
+
+        class MacLibc:
+            def renamex_np(self, source: bytes, destination: bytes, flags: int) -> int:
+                calls.append((source, destination, flags))
+                _ = target.write_bytes(b"concurrent shared bytes")
+                return -1
+
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(ctypes, "CDLL", return_value=MacLibc()),
+              patch.object(ctypes, "get_errno", return_value=errno.EEXIST)):
+            with self.assertRaises(FileExistsError):
+                accounts._move_shared_entry(local, target)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(calls, [(os.fsencode(local), os.fsencode(target), 4)])
+        self.assertEqual(local.read_bytes(), b"local bytes")
+        self.assertEqual(target.read_bytes(), b"concurrent shared bytes")
+
+    def test_unavailable_atomic_move_keeps_the_local_entry_and_returns_a_repair_step(self) -> None:
+        destination, shared = self.shared_repair_fixture("claude")
+        local, target = destination / "settings.json", shared / "settings.json"
+        _ = local.write_bytes(b"local settings")
+        with patch.object(accounts, "_move_shared_entry", side_effect=OSError(errno.ENOTSUP, "not supported")):
+            problems = accounts._repair_link(local, target)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(local.read_bytes(), b"local settings")
+        self.assertFalse(local.is_symlink())
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("repair", problems[0])
+        self.assertIn("rerun", problems[0])
+
+    def test_move_and_selection_accept_empty_local_folders_but_refuse_merge_clashes(self) -> None:
+        self.login_directory("claude3", "repair@example.invalid")
+        destination = accounts.account_dir("claude3")
+        folder = destination / "shell-snapshots"
+        for operation in ("move", "selection"):
+            with self.subTest(operation=operation):
+                if folder.is_symlink():
+                    folder.unlink()
+                folder.mkdir(exist_ok=True)
+                self.assertTrue(accounts.check("claude3"))
+                if operation == "move":
+                    selected = accounts._move_target("claude3")  # pyright: ignore[reportPrivateUsage]
+                    self.assertIsInstance(selected, agent_accounts.NumberedAccount)
+                    self.assertTrue(folder.is_symlink())
+                else:
+                    self.assertIn("claude3", [named.label for named in accounts.checked_named_accounts()])
+                if folder.is_symlink():
+                    folder.unlink()
+                folder.mkdir(exist_ok=True)
+                _ = (folder / "collision").write_text("local")
+                _ = (self.main_dir / "shell-snapshots/collision").write_text("shared")
+                refused = accounts._move_target("claude3")  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(refused, accounts.MoveRefused)
+                assert isinstance(refused, accounts.MoveRefused)
+                self.assertIn("resolve clashing entries collision", refused.reason)
+                self.assertNotIn("claude3", [named.label for named in accounts.checked_named_accounts()])
+                self.assertEqual((folder / "collision").read_text(), "local")
+                self.assertEqual((self.main_dir / "shell-snapshots/collision").read_text(), "shared")
+                (folder / "collision").unlink()
+                (self.main_dir / "shell-snapshots/collision").unlink()
+
+    def test_repair_accepts_a_concurrent_launch_that_already_linked_or_removed_the_entry(self) -> None:
+        destination, shared = self.shared_repair_fixture("claude")
+        local = destination / "skills"
+        target = shared / "skills"
+        target.mkdir()
+        rmdir = Path.rmdir
+        symlink = Path.symlink_to
+        for operation in ("rmdir", "symlink_to"):
+            with self.subTest(operation=operation):
+                if local.is_symlink():
+                    local.unlink()
+                local.mkdir()
+
+                def won_rmdir(path: Path) -> None:
+                    rmdir(path)
+                    if path == local:
+                        symlink(local, target, target_is_directory=True)
+                        raise FileNotFoundError("another launch linked this entry")
+
+                def won_link(path: Path, link_target: str | os.PathLike[str], target_is_directory: bool = False) -> None:
+                    symlink(path, link_target, target_is_directory=target_is_directory)
+                    if path == local:
+                        raise FileExistsError("another launch linked this entry")
+
+                with patch.object(Path, operation, won_rmdir if operation == "rmdir" else won_link):
+                    problems = accounts._repair_shared_links(  # pyright: ignore[reportPrivateUsage]
+                        destination, shared, ("skills",), frozenset({"skills"}))
+                self.assertEqual(problems, [])
+                self.assertTrue(local.is_symlink())
+                self.assertEqual(local.resolve(), target)
+
+        removed = destination / "settings.json"
+        missing_target = shared / "settings.json"
+        removed.symlink_to(missing_target)
+        unlink = Path.unlink
+
+        def won_removal(path: Path, missing_ok: bool = False) -> None:
+            unlink(path, missing_ok=missing_ok)
+            if path == removed:
+                raise FileNotFoundError("another launch already removed the stale link")
+
+        with patch.object(Path, "unlink", won_removal):
+            problems = accounts._repair_shared_links(  # pyright: ignore[reportPrivateUsage]
+                destination, shared, ("settings.json",), frozenset())
+        self.assertEqual(problems, [])
+        self.assertFalse(os.path.lexists(removed))
+        self.assertFalse(os.path.lexists(missing_target))
+
+    def test_codex_launch_repair_does_not_create_an_absent_shared_home(self) -> None:
+        shared = self.home / ".codex"
+        destination = self.home / ".codex3"
+        self.write_note("codex3", "repair@example.invalid")
+        self.codex_login("repair@example.invalid", destination)
+        entries = {entry.name for entry in destination.iterdir()}
+        self.assertFalse(os.path.lexists(shared))
+
+        selected = accounts.check_codex_target("codex3", shared)
+
+        self.assertEqual(selected.home, destination)
+        self.assertFalse(os.path.lexists(shared))
+        self.assertEqual({entry.name for entry in destination.iterdir()}, entries)
+
+    def test_check_requires_a_declared_folder_link_only_once_its_shared_target_exists(self) -> None:
+        for tool in ("claude", "codex"):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                self.assertFalse(os.path.lexists(destination / "skills"))
+                self.assertFalse(os.path.lexists(shared / "skills"))
+                self.assertEqual(accounts.check(tool + "3"), [])
+                self.assertFalse(os.path.lexists(shared / "skills"))
+                (shared / "skills").mkdir()
+                self.assertEqual(accounts.check(tool + "3"), [f"accounts: {destination / 'skills'} is missing"])
+                self.assertFalse(os.path.lexists(destination / "skills"))
+
+    def test_check_reports_a_wrong_folder_link_while_its_shared_target_is_absent(self) -> None:
+        for tool in ("claude", "codex"):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                elsewhere = destination.parent / f"{tool}-other-skills"
+                elsewhere.mkdir()
+                (destination / "skills").symlink_to(elsewhere, target_is_directory=True)
+                self.assertFalse(os.path.lexists(shared / "skills"))
+                self.assertEqual(accounts.check(tool + "3"), [
+                    f"accounts: {destination / 'skills'} points to {elsewhere}, not {shared / 'skills'}",
+                ])
+
+    def test_launch_creates_shell_snapshots_as_a_private_shared_folder(self) -> None:
+        destination, shared = self.shared_repair_fixture("claude")
+        linked = destination / "shell-snapshots"
+        linked.unlink(missing_ok=True)
+        target = shared / "shell-snapshots"
+        if target.exists():
+            target.rmdir()
+        previous_umask = os.umask(0)
+        try:
+            self.assert_shared_launch_ready("claude")
+        finally:
+            _ = os.umask(previous_umask)
+        self.assertTrue(target.is_dir())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(linked.resolve(), target)
+
+    def test_launch_never_creates_empty_missing_shared_files(self) -> None:
+        for tool, names in (("claude", ("settings.json", "keybindings.json", "history.jsonl")),
+                            ("codex", ("config.toml", "hooks.json", "models_cache.json", "session_index.jsonl"))):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                self.assert_shared_launch_ready(tool)
+                for name in names:
+                    self.assertFalse(os.path.lexists(shared / name), name)
+                    self.assertFalse(os.path.lexists(destination / name), name)
+
+    def test_launch_adopts_missing_shared_targets_and_reports_only_on_stderr(self) -> None:
+        for tool, file_name in (("claude", "settings.json"), ("codex", "config.toml")):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                local_file = destination / file_name
+                _ = local_file.write_text("adopted settings")
+                local_folder = destination / "skills"
+                local_folder.mkdir()
+                _ = (local_folder / "local-skill").write_text("adopted skill")
+                file_inode = local_file.stat().st_ino
+                folder_inode = local_folder.stat().st_ino
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    self.assert_shared_launch_ready(tool)
+                self.assertTrue(local_file.is_symlink())
+                self.assertTrue(local_folder.is_symlink())
+                self.assertEqual((shared / file_name).stat().st_ino, file_inode)
+                self.assertEqual((shared / "skills").stat().st_ino, folder_inode)
+                self.assertEqual((shared / file_name).read_text(), "adopted settings")
+                self.assertEqual((shared / "skills/local-skill").read_text(), "adopted skill")
+                self.assertEqual(output.getvalue(), "")
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(len(lines), 2)
+                for name in (file_name, "skills"):
+                    self.assertTrue(any(str(destination / name) in line and str(shared / name) in line
+                                        for line in lines), lines)
+
+    def test_launch_silently_replaces_an_empty_local_folder_with_the_shared_link(self) -> None:
+        for tool in ("claude", "codex"):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                (shared / "skills").mkdir()
+                _ = (shared / "skills/kept").write_text("shared skill")
+                (destination / "skills").mkdir()
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    self.assert_shared_launch_ready(tool)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "")
+                self.assertTrue((destination / "skills").is_symlink())
+                self.assertEqual((destination / "skills").resolve(), shared / "skills")
+                self.assertEqual((shared / "skills/kept").read_text(), "shared skill")
+
+    def test_launch_merges_disjoint_entries_preserving_inodes_and_reports_only_on_stderr(self) -> None:
+        for tool in ("claude", "codex"):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                target = shared / "skills"
+                target.mkdir()
+                _ = (target / "shared-skill").write_text("shared")
+                local = destination / "skills"
+                local.mkdir()
+                (local / "nested").mkdir()
+                _ = (local / "nested/kept").write_text("nested local")
+                _ = (local / "local-skill").write_text("local")
+                original = {name: (local / name).stat().st_ino for name in ("nested", "local-skill")}
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    self.assert_shared_launch_ready(tool)
+                self.assertTrue(local.is_symlink())
+                self.assertEqual(local.resolve(), target)
+                self.assertEqual({path.name for path in target.iterdir()}, {"shared-skill", "nested", "local-skill"})
+                self.assertEqual((target / "shared-skill").read_text(), "shared")
+                self.assertEqual((target / "nested/kept").read_text(), "nested local")
+                for name, inode in original.items():
+                    self.assertEqual((target / name).stat().st_ino, inode)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn("merged", errors.getvalue().lower())
+                self.assertIn(str(local), errors.getvalue())
+                self.assertIn(str(target), errors.getvalue())
+
+    def test_launch_keeps_both_folders_and_all_entries_when_a_merge_has_name_clashes(self) -> None:
+        for tool in ("claude", "codex"):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                target = shared / "skills"
+                local = destination / "skills"
+                target.mkdir()
+                local.mkdir()
+                for name in ("collision-a", "collision-b"):
+                    _ = (target / name).write_text("shared " + name)
+                    _ = (local / name).write_text("local " + name)
+                _ = (local / "movable").write_text("must stay local too")
+                before = {path: (path.stat().st_ino, path.read_text())
+                          for folder in (local, target) for path in folder.iterdir()}
+                with redirect_stdout(io.StringIO()) as output:
+                    if tool == "claude":
+                        refused = accounts.prepared_account("claude3", resume=True)
+                        self.assertIsInstance(refused, accounts.AccountRefused)
+                        assert isinstance(refused, accounts.AccountRefused)
+                        reason = refused.reason
+                    else:
+                        with self.assertRaises(accounts.AccountsError) as refused_codex:
+                            _ = accounts.check_codex_target("codex3", shared)
+                        reason = str(refused_codex.exception)
+                diagnostic = output.getvalue() + reason
+                self.assertIn("collision-a", diagnostic)
+                self.assertIn("collision-b", diagnostic)
+                self.assertIn(str(local), diagnostic)
+                self.assertIn(str(target), diagnostic)
+                self.assertRegex(diagnostic.lower(), r"move|merge|resolve")
+                self.assertNotIn("is a real file", diagnostic)
+                self.assertFalse(local.is_symlink())
+                after = {path: (path.stat().st_ino, path.read_text())
+                         for folder in (local, target) for path in folder.iterdir()}
+                self.assertEqual(after, before)
+
+    def test_launch_refuses_a_real_file_when_the_shared_target_already_exists(self) -> None:
+        for tool, name in (("claude", "settings.json"), ("codex", "config.toml")):
+            with self.subTest(tool=tool):
+                destination, shared = self.shared_repair_fixture(tool)
+                _ = (shared / name).write_text("shared settings")
+                _ = (destination / name).write_text("local settings")
+                if tool == "claude":
+                    result = accounts.prepared_account("claude3", resume=True)
+                    self.assertIsInstance(result, accounts.AccountRefused)
+                    assert isinstance(result, accounts.AccountRefused)
+                    reason = result.reason
+                else:
+                    with self.assertRaises(accounts.AccountsError) as refused:
+                        _ = accounts.check_codex_target("codex3", shared)
+                    reason = str(refused.exception)
+                self.assertIn(f"{destination / name} is a real file;", reason)
+                self.assertEqual((shared / name).read_text(), "shared settings")
+                self.assertEqual((destination / name).read_text(), "local settings")
+                self.assertFalse((destination / name).is_symlink())
+
     def test_setup_creates_missing_required_shared_targets_before_linking(self) -> None:
         self.write_main_config()
         for name in accounts.ALWAYS_LINKED:
@@ -1576,7 +2039,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.check("claude3"), [])
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryReady)
 
-    def test_missing_optional_sources_report_wrong_links_and_real_entries_without_removing_them(self) -> None:
+    def test_missing_optional_sources_keep_wrong_links_but_adopt_real_entries_on_setup(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
         destination = accounts.account_dir("claude3")
@@ -1590,10 +2053,15 @@ class AccountsTests(unittest.TestCase):
             f"accounts: {linked} points to {outside}, not {self.main_dir / 'settings.json'}",
             f"accounts: {local} is a real file; move it aside or merge it into ~/.claude",
         ])
-        _ = accounts.setup("claude3")
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            _ = accounts.setup("claude3")
         self.assertEqual(os.readlink(linked), str(outside))
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
         self.assertEqual(local.read_text(encoding="utf-8"), "private content")
+        self.assertTrue(local.is_symlink())
+        self.assertEqual(local.resolve(), self.main_dir / "CLAUDE.md")
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn(str(local), errors.getvalue())
 
     def test_setup_leaves_correct_link_and_existing_seed_untouched(self) -> None:
         self.write_main_config()
@@ -1670,7 +2138,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(os.readlink(account_dir / "settings.json"), str(source))
 
-    def test_setup_reports_each_real_entry_and_finishes_the_rest(self) -> None:
+    def test_setup_refuses_a_real_file_but_repairs_an_empty_folder_and_finishes_the_rest(self) -> None:
         self.write_main_config()
         _ = (self.main_dir / "settings.json").write_text("{}", encoding="utf-8")
         _ = (self.main_dir / "commands").mkdir()
@@ -1688,11 +2156,9 @@ class AccountsTests(unittest.TestCase):
         )
         self.assertEqual(
             stderr,
-            "".join(
-                f"accounts: {account_dir}/{entry} is a real file; move it aside or merge it into ~/.claude\n"
-                for entry in ("settings.json", "commands")
-            ),
+            f"accounts: {account_dir}/settings.json is a real file; move it aside or merge it into ~/.claude\n",
         )
+        self.assertTrue((account_dir / "commands").is_symlink())
         self.assertTrue((account_dir / "projects").is_symlink())
         self.assertTrue((account_dir / "sessions").is_symlink())
         self.assertTrue((account_dir / ".claude.json").is_file())
@@ -2347,10 +2813,11 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(linked.lstat().st_ino, before.st_ino)
         self.assertEqual(linked.lstat().st_mtime_ns, before.st_mtime_ns)
         self.assertEqual((home / "auth.json").read_bytes(), authentication)
-        self.assertEqual({entry.name for entry in home.iterdir()}, {"config.toml", "auth.json"})
-        self.assertEqual({entry.name for entry in default.iterdir()}, {"config.toml"})
+        folders = {"skills", "rules", "plugins", "sessions", "archived_sessions"}
+        self.assertEqual({entry.name for entry in home.iterdir()}, {"config.toml", "auth.json", *folders})
+        self.assertEqual({entry.name for entry in default.iterdir()}, {"config.toml", *folders})
 
-    def test_codex_setup_reports_real_entries_without_replacing_them(self) -> None:
+    def test_codex_setup_refuses_an_occupied_real_file_but_merges_a_disjoint_folder(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
         default = self.home / ".codex"
         default.mkdir()
@@ -2363,13 +2830,15 @@ class AccountsTests(unittest.TestCase):
         (home / "skills").mkdir()
         _ = (home / "skills" / "own").write_text("own skills")
 
-        result, _, stderr = self.run_cli("setup", "codex1")
+        result, stdout, stderr = self.run_cli("setup", "codex1")
 
         self.assertNotEqual(result, 0)
         self.assertIn("config.toml", stderr)
-        self.assertIn("skills", stderr)
+        self.assertNotIn(f"{home / 'skills'} is a real file", stderr)
+        self.assertIn("merged", stderr)
+        self.assertEqual(stdout, "")
         self.assertEqual((home / "config.toml").read_text(), "own config")
-        self.assertFalse((home / "skills").is_symlink())
+        self.assertTrue((home / "skills").is_symlink())
         self.assertEqual((home / "skills" / "own").read_text(), "own skills")
         self.assertEqual((home / "hooks.json").resolve(), default / "hooks.json")
 
@@ -4134,9 +4603,32 @@ class PickerTests(unittest.TestCase):
         self.assertIn("has room", output)
         self.assert_picked("claude3")
 
-    def test_picker_skips_a_named_directory_that_fails_check(self) -> None:
-        (accounts.account_dir("claude3") / "projects").unlink()
+    def test_picker_accepts_a_repairable_missing_link_but_skips_a_real_file_collision(self) -> None:
+        projects = accounts.account_dir("claude3") / "projects"
+        projects.unlink()
+        self.assert_picked("claude3")
+        self.assertFalse(os.path.lexists(projects))
+        _ = projects.write_text("local file against existing shared folder")
         self.assert_picked("claude1")
+        self.assertEqual(projects.read_text(), "local file against existing shared folder")
+
+    def test_picker_skips_accounts_whose_shared_target_is_a_dangling_link(self) -> None:
+        target = self.home / ".claude/projects"
+        target.rmdir()
+        missing = self.home / "missing-shared-projects"
+        target.symlink_to(missing, target_is_directory=True)
+
+        code, output, error = self.cli("--keep", "claude3")
+
+        self.assertEqual(code, 1)
+        self.assertIn("no claude account has room", output)
+        self.assertEqual(error, "")
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(os.readlink(target), str(missing))
+        self.assertFalse(missing.exists())
+        target.unlink()
+        target.mkdir()
+        self.assert_picked("claude3")
 
     def test_picker_deduplicates_logins_in_favor_of_default(self) -> None:
         self.claude("claude3", "main@example.invalid")

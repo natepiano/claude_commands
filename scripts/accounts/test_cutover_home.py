@@ -270,6 +270,8 @@ class CodexHomeCutoverTests(unittest.TestCase):
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         self.process_lister = accounts.list_codex_home_processes
         _ = self.enterContext(patch.object(accounts, "list_codex_home_processes", return_value=[]))
+        _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
+                                           return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real process or keychain calls")))
         self.source = self.home / ".codex"
         self.target = self.home / ".codex2"
@@ -327,6 +329,71 @@ class CodexHomeCutoverTests(unittest.TestCase):
         self.assertFalse(self.target.exists())
         self.assertEqual(self.run_cutover(), 0)
         self.assert_login_moved()
+
+    def test_cutover_waits_for_initialize_after_moving_the_login_before_reporting_ready(self) -> None:
+        wait_line = (
+            "Wait for codex2 (~/.codex2) to finish its shared session index and answer initialize; "
+            "an interrupted index can hold startup for 15 minutes, then indexing must finish; limit 20 minutes.\n"
+        )
+        ready_line = "codex2 (~/.codex2) login moved; shared session index ready.\n"
+
+        async def initialize(home: Path) -> agent_accounts.CodexHomePrepared:
+            self.assertEqual(home, self.target)
+            self.assert_login_moved()
+            self.assertEqual(self.output.getvalue(), wait_line)
+            return agent_accounts.CodexHomePrepared()
+
+        with patch.object(agent_accounts, "prepare_codex_home", side_effect=initialize) as prepare:
+            self.assertEqual(self.run_cutover(), 0)
+        _ = prepare.assert_awaited_once_with(self.target)
+        self.assertEqual(self.output.getvalue(), wait_line + ready_line)
+        self.assertEqual(self.errors.getvalue(), "")
+
+    def test_failed_initialization_leaves_the_login_move_complete_and_names_the_setup_recovery(self) -> None:
+        async def fail_initialize(home: Path) -> agent_accounts.CodexHomePreparationFailed:
+            self.assertEqual(home, self.target)
+            self.assert_login_moved()
+            return agent_accounts.CodexHomePreparationFailed("synthetic initialize timeout")
+
+        with patch.object(agent_accounts, "prepare_codex_home", side_effect=fail_initialize) as prepare:
+            self.assertNotEqual(self.run_cutover(), 0)
+        _ = prepare.assert_awaited_once_with(self.target)
+        self.assert_login_moved()
+        self.assertEqual(self.errors.getvalue(),
+            "accounts: ~/.codex2 login moved, but its shared session index is not ready "
+            + "(synthetic initialize timeout); run accounts.py setup codex2 to finish the index\n")
+        self.assertNotIn("shared session index ready.", self.output.getvalue())
+
+    def test_rerun_after_failed_initialization_does_not_repeat_the_move_or_preparation(self) -> None:
+        with patch.object(agent_accounts, "prepare_codex_home",
+                          return_value=agent_accounts.CodexHomePreparationFailed("synthetic initialize timeout")):
+            self.assertNotEqual(self.run_cutover(), 0)
+        before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
+                  (self.target / "auth.json").stat())
+        _ = self.output.seek(0)
+        _ = self.output.truncate()
+        _ = self.errors.seek(0)
+        _ = self.errors.truncate()
+        with (patch.object(agent_accounts, "prepare_codex_home", side_effect=AssertionError("rerun must use setup to prepare")),
+              patch.object(os, "replace", side_effect=AssertionError("completed cutover must not move files"))):
+            self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+        self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
+                          (self.target / "auth.json").stat()), before)
+        self.assertEqual(self.output.getvalue(), "")
+        self.assertEqual(self.errors.getvalue(), "")
+
+    def test_undo_restores_the_login_without_running_first_startup(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        _ = self.output.seek(0)
+        _ = self.output.truncate()
+        with patch.object(agent_accounts, "prepare_codex_home", side_effect=AssertionError("undo must not prepare")):
+            self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual(self.journal_record()["state"], "undone")
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertFalse((self.target / "auth.json").exists())
+        self.assertEqual(self.output.getvalue(), "")
+        self.assertEqual(self.errors.getvalue(), "")
 
     def test_complete_codex_cutover_rerun_changes_no_identity_journal_or_history(self) -> None:
         self.assertEqual(self.run_cutover(), 0)

@@ -944,6 +944,42 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(moves.read_moves(), [])
 
+    def test_preview_accepts_repairable_destinations_without_changing_any_home_entry(self) -> None:
+        _ = self.groups(units="claude3")
+        _ = self.owner("off-target-unit", host="unit")
+        _ = self.transcript("off-target-unit")
+        _ = self.owner("scratch-refusal", host="terminal")
+        _ = self.transcript("scratch-refusal")
+        destination = accounts.account_dir("claude3")
+        shared = self.home / ".claude"
+        (destination / "shell-snapshots").unlink()
+        (destination / "shell-snapshots").mkdir()
+        for label in ("claude1", "claude2", "claude3"):
+            (accounts.account_dir(label) / "skills").unlink()
+        (shared / "skills").rmdir()
+        _ = (destination / "settings.json").write_bytes(b"adoptable local settings")
+
+        def listing() -> dict[str, tuple[int, int, int, int, str]]:
+            entries: dict[str, tuple[int, int, int, int, str]] = {}
+            for path in self.home.rglob("*"):
+                stat = path.lstat()
+                entries[str(path.relative_to(self.home))] = (
+                    stat.st_ino, stat.st_mode, stat.st_size, stat.st_mtime_ns,
+                    os.readlink(path) if path.is_symlink() else "")
+            return entries
+
+        before = listing()
+        code, output, error = self.cli("--dry-run")
+        self.assertIn(code, (0, None))
+        self.assertEqual(error, "")
+        self.assertIn("off-target-unit", output)
+        self.assertIn("scratch-refusal", output)
+        self.assertIn("claude3", output)
+        self.assertNotIn("refused:", output)
+        self.assertEqual(listing(), before)
+        self.assertEqual((destination / "settings.json").read_bytes(), b"adoptable local settings")
+        self.assertEqual(self.commands, [])
+
     def test_only_last_entry_with_all_refusal_markers_is_detected(self) -> None:
         for identity, tail in (
             ("user-last", {"type": "user", "message": {"content": "hello"}}),

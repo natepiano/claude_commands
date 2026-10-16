@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import io
+from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Callable
 import os
+import signal
 import subprocess
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +22,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import herdr
+import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
 
@@ -77,7 +82,8 @@ class HerdrTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.fake = self.root / "fake-herdr"
         source = Path(__file__).with_name("fake_herdr.py").read_text()
         _ = self.fake.write_text("#!" + sys.executable + "\n" + source.split("\n", 1)[1])
@@ -133,6 +139,480 @@ class HerdrTests(unittest.TestCase):
         directory = process / "fd"
         directory.mkdir(exist_ok=True)
         directory.joinpath(str(fd)).symlink_to(f"socket:[{inode}]")
+
+    def darwin(self) -> None:
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "darwin")))
+        _ = cast(object, self.enterContext(patch.object(sys, "platform", "darwin")))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_PS": str(self.fake), "HERDR_LSOF": str(self.fake),
+        })))
+
+    def darwin_environment(self, pid: int, command: str, environment: str) -> None:
+        self.configure(["-o", "command=", "-p", str(pid)], command + "\n")
+        self.configure(["eww", "-o", "command=", "-p", str(pid)], command + " " + environment + "\n")
+
+    def darwin_sockets(self, text: str) -> None:
+        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"], text)
+
+    def darwin_process_table(self, text: str) -> None:
+        executables: list[str] = []
+        commands: list[str] = []
+        for line in text.splitlines():
+            pid, parent, uid, command = line.split(maxsplit=3)
+            executables.append(f"{pid} {parent} {uid} {command.split()[0]}")
+            commands.append(f"{pid} {command}")
+        self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,comm="], "\n".join(executables))
+        self.configure(["-U", str(os.getuid()), "-o", "pid=,command="], "\n".join(commands))
+
+    def run_fake(self, argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+        """Replay the command fake in process while Popen models the server child."""
+        self.assertGreater(timeout, 0)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = fake_herdr.main(argv[1:])
+        return subprocess.CompletedProcess(argv, code, stdout.getvalue(), stderr.getvalue())
+
+    def detached_server(self) -> tuple[Mock, Mock]:
+        self.darwin()
+        _ = self.enterContext(patch.object(herdr, "run_program", side_effect=self.run_fake))
+        poll = Mock(return_value=None)
+        child = SimpleNamespace(pid=42, poll=poll, wait=Mock(return_value=0))
+        _ = self.enterContext(patch.object(os, "killpg"))
+        self.darwin_sockets(f"p42\nf3\nn{self.root}/config/herdr/sessions/fixture/herdr.sock\n")
+        spawn = self.enterContext(patch.object(subprocess, "Popen", return_value=child))
+        return spawn, poll
+
+    def test_darwin_detaches_server_and_clears_restored_workspaces_after_it_answers(self) -> None:
+        spawn, _ = self.detached_server()
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__):
+                spawn.reset_mock()
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+                self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+                    {"workspace_id": "w1"}, {"workspace_id": "w2"}]}}))
+                outcome = start("fixture", 90_000)
+                if start is herdr.start_server:
+                    self.assertIsInstance(outcome, herdr.ServerCreated)
+                spawn.assert_called_once_with([str(self.fake), "--session", "fixture", "server"],
+                    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, close_fds=True, env=None)
+                self.assertEqual(self.commands(), [
+                    ["--session", "fixture", "status", "server"],
+                    ["--session", "fixture", "status", "server"],
+                    ["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
+                    ["--session", "fixture", "workspace", "list"],
+                    ["--session", "fixture", "workspace", "close", "w1"],
+                    ["--session", "fixture", "workspace", "close", "w2"]])
+
+    def test_linux_client_discovery_in_an_isolated_copy_does_not_need_darwin_launcher(self) -> None:
+        _ = self.process(42, 1, ["herdr", "session", "attach", "fixture"], {})
+        isolated = self.root / "isolated/scripts/herdr"
+        isolated.mkdir(parents=True)
+        _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
+        probe = (
+            "import sys; sys.path.insert(0,sys.argv[1]); import herdr; "
+            "herdr._PLATFORM='linux'; print(herdr.attached_clients('fixture'))"
+        )
+        result = subprocess.run([sys.executable, "-I", "-c", probe, str(isolated)],
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ClientsAttached(count=1)\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_darwin_running_server_is_adopted_or_refused_without_spawning_or_clearing(self) -> None:
+        spawn, _ = self.detached_server()
+        self.configure_herdr(["status", "server"], "status: running\n")
+        self.assertIsInstance(herdr.start_server("fixture", 90_000), herdr.ServerAdopted)
+        with self.assertRaises(herdr.SessionTaken):
+            herdr.start_new_server("fixture", 90_000)
+        spawn.assert_not_called()
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]] * 2)
+
+    def test_darwin_exited_child_fails_immediately_with_plain_message_and_existing_log(self) -> None:
+        _, poll = self.detached_server()
+        poll.return_value = 1
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        log = self.root / "config/herdr/sessions/fixture/herdr-server.log"
+        log.parent.mkdir(parents=True)
+        _ = log.write_text("server could not bind its socket\n")
+        with patch.object(time, "sleep") as pause:
+            for start in (herdr.start_server, herdr.start_new_server):
+                with self.subTest(start=start.__name__), self.assertRaises(herdr.HerdrFailure) as raised:
+                    _ = start("fixture", 90_000)
+                self.assertEqual(str(raised.exception), f"herdr server for fixture did not start; see {log}")
+            pause.assert_not_called()
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]] * 2)
+
+    def test_darwin_never_clears_a_server_answering_after_our_child_exited(self) -> None:
+        _, poll = self.detached_server()
+        poll.side_effect = [None, 1]
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr server for fixture did not start"):
+            herdr.start_new_server("fixture", 90_000)
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]] * 2 + [
+            ["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"]])
+
+    def test_darwin_unanswering_child_has_ten_second_limit_with_shorter_caller_bound(self) -> None:
+        _ = self.detached_server()
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        for start in (herdr.start_server, herdr.start_new_server):
+            for timeout_ms, seconds in ((90_000, 10.0), (250, 0.25)):
+                clock = StartupClock()
+
+                def advance(seconds: float) -> None:
+                    clock.elapsed += seconds
+
+                with (self.subTest(start=start.__name__, timeout_ms=timeout_ms),
+                      patch.object(time, "monotonic", side_effect=lambda: clock.elapsed),
+                      patch.object(time, "sleep", side_effect=advance),
+                      self.assertRaises(herdr.HerdrFailure) as raised):
+                    _ = start("fixture", timeout_ms)
+                self.assertEqual(str(raised.exception), "herdr server for fixture did not start")
+                self.assertAlmostEqual(clock.elapsed, seconds)
+
+    def test_darwin_competing_listener_is_adopted_or_refused_while_our_child_is_alive(self) -> None:
+        _, poll = self.detached_server()
+        socket = self.root / "config/herdr/sessions/fixture/herdr.sock"
+        self.darwin_sockets(f"p77\nf3\nn{socket}\np42\nf4\nn{socket.parent}/other.sock\n")
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__), patch.object(os, "kill") as stop:
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+                _ = self.responses_path.write_text(json.dumps(self.responses))
+                if start is herdr.start_new_server:
+                    with self.assertRaises(herdr.SessionTaken):
+                        _ = start("fixture", 90_000)
+                else:
+                    self.assertIsInstance(start("fixture", 90_000), herdr.ServerAdopted)
+                stop.assert_called_once_with(42, signal.SIGTERM)
+                self.assertFalse(any(command[2:3] == ["workspace"] for command in self.commands()))
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__, exited=True):
+                poll.side_effect = [None, 1]
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+                _ = self.responses_path.write_text(json.dumps(self.responses))
+                if start is herdr.start_new_server:
+                    with self.assertRaises(herdr.SessionTaken):
+                        _ = start("fixture", 90_000)
+                else:
+                    self.assertIsInstance(start("fixture", 90_000), herdr.ServerAdopted)
+                self.assertFalse(any(command[2:3] == ["workspace"] for command in self.commands()))
+
+    def test_darwin_status_answer_without_our_socket_never_clears_workspaces(self) -> None:
+        _ = self.detached_server()
+        self.darwin_sockets("")
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        clock = StartupClock()
+
+        def advance(seconds: float) -> None:
+            clock.elapsed += seconds
+
+        with (patch.object(time, "monotonic", side_effect=lambda: clock.elapsed),
+              patch.object(time, "sleep", side_effect=advance),
+              self.assertRaisesRegex(herdr.HerdrFailure, "did not start")):
+            herdr.start_new_server("fixture", 250)
+        self.assertFalse(any(command[2:3] == ["workspace"] for command in self.commands()))
+
+    def test_darwin_unreadable_startup_listener_fails_plainly_without_clearing(self) -> None:
+        _ = self.detached_server()
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
+                       code=1, stderr="inspection denied")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr server for fixture did not start"):
+            herdr.start_new_server("fixture", 90_000)
+        self.assertFalse(any(command[2:3] == ["workspace"] for command in self.commands()))
+
+    def test_darwin_status_probe_timeout_is_bounded_and_plain(self) -> None:
+        spawn, _ = self.detached_server()
+        clock = StartupClock()
+
+        def timed_out(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv, [str(self.fake), "--session", "fixture", "status", "server"])
+            self.assertLessEqual(timeout, 10.0)
+            clock.elapsed += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        with (patch.object(time, "monotonic", side_effect=lambda: clock.elapsed),
+              patch.object(herdr, "run_program", side_effect=timed_out),
+              self.assertRaisesRegex(herdr.HerdrFailure, "herdr server for fixture did not start")):
+            herdr.start_new_server("fixture", 90_000)
+        spawn.assert_not_called()
+        self.assertEqual(clock.elapsed, 10.0)
+
+    def test_darwin_spawn_failure_has_plain_start_message(self) -> None:
+        spawn, _ = self.detached_server()
+        spawn.side_effect = OSError("cannot execute")
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        with self.assertRaises(herdr.HerdrFailure) as raised:
+            herdr.start_new_server("fixture", 90_000)
+        self.assertEqual(str(raised.exception), "herdr server for fixture did not start")
+
+    def test_darwin_readiness_probes_share_the_startup_deadline(self) -> None:
+        _ = self.detached_server()
+        clock = StartupClock()
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        budgets: list[float] = []
+
+        def slow_probe(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            budgets.append(timeout)
+            if argv[1] == "-n":
+                clock.elapsed += timeout
+                raise subprocess.TimeoutExpired(argv, timeout)
+            clock.elapsed += 2
+            return self.run_fake(argv, timeout)
+
+        with (patch.object(time, "monotonic", side_effect=lambda: clock.elapsed),
+              patch.object(herdr, "run_program", side_effect=slow_probe),
+              self.assertRaisesRegex(herdr.HerdrFailure, "did not start")):
+            herdr.start_new_server("fixture", 90_000)
+        self.assertEqual(budgets, [10, 8, 6])
+        self.assertEqual(clock.elapsed, 10)
+
+    def test_darwin_stop_runs_only_named_server_stop_and_reports_refusal(self) -> None:
+        self.darwin()
+        herdr.stop_session("foo.service")
+        self.configure(["--session", "foo.service", "server", "stop"], code=1, stderr="stop refused")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "stop refused"):
+            herdr.stop_session("foo.service")
+        self.assertEqual(self.commands(), [["--session", "foo.service", "server", "stop"]] * 2)
+
+    def test_darwin_identity_preserves_registry_start_time_and_pins_locale_and_zone(self) -> None:
+        self.darwin()
+        started = "Thu Oct  1 12:00:00 2026"
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], f"  {started} ttys001\n")
+        with patch.object(herdr, "run_program", wraps=herdr.run_program) as probe:
+            identity = herdr.darwin_process_identity(42)
+        self.assertEqual(identity.started, started)
+        self.assertEqual(identity.terminal, 1)
+        self.assertEqual(tuple(identity), (started, 1))
+        self.assertEqual(probe.call_args.args[0], [str(self.fake), "-o", "lstart=,tty=", "-p", "42"])
+        self.assertEqual(probe.call_args.kwargs["timeout"], 5)
+        environment = cast(dict[str, str], probe.call_args.kwargs["environment"])
+        self.assertEqual(environment, {**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+
+    def test_darwin_identity_distinguishes_no_terminal_and_refuses_missing_or_malformed_process(self) -> None:
+        self.darwin()
+        for terminal in ("??", "?", "-"):
+            self.configure(["-o", "lstart=,tty=", "-p", "42"], f"Thu Oct 15 12:00:00 2026 {terminal}\n")
+            self.assertEqual(herdr.darwin_process_identity(42).terminal, 0)
+        for output in ("", "Thu Oct 15 12:00:00 2026", "malformed ttys001",
+                       "Thu Oct 15 12:00:00 2026 ttys001\nThu Oct 15 12:00:00 2026 ??"):
+            self.configure(["-o", "lstart=,tty=", "-p", "42"], output)
+            with self.subTest(output=output), self.assertRaisesRegex(herdr.HerdrFailure, "process 42"):
+                _ = herdr.darwin_process_identity(42)
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], code=1, stderr="process vanished")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "process vanished"):
+            _ = herdr.darwin_process_identity(42)
+
+    def test_darwin_open_files_preserves_absolute_paths_and_distinguishes_errors_from_no_matches(self) -> None:
+        self.darwin()
+        rollout = self.root / "account with spaces/sessions/rollout.jsonl"
+        self.configure(["-a", "-p", "42", "-Fn"], f"p42\nf8\nn{rollout}\nf9\nnrelative\nf10\nn/dev/ttys001\n")
+        self.assertEqual(herdr.darwin_open_files(42), [rollout, Path("/dev/ttys001")])
+        self.assertEqual(self.commands(), [["-a", "-p", "42", "-Fn"]])
+        self.configure(["-a", "-p", "42", "-Fn"], code=1)
+        self.assertEqual(herdr.darwin_open_files(42), [])
+        self.configure(["-a", "-p", "42", "-Fn"], code=1, stderr="permission denied")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "process 42 open files.*permission denied"):
+            _ = herdr.darwin_open_files(42)
+
+    def test_darwin_environment_uses_only_the_suffix_after_unchanged_arguments(self) -> None:
+        self.darwin()
+        command = 'claude --prompt "HERDR_PANE_ID=forged CLAUDE_CONFIG_DIR=/wrong"'
+        self.darwin_environment(42, command, "HERDR_PANE_ID=w1:p1 CLAUDE_CONFIG_DIR=/real account VALUE=a=b")
+        self.assertEqual(herdr.darwin_process_environment(42), {
+            "HERDR_PANE_ID": "w1:p1", "CLAUDE_CONFIG_DIR": "/real account", "VALUE": "a=b"})
+        self.darwin_environment(43, command, "")
+        self.assertEqual(herdr.darwin_process_environment(43), {})
+
+    def test_darwin_environment_refuses_a_changed_command_or_failed_ps(self) -> None:
+        self.darwin()
+        self.darwin_environment(42, "claude", "HERDR_PANE_ID=w1:p1")
+        self.responses["-o command= -p 42"] = [
+            {"stdout": "claude\n", "code": 0}, {"stdout": "claude HERDR_PANE_ID=forged\n", "code": 0}]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        with self.assertRaisesRegex(herdr.HerdrFailure, "stable command"):
+            _ = herdr.darwin_process_environment(42)
+        self.configure(["-o", "command=", "-p", "42"], code=1, stderr="vanished")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "vanished"):
+            _ = herdr.darwin_process_environment(42)
+
+    def test_darwin_unreadable_command_cannot_be_used_to_read_an_environment(self) -> None:
+        self.darwin()
+        self.darwin_environment(42, "(herdr)", "HERDR_SESSION=writing")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "arguments are unreadable"):
+            _ = herdr.darwin_process_environment(42)
+        self.assertEqual(self.commands(), [["-o", "command=", "-p", "42"]])
+
+    def test_darwin_process_columns_preserve_spaced_executables_and_argument_states(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        ghostty = "/Applications/Nix Apps/Ghostty.app/Contents/MacOS/ghostty"
+        drive = "/Applications/Google Drive.app/Contents/MacOS/Google Drive"
+        herdr_path = "/Applications/Nix Apps/herdr"
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="],
+            f"40 1 {uid} {ghostty}\n41 40 {uid} {drive}\n42 40 {uid} {herdr_path}\n" +
+            f"43 40 {uid} {herdr_path}\n44 40 {uid} {herdr_path}\n45 40 {uid} {herdr_path}\n")
+        self.configure(["-U", str(uid), "-o", "pid=,command="],
+            f"40 {ghostty} --working-directory '/work folder'\n41 {drive} --auto_restart_count=1\n" +
+            f"42 {herdr_path} --session writing\n43 (herdr)\n44 changed-executable --session writing\n" +
+            f"45 {herdr_path} 'unterminated\n")
+        rows = herdr._darwin_processes()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual([row.executable for row in rows], [ghostty, drive, *([herdr_path] * 4)])
+        self.assertEqual(rows[0].arguments, herdr.ReadProcessArguments((ghostty, "--working-directory", "/work folder")))
+        self.assertEqual(rows[1].arguments, herdr.ReadProcessArguments((drive, "--auto_restart_count=1")))
+        self.assertEqual(rows[2].arguments, herdr.ReadProcessArguments((herdr_path, "--session", "writing")))
+        for row in rows[3:]:
+            self.assertIsInstance(row.arguments, herdr.UnreadableProcessArguments)
+        self.assertEqual(self.commands(), [
+            ["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="],
+            ["-U", str(uid), "-o", "pid=,command="]])
+
+    def test_darwin_unreadable_herdr_arguments_report_unreadable_clients(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="],
+                       f"42 1 {uid} /Applications/Nix Apps/herdr\n")
+        self.configure(["-U", str(uid), "-o", "pid=,command="], "42 (herdr)\n")
+        self.assertIsInstance(herdr.attached_clients("writing"), herdr.ClientsUnreadable)
+
+    def test_darwin_spaced_herdr_path_detects_attached_clients_and_unreadable_environment(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        executable = "/Applications/Nix Apps/herdr"
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="], f"42 1 {uid} {executable}\n")
+        self.configure(["-U", str(uid), "-o", "pid=,command="], f"42 {executable} session attach writing\n")
+        self.assertEqual(herdr.attached_clients("writing"), herdr.ClientsAttached(1))
+        self.configure(["-U", str(uid), "-o", "pid=,command="], f"42 {executable}\n")
+        self.configure(["-o", "command=", "-p", "42"], code=1, stderr="permission denied")
+        self.assertIsInstance(herdr.attached_clients("writing"), herdr.ClientsUnreadable)
+
+    def test_darwin_server_environment_uses_the_exact_listener_not_a_client(self) -> None:
+        self.darwin()
+        for name, directory in (("fixture", self.root / "config/herdr/sessions/fixture"),
+                                ("default", self.root / "config/herdr")):
+            with self.subTest(name=name):
+                self.darwin_sockets(f"p70\nf3\nn{directory}/herdr.sock\n" +
+                                    "p71\nf4\nn->0x1234\n")
+                self.darwin_environment(70, "herdr server", "ACCOUNT=kept CLAUDE_CONFIG_DIR=/named account")
+                self.darwin_environment(71, "herdr session attach fixture", "ACCOUNT=wrong")
+                self.assertEqual(herdr.server_environment(name), {"ACCOUNT": "kept", "CLAUDE_CONFIG_DIR": "/named account"})
+                self.assertNotIn(["eww", "-o", "command=", "-p", "71"], self.commands())
+
+    def test_darwin_server_environment_refuses_missing_ambiguous_or_unreadable_holders(self) -> None:
+        self.darwin()
+        path = self.root / "config/herdr/sessions/fixture/herdr.sock"
+        for sockets in ("", f"p70\nf3\nn{path}\np71\nf3\nn{path}\n"):
+            with self.subTest(sockets=sockets):
+                self.darwin_sockets(sockets)
+                with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket holder"):
+                    _ = herdr.server_environment("fixture")
+        self.darwin_sockets(f"p70\nf3\nn{path}\n")
+        self.configure(["-o", "command=", "-p", "70"], code=1, stderr="environment unavailable")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*environment unavailable"):
+            _ = herdr.server_environment("fixture")
+
+    def test_darwin_process_discovery_uses_sockets_uid_cwd_and_real_environment(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(
+            f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
+            f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": []}}))
+        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 SHOWRUNNER_UNIT=prod SHOWRUNNER_UNIT_ID=unit")
+        self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
+        self.darwin_environment(74, "claude HERDR_PANE_ID=forged", "")
+        self.configure(["-o", "command=", "-p", "75"], code=1, stderr="vanished")
+        self.darwin_environment(76, "claude", "HERDR_PANE_ID=w1:p2")
+        self.configure(["-a", "-p", "71", "-d", "cwd", "-Fn"], "p71\nfcwd\nn/work folder\n")
+        self.configure(["-a", "-p", "72", "-d", "cwd", "-Fn"], "p72\nfcwd\nn/work folder\n")
+        self.configure(["-a", "-p", "76", "-d", "cwd", "-Fn"], code=1, stderr="gone")
+        rows = herdr.herdr_processes()
+        self.assertCountEqual(rows, [
+            herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "zsh", "/work folder"),
+            herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),
+            herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
+                               herdr.UnreadableCwd("process 76 cwd: gone"))])
+        self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+        self.assertEqual(herdr.herdr_place_of(74), herdr.NotInHerdr())
+        for pid in (73, 77):
+            self.assertNotIn(["eww", "-o", "command=", "-p", str(pid)], self.commands())
+
+    def test_darwin_live_marked_process_remains_placed_when_cwd_is_unreadable(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(
+                       f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": []}}))
+        self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 SHOWRUNNER_UNIT=prod SHOWRUNNER_UNIT_ID=unit")
+        self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p1")
+        for output, code, error in (("", 1, "permission denied"), ("p72\nfcwd\n", 0, ""),
+                                    ("n/one\nn/two\n", 0, "")):
+            with self.subTest(output=output, code=code):
+                for pid in (71, 72):
+                    self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], output, code, error)
+                processes = {process.pid: process for process in herdr.herdr_processes()}
+                self.assertCountEqual(processes, [71, 72])
+                self.assertEqual(processes[71].marks, {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"})
+                for process in processes.values():
+                    self.assertIsInstance(process.working_directory, herdr.UnreadableCwd)
+                    self.assertEqual(process.place, herdr.HerdrPlace("writing", "w1:p1"))
+                self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_darwin_attached_clients_exclude_other_users_and_noninteractive_commands(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        commands = ["herdr session attach writing", "herdr --session writing", "herdr",
+                    "herdr --session writing server", "herdr --session writing pane read p1",
+                    "herdr --session writing agent list", "herdr --session writing status", "herdr session attach other"]
+        table = "".join(f"{80 + index} 1 {uid} {command}\n" for index, command in enumerate(commands))
+        self.darwin_process_table(table + f"99 1 {uid + 1} herdr session attach writing\n")
+        self.darwin_environment(81, commands[1], "")
+        self.darwin_environment(82, "herdr", "HERDR_SESSION=writing")
+        self.assertEqual(herdr.attached_clients("writing"), herdr.ClientsAttached(3))
+        self.assertEqual(herdr.attached_clients("missing"), herdr.NoClientAttached())
+        for pid in (83, 84, 85, 86, 99):
+            self.assertNotIn(["eww", "-o", "command=", "-p", str(pid)], self.commands())
+        self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="], code=1, stderr="cannot read processes")
+        self.assertIsInstance(herdr.attached_clients("writing"), herdr.ClientsUnreadable)
+
+    def test_darwin_handoff_finds_reparented_pane_shells_and_their_agents(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(
+                       f"70 1 {uid} herdr server\n71 1 {uid} zsh\n72 71 {uid} claude\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1", "label": "kept"}]}}))
+        self.configure(["--session", "writing", "pane", "process-info", "--pane", "w1:p1"],
+                       json.dumps({"result": {"process_info": {"shell_pid": 71}}}))
+        for pid, command in ((71, "zsh"), (72, "claude")):
+            self.darwin_environment(pid, command, "HERDR_PANE_ID=w1:p1")
+            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn/work\n")
+        self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
+        self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_darwin_unreadable_socket_listing_refuses_server_environment(self) -> None:
+        self.darwin()
+        self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
+                       code=1, stderr="socket inspection denied")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket inspection denied"):
+            _ = herdr.server_environment("fixture")
+        self.assertEqual(herdr.herdr_processes(), [])
 
     def test_binary_missing_and_override(self) -> None:
         self.assertEqual(herdr.herdr_binary(), str(self.fake))
@@ -321,6 +801,13 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(arguments, json.dumps({"result": {"root_pane": {"pane_id": "pane-1"}}}))
         self.assertEqual(herdr.open_pane("fixture", "worker", "/repo", {"SHOWRUNNER_UNIT": "prod", "CLAUDE_CONFIG_DIR": "/account"}), "pane-1")
         self.assertEqual(self.commands(), [["--session", "fixture", *arguments], ["--session", "fixture", "pane", "rename", "pane-1", "worker"]])
+
+    def test_focus_workspace_targets_the_named_session_and_reports_refusal(self) -> None:
+        self.herdr.focus_workspace("w3")
+        self.assertEqual(self.commands(), [["--session", "fixture", "workspace", "focus", "w3"]])
+        self.configure_herdr(["workspace", "focus", "w3"], code=1, stderr="workspace no longer exists")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "workspace no longer exists"):
+            self.herdr.focus_workspace("w3")
 
     def test_promptless_start_never_sends_input(self) -> None:
         self.herdr.start_agent("worker", "pane-1", "claude", ["-n", "solo"], herdr.NoOpeningPrompt(), 90_000)
