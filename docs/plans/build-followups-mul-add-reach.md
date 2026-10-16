@@ -176,35 +176,22 @@ The wider detector is confirmed live on natedev for both agents. T_reach, the ti
 
 ### Phase 4 — Re-measure  · status: done
 
-**Blocked by:** G2 — 96 hours after T_reach: 2026-10-16 14:13:42 EDT.
+#### As-built
 
-#### Work Order
+The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z) ≤ start < 2026-10-16 14:13:42 EDT (2026-10-16T18:13:42Z), is measured, and both limits fail:
 
-**Goal:** The measured rate of hana clippy steps that fail with a multiply-add warning, over the 96 hours after T_reach, is recorded against its limits.
-
-**Spec:**
-
-Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. Read-only measurement; saved output stays under a few MB.
-
-1. Window: T_reach to T_reach + 96 h, with both ends applied to every query (compare `datetime(started_at)` in UTC). Source: the buildlog index `~/.local/state/buildlog/index.sqlite` (table `steps`) and its gzip logs. Method: the "Measured outcome" section of `docs/as-built/build-followups-mul-add.md`. The first re-measure's scripts in `~/.local/state/mul-add-hook/reach-2026-10-12/remeasure/` (`clippy_fail_lints.py`, `cost.py`, `loop.py`, `totals.py`, `derive.py`, `scan_residuals.py`) and `extract.py` beside that folder are a reference for the log parsing and the cost definitions, not a ready pipeline: `extract.py` has a start time and no end; `clippy_fail_lints.py`, `cost.py` and `loop.py` look back a number of days from now; `totals.py` holds its own window; `derive.py` reads `totals.json` and `residuals_scanned.json`; `scan_residuals.py`, which writes the second, imports `float_mul_add_findings`, now `mul_add_findings`. Copy what is needed to scratch, give every copy the same two bounds, trace each input file to the script that writes it before running anything, and never edit the evidence folder.
-2. Report, for `clippy::suboptimal_flops`:
-   - failed steps per 100 hana clippy steps: limit 1.979 (baseline 7.916; first re-measure 8.126; since go-live 8.67);
-   - sole-cause seat-hours per day: limit 0.100 (baseline 0.402; first re-measure 0.576);
-   - of the window's warnings, how many had an earlier record for the same file and expression in `~/.local/state/mul-add-hook/blocks.jsonl`, and how many had none. Split those with none in two by running the detector on a stub, as `gate.py` does: the stub is reported, so today's detector sees the shape and the hook stayed silent for a cause the log cannot name (the line was not written by the edit, the edit came from outside the hooks, or the log write failed), counted as unknown; or the stub is not reported, counted under the rule that skips it on the stub;
-   - blocks in the window, where one block is one record in `blocks.jsonl`, that is one reported expression (a hook response that reports several expressions writes several records, each with its own `at` and no shared id): total, by agent, and how many were followed by a `mul_add` on that line in the next commit touching the file (a sample of 30 is enough).
-3. Each limit gets PASS or FAIL. A FAIL names its largest remaining cause with counts. A window with no sole-cause failure, or with failures and no later lint call, still gives its sums and a verdict: write the median and the percentile as unavailable, never computed from an empty sample (`cost.py` and `loop.py` compute them unconditionally).
-4. Write the result as a "Detector reach, re-measure" table and paragraph under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`. State every time in EDT (America/New_York), the user's zone since 2026-10-12, with the UTC time beside any time a query uses. The "Detector reach, live check" paragraph above it gives T_reach in PDT: restate that one time as 2026-10-12 14:13:42 EDT (America/New_York, UTC-04:00), so the section reads in one zone.
+- 850 hana clippy steps, 295 failed; 70 carry `clippy::suboptimal_flops`: 8.235 per 100 against the 1.979 limit (**FAIL**).
+- 16 sole-cause failures cost 1.104 seat-hours a day against the 0.100 limit (**FAIL**).
+- Of 227 warnings, 1 matches an earlier block for the same file and expression. 208 are unknown: the detector reports their stub, yet the hook left no record. These occur in 66 of the 70 affected steps and 15 of the 16 sole-cause failures, the largest cause for both FAILs. 18 are skipped by a rule on the stub (9 `VECTOR`, 5 `.powi(2)`, 2 `.sqrt()` receiver, 1 macro, 1 truncated excerpt).
+- 39 block records, all Codex; the two live-check controls are excluded. All 39 are checked against the next commit touching their file: at least 17 matching rewrites, 2 kept, 8 unverified, 12 with no next commit in the window.
 
 **Files:**
-- `docs/as-built/build-followups-mul-add.md` — the "Detector reach, re-measure" table and paragraph
+- `docs/as-built/build-followups-mul-add.md` — the "Detector reach, re-measure" table and paragraphs under "Measured outcome", with the complete SQL; T_reach and the earlier window restated in EDT with UTC
+- `~/.local/state/mul-add-hook/reach-2026-10-16/` — `measure.py`, `commits.py`, `audit.py` and their JSON outputs, outside the repository; each reads and writes beside itself
 
-**Seats:** 1 writer — one measurement and one doc section; nothing splits.
-- `impl` — `docs/as-built/build-followups-mul-add.md`
-- `test` — opens as impl; no file
+**Gotchas:** the buildlog index names the seat column `worker`. Clippy's multiply-add header comes in two wordings ("may be calculated" and "can be calculated"); a parser that knows one misses diagnostics.
 
-**Constraints from prior phases:** T_reach is 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z), the committer time of the merge that brought Phase 2's checkpoint into `~/.claude`; the window ends 2026-10-16 14:13:42 EDT (2026-10-16T18:13:42Z). Phase 3's live check wrote two records into `blocks.jsonl` inside the window, at 2026-10-12T18:18:04Z (`agent` `claude`) and 2026-10-12T18:21:28Z (`agent` `codex`), both with `expression` `top + metrics.button.height * 0.5` and a `file` under `live_check_claude/` or `live_check_codex/`; they come from scratch crates, so leave them out of every block count and say so beside the counts. "Measured outcome" in the as-built doc opens with Phase 3's "Detector reach, live check" paragraph; put the re-measure's table and paragraph directly after it. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text. From Phase 2 on, `expression` is the detector's `expr`: the sum's source text with each run of whitespace outside string and char literals collapsed to one space and comments left out; a record from before T_reach holds the raw source slice. To compare a clippy warning with a record, run `mul_add_lib.mul_add_findings(path)` on the warning's stub as `gate.py` does (it returns the lint scope and a list of findings with `line`, `expr` and `rewrite`) and compare `expr`. On Phase 2's checkpoint `gate.py` reports 160 of the 168 recorded warnings; the `VECTOR` pattern in `mul_add_lib.py` skips the other eight (a `.min(` or `.max(` call with an argument, three; a `.left` member, three; a `.size()` call, one; a `Transform` type token, one).
-
-**Acceptance gate:** both limits reported with PASS or FAIL from the 96-hour window; every number traces to a query the report names.
+**Ruled out:** sampling 30 blocks — all 39 were checked.
 
 ## Out of scope
 
