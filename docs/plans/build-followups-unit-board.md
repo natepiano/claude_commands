@@ -95,7 +95,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - `phase_table` imports `plan_history`, never `progress_history`; `progress_history` imports `phase_table` only inside `_project_chain_eta`. basedpyright's import-cycle check is file-level with no line anchor and file-level ignores are forbidden, so any cycle must be removed, not suppressed.
 - Tests patch `plan_history.now_epoch` for the clock.
 
-### Phase 3 — Board data  · status: todo
+### Phase 3 — Board data  · status: done
 **Depends on:** 2
 
 #### Work Order
