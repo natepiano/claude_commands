@@ -22,8 +22,8 @@ not pause the phase's work.
 3. **Name the basis.** Say which recorded steps the time comes from, e.g. "hana
    full tests took 14–19 min in phases 10–11".
 4. **When the answer has an ETA, record it before answering.** Run
-   `python3 ~/.claude/scripts/delegate/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --earliest "<YYYY-MM-DDTHH:MM>" --latest "<YYYY-MM-DDTHH:MM>" --basis "<basis>"`
-   with the ETA, range and basis in the answer. The recorder reads each time
+   `python3 ~/.claude/scripts/delegate/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --earliest "<YYYY-MM-DDTHH:MM>" --latest "<YYYY-MM-DDTHH:MM>" --basis eta-command`
+   with the ETA and range in the answer. The recorder reads each time
    in the user's zone setting, and the `ETA recorded:` line it prints names
    that zone. If the answer has no range, omit both range options.
 5. **Only when no remaining step has any record,** say `none measured` and name

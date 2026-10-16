@@ -2212,15 +2212,26 @@ def snapshot_restore_record(snapshot: RecoverySnapshot, entry: SnapshotClaudeSes
     return _session_shutdown(saved, "recovery record")
 
 
+def snapshot_supersedes_record(snapshot: RecoverySnapshot, existing: SessionShutdown) -> bool:
+    """A later snapshot replaces older restore intent, including an earlier recovery."""
+    origin = existing["requested_by"]
+    requested_at = origin["taken_at"] if origin["kind"] == "snapshot" else existing["requested_at"]
+    return datetime.fromisoformat(snapshot["taken_at"]) > datetime.fromisoformat(requested_at)
+
+
 def materialize_snapshot(snapshot: RecoverySnapshot, entry: SnapshotClaudeSession) -> SessionShutdown:
-    """Persist a recovery request before launch; an existing request takes precedence."""
+    """Persist recovery before launch, retaining an equally recent or newer request."""
     saved = snapshot_restore_record(snapshot, entry)
     login, identity = saved["login"], saved["session"]["session_id"]
     with launch_barrier():
         with _session_store_lock(login, create=True) as directory:
             for existing in _session_records_in_directory(directory, login):
                 if existing["session"]["session_id"] == identity:
-                    return existing
+                    if not snapshot_supersedes_record(snapshot, existing):
+                        return existing
+                    _ = _record_directory(directory / "sessions", create=True)
+                    _write_record(directory / "sessions" / _session_filename(identity), saved)
+                    return saved
             target = directory / "sessions" / _session_filename(identity)
             _ = _record_directory(target.parent, create=True)
             if _regular_record(target):

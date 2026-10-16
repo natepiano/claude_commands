@@ -14,7 +14,8 @@ and print its output exactly as it comes, with nothing added.
 - An argument it does not recognise: run the no-argument form instead and print only its output, with no explanation.
 - A proof refusal affects only its ungrouped probe; it changes no account refusal or other session’s pick. Hand moves record `by hand`; group retries keep their transition ID and cause.
 - Claude sessions refused by the provider move automatically on the notes timer;
-  the shutdown progress line keeps their target and reason visible until safe to stop.
+  `auto_moves` rules in `config/accounts.json` also move groups on fresh low weekly readings or an observed reset. Rules record `auto: <name>`, reuse production-showrunner notices and send no phone alert. See `docs/accounts.md` for the seed rules.
+  The shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup claudeN`: builds the folder and prints how to log in.
 - `exec claudeN|codexN|units|showrunners|workers [args…]`: starts Claude or Codex on that account or group's selection, passing arguments unchanged; `--probe` before the label is Claude-only.
 - `setup codexN`: links the home, finishes its first startup (up to 20 minutes: run it in the background), then prints the login command.

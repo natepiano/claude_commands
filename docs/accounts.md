@@ -32,6 +32,14 @@ Each Codex account can stay signed in in its own home. The table's `workers` rol
 
 Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
+`status --json` prints `{"accounts": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the lines below the normal table. Each account has `label`, `tool` (`claude` or `codex`), `roles`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
+
+The default JSON has no login or folder fields. `status --json --with-login` adds `login`, the table's signed-in login or null, without another read. `--with-login` requires `--json`; `--json` cannot be combined with `--detail`.
+
+`status --stored`, with or without `--json`, skips every live usage read, subprocess and network call. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
+
+Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
+
 ## Starting a session
 
 Run these in a terminal:
@@ -213,13 +221,13 @@ Numbered Claude aliases through `accounts.py exec` use the terminal supervisor w
 
 `/showrunner:accounts pick claude --explain` shows each candidate's weekly and 5-hour readings, its reset, and why it was picked or skipped. Use `pick codex` for Codex, repeat `--exclude "<label>"` to omit accounts, or use `--keep "<label>"` to retain a session's account while it has room.
 
-Claude accounts have room until they have an unresolved provider refusal. Low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. Only a refusal moves the group. If no destination has room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
+Claude accounts have room until they have an unresolved provider refusal. Without an `auto_moves` rule, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A refusal or a configured automatic rule moves the group. If no destination has room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 
 natedev holds the one role map for both machines: Claude groups in `~/.local/state/accounts/groups.json`, workers in `~/.claude/config/accounts.json`, and changes in `~/.local/state/accounts/roles.jsonl`. All readers and writers use `read_role_map()` / `write_role_map(change)`. On the Mac, writes run through `ssh natedev` and preserve the reason, cause and move id; failed writes refuse without changing local selections. Reads fetch the map once per command and save `~/.local/state/accounts/role_map_cache.json`. When natedev is unreachable, a cached map prints `role map from <time in the user's zone>; natedev unreachable`; without a usable cache the command refuses. No machine selects a substitute account.
 
 A role mapped to an account missing on this machine refuses with `accounts: <role> is on <label>, which is not set up on this machine; <setup step>`. A signed-out account instead says `not logged in on this machine` and names its login step. Status prints the same problem under the table. Set up and sign in the mapped account on each machine before launching that role.
 
-`groups.json` stores explicitly selected group accounts. Only a manual group move or a move after a refusal writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
+`groups.json` stores explicitly selected group accounts. A manual group move, a refusal move or a configured automatic rule writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
 
 `claude-unit`, `exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex workers retain their own role.
 
@@ -297,6 +305,24 @@ Refusals leave both the role and history unchanged. A home-check failure names t
 A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `workers` role through the `swap workers` path; running workers are interrupted and resumed on that account, continuing the refused work before held messages.
 
 When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume, and records waits, failures and renewed room.
+
+## Automatic group rules
+
+On natedev, the two-minute notes timer checks `auto_moves` in `~/.claude/config/accounts.json` after handling refusals. Add these rules alongside the existing config keys:
+
+```json
+"auto_moves": [
+  {"name": "units-low", "group": "units", "to": "claude2", "when": {"left_at_most": 1}},
+  {"name": "showrunners-low", "group": "showrunners", "to": "claude2", "when": {"left_at_most": 1}},
+  {"name": "units-claude3-reset", "group": "units", "to": "claude3", "when": {"after_reset": true}}
+]
+```
+
+`left_at_most` tests the current group's weekly percentage. `after_reset` first records the target's weekly reset without moving; once that reset passes, it returns the group to the target when its fresh reading has room above every configured low threshold. It acts once per observed reset, recording both the observed and acted-on resets in `refusal_watch.json`.
+
+Rules require fresh readings (at most ten minutes old), a ready, signed-in target with room above the configured thresholds, and no unresolved target refusal. They skip the current account, groups with a shutdown transition in flight and groups the refusal pass already moved this run. Malformed rules print a problem and leave valid rules active. Both groups may select one account; the table then shows `units, showrunners` on that account.
+
+Each rule move records cause `auto`, reason `auto: <name>` and one transition ID in the role and move histories. Off-target members use the usual safe shutdown and restart, including the existing production-showrunner stopping and outcome notices; automatic rules send no phone alert. `refusal_watch.py --dry-run` previews without changing homes, selections or rule state. A conductor's final report includes only the requests it handled, including matching peer requests; older stopped records remain for `shutdown.py forget`.
 
 ## Automatic Claude moves
 

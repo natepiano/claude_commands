@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import pwd
 import re
 import shlex
 import socket
@@ -29,9 +30,10 @@ Role = Literal["showrunners", "units", "workers"]
 class StoredGroupSelection(TypedDict):
     label: str
     move_id: str
-    cause: Literal["by hand", "refusal"]
+    cause: Literal["by hand", "refusal", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
+    why: NotRequired[str]
 
 
 class StoredGroupSelections(TypedDict, total=False):
@@ -52,7 +54,7 @@ class RoleMapChange:
     why: str
     at: str
     move_id: str = ""
-    cause: Literal["by hand", "refusal"] = "by hand"
+    cause: Literal["by hand", "refusal", "auto"] = "by hand"
     window: Literal["weekly", "five_hour", "unknown"] = "unknown"
     reset: str = ""
 
@@ -80,7 +82,7 @@ class RoleChangeDocument(TypedDict):
     why: str
     at: str
     move_id: str
-    cause: Literal["by hand", "refusal"]
+    cause: Literal["by hand", "refusal", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: str
 
@@ -93,7 +95,7 @@ class RoleHistoryEntry(TypedDict):
     group: NotRequired[Role]
     account_label: NotRequired[str]
     move_id: NotRequired[str]
-    cause: NotRequired[Literal["by hand", "refusal"]]
+    cause: NotRequired[Literal["by hand", "refusal", "auto"]]
     window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
     reset: NotRequired[str]
 
@@ -123,7 +125,19 @@ class CommandRoleMap:
     value: RoleMap | MapNotRead | MapReadRefused
 
 
+@dataclass(frozen=True)
+class FetchRoleMap:
+    """Read the authority, falling back to its last usable cache."""
+
+
+@dataclass(frozen=True)
+class StoredRoleMap:
+    """Read local authority or saved cache without contacting a remote host."""
+
+
+RoleMapSource = FetchRoleMap | StoredRoleMap
 _command_map: ContextVar[CommandRoleMap | MapNotRead] = ContextVar("role_map", default=MapNotRead())
+_role_map_source: ContextVar[RoleMapSource] = ContextVar("role_map_source", default=FetchRoleMap())
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -142,6 +156,18 @@ def role_map_command(function: Callable[P, R]) -> Callable[P, R]:
     return command
 
 
+@contextmanager
+def stored_role_map() -> Generator[None]:
+    """Read local authority or saved cache only, within an independent scope."""
+    source_token = _role_map_source.set(StoredRoleMap())
+    map_token = _command_map.set(CommandRoleMap(MapNotRead()))
+    try:
+        yield
+    finally:
+        _command_map.reset(map_token)
+        _role_map_source.reset(source_token)
+
+
 def groups_file() -> Path:
     return Path.home() / ".local/state/accounts/groups.json"
 
@@ -150,8 +176,35 @@ def role_map_cache_file() -> Path:
     return groups_file().with_name("role_map_cache.json")
 
 
+@dataclass(frozen=True)
+class LoginHome:
+    path: Path
+
+
+@dataclass(frozen=True)
+class LoginHomeUnread:
+    """The password database did not supply the current uid's home."""
+
+
+def _login_home() -> LoginHome | LoginHomeUnread:
+    """Read the current uid's home independently of the process's HOME."""
+    try:
+        return LoginHome(Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (KeyError, OSError):
+        return LoginHomeUnread()
+
+
 def is_role_map_host() -> bool:
-    return socket.gethostname().split(".", 1)[0] == ROLE_MAP_HOST
+    if socket.gethostname().split(".", 1)[0] == ROLE_MAP_HOST:
+        return True
+    login_home = _login_home()
+    if isinstance(login_home, LoginHomeUnread):
+        return True
+    try:
+        return Path.home().resolve() != login_home.path.resolve()
+    except (OSError, RuntimeError):
+        # An unconfirmed home must never reach the real remote map.
+        return True
 
 
 def ssh_role_map(arguments: tuple[str, ...]) -> str:
@@ -186,7 +239,7 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
             raise ValueError(f"invalid {group} account")
         fields = cast(dict[str, object], value)
         if (not isinstance(fields.get("label"), str) or not isinstance(fields.get("move_id"), str)
-                or not fields["move_id"] or fields.get("cause") not in ("by hand", "refusal")
+                or not fields["move_id"] or fields.get("cause") not in ("by hand", "refusal", "auto")
                 or fields.get("window") not in ("weekly", "five_hour", "unknown")):
             raise ValueError(f"invalid {group} transition")
         if re.fullmatch(r"claude ?[1-9][0-9]*", str(fields["label"])) is None:
@@ -195,11 +248,15 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
             reset = fields["reset"]
             if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
                 raise ValueError(f"invalid {group} reset")
+        if "why" in fields and not isinstance(fields["why"], str):
+            raise ValueError(f"invalid {group} reason")
         selected = StoredGroupSelection(label=cast(str, fields["label"]), move_id=cast(str, fields["move_id"]),
-            cause=cast(Literal["by hand", "refusal"], fields["cause"]),
+            cause=cast(Literal["by hand", "refusal", "auto"], fields["cause"]),
             window=cast(Literal["weekly", "five_hour", "unknown"], fields["window"]))
         if "reset" in fields:
             selected["reset"] = cast(str, fields["reset"])
+        if "why" in fields:
+            selected["why"] = cast(str, fields["why"])
         groups[group] = selected
     return groups
 
@@ -246,6 +303,17 @@ def _atomic_write(path: Path, contents: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _cached_role_map() -> tuple[RoleMap, datetime]:
+    saved = _object(role_map_cache_file())
+    at = saved["at"]
+    if not isinstance(at, str):
+        raise ValueError("invalid cache time")
+    stamp = datetime.fromisoformat(at)
+    if stamp.tzinfo is None:
+        raise ValueError("invalid cache time")
+    return decode_role_map(json.dumps(saved["map"])), stamp
+
+
 def read_role_map() -> RoleMap:
     scope = _command_map.get()
     if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap):
@@ -255,18 +323,13 @@ def read_role_map() -> RoleMap:
     try:
         if is_role_map_host():
             result = _local_role_map()
+        elif isinstance(_role_map_source.get(), StoredRoleMap):
+            result, _ = _cached_role_map()
         else:
             try:
                 result = decode_role_map(ssh_role_map(("role-map-read",)))
             except (OSError, ValueError, subprocess.SubprocessError):
-                saved = _object(role_map_cache_file())
-                at = saved["at"]
-                if not isinstance(at, str):
-                    raise ValueError("invalid cache time")
-                stamp = datetime.fromisoformat(at)
-                if stamp.tzinfo is None:
-                    raise ValueError("invalid cache time")
-                result = decode_role_map(json.dumps(saved["map"]))
+                result, stamp = _cached_role_map()
                 print(f"role map from {stamp.astimezone(user_zone()).strftime('%Y-%m-%d %H:%M %Z')}; "
                       + f"{ROLE_MAP_HOST} unreachable", file=sys.stderr)
             else:
@@ -294,7 +357,7 @@ def decode_role_map_change(text: str) -> RoleMapChange:
     move_id, reset = fields.get("move_id", ""), fields.get("reset", "")
     cause, window = fields.get("cause", "by hand"), fields.get("window", "unknown")
     if (not isinstance(move_id, str) or not isinstance(reset, str)
-            or cause not in ("by hand", "refusal") or window not in ("weekly", "five_hour", "unknown")):
+            or cause not in ("by hand", "refusal", "auto") or window not in ("weekly", "five_hour", "unknown")):
         raise ValueError("invalid role change")
     change = RoleMapChange(role, cast(str, label), cast(str, why), cast(str, at), move_id, cause, window, reset)
     if datetime.fromisoformat(change.at).tzinfo is None:
@@ -338,7 +401,7 @@ def write_role_map(change: RoleMapChange) -> None:
                         values["workers"] = change.label
                     else:
                         selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                            cause=change.cause, window=change.window)
+                            cause=change.cause, window=change.window, why=change.why)
                         if change.reset:
                             selection["reset"] = change.reset
                         values[change.role] = selection
@@ -384,7 +447,7 @@ def write_role_map(change: RoleMapChange) -> None:
             workers = change.label
         else:
             selected = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                cause=change.cause, window=change.window)
+                cause=change.cause, window=change.window, why=change.why)
             if change.reset:
                 selected["reset"] = change.reset
             groups[change.role] = selected

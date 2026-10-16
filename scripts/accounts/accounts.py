@@ -20,7 +20,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -447,6 +447,9 @@ class CommandLine(argparse.Namespace):
     explain: bool = False
     why: str = ""
     detail: bool = False
+    as_json: bool = False
+    stored: bool = False
+    with_login: bool = False
     change: str = ""
 
 
@@ -1708,17 +1711,24 @@ class RefusalOrigin:
     reset: KnownReset | NoResetKnown = field(default_factory=NoResetKnown)
 
 
-MoveOrigin = RefusalOrigin | HandOrigin
+@dataclass(frozen=True)
+class AutoOrigin:
+    """A configured automatic group-move rule requested this transition."""
+
+
+MoveOrigin = RefusalOrigin | HandOrigin | AutoOrigin
 
 
 class MoveOriginFields(TypedDict):
-    cause: Literal["refusal", "by hand"]
+    cause: Literal["refusal", "by hand", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
 
 
 def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
     fields = MoveOriginFields(cause="by hand", window="unknown")
+    if isinstance(origin, AutoOrigin):
+        fields["cause"] = "auto"
     if isinstance(origin, RefusalOrigin):
         fields["cause"] = "refusal"
         fields["window"] = origin.window
@@ -1728,6 +1738,8 @@ def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
 
 
 def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
+    if isinstance(origin, AutoOrigin):
+        return ("--auto",)
     if isinstance(origin, HandOrigin):
         return ()
     arguments: tuple[str, ...] = ("--refused", origin.window)
@@ -1740,6 +1752,7 @@ def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
 class GroupTransition:
     move_id: str
     origin: MoveOrigin
+    why: str = ""
 
 
 @dataclass(frozen=True)
@@ -1791,7 +1804,9 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
     if selection["cause"] == "refusal":
         reset = KnownReset(datetime.fromisoformat(selection["reset"])) if "reset" in selection else NoResetKnown()
         origin = RefusalOrigin(selection["window"], reset)
-    return GroupTransition(selection["move_id"], origin)
+    elif selection["cause"] == "auto":
+        origin = AutoOrigin()
+    return GroupTransition(selection["move_id"], origin, selection.get("why", ""))
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -1948,7 +1963,7 @@ def set_group_account(group: ClaudeGroup, label: str, *, why: str,
         selection["reset"] = fields["reset"]
     write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
         fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin)
+    return GroupTransition(selection["move_id"], origin, why)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:
@@ -3523,11 +3538,28 @@ def _is_stale(usage: usage_store.StoredUsage | None, now: datetime) -> bool:
     return read is None or now - read > STALE_AFTER
 
 
+@dataclass(frozen=True)
+class RefreshStaleUsage:
+    """Refresh signed-in accounts whose last good usage reading is stale."""
+
+
+@dataclass(frozen=True)
+class StoredUsageOnly:
+    """Observe saved usage and roles without starting processes or networking."""
+
+
+UsageSource = RefreshStaleUsage | StoredUsageOnly
+REFRESH_STALE_USAGE = RefreshStaleUsage()
+
+
 def _stored_usage(
     statuses: list[AccountStatus], codex: list[CodexStatus], now: datetime,
+    source: UsageSource = REFRESH_STALE_USAGE,
 ) -> dict[str, usage_store.StoredUsage]:
     """Each login's stored readings. A login with none read lately is read live first, all at once."""
     stored = usage_store.load()
+    if isinstance(source, StoredUsageOnly):
+        return stored
     stale = [
         status.config_dir for status in statuses
         if status.login and _is_stale(stored.get(usage_store.key("Claude", status.login)), now)
@@ -3562,31 +3594,69 @@ def _is_current(window: usage_store.StoredWindow, now: datetime) -> bool:
     return resets is not None and resets > now
 
 
-def _window_cells(
-    window: usage_store.StoredWindow | None, now: datetime, zone: tzinfo | None, pattern: str,
-) -> tuple[str, str]:
-    """What is left of one window and when it resets."""
-    if window is None or not _is_current(window, now):
-        return ("unavailable", "unavailable")
-    resets = _stored_time(window["resets"])
-    return (f"{window['left']:.0f}%", NO_VALUE if resets is None else resets.astimezone(zone).strftime(pattern))
+@dataclass(frozen=True)
+class StatusUnavailable:
+    """No usable value; cell retains the table's reason or dash."""
+    cell: str = NO_VALUE
 
 
-def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, str]:
-    """Whether Codex work now draws on the account's credits, and the credits left.
+@dataclass(frozen=True)
+class StatusRow:
+    """One account's values, shared by the table and JSON renderers."""
+    label: str
+    tool: Literal["claude", "codex"]
+    folder: str
+    login: str
+    login_cell: str
+    roles: tuple[str, ...]
+    weekly_left_percent: float | StatusUnavailable
+    resets_at: datetime | StatusUnavailable
+    credits: float | Literal["unlimited"] | StatusUnavailable
+    on_credits: str
+    use_credits: bool
+    read_at: datetime | StatusUnavailable
 
-    Codex spends credits once an allowance window is used up.
-    """
+
+@dataclass(frozen=True)
+class StatusReading:
+    rows: tuple[StatusRow, ...]
+    notes: tuple[str, ...]
+    group_line: str
+    detail_lines: tuple[str, ...]
+    zone: tzinfo
+
+
+class StatusAccountDocument(TypedDict):
+    label: str
+    tool: Literal["claude", "codex"]
+    roles: list[str]
+    weekly_left_percent: float | None
+    resets_at: str | None
+    credits: float | Literal["unlimited"] | None
+    use_credits: bool
+    read_at: str | None
+    login: NotRequired[str | None]
+
+
+class StatusDocument(TypedDict):
+    accounts: list[StatusAccountDocument]
+    problems: list[str]
+
+
+def _credit_reading(
+    usage: usage_store.StoredUsage, now: datetime,
+) -> tuple[str, float | Literal["unlimited"] | StatusUnavailable]:
     credits = usage.get("credits")
     if credits is None:
-        return ("unavailable", "unavailable")
+        return ("unavailable", StatusUnavailable("unavailable"))
     balance = credits["balance"]
     try:
         amount = math.inf if balance == "unlimited" else float(balance)
     except ValueError:
-        # Codex reported no balance.
-        return ("unavailable", "unavailable")
-    left = "unlimited" if math.isinf(amount) else f"{amount:,.0f}"
+        return ("unavailable", StatusUnavailable("unavailable"))
+    if math.isnan(amount):
+        return ("unavailable", StatusUnavailable("unavailable"))
+    left: float | Literal["unlimited"] = "unlimited" if math.isinf(amount) else amount
     windows = [window for window in (usage.get("five_hour"), usage.get("weekly")) if window is not None]
     current = [window for window in windows if _is_current(window, now)]
     if any(window["left"] <= 0 for window in current):
@@ -3594,54 +3664,73 @@ def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, s
     return ("no" if "weekly" in usage and len(current) == len(windows) else "unavailable", left)
 
 
-def _reading_cells(
-    usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None, *, has_credits: bool,
-) -> tuple[str, ...]:
-    """The cells after the role: the weekly window, credits, and when they were read."""
-    held = usage or usage_store.StoredUsage()
-    read = _read_at(usage)
-    return (
-        *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
-        *(_credit_cells(held, now) if has_credits else (NO_VALUE, NO_VALUE)),
-        NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
-    )
+def _status_row(
+    status: AccountStatus | CodexStatus, usage: usage_store.StoredUsage | None, now: datetime,
+    roles: tuple[str, ...],
+) -> StatusRow:
+    tool = "codex" if isinstance(status, CodexStatus) else "claude"
+    login_cell = ("not set up" if not status.is_set_up else "unavailable" if not status.account_is_safe_to_inspect
+                  else status.login or "not logged in")
+    weekly: float | StatusUnavailable = StatusUnavailable()
+    resets: datetime | StatusUnavailable = StatusUnavailable()
+    credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
+    read_at: datetime | StatusUnavailable = StatusUnavailable()
+    on_credits = NO_VALUE
+    login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
+    if login:
+        if isinstance(status, CodexStatus) and isinstance(status.startup, agent_accounts.CodexStartupFailure):
+            weekly = StatusUnavailable(status.startup.setup_command)
+        else:
+            held = usage or usage_store.StoredUsage()
+            window = held.get("weekly")
+            if window is not None and _is_current(window, now):
+                weekly = window["left"]
+                resets = _stored_time(window["resets"]) or StatusUnavailable()
+            else:
+                weekly = StatusUnavailable("unavailable")
+                resets = StatusUnavailable("unavailable")
+            read_at = _read_at(usage) or StatusUnavailable()
+            if tool == "codex":
+                on_credits, credits = _credit_reading(held, now)
+    return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
+        weekly, resets, credits, on_credits,
+        tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
+        read_at)
 
 
-NO_READING = (NO_VALUE,) * 5
+def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
+    weekly = row.weekly_left_percent
+    reset = row.resets_at
+    credits = row.credits
+    read = row.read_at
+    role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    return (row.folder, row.label, row.login_cell, role_cell,
+        weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%",
+        reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
+        row.on_credits,
+        credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
+        read.cell if isinstance(read, StatusUnavailable) else read.astimezone(zone).strftime("%H:%M %Z"))
 
 
-def _table_row(
-    status: AccountStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
-) -> tuple[str, ...]:
-    """One Claude folder's row. `usage` is its login's stored reading, if it has one."""
-    if not status.is_set_up:
-        return (status.folder, status.label, "not set up", status.role, *NO_READING)
-    if not status.account_is_safe_to_inspect:
-        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
-    if not status.login:
-        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
-    return (
-        status.folder, status.label, status.login, status.role,
-        *_reading_cells(usage, now, zone, has_credits=False),
-    )
+def render_status_json(reading: StatusReading, *, with_login: bool = False) -> str:
+    accounts: list[StatusAccountDocument] = []
+    for row in reading.rows:
+        item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
+            weekly_left_percent=None if isinstance(row.weekly_left_percent, StatusUnavailable) else row.weekly_left_percent,
+            resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
+            credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
+            use_credits=row.use_credits,
+            read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat())
+        if with_login:
+            item["login"] = row.login or None
+        accounts.append(item)
+    return json.dumps(StatusDocument(accounts=accounts, problems=list(reading.notes)))
 
 
-def _codex_row(
-    status: CodexStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
-) -> tuple[str, ...]:
-    """One Codex row. `usage` is its login's stored reading, if it has one."""
-    if not status.is_set_up:
-        return (status.folder, status.label, "not set up", status.role, *NO_READING)
-    if not status.account_is_safe_to_inspect:
-        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
-    if not status.login:
-        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
-    if isinstance(status.startup, agent_accounts.CodexStartupFailure):
-        return (status.folder, status.label, status.login, status.role, status.startup.setup_command, *NO_READING[1:])
-    return (
-        status.folder, status.label, status.login, status.role,
-        *_reading_cells(usage, now, zone, has_credits=True),
-    )
+def render_status_table(reading: StatusReading) -> str:
+    return "\n".join([reading.group_line,
+        _render_table([_status_row_cells(row, reading.zone) for row in reading.rows]), "",
+        *reading.notes, *reading.detail_lines])
 
 
 def _render_table(rows: list[tuple[str, ...]]) -> str:
@@ -3672,8 +3761,7 @@ def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
     return notes
 
 
-@role_map.role_map_command
-def status_report(*, detail: bool = False) -> str:
+def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     """One table row per account folder, then one line for each thing wrong in a folder.
 
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
@@ -3689,9 +3777,17 @@ def status_report(*, detail: bool = False) -> str:
     if not selected_workers.label:
         codex = [replace(status, role="spare") if status.role == CODEX_ROLE else status for status in codex]
     now = datetime.now(timezone.utc)
-    usage = _stored_usage(statuses, codex, now)
+    usage = _stored_usage(statuses, codex, now, source)
     zone = agent_accounts.user_zone()
-    groups = group_accounts()
+    try:
+        groups = group_accounts()
+    except AccountsError as error:
+        if isinstance(source, RefreshStaleUsage):
+            raise
+        if str(error) not in role_problems:
+            role_problems.append(str(error))
+        groups = GroupAccounts()
+        codex = [replace(status, role=NO_VALUE) for status in codex]
     group_directories: dict[ClaudeGroup, Path] = {}
     for group in CLAUDE_GROUPS:
         label = group_label(groups, group)
@@ -3702,12 +3798,13 @@ def status_report(*, detail: bool = False) -> str:
                 role_problems.append(str(error))
                 # The folder's status reports its unreadable note without selecting it.
                 continue
-    statuses = [replace(status, role=", ".join(group for group, directory in group_directories.items()
-        if status.config_dir == directory)) for status in statuses]
-    table = _render_table([
-        *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
-        *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
-    ])
+    rows = (
+        *(_status_row(status, usage.get(usage_store.key("Claude", status.login)), now,
+            tuple(group for group, directory in group_directories.items() if status.config_dir == directory))
+          for status in statuses),
+        *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
+            (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
+    )
     home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
     notes = [
         *role_problems,
@@ -3720,13 +3817,26 @@ def status_report(*, detail: bool = False) -> str:
         *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
           for status in codex if detail and status.unclassified),
     ]
-    summary = [group_status_line(groups), table, "", *notes]
-    if not detail:
-        return "\n".join(summary)
-    journal = moves.read_journal()
-    return "\n".join([*summary,
-        *_live_status_lines(groups), *_workers_status_lines(now, selected_workers),
-        *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone)])
+    detail_lines: tuple[str, ...] = ()
+    if detail:
+        journal = moves.read_journal()
+        live_lines = ((*_live_status_lines(groups), *_workers_status_lines(now, selected_workers))
+                      if isinstance(source, RefreshStaleUsage) else ())
+        detail_lines = (*live_lines,
+            *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
+    return StatusReading(rows, tuple(notes), group_status_line(groups), detail_lines, zone)
+
+
+@role_map.role_map_command
+def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False) -> StatusReading:
+    """Read each account once for either renderer; stored mode performs no live work."""
+    with role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext():
+        return _read_status(source, detail=detail)
+
+
+def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE) -> str:
+    """The account table, with optional session, worker and move details."""
+    return render_status_table(read_status(source=source, detail=detail))
 
 
 # Run folders under unit/, and under delegate/ for a run started before the rename.
@@ -3874,7 +3984,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("role-map-read")
     writer = commands.add_parser("role-map-write")
     _ = writer.add_argument("change")
-    parser.set_defaults(action="status")
+    parser.set_defaults(action="status", as_json=False, stored=False, with_login=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
@@ -3882,7 +3992,11 @@ def _parser() -> argparse.ArgumentParser:
     cutover = commands.add_parser("cutover-home")
     _ = cutover.add_argument("label", nargs="?", default="")
     _ = cutover.add_argument("--undo", action="store_true")
-    _ = commands.add_parser("status")
+    status = commands.add_parser("status")
+    _ = status.add_argument("--json", dest="as_json", action="store_true")
+    _ = status.add_argument("--stored", action="store_true")
+    _ = status.add_argument("--with-login", action="store_true")
+    _ = status.add_argument("--detail", action="store_true", default=argparse.SUPPRESS)
     placer = commands.add_parser("placement")
     _ = placer.add_argument("--explain", action="store_true")
     picker = commands.add_parser("pick")
@@ -3920,7 +4034,12 @@ def _parser() -> argparse.ArgumentParser:
 
 @role_map.role_map_command
 def main(argv: list[str]) -> int:
-    options = cast(CommandLine, _parser().parse_args(argv))
+    parser = _parser()
+    options = cast(CommandLine, parser.parse_args(argv))
+    if options.as_json and options.detail:
+        parser.error("--json and --detail cannot be used together")
+    if options.with_login and not options.as_json:
+        parser.error("--with-login requires --json")
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
@@ -3994,7 +4113,11 @@ def main(argv: list[str]) -> int:
                 print(problem)
             return 1 if problems else 0
         if options.action == "status":
-            print(status_report(detail=options.detail))
+            source: UsageSource = StoredUsageOnly() if options.stored else RefreshStaleUsage()
+            if options.as_json:
+                print(render_status_json(read_status(source=source), with_login=options.with_login))
+            else:
+                print(status_report(detail=options.detail, source=source))
             return 0
         if options.action == "role":
             selected = role_account(options.role)
