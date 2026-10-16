@@ -1711,17 +1711,24 @@ class RefusalOrigin:
     reset: KnownReset | NoResetKnown = field(default_factory=NoResetKnown)
 
 
-MoveOrigin = RefusalOrigin | HandOrigin
+@dataclass(frozen=True)
+class AutoOrigin:
+    """A configured automatic group-move rule requested this transition."""
+
+
+MoveOrigin = RefusalOrigin | HandOrigin | AutoOrigin
 
 
 class MoveOriginFields(TypedDict):
-    cause: Literal["refusal", "by hand"]
+    cause: Literal["refusal", "by hand", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
 
 
 def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
     fields = MoveOriginFields(cause="by hand", window="unknown")
+    if isinstance(origin, AutoOrigin):
+        fields["cause"] = "auto"
     if isinstance(origin, RefusalOrigin):
         fields["cause"] = "refusal"
         fields["window"] = origin.window
@@ -1731,6 +1738,8 @@ def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
 
 
 def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
+    if isinstance(origin, AutoOrigin):
+        return ("--auto",)
     if isinstance(origin, HandOrigin):
         return ()
     arguments: tuple[str, ...] = ("--refused", origin.window)
@@ -1743,6 +1752,7 @@ def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
 class GroupTransition:
     move_id: str
     origin: MoveOrigin
+    why: str = ""
 
 
 @dataclass(frozen=True)
@@ -1794,7 +1804,9 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
     if selection["cause"] == "refusal":
         reset = KnownReset(datetime.fromisoformat(selection["reset"])) if "reset" in selection else NoResetKnown()
         origin = RefusalOrigin(selection["window"], reset)
-    return GroupTransition(selection["move_id"], origin)
+    elif selection["cause"] == "auto":
+        origin = AutoOrigin()
+    return GroupTransition(selection["move_id"], origin, selection.get("why", ""))
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -1951,7 +1963,7 @@ def set_group_account(group: ClaudeGroup, label: str, *, why: str,
         selection["reset"] = fields["reset"]
     write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
         fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin)
+    return GroupTransition(selection["move_id"], origin, why)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:

@@ -1412,3 +1412,40 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:** macOS `/tmp` links to `/private/tmp`, so a fixture compared against `resolve()` resolves its temporary root at creation; a symlinked `TMPDIR` on natedev reproduces it. A test that fakes one platform's process or login reads pins `sys.platform` to that platform; unpinned, the Mac takes the darwin branch and reads the real process table or keychain. Run the account suites on the Mac from a scratch copy of the tree with a scratch `HOME`.
 
 **Ruled out:** skipping a test by platform (each platform's case is pinned and runs on both machines).
+
+### Phase 49 — Automatic group moves by rule  · status: done
+
+**Depends on:** Phase 47
+
+#### Work Order
+
+**Goal:** the notes timer moves the units or the showrunners group by itself when a config rule says to: a group whose account reads 1% weekly or less moves to claude2, and units move to claude3 once claude3's weekly window has reset and reads room again. Each move records `auto: <rule>`, tells the moved group's showrunner sessions, and sends nothing to the phone. A move's final shutdown report lists only its own request's sessions.
+
+**Constraints from prior phases:** the timer is `scripts/whoami/agent_notes.py` `main` → `refusal_watch.run()`, every 2 minutes, natedev only (the Mac has no timer). A group move is `accounts.set_group_account` then `accounts.move_sessions` with one `GroupTransition` move_id (`refusal_watch._run` is the pattern). Readings come from `refusals.stored_reading("claude", login, now)` (`FreshReading` within 10 minutes, else `StaleReading`). `~/.claude/config/accounts.json` already holds `workers` and `home_cutovers`, read with `_read_json_object` and written atomically under a lock. The status Role cell joins `row.roles` in `CLAUDE_GROUPS` order (Phase 47). Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
+
+**Spec:**
+1. **Rule config.** `accounts.json` gains `auto_moves`, a list of `{"name", "group", "to", "when"}`; `group` is `units` or `showrunners`, `to` an account label, `when` either `{"left_at_most": <percent>}` (the group's current account reads that weekly percent or less) or `{"after_reset": true}` (the target's weekly reset stored when the rule last looked has passed, and the target reads room again, above every `left_at_most` threshold in the list). A malformed rule is reported in the pass's lines and skipped; the others still run. No threshold or target is a code constant. `docs/accounts.md` documents the key with the three seed rules: `units-low` (units, 1% → claude2), `showrunners-low` (showrunners, 1% → claude2), `units-claude3-reset` (units → claude3 after its reset).
+2. **Rule pass.** `refusal_watch.run` runs the rules after the refusal pass, under the same `_watch_lock`, on natedev only. A rule fires only on fresh readings. It never moves to a target that reads at or below the threshold, holds an unresolved refusal, or is already the group's account, and it skips a group with a transition in flight or one the refusal pass moved this run. Both groups may share one account. `after_reset` fires once per reset: the state records the reset it acted on, and a rule seen for the first time records the target's current reset without firing.
+3. **Move and record.** A firing rule moves the group exactly as a refusal move does (`prepared_account`, `set_group_account`, `move_sessions` for off-target members, one move_id), with cause `auto` and why `auto: <rule name>`. Widen the cause from `refusal | by hand` to `refusal | by hand | auto` everywhere it is a literal: `accounts.MoveOrigin` and its field and argument helpers, the status readout, `role_map.py` and `moves.py`, so roles.jsonl and moves.jsonl both carry it and older lines still parse.
+4. **Notice.** When an auto move fires, the moved group's showrunner sessions get the same notice a refusal move sends them; the phone gets nothing (the shutdown runs with `alerts="none"`). If a refusal move sends showrunner sessions no notice today, post that on the board and to the director before inventing one.
+5. **Table.** With both groups on claude2, the rendered `status` table's claude2 row reads `units, showrunners` in its Role cell; a test pins the rendered table, not only the JSON.
+6. **Report filter (showrunner add-on).** The detached conductor's final report (`scripts/shutdown/settle.py` `conduct` → `report_stop`) lists every record in the login's `sessions/` directory and every peer record for the login, so a move's report also showed stopped records left from older requests. It lists only the records of the requests this conductor run handled, local and peer alike. Records that finish as anything other than `restarted` stay where they are (the operator closes them with `shutdown.py forget`); only the report changes.
+
+**Files:**
+- `scripts/accounts/refusal_watch.py`
+- `scripts/accounts/accounts.py`
+- `scripts/accounts/role_map.py`
+- `scripts/accounts/moves.py`
+- `scripts/shutdown/settle.py`
+- `scripts/shutdown/shutdown.py`
+- `docs/accounts.md`
+- `commands/showrunner/accounts.md`
+- `scripts/accounts/test_refusal_watch.py`
+- `scripts/accounts/test_accounts.py`
+- `scripts/accounts/test_role_map.py`
+- `scripts/accounts/test_moves.py`
+- `scripts/shutdown/test_settle.py`
+
+**Workers:** `impl` owns the production files and the two docs; `test` owns the five test files.
+
+**Acceptance gate:** tests cover each threshold edge (2% holds, 1% fires), fresh against stale readings, `after_reset` firing once per reset and not on first sight, both groups landing on claude2, each target guard, the transition-in-flight skip, the journal cause and why, the notice with no phone alert, the rendered `units, showrunners` row, and a conductor report that leaves out an older request's stopped record. The accounts, shutdown and whoami suites pass on natedev and the Mac; the merge gate is green.

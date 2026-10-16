@@ -30,9 +30,10 @@ Role = Literal["showrunners", "units", "workers"]
 class StoredGroupSelection(TypedDict):
     label: str
     move_id: str
-    cause: Literal["by hand", "refusal"]
+    cause: Literal["by hand", "refusal", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
+    why: NotRequired[str]
 
 
 class StoredGroupSelections(TypedDict, total=False):
@@ -53,7 +54,7 @@ class RoleMapChange:
     why: str
     at: str
     move_id: str = ""
-    cause: Literal["by hand", "refusal"] = "by hand"
+    cause: Literal["by hand", "refusal", "auto"] = "by hand"
     window: Literal["weekly", "five_hour", "unknown"] = "unknown"
     reset: str = ""
 
@@ -81,7 +82,7 @@ class RoleChangeDocument(TypedDict):
     why: str
     at: str
     move_id: str
-    cause: Literal["by hand", "refusal"]
+    cause: Literal["by hand", "refusal", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: str
 
@@ -94,7 +95,7 @@ class RoleHistoryEntry(TypedDict):
     group: NotRequired[Role]
     account_label: NotRequired[str]
     move_id: NotRequired[str]
-    cause: NotRequired[Literal["by hand", "refusal"]]
+    cause: NotRequired[Literal["by hand", "refusal", "auto"]]
     window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
     reset: NotRequired[str]
 
@@ -238,7 +239,7 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
             raise ValueError(f"invalid {group} account")
         fields = cast(dict[str, object], value)
         if (not isinstance(fields.get("label"), str) or not isinstance(fields.get("move_id"), str)
-                or not fields["move_id"] or fields.get("cause") not in ("by hand", "refusal")
+                or not fields["move_id"] or fields.get("cause") not in ("by hand", "refusal", "auto")
                 or fields.get("window") not in ("weekly", "five_hour", "unknown")):
             raise ValueError(f"invalid {group} transition")
         if re.fullmatch(r"claude ?[1-9][0-9]*", str(fields["label"])) is None:
@@ -247,11 +248,15 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
             reset = fields["reset"]
             if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
                 raise ValueError(f"invalid {group} reset")
+        if "why" in fields and not isinstance(fields["why"], str):
+            raise ValueError(f"invalid {group} reason")
         selected = StoredGroupSelection(label=cast(str, fields["label"]), move_id=cast(str, fields["move_id"]),
-            cause=cast(Literal["by hand", "refusal"], fields["cause"]),
+            cause=cast(Literal["by hand", "refusal", "auto"], fields["cause"]),
             window=cast(Literal["weekly", "five_hour", "unknown"], fields["window"]))
         if "reset" in fields:
             selected["reset"] = cast(str, fields["reset"])
+        if "why" in fields:
+            selected["why"] = cast(str, fields["why"])
         groups[group] = selected
     return groups
 
@@ -352,7 +357,7 @@ def decode_role_map_change(text: str) -> RoleMapChange:
     move_id, reset = fields.get("move_id", ""), fields.get("reset", "")
     cause, window = fields.get("cause", "by hand"), fields.get("window", "unknown")
     if (not isinstance(move_id, str) or not isinstance(reset, str)
-            or cause not in ("by hand", "refusal") or window not in ("weekly", "five_hour", "unknown")):
+            or cause not in ("by hand", "refusal", "auto") or window not in ("weekly", "five_hour", "unknown")):
         raise ValueError("invalid role change")
     change = RoleMapChange(role, cast(str, label), cast(str, why), cast(str, at), move_id, cause, window, reset)
     if datetime.fromisoformat(change.at).tzinfo is None:
@@ -396,7 +401,7 @@ def write_role_map(change: RoleMapChange) -> None:
                         values["workers"] = change.label
                     else:
                         selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                            cause=change.cause, window=change.window)
+                            cause=change.cause, window=change.window, why=change.why)
                         if change.reset:
                             selection["reset"] = change.reset
                         values[change.role] = selection
@@ -442,7 +447,7 @@ def write_role_map(change: RoleMapChange) -> None:
             workers = change.label
         else:
             selected = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                cause=change.cause, window=change.window)
+                cause=change.cause, window=change.window, why=change.why)
             if change.reset:
                 selected["reset"] = change.reset
             groups[change.role] = selected

@@ -1780,6 +1780,47 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(arguments[arguments.index("--requested-by") + 1], "requester")
         self.assertIn("--restart", arguments)
 
+    def test_automatic_move_peer_and_cold_key_retries_preserve_the_flag_and_journal_cause(self) -> None:
+        account = Account("claude", LOGIN, LABEL)
+        empty = machine_inventory([])
+        for failure in ("peer unreachable", "cold keys"):
+            identity = "auto-" + failure.replace(" ", "-")
+            owner = top_level(identity, identity)
+            errors = io.StringIO()
+            with (self.subTest(failure=failure),
+                  patch.object(settle, "_warm", return_value=failure != "cold keys"),
+                  patch.object(settle, "_launch_conductor"),
+                  patch.object(settle, "run_remote", return_value=(255, "unreachable")) as peer,
+                  redirect_stdout(io.StringIO()), redirect_stderr(errors)):
+                result = settle.down(account, False, [identity], then="restart", alerts="none",
+                    target="claude3", why="auto: units-low", origin=accounts.AutoOrigin(),
+                    move_id=identity, report=empty)
+            self.assertEqual(result, 1 if failure == "cold keys" else 0)
+            retry = shlex.split(errors.getvalue().split("~/.claude/scripts/lib/py ", 1)[1])
+            self.assertTrue(retry[0].endswith("/shutdown.py"))
+            arguments = retry[1:]
+            self.assertIn("--auto", arguments)
+            self.assertIn("--no-alert", arguments)
+            if failure == "peer unreachable":
+                peer.assert_called_once_with(arguments)
+            else:
+                peer.assert_not_called()
+            report = machine_inventory([owner])
+            with (patch.object(shutdown, "named_claude_account", return_value=account),
+                  patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions((identity,), report)),
+                  patch.object(settle, "_warm", return_value=True),
+                  patch.object(settle, "_launch_conductor"),
+                  patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                self.assertEqual(shutdown.main(arguments), 0)
+            requested = [entry for entry in moves.read_moves()
+                         if entry["kind"] == "requested" and entry["move_id"] == identity]
+            self.assertEqual(len(requested), 1)
+            self.assertEqual((requested[0].get("cause"), requested[0]["why"]), ("auto", "auto: units-low"))
+            saved = record.find_session(LOGIN, identity)
+            assert saved is not None
+            self.assertEqual(saved["alerts"], "none")
+
     def test_self_move_records_the_session_as_its_requester(self) -> None:
         owner = top_level("self-id", "Self")
         with (
@@ -2912,6 +2953,43 @@ class SettleTests(ShutdownTestCase):
                 self.assertEqual(process.wait(timeout=0.8), 0)
         result = subprocess.run([sys.executable, str(sender), "send"], input="body", capture_output=True, text=True, check=False, timeout=0.8)
         self.assertEqual(result.stdout, "body\n")
+
+    def test_conductor_report_includes_current_local_and_peer_requests_but_keeps_older_stopped_records(self) -> None:
+        old = session_shutdown(top_level("old-local", "Older local"),
+            progress={"kind": "stopped", "at": NOW}, request_id="earlier-request")
+        current = session_shutdown(top_level("current-local", "Current local"),
+            progress={"kind": "ready", "at": NOW}, request_id="current-request")
+        another = session_shutdown(top_level("another-local", "Another local"),
+            progress={"kind": "ready", "at": NOW}, request_id="another-request")
+        peer = session_shutdown(top_level("current-peer", "Current peer"), request_id="current-request")
+        older_peer = session_shutdown(top_level("old-peer", "Older peer"),
+            progress={"kind": "stopped", "at": NOW}, request_id="earlier-request")
+        peer["machine"] = older_peer["machine"] = "Mac"
+        for saved in (old, current, another):
+            saved["alerts"] = "none"
+        for saved in (old, current):
+            self.save(saved)
+        def stop_and_accept_late_request(saved: record.SessionShutdown) -> record.SessionShutdown:
+            if saved["session"]["session_id"] == "current-local":
+                self.save(another)
+            return self.fake_stop(saved)
+        with (patch.object(settle, "run_inventory", return_value=machine_inventory([current["session"], another["session"]])),
+              patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop_and_accept_late_request)),
+              patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001),
+              patch.object(settle, "run_remote", return_value=(0, json.dumps([peer, older_peer]))),
+              patch.object(settle, "send_message", return_value={"kind": "sent"}),
+              patch.object(settle, "alert_user") as alert,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertIn("natedev Current local: stopped", output.getvalue())
+        self.assertIn("natedev Another local: stopped", output.getvalue())
+        self.assertIn("Mac Current peer: waiting", output.getvalue())
+        self.assertNotIn("Older local", output.getvalue())
+        self.assertNotIn("Older peer", output.getvalue())
+        self.assertEqual(record.find_session(LOGIN, "old-local"), old)
+        self.assertIsNotNone(record.find_session(LOGIN, "current-local"))
+        self.assertIsNotNone(record.find_session(LOGIN, "another-local"))
+        alert.assert_not_called()
 
     def test_report_stop_lists_peer_waiting_and_alerts_only_requested_failures(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stop failed", "at": NOW, "reason": "busy"}, requester="requester")
