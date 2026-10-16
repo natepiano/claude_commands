@@ -223,6 +223,9 @@ State:
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
   they want it (user, 2026-10-15).
+  When the user's answer needs research before they can finish it, remove the
+  item from `open_for_user` in that turn; it returns, in full, when the
+  research reports (user, 2026-10-15).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
