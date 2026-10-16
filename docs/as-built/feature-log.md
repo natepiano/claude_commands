@@ -23,7 +23,7 @@ The feature log is the current account of what seven projects do: hana, natedev,
 | `/home/natepiano/rust/hanadocs/feature-log/<project>/` | The notes. |
 | `/home/natepiano/rust/hanadocs/home-base/feature-log.base`, `feature-log - <project>.base` | The Bases: the global one and one per project. |
 | `~/.local/state/claude/feature-log/` | State: lock, events, proposals, digest cursor, ledgers, saved release contents. |
-| `/home/natepiano/rust/hanadocs/proposals/feature-log.md` | The design this implements. Read-only for agents. |
+| `~/rust/hanadocs/issues/feature log.md` | The design this implements. Read-only for agents. |
 
 Every call is `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py <verb> …`. Both scripts use the Python standard library only.
 
