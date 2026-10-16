@@ -205,6 +205,7 @@ class UnitMarks:
 
 DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
 SNAPSHOT_SESSION = re.compile(r"^`(.+)` · (\S+) · (.+?)\s*$")
+SNAPSHOT_COMMIT_PREFIX = "agent-sessions-snapshot: "
 RESUME_ID = re.compile(r"(?:^|\s)--resume\s+['\"]?([^\s'\"]+)")
 
 
@@ -790,7 +791,10 @@ def _checkout(cwd: str) -> CheckoutState:
     if any(result is None or result.returncode != 0 for result in (root, branch, head)):
         return {"kind": "not a checkout"}
     assert root is not None and branch is not None and head is not None
-    ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
+    # The vault's snapshot job commits every minute or two and hanadocs-push pushes them,
+    # so they never block a stop; counting them, no session in the vault reads as pushed.
+    ahead_result = _git(cwd, "rev-list", "--count", "--invert-grep",
+                        f"--grep=^{SNAPSHOT_COMMIT_PREFIX}", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
         try:
