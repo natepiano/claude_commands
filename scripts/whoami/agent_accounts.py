@@ -28,6 +28,7 @@ import os
 import math
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import time
@@ -504,30 +505,45 @@ def codex_home() -> Path:
 
 
 def workers_home() -> Path:
-    """Resolve the shared workers role without using this process's CODEX_HOME."""
-    path = Path.home() / ".claude" / "config" / "accounts.json"
-    try:
-        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return Path.home() / ".codex"
-    if not isinstance(decoded, dict):
-        raise ValueError(f"accounts: {path} must contain an object")
-    from scripts.accounts.worker_names import configuration
+    """Resolve only the authoritative workers account, never the caller's home."""
+    from scripts.accounts.role_map import read_role_map, RoleAccountUnavailable
 
-    values = configuration(cast(dict[str, object], decoded))
-    if "workers" not in values:
-        return Path.home() / ".codex"
-    label = values["workers"]
-    from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
-
+    label = read_role_map().workers
+    if not label:
+        raise RoleAccountUnavailable("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
     if label == "default":
-        return Path.home() / ".codex"
-    if not isinstance(label, str):
-        raise ValueError(f"accounts: {path} has an invalid workers account")
-    parsed = parse_account_label(label)
-    if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
-        raise ValueError(f"accounts: {path} has an invalid workers account")
-    return codex_account_home(label).home
+        # Read old explicit selections without inventing a missing selection.
+        label = codex_home_role_label(Path.home() / ".codex")
+    try:
+        selected = codex_account_home(label)
+    except ValueError as error:
+        raise RoleAccountUnavailable(str(error)) from error
+    if isinstance(selected, CodexHomeHoldingLogin):
+        return selected.home
+    state = "not logged in" if selected.home.is_dir() else "not set up"
+    step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
+            else f"run accounts.py setup {label}")
+    raise RoleAccountUnavailable(f"accounts: workers is on {label}, which is {state} on this machine; {step}")
+
+
+@dataclass(frozen=True)
+class NoWorkersHome:
+    reason: str
+
+
+def observe_workers_home() -> Path | NoWorkersHome:
+    """Observe a mapped home even when signed out; never choose a replacement."""
+    from scripts.accounts.role_map import read_role_map
+
+    try:
+        label = read_role_map().workers
+        if not label:
+            return NoWorkersHome("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
+        if label == "default":
+            label = codex_home_role_label(Path.home() / ".codex")
+        return codex_account_home(label).home
+    except ValueError as error:
+        return NoWorkersHome(str(error))
 
 
 def codex_home_display(home: Path) -> str:
@@ -538,7 +554,7 @@ def codex_home_display(home: Path) -> str:
     return f"~/{home.relative_to(user_home)}" if home.is_relative_to(user_home) else str(home)
 
 
-def codex_homes(workers_home: Path) -> list[Path]:
+def codex_homes(workers_home: Path | NoWorkersHome) -> list[Path]:
     """The default home, existing numbered homes, and any other home in use."""
     default = Path.home() / ".codex"
     numbered: list[tuple[int, Path]] = []
@@ -550,14 +566,14 @@ def codex_homes(workers_home: Path) -> list[Path]:
     except OSError:
         pass
     homes = [default, *(home for _, home in sorted(numbered))]
-    if workers_home not in homes:
+    if isinstance(workers_home, Path) and workers_home not in homes:
         homes.append(workers_home)
     return homes
 
 
-def codex_report_in_use(report: Report, workers_home: Path) -> bool:
+def codex_report_in_use(report: Report, workers_home: Path | NoWorkersHome) -> bool:
     """Select the workers' home; an older report without a source needs a single home."""
-    if report.tool.lower() != "codex":
+    if report.tool.lower() != "codex" or isinstance(workers_home, NoWorkersHome):
         return False
     if isinstance(report.source, CodexHomeSource):
         return report.source.home == workers_home
@@ -1015,7 +1031,7 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path) -> list[Report]:
+async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[Report]:
     """Live Claude directories and every Codex home, fetched concurrently."""
     homes = codex_homes(workers_home)
     directories = list(dict.fromkeys([

@@ -106,24 +106,11 @@ UNIT_CLEAR = (
 )
 
 
-def owner(
-    process: process_table.Process,
-    table: Mapping[int, process_table.Process],
-    names: Mapping[int, str],
-) -> str:
-    seen: set[int] = set()
-    current: process_table.Process | None = process
-    while current is not None and current.pid not in seen:
-        if current.pid in names:
-            return names[current.pid]
-        seen.add(current.pid)
-        current = table.get(current.parent)
-    return NO_SESSION
-
-
 def agent_counts(table: Mapping[int, process_table.Process], names: Mapping[int, str]) -> Counter[str]:
-    return Counter(owner(process, table, names) for process in table.values()
-                   if process_table.is_codex_agent(process))
+    return Counter(
+        NO_SESSION if (name := process_table.nearest_named(process, table, names)) is None else name
+        for process in table.values() if process_table.is_codex_agent(process)
+    )
 
 
 def current_counts() -> Counter[str]:

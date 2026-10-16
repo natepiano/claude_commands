@@ -44,7 +44,7 @@ PauseRecord(
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances and footers that this pause switched off.
 
-`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `delegate-*` status reports, `showrunner-*` dailies, `report-builds`, and later scheduled reports. A matching `showrunner-*` instance also identifies the production footer through `scripts/hooks/showrunner_footer.py`. The pause stops enabled instances with `notifier.sh stop` and turns those footers off.
+`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `delegate-*` status reports, `showrunner-*` dailies, and other scheduled reports. A matching `showrunner-*` instance also identifies the production footer through `scripts/hooks/showrunner_footer.py`. The pause stops enabled instances with `notifier.sh stop` and turns those footers off.
 
 `ensure_watcher()` creates or repairs the run-only `conversation-pause` notifier instance:
 

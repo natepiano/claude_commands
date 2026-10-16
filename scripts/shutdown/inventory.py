@@ -13,10 +13,10 @@ import stat
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib", "hooks"):
@@ -515,45 +515,9 @@ def _newest_unit_plans() -> dict[str, str]:
 def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         try:
-            command = subprocess.run(
-                ("ps", "-o", "command=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if command.returncode:
-                return {}
-            result = subprocess.run(
-                ("ps", "eww", "-o", "command=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if result.returncode:
-                return {}
-            confirmed_command = subprocess.run(
-                ("ps", "-o", "command=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            return herdr.darwin_process_environment(pid)
+        except (herdr.HerdrFailure, subprocess.TimeoutExpired):
             return {}
-        if confirmed_command.returncode or confirmed_command.stdout != command.stdout:
-            return {}
-        arguments = command.stdout.rstrip("\r\n").lstrip()
-        with_environment = result.stdout.rstrip("\r\n").lstrip()
-        if not arguments or not with_environment.startswith(arguments):
-            return {}
-        environment_text = with_environment[len(arguments):]
-        if environment_text and not environment_text[0].isspace():
-            return {}
-        tokens = environment_text.split()
-        pairs = (token.split("=", 1) for token in tokens if "=" in token)
-        return {name: value for name, value in pairs}
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
@@ -1180,7 +1144,189 @@ def _snapshot_stat(process: Path) -> tuple[str, int]:
         raise ObservationFailure(f"process liveness {process}: malformed stat") from error
 
 
+class _SnapshotProcesses:
+    """Strict Linux observations; absence and unreadability remain distinct."""
+
+    def __init__(self) -> None:
+        self.root: Path = Path(os.environ.get("HERDR_PROC", "/proc"))
+
+    def boot(self) -> str:
+        value = self.root.joinpath("sys/kernel/random/boot_id").read_text().strip()
+        if not value:
+            raise ObservationFailure("boot id is empty")
+        return value
+
+    def paths(self) -> list[Path]:
+        return [path for path in self.root.iterdir() if path.name.isdecimal()]
+
+    def path(self, pid: int) -> Path:
+        return self.root / str(pid)
+
+    def exists(self, process: Path) -> bool:
+        return process.exists()
+
+    def identity(self, process: Path) -> tuple[str, int]:
+        return _snapshot_stat(process)
+
+    def environment(self, process: Path) -> dict[str, str]:
+        return _snapshot_environment(process)
+
+    def command(self, process: Path) -> str:
+        return process.joinpath("comm").read_text().strip() if process.stat().st_uid == os.getuid() else ""
+
+    def arguments(self, process: Path) -> list[str]:
+        return [os.fsdecode(item) for item in process.joinpath("cmdline").read_bytes().split(b"\0") if item]
+
+    def cwd(self, process: Path) -> str:
+        return str(process.joinpath("cwd").resolve(strict=True))
+
+    def rollout(self, process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
+        return _codex_resume(process, home)
+
+    def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
+        found: dict[str, RecoveryHostProcess] = {}
+        for pid, name in herdr._live_server_processes(processes).items():  # pyright: ignore[reportPrivateUsage]
+            started, _ = self.identity(self.path(pid))
+            found[name] = RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
+        return found
+
+
+class _DarwinSnapshotProcesses(_SnapshotProcesses):
+    """One user-process observation, with native identity and file readers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.processes: dict[int, herdr._UserProcess] = {  # pyright: ignore[reportPrivateUsage]
+            process.pid: process for process in herdr._darwin_processes()}  # pyright: ignore[reportPrivateUsage]
+        self.identities: dict[int, tuple[str, int]] = {}
+
+    @override
+    def boot(self) -> str:
+        program = os.environ.get("SHUTDOWN_SYSCTL", "sysctl")
+        result = herdr.run_program([program, "-n", "kern.bootsessionuuid"])
+        herdr.require_success(result, "boot session uuid")
+        value = result.stdout.strip()
+        if not value:
+            raise ObservationFailure("boot session uuid is empty")
+        return value
+
+    @override
+    def paths(self) -> list[Path]:
+        return [Path(str(pid)) for pid in self.processes]
+
+    @override
+    def path(self, pid: int) -> Path:
+        return Path(str(pid))
+
+    @override
+    def exists(self, process: Path) -> bool:
+        return int(process.name) in self.processes
+
+    @override
+    def identity(self, process: Path) -> tuple[str, int]:
+        pid = int(process.name)
+        if pid not in self.processes:
+            raise FileNotFoundError(f"process {pid} is absent")
+        if pid not in self.identities:
+            self.identities[pid] = herdr.darwin_process_identity(pid)
+        return self.identities[pid]
+
+    @override
+    def environment(self, process: Path) -> dict[str, str]:
+        return herdr.darwin_process_environment(int(process.name))
+
+    @override
+    def command(self, process: Path) -> str:
+        return Path(self.processes[int(process.name)].executable).name
+
+    @override
+    def arguments(self, process: Path) -> list[str]:
+        arguments = self.processes[int(process.name)].arguments
+        if isinstance(arguments, herdr.UnreadableProcessArguments):
+            raise ObservationFailure(arguments.reason)
+        return list(arguments.argv)
+
+    @override
+    def cwd(self, process: Path) -> str:
+        cwd = herdr._darwin_process_cwd(int(process.name))  # pyright: ignore[reportPrivateUsage]
+        if isinstance(cwd, herdr.UnreadableCwd):
+            raise ObservationFailure(cwd.detail)
+        return cwd
+
+    @override
+    def rollout(self, process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
+        ids: set[str] = set()
+        for path in herdr.darwin_open_files(int(process.name)):
+            if path.is_relative_to(home / "sessions"):
+                match = _ROLLOUT_ID.fullmatch(path.name)
+                if match:
+                    ids.add(match[1].lower())
+        if len(ids) > 1:
+            raise ObservationFailure(f"Codex rollout {process}: more than one open session id")
+        return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
+
+    @override
+    def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
+        config = herdr._session_socket("default").parent  # pyright: ignore[reportPrivateUsage]
+        found: dict[str, RecoveryHostProcess] = {}
+        for listener in herdr._darwin_bound_sockets():  # pyright: ignore[reportPrivateUsage]
+            if listener.pid not in self.processes or listener.path.name != "herdr.sock":
+                continue
+            if listener.path == config / "herdr.sock":
+                name = "default"
+            elif listener.path.parent.parent == config / "sessions":
+                name = listener.path.parent.name
+            else:
+                continue
+            started, _ = self.identity(self.path(listener.pid))
+            if name in found and found[name]["pid"] != listener.pid:
+                raise ObservationFailure(f"herdr {name}: multiple socket holders")
+            found[name] = RecoveryHostProcess(kind="process", pid=listener.pid, proc_start=started)
+        return found
+
+    def terminal(self, pid: int, desktop: Desktop) -> tuple[SessionHost, RecoveryHostProcess | RecoveryHostUnrecorded]:
+        current, child = pid, 0
+        supervisor: SupervisorIdentity | NoSupervisor = NoSupervisor(kind="no supervisor")
+        parent = self.processes.get(self.processes[pid].parent)
+        if parent is not None and isinstance(parent.arguments, herdr.ReadProcessArguments) and any(
+                Path(argument).name == "relaunch.py" and
+                parent.arguments.argv[index + 1:index + 3] == ("run", "--")
+                for index, argument in enumerate(parent.arguments.argv)):
+            started, _ = self.identity(self.path(parent.pid))
+            supervisor = SupervisorIdentity(kind="supervisor", pid=parent.pid, proc_start=started)
+        seen: set[int] = set()
+        while current > 1 and current not in seen:
+            seen.add(current)
+            process = self.processes.get(current)
+            if process is None:
+                raise ObservationFailure(f"terminal ancestry {current}: process is missing")
+            kind = terminal_kind(process.executable)
+            if kind != "unknown":
+                started, _ = self.identity(self.path(current))
+                identity = RecoveryHostProcess(kind="process", pid=current, proc_start=started)
+                if (kind == "ghostty" or kind == "zed") and child:
+                    return WindowHost(kind=kind, window_shell=child, desktop=desktop,
+                        supervisor=supervisor if supervisor.get("pid") != child else NoSupervisor(kind="no supervisor")), identity
+                if kind == "terminal":
+                    if child and supervisor["kind"] == "supervisor" and supervisor["pid"] != child:
+                        return TerminalHost(kind="terminal", supervisor=supervisor), identity
+                    return TerminalHost(kind="terminal"), identity
+                return UnknownHost(kind="unknown"), identity
+            child, current = current, process.parent
+        return UnknownHost(kind="unknown"), RecoveryHostUnrecorded(kind="not recorded")
+
+
+def _snapshot_processes() -> _SnapshotProcesses:
+    return _DarwinSnapshotProcesses() if sys.platform == "darwin" else _SnapshotProcesses()
+
+
+def _snapshot_reads_tmux() -> bool:
+    return sys.platform != "darwin" or bool(os.environ.get("UNIT_LOOKUP_TMUX") or shutil.which("tmux"))
+
+
 def _snapshot_tmux_hosts() -> dict[str, TmuxHost]:
+    if not _snapshot_reads_tmux():
+        return {}
     found: dict[str, TmuxHost] = {}
     for _, panes in unit_lookup.tmux_sessions().values():
         for pane in panes:
@@ -1198,7 +1344,8 @@ class _SnapshotHosts:
     native: dict[int, herdr.HerdrPlace]
     presentation: dict[str, Literal["attached window", "detached"]]
     desktops: dict[str, str]
-    servers: dict[str, RecoveryHostProcess] = field(default_factory=dict)
+    servers: dict[str, RecoveryHostProcess]
+    reader: _SnapshotProcesses
 
 
 def _snapshot_native_hosts() -> tuple[dict[int, herdr.HerdrPlace], dict[str, Literal["attached window", "detached"]]]:
@@ -1227,12 +1374,14 @@ def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts
                          presentation=hosts.presentation[place.session])
     desktop: Desktop = (NamedDesktop(kind="named", name=hosts.desktops[session_id])
                         if session_id in hosts.desktops else DesktopNotInSnapshot(kind="not in snapshot"))
-    host = _terminal_host(pid, desktop)
-    return host
+    if isinstance(hosts.reader, _DarwinSnapshotProcesses):
+        return hosts.reader.terminal(pid, desktop)[0]
+    return _terminal_host(pid, desktop)
 
 
 def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
-    every = unit_lookup.every_marked_unit(every_host=True)
+    every = (unit_lookup.every_marked_unit(every_host=True) if _snapshot_reads_tmux() else
+             unit_lookup.every_marked_unit(every_host=True, include_tmux=False))
     if every.faults:
         raise ObservationFailure("production unit marks: " + "; ".join(f"{slug}: {detail}" for slug, detail in every.faults.items()))
     docs = {runner.slug: runner.doc for runner in timers.registrations}
@@ -1295,20 +1444,21 @@ def _codex_resume(process: Path, home: Path) -> CodexSessionId | CodexResumePick
 
 
 def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> dict[str, list[SnapshotSession]]:
+    reader = hosts.reader
     found: dict[str, list[SnapshotSession]] = {}
     homes: dict[str, Path] = {}
     for process in processes:
         try:
-            if process.stat().st_uid != os.getuid() or process.joinpath("comm").read_text().strip() != "codex":
+            if reader.command(process) != "codex":
                 continue
-            started, terminal = _snapshot_stat(process)
-            arguments = [os.fsdecode(item) for item in process.joinpath("cmdline").read_bytes().split(b"\0") if item]
+            started, terminal = reader.identity(process)
+            arguments = reader.arguments(process)
             if not terminal or not arguments or not _codex_interactive(arguments):
                 continue
-            environment = _snapshot_environment(process)
+            environment = reader.environment(process)
             home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
             try:
-                resume = _codex_resume(process, home)
+                resume = reader.rollout(process, home)
             except CodexDescriptorsUnreadable:
                 resume = CodexResumePicker(kind="picker")
             identity = resume["session_id"] if resume["kind"] == "session id" else f"codex-{process.name}-{started}"
@@ -1316,7 +1466,7 @@ def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> di
             if login in homes and homes[login] != home:
                 raise ObservationFailure(f"Codex home collision: {homes[login]} and {home}")
             homes[login] = home
-            cwd = str(process.joinpath("cwd").resolve(strict=True))
+            cwd = reader.cwd(process)
             owner = TopLevelSession(kind="top-level", session_id=identity, pid=int(process.name), proc_start=started,
                 name=f"codex-{process.name}", cwd=cwd, probe=False, status="unknown", updated_at=0,
                 model=NoReplyYet(kind="no reply yet"), checkout=_checkout(cwd), run_dirs=[], codex_servers=[], timers=[],
@@ -1324,7 +1474,7 @@ def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> di
             found.setdefault(login, []).append(SnapshotCodexSession(agent="codex", session=owner,
                 codex=CodexLaunch(home=str(home), resume=resume), workers=[], timers=[], last_seen=at, state="running"))
         except FileNotFoundError:
-            if process.exists():
+            if reader.exists(process):
                 raise ObservationFailure(f"Codex observation {process}: required process data is missing") from None
     return found
 
@@ -1332,6 +1482,7 @@ def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> di
 def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHostProcess | RecoveryHostUnrecorded:
     """Save the terminal process identity while its ancestry is still available."""
     host = owner["host"]
+    reader = hosts.reader
     if host["kind"] == "herdr":
         return hosts.servers.get(host["herdr_session"], RecoveryHostUnrecorded(kind="not recorded"))
     if host["kind"] == "unit" and host["session_host"] == "herdr":
@@ -1343,10 +1494,12 @@ def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHos
             host = matching
     if host["kind"] == "tmux" and host["server"]["kind"] == "server":
         pid = host["server"]["pid"]
-        started, _ = _snapshot_stat(Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid))
+        started, _ = reader.identity(reader.path(pid))
         return RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
     if host["kind"] not in {"ghostty", "zed", "terminal"}:
         return RecoveryHostUnrecorded(kind="not recorded")
+    if isinstance(reader, _DarwinSnapshotProcesses):
+        return reader.terminal(owner["pid"], DesktopNotInSnapshot(kind="not in snapshot"))[1]
     proc = Path(os.environ.get("HERDR_PROC", "/proc"))
     current = owner["pid"]
     seen: set[int] = set()
@@ -1356,12 +1509,12 @@ def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHos
         try:
             command = process.joinpath("comm").read_text().strip()
             if terminal_kind(command) != "unknown":
-                started, _ = _snapshot_stat(process)
+                started, _ = reader.identity(process)
                 return RecoveryHostProcess(kind="process", pid=current, proc_start=started)
             fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
             current = int(fields[1])
         except FileNotFoundError:
-            if process.exists():
+            if reader.exists(process):
                 raise ObservationFailure(f"host ancestry {process}: required process data is missing") from None
             break
         except (IndexError, ValueError) as error:
@@ -1373,7 +1526,7 @@ def _snapshot_gone_hosts(hosts: _SnapshotHosts, boot_id: str) -> frozenset[tuple
     """Positive host loss is distinct from an unavailable host identity."""
     from record import all_snapshots
     gone: set[tuple[str, str]] = set()
-    proc = Path(os.environ.get("HERDR_PROC", "/proc"))
+    reader = hosts.reader
     for saved in all_snapshots():
         for entry in saved["sessions"]:
             if entry.get("boot_id") != boot_id or entry["state"] == "unresolved":
@@ -1382,12 +1535,12 @@ def _snapshot_gone_hosts(hosts: _SnapshotHosts, boot_id: str) -> frozenset[tuple
             lost = False
             identity = entry.get("host_process", RecoveryHostUnrecorded(kind="not recorded"))
             if identity["kind"] == "process":
-                process = proc / str(identity["pid"])
+                process = reader.path(identity["pid"])
                 try:
-                    started, _ = _snapshot_stat(process)
+                    started, _ = reader.identity(process)
                     lost = started != identity["proc_start"]
                 except FileNotFoundError:
-                    if process.exists():
+                    if reader.exists(process):
                         raise ObservationFailure(f"host process {identity['pid']}: stat is missing") from None
                     lost = True
             elif host["kind"] == "herdr":
@@ -1405,23 +1558,22 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
     registry = sessions.read_registry()
     failures.extend(f"session registry: {path} is unreadable" for path in registry.unreadable)
     try:
-        proc = Path(os.environ.get("HERDR_PROC", "/proc"))
-        boot_id = proc.joinpath("sys/kernel/random/boot_id").read_text().strip()
-        if not boot_id:
-            raise ObservationFailure("boot id is empty")
+        reader = _snapshot_processes()
+        boot_id = reader.boot()
         home_state = account.home_account_state()
         timers = _snapshot_timers()
         units = _snapshot_units(timers)
         tmux = _snapshot_tmux_hosts()
         native, presentation = _snapshot_native_hosts()
         desktops = _snapshot_desktops(refresh=False)
-        processes = [path for path in proc.iterdir() if path.name.isdecimal()]
+        processes = reader.paths()
         # Socket ownership also distinguishes a replacement with the same session name.
-        servers: dict[str, RecoveryHostProcess] = {}
-        for pid, name in herdr._live_server_processes(processes).items():  # pyright: ignore[reportPrivateUsage]
-            started, _ = _snapshot_stat(proc / str(pid))
-            servers[name] = RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
-        hosts = _SnapshotHosts(tmux, native, presentation, desktops, servers)
+        servers = reader.servers(processes)
+        if isinstance(reader, _DarwinSnapshotProcesses):
+            missing = set(presentation) - servers.keys()
+            if missing:
+                raise ObservationFailure("herdr socket owners missing: " + ", ".join(sorted(missing)))
+        hosts = _SnapshotHosts(tmux, native, presentation, desktops, servers, reader)
         run_directories = _active_run_directories()
         ids = {item.record["sessionId"] for item in registry.entries}
         worker_owners = _worker_owners(run_directories, ids)
@@ -1435,15 +1587,17 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
     productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.registrations}
     for item in registry.entries:
         registered, details = item.record, item.details
-        process = proc / str(registered["pid"])
+        process = reader.path(registered["pid"])
         try:
-            started, _ = _snapshot_stat(process)
+            started, _ = reader.identity(process)
             if registered.get("procStart") and registered.get("procStart") != started:
                 continue  # A positively different process is no longer this session.
             if not registered.get("procStart"):
                 raise ObservationFailure(f"session {registered['sessionId']}: recorded process identity is missing")
             data = cast(SessionFile, cast(object, {**registered, **details}))
-            environment = _snapshot_environment(process)
+            if isinstance(reader, _DarwinSnapshotProcesses):
+                data["cwd"] = reader.cwd(process)
+            environment = reader.environment(process)
             configured = environment.get("CLAUDE_CONFIG_DIR", "")
             setting = account.ConfiguredClaudeFolder(Path(configured)) if configured else account.NoAccountSetting()
             configuration = _configuration_from_setting(setting, home_state)
@@ -1463,9 +1617,9 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
             by_login.setdefault(entry.login, []).append(owner)
             labels[entry.login] = attributed.label
         except FileNotFoundError as error:
-            if process.exists():
+            if reader.exists(process):
                 failures.append(f"session {registered['sessionId']}: {error}")
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             failures.append(f"session {registered['sessionId']}: {error}")
     snapshots: dict[str, list[SnapshotSession]] = {}
     all_owners = [owner for owners in by_login.values() for owner in owners]
@@ -1485,7 +1639,7 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
                 snapshots.setdefault(login, []).append(SnapshotClaudeSession(agent="claude", session=owner,
                     workers=workers, timers=_snapshot_timer_restores(owner, timers), last_seen=at, state="running",
                     boot_id=boot_id, host_process=_snapshot_host_process(owner, hosts)))
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                 failures.append(f"timer/pause intent {owner['session_id']}: {error}")
     try:
         for login, entries in _snapshot_codex(processes, hosts, at).items():
@@ -1494,7 +1648,7 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
                 item["host_process"] = _snapshot_host_process(item["session"], hosts)
             snapshots[login] = entries
             labels[login] = login
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         failures.append(f"Codex observation: {error}")
     return PartialInventory(tuple(failures)) if failures else CompleteInventory(_machine(), snapshots, labels, KnownBoot(boot_id), gone_hosts)
 
@@ -1516,32 +1670,32 @@ class CodexLivenessUnknown:
 
 def codex_liveness(entry: SnapshotCodexSession) -> CodexLive | CodexGone | CodexLivenessUnknown:
     """Check PID identity and rollout IDs independently of the saved account."""
-    proc = Path(os.environ.get("HERDR_PROC", "/proc"))
     try:
-        processes = [path for path in proc.iterdir() if path.name.isdecimal()]
-    except OSError as error:
+        reader = _snapshot_processes()
+        processes = reader.paths()
+    except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         return CodexLivenessUnknown(str(error))
     failure = ""
     for process in processes:
         try:
-            if process.stat().st_uid != os.getuid() or process.joinpath("comm").read_text().strip() != "codex":
+            if reader.command(process) != "codex":
                 continue
-            started, terminal = _snapshot_stat(process)
-            argv = [os.fsdecode(item) for item in process.joinpath("cmdline").read_bytes().split(b"\0") if item]
+            started, terminal = reader.identity(process)
+            argv = reader.arguments(process)
             if not terminal or not argv or not _codex_interactive(argv):
                 continue
             if int(process.name) == entry["session"]["pid"] and started == entry["session"]["proc_start"]:
                 return CodexLive(int(process.name))
             if entry["codex"]["resume"]["kind"] != "session id":
                 continue
-            environment = _snapshot_environment(process)
+            environment = reader.environment(process)
             home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
-            resume = _codex_resume(process, home)
+            resume = reader.rollout(process, home)
             if resume == entry["codex"]["resume"]:
                 return CodexLive(int(process.name))
         except FileNotFoundError as error:
-            if process.exists():
+            if reader.exists(process):
                 failure = str(error)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             failure = str(error)
     return CodexLivenessUnknown(failure) if failure else CodexGone()

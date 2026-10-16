@@ -79,7 +79,7 @@ import review
 from note_file import reset_time
 from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
-                            codex_homes, codex_live, workers_home)
+                            codex_homes, codex_live, observe_workers_home, NoWorkersHome)
 
 if TYPE_CHECKING:
     from ..notify.push_texts import RenderedPush
@@ -97,8 +97,8 @@ class CodexHomeReading:
 
 @dataclass(frozen=True)
 class CodexAlertPassReadings:
-    workers: CodexWorkersAccount
-    selected_account: agent_accounts.RefusingCodexAccount
+    workers: CodexWorkersAccount | NoWorkersHome
+    selected_account: agent_accounts.RefusingCodexAccount | NoWorkersHome
     checked_homes: tuple[CodexHomeReading, ...]
 
 
@@ -112,12 +112,14 @@ CODEX_READING_MAX_AGE = timedelta(minutes=10)
 UNKNOWN_REFUSAL_WINDOW = refusals.UnknownWindow()
 
 
-def codex_alert_pass(home: Path, reports: list[Report], observed_at: datetime) -> CodexAlertPassReadings:
+def codex_alert_pass(home: Path | NoWorkersHome, reports: list[Report], observed_at: datetime) -> CodexAlertPassReadings:
     from scripts.accounts.accounts import CodexWorkersAccount
 
-    label = agent_accounts.codex_home_role_label(home)
+    workers = (home if isinstance(home, NoWorkersHome)
+               else CodexWorkersAccount(agent_accounts.codex_home_role_label(home), home))
+    identity = home if isinstance(home, NoWorkersHome) else agent_accounts.codex_account(home)
     return CodexAlertPassReadings(
-        CodexWorkersAccount(label, home), agent_accounts.codex_account(home),
+        workers, identity,
         tuple(CodexHomeReading(report.source.home, copy.deepcopy(report), observed_at)
               for report in reports if isinstance(report.source, CodexHomeSource)),
     )
@@ -126,7 +128,7 @@ def codex_alert_pass(home: Path, reports: list[Report], observed_at: datetime) -
 def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadings) -> CodexAlertPassReadings:
     if isinstance(value, CodexAlertPassReadings):
         return value
-    home = workers_home()
+    home = observe_workers_home()
     async def collect() -> list[Report]:
         return list(await asyncio.gather(*(codex_live(folder) for folder in codex_homes(home)
                                           if folder.is_dir() and codex_email_on_disk(folder))))
@@ -135,7 +137,7 @@ def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadi
 
 def selected_codex_report(readings: CodexAlertPassReadings, now: datetime) -> Report:
     identity = readings.selected_account
-    if isinstance(identity, agent_accounts.KnownCodexAccount):
+    if isinstance(identity, agent_accounts.KnownCodexAccount) and not isinstance(readings.workers, NoWorkersHome):
         for checked in readings.checked_homes:
             if (checked.home == readings.workers.home and checked.home == identity.home
                     and checked.report.email and checked.report.email.casefold() == identity.login.casefold()
@@ -148,6 +150,8 @@ def codex_swap_line(readings: CodexAlertPassReadings, now: datetime) -> str:
     """Describe the refusal destination without asking the user to swap workers."""
     from scripts.accounts import accounts
 
+    if isinstance(readings.workers, NoWorkersHome):
+        return readings.workers.reason
     chosen = accounts.pick("codex", now, exclude=frozenset({readings.workers.label}), keep=accounts.NoKeep())
     if isinstance(chosen, accounts.PickedAccount):
         return f"workers move to {chosen.label} when Codex refuses work"
@@ -801,6 +805,8 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
 
 def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -> CodexFallbackRestoration:
     """Restore owed assignments when the selected account can work on allowance or credits."""
+    if isinstance(readings.workers, NoWorkersHome):
+        return NoCodexFallbackRestoration()
     _finish_workers_transitions(now)
     _room_again(now)
     fallback = state["fallback"]
@@ -850,6 +856,8 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
         refusal = refusals.load().get(refusals.key("codex", selected.login))
         if refusal is not None and not refusals.resolved(refusal, _reading_for_account(readings, selected, now), now):
             return NoCodexFallbackRestoration()
+    if isinstance(readings.workers, NoWorkersHome):
+        return NoCodexFallbackRestoration()
     if isinstance(fallback, NoCodexQuotaFallback) or not isinstance(
             codex_can_work(selected_codex_report(readings, now), now, agent_accounts.codex_credits_setting(readings.workers.label)), CodexWorkAvailable):
         return NoCodexFallbackRestoration()
@@ -1582,7 +1590,7 @@ def _low_codex_notes(notes: list[AgentNote], threshold: float,
                      readings: CodexAlertPassReadings, now: datetime) -> list[AgentNote]:
     identity = readings.selected_account
     report = selected_codex_report(readings, now)
-    if isinstance(identity, agent_accounts.UnknownCodexAccount) or report.problem:
+    if not isinstance(identity, agent_accounts.KnownCodexAccount) or report.problem:
         return []
     left, reset = report.weekly_remaining, report.weekly_reset
     if left is None or not math.isfinite(left) or not 0 < left <= threshold or reset is None or reset.tzinfo is None or reset <= now:
@@ -1668,8 +1676,9 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
         owns_role = (current_workers.home == refusing_account.home
                      and isinstance(selected, agent_accounts.KnownCodexAccount) and selected.home == refusing_account.home
                      and selected.login.casefold() == refusing_account.login.casefold()
+                     and not isinstance(readings.workers, NoWorkersHome)
                      and selected.home == readings.workers.home)
-        if owns_role:
+        if owns_role and not isinstance(readings.workers, NoWorkersHome):
             entries = moves.read_moves()
             if (isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
                     and isinstance(reset, refusals.KnownReset) and timedelta(0) < reset.at - now < timedelta(minutes=20)):

@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import change_review
-from add_unit import Production, Refusal, cell_value, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, unit_table
 
 
 class ValidateAndPush(NamedTuple):

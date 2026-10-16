@@ -77,11 +77,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.lib import unit_runs
-from scripts.message import sessions
+from scripts.message import sessions, process_table
+from scripts.whoami import account
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
     workers_home, codex_home, codex_home_display, user_zone,
@@ -1644,14 +1646,21 @@ def _elapsed_secs(text: str) -> float | None:
     return float(seconds + int(days or "0") * 86400)
 
 
+def _list_process_elapsed(pid: int) -> str:
+    return _cleanup_command(("ps", "-o", "etime=", "-p", str(pid)))
+
+
 def _server_started_at(pid: int) -> float | None:
     """When the process started. `ps -o etime` reads the same on Linux and macOS."""
     try:
-        listed = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, check=False)
-    except OSError:
+        elapsed = _elapsed_secs(_list_process_elapsed(pid))
+    except OSError as error:
+        print(f"codex_mesh: cannot read app-server {pid} start time ({error}); kept", file=sys.stderr)
         return None
-    elapsed = _elapsed_secs(listed.stdout)
-    return None if elapsed is None else time.time() - elapsed
+    if elapsed is None:
+        print(f"codex_mesh: ps -o etime= -p {pid}: unreadable elapsed time; kept", file=sys.stderr)
+        return None
+    return time.time() - elapsed
 
 
 def _holds_old_sign_in(pid: int, home: Path) -> bool:
@@ -3329,6 +3338,7 @@ def _release_other_worker_writers(
     return _ReleasedWorkerThread()
 
 
+@role_map_command
 def _move_resident(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
     *, message: str = "",
@@ -4008,12 +4018,18 @@ class UnownedServerWithoutLog:
     """No record or mesh log handle identifies this server's run."""
 
 
-ServerOwnership = (
+@dataclass(frozen=True)
+class UnreadServerOwnership:
+    reason: str
+
+
+KnownServerOwnership = (
     CurrentRunServer
     | RetiredRunServer
     | UnownedServerWithLog
     | UnownedServerWithoutLog
 )
+ServerOwnership = KnownServerOwnership | UnreadServerOwnership
 
 
 @dataclass(frozen=True)
@@ -4048,7 +4064,7 @@ class ServerFacts:
     port: int
     age_secs: float
     clients: int
-    ownership: ServerOwnership
+    ownership: KnownServerOwnership
     folder_exists: bool
     run_lifecycle: RunLifecycle
     # Workers in the run folder's roster whose launcher process is alive.
@@ -4106,11 +4122,50 @@ def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...
     return ServerUnused(f"no client, no launcher, no active marker, no conversation mid-turn, {folder}")
 
 
-def _running_servers() -> list[tuple[int, int, float]]:
+def _cleanup_command(arguments: tuple[str, ...], *, empty_selection: bool = False) -> str:
+    """Read a command without including its potentially private output in a failure."""
+    command = shlex.join(arguments)
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise OSError(f"{command}: command unavailable") from error
+    if result.returncode == 0 and not result.stderr.strip():
+        return result.stdout
+    if empty_selection and result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+        return ""
+    raise OSError(f"{command}: command failed (exit {result.returncode})")
+
+
+def _list_server_processes() -> str:
+    fields = "pid=,etime=,args=" if sys.platform == "darwin" else "pid=,etimes=,args="
+    return _cleanup_command(("ps", "-eo", fields))
+
+
+def _list_established_connections() -> str:
+    if sys.platform == "darwin":
+        return _cleanup_command(("lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"), empty_selection=True)
+    return _cleanup_command(("ss", "-Htn", "state", "established"))
+
+
+def _list_server_stderr(pid: int) -> str:
+    return _cleanup_command(("lsof", "-p", str(pid), "-a", "-d", "2", "-Fn"), empty_selection=True)
+
+
+def _server_owned_by_user(pid: int) -> bool:
+    output = _cleanup_command(("ps", "-p", str(pid), "-o", "uid="))
+    return output.strip() == str(os.getuid())
+
+
+class WebSocketServer(NamedTuple):
+    pid: int
+    port: int
+    age_secs: float
+
+
+def _running_servers() -> list[WebSocketServer]:
     """(pid, WebSocket port, age in seconds) for each standalone app-server."""
-    listed = subprocess.run(["ps", "-eo", "pid=,etimes=,args="], capture_output=True, text=True, check=True)
-    servers: list[tuple[int, int, float]] = []
-    for line in listed.stdout.splitlines():
+    servers: list[WebSocketServer] = []
+    for line in _list_server_processes().splitlines():
         fields = line.split(None, 2)
         if len(fields) < 3:
             continue
@@ -4128,32 +4183,458 @@ def _running_servers() -> list[tuple[int, int, float]]:
         if not address.startswith("ws://"):
             continue
         port = address.rpartition(":")[2]
-        if port.isdigit() and fields[0].isdigit() and fields[1].isdigit():
-            servers.append((int(fields[0]), int(port), float(fields[1])))
+        if port.isdigit() and fields[0].isdigit():
+            try:
+                if _application_codex(str(_process_executable(int(fields[0])))):
+                    continue
+            except OSError:
+                # Retain the candidate: _judge reports why it cannot be stopped.
+                pass
+            if sys.platform == "darwin":
+                elapsed = _elapsed_secs(fields[1])
+                if elapsed is None:
+                    raise OSError("ps -eo pid=,etime=,args=: unreadable elapsed time")
+                age = elapsed
+            elif fields[1].isdigit():
+                age = float(fields[1])
+            else:
+                continue
+            servers.append(WebSocketServer(int(fields[0]), int(port), age))
     return servers
 
 
 def _client_counts() -> dict[int, int]:
-    """Established connections per local port. A server's clients land on its own port."""
-    listed = subprocess.run(["ss", "-Htn", "state", "established"], capture_output=True, text=True, check=True)
+    """Established connections per local port. Never substitute zero for a failed command."""
     counts: dict[int, int] = {}
-    for line in listed.stdout.splitlines():
+    for line in _list_established_connections().splitlines():
         fields = line.split()
-        port = fields[2].rpartition(":")[2] if len(fields) >= 4 else ""
+        if sys.platform == "darwin":
+            if fields[:1] == ["COMMAND"]:
+                continue
+            address = next((part for part in fields if "->" in part), "")
+            if not address:
+                raise OSError("lsof -nP -iTCP -sTCP:ESTABLISHED: unreadable connection")
+            port = address.partition("->")[0].rpartition(":")[2]
+        else:
+            port = fields[2].rpartition(":")[2] if len(fields) >= 4 else ""
         if port.isdigit():
             counts[int(port)] = counts.get(int(port), 0) + 1
+        elif sys.platform == "darwin":
+            raise OSError("lsof -nP -iTCP -sTCP:ESTABLISHED: unreadable local port")
     return counts
 
 
-def _server_folder(pid: int) -> Path | None:
-    """The run folder that started this server: `ensure_server` points its stderr at that folder's
-    log, and the handle outlives a rewritten record or a deleted folder. None when it names no such log."""
+@dataclass(frozen=True)
+class MeshServerLog:
+    folder: Path
+
+
+@dataclass(frozen=True)
+class NonMeshServerStderr:
+    """The stderr handle was read and does not name a mesh log."""
+
+
+@dataclass(frozen=True)
+class UnreadServerStderr:
+    reason: str
+
+
+ServerStderr = MeshServerLog | NonMeshServerStderr | UnreadServerStderr
+
+
+def _server_folder(pid: int) -> ServerStderr:
+    """Read stderr without erasing the distinction between no mesh log and no evidence."""
     try:
-        target = os.readlink(f"/proc/{pid}/fd/2")
-    except OSError:
-        return None
+        if sys.platform == "darwin":
+            output = _list_server_stderr(pid)
+            targets = [line[1:] for line in output.splitlines() if line.startswith("n")]
+            if not targets:
+                if not _server_owned_by_user(pid):
+                    return UnreadServerStderr("lsof: stderr unavailable; process ownership could not be confirmed")
+                return NonMeshServerStderr()
+            target = targets[0]
+        else:
+            target = os.readlink(f"/proc/{pid}/fd/2")
+    except OSError as error:
+        command = "lsof" if sys.platform == "darwin" else f"/proc/{pid}/fd/2"
+        return UnreadServerStderr(f"{command}: stderr log could not be read ({error})")
     log = Path(target.removesuffix(" (deleted)"))
-    return log.parent if log.name == SERVER_LOG else None
+    return MeshServerLog(log.parent) if log.name == SERVER_LOG else NonMeshServerStderr()
+
+
+def _application_codex(executable: str) -> bool:
+    return any(part.endswith(".app") and following == "Contents"
+               for part, following in zip(Path(executable).parts, Path(executable).parts[1:]))
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    started: str
+    arguments: tuple[str, ...]
+    executable: Path
+
+
+@dataclass(frozen=True)
+class CodexDaemon(ProcessIdentity):
+    """An executable-backed identity whose argv selects app-server daemon."""
+
+
+@dataclass(frozen=True)
+class UnclassifiedCodexProcess(ProcessIdentity):
+    """A readable process identity that is not an app-server daemon."""
+
+
+@dataclass(frozen=True)
+class UnreadCodexProcess:
+    pid: int
+    reason: str
+
+
+DaemonTarget = CodexDaemon | UnclassifiedCodexProcess | UnreadCodexProcess
+
+
+@dataclass(frozen=True)
+class FamilyProcess:
+    parent: int
+    identity: ProcessIdentity | UnreadCodexProcess
+
+
+def _list_codex_processes() -> str:
+    name = "ucomm=" if sys.platform == "darwin" else "comm="
+    return _cleanup_command(("ps", "-u", str(os.getuid()), "-o", f"pid=,{name}"))
+
+
+def _process_executable(pid: int) -> Path:
+    """Read the executable path independently of the caller-controlled argv[0]."""
+    if sys.platform == "darwin":
+        record = account.mac_process_record(pid)
+        if isinstance(record, account.ProcessEnvironmentUnread):
+            raise OSError("kernel executable path could not be read")
+        return record.executable
+    return Path(os.readlink(f"/proc/{pid}/exe"))
+
+
+def _process_identity(pid: int) -> ProcessIdentity | UnreadCodexProcess:
+    before = sessions.process_start(pid)
+    try:
+        if sys.platform == "darwin":
+            record = account.mac_process_record(pid)
+            if isinstance(record, account.ProcessEnvironmentUnread):
+                return UnreadCodexProcess(pid, "process argument record could not be read")
+            arguments, executable = record.arguments, record.executable
+        else:
+            arguments = tuple(os.fsdecode(part) for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part)
+            executable = _process_executable(pid)
+    except OSError:
+        return UnreadCodexProcess(pid, "process arguments or executable path could not be read")
+    after = sessions.process_start(pid)
+    if not before or before != after or not arguments or not executable.is_absolute():
+        return UnreadCodexProcess(pid, "process start, arguments or executable path could not be read consistently")
+    return ProcessIdentity(pid, before, arguments, executable)
+
+
+def _is_standalone_daemon(target: ProcessIdentity) -> bool:
+    arguments = target.arguments
+    if target.executable.name != "codex" or _application_codex(str(target.executable)):
+        return False
+    index = 1
+    while index < len(arguments):
+        option = arguments[index]
+        if option in ("-c", "--config", "--enable", "--disable"):
+            index += 2
+        elif option.startswith(("--config=", "--enable=", "--disable=")):
+            index += 1
+        else:
+            break
+    return arguments[index:index + 2] == ("app-server", "daemon")
+
+
+def _daemon_record(pid: int) -> DaemonTarget:
+    identity = _process_identity(pid)
+    if isinstance(identity, UnreadCodexProcess):
+        return identity
+    kind = CodexDaemon if _is_standalone_daemon(identity) else UnclassifiedCodexProcess
+    return kind(identity.pid, identity.started, identity.arguments, identity.executable)
+
+
+def _running_daemons() -> list[DaemonTarget]:
+    targets: list[DaemonTarget] = []
+    for line in _list_codex_processes().splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or not fields[0].isdigit() or fields[1].strip() != "codex":
+            continue
+        target = _daemon_record(int(fields[0]))
+        if isinstance(target, (UnreadCodexProcess, CodexDaemon)):
+            targets.append(target)
+    return targets
+
+
+def _process_cleanup_verdict(target: ProcessIdentity) -> SweepVerdict:
+    if _application_codex(str(target.executable)):
+        return ServerInUse("executable belongs to an application bundle")
+    setting = account.process_codex_home(target.pid)
+    if isinstance(setting, account.ProcessEnvironmentUnread):
+        return ServerInUse("process environment could not be read")
+    home = Path.home() / ".codex"
+    if isinstance(setting, account.ProcessCodexHome) and setting.home != home:
+        return ServerInUse("daemon uses another Codex home")
+    try:
+        _ = (home / "auth.json").lstat()
+    except FileNotFoundError:
+        return ServerUnused("~/.codex/auth.json is absent; shared home has no login")
+    except OSError:
+        return ServerInUse("cannot establish whether ~/.codex/auth.json is absent")
+    return ServerInUse("~/.codex/auth.json exists; shared home may hold a login")
+
+
+def _daemon_verdict(target: DaemonTarget) -> SweepVerdict:
+    if isinstance(target, UnreadCodexProcess):
+        return ServerInUse(target.reason)
+    if not isinstance(target, CodexDaemon) or not _is_standalone_daemon(target):
+        return ServerInUse("not a standalone Codex app-server daemon")
+    return _process_cleanup_verdict(target)
+
+
+def _daemon_process_tree() -> dict[int, FamilyProcess]:
+    """Bind identity evidence to a verified ancestry snapshot before returning it.
+
+    Read identities before the authoritative second table. A pid newly appearing or
+    changing its parent/command between tables has no trusted snapshot identity.
+    """
+    before = process_table.snapshot()
+    identities = {pid: _process_identity(pid) for pid in before}
+    table = process_table.snapshot()
+    result: dict[int, FamilyProcess] = {}
+    for pid, process in table.items():
+        identity = identities.get(pid, UnreadCodexProcess(pid, "process appeared during family snapshot"))
+        if before.get(pid) != process or _process_identity(pid) != identity:
+            identity = UnreadCodexProcess(pid, "process changed during family snapshot")
+        result[pid] = FamilyProcess(process.parent, identity)
+    return result
+
+
+def _family_members(table: dict[int, FamilyProcess], parent: int) -> list[FamilyProcess]:
+    pending, seen = [parent], {parent}
+    members: list[FamilyProcess] = []
+    while pending:
+        current = pending.pop(0)
+        for pid, process in table.items():
+            if process.parent == current and pid not in seen:
+                seen.add(pid)
+                members.append(process)
+                pending.append(pid)
+    return members
+
+
+def _identity_matches(target: ProcessIdentity) -> bool:
+    current = _process_identity(target.pid)
+    return (isinstance(current, ProcessIdentity)
+            and (current.pid, current.started, current.arguments, current.executable)
+            == (target.pid, target.started, target.arguments, target.executable))
+
+
+class ProcessRunState(Enum):
+    RUNNING = "running"
+    STOPPED = "stopped"
+    GONE = "gone"
+
+
+class DaemonFreezeRefused(Exception):
+    def __init__(self, pid: int, reason: str) -> None:
+        super().__init__(reason)
+        self.pid: int = pid
+        self.reason: str = reason
+
+
+def _daemon_process_state(pid: int) -> ProcessRunState:
+    """Read kernel scheduling state; zombies no longer execute or fork."""
+    if sys.platform == "darwin":
+        state = _cleanup_command(("ps", "-p", str(pid), "-o", "stat="), empty_selection=True).strip()
+        if not state:
+            return ProcessRunState.GONE
+    else:
+        try:
+            record = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            return ProcessRunState.GONE
+        closing = record.rfind(")")
+        fields = record[closing + 1:].split()
+        if closing < 0 or not fields:
+            raise OSError("process scheduling state could not be read")
+        state = fields[0]
+    if state[0] in ("Z", "X"):
+        return ProcessRunState.GONE
+    if state[0] == "T":
+        return ProcessRunState.STOPPED
+    if state[0] not in "RSDIUtWPN":
+        raise OSError("process scheduling state could not be read")
+    return ProcessRunState.RUNNING
+
+
+def _signal_daemon_process(target: ProcessIdentity, signum: int) -> bool:
+    """Never signal a pid without rechecking its captured identity."""
+    try:
+        if not _identity_matches(target):
+            return False
+        os.kill(target.pid, signum)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class FrozenDaemonMember:
+    identity: ProcessIdentity
+    stopped_by_cleanup: bool
+
+
+def _freeze_daemon_process(target: ProcessIdentity, frozen: list[FrozenDaemonMember]) -> None:
+    unconfirmed = "member exited before the family was frozen; family absence is unconfirmed"
+    initial_state = _daemon_process_state(target.pid)
+    if initial_state is ProcessRunState.GONE:
+        raise DaemonFreezeRefused(target.pid, unconfirmed)
+    if initial_state is ProcessRunState.STOPPED:
+        if not _identity_matches(target):
+            raise DaemonFreezeRefused(target.pid, "member identity changed while freezing")
+        frozen.append(FrozenDaemonMember(target, stopped_by_cleanup=False))
+        return
+    if not _signal_daemon_process(target, signal.SIGSTOP):
+        reason = unconfirmed if _daemon_process_state(target.pid) is ProcessRunState.GONE else "member identity changed or SIGSTOP failed"
+        raise DaemonFreezeRefused(target.pid, reason)
+    # Record our STOP before any further reads, so even a failed read rolls back.
+    frozen.append(FrozenDaemonMember(target, stopped_by_cleanup=True))
+    deadline = time.monotonic() + REAP_WAIT_SECS
+    while True:
+        state = _daemon_process_state(target.pid)
+        if state is ProcessRunState.GONE:
+            raise DaemonFreezeRefused(target.pid, unconfirmed)
+        if not _identity_matches(target):
+            raise DaemonFreezeRefused(target.pid, "member identity changed while freezing")
+        if state is ProcessRunState.STOPPED:
+            return
+        if time.monotonic() >= deadline:
+            raise DaemonFreezeRefused(target.pid, "SIGSTOP was not confirmed")
+        time.sleep(REAP_POLL_SECS)
+
+
+def _resume_daemon_family(frozen: list[FrozenDaemonMember]) -> None:
+    for member in reversed(frozen):
+        if not member.stopped_by_cleanup:
+            continue
+        identity = member.identity
+        try:
+            if _daemon_process_state(identity.pid) is ProcessRunState.GONE:
+                continue
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Scheduling state is not needed to identify a surviving process.
+            pass
+        try:
+            if sessions.process_start(identity.pid) != identity.started:
+                _ = _family_kept(identity.pid, "process start could not be confirmed; may still be stopped")
+                continue
+            # A stopped process retains its pid. Its start time is enough for
+            # rollback even when its argv or executable can no longer be read.
+            os.kill(identity.pid, signal.SIGCONT)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            _ = _family_kept(identity.pid, "could not resume family member; may still be stopped")
+
+
+def _daemon_identity_gone(target: ProcessIdentity) -> bool:
+    try:
+        if _daemon_process_state(target.pid) is ProcessRunState.GONE:
+            return True
+        current = _process_identity(target.pid)
+        return isinstance(current, ProcessIdentity) and (
+            current.started, current.arguments, current.executable
+        ) != (target.started, target.arguments, target.executable)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _family_kept(pid: int, reason: str) -> bool:
+    print(f"codex_mesh: daemon family not stopped: pid {pid}: {reason}", file=sys.stderr)
+    return False
+
+
+def _stop_daemon(target: DaemonTarget) -> bool:
+    """Freeze a fixed family before killing it, and release survivors on failure."""
+    if not isinstance(target, CodexDaemon):
+        return False
+    frozen: list[FrozenDaemonMember] = []
+    try:
+        table = _daemon_process_tree()
+        root = table.get(target.pid)
+        if root is None or isinstance(root.identity, UnreadCodexProcess) or not _identity_matches(target):
+            return _family_kept(target.pid, "parent identity could not be confirmed")
+        if (root.identity.started, root.identity.arguments, root.identity.executable) != (
+                target.started, target.arguments, target.executable):
+            return _family_kept(target.pid, "parent identity changed")
+        # Remember every seen member before stopping the parent. Reparenting
+        # never removes a member from this identity ledger.
+        tracked = {target.pid: root}
+        for member in _family_members(table, target.pid):
+            tracked[member.identity.pid] = member
+        deadline = time.monotonic() + REAP_WAIT_SECS
+        while True:
+            for member in list(tracked.values())[len(frozen):]:
+                identity = member.identity
+                if isinstance(identity, UnreadCodexProcess):
+                    raise DaemonFreezeRefused(identity.pid, identity.reason)
+                # An excluded process is never signalled, not even by STOP.
+                verdict = _process_cleanup_verdict(identity)
+                if isinstance(verdict, ServerInUse):
+                    raise DaemonFreezeRefused(identity.pid, verdict.reason)
+                _freeze_daemon_process(identity, frozen)
+            table = _daemon_process_tree()
+            added = False
+            for pid in list(tracked):
+                for member in _family_members(table, pid):
+                    if member.identity.pid not in tracked:
+                        tracked[member.identity.pid] = member
+                        added = True
+            for frozen_member in frozen:
+                member = frozen_member.identity
+                if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
+                    raise DaemonFreezeRefused(member.pid, "member exited before the family was frozen; family absence is unconfirmed")
+                if not _identity_matches(member):
+                    raise DaemonFreezeRefused(member.pid, "member identity changed while freezing")
+            if not added:
+                break
+            if time.monotonic() >= deadline:
+                raise DaemonFreezeRefused(target.pid, "family could not be frozen before the deadline")
+        # A frozen member cannot fork or exit. Validate every exclusion only
+        # after the family reaches this fixed point, before sending any KILL.
+        for frozen_member in frozen:
+            member = frozen_member.identity
+            verdict = _process_cleanup_verdict(member)
+            if isinstance(verdict, ServerInUse):
+                raise DaemonFreezeRefused(member.pid, verdict.reason)
+        for frozen_member in reversed(frozen):
+            member = frozen_member.identity
+            if not isinstance(_daemon_verdict(target), ServerUnused) or not _identity_matches(target):
+                raise DaemonFreezeRefused(target.pid, "parent identity or login changed")
+            if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
+                raise DaemonFreezeRefused(member.pid, "member is no longer frozen")
+            verdict = _process_cleanup_verdict(member)
+            if isinstance(verdict, ServerInUse):
+                raise DaemonFreezeRefused(member.pid, verdict.reason)
+            if not _signal_daemon_process(member, signal.SIGKILL):
+                raise DaemonFreezeRefused(member.pid, "frozen member identity changed or SIGKILL failed")
+        deadline = time.monotonic() + REAP_WAIT_SECS
+        while True:
+            remaining = [member.identity for member in frozen if not _daemon_identity_gone(member.identity)]
+            if not remaining:
+                return True
+            if time.monotonic() >= deadline:
+                return _family_kept(remaining[0].pid, "family member remains after shutdown")
+            time.sleep(REAP_POLL_SECS)
+    except DaemonFreezeRefused as error:
+        return _family_kept(error.pid, error.reason)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return _family_kept(target.pid, "process family could not be read")
+    finally:
+        _resume_daemon_family(frozen)
 
 
 def _record_names_server(record: dict[str, object], pid: int, port: int) -> bool:
@@ -4167,11 +4648,11 @@ def _retired_file_names_server(path: Path, pid: int, port: int) -> bool:
 
 
 def _server_ownership(
-    roots: tuple[Path, ...] | None, pid: int, port: int, log_folder: Path | None
-) -> ServerOwnership:
+    roots: tuple[Path, ...] | None, pid: int, port: int, stderr: MeshServerLog | NonMeshServerStderr
+) -> KnownServerOwnership:
     """Resolve the record that owns a server; a live current owner wins stale duplicates."""
     if roots is None:
-        folders = (log_folder,) if log_folder is not None else ()
+        folders = (stderr.folder,) if isinstance(stderr, MeshServerLog) else ()
     else:
         current_folders = {path.parent for root in roots for path in root.glob(f"*/{SERVER_FILE}")}
         retired_folders = {path.parent for root in roots for path in root.glob(f"*/{RETIRED_FILE}")}
@@ -4196,8 +4677,8 @@ def _server_ownership(
             return RetiredRunServer(folder)
     if current_owners:
         return CurrentRunServer(current_owners[0])
-    if log_folder is not None:
-        return UnownedServerWithLog(log_folder)
+    if isinstance(stderr, MeshServerLog):
+        return UnownedServerWithLog(stderr.folder)
     return UnownedServerWithoutLog()
 
 
@@ -4295,8 +4776,18 @@ def _judge(roots: tuple[Path, ...] | None, pid: int, port: int, age: float,
     `roots` hold the run-active markers. A server judging itself passes None: a stopped server
     comes back at the next use, so a run that is only between dispatches does not need it kept.
     """
-    log_folder = _server_folder(pid)
-    ownership = _server_ownership(roots, pid, port, log_folder)
+    try:
+        executable = _process_executable(pid)
+        if _application_codex(str(executable)):
+            reason = "executable belongs to an application bundle"
+            return SweepJudgment(ServerInUse(reason), UnreadServerOwnership(reason))
+    except OSError:
+        reason = "process executable path could not be read"
+        return SweepJudgment(ServerInUse(reason), UnreadServerOwnership(reason))
+    stderr = _server_folder(pid)
+    if isinstance(stderr, UnreadServerStderr):
+        return SweepJudgment(ServerInUse(stderr.reason), UnreadServerOwnership(stderr.reason))
+    ownership = _server_ownership(roots, pid, port, stderr)
     folder = None if isinstance(ownership, UnownedServerWithoutLog) else ownership.session_dir
     exists = folder is not None and folder.is_dir()
     lifecycle: RunLifecycle = UncheckedRunLifecycle() if roots is None or folder is None else CheckedRunLifecycle(
@@ -4324,6 +4815,8 @@ def _stop_unused(
     launcher to wait and is not created again for the lock."""
     if isinstance(ownership, UnownedServerWithoutLog):
         return _stop_unused_with_lock_held(roots, pid, port)
+    if not isinstance(ownership, (CurrentRunServer, RetiredRunServer, UnownedServerWithLog)):
+        return False
     folder = ownership.session_dir
     if not folder.is_dir():
         return _stop_unused_with_lock_held(roots, pid, port)
@@ -4336,7 +4829,8 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
     try:
         running = {(found, at): age for found, at, age in _running_servers()}
         clients = _client_counts()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"codex_mesh: cleanup: cannot judge app-server {pid} ({error}); kept", file=sys.stderr)
         return False
     # A pid that no longer runs this server on this port is not the process that was judged.
     age = running.get((pid, port))
@@ -4347,7 +4841,10 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
         return False
     if isinstance(judgment.ownership, UnownedServerWithoutLog):
         return True
-    folder = judgment.ownership.session_dir
+    ownership = judgment.ownership
+    if not isinstance(ownership, (CurrentRunServer, RetiredRunServer, UnownedServerWithLog)):
+        return False
+    folder = ownership.session_dir
     if folder.is_dir():
         _forget_retired(folder, pid)
         record = folder / SERVER_FILE
@@ -4369,13 +4866,16 @@ def command_idle_stop(args: argparse.Namespace) -> int:
     try:
         running = {(found, at): age for found, at, age in _running_servers()}
         clients = _client_counts()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"codex_mesh: idle-stop: cannot judge app-server {pid} ({error}); kept", file=sys.stderr)
         running, clients = None, {}
     if running is not None:
         age = running.get((pid, port))
         if age is None:
             return 0
         judgment = _judge(None, pid, port, age, clients.get(port, 0))
+        if isinstance(judgment.verdict, ServerInUse):
+            print(f"codex_mesh: idle-stop: kept app-server {pid}: {judgment.verdict.reason}")
         if isinstance(judgment.verdict, ServerUnused) and _stop_unused(
             None, pid, port, judgment.ownership
         ):
@@ -4406,7 +4906,7 @@ def command_sweep(args: argparse.Namespace) -> int:
     roots = _sweep_roots(args)
     stop = _attr(args, "stop") is True
     try:
-        servers, clients = _running_servers(), _client_counts()
+        servers, clients, daemons = _running_servers(), _client_counts(), _running_daemons()
     except (OSError, subprocess.CalledProcessError) as exc:
         print(f"codex_mesh: sweep: cannot list servers or connections ({exc}); nothing judged", file=sys.stderr)
         return 1
@@ -4424,12 +4924,28 @@ def command_sweep(args: argparse.Namespace) -> int:
                 label, reason = "kept", "unused at the first look, not stopped at the second"
         owner = (
             "-"
-            if isinstance(judgment.ownership, UnownedServerWithoutLog)
+            if isinstance(judgment.ownership, (UnownedServerWithoutLog, UnreadServerOwnership))
             else str(judgment.ownership.session_dir)
         )
         print(f"{pid}\t{port}\t{label}\t{reason}\t{owner}")
+    for daemon in daemons:
+        if not isinstance(daemon, CodexDaemon):
+            reason = daemon.reason if isinstance(daemon, UnreadCodexProcess) else "not an app-server daemon"
+            print(f"{daemon.pid}\tunclassified\tkept\t{reason}\t-")
+            continue
+        verdict = _daemon_verdict(daemon)
+        label = "unused" if isinstance(verdict, ServerUnused) else "in use"
+        reason = verdict.reason
+        if isinstance(verdict, ServerUnused):
+            unused += 1
+            if stop and _stop_daemon(daemon):
+                stopped += 1
+                label = "stopped"
+            elif stop:
+                label, reason = "kept", "unused at the first look, not stopped at the second"
+        print(f"{daemon.pid}\tdaemon\t{label}\t{reason}\t~/.codex")
     tail = f"{stopped} stopped" if stop else "report only, nothing was stopped"
-    print(f"{len(servers)} app-server(s), {unused} unused; {tail}")
+    print(f"{len(servers) + sum(isinstance(target, CodexDaemon) for target in daemons)} app-server(s), {unused} unused; {tail}")
     return 0
 
 
@@ -4471,14 +4987,6 @@ def _launcher_sessions(folder: Path) -> tuple[str, ...]:
                  if isinstance(pid, int) and _pid_alive(pid))
     if not pids:
         return ()
-    # Reuse wind-down's cross-platform ancestry walk and its process-table reader.
-    for directory in ("message", "production"):
-        path = str(Path(__file__).resolve().parents[1] / directory)
-        if path not in sys.path:
-            sys.path.insert(0, path)
-    from scripts.production.codex_winddown import NO_SESSION, owner
-    from scripts.message import process_table
-
     try:
         table = process_table.snapshot()
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -4494,8 +5002,8 @@ def _launcher_sessions(folder: Path) -> tuple[str, ...]:
         process = table.get(pid)
         if process is None:
             continue
-        session_id = owner(process, table, names)
-        if session_id != NO_SESSION and session_id not in found:
+        session_id = process_table.nearest_named(process, table, names)
+        if session_id is not None and session_id not in found:
             found.append(session_id)
     return tuple(found)
 
@@ -4520,6 +5028,7 @@ def _notify_holder(session_id: str, line: str, kind: CodexNoticeKind) -> None:
         print(f"codex_mesh: could not tell session {session_id}: {sent.stderr.strip()}", file=sys.stderr)
 
 
+@role_map_command
 def command_signin_changed(args: argparse.Namespace) -> int:
     """Move every run off an app-server started before the Codex sign-in last changed.
 
@@ -4789,6 +5298,9 @@ def _wait_account_move_resumes(
 
 def _leftover_server_verdict(folder: Path, pid: int, port: int) -> SweepVerdict:
     """Use the sweep's retired-server rules even in a preview before retirement."""
+    stderr = _server_folder(pid)
+    if isinstance(stderr, UnreadServerStderr):
+        return ServerInUse(stderr.reason)
     try:
         clients = _client_counts().get(port, 0)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -5380,7 +5892,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     handler = cast("Callable[[argparse.Namespace], int]", _attr(args, "handler"))
-    return handler(args)
+    try:
+        return handler(args)
+    except (RoleMapUnavailable, RoleAccountUnavailable) as error:
+        print(error, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

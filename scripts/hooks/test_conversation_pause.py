@@ -638,11 +638,11 @@ print("SENT: delivered")
             {"kind": "replying", "user_wrote_at": 120},
         )
 
-    def test_report_names_for_unit_and_build_instances(self) -> None:
+    def test_report_names_for_unit_and_other_instances(self) -> None:
         for name, words in (
             ("unit-abc", "status reports"),
             ("delegate-abc", "status reports"),
-            ("report-builds", "build report"),
+            ("report-nightly", "report-nightly"),
         ):
             with self.subTest(name=name):
                 instance = self.create_instance(name)
@@ -689,17 +689,17 @@ print("SENT: delivered")
     def test_existing_pause_adds_a_report_that_was_turned_on_later(self) -> None:
         first = self.create_instance("delegate-abc")
         _ = self.parsed_reply(self.run_prompt("first", now=100))
-        build = self.create_instance("report-builds")
+        later = self.create_instance("report-nightly")
         reply = self.parsed_reply(self.run_prompt("second", now=120))
         self.assertEqual(
             reply["systemMessage"],
-            f"Automatic updates paused while we talk: build report. {RETURN_SCHEDULE}",
+            f"Automatic updates paused while we talk: report-nightly. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
-            self.record()["instances"], ["delegate-abc", "report-builds"]
+            self.record()["instances"], ["delegate-abc", "report-nightly"]
         )
         self.assertTrue((first / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue((build / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((later / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_failed_watcher_creation_stops_nothing_and_writes_no_record(self) -> None:
         instance = self.create_instance("delegate-abc")
