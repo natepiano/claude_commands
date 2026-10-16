@@ -1103,31 +1103,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 33 — Cutover on the Mac  · status: done
 
-**Depends on:** Phase 31
+#### As-built
 
-#### Work Order
-
-**Goal:** on the Mac, claude2's login lives in `~/.claude2` (keychain entry keyed to that folder), `~/.claude` holds no login, usage readings work for the named folder, and plain `claude` launches on the showrunners group's account. One user `/login` in `~/.claude2`; never `/logout`.
-
-**Constraints from prior phases:** the Mac's login is keychain-only plus `$HOME/.claude.json` `oauthAccount`; ssh cannot read its keychain, so names are read from a session on the Mac. `cutover-home` refuses on macOS. `scripts/whoami/agent_accounts.py` `claude_credentials` reads the keychain only for the legacy home. The Mac has no account aliases and no showrunners group set. Claude Code 2.1.296 names a folder's keychain service `Claude Code-credentials` when `CLAUDE_CONFIG_DIR` is unset, else `Claude Code-credentials-<first 8 hex of sha256 of the NFC-normalized CLAUDE_CONFIG_DIR value>`; the hash is over the exact string the launch sets, so it must match what `accounts.py` puts in `CLAUDE_CONFIG_DIR`. Showrunner, 2026-10-15: deleting the old local keychain entry is approved with three conditions — (1) it runs only after the `~/.claude2` login is checked to be the same account as the old entry, comparing identifiers in code and never printing them; if they differ it refuses and changes nothing; (2) it reads and deletes by service name only, never prints contents, never runs `/logout`; (3) the user is told as part of the one live step: once the new login works, the old copy in `~/.claude` is removed from the Mac's keychain, and the server login is not touched.
-
-**Spec:**
-
-1. Usage readings for a named folder read its own keychain entry by the folder's service name and never fall back to the legacy entry.
-2. On macOS, `cutover-home claude2` (after the user's `/login` in `~/.claude2`) removes `oauthAccount` from `$HOME/.claude.json` keeping every other key, deletes the old legacy keychain entry under the three conditions, writes the same journal and dated `home_cutovers` record, refuses while any Claude process uses `~/.claude`, and `--undo` restores `oauthAccount` (the keychain entry needs a `/login` in `~/.claude`, said in its line).
-5. Add-on (showrunner, 2026-10-15; the user: "i would want to know the name of the showrunner-unit director-worker that is switching and to what it is switching to"): `accounts.py swap workers codexN` prints a header `Workers moving codex2 → codex1:` (dry run `Workers would move codex2 → codex1:`), then one line per switching worker with no run ids — `natedev · two-accounts · impl-worker → codex1`, with `(mid-turn; switches when its turn ends)` for a worker mid-turn. Parts: showrunner, unit (else the session name), worker name; the host first only when it is not this machine; an unresolved holder shows the session name, else `unknown session` and the run id. Per-run text stays in the server log and the holder notices.
-6. Add-on (showrunner, 2026-10-15; the user ran bare `codex`, got codex2 and did not know how to start codex1): `accounts.py exec codexN [codex args]` resolves the label to the home holding its note's login, with the resolution `swap` uses (`codex2` → `~/.codex`), sets `CODEX_HOME` and execs `codex`; `exec workers [codex args]` does the same for the account `role workers` selects. An unknown or signed-out label is refused with the existing wording; `--probe` stays Claude-only. The showrunner adds the `codex1`, `codex2` and bare `codex` (→ `exec workers`) aliases after promotion.
+- On macOS, `accounts.py cutover-home <label>` refuses unless the numbered folder holds a login (its `.claude.json` `oauthAccount` and its keychain entry, checked by service name). It refuses on an account mismatch, compared in code and never printed, with nothing changed. It also refuses while a Claude process uses `~/.claude`; the Mac guard reads each candidate's native argv through `sysctl` `KERN_PROCARGS2` (`_mac_process_arguments`) and refuses when that argv cannot be read. It writes the journal, removes `oauthAccount` from `$HOME/.claude.json` keeping every other key, deletes `Claude Code-credentials` by service name last, and appends the dated `home_cutovers` record. A rerun finishes an interrupted run. `--undo` restores `oauthAccount` and says the keychain entry needs a `/login` in `~/.claude`; an undone journal lets a fresh forward cutover start.
+- `agent_accounts.claude_keychain_service` returns `Claude Code-credentials` when `CLAUDE_CONFIG_DIR` is unset or empty, else `Claude Code-credentials-<first 8 hex of sha256 of the NFC value>`; a named folder reads only its own entry and a missing one raises "usage credentials unavailable".
+- `swap workers codexN` prints `Workers moving <from> → <to>:` (dry run `Workers would move …`), then one line per switching worker: `showrunner · unit · worker → codexN`, marked `(mid-turn; switches when its turn ends)` when mid-turn; an unlisted holder shows its saved session name, else `unknown session (<run>)`.
+- `accounts.py exec codexN|workers [codex args]` resolves the home through `check_codex_target` (for `workers`, the account `role workers` selects), sets `CODEX_HOME` and execs `codex`; `--probe` is Claude-only.
 
 **Files:**
+- `scripts/accounts/accounts.py` — macOS cutover, Mac process guard, swap lines, Codex exec.
+- `scripts/whoami/agent_accounts.py` — keychain service names.
+- `scripts/agents/codex_mesh.py` — `WorkersRunSwitch` / `SwitchingWorker` from `retire_workers_servers`.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — the Mac step, natedev's cutover, Codex launch lines.
 
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_cutover_home.py` — the macOS cutover; Codex labels in `exec`.
-- `scripts/whoami/agent_accounts.py`, `scripts/whoami/test_agent_accounts.py` — named-folder keychain lookup.
-- `docs/accounts.md` — the Mac step, natedev's cutover line and the Codex launch lines.
-- `scripts/agents/codex_mesh.py`, `scripts/accounts/test_accounts.py`, `commands/showrunner/accounts.md` — the per-worker swap output; the `exec` tests and line.
-
-**Workers:** 1 writer + 1 tester. `impl` takes `scripts/accounts/` and `scripts/whoami/`; `test` writes the tests (keychain calls stubbed by service name; never a real keychain) and the docs.
-
-**Acceptance gate:** tests prove the identity comparison refuses on a mismatch with nothing changed, deletion is by service name only, nothing prints credential contents, and named folders never read the legacy entry.
+**Gotchas:** no real Mac keychain or `sysctl` call has run in tests; `security` and the kernel read are stubbed.
 
 ### Phase 34 — Cutover on the Mac: the live step  · status: todo
 
