@@ -1091,7 +1091,8 @@ def _review_workers(
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
-        statuses = sorted(run.path.glob("review_status*"))
+        # A launch that names its phase writes in that phase's directory.
+        statuses = sorted([*run.path.glob("review_status*"), *run.path.glob("phases/*/review_status*")])
     except OSError as error:
         _problem(problems, f"review state in {run.path}", error)
         return entries
@@ -1107,7 +1108,7 @@ def _review_workers(
             continue
         if status != "reviewing":
             continue
-        pid_path = run.path / f"review_pid{suffix}"
+        pid_path = status_path.parent / f"review_pid{suffix}"
         try:
             launcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
         except (OSError, UnicodeError, ValueError) as error:

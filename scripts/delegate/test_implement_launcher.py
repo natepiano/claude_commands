@@ -309,7 +309,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "findings.py", "board.sh"):
+        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "phase_reservation.py", "findings.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         launcher = delegate / "implement.sh"
         _ = launcher.write_text(
@@ -397,6 +397,23 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
             env=self.environment(),
             timeout=300,
         )
+
+    def test_a_launch_naming_its_phase_writes_in_that_phase_directory(self) -> None:
+        # Two phases running the same role each name their own, so neither overwrites the
+        # other's status, summary or log, and the name stays off the worker's address.
+        session_dir = self.start_phase("phase-directory")
+        result = subprocess.run(
+            ["bash", str(self.implement_script), "--phase", "3", str(session_dir), str(self.working_dir),
+             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            check=False, capture_output=True, text=True, env=self.environment(), timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        phase_dir = session_dir / "phases" / "3"
+        self.assertEqual((phase_dir / "impl_status_impl").read_text(encoding="utf-8").strip(), "implemented")
+        self.assertTrue((phase_dir / "impl_agent_impl.log").is_file())
+        self.assertEqual(sorted(path.name for path in session_dir.glob("impl_status*")), [])
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertNotIn("3-impl", board)
 
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()

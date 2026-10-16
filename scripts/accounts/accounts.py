@@ -155,6 +155,8 @@ KNOWN_PRIVATE_NAMES = frozenset(
         "jobs",
         "backups",
         "cache",
+        "feedback",
+        "telemetry",
         ".last-cleanup",
     }
 )
@@ -405,6 +407,7 @@ class CodexStatus:
     login: str
     role: str
     problems: tuple[str, ...]
+    unclassified: tuple[str, ...]
     startup: agent_accounts.CodexStartupStatus = field(default_factory=agent_accounts.NoCodexStartupFailure)
 
 
@@ -1000,10 +1003,8 @@ def _check_codex_home(label: str, workers_home: Path) -> list[str]:
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
-            unknown = sorted(entry.name for entry in destination.iterdir()
-                             if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES)
-            if unknown:
-                problems.append(f"{folder}: unclassified: {', '.join(unknown)}")
+            with os.scandir(destination):
+                pass
         except OSError as error:
             problems.append(f"accounts: could not inspect {destination}: {error}")
     expected = _account_note(label)
@@ -2664,7 +2665,41 @@ def _is_known_private(name: str) -> bool:
         name in KNOWN_PRIVATE_NAMES
         or name.startswith("daemon-auth-")
         or name.startswith(".oauth_refresh.lock")
+        or name.startswith(".claude.json.tmp.")
     )
+
+
+def sweep_claude_temp_files(now: datetime) -> None:
+    """Remove only regular atomic-write remnants older than a day, without following links."""
+    home = accounts_home()
+    folders = [home]
+    stale_before = (now - timedelta(days=1)).timestamp()
+    for folder in folders:
+        try:
+            descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    try:
+                        if (folder == home and re.fullmatch(r"\.claude[1-9][0-9]*", entry.name)
+                                and entry.is_dir(follow_symlinks=False)):
+                            folders.append(folder / entry.name)
+                        if not entry.name.startswith(".claude.json.tmp."):
+                            continue
+                        metadata = os.lstat(entry.name, dir_fd=descriptor)
+                        if stat.S_ISREG(metadata.st_mode) and metadata.st_mtime < stale_before:
+                            os.unlink(entry.name, dir_fd=descriptor)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _unclassified(config_dir: Path) -> tuple[str, ...]:
@@ -2819,9 +2854,18 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
             expected = _account_note(intended)
             hint = intended if isinstance(expected, ExpectedAccountLogin) else label
             problems.append(f"accounts: sign in as {hint} at {folder}")
+        unclassified: tuple[str, ...] = ()
+        if match and safe:
+            try:
+                unclassified = tuple(sorted(entry.name for entry in home.iterdir()
+                    if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES))
+            except OSError as error:
+                problem = f"accounts: could not inspect {home}: {error}"
+                if problem not in problems:
+                    problems.append(problem)
         statuses.append(CodexStatus(
             folder, home, True, safe, NO_VALUE if label == login else label, login,
-            CODEX_ROLE if home == workers_home else "spare", tuple(problems),
+            CODEX_ROLE if home == workers_home else "spare", tuple(problems), unclassified,
         ))
     held_logins = {status.login.casefold() for status in statuses if status.login}
     noted = sorted(
@@ -2837,7 +2881,7 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
             continue
         problems = tuple(_check_codex_home(label, workers_home)) if os.path.lexists(home) else ()
         statuses.append(CodexStatus(
-            f"~/{home.name}", home, False, not home.is_symlink(), label, "", NO_VALUE, problems,
+            f"~/{home.name}", home, False, not home.is_symlink(), label, "", NO_VALUE, problems, (),
         ))
     return statuses
 
@@ -3003,10 +3047,10 @@ def _render_table(rows: list[tuple[str, ...]]) -> str:
     ])
 
 
-def _status_notes(status: AccountStatus) -> list[str]:
+def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
     """What is wrong or unusual in one folder. Nothing for a folder in order."""
     notes = list(status.problems)
-    if status.unclassified:
+    if detail and status.unclassified:
         notes.append(f"{status.folder}: unclassified: {', '.join(status.unclassified)}")
     mcp_differences = [
         *(f"- {name}" for name in status.missing_mcp_servers),
@@ -3020,7 +3064,7 @@ def _status_notes(status: AccountStatus) -> list[str]:
 def status_report(*, detail: bool = False) -> str:
     """One table row per account folder, then one line for each thing wrong in a folder.
 
-    With `detail`, also each live session, the Codex workers and the recent moves.
+    With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
     """
     statuses = account_statuses()
     selected_workers = role_account("workers")
@@ -3045,8 +3089,10 @@ def status_report(*, detail: bool = False) -> str:
         *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
         *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
     ])
-    notes = [*(note for status in statuses for note in _status_notes(status)),
-             *(problem for status in codex for problem in status.problems)]
+    notes = [*(note for status in statuses for note in _status_notes(status, detail=detail)),
+             *(problem for status in codex for problem in status.problems),
+             *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
+               for status in codex if detail and status.unclassified)]
     summary = [group_status_line(groups), table, "", *notes]
     if not detail:
         return "\n".join(summary)

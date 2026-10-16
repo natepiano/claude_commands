@@ -170,9 +170,11 @@ State:
     retires.
   - **Start a lower showrunner only with `/showrunner:add_showrunner
     <production doc>`**, never in your own pane and never as a unit. It gets
-    its own tmux session on the showrunner account and is attached to you
+    its own herdr session on the selected account and is attached to you
     once it runs. User, 2026-10-12: "top level (L1) showrunners should make
-    sure to use tmux to start lower level showrunners".
+    sure to use tmux to start lower level showrunners". With the user's
+    2026-10-13 move to herdr, `add_showrunner.py` opens each lower showrunner
+    in its own herdr session.
 - **What reaches the user:**
   - a unit director's `— decision:` that only the user can settle (**Designs
     and add-ons** below), shown in the unit director's words, with the answer
@@ -334,7 +336,7 @@ State:
 Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 --production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
 the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
-last code checkpoint from first-parent merge history, and checks its tmux
+last code checkpoint from first-parent merge history, and checks its herdr or tmux
 session. Use its lines to restore state. <StartUpdates/> registers this session
 again and retargets the instance. A reboot needs nothing.
 
@@ -372,7 +374,7 @@ For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
 `<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
-per unit director: its session name and `tmux attach -t <session>`.
+per unit director: its session name and `herdr session attach <session>`.
 
 When a unit director is blocked on a full context, first read its pane with
 `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
@@ -1188,7 +1190,7 @@ outside it too: wrap neither waits on it nor retires its worktree or branch.
    production's links in the showrunner tree, deletes its own footer, pause,
    open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
-   Leave tmux sessions for the user to close.
+   Leave herdr and tmux sessions for the user to close.
 </Wrap>
 
 ---

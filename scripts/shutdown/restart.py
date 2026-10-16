@@ -517,6 +517,20 @@ class ResumeParts:
     account: RetainResumeAccount | MoveResumeAccount
 
 
+@dataclass(frozen=True)
+class NewHerdrSession:
+    name: str
+
+
+@dataclass(frozen=True)
+class RecordedHerdrPane:
+    name: str
+    pane_id: str
+
+
+HerdrDestination = NewHerdrSession | RecordedHerdrPane
+
+
 def _resume_parts(session: Session, prompt: str, target: str = "", *, probe: bool = False) -> ResumeParts:
     default_dir = Path.home() / ".claude"
     config_dir = Path(session.get("config_dir", str(default_dir)))
@@ -525,14 +539,7 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, probe: boo
 
         role = "unit" if session["kind"] == "unit" else "showrunner"
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
-        selected_dir = selected.dir
-        host = session["host"]
-        herdr_host = host["kind"] == "herdr"
-        # Only native herdr resumes retain an already configured directory.
-        if target or not herdr_host or selected_dir.resolve() != config_dir.resolve():
-            target = selected.label
-        else:
-            config_dir = selected_dir
+        target = selected.label
     account: RetainResumeAccount | MoveResumeAccount = (
         MoveResumeAccount(target) if target else RetainResumeAccount(config_dir)
     )
@@ -722,8 +729,10 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
     model = session["model"]
     if model["kind"] == "model":
         argv.extend(("--model", model["name"]))
-    if "target" in record:
-        argv.extend(("--account", record["target"]))
+    from scripts.accounts import accounts
+
+    selected = accounts.account_for_group_launch("unit", resume=True, target=record.get("target", ""))
+    argv.extend(("--account", selected.label))
     if record["probe"]:
         argv.append("--probe")
     return argv
@@ -1012,28 +1021,38 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> str:
     return f"={host['tmux_session']}"
 
 
-def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> None:
+def _herdr_launch(
+    parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool
+) -> None:
     """Resume Claude with its own arguments and one separate opening prompt."""
-    host = session["host"]
-    if host["kind"] != "herdr":
-        raise ValueError("herdr launch needs a herdr host")
+    unset_variables: set[str] = set()
     if isinstance(parts.account, MoveResumeAccount):
-        raise OSError(
-            f"herdr account move to {parts.account.target} is not supported: "
-            + "pane environment assignments cannot perform accounts exec credential "
-            + "removal and readiness checks; resume manually with accounts.py exec"
-        )
-    environment = {**named_account_environment(parts.account.config_dir), **parts.environment}
-    name = host["herdr_session"]
-    pane = host["pane_id"]
+        from scripts.accounts import accounts
+
+        prepared = accounts.prepared_account(parts.account.target, resume=True)
+        if isinstance(prepared, accounts.AccountRefused):
+            raise OSError(prepared.reason)
+        unset_variables.update(prepared.remove)
+        environment = {**parts.environment, **prepared.variables}
+        for key in prepared.remove:
+            _ = environment.pop(key, None)
+    else:
+        environment = dict(parts.environment)
+        if parts.account.config_dir != Path.home() / ".claude":
+            environment = {**named_account_environment(parts.account.config_dir), **environment}
+    name = destination.name
     if dry_run:
-        print(f"herdr {name}: resume {session['session_id']} in {pane}")
+        location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
+                    else "a new pane")
+        print(f"herdr {name}: resume {session['session_id']} in {location}")
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
         from scripts.accounts.accounts import NamedAccount, home_account_label, trust_command
 
-        config_dir = parts.account.config_dir
+        config_dir = Path(environment.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+        if config_dir == Path.home() / ".claude":
+            unset_variables.update({"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"})
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
@@ -1044,11 +1063,29 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         herdr.start_server(name, 90_000)
+        server_environment = herdr.server_environment(name)
+        for variable in sorted(unset_variables):
+            if variable in server_environment:
+                raise OSError(
+                    f"herdr server {name} carries {variable} from where it started; "
+                    + f"stop it with herdr --session {name} server stop and restart again"
+                )
         client = herdr.Herdr(name)
         agents = client.agents()
-        if any(row["pane_id"] == pane and row.get("agent")
+        if any((isinstance(destination, NewHerdrSession) or row["pane_id"] == destination.pane_id)
+               and row.get("agent")
                and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
-            raise OSError(f"herdr {name}:{pane}: pane still holds a live agent")
+            location = (f"{name}:{destination.pane_id}" if isinstance(destination, RecordedHerdrPane)
+                        else name)
+            raise OSError(f"herdr {location}: pane still holds a live agent")
+        if isinstance(destination, RecordedHerdrPane) and any(
+            row["pane_id"] == destination.pane_id for row in client.panes()
+        ):
+            activity = client.pane_activity(destination.pane_id)
+            if isinstance(activity, herdr.PaneAtShell):
+                client.close_pane(destination.pane_id)
+            else:
+                raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         pane = herdr.open_pane(name, name, parts.cwd, environment)
         client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
                            opening_prompt=parts.opening_prompt, timeout_ms=90_000)
@@ -1069,8 +1106,6 @@ def _launch_session(
     if session["kind"] == "unit":
         if host["kind"] != "unit":
             raise ValueError("unit session has no unit host")
-        if host["session_host"] == "herdr":
-            return ManualRestartRequired(_resume_command(session, note, record.get("target", ""), probe=record.get("probe", False)))
         argv = _unit_argv(record)
         note_path = _note_path(record, session["session_id"])
         _write_note(note_path, note, dry_run)
@@ -1086,10 +1121,12 @@ def _launch_session(
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""), probe=record.get("probe", False))
     if host["kind"] == "herdr":
-        if session["kind"] == "showrunner" and isinstance(parts.account, MoveResumeAccount):
-            return ManualRestartRequired(_resume_command(
-                session, f"{_showrunner_prompt(session)} {note}", record.get("target", ""), probe=record.get("probe", False)))
-        _herdr_launch(parts, session, dry_run=dry_run)
+        _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
+                      session, dry_run=dry_run)
+        return SessionLaunched()
+    if host["kind"] == "tmux" and session["kind"] == "showrunner":
+        name = re.sub(r"[^A-Za-z0-9_.-]", "-", host["tmux_session"])
+        _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
         return SessionLaunched()
     window_launch = host["kind"] in {"ghostty", "zed"} or (
         host["kind"] == "terminal" and sys.platform == "darwin"

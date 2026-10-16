@@ -90,7 +90,7 @@ Everything below is the contract.
    finished: a live run has shown two workers carrying a closed pass while both
    were posting to the board, and treating that as completion routes a healthy
    round through <FixDispatch/>'s abandon path.
-   Check the workers: `impl_status_<slot>`, board posts since the last cursor,
+   Check the workers: each open phase's `phases/<id>/impl_status_<slot>`, board posts since the last cursor,
    and whether the launcher has exited. Alive means say so in prose and keep the
    run going; terminal means step 1's completion handling. Never open an
    activity to make the tables render — that records unit-director work that

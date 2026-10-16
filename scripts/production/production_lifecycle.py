@@ -496,7 +496,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     main_result = (f"promoted to {tip[:7]} ({commit_count} commits)" if isinstance(status, ProductionRunning)
                    else f"promoted to {tip[:7]} by the earlier run")
     print(f"| Main | {main_result} |")
-    print("| Next | close tmux sessions |")
+    print("| Next | close herdr or tmux sessions |")
 
 
 def main() -> int:

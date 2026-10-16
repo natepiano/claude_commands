@@ -347,6 +347,9 @@ class UpdatedAgentNotes:
 
 def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
+    from scripts.accounts import accounts
+
+    accounts.sweep_claude_temp_files(datetime.now(timezone.utc))
     messages = rename_legacy_notes(note_file.notes_dir())
     notes = note_file.read_notes()
     multiple_codex_homes = len(codex_homes(workers_home)) > 1
@@ -377,7 +380,6 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
             else:
                 for key, value in updates.items():
                     _ = merged[label].setdefault(key, value)
-    from scripts.accounts import accounts
     try:
         groups = accounts.group_note_labels()
     except accounts.AccountsError as error:

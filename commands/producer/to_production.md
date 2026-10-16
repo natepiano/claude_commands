@@ -104,7 +104,7 @@ production format, with status `planned`:
 - **Units:**
   - **Worktree:** `<parent of ${REPO}>/<name>-<area>`, with a branch of the
     same name.
-  - **Session:** the unit name. If a tmux session with that name already
+  - **Session:** the unit name. If a herdr or tmux session with that name already
     exists, add the production name as a prefix.
   - **Port:** a distinct app port per unit, only when the project launches an
     app for smoke tests. Never the user's default port. The repository's
