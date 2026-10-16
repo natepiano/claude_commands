@@ -58,6 +58,7 @@ class ProductionTreeTests(unittest.TestCase):
             mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"),
             mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"),
             mock.patch.object(production_tree, "_server_running", side_effect=server_recorded),
+            mock.patch.object(production_tree, "pool_root", return_value=self.root / "review-pool"),
         ):
             _ = self.enterContext(patch)
 
@@ -96,6 +97,30 @@ class ProductionTreeTests(unittest.TestCase):
             {"manager": DIRECTOR, "member": "thread-impl", "role": "impl"},
             {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
             {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
+        ])
+
+    def test_each_leased_pool_reviewer_reports_to_its_running_unit_director(self) -> None:
+        pool = self.root / "review-pool" / "main" / "pool.json"
+        pool.parent.mkdir(parents=True)
+        _ = pool.write_text(json.dumps({
+            "generation": 1, "next_index": 5,
+            "templates": {"code": {"thread_id": "thread-template"}},
+            "reviewers": {
+                "code1": {"type": "code", "thread_id": "thread-busy", "lease": {"unit": "one", "ordinal": 1},
+                          "busy_pid": os.getpid()},
+                "design2": {"type": "design", "thread_id": "thread-idle", "lease": {"unit": "one", "ordinal": 2},
+                            "busy_pid": None},
+                "code3": {"type": "code", "thread_id": "thread-free", "lease": None, "busy_pid": None},
+                "code4": {"type": "code", "thread_id": "thread-stopped", "lease": {"unit": "two", "ordinal": 1},
+                          "busy_pid": None},
+            },
+        }))
+        edges = self.tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one"), "two": unit(OLD_DIRECTOR, "two")}})
+        self.assertEqual([edge for edge in edges if edge["role"] == "review"], [
+            {"manager": DIRECTOR, "member": "thread-busy", "role": "review", "unit": "one",
+             "thread_id": "thread-busy", "state": "busy", "type": "code"},
+            {"manager": DIRECTOR, "member": "thread-idle", "role": "review", "unit": "one",
+             "thread_id": "thread-idle", "state": "idle", "type": "design"},
         ])
 
     def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
