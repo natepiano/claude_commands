@@ -378,30 +378,25 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 ### Phase 15 — Every question a showrunner puts to the user is registered and reviewed  · status: done
 
-**Depends on:** Phase 5, Phase 7
+#### As-built
 
-#### Work Order
-
-**Goal:** A question or request a showrunner puts to the user in a reply ("Say go and I'll …", "Want me to …?", `(recommended` choice lines) is registered and goes through Phase 5's question review, so the open-questions count is right.
-
-**Spec:**
-- Showrunner's call 2026-10-16 after Phase 7's measurement: 28 of 29 counted replies were asks of the user that were never registered, so the open-questions count was wrong. This phase fixes that result.
-- `commands/showrunner/produce.md`, where `open_for_user` is described: any reply that asks the user something — a question, a request such as "Say go and I'll …", or `(recommended` choice lines — registers it first as an `open_for_user` item with its full `question`, and the reply carries the `reviewed question` text. One or two sentences.
-- `scripts/hooks/showrunner_footer.py` `block_reason`: block a showrunner reply holding an ask of the user that matches no registered text. Asks come from `review.reply_questions` (sentences and choice lines), imported the way the existing choice-line check imports it. Registered text is the instance's pending record plus the current outstanding items' `text`, `reviewed` and `question`, compared through `review.question_prose` on both sides (either containing the other, as `sample` does). The reason names the sentence and says to register it with `update_registration.py footer --state` and paste the reviewed text. It runs where the existing reviewed-text check runs (before the footers-off return and the `stop_hook_active` skip).
-- Not an ask of the user (no block): a question or choice inside a message relayed to another session or unit (a recipient heading or lead-in naming it, as in Phase 7's reply 28), a choice line quoted from a unit director in its own words, and anything in `>` quotes or code (already excluded by `reply_questions`). If recipient detection needs a helper, it lives in `scripts/notify/review.py` beside `reply_questions`, with `reply_questions`' result and `sample`'s count unchanged.
-- Dry check (unit director runs it): over Phase 7's frozen inputs in `${SESSION_DIR}/phases/7/inputs` (classification in `phases/7/classification.md`), the new check flags all 28 user asks and not reply 28.
+- `commands/showrunner/produce.md`, under `open_for_user`: before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, the showrunner registers an item with the full ask in `question`, and the reply carries the printed `reviewed question` text.
+- `showrunner_footer.check_reviewed_text` (called first in `block_reason`, before the footers-off return and the `stop_hook_active` skip) runs the pending reviewed-text check, then takes the reply's asks from `review.user_reply_questions` and blocks with `QuestionReplyBlocked("Unregistered ask …")` on any sentence or choice line that matches no registered text. The reason names the sentence and says to record it with `update_registration.py footer --state` and paste the reviewed question.
+- Registered text is the instances' pending reviewed records plus `text`, `question` and `reviewed` of every outstanding item for the instance's slug and every slug below it; both sides pass through `choice_comparison_text` and `review.question_prose`, and a match is either string containing the other.
+- `review.user_reply_questions` blanks paragraphs addressed to another session before calling `reply_questions`: `peer_question_lead` recognises a recipient heading or lead-in (`to`/`for` a unit, session, worker, agent or showrunner; "sent/relayed/forwarded to …"; "quoted from …"; "… said/wrote/in its own words"), and an inline user-return marker ("back to you:", "for you:", "your decision:") hands the rest of the line back to the user. Code fences, inline code and `>` quotes stay excluded.
+- Over Phase 7's frozen inputs the check flags all 28 user asks and passes reply 28, the question relayed to hana.
 
 **Files:**
-- `scripts/hooks/showrunner_footer.py` — the unregistered-ask check
-- `scripts/hooks/test_stop_showrunner_footer.py` — its cases
-- `scripts/notify/review.py` — recipient helper, only if needed
-- `scripts/notify/test_review.py` — its cases, only if needed
+- `scripts/hooks/showrunner_footer.py` — `check_reviewed_text`: reviewed-text and unregistered-ask checks
+- `scripts/hooks/test_stop_showrunner_footer.py` — unregistered "Say go" and `(recommended` cases block; registered, relayed and unit-quoted cases pass
+- `scripts/notify/review.py` — `peer_question_lead`, `user_reply_questions`
+- `scripts/notify/test_review.py` — recipient-detection cases
 - `commands/showrunner/produce.md` — the registration sentence
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `showrunner_footer.py`, `review.py`, `produce.md`; hub: `scripts/hooks/showrunner_footer.py`
-- `test` — `test_stop_showrunner_footer.py`, `test_review.py`
+**Gotchas:**
+- `reply_questions` and `review.sample` are unchanged; recipient context applies only to the Stop hook through `user_reply_questions`.
+- A heading that only names a unit or session (no `to`/`for`, no attribution) is a subject, not a recipient, so questions under it stay the user's; status replies use such headings often.
+- `review` is imported inside `check_reviewed_text`, never at module level, since `test_update_registration.py` loads `showrunner_footer.py`.
+- A dry check against an outstanding snapshot taken later than the replies over-reports: questions registered before their reply and closed before the snapshot read as unregistered.
 
-**Constraints from prior phases:** Phase 5: `showrunner_footer.read_pending_reviewed`, `pending_question_text`, the reviewed-text and choice-line checks in `block_reason`; `review` is imported inside functions in any module `test_update_registration.py` loads (`showrunner_footer.py` included), never at module level. Phase 7: `reply_questions` and `sample` stay unchanged. No test reaches the phone; tests use temp state directories (`SHOWRUNNER_STATE_DIR`). Codex workers start no build, test, lint or type check: they end with `Run request:` and the unit director runs it.
-
-**Acceptance gate:** test lines for `scripts/hooks`, `scripts/production`, `scripts/notify` and `scripts/lib` green; basedpyright 0/0 on changed files; tests: an unregistered "Say go and I'll …" reply blocks, an unregistered `(recommended` choice blocks, a registered one passes, a question relayed to another session passes, a choice quoted from a unit director passes; the dry check above flags 28 and not reply 28.
+**Ruled out:** a bare-name recipient rule (a heading naming a unit marks a relay) — it hides real user asks under status headings.
