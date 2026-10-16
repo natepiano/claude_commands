@@ -424,7 +424,7 @@ def move_run(history_file: Path, old: Path, new: Path, new_branch: str) -> list[
     os.replace(temporary, history_file)
     moved = [history_file]
     for root in SESSION_ROOTS:
-        for path in root.glob(f"*/{STATE_FILENAME}"):
+        for path in root.glob(f"*/{plan_history.STATE_FILENAME}"):
             try:
                 state = _json_object(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError):
