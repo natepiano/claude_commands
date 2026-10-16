@@ -1026,6 +1026,7 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             if server_answering(run_program(client.argv("status", "server"), timeout=max(0.001, remaining))):
+                _clear_restored_workspaces(client)
                 return WindowServerCreated()
             remaining = deadline - time.monotonic()
             if remaining > 0:

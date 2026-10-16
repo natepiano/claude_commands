@@ -979,6 +979,7 @@ class RestartTests(ShutdownTestCase):
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
         replies[f"--session {name} status server"] = [
             {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        replies[f"--session {name} workspace list"] = {"stdout": json.dumps({"result": {"workspaces": []}}), "code": 0}
         replies[f"--session {name} agent list"] = {"stdout": json.dumps({"result": {"agents": []}}), "code": 0}
         replies[f"--session {name} pane list"] = {"stdout": json.dumps({"result": {"panes": []}}), "code": 0}
         replies[f"-n -P -a -U -u {os.getuid()} -F pfn"] = [

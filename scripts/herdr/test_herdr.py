@@ -230,6 +230,27 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(calls[3:5], [["--session", "fixture", "status", "server"]] * 2)
         self.assertFalse(any(row[2:] == ["server"] or row[2:4] == ["workspace", "close"] for row in calls))
 
+    def test_window_bootstrap_closes_restored_workspaces_after_answering_before_returning(self) -> None:
+        self.darwin()
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]
+        self.darwin_sockets("")
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1"}, {"workspace_id": "w2"}]}}))
+        with patch.object(herdr, "run_program", side_effect=self.run_fake):
+            ownership = herdr.restore_server("fixture", 2000, session_kind=herdr.NonDesktopSession(),
+                                             attached_window=True, exclusive=True)
+        self.assertIsInstance(ownership, herdr.WindowServerCreated)
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "status", "server"],
+            ["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"],
+            ["-na", "/Applications/Nix Apps/Ghostty.app", "--args", "-e", str(self.fake),
+             "session", "attach", "fixture"],
+            ["--session", "fixture", "status", "server"],
+            ["--session", "fixture", "workspace", "list"],
+            ["--session", "fixture", "workspace", "close", "w1"],
+            ["--session", "fixture", "workspace", "close", "w2"]])
+
     def test_non_desktop_refuses_detached_missing_servers_and_window_failures(self) -> None:
         self.darwin()
         self.configure_herdr(["status", "server"], "status: stopped\n")
