@@ -1315,36 +1315,21 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 44 — Shared links repair themselves  · status: done
 
-**Depends on:** Phase 43
+#### As-built
 
-#### Work Order
-
-**Goal:** the user never sees "is a real file; move it aside or merge it into ~/.claude". Showrunner, 2026-10-16: on the Mac, the user's herdr start refused with "accounts: ~/.claude1/shell-snapshots is a real file; move it aside or merge it into ~/.claude". The Mac had no `~/.claude/shell-snapshots`, so no account dir linked it, and a claude1 session created an empty real folder at 12:40 EDT; claude2–4 had no entry. The showrunner repaired it by hand.
-
-**Constraints from prior phases:** `_repair_link(path, target, shared_home)` (`accounts.py:605`) relinks a wrong link and refuses a real entry with `_real_entry_problem`; only `setup` and `_link_codex_home` call it. A missing target is skipped, so an account dir gets no link, and Claude then creates a real folder there. The refusal the user saw comes from launch, which only checks: `prepared_account` (`:1043`) → `_inspect_account_directory` (`:826`) → `_link_problems` → `_shared_link_problems` (`:734`) reports and never repairs, and `check_codex_target` (`:2959`) also only checks. `ALWAYS_LINKED` (`:133`, `projects`, `sessions`) names the folders setup creates even when missing. The farm links only entries that exist (Delegation Context); most shared names are files (`settings.json`, `keybindings.json`, `history.jsonl`, `config.toml`, `hooks.json`, `models_cache.json`, `session_index.jsonl`), and an empty one is not valid content, so a missing file target is never created.
-
-**Spec:**
-
-1. One repair runs on setup and on every launch path (`prepared_account`; `check_codex_target` for Codex) before the check, so a launch never refuses on something the repair fixes, and creating a shared target for one account never leaves another account's launch refused.
-2. Only a declared set of folder targets is created when missing: `shell-snapshots` joins `ALWAYS_LINKED` (with any other folder Claude or Codex creates on demand), created in the shared home with private permissions. A missing file target is never created.
-3. When the shared target is missing and an account holds a real entry (file or folder) under that name, the entry is moved into the shared home and linked, with one line saying so.
-4. An empty real folder where a link belongs is removed and linked, with no message.
-5. A non-empty real folder is merged into the existing shared target, each entry moved, when no name exists in both; the folder is then removed and linked, and one line says what was merged. A name in both keeps everything in place and prints a repair step naming the clashing entries; it is never the old refusal wording, and no file is overwritten or deleted.
-6. A real file where a link belongs keeps today's refusal only when the shared target already exists.
+- `_repair_shared_links(destination, source_dir, shared, folders)` runs before any judgment on setup, Codex home linking, `prepared_account`, `check_codex_target(..., repair=True)` and move targets (`_move_target`, `check_move_target`), so a launch never refuses on something repair fixes.
+- Declared folders (`ALWAYS_LINKED`, which now names every Claude folder created on demand including `shell-snapshots`; `CODEX_ALWAYS_LINKED` for Codex) are created private inside an existing shared home. A missing shared file and the shared home itself are never created.
+- Repair rules: a real entry moves into a missing shared target and is linked; an empty real folder is replaced by the link silently; a non-empty folder merges entry by entry when no name clashes; a clash leaves everything in place and prints a repair step naming the clashing entries; a real file refuses only when the shared target exists. Adoption and merge notices go to stderr.
+- Read-only judgment: `prepared_account_preview`, `check_codex_target(..., repair=False)` and `_inspect_account_directory(..., allow_shared_repair=True)` use `_shared_repair_problems` to count repairable entries as ready without touching disk (refusal-watch previews, automatic selection, `set_role`).
+- `accounts.py check` stays strict; a declared folder whose shared target is absent is skipped only when the account entry is absent or already the expected link.
 
 **Files:**
+- `scripts/accounts/accounts.py` — `_repair_shared_links`, `_move_shared_entry`, `_shared_repair_problems`, `ALWAYS_LINKED`, `CODEX_ALWAYS_LINKED`, `prepared_account_preview`, `repair=` on target checks.
+- `scripts/accounts/refusal_watch.py` — previews through the read-only path.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py` — every repair case on scratch homes, Claude and Codex; a preview leaves both homes untouched.
+- `scripts/whoami/test_agent_notes.py`, `scripts/production/test_add_showrunner.py`, `scripts/shutdown/test_account_move.py` — fixtures follow the repair rules.
 
-- `scripts/accounts/accounts.py` — `_repair_link` and its callers: create, adopt, replace, merge; `prepared_account` and `check_codex_target` repair before checking; `ALWAYS_LINKED`.
-- `scripts/accounts/refusal_watch.py` — a preview judges repairable entries as ready and changes nothing on disk.
-- `scripts/accounts/test_refusal_watch.py` — a preview leaves both homes untouched.
-- `scripts/whoami/test_agent_notes.py`, `scripts/production/test_add_showrunner.py`, `scripts/shutdown/test_account_move.py` — fixtures follow the repair rules: an unfit account is unfit for a reason repair cannot fix, a wrong link is relinked at launch, a refused move names its first problem.
-- `scripts/accounts/test_accounts.py` — launch repairs (no refusal for a missing link once another account created the target), folder target created, missing file target not created, account entry adopted into a missing target, empty folder replaced, merge without clash, clash kept with the step, real file refused against an existing target; Codex home the same.
-
-**Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_accounts.py`.
-
-**Live (director):** after merge and promote, run a launch (or `setup`) for every account on both machines, then `accounts.py check`, and confirm no shared-link problem.
-
-**Acceptance gate:** each case above pinned by tests on scratch homes; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+**Gotchas:** `Path.rename` replaces a destination created after a clash check, so every move goes through `_move_shared_entry` (renameat2 `RENAME_NOREPLACE` on Linux, renamex_np `RENAME_EXCL` on macOS); a destination appearing mid-repair is a clash, and a losing concurrent repair accepts the winner's state. Any check reachable from `set_role` must pass `repair=False`, or it creates `~/.codex`. A move refused by its target prints one line, the first problem.
 
 ### Phase 45 — No Codex daemon descendant escapes the stop  · status: todo
 
