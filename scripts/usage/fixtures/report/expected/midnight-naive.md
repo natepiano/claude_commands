@@ -16,6 +16,7 @@ Coverage
 Unweighted: none
 
 Review turns with unrecorded lens: 0.
+Turns with unclassified activity: 0.
 
 Sources
 

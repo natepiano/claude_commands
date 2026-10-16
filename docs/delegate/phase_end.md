@@ -32,9 +32,7 @@ Run these steps in order for each completed loop or verbose phase:
    `remove_workers.py`, helpers, launchers, and apps. Run it before the next
    launch. Per <LongLivedWorkers/>, Codex turns finish but their threads remain
    open until `end_session.sh`; Claude workers keep their existing cleanup.
-   When the production doc names a review pool, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py end-lease --production <slug> --unit <unit> --phase <phase>`
-   in this worker cleanup. Then
+   A pooled reviewer belongs to the unit, not the phase, and stays. Then
    run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,

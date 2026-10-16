@@ -122,7 +122,8 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.environment = {
             **{name: value for name, value in os.environ.items()
-               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}},
+               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
+                               "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(home),
             "RUSTUP_HOME": str(Path.home() / ".rustup"),
@@ -238,12 +239,25 @@ esac
             _ = child.wait(timeout=300)
 
     def test_no_token_records_zero(self) -> None:
-        result = self.verify(self.environment)
+        # A session dir alone makes this a director's run, which takes the token.
+        environment = {name: value for name, value in self.environment.items()
+                       if name != "PLAN_DELEGATE_SESSION_DIR"}
+        result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
         self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+
+    def test_director_run_takes_the_token_as_slot_director(self) -> None:
+        clock = self.root / "director-clock"
+        _ = clock.write_text("100\n")
+        session = Path(self.environment["PLAN_DELEGATE_SESSION_DIR"])
+        result = self.verify({**self.environment, "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records()[0]["token_wait_s"], 0)
+        self.assertIn("[director] claim: token cargo acquired", (session / "board.log").read_text())
+        self.assertFalse((session / "locks" / "cargo.d").exists(), "the director's token was not released")
 
     def test_token_wait_uses_elapsed_seconds_when_no_clock_override_is_present(self) -> None:
         # Copy the board boundary into a disposable HOME; acquire deliberately
@@ -703,6 +717,50 @@ exec "$TEST_REAL_SLEEP" "$@"
 
     def test_sigint_stops_step_before_token_release(self) -> None:
         self.assert_interrupted_holder_stops_step_before_release(signal.SIGINT)
+
+    def detach_environment(self, status: int) -> dict[str, str]:
+        """A Codex worker's environment whose mesh_runs.py stub records its argv and exits `status`."""
+        stub = self.root / "mesh_runs_stub.py"
+        _ = stub.write_text("import json, os, sys\n"
+                            + "with open(os.environ['TEST_MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                            + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                            + "raise SystemExit(int(os.environ['TEST_MESH_RUNS_STATUS']))\n")
+        return {**self.environment, "CODEX_THREAD_ID": "thread-worker", "VERIFY_MESH_RUNS_SCRIPT": str(stub),
+                "TEST_MESH_RUNS_CALLS": str(self.root / "mesh-runs-calls"), "TEST_MESH_RUNS_STATUS": str(status)}
+
+    def mesh_runs_calls(self) -> list[list[str]]:
+        path = self.root / "mesh-runs-calls"
+        if not path.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_a_codex_worker_call_detaches_and_returns_without_building(self) -> None:
+        result = self.verify(self.detach_environment(0))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.mesh_runs_calls(), [[
+            "start", "--label", "verify.sh check sample", "--",
+            "bash", str(VERIFY.resolve()), "check", "sample",
+        ]])
+        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertEqual(self.records(), [])
+
+    def test_a_caller_mesh_runs_cannot_detach_runs_attached(self) -> None:
+        for status, note in ((3, False), (1, True)):
+            with self.subTest(status=status):
+                for path in (self.root / "mesh-runs-calls", self.root / "cargo-calls"):
+                    path.unlink(missing_ok=True)
+                result = self.verify(self.detach_environment(status))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(self.mesh_runs_calls()), 1)
+                self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+                self.assertEqual("could not detach" in result.stderr, note, result.stderr)
+
+    def test_the_detached_run_itself_does_not_detach_again(self) -> None:
+        environment = {**self.detach_environment(0), "PLAN_DELEGATE_DETACHED_RUN": "1"}
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.mesh_runs_calls(), [])
+        self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
 
 if __name__ == "__main__":

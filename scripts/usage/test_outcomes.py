@@ -286,7 +286,7 @@ class OutcomeTests(OutcomeFixture):
         self.assertEqual(self.values(columns, "name"),
                          [("machine",), ("family",), ("parent_id",), ("agent_id",), ("folder",)])
         self.assertEqual(self.values(columns, "pk"), [(1,), (2,), (3,), (4,), (0,)])
-        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 9)
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 10)
         self.assertEqual(self.values(self.rows("PRAGMA index_info(turns_at)"), "name"), [("at",)])
 
     def test_claude_folder_uses_first_cwd_even_after_saved_cursor(self) -> None:

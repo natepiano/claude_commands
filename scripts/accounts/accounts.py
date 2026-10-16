@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import fcntl
 import json
 import math
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -49,6 +50,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
+    from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
 
 
@@ -545,7 +547,7 @@ class WorkersSwapDryRun:
 
 @dataclass(frozen=True)
 class WorkersSwapStarted:
-    """The workers role has moved; live turns finish on their existing server."""
+    """The workers role has moved; each interrupted worker reports its resume outcome."""
 
     lines: tuple[str, ...]
 
@@ -1071,9 +1073,25 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
+def _exec_codex_account(label: str, arguments: list[str]) -> None:
+    """Launch Codex on a checked account, including the stored workers selection."""
+    selected_label = role_account("workers").label if label == "workers" else label
+    target = check_codex_target(selected_label, _workers_home())
+    environment = {**os.environ, "CODEX_HOME": str(target.home)}
+    try:
+        os.execvpe("codex", ["codex", *arguments], environment)
+    except OSError as error:
+        raise AccountsError(f"accounts: could not start codex: {error}") from error
+
+
 def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
-    """Replace this process with Claude on the selected, safe directory."""
+    """Replace this process with the selected Claude or Codex account."""
     label = note_file.canonical_label(label)
+    if label == "workers" or _label_is(label, "codex"):
+        if probe:
+            raise AccountsError("accounts: --probe is only supported for Claude accounts")
+        _exec_codex_account(label, arguments)
+        return
     prepared = prepared_account(label, resume="--resume" in arguments)
     if isinstance(prepared, AccountRefused):
         raise AccountsError(prepared.reason)
@@ -2148,6 +2166,46 @@ class HomeCutover(HomeCutoverEvidence):
     state: Literal["moving", "complete", "undoing", "undone"]
 
 
+class MacHomeCutover(HomeCutover):
+    platform: Literal["darwin"]
+    oauthAccount: dict[str, object]
+
+
+def _record_home_cutover(journal: HomeCutover) -> None:
+    with _roles_lock():
+        configuration = _read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
+        rows = configuration.get("home_cutovers", [])
+        if not isinstance(rows, list):
+            raise AccountsError("accounts: invalid home_cutovers history")
+        history = cast(list[object], rows)
+        evidence = HomeCutoverEvidence(label=journal["label"], login=journal["login"], at=journal["at"])
+        if evidence not in history:
+            history.append(evidence)
+        configuration["home_cutovers"] = history
+        _atomic_write(accounts_config_file(), json.dumps(configuration) + "\n")
+
+
+def _mac_process_arguments(pid: int) -> list[str]:
+    """Read the kernel's NUL-separated argv, preserving spaces and prompt quotes."""
+    # KERN_PROCARGS2 returns argc, the executable path, padding, then argv.
+    query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    size = ctypes.c_size_t(ctypes.sizeof(buffer))
+    sysctl = cast(Callable[[object, int, object, object, object, int], int],
+                  ctypes.CDLL(None, use_errno=True).sysctl)
+    if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+    payload = buffer.raw[:size.value]
+    count = int.from_bytes(payload[:4], sys.byteorder, signed=True)
+    executable_end = payload.find(b"\0", 4)
+    if count <= 0 or executable_end < 0:
+        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+    arguments = payload[executable_end + 1:].lstrip(b"\0").split(b"\0")
+    if len(arguments) <= count or not arguments[0]:
+        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
+    return [os.fsdecode(word) for word in arguments[:count]]
+
+
 def _claude_process_ids() -> list[int]:
     """Every Claude Code process owned by this user, including socketless ones."""
     try:
@@ -2178,12 +2236,12 @@ def _claude_process_ids() -> list[int]:
             if not raw_arguments.endswith(b"\0") or not raw_arguments.removesuffix(b"\0"):
                 raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
             arguments = [os.fsdecode(word) for word in raw_arguments.removesuffix(b"\0").split(b"\0")]
-        # macOS exposes only flattened ps text. A runtime with ambiguous argv
-        # remains a candidate: checking its environment is safer than skipping it.
+        elif sys.platform == "darwin":
+            arguments = _mac_process_arguments(pid)
         if (command == "claude"
                 or arguments and Path(arguments[0]).name == "claude"
-                or runtime and (sys.platform != "linux" or any(
-                    word.endswith("/@anthropic-ai/claude-code/cli.js") for word in arguments))):
+                or runtime and any(
+                    word.endswith("/@anthropic-ai/claude-code/cli.js") for word in arguments)):
             found.append(pid)
     return found
 
@@ -2201,6 +2259,129 @@ def _cutover_session_check(folder: Path) -> None:
 MAC_HOME_LOGIN_STEP = "Mac's own step: one /login in ~/.claude2, never /logout"
 
 
+def _mac_keychain_has_entry(folder: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ("security", "find-generic-password", "-s", agent_accounts.claude_keychain_service(folder)),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AccountsError("accounts: cannot check the keychain entry") from error
+    if result.returncode == 44:
+        return False
+    if result.returncode:
+        raise AccountsError("accounts: cannot check the keychain entry")
+    return True
+
+
+def _delete_legacy_keychain_entry() -> None:
+    try:
+        result = subprocess.run(
+            ("security", "delete-generic-password", "-s", agent_accounts.claude_keychain_service(main_config_dir())),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AccountsError("accounts: cannot delete the legacy keychain entry; rerun cutover-home") from error
+    # errSecItemNotFound (44) also finishes a deletion interrupted before journalling.
+    if result.returncode not in (0, 44):
+        raise AccountsError("accounts: cannot delete the legacy keychain entry; rerun cutover-home")
+
+
+def _mac_oauth_account(values: dict[str, object]) -> dict[str, object]:
+    raw = values.get("oauthAccount")
+    if not isinstance(raw, dict):
+        raise AccountsError("accounts: cutover requires an oauthAccount in both homes")
+    identity = cast(dict[str, object], raw)
+    identifier = identity.get("accountUuid")
+    if not isinstance(identifier, str) or not identifier:
+        raise AccountsError("accounts: cutover cannot establish the account identifier")
+    return identity
+
+
+def _cutover_home_macos(label: str, *, undo: bool) -> None:
+    """Retire the legacy login only after the user's numbered login is verified."""
+    path = accounts_home() / ".local/state/accounts/cutover-home.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if path.is_symlink():
+            raise AccountsError("accounts: cutover journal must not be a link")
+        raw = _read_json_object(path) if path.exists() else {}
+        if raw and raw.get("platform") != "darwin":
+            raise AccountsError("accounts: finish the recorded cutover on its original platform")
+        if raw:
+            if (not all(isinstance(raw.get(key), str) and raw[key] for key in ("label", "login", "at"))
+                    or raw.get("state") not in ("moving", "complete", "undoing", "undone")):
+                raise AccountsError("accounts: cutover journal is unreadable; no identity changed")
+            _ = _mac_oauth_account(raw)
+            recorded = cast(MacHomeCutover, cast(object, raw))
+            if label and numbered_account_label(label, "claude").label != recorded["label"]:
+                raise AccountsError("accounts: finish or undo the recorded cutover first")
+            label = recorded["label"]
+            if not undo and recorded["state"] == "undone":
+                raw = {}
+        else:
+            if undo:
+                raise AccountsError("accounts: no cutover to undo")
+            label = numbered_account_label(label, "claude").label
+        destination = account_dir(label)
+        _cutover_session_check(destination if undo else main_config_dir())
+        seed_path = accounts_home() / ".claude.json"
+        numbered_path = destination / ".claude.json"
+        if any(item.is_symlink() for item in (main_config_dir(), destination, seed_path, numbered_path)):
+            raise AccountsError("accounts: cutover homes and identity files must not be links")
+        seed = _read_json_object(seed_path)
+        if raw:
+            journal = cast(MacHomeCutover, cast(object, raw))
+        else:
+            source = _mac_oauth_account(seed)
+            source_login = source.get("emailAddress")
+            if not isinstance(source_login, str) or not source_login:
+                raise AccountsError("accounts: cutover-home requires a readable home login")
+            journal = MacHomeCutover(label=label, login=source_login, at=datetime.now(timezone.utc).isoformat(),
+                                     state="moving", platform="darwin", oauthAccount=source)
+        if undo:
+            if journal["state"] != "undone":
+                if "oauthAccount" in seed and seed["oauthAccount"] != journal["oauthAccount"]:
+                    raise AccountsError("accounts: ~/.claude already holds another login")
+                journal["state"] = "undoing"
+                _atomic_write(path, json.dumps(journal) + "\n")
+                seed["oauthAccount"] = journal["oauthAccount"]
+                _atomic_write(seed_path, json.dumps(seed) + "\n")
+                journal["state"] = "undone"
+                _atomic_write(path, json.dumps(journal) + "\n")
+            print("accounts: restored home identity; the keychain entry needs one /login in ~/.claude (never /logout)")
+            return
+        if journal["state"] == "complete":
+            return
+        if journal["state"] == "undoing":
+            raise AccountsError("accounts: finish undo before starting again")
+        expected = _account_note(journal["label"])
+        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        numbered_oauth = _mac_oauth_account(numbered)
+        source_oauth = journal["oauthAccount"]
+        if source_oauth["accountUuid"] != numbered_oauth["accountUuid"]:
+            raise AccountsError("accounts: the numbered login is not the same account as the legacy login")
+        login = source_oauth.get("emailAddress")
+        if (not isinstance(expected, ExpectedAccountLogin) or not isinstance(login, str)
+                or expected.login.casefold() != login.casefold()):
+            raise AccountsError("accounts: cutover-home requires a matching account note and home login")
+        if not _mac_keychain_has_entry(destination):
+            raise AccountsError("accounts: the numbered keychain entry is missing; complete its /login first")
+        if not raw:
+            _atomic_write(path, json.dumps(journal) + "\n")
+        if "oauthAccount" in seed:
+            if _mac_oauth_account(seed) != source_oauth:
+                raise AccountsError("accounts: ~/.claude now holds another login")
+            del seed["oauthAccount"]
+            _atomic_write(seed_path, json.dumps(seed) + "\n")
+        if _mac_keychain_has_entry(main_config_dir()):
+            _delete_legacy_keychain_entry()
+        _record_home_cutover(journal)
+        journal["state"] = "complete"
+        _atomic_write(path, json.dumps(journal) + "\n")
+
+
 def cutover_home(label: str = "", *, undo: bool = False) -> None:
     """Move the legacy home identity, retaining a recoverable intent before mutation.
 
@@ -2208,7 +2389,8 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
     replacements; the journal lets either direction resume after any replacement.
     """
     if sys.platform == "darwin":
-        raise AccountsError(f"accounts: {MAC_HOME_LOGIN_STEP}")
+        _cutover_home_macos(label, undo=undo)
+        return
     path = accounts_home() / ".local/state/accounts/cutover-home.json"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
@@ -2296,17 +2478,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
             if numbered_credentials.exists():
                 raise AccountsError("accounts: destination already holds credentials")
             _ = home_credentials.rename(numbered_credentials)
-        with _roles_lock():
-            configuration = _read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
-            rows = configuration.get("home_cutovers", [])
-            if not isinstance(rows, list):
-                raise AccountsError("accounts: invalid home_cutovers history")
-            history = cast(list[object], rows)
-            evidence = HomeCutoverEvidence(label=journal["label"], login=journal["login"], at=journal["at"])
-            if evidence not in history:
-                history.append(evidence)
-            configuration["home_cutovers"] = history
-            _atomic_write(accounts_config_file(), json.dumps(configuration) + "\n")
+        _record_home_cutover(journal)
         journal["state"] = "complete"
         _atomic_write(path, json.dumps(journal) + "\n")
 
@@ -2806,7 +2978,9 @@ def check_codex_target(label: str, workers_home: Path) -> SelectableCodexAccount
     identity = agent_accounts.codex_account(home)
     if not isinstance(identity, agent_accounts.KnownCodexAccount):
         login = _codex_home_login(home)
-        home_login = _codex_home_login(accounts_home() / ".codex")
+        legacy_home = accounts_home() / ".codex"
+        noted_legacy = isinstance(agent_accounts.codex_account(legacy_home), agent_accounts.KnownCodexAccount)
+        home_login = "" if noted_legacy else _codex_home_login(legacy_home)
         if login or home_login and not home.exists():
             raise AccountsError("accounts: " + unnoted_home_line(home if login else accounts_home() / ".codex", login or home_login))
     problems = _check_codex_home(label, workers_home)
@@ -2826,10 +3000,89 @@ def codex_home_label(home: Path) -> str:
     return agent_accounts.codex_home_role_label(home)
 
 
-def _retire_workers_servers(home: Path, label: str, *, dry_run: bool) -> list[str]:
+@dataclass(frozen=True)
+class FoldedWorkerRow:
+    index: int
+    context: str
+    mid_turn_count: int
+    count: int
+
+
+def _retire_workers_servers(home: Path, label: str, *, dry_run: bool) -> Sequence[WorkersRunSwitch]:
     from scripts.agents.codex_mesh import retire_workers_servers
 
     return retire_workers_servers(home, label, dry_run=dry_run)
+
+
+def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
+                        target: str, *, dry_run: bool) -> tuple[str, ...]:
+    from scripts.agents.codex_mesh import leftover_server_lines
+    from scripts.message import roster, sessions
+
+    old = agent_accounts.codex_account(previous)
+    source = old.label + " → " if isinstance(old, agent_accounts.KnownCodexAccount) else ""
+    lines = [f"Workers {'would move' if dry_run else 'moving'} {source}{target}:"]
+    active = [switch for switch in switches if switch.workers]
+    if not active:
+        return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
+    listing = roster.roster(os.environ, roster.ThisMachine())
+    holders = {entry.session.session_id: entry for entry in listing.entries
+               if isinstance(entry.session, roster.ClaudeSession)}
+    saved_names: dict[str, str] = {}
+    if any(not any(session_id in holders for session_id in switch.holders) for switch in active):
+        try:
+            paths = sessions.sessions_dir().glob("*.json")
+            records = [sessions.read_session(path) for path in paths]
+        except OSError:
+            records = []
+        readable = [record for record in records if not isinstance(record, sessions.UnreadableSessionRecord)]
+        for record in sorted(readable, key=lambda item: item["updatedAt"], reverse=True):
+            if record["name"]:
+                _ = saved_names.setdefault(record["sessionId"], record["name"])
+    folded: dict[tuple[str, str], FoldedWorkerRow] = {}
+    for switch in active:
+        holder_id = next((session_id for session_id in switch.holders if session_id in holders),
+                         next(iter(switch.holders), str(switch.folder)))
+        holder = holders.get(holder_id)
+        parts: list[str] = []
+        if holder is not None:
+            if holder.machine != roster.machine_name():
+                parts.append(holder.machine)
+            if isinstance(holder.showrunner, roster.UnderShowrunner):
+                parts.append(holder.showrunner.name)
+            elif isinstance(holder.showrunner, (roster.RunsProduction, roster.ProductionWithoutRunningShowrunner)):
+                parts.append(holder.showrunner.production)
+            parts.append(holder.director.unit if isinstance(holder.director, (roster.DirectsUnit, roster.UnderDirector))
+                         and holder.director.unit else holder.name)
+        else:
+            parts.append(next((saved_names[session_id] for session_id in switch.holders if session_id in saved_names),
+                              f"unknown session ({switch.folder.name})"))
+        for worker in switch.workers:
+            stem = worker.name.removesuffix("-worker")
+            slot = stem.rpartition("-")[2] or stem
+            name = f"{slot}-worker"
+            context = " · ".join([*parts, name])
+            if worker.failure:
+                lines.append(f"  {context} → {target}, {worker.failure}; resume with {worker.resume_command}")
+                continue
+            key = (holder_id, slot)
+            previous_row = folded.get(key, FoldedWorkerRow(len(lines), context, 0, 0))
+            row = replace(previous_row, mid_turn_count=previous_row.mid_turn_count + int(worker.mid_turn),
+                          count=previous_row.count + 1)
+            copies = f" ×{row.count}" if row.count > 1 else ""
+            if row.mid_turn_count == 0:
+                suffix = ""
+            elif row.count == 1:
+                suffix = ", interrupted and resumed"
+            else:
+                suffix = f", {row.mid_turn_count} interrupted and resumed"
+            line = f"  {row.context} → {target}{copies}{suffix}"
+            if row.index == len(lines):
+                lines.append(line)
+            else:
+                lines[row.index] = line
+            folded[key] = row
+    return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
 
 
 def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
@@ -2853,15 +3106,19 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     if isinstance(readiness, agent_accounts.CodexWorkUnknown):
         raise AccountsError(f"accounts: cannot use {account_label} ({_codex_folder(target_home)}): {readiness.problem}")
     if dry_run:
-        lines = _retire_workers_servers(target_home, account_label, dry_run=True)
-        return WorkersSwapDryRun(tuple([
-            f"Would move workers to {account_label} ({_codex_folder(target_home)}); live turns finish first.", *lines,
-        ]))
-    _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
-    lines = _retire_workers_servers(target_home, account_label, dry_run=False)
-    return WorkersSwapStarted(tuple([
-        f"Workers now use {account_label} ({_codex_folder(target_home)}); working workers move at their next turn.", *lines,
-    ]))
+        switches = _retire_workers_servers(target_home, account_label, dry_run=True)
+        return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
+    try:
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
+    except OSError as error:
+        raise AccountsError(f"accounts: could not move the workers role: {error}") from error
+    try:
+        switches = _retire_workers_servers(target_home, account_label, dry_run=False)
+        lines = _workers_swap_lines(switches, workers_home, account_label, dry_run=False)
+    except (ConnectionError, OSError, SystemExit) as error:
+        lines = (f"Workers role now uses {account_label}; worker move failed: {error}. "
+                 + "Resume affected workers with codex_mesh.py resume-account-move --session-dir <run> --to <worker>.",)
+    return WorkersSwapStarted(lines)
 
 
 def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:

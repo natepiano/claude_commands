@@ -1,6 +1,6 @@
 # herdr on the Mac
 
-> **Status: IMPLEMENTATION PLAN — one phase, delegate-ready.** Moved out of `docs/plans/build-followups-herdr-adoption.md` (its Phase 11) by the showrunner, 2026-10-15. The herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
+> **Status: IMPLEMENTATION PLAN — one phase, delegate-ready.** Moved out of `docs/plans/build-followups-herdr-adoption.md` (its Phase 13) by the showrunner, 2026-10-15. The herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
 
 > **As-built disposition: update** — `docs/as-built/herdr-adoption.md` gains a "herdr on the Mac" section
 
@@ -12,7 +12,7 @@ The showrunner (build-followups), 2026-10-15: the Mac phase of the herdr adoptio
 
 ## Ordering
 
-**Starts after** the parent plan's Phase 10 (tmux removed from productions and sessions on Linux) has merged into build-followups. Phase 8 there adds `start_new_server`, `herdr_sessions.py` and `herdr-claude`; Phase 10 is the last change to `restart.py` and `herdr.py` before this one. Both machines share these scripts, so this unit merges build-followups before it starts.
+**Starts after** the parent plan's Phase 11 (tmux removed from productions and sessions on Linux) has merged into build-followups. Phase 8 there adds `start_new_server`, `herdr_sessions.py` and `herdr-claude`; Phase 11 is the last change to `restart.py` and `herdr.py` before this one. Both machines share these scripts, so this unit merges build-followups before it starts.
 
 ## Phases
 

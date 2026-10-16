@@ -216,7 +216,8 @@ def main() -> int:
                         line = json.dumps(fields).encode("utf-8") + b"\n"
                         report["altered_lifecycle_records"] += 1
                     if behavior in ("malformed_record", "unknown_measurement", "missing_output",
-                                    "oversized_output", "cut_inside_record") and (
+                                    "oversized_output", "cut_inside_record", "invalid_activity",
+                                    "wait_without_action", "missing_activity") and (
                             transcript_file and report["cursor_records"] == 1 and kind == "turn" and not changed_record):
                         changed_record = True
                         if behavior == "malformed_record":
@@ -228,6 +229,13 @@ def main() -> int:
                             record = cast(dict[str, object], json.loads(line))
                             if behavior == "unknown_measurement":
                                 record["kind"] = "unknown-measurement"
+                            elif behavior == "invalid_activity":
+                                record["activity"] = "napping"
+                            elif behavior == "wait_without_action":
+                                record["activity"] = "wait"
+                                record["wait_action"] = None
+                            elif behavior == "missing_activity":
+                                del record["activity"]
                             else:
                                 tokens = cast(dict[str, object], record["tokens"])
                                 if behavior == "missing_output":

@@ -43,7 +43,7 @@ State:
 - `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
-  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`); a new question goes in the object's `question` field, and the reply carries the printed `reviewed question` text.
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply carries the printed `reviewed question` text.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -223,6 +223,9 @@ State:
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
   they want it (user, 2026-10-15).
+  When the user's answer needs research before they can finish it, remove the
+  item from `open_for_user` in that turn; it returns, in full, when the
+  research reports (user, 2026-10-15).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -884,8 +887,8 @@ it needs. Every other wait is yours to clear, and fast.
    what to run, and log the call. Each unit director runs its own cargo-berth
    commands. When a unit director sends an overlap, reply in that turn with the
    answer it records —
-   `--before`, `--after`, `--defer` or `--override` on the named holder — and a
-   one-line why.
+   `--before`, `--after`, `--defer` or `--override` on each named holder, all
+   in one claim — and a one-line why.
    1. The holding unit checkpoints what is green; merge it, and its
       reservations release.
    2. Release in batches: the holder releases what it is done with, you merge,

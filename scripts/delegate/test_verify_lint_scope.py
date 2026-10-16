@@ -183,7 +183,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.environment = {
             name: value for name, value in os.environ.items()
             if not name.startswith(("BUILD", "PLAN_DELEGATE_", "LINT_", "MAC_TEST_",
-                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_"))
+                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
         self.environment.update({
             "HOME": str(home),

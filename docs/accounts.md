@@ -43,15 +43,23 @@ Run these in a terminal:
 | `claude1` | claude1 |
 | `claude2` | claude2 |
 | `claude3` | claude3 |
+| `codex` | The configured workers account, through `accounts.py exec workers` after the shell alias is updated. |
+| `codex1` | codex1 |
+| `codex2` | codex2 |
 
 These aliases come from natedev's shell configuration after a rebuild; the Mac has none. In a shell without them, run:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude3
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec showrunners
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex1
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec codex2
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec workers
 ```
 
-Arguments after the label or group pass through to `claude`. Every launch sets `CLAUDE_CONFIG_DIR` to a numbered folder; claude2 uses `~/.claude2` just like the other accounts. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
+For Claude labels and groups, arguments pass through to `claude`. Every Claude launch sets `CLAUDE_CONFIG_DIR` to a numbered folder; claude2 uses `~/.claude2` just like the other accounts. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
+
+For `codexN` or `workers`, arguments pass through to `codex` and the launch sets `CODEX_HOME` to the home holding that account's login: today codex2 uses `~/.codex` and codex1 uses `~/.codex1`. The `codex1`, `codex2` and bare `codex` aliases are being added to the shell configuration; bare `codex` will follow `exec workers`. `--probe` applies only to Claude accounts.
 
 Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. New unit launches use herdr panes carrying the selected account variables; legacy tmux options remain available for observation and model recovery, and never choose a resume account. Every selected account runs in its own numbered folder, with the shared memory directory set to `~/.claude`. The launch removes any inherited OAuth token. Commands accept account numbers and the launch groups; `default` refuses.
 
@@ -113,13 +121,27 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 
 Each machine cuts over separately. While `~/.claude` still holds a login, processes without `CLAUDE_CONFIG_DIR` retain that login's attribution and status prints `~/.claude holds a login; run accounts.py cutover-home`. After cutover they have no account; a stale status-line label does not identify them. Unscoped helpers, including the message relay, retain the legacy launch without an account setting until this machine cuts over. Afterwards they keep the caller’s numbered folder or select the showrunners group.
 
-In a terminal on the machine being changed, after its legacy sessions have stopped:
+On Linux, in a terminal after its legacy sessions have stopped:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
 ```
 
-This moves the login into `~/.claude2` by rename, refuses an occupied destination and live legacy sessions, and journals the operation before moving identity files. Rerun after an interruption to finish. `cutover-home --undo` reverses it after sessions on the destination stop. No live cutover is part of installing this code. The Mac keeps its current home-login attribution until its own cutover.
+On Linux this moves the login into `~/.claude2` by rename, refuses an occupied destination and live legacy sessions, and journals the operation before moving identity files. Rerun after an interruption to finish. `cutover-home --undo` reverses it after sessions on the destination stop. No live cutover is part of installing this code. natedev cut over on 2026-10-15: there `~/.claude` holds no login and claude2's login lives in `~/.claude2`. The Mac keeps its current home-login attribution until its own cutover.
+
+For the Mac's separate step, the director first prepares `~/.claude2` and arranges for legacy sessions to stop. The user launches that numbered account and runs `/login` once inside it:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude2
+```
+
+After the new login is checked, exit that session and run:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
+```
+
+The command checks that the new and legacy logins are the same account before changing anything. It keeps the shared seed's other settings, removes its `oauthAccount`, and removes only the old local `Claude Code-credentials` keychain copy by service name. The server login is untouched. Never `/logout`. Named-folder usage readings use that folder's own keychain entry and never fall back to the old copy. An interrupted cutover can be finished by rerunning the command. On the Mac, `--undo` restores the home identity settings; signing in to `~/.claude` again requires `/login`, as its output explains.
 
 Historical `default` or `~/.claude` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
 
@@ -244,15 +266,19 @@ One account serves every unit's Codex workers, including the `codex exec` fallba
 /showrunner:accounts swap workers codex2
 ```
 
-A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working worker finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the worker starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
+A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A running worker's turn is interrupted and the same thread resumes on the new account immediately, including when its launcher has gone. The continuation tells it to rerun any command stopped by the interruption. Its pass and the director's wait continue unchanged. A sign-in change also interrupts and resumes running workers on a fresh server. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses an account-move resume, the swap reports the worker's failure and its manual resume command. An unreadable thread state or unconfirmed release starts no replacement turn.
 
-`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role workers codexN` selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
+A swap prints `Workers moving <source> → <target>:` and one showrunner · unit · worker → target line per worker. A worker that was mid-turn adds `, interrupted and resumed`. An interrupt or resume failure names that worker, the failed step and its manual resume command; other workers still move and the selected role stays changed. `--dry-run` uses `Workers would move` with the same worker lines and interrupts nothing, with no role or history write. `set-role workers codexN` selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
+
+Swaps and sign-in changes leave ended sessions' workers alone, even when their launchers survive. A run stays live while any holder session is running, with or without a messaging socket; a run with no holder stays live only while a worker launcher is alive. Ended runs have no worker rows or holder notices. Their outgoing servers are checked for safe shutdown, and the output says `N leftover servers from ended sessions, M stopped`. Busy servers stay running and get a `left running: <pid> on port <port> (<run folder>): <reason>` line. A preview stops nothing and says `N leftover servers from ended sessions: M can be stopped, K would stay`, with a `would stay:` line for each busy server.
+
+Worker rows fold by holder session and slot, across plans and run folders. A folded row shows ` ×N`, followed by `, K interrupted and resumed` when K entries were mid-turn. Every failed entry retains its own row, reason and manual resume command.
 
 Refusals leave both the role and history unchanged. A home-check failure names the file, link, login or duplicate sign-in to fix; rerun setup or correct that home's sign-in. An already-selected account needs no swap. An account used up with no credits needs a different target, credits or its reset. Unknown or expired usage needs a fresh reading before trying again. Selecting the numbered account held in `~/.codex` requires a real, signed-in home whose login no other home holds; its shared entries remain real files and directories.
 
 ## Automatic Codex moves
 
-A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `workers` role through the `swap workers` path; each worker moves after its live turn ends and continues the refused work before held messages.
+A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `workers` role through the `swap workers` path; running workers are interrupted and resumed on that account, continuing the refused work before held messages.
 
 When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume, and records waits, failures and renewed room.
 
