@@ -904,16 +904,21 @@ def _setup_codex_home(label: str) -> list[str]:
             ]
     problems = _link_codex_home(label)
     if not problems:
-        print(
-            f"Wait for {label} ({_codex_folder(destination)}) to finish its shared session index "
-            + "and answer initialize; an interrupted index can hold startup for 15 minutes, "
-            + f"then indexing must finish; limit {agent_accounts.CODEX_HOME_PREPARATION_SECONDS / 60:g} minutes.",
-            flush=True,
-        )
-        prepared = asyncio.run(agent_accounts.prepare_codex_home(destination))
+        prepared = _prepare_codex_home(label)
         if isinstance(prepared, agent_accounts.CodexHomePreparationFailed):
             problems.append(f"accounts: {prepared.problem}")
     return problems
+
+
+def _prepare_codex_home(label: str) -> agent_accounts.CodexHomePreparation:
+    destination = codex_setup_home(label)
+    print(
+        f"Wait for {label} ({_codex_folder(destination)}) to finish its shared session index "
+        + "and answer initialize; an interrupted index can hold startup for 15 minutes, "
+        + f"then indexing must finish; limit {agent_accounts.CODEX_HOME_PREPARATION_SECONDS / 60:g} minutes.",
+        flush=True,
+    )
+    return asyncio.run(agent_accounts.prepare_codex_home(destination))
 
 
 def _link_codex_home(label: str) -> list[str]:
@@ -2418,6 +2423,13 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
         _record_home_cutover(journal)
         journal["state"] = "complete"
         _atomic_write(path, json.dumps(journal) + "\n")
+        prepared = _prepare_codex_home(label)
+        if isinstance(prepared, agent_accounts.CodexHomePreparationFailed):
+            raise AccountsError(
+                f"accounts: {_codex_folder(destination)} login moved, but its shared session index is not ready "
+                + f"({prepared.problem}); run accounts.py setup {label} to finish the index"
+            )
+        print(f"{label} ({_codex_folder(destination)}) login moved; shared session index ready.")
 
 
 def cutover_home(label: str = "", *, undo: bool = False) -> None:
