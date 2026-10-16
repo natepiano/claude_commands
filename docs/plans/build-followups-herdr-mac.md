@@ -1,6 +1,6 @@
 # herdr on the Mac
 
-> **Status: IMPLEMENTATION PLAN — one phase, delegate-ready.** Moved out of `docs/plans/build-followups-herdr-adoption.md` (its Phase 12) by the showrunner, 2026-10-15. The herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
+> **Status: IMPLEMENTATION PLAN — one phase, delegate-ready.** Moved out of `docs/plans/build-followups-herdr-adoption.md` (its Phase 13) by the showrunner, 2026-10-15. The herdr library, standalone launcher and restart work on the Mac, with launchd in place of systemd.
 
 > **As-built disposition: update** — `docs/as-built/herdr-adoption.md` gains a "herdr on the Mac" section
 
