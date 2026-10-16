@@ -465,28 +465,21 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 15 — herdr sessions across machines  · status: done
 
-**Depends on:** Phase 19
+#### As-built
 
-**User sees:** before — herdr sessions on natedev and on the Mac are separate; each machine sees only its own. After — from either machine, the user can bring a session from the other machine into reach and attach to it, kept simple: adding a session from the other machine may be a manual step the user takes per session.
-
-#### Work Order
-
-**Goal:** the simplest working way to reach a herdr session on the other machine from this one, found by research first and kept small (user, 2026-10-16: "it's fine if it does research and i don't want it to be overly complicated - it can be the case that i manually add sessions that i want from another system").
-
-**Spec:**
-
-1. Research (done, 2026-10-16): herdr 0.9.0 on both machines has native remote attach, `herdr --remote <ssh-target> --session <name>`, and saved machines (`herdr machine add|list|remove`, where `add` changes the remote server). ssh works both ways without a prompt (natedev to `mac`, the Mac to `natedev`). Settled design (showrunner, 2026-10-16): a thin wrapper over herdr's own remote attach — no saved machines, no stored state, no sync.
-2. `herdr_sessions.py list --on <host>` lists that host's herdr sessions by running the same list over ssh (`ssh <host> herdr_sessions.py list`, through the host's `~/.claude/scripts/lib/py`). `herdr_sessions.py attach-remote <host> <name>` replaces the process with `herdr --remote <host> --session <name>`. Remote is its own verb and flag: no optional host whose absence means local, and local `list` and `attach` stay unchanged. An unreachable host or a failed remote list prints one line naming the host and exits 1, never a traceback.
-3. Live check on both machines: attach from natedev to a Mac session and from the Mac to a natedev session.
+- `herdr_sessions.py list --on <host>` runs `ssh <host> ~/.claude/scripts/lib/py ~/.claude/scripts/herdr/herdr_sessions.py list` with a 15 s bound (`REMOTE_LIST_TIMEOUT`) and prints the remote rows. A timeout, an `OSError` or a nonzero ssh exit prints one stderr line naming the host and returns 1, never a traceback.
+- `herdr_sessions.py attach-remote <host> <name>` execs `herdr --remote <host> --session <name>`, using the same `herdr.herdr_binary()` resolver as local `attach`; later failures are herdr's own output.
+- `RemoteHost` (frozen dataclass, field `target`) rejects an empty, option-like (leading `-`) or whitespace-bearing ssh target with `ValueError`.
+- Remote is its own verb and flag; local `list` and `attach` are unchanged. `--help` describes both remote forms.
+- No saved machines, stored state or sync: a session on the other machine is opened on demand, per session.
 
 **Files:**
-- `scripts/herdr/herdr_sessions.py` — remote entries, list, attach.
-- `scripts/herdr/test_herdr_sessions.py` — remote entry add, list, ssh attach argv.
+- `scripts/herdr/herdr_sessions.py` — `RemoteHost`, `_remote_list`, `_attach_remote`, and the `list --on` / `attach-remote` dispatch in `_main`.
+- `scripts/herdr/test_herdr_sessions.py` — ssh argv, failure, timeout, exec and target-validation regressions.
 
-**Workers:** 1 writer.
-- `impl` — `herdr_sessions.py`, `test_herdr_sessions.py`.
+**Gotchas:** `list --on` runs the remote machine's installed `~/.claude` code, not this branch, so both machines need the promoted code before the remote list reflects a change.
 
-**Acceptance gate:** `merge_gate.py --tests-only` green; `basedpyright scripts/herdr` prints `0 errors, 0 warnings`; the Spec 3 live check passes both ways.
+**Ruled out:** herdr's `machine add` registry, which changes the remote server; two-way session mirroring or sync of any kind.
 
 ### Phase 16 — herdr and shutdown tests green on the Mac  · status: done
 
