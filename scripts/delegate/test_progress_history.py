@@ -4424,6 +4424,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             if event.get("event_type") == "eta_stated"
         ]
         self.assertEqual(len(events), 2)
+        self.assertEqual([event.get("eta_phase_id") for event in events], ["3", "3"])
         self.assertEqual(
             events[0].get("eta_at"),
             datetime(2026, 10, 8, 13, tzinfo=UTC).timestamp(),
@@ -4442,6 +4443,52 @@ print('two homes isolated; recorder lock retained; caller restored')
             events[1].get("eta_latest_at"),
             datetime(2026, 10, 8, 14, 30, tzinfo=UTC).timestamp(),
         )
+
+    def test_eta_can_target_the_next_phase_while_another_is_active(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-next-phase", now - 100)
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir),
+            "--phase-id", "2", "--phase-title", "Current delivery",
+            at=now - 50,
+        )
+        active_phase = self.read_state(session_dir)["phase"]
+
+        output = self.run_command(
+            "eta", "--session-dir", str(session_dir),
+            "--phase-id", "3", "--time", "13:00", "--basis", "checkpoint",
+            at=now,
+        )
+
+        events = [event for event in self.read_events("eta-next-phase")
+                  if event.get("event_type") == "eta_stated"]
+        self.assertEqual(output, "ETA recorded: 13:00 UTC")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].get("eta_phase_id"), "3")
+        self.assertEqual(events[0].get("phase_id"), "2")
+        self.assertEqual(events[0].get("basis"), "checkpoint")
+        self.assertEqual(
+            events[0].get("eta_at"),
+            datetime(2026, 10, 8, 13, tzinfo=UTC).timestamp(),
+        )
+        self.assertEqual(self.read_state(session_dir)["phase"], active_phase)
+
+    def test_eta_can_target_a_phase_without_an_active_phase(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-before-phase", now - 100)
+
+        _ = self.run_command(
+            "eta", "--session-dir", str(session_dir),
+            "--phase-id", "3", "--time", "13:00", "--basis", "checkpoint",
+            at=now,
+        )
+
+        events = [event for event in self.read_events("eta-before-phase")
+                  if event.get("event_type") == "eta_stated"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].get("eta_phase_id"), "3")
+        self.assertFalse(events[0].get("phase_id"))
+        self.assertIsNone(self.read_state(session_dir)["phase"])
 
     def test_eta_uses_the_process_timezone(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
@@ -4472,12 +4519,37 @@ print('two homes isolated; recorder lock retained; caller restored')
             datetime(2026, 10, 8, 20, tzinfo=UTC).timestamp(),
         )
 
+    def test_short_eta_uses_the_users_local_calendar_date(self) -> None:
+        now = int(datetime(2026, 10, 8, 2, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-local-date", now - 100)
+        self.start_phase(session_dir, now - 50)
+
+        output = self.run_command(
+            "eta", "--session-dir", str(session_dir),
+            "--time", "20:00", "--basis", "eta-command",
+            at=now, zone="America/Los_Angeles",
+        )
+
+        events = [event for event in self.read_events("eta-local-date")
+                  if event.get("event_type") == "eta_stated"]
+        self.assertEqual(output, "ETA recorded: 20:00 PDT")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            events[0].get("eta_at"),
+            datetime(2026, 10, 8, 3, tzinfo=UTC).timestamp(),
+        )
+
     def test_eta_refuses_invalid_times_without_recording_an_event(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
         cases = (
             (
                 "past",
                 ["--time", "2026-10-08T11:59"],
+                "--time must not be in the past",
+            ),
+            (
+                "past-short-time",
+                ["--time", "11:59"],
                 "--time must not be in the past",
             ),
             (
@@ -4601,7 +4673,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             )
         )
 
-    def test_eta_requires_an_active_phase(self) -> None:
+    def test_eta_requires_an_active_phase_without_an_explicit_phase_id(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
         session_dir = self.start_run("eta-no-phase", now - 100)
 
