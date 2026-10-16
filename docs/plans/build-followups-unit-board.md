@@ -184,35 +184,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 **Acceptance gate:** `tsc`, `command claude plugin validate --strict mods/unit-board` and `command claude plugin test mods/unit-board` exit 0; the live check's captures match the mockups' layout.
 
-### Phase 5 — Accounts view  · status: todo
-**Depends on:** 4
-
-#### Work Order
-
-**Goal:** `/accounts-board` opens a pane drawing what `accounts.py` prints — the units/showrunners line, the accounts table, the problems under it — straight from disk to the screen, current while open, with nothing running while closed.
-
-**Spec:**
-- **Data split.** In `scripts/accounts/accounts.py`, pull `status_rows(*, stored_only: bool) -> StatusRows` out of `status_report` (3675–3729): `group_line` (`group_status_line`, 1874), `headings` (`TABLE_HEADINGS`, 186–189), `rows` (the `_table_row` 3613 / `_codex_row` 3629 tuples), `notes` (3712–3722). `status_report` renders from it, text output unchanged byte for byte.
-- **`accounts.py status --json [--stored]`** prints `{"group_line", "headings", "rows", "notes", "sources"}` on one line. `sources`: `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json`, `~/.claude/config/accounts.json`, and `role_map_cache.json` where it exists. `--stored` reads stored data only: `_stored_usage` (3526–3554) skips every live read (no `claude auth status`, no HTTPS usage call, no `codex app-server`, no `usage.json` rewrite), and `read_role_map` uses the local cache instead of the `ssh natedev` call off natedev. A stale reading keeps its old `Read` time; the table already shows that.
-- **Mod** (in `mods/unit-board/`, module `hooks/accounts.tsx`, wiring in `register.tsx`): `session.start` also registers `/accounts-board` (and restarts its refresh when `$.ui.list()` shows the pane open). `/accounts-board` runs `accounts.py status --json` once (a full read), opens pane `accounts-board` (title `Accounts`) and draws the line, the table (the nine headings, theme colours: a weekly left under 10 % `error`, under 25 % `warning`) and the notes. `/accounts-board close` closes it. The command result text is `Accounts opened.` and never carries table data.
-- **Refresh while open only.** `$.clock.every(10_000)` stats `sources`; on a newer mtime run `accounts.py status --json --stored` once and redraw. `usage.json` moves about every 2 min (the `agent-sessions-snapshot` timer), so an open pane runs one stored-only read per move and none between. `ui.close` cancels the timer; `turn.complete` does nothing for this pane. Closed: no timer, stat or process.
-- **Logins stay out of model text.** The JSON is read by the mod and drawn; it is never returned as a command or tool result, written to `$.ui.log`, or sent in a message. The unit director's live check captures the pane to a file under the scratchpad and confirms it by line count and headings only, never pasting rows into a reply.
-- **Tests.** Python: `status --json` matches the text report's rows and notes; `--stored` makes no subprocess or network call (patch `subprocess.run`, the usage fetch and the codex reader to fail the test if called) and no `usage.json` write. Mod: `/accounts-board` opens and draws a fixture; a changed `usage.json` mtime runs the stored read once; closed → nothing on a fake-clock minute; the command result holds no login.
-
-**Files:**
-- `scripts/accounts/accounts.py` — `status_rows`, `--json`, `--stored`.
-- `scripts/accounts/test_accounts.py` — the Python cases.
-- `mods/unit-board/hooks/accounts.tsx`, `hooks/register.tsx`, `types/accounts.d.ts`, `tests/accounts.test.ts`.
-
-**Workers:** 2 writers
-- `impl` — `scripts/accounts/accounts.py` and its test (the Python split and its test move together); hub: `scripts/accounts/accounts.py`.
-- `test` opens as `impl` — `mods/unit-board/hooks/accounts.tsx`, `types/accounts.d.ts`, `tests/accounts.test.ts`; hub: `mods/unit-board/hooks/register.tsx` (two wiring lines).
-
-**Constraints from prior phases:** the mod's layout, `register.tsx` wiring-only rule, the open/close and closed-quiet pattern, the 10 s stat refresh and the test kit usage come from Phase "The board mod"; reuse its stat-and-run helper in `hooks/data.ts`.
-
-**Acceptance gate:** the Test and Lint lines of Delegation Context green; `tsc`, `command claude plugin validate --strict mods/unit-board` and `command claude plugin test mods/unit-board` exit 0; live check: `/accounts-board` in the throwaway session draws the table, touching `usage.json` redraws within 10 s, and closing it stops every stat.
-
-### Phase 6 — Shorter terminal report  · status: todo
+### Phase 5 — Shorter terminal report  · status: todo
 **Depends on:** 4
 
 #### Work Order
@@ -234,3 +206,29 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 **Constraints from prior phases:** the phase record (`first_eta`, `moves`, `delta_minutes`, `fix_rounds`) and the gate text come from `phase_table`; the board command is `/unit-board`.
 
 **Acceptance gate:** the Test and Lint lines of Delegation Context green.
+
+### Phase 6 — Accounts view  · status: todo
+**Depends on:** 4
+
+#### Work Order
+
+**Goal:** `/accounts-board` opens a pane showing the units/showrunners line, the accounts table with each login's address, and the problems under it, drawn from disk straight to the screen, current while open, with nothing running while closed.
+
+**Spec:**
+- **Starts after** two-accounts-unit's `accounts.py status --json` is promoted to main (the showrunner says when; set by the showrunner 2026-10-16). That JSON is the data source; never parse the text table. Its shape: `accounts` rows with `label`, `tool`, `role`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits`, `read_at`, plus `problems`; it carries no login addresses. Copy its exact field types into `mods/unit-board/types/accounts.d.ts` from the merged code.
+- **Refresh runs must not read live.** A plain `status --json` reads any login whose stored reading is over 10 min old live (`_stored_usage`, `accounts.py` 3526–3554: `claude auth status`, an HTTPS usage call, `codex app-server`; off natedev also `ssh natedev` for the role map). The open run may do that once. Each refresh run uses a stored-only mode (`--stored`: no live read, no `usage.json` rewrite, the local role-map cache off natedev). If two-accounts-unit's JSON has no such mode, the showrunner arranges it with two-accounts-unit (the owner of `accounts.py`) before this phase starts; this phase does not edit `accounts.py`.
+- **Login addresses on screen, never in model text.** The mod reads them itself, once on open, and only draws them: for a `claude<N>` label `oauthAccount.emailAddress` from `$HOME/.claude<N>/.claude.json` (about 100 KB); for a Codex label the `email` claim of `tokens.id_token` in `$HOME/.codex<N>/auth.json` (`$HOME/.codex` for an unnumbered label): decode only the JWT payload's `email` (base64url, in `hooks/accounts.tsx`) and keep nothing else from the file. A missing or unreadable file shows `—`. The address never goes into a command result, `$.ui.log`, a toast or a message.
+- **Mod** (`hooks/accounts.tsx`, wiring in `register.tsx`): `session.start` also registers `/accounts-board`, and restarts its refresh when `$.ui.list()` shows the pane open. `/accounts-board` runs `status --json` once, reads the login files, opens pane `accounts-board` (title `Accounts`), and draws: the units/showrunners line built from the `role` fields; the table (Label, Login, Role, Weekly left, Weekly resets, On credits, Credits left, Read; weekly left under 10 % `error`, under 25 % `warning`); the problems under it. `/accounts-board close` closes it. The command result text is `Accounts opened.` only.
+- **Refresh while open only.** `$.clock.every(10_000)` stats `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json` and `~/.claude/config/accounts.json`; on a newer mtime run the stored-only `status --json` once and redraw. `usage.json` moves about every 2 min (the `agent-sessions-snapshot` timer), so an open pane runs one stored read per move and none between. Login files are not re-read (they change only on login or logout; reopening reads them). `ui.close` cancels the timer; `turn.complete` does nothing for this pane. Closed: no timer, stat or process. Reuse the board's stat-and-run helper in `hooks/data.ts`.
+- **Tests** (`tests/accounts.test.ts`): `/accounts-board` opens and draws a fixture with addresses from fixture login files; the JWT decode returns the `email` claim; a changed `usage.json` mtime runs the stored read once and an unchanged one runs nothing; closed → nothing over a fake-clock minute; the command result holds no address.
+- **Live check:** in the throwaway session, `/accounts-board` draws the table; touching `usage.json` redraws within 10 s; closing stops every stat. Capture the pane to a scratchpad file and confirm it by headings and row count only, never pasting rows into a reply or message.
+
+**Files:** `mods/unit-board/hooks/accounts.tsx`, `hooks/register.tsx`, `types/accounts.d.ts`, `tests/accounts.test.ts`.
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `hooks/accounts.tsx`, `types/accounts.d.ts`; hub: `mods/unit-board/hooks/register.tsx` (two wiring lines).
+- `test` — `tests/accounts.test.ts` from the Spec and a fixture in the merged JSON's shape.
+
+**Constraints from prior phases:** the mod's layout, `register.tsx` wiring-only rule, the open/close and closed-quiet pattern, the 10 s stat refresh, the `hooks/data.ts` helper and the test kit usage come from Phase "The board mod".
+
+**Acceptance gate:** `tsc`, `command claude plugin validate --strict mods/unit-board` and `command claude plugin test mods/unit-board` exit 0; the live check above.
