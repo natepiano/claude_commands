@@ -202,71 +202,35 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 8 — Standalone sessions in herdr  · status: done
 
-**Depends on:** Phase 7
-
-**User sees:** before — a standalone `claude` runs straight in a ghostty window, and the shutdown verbs need an account and `/shutdown`; after — `herdr-claude [name]` opens a standalone Claude in its own herdr session in the current terminal, `continue` does the same with `--continue`, a restart brings a ghostty standalone back in herdr in a ghostty window attached to it, and `agents down`, `agents restart` and `agents status` work from any terminal with or without an account.
-
-#### Work Order
-
-**Goal:** standalone Claude sessions start and restart in their own herdr sessions, and the shutdown verbs run from the terminal as `agents`.
-
-**The `agents` command (the user, 2026-10-14).** "i don't think we'l need agent-sessions-restore if we just have /shutdown restart" and "i think we should use agents at the command line - agents down agents restart - agents status". This phase adds `agents` and the account-optional verbs (Spec 7). Restore after a crash or reboot, and the retirement of `agent-sessions-restore`, are Phase 9.
-
-- Fencing: shutdown-unit's restart-in-place work has landed on build-followups (its Phases 3 to 5). Merge origin/build-followups before dispatch.
-- From shutdown's as-built (showrunner, 2026-10-14): Ghostty and Mac `terminal` hosts run under the relaunch supervisor and restart in the same window; a new window is only the fallback when the supervisor is gone. Spec 4 keeps that: a window host restarting into herdr has its supervisor run `herdr session attach <name>` in the same window, and only a host with no supervisor gets a new window.
-- The system `shutdown` (systemd poweroff) stays untouched; `/shutdown` stays the in-Claude form; the `agents` PATH wrapper in `/etc/nixos` is the showrunner's.
-
-**Spec:**
-
-1. `herdr.py`:
-   - `start_agent` (method and module; `agent_arguments` from Phase 6) takes `opening: OpeningPrompt | NoOpeningPrompt` (frozen dataclasses; `OpeningPrompt(text)`) in place of `opening_prompt: str`. `NoOpeningPrompt` sends no `agent prompt` and no keys; today the method calls `self.prompt(pane, opening_prompt)` unconditionally (406). The busy-pane retry (`agent_pane_busy`, 387) stays. Every caller passes one: `add_unit.py`, `add_showrunner.py`, `restart.py` `_herdr_launch` pass `OpeningPrompt`.
-   - Session names map one-to-one to systemd units: today `server_unit` (542) maps every character outside `[A-Za-z0-9_.-]` to `-`, so `a b` and `a-b` share `herdr-a-b`. Names follow herdr's own contract (`validate_name` in herdr's `src/session.rs`): nonempty ASCII `[A-Za-z0-9_.-]+`, at most 64 bytes, never `.` or `..`. `server_unit`, `start_server`, `start_new_server` and `stop_session` refuse any other name with `ValueError` naming the contract; `server_unit` is then `herdr-<name>`. `generated_session_name(text, suffix)` maps other characters to `-`, cuts the result so `-<suffix>` still fits in 64 bytes, and maps `.` and `..` to `-`; Spec 2's default name and Spec 4's restart name use it.
-   - `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)`: the user's processes under `HERDR_PROC` whose argv runs an interactive client attached to that session: `herdr session attach <name>`, or the default TUI (herdr global options with `--session <name>` and no subcommand). Every noninteractive subcommand (`server`, `pane read`, `agent list`, `status` and the rest) is excluded, and tests cover those exclusions. An unreadable `/proc` is `ClientsUnreadable`.
-   - `open_pane` always adds `HERDR_AGENT_PANE=1` to the pane environment. `herdr agent start` types a bare `claude` at the pane's zsh, and the user's `claude` alias prepends its own `--remote-control` and `--settings`. Since /etc/nixos 7dd42a7 (showrunner, 2026-10-15) that alias is defined only when `HERDR_AGENT_PANE` is empty. Test: every opened pane's environment carries it. Live: after the user's rebuild, a herdr unit's `pane process-info` argv holds one `--remote-control`.
-2. `herdr_sessions.py` gains:
-   - `start [--name N] [--cwd D] [-- <claude args>]`: name defaults to `generated_session_name(<cwd basename>, ...)`; a taken generated name (`SessionTaken` from `start_new_server`) retries with the next suffix. An explicit name outside the contract, or one whose server already runs, is refused. Refuses an untrusted folder (`claude_trust`, printing `trust_command`; the account from `CLAUDE_CONFIG_DIR` or the default). Admission as Spec 3, as new work. `start_new_server` (exclusive, as Phase 7's launchers; never the adopting `start_server`); `open_pane` with the selected account's pane variables (`named_account_environment(dir)` for a named account, none for the default) beside `HERDR_AGENT_PANE`; then the names that must be unset (`CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN` for the default account) are checked against `server_environment(name)` as `_herdr_launch` does (restart.py 1068), refusing with the server stop command; `start_agent(kind="claude", agent_arguments=[*claude args, "-n", name], opening=NoOpeningPrompt())` (the user types; busy-start retry kept); then execs `herdr session attach <name>`.
-   - `resume <name> --session-id <id> --cwd <dir> [--config-dir <dir>] [--restore] [--prompt-file <path>] [--attach] [-- <claude args>]`: the same with `--resume <id>` and the passed Claude arguments (model, settings, Remote Control), by hand. `--prompt-file` is read once and sent as `OpeningPrompt` (multiline text goes through `agent prompt`, never the start argv); without it, `NoOpeningPrompt`. `--restore` makes the admission a restore of that recorded session. No attach unless `--attach`.
-3. Admission for `start` and `resume`, before any server starts, as unit launchers do: hold `launch_barrier()` and ask `launch_permission(environment, purpose)` (`scripts/shutdown/launch_permission.py`) with the selected account's environment. New work passes `NewWorkLaunchPurpose()`; `resume --restore` passes the restore purpose. `BlockedByShutdown` and `ShutdownStateUnreadable` exit 1 with the reason; a barrier `OSError` is unreadable state.
-   - The restore purpose is renamed first, by the shutdown writer, before either lane changes a consumer: `ShutdownUnitRestoreLaunchPurpose` (`launch_permission.py` 24, documented as restoring a shutdown-recorded unit) becomes `RecordedSessionRestoreLaunchPurpose(session_id)`, documented as restoring any session a shutdown record holds. Its docstring and `shutdown.py launch_blocked` (259) state the cases: a record in a restorable progress (`stopped`, `already gone`, `process identity lost`, `restarting`, `restart failed`, `manual restart`) permits its restore while the account is held; a record in any other progress is held; with no record, the account hold alone decides, as for new work (no hold permits, a hold blocks), so the purpose alone never proves a restore was authorized. Tests in `test_shutdown_cli.py` cover those cases, with and without a hold. Consumers then switch: `add_unit.py` and `herdr_sessions.py`.
-4. `restart.py`:
-   - A `ghostty` or `zed` host restarts into herdr in-process: `_herdr_launch(parts, NewHerdrSession(<herdr name>), ...)` with the full `ResumeParts` (recorded model, settings, Remote Control arguments, account), its opening prompt as `OpeningPrompt`, delivered once, and `_record_scheduled_restart_prompt` called once. The herdr name is `generated_session_name(<Claude session name>, ...)` with no suffix retry; a running herdr session of that name is an occupied destination and a refusal. Then the host's relaunch supervisor runs `herdr session attach <name>` in the same window; only a host whose supervisor is gone gets a new ghostty window running it on the recorded desktop (the existing window opener with the new command).
-   - A `herdr` host (a standalone started by `start`) reopens a window when it had one: `HerdrHost` gains `presentation: "attached window" | "detached"`, recorded at inventory time from `attached_clients` (`ClientsUnreadable` and old records read as `"detached"`). On restart an `"attached window"` host gets one ghostty window running `herdr session attach <name>`; a `"detached"` host prints `herdr session attach <name>`. Today the herdr branch of `_launch_session` (1125–1128) returns without a window.
-   - The Mac `terminal` host is unchanged until the Mac unit (`docs/plans/build-followups-herdr-mac.md`).
-5. The nightly review keeps its merged design: `nightly-review-unit` is the permanent unit of one production, `tonight` (`nightly_review.py` 274) starts it through `add_unit.py --production <doc> nightly-review --permanent` when it is gone and sends the dated job (`job`, 227) to its socket. Since Phase 7 that launch opens herdr session `nightly-review` (`add_unit.host_session_name`). No nightly server, ownership mark or retirement lifecycle is added; `nightly_review.py` and its test do not change. Host-facing text only: `commands/nightly_review.md` (line 46, "the user may attach") names `herdr session attach nightly-review`.
-6. **Outside this repo (the showrunner's, in `/etc/nixos`; no worker makes these):**
-   - `/etc/nixos/modules/common/shell.nix`: `herdr-claude() { ~/.claude/scripts/lib/py ~/.claude/scripts/herdr/herdr_sessions.py start "$@"; }` and `alias continue='herdr-claude -- --continue'` inside the existing `CLAUDECODE` guard.
-   - `/etc/nixos/modules/linux/nightly-review.nix`: herdr in its packages beside tmux; the comment (line 13, `tmux attach -t nightly-review`) names `herdr session attach nightly-review`.
-   - An `agents` command on PATH: `agents <verb> [args]` runs `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> [args]` for `down`, `restart`, `status`, `cancel`, `now` and `follow`.
-7. Account optional on `down`, `restart` and `status`: with none given, the verb runs for every configured Claude account (for `restart`, every account with a shutdown record; Phase 9 adds accounts with a recovery snapshot). One account named keeps today's form. `--only` and `--here` work in both forms. `commands/shutdown.md` names `agents` as the terminal form beside `/shutdown`.
+#### As-built
+- `herdr.py`: `start_agent(..., opening: OpeningPrompt | NoOpeningPrompt)` (frozen dataclasses; `NoOpeningPrompt` sends no prompt or keys); session names follow herdr's contract (`[A-Za-z0-9_.-]{1,64}`, never `.`/`..`), checked by `_validate_session_name`, and `server_unit(name)` is `herdr-<name>.service`; `generated_session_name(text, suffix="")` maps other characters to `-` and fits `-<suffix>` in 64 bytes; `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)` counts interactive `session attach` and TUI clients (argv `--session` first, then `HERDR_SESSION`); `open_pane` adds `HERDR_AGENT_PANE=1` to every pane.
+- Discovery names a server's session by the listening socket it owns, never its argv; handoff survivors come from the dedicated unit cgroup, or in a shared terminal scope from server-reported shell pids (`_pane_shell_pids`, via `pane list` and `pane process-info`).
+- `herdr_sessions.py start [--name N] [--cwd D] [-- args]` and `resume <name> --session-id --cwd [--config-dir] [--restore] [--prompt-file] [--attach] [-- args]`: trust check, `launch_barrier` plus `launch_permission` (`NewWorkLaunchPurpose`, or `RecordedSessionRestoreLaunchPurpose(session_id)` with `--restore`), exclusive `start_new_server` (a generated name retries the next suffix), must-be-unset check against `server_environment`, `start_agent` with `-n <name>`; `start` then execs `herdr session attach`.
+- `restart.py`: a ghostty or zed host restarts into `NewHerdrSession(generated_session_name(<Claude name>))`; a live ghostty supervisor runs `herdr session attach <name>` in the same window, otherwise a new ghostty window opens. A herdr host with `presentation: "attached window"` gets a window only when `attached_clients` reports none; `"detached"` or unreadable prints the attach command. A failed window open appends to the record's `restart_issues` and leaves the agent launched.
+- `shutdown.py`: `down`, `restart` and `status` run with no account; `restart` covers every account with a session record or an account hold on either machine, the other verbs every configured Claude login. `agents <verb>` on PATH is the terminal form.
 
 **Files:**
-- `scripts/herdr/herdr.py` — `OpeningPrompt | NoOpeningPrompt`, name contract, `generated_session_name`, `attached_clients`, `HERDR_AGENT_PANE`.
-- `scripts/herdr/test_herdr.py` — promptless start logs no prompt or keys; `a b`, `.`, `..` and a 65-byte name refused, starting or stopping `a-b` touches only `herdr-a-b`; generated names fit 64 bytes with a suffix; attached clients counted, noninteractive subcommands excluded; every opened pane carries `HERDR_AGENT_PANE`.
+- `scripts/herdr/herdr.py` — prompt types, name contract, `generated_session_name`, `attached_clients`, socket and handoff discovery, `HERDR_AGENT_PANE`.
 - `scripts/herdr/herdr_sessions.py` — `start`, `resume`, admission.
-- `scripts/herdr/test_herdr_sessions.py` — both verbs, trust refusal, generated-name collision retried and explicit occupied name refused, invalid names, the account's pane variables, a server carrying a must-be-unset variable refused, held account, unreadable shutdown state, permitted restore, all before any agent starts; multiline `--prompt-file` sent once.
-- `scripts/production/add_unit.py` — passes `OpeningPrompt`; the renamed restore purpose.
-- `scripts/production/test_add_unit.py` — follows `OpeningPrompt`.
-- `scripts/production/add_showrunner.py` — passes `OpeningPrompt`.
-- `commands/nightly_review.md` — attach line.
-- `scripts/shutdown/launch_permission.py` — `RecordedSessionRestoreLaunchPurpose`.
-- `scripts/shutdown/shutdown.py` — `launch_blocked` with the renamed purpose; account optional.
-- `scripts/shutdown/test_shutdown_cli.py` — restore purpose with and without a hold; no-account `down`, `restart` and `status`.
-- `scripts/shutdown/restart.py` — window hosts restart into herdr; herdr host presentation; `OpeningPrompt`.
-- `scripts/shutdown/test_restart.py` — window host with a recorded model and a multiline prompt; attached and detached herdr hosts.
-- `scripts/shutdown/inventory.py` — `HerdrHost.presentation`.
-- `scripts/shutdown/test_inventory.py` — presentation recorded and old records parsed.
-- `commands/shutdown.md` — `agents` as the terminal form.
-- `docs/as-built/shutdown-and-restart.md` — window and herdr hosts restart into herdr; `agents`; the restore purpose.
+- `scripts/shutdown/{launch_permission,shutdown,restart,inventory,record,settle}.py` — `RecordedSessionRestoreLaunchPurpose`, account-optional verbs, herdr restarts, `HerdrHost.presentation`, hold registration and ownership.
+- `scripts/production/{unit_lookup,add_unit,add_showrunner}.py`, `commands/{shutdown,nightly_review}.md`, `docs/as-built/shutdown-and-restart.md` — pid placement fallback, `OpeningPrompt`, `agents`, attach lines.
 
-**Workers:** 2 writers (no test lane; `test` opens as impl); split the herdr side against the shutdown side.
-- `impl` — `herdr.py`, `test_herdr.py`, `herdr_sessions.py`, `test_herdr_sessions.py`, the `add_unit.py`, `test_add_unit.py` and `add_showrunner.py` call sites, `commands/nightly_review.md`; hub: `scripts/herdr/herdr.py` (every caller imports the new types).
-- `test` (opens as impl) — `launch_permission.py`, `shutdown.py`, `test_shutdown_cli.py`, `restart.py`, `test_restart.py`, `inventory.py`, `test_inventory.py`, `commands/shutdown.md`, `shutdown-and-restart.md`; hub: `scripts/shutdown/launch_permission.py`. The renamed purpose lands first; `impl` switches `add_unit.py` and writes `herdr_sessions.py` admission after it.
+**Binds later work:**
+- `herdr.server_unit(name)` is `herdr-<name>.service`; any name outside the contract raises `ValueError` before a server starts or stops.
+- Session identity comes from the listening socket; handoff survivors are found through server-reported shell pids and the dedicated unit cgroup, never by reading every process environment.
+- `RecordedSessionRestoreLaunchPurpose` permits a restore only for a record in a restorable progress; with no record the account hold alone decides.
+- Account holds carry `request_ids` and `registering_request_ids`; `begin()` registers each request before inserting records, nothing releases a hold while a registration is pending, and only the owning `request_id` releases it (joined requests protect it).
+- Every pane carries `HERDR_AGENT_PANE=1`; callers pick `OpeningPrompt` or `NoOpeningPrompt` explicitly; restart names come from `generated_session_name` with no suffix retry; records carry `restart_issues`; restart reads `attached_clients` outcomes before opening any window.
 
-**Constraints from prior phases:** herdr is on PATH on natedev; launchers start in herdr through the exclusive `herdr.start_new_server` (`SessionTaken` for a taken name); `restart.py` `_herdr_launch(parts, destination: NewHerdrSession | RecordedHerdrPane, session, *, dry_run)` with `ResumeParts(cwd, environment, claude_arguments, opening_prompt, account)`, which refuses a server whose `herdr.server_environment(name)` carries a must-be-unset variable (1068); trust through `herdr.claude_trust` and `trust_command`; `herdr_sessions.py list` and `attach` exist. `launch_permission.py`: `launch_barrier`, `launch_permission`, `NewWorkLaunchPurpose`, `ShutdownUnitRestoreLaunchPurpose(session_id)`, outcomes `AllowedByShutdownState | BlockedByShutdown | ShutdownStateUnreadable`. The nightly review is the permanent unit `nightly-review-unit`, started through `add_unit.py --permanent`.
+**Gotchas:**
+- systemd appends `.service` to a bare unit name, so the suffix is explicit or `a` and `a.service` share a unit; an attach-started server's argv says `default`, so only the socket names its session.
+- Discovery skips a process whose cwd no longer resolves, so `unit_lookup` places a live registry pid with `herdr_place_of(pid)`; `HERDR_SESSION` selects a bare `herdr` client's session.
 
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr`, `scripts/production` and `scripts/shutdown` green; `basedpyright scripts/herdr scripts/production scripts/shutdown` prints `0 errors, 0 warnings`. Live (not a test): `herdr_sessions.py start --name herdr-standalone-check` in a trusted folder opens an attached Claude; a second `start --name herdr-standalone-check` is refused; `/shutdown --only herdr-standalone-check --restart` brings it back in a ghostty window attached to its herdr session; after the user's rebuild, `agents status` with no account lists every account. Remove the check session afterwards.
+**Ruled out:**
+- Matching pane ids from environments, because sessions sharing one scope can reuse the same ids.
+- Treating membership in a hold's `request_ids` as permission to release it; opening a window on every attached herdr restart, since the existing client already shows the session.
 
-### Phase 9 — One restore: agents restart after a crash  · status: todo
+### Phase 9 — One restore: agents restart after a crash  · status: done
 
 **Depends on:** Phase 8
 
@@ -290,6 +254,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
    Shared observations are collected once per pass for every account. The desktop map comes from the existing vault snapshot (`_snapshot_desktops(refresh=False)`, 1234): one pass never runs `agent-sessions-snapshot`, whose run refreshes account notes, prunes and commits. Timer enablement and pause and footer restoration intent are read without `conversation_pause.release` (`settle._pause_timers` 364 releases) and without stopping a timer. A partial observation never replaces recovery data, and unreadable liveness never means a session is absent.
 2. Recovery snapshot (`record.py`): `RecoverySnapshot {machine, login (canonical), taken_at, sessions: list[SnapshotSession]}`, one file per login at `<shutdown state>/snapshots/<login>.json` (temporary file, then rename; `_safe_login` applies). `SnapshotSession` holds the owner `Session`, its workers, its timer restores, `last_seen` and `state: "running" | "unresolved"`.
    - `shutdown.py snapshot`: a `PartialInventory` keeps every previous file and exits 1 naming the sources. A complete inventory rewrites each login's file: sessions seen now are `running`; a previous session not seen now becomes `unresolved` with its `last_seen` kept. A readable empty inventory never drops a populated snapshot's sessions: they stay `unresolved`, across reboot (the state directory is on disk).
+   - **Crash signal (showrunner, option 1, 2026-10-15).** Only a session that vanished with a crash signal is restored: the boot id changed, or its host is gone (the herdr or tmux server, or the terminal window process). A session whose host is still alive ended on its own and is dropped. Sessions stopped by `agents down` come back through shutdown's own record, never through the snapshot; the two paths stay separate. Tests cover reboot, host loss and a clean exit.
    - A session leaves the snapshot only when acknowledged: `agents restart` restored it (Spec 3), or `agents forget <name|id>` (`shutdown.py forget`) retired it. `agents status` lists unresolved sessions with their `last_seen` in the user zone.
    - Running `snapshot` changes nothing in any session.
 3. `shutdown.py restart` and internal `up` (`restart._up`, 1855) choose sources per session id:
@@ -307,8 +272,11 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
    - `agent-sessions-restore.py` and its wrapper (`agent-sessions.nix` 50–64) are removed once this phase merges and its live check passes.
    - The `agents` wrapper gains `forget`.
 
+6. **Standalone launches choose an account (two-accounts, 2026-10-15).** After two-accounts' Phase 32 cutover `~/.claude` holds no login. `herdr_sessions.py start` calls `accounts.account_for_unscoped_launch(os.environ)` (two-accounts Phase 31, 69952e72) before any herdr server or pane starts: `AccountsError` refuses with its message; `LegacyHomeLaunch` sets nothing; otherwise the pane gets `named_account_environment(selected.dir)` and trust is checked against that account's folder. An explicit `--config-dir` keeps priority. Delivered by two-accounts in its merge 7288c1b5 (resolving Phase 31 against Phases 7–8), which reached build-followups beside 69952e72; this branch takes it by merging build-followups right after the Phase 9 checkpoint, and that merge's gate runs both units' tests. two-accounts holds `cutover-home` until that merge lands.
+
 **Files:**
 - `scripts/message/sessions.py` — registry read with unreadable paths.
+- `scripts/herdr/herdr_sessions.py`, `scripts/herdr/test_herdr_sessions.py` — account resolution through the shared resolver (Spec 6).
 - `scripts/message/test_sessions.py` — an unreadable directory and record reported.
 - `scripts/shutdown/inventory.py` — `snapshot_inventory`, shared observations once, read-only timer and pause intent.
 - `scripts/shutdown/test_inventory.py` — each source failure makes a `PartialInventory`; a faulted production never yields a standalone; no `release` and no snapshotter run.
@@ -329,9 +297,35 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/message` and `scripts/shutdown` green; `basedpyright scripts/message scripts/shutdown` prints `0 errors, 0 warnings`. Live (not a test), after the user's rebuild: `shutdown.py snapshot` writes one file per login and changes no session; a throwaway herdr session `herdr-crash-check` (`herdr-claude --name herdr-crash-check` in a trusted scratch folder) is in it; with no shutdown record, stopping its herdr server by hand (`herdr --session herdr-crash-check server stop`, the crash) and running `snapshot` again leaves it `unresolved`; `agents restart` brings it back in herdr, prints `from snapshot taken ...`, answers a question about its earlier turn, and leaves it out of the snapshot. Remove the check session afterwards.
 
-### Phase 10 — Remove tmux from productions and sessions on Linux  · status: todo
+### Phase 10 — Phase 9 follow-ups: crash restore wording, status heading, failed herdr start  · status: todo
 
-**Depends on:** Phase 7, Phase 8, Phase 9
+**Depends on:** Phase 9
+
+**User sees:** before — `agents status` prints a crashed natedev session under the Mac's heading; a session restored after a crash is told it was restarted after `/shutdown`; a restore whose Claude exits at once waits 90 s and leaves an empty herdr session behind. After — the crashed session is listed under its own machine, the restored session is told it came back after a crash, and a failed start is reported at once with its new herdr session removed.
+
+Found by the Phase 9 live check (2026-10-15) after the third repair round; moved here under the landing rule.
+
+#### Work Order
+
+**Goal:** the three Phase 9 restore defects above are fixed, each with a regression test.
+
+**Spec:**
+1. `shutdown.py status` (text form) prints `_unresolved_snapshot_lines` for the local machine inside the local machine's section (the report at index 0), not after the last machine's section. Recovery snapshots are machine-local, so a remote section never carries them.
+2. `restart.restart_note` gives a record materialized from a recovery snapshot (`requested_by` kind `snapshot`) its own opening: restored after a crash, naming the crash signal the snapshot recorded (reboot, or its host was lost) and the last-seen time in the user zone, never "after /shutdown" or a stop time. The rest of the note (pending messages, keep waiting on the user) stays.
+3. A herdr restart whose agent process exits before startup completes is reported as soon as it exits, not after the start timeout, and the herdr server that restart opened for it is stopped, as the Codex restore already does for its failed start (Phase 9 F005). A server the session already had is left alone.
+
+**Files:**
+- `scripts/shutdown/shutdown.py`, `scripts/shutdown/test_shutdown_cli.py` — Spec 1.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — Specs 2 and 3.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — Spec 3, if the early exit is detected in `start_agent`.
+
+**Workers:** 1 writer; one file set.
+
+**Acceptance gate:** `merge_gate.py --tests-only` green and `basedpyright scripts/message scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Live: repeat Phase 9's crash check and read the restored session's first prompt and `agents status` placement; restore a snapshot session whose transcript is missing and see the failure reported within seconds with no herdr session left.
+
+### Phase 11 — Remove tmux from productions and sessions on Linux  · status: todo
+
+**Depends on:** Phase 7, Phase 8, Phase 9, Phase 10
 
 **Blocked by:** `shutdown.py tmux-free` (Spec 2) exits 0 on natedev: tmux answers and lists no session, every herdr source answers, and every account's inventory is complete with no session on a tmux or unknown host. `unit_lookup.every_marked_unit` alone is no proof: it returns partial results when one host answers (253–272).
 
@@ -434,6 +428,6 @@ Move them at their next idle points rather than waiting for productions to end, 
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown`, `scripts/message`, `scripts/hooks`, `scripts/nightly_review` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/message scripts/hooks scripts/nightly_review scripts/herdr` prints `0 errors, 0 warnings`; `grep -rln tmux scripts/production scripts/shutdown scripts/message commands/showrunner` names only lines kept on purpose (legacy-record parsing and its manual commands), each listed in the phase report. Tests cover the standalone tmux migration (Spec 1) and legacy hosts and leftovers in records and snapshots through parsing, `status`, `now` and restart, never as herdr names and never cleared silently. The phase report quotes `tmux-free`'s passing output from before Spec 4.
 
-### Phase 11 — herdr on the Mac  · status: moved
+### Phase 12 — herdr on the Mac  · status: moved
 
-Moved to its own unit (showrunner, 2026-10-15): `docs/plans/build-followups-herdr-mac.md`. It starts after Phase 10 merges.
+Moved to its own unit (showrunner, 2026-10-15): `docs/plans/build-followups-herdr-mac.md`. It starts after Phase 11 merges.

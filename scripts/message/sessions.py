@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
@@ -33,6 +34,47 @@ class UnreadableSessionRecord(Enum):
 
 
 RegistryEntry = SessionRecord | UnreadableSessionRecord
+
+
+class RegistryDetails(TypedDict, total=False):
+    cwd: str
+    kind: str
+    status: str
+
+
+@dataclass(frozen=True)
+class RegistryObservation:
+    record: SessionRecord
+    details: RegistryDetails
+
+
+@dataclass(frozen=True)
+class RegistryRead:
+    entries: tuple[RegistryObservation, ...]
+    unreadable: tuple[Path, ...]
+
+
+def read_registry() -> RegistryRead:
+    """Keep unreadable directories and records visible to complete observers."""
+    directory = sessions_dir()
+    try:
+        paths = [path for path in directory.iterdir() if path.suffix == ".json"]
+    except OSError:
+        return RegistryRead((), (directory,))
+    entries: list[RegistryObservation] = []
+    unreadable: list[Path] = []
+    for path in paths:
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+            record = parse_session(raw)
+        except (OSError, ValueError, TypeError):
+            record = UnreadableSessionRecord.FOUND
+            raw = {}
+        if isinstance(record, UnreadableSessionRecord):
+            unreadable.append(path)
+        else:
+            entries.append(RegistryObservation(record, cast(RegistryDetails, raw)))
+    return RegistryRead(tuple(entries), tuple(unreadable))
 
 
 def parse_session(parsed: object) -> RegistryEntry:
@@ -150,14 +192,7 @@ def sessions_dir() -> Path:
 
 
 def _readable_records() -> Iterator[SessionRecord]:
-    try:
-        paths = [path for path in sessions_dir().iterdir() if path.suffix == ".json"]
-    except OSError:
-        return
-    for path in paths:
-        record = read_session(path)
-        if not isinstance(record, UnreadableSessionRecord):
-            yield record
+    yield from (item.record for item in read_registry().entries)
 
 
 def running_sessions() -> list[SessionRecord]:

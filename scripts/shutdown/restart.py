@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
-from contextlib import redirect_stdout
-from collections.abc import Iterable, Sequence
+from contextlib import contextmanager, redirect_stdout
+from contextvars import ContextVar
+from collections.abc import Generator, Iterable, Sequence
 import os
 import re
 import shlex
@@ -35,9 +37,11 @@ from account import (  # noqa: E402
     named_account_environment,
     named_claude_account,
     own_claude_account,
+    NAMED_ACCOUNT_VARIABLES,
 )
 import add_unit  # noqa: E402
 import herdr  # noqa: E402
+import inventory as inventory_work  # noqa: E402
 import conversation_pause  # noqa: E402
 import relaunch  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
@@ -82,7 +86,15 @@ from record import (  # noqa: E402
     parse_session_records,
     session_records,
     update_session,
+    RecoverySnapshot,
+    SnapshotCodexSession,
+    SnapshotSession,
+    all_snapshots,
+    acknowledge_snapshot,
+    materialize_snapshot,
 )
+import record as recovery_store  # noqa: E402
+import launch_permission as restore_permission  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import remote_control  # noqa: E402
@@ -178,7 +190,7 @@ class NeverAlert:
 
 @dataclass(frozen=True)
 class SessionLive:
-    """The session registry positively identifies the session as live."""
+    """The registry or saved process identity positively identifies a live owner."""
 
 
 @dataclass(frozen=True)
@@ -191,6 +203,95 @@ class SessionLivenessUnknown:
     """The session registry cannot safely establish whether the session is live."""
 
     reason: str
+
+
+@dataclass(frozen=True)
+class AccountObservation:
+    """Evidence of which account last owned one session."""
+
+    login: str
+    label: str
+    at: datetime
+
+
+@dataclass(frozen=True)
+class RestoreAccountChosen:
+    login: str
+    source_login: str
+
+
+@dataclass(frozen=True)
+class RestoreAccountConflict:
+    accounts: tuple[str, ...]
+
+
+def _restore_account(observations: Sequence[AccountObservation | RestoreAccountConflict]) -> RestoreAccountChosen | RestoreAccountConflict:
+    conflicts = [item for item in observations if isinstance(item, RestoreAccountConflict)]
+    known = [item for item in observations if isinstance(item, AccountObservation)]
+    if conflicts:
+        accounts = {account for conflict in conflicts for account in conflict.accounts}
+        accounts.update(f"{item.label} ({item.login})" for item in known)
+        return RestoreAccountConflict(tuple(sorted(accounts)))
+    latest = max(item.at for item in known)
+    current = {item.login.casefold(): item for item in known if item.at == latest}
+    if len(current) == 1:
+        login = next(iter(current))
+        return RestoreAccountChosen(login, login)
+    return RestoreAccountConflict(tuple(sorted(f"{item.label} ({item.login})" for item in current.values())))
+
+
+def _record_observation(saved: SessionShutdown) -> AccountObservation | RestoreAccountConflict:
+    progress = saved["progress"]
+    target_name = saved.get("target", "")
+    if target_name and progress["kind"] == "restarted":
+        try:
+            from scripts.accounts import accounts
+
+            resolved = accounts.resolve_history_label(target_name, saved["requested_at"])
+            if not isinstance(resolved, accounts.ResolvedHistoryLabel):
+                return RestoreAccountConflict((f"{saved['label']} ({saved['login']})", f"{target_name} (unavailable)"))
+            target = named_claude_account(resolved.label)
+        except (UnknownAccountName, UnreadableAccount):
+            return RestoreAccountConflict((f"{saved['label']} ({saved['login']})", f"{target_name} (unavailable)"))
+        return AccountObservation(target.login, target.label, datetime.fromisoformat(progress["at"]))
+    at = progress["at"] if progress["kind"] == "restarted" else saved["requested_at"]
+    return AccountObservation(saved["login"], saved["label"], datetime.fromisoformat(at))
+
+
+@dataclass(frozen=True)
+class IncompleteShutdownRefused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class IncompleteShutdownStillLive:
+    """The owner is running, so its unfinished shutdown remains unchanged."""
+
+
+INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping"})
+
+
+def _recover_incomplete_shutdown(
+    saved: SessionShutdown, *, dry_run: bool,
+) -> SessionShutdown | IncompleteShutdownRefused | IncompleteShutdownStillLive:
+    if saved["progress"]["kind"] not in INCOMPLETE_PROGRESS:
+        return saved
+    match _owner_liveness(saved["session"]):
+        case SessionLive():
+            return IncompleteShutdownStillLive()
+        case SessionLivenessUnknown(reason):
+            return IncompleteShutdownRefused(reason)
+        case SessionNotLive():
+            pass
+    if dry_run:
+        return {**saved, "progress": {"kind": "already gone", "at": settle.record_time()}}
+    # The stop path proves worker and host cleanup too, and owns its stopping claim.
+    cleaned = stop_work.stop_session(saved)
+    if cleaned["request_id"] != saved["request_id"]:
+        return IncompleteShutdownRefused("shutdown request changed during recovery")
+    if cleaned["progress"]["kind"] not in RESTARTABLE_PROGRESS or _unfinished_cleanup(cleaned):
+        return IncompleteShutdownRefused("owner cleanup not confirmed: " + cleaned["progress"]["kind"])
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -369,38 +470,60 @@ def _run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.Co
 
 
 def _live_session_ids() -> frozenset[str]:
-    return frozenset(item["sessionId"] for item in sessions.live_sessions())
+    return frozenset(item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()])
+
+
+def _process_liveness(pid: int, recorded_start: str) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
+    if not recorded_start:
+        return SessionNotLive()
+    current = sessions.process_start(pid)
+    if current is not None and current != recorded_start:
+        return SessionNotLive()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return SessionNotLive()
+    except PermissionError:
+        if current == recorded_start:
+            return SessionLive()
+    except (OSError, OverflowError) as error:
+        return SessionLivenessUnknown(f"process identity unreadable: {error}")
+    if current is None:
+        return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
+    return SessionLive()
 
 
 def _session_liveness(
     session_id: str,
 ) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
     try:
-        paths = [
-            path
-            for path in sessions.sessions_dir().iterdir()
-            if path.suffix == ".json"
-        ]
+        paths = [path for path in sessions.sessions_dir().iterdir() if path.suffix == ".json"]
     except OSError as error:
-        return SessionLivenessUnknown(
-            f"session registry unreadable: {_error_reason(error)}"
-        )
-
+        return SessionLivenessUnknown(f"session registry unreadable: {_error_reason(error)}")
     unreadable_records: list[str] = []
     for path in paths:
         registered = sessions.read_session(path)
         if isinstance(registered, sessions.UnreadableSessionRecord):
             unreadable_records.append(path.name)
             continue
-        if registered["sessionId"] == session_id and sessions.live_session(
-            registered
-        ):
+        if registered["sessionId"] != session_id:
+            continue
+        if sessions.running_session(registered):
             return SessionLive()
+        observed = _process_liveness(registered["pid"], registered.get("procStart", ""))
+        if not isinstance(observed, SessionNotLive):
+            return observed
     if unreadable_records:
-        return SessionLivenessUnknown(
-            "unreadable session registry record: " + unreadable_records[0]
-        )
+        return SessionLivenessUnknown("unreadable session registry record: " + unreadable_records[0])
     return SessionNotLive()
+
+
+def _owner_liveness(owner: Session) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
+    """Registry absence is insufficient while the saved process identity still runs."""
+    observed = _session_liveness(owner["session_id"])
+    if not isinstance(observed, SessionNotLive):
+        return observed
+    return _process_liveness(owner["pid"], owner["proc_start"])
 
 
 def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> RegistryConfirmation:
@@ -1587,6 +1710,43 @@ def _restart_note_delivered(
     return False
 
 
+def _launch_recovery_record(
+    saved: SessionShutdown, note: str, desktop_state: DesktopLaunchState, *, dry_run: bool,
+) -> SessionLaunched | ManualRestartRequired:
+    # Units perform the same admission in add_unit, in its own process/barrier.
+    if dry_run or saved["requested_by"]["kind"] != "snapshot" or saved["session"]["kind"] == "unit":
+        return _launch_session(saved, note, desktop_state, dry_run=dry_run)
+    with restore_permission.launch_barrier():
+        found = lookup_session(saved["login"], saved["session"]["session_id"])
+        if not isinstance(found, ShutdownFound) or not _same_relaunch_claim(saved, found.record):
+            raise OSError("recovery record is absent or its restart claim changed")
+        parts = _resume_parts(saved["session"], note, saved.get("target", ""), login=saved["login"],
+                              at=saved["requested_at"], probe=saved.get("probe", False))
+        launch_record: SessionShutdown = saved
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {*NAMED_ACCOUNT_VARIABLES, "CLAUDE_CODE_OAUTH_TOKEN"}}
+        if isinstance(parts.account, MoveResumeAccount):
+            from scripts.accounts import accounts
+
+            prepared = accounts.prepared_account(parts.account.target, resume=True)
+            if isinstance(prepared, accounts.AccountRefused):
+                raise OSError(prepared.reason)
+            environment.update(prepared.variables)
+            for key in prepared.remove:
+                _ = environment.pop(key, None)
+            # Pin the selected group account; a concurrent group change must refuse.
+            launch_record = {**saved, "target": parts.account.target}
+        else:
+            environment.update(parts.environment)
+        permission = restore_permission.launch_permission(environment,
+            restore_permission.RecordedSessionRestoreLaunchPurpose(saved["session"]["session_id"]))
+        if isinstance(permission, restore_permission.BlockedByShutdown):
+            raise OSError(permission.reason)
+        if isinstance(permission, restore_permission.ShutdownStateUnreadable):
+            raise OSError("shutdown state unreadable: " + permission.detail)
+        return _launch_session(launch_record, note, desktop_state, dry_run=False)
+
+
 def launch_entry(
     record: SessionShutdown,
     restarted_at: str,
@@ -1619,6 +1779,18 @@ def launch_entry(
                 return EntrySettled()
             case SessionNotLive():
                 pass
+    if record["requested_by"]["kind"] == "snapshot" and progress["kind"] in {"already gone", "restart failed"}:
+        observed = _owner_liveness(session)
+        if isinstance(observed, SessionLive):
+            print(f"{session['name']}: already running; skipped")
+            if not dry_run:
+                _restore_prior(record)
+            return EntrySettled()
+        if isinstance(observed, SessionLivenessUnknown):
+            print(f"{session['name']}: recovery refused: {observed.reason}")
+            if not dry_run:
+                mark_restart_failed(record, observed.reason)
+            return EntrySettled()
     try:
         _retire(record, dry_run=dry_run)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
@@ -1650,7 +1822,7 @@ def launch_entry(
         return EntrySettled()
 
     try:
-        launch = _launch_session(
+        launch = _launch_recovery_record(
             record, note, desktop_state, dry_run=dry_run
         )
     except ScheduledRestartPromptNotRecorded as error:
@@ -1913,8 +2085,186 @@ def _confirm_entries(records: list[SessionShutdown]) -> None:
     for record in records:
         if record["progress"]["kind"] == "restarted":
             archive_session(record["login"], record["session"]["session_id"])
+            _acknowledge_restored_snapshots(record["session"]["session_id"])
 
     remote_control_missing(launched, confirmation)
+
+
+def _acknowledge_restored_snapshots(identity: str) -> None:
+    """A successful restore retires stale account copies of the same session too."""
+    for snapshot in all_snapshots():
+        if any(entry["session"]["session_id"] == identity for entry in snapshot["sessions"]):
+            _ = acknowledge_snapshot(snapshot["login"], identity)
+
+
+def snapshot_source(last_seen: str) -> str:
+    taken = datetime.fromisoformat(last_seen)
+    age = max(0, int((datetime.now(timezone.utc) - taken).total_seconds()))
+    elapsed = f"{age}s" if age < 60 else f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
+    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({elapsed} ago)"
+
+
+@dataclass(frozen=True)
+class UnsharedRestoreHistory:
+    """A direct restart reads completed history for its own selection pass."""
+
+
+@dataclass(frozen=True)
+class CompletedRestoreHistory:
+    records: tuple[SessionShutdown, ...]
+
+
+_RESTORE_HISTORY: ContextVar[UnsharedRestoreHistory | CompletedRestoreHistory] = ContextVar(
+    "restore_history", default=UnsharedRestoreHistory())
+
+
+@contextmanager
+def restore_history_pass() -> Generator[None, None, None]:
+    """Share one archive observation across an account-wide restart command."""
+    history = CompletedRestoreHistory(tuple(recovery_store.restarted_history()))
+    token = _RESTORE_HISTORY.set(history)
+    try:
+        yield
+    finally:
+        _RESTORE_HISTORY.reset(token)
+
+
+def _account_observations(
+    records: list[SessionShutdown], snapshots: list[RecoverySnapshot],
+) -> dict[str, list[AccountObservation | RestoreAccountConflict]]:
+    observations: dict[str, list[AccountObservation | RestoreAccountConflict]] = {}
+    for saved in records:
+        observations.setdefault(saved["session"]["session_id"], []).append(_record_observation(saved))
+    history = _RESTORE_HISTORY.get()
+    archived = history.records if isinstance(history, CompletedRestoreHistory) else recovery_store.restarted_history()
+    for saved in archived:
+        observations.setdefault(saved["session"]["session_id"], []).append(_record_observation(saved))
+    for snapshot in snapshots:
+        for entry in snapshot["sessions"]:
+            observations.setdefault(entry["session"]["session_id"], []).append(AccountObservation(
+                snapshot["login"], snapshot["label"], datetime.fromisoformat(entry["last_seen"])))
+    return observations
+
+
+def _restore_choices(
+    records: list[SessionShutdown], snapshots: list[RecoverySnapshot],
+) -> dict[str, RestoreAccountChosen | RestoreAccountConflict]:
+    observations = _account_observations(records, snapshots)
+    copies: dict[str, list[AccountObservation]] = {}
+    for saved in records:
+        copies.setdefault(saved["session"]["session_id"], []).append(AccountObservation(
+            saved["login"], saved["label"], datetime.fromisoformat(saved["requested_at"])))
+    for snapshot in snapshots:
+        for entry in snapshot["sessions"]:
+            copies.setdefault(entry["session"]["session_id"], []).append(AccountObservation(
+                snapshot["login"], snapshot["label"], datetime.fromisoformat(entry["last_seen"])))
+    choices: dict[str, RestoreAccountChosen | RestoreAccountConflict] = {}
+    for identity, evidence in observations.items():
+        decision = _restore_account(evidence)
+        if isinstance(decision, RestoreAccountChosen) and identity in copies:
+            available = copies[identity]
+            if not any(item.login.casefold() == decision.login for item in available):
+                source = _restore_account(available)
+                decision = (RestoreAccountChosen(decision.login, source.login)
+                            if isinstance(source, RestoreAccountChosen) else source)
+        choices[identity] = decision
+    return choices
+
+
+def restore_account_choices() -> dict[str, RestoreAccountChosen | RestoreAccountConflict]:
+    """Choose the source copy and destination across all local recovery sources."""
+    return _restore_choices(all_session_records(), all_snapshots())
+
+
+def _restore_target(saved: SessionShutdown, decision: RestoreAccountChosen, *, dry_run: bool) -> SessionShutdown:
+    if decision.login == saved["login"].casefold():
+        return saved
+    target = named_claude_account(decision.login).label
+    if dry_run:
+        return {**saved, "target": target}
+    def retarget(current: SessionShutdown) -> None:
+        if current["request_id"] == saved["request_id"]:
+            current["target"] = target
+    return update_session(saved["login"], saved["session"]["session_id"], retarget)
+
+
+def _launch_codex_snapshot(
+    snapshot: RecoverySnapshot, entry: SnapshotCodexSession, state: DesktopLaunchState, *, dry_run: bool,
+) -> None:
+    owner, launch = entry["session"], entry["codex"]
+    suffix = hashlib.sha256(owner["session_id"].encode()).hexdigest()[:16]
+    name = herdr.generated_session_name(Path(owner["cwd"]).name + "-codex", suffix)
+    arguments = ["resume"]
+    if launch["resume"]["kind"] == "session id":
+        arguments.append(launch["resume"]["session_id"])
+    else:
+        print(f"{owner['name']}: Codex resume picker opens")
+    if dry_run:
+        print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in {owner['cwd']}")
+        return
+    herdr.start_new_server(name, 90_000)
+    try:
+        pane = herdr.open_pane(name, name, owner["cwd"], {"CODEX_HOME": launch["home"]})
+        herdr.start_agent(name, pane, kind="codex", agent_arguments=arguments,
+                          opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
+    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
+        herdr.stop_session(name)
+        raise
+    _acknowledge_restored_snapshots(owner["session_id"])
+    attach = shlex.join(["herdr", "session", "attach", name])
+    if launches_window(owner["host"]):
+        clients = herdr.attached_clients(name)
+        if isinstance(clients, herdr.ClientsAttached):
+            return
+        if isinstance(clients, herdr.NoClientAttached):
+            try:
+                _open_window(_herdr_attach_command(name, owner["cwd"]),
+                    DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)
+                return
+            except (OSError, subprocess.SubprocessError) as error:
+                print(f"{snapshot['machine']}: {owner['name']}: window not opened: {_error_reason(error)}")
+    print(attach)
+
+
+@dataclass(frozen=True)
+class CrashNotChecked:
+    """No current boot or host observation was needed yet."""
+
+
+@dataclass(frozen=True)
+class CrashConfirmed:
+    """A recorded or current boot/host observation proves a crash signal."""
+
+
+@dataclass(frozen=True)
+class NoCrashSignal:
+    """The observations do not authorize snapshot recovery."""
+
+
+@dataclass(frozen=True)
+class CrashEvidenceUnreadable:
+    reason: str
+
+
+@dataclass
+class RecoveryCrashCheck:
+    observation: inventory_work.CompleteInventory | inventory_work.PartialInventory | CrashNotChecked = field(default_factory=CrashNotChecked)
+
+    def check(self, snapshot: RecoverySnapshot, entry: SnapshotSession) -> CrashConfirmed | NoCrashSignal | CrashEvidenceUnreadable:
+        if "crash" in entry:
+            return CrashConfirmed()
+        if isinstance(self.observation, CrashNotChecked):
+            self.observation = inventory_work.snapshot_inventory()
+        observed = self.observation
+        if isinstance(observed, inventory_work.PartialInventory):
+            return CrashEvidenceUnreadable("; ".join(observed.failures))
+        previous_boot = entry.get("boot_id", snapshot.get("boot_id", ""))
+        if (isinstance(observed.boot, inventory_work.KnownBoot) and previous_boot
+                and previous_boot != observed.boot.boot_id):
+            return CrashConfirmed()
+        if (snapshot["login"], entry["session"]["session_id"]) in observed.gone_hosts:
+            return CrashConfirmed()
+        return NoCrashSignal()
 
 
 def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartResult:
@@ -1923,8 +2273,117 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             print(line)
     ids = tuple(only)
     all_records = session_records(login)
+    snapshots = all_snapshots()
+    choices = _restore_choices(all_session_records(), snapshots)
+    recovery_failures: list[FailedSessionRestart] = []
+    sources: dict[str, RecoverySnapshot] = {}
+    recorded_ids = {saved["session"]["session_id"] for saved in all_records}
+    live_ids = _live_session_ids()
+    codex_entries: list[tuple[RecoverySnapshot, SnapshotCodexSession]] = []
+    snapshot_ids: set[str] = set()
+    crash_check = RecoveryCrashCheck()
+    for snapshot in snapshots:
+        if snapshot["login"].casefold() != login.casefold():
+            continue
+        for entry in snapshot["sessions"]:
+            identity, name = entry["session"]["session_id"], entry["session"]["name"]
+            snapshot_ids.add(identity)
+            if identity in recorded_ids or (ids and identity not in ids):
+                continue
+            print(f"{name}: {snapshot_source(entry['last_seen'])}")
+            decision = choices[identity]
+            if isinstance(decision, RestoreAccountConflict):
+                reason = "conflicting account evidence: " + ", ".join(decision.accounts)
+                print(f"{name}: {reason}")
+                recovery_failures.append(FailedSessionRestart(name, reason))
+                continue
+            if decision.source_login != login.casefold():
+                print(f"{name}: skipped obsolete copy on {snapshot['label']}; current account {decision.login}")
+                continue
+            if entry["agent"] == "codex":
+                liveness = inventory_work.codex_liveness(entry)
+                if isinstance(liveness, inventory_work.CodexLive):
+                    print(f"{name}: already running (pid {liveness.pid}); skipped")
+                elif isinstance(liveness, inventory_work.CodexLivenessUnknown):
+                    print(f"{name}: recovery refused: {liveness.reason}")
+                    recovery_failures.append(FailedSessionRestart(name, liveness.reason))
+                else:
+                    evidence = crash_check.check(snapshot, entry)
+                    if isinstance(evidence, CrashConfirmed):
+                        codex_entries.append((snapshot, entry))
+                    elif isinstance(evidence, CrashEvidenceUnreadable):
+                        print(f"{name}: recovery refused: {evidence.reason}")
+                        recovery_failures.append(FailedSessionRestart(name, evidence.reason))
+                    else:
+                        print(f"{name}: no crash signal; skipped")
+                continue
+            if identity in live_ids:
+                print(f"{name}: already running; skipped")
+                continue
+            liveness = _owner_liveness(entry["session"])
+            if isinstance(liveness, SessionLive):
+                print(f"{name}: already running; skipped")
+                continue
+            if isinstance(liveness, SessionLivenessUnknown):
+                print(f"{name}: recovery refused: {liveness.reason}")
+                recovery_failures.append(FailedSessionRestart(name, liveness.reason))
+                continue
+            evidence = crash_check.check(snapshot, entry)
+            if isinstance(evidence, CrashEvidenceUnreadable):
+                print(f"{name}: recovery refused: {evidence.reason}")
+                recovery_failures.append(FailedSessionRestart(name, evidence.reason))
+                continue
+            if isinstance(evidence, NoCrashSignal):
+                print(f"{name}: no crash signal; skipped")
+                continue
+            saved = (recovery_store.snapshot_restore_record(snapshot, entry) if dry_run
+                     else materialize_snapshot(snapshot, entry))
+            saved = _restore_target(saved, decision, dry_run=dry_run)
+            all_records.append(saved)
+            recorded_ids.add(identity)
+            sources[identity] = snapshot
     hold_outcome = lookup_account_hold(login)
     records = [saved for saved in all_records if not ids or saved["session"]["session_id"] in ids]
+    selected_records: list[SessionShutdown] = []
+    for saved in records:
+        name, identity = saved["session"]["name"], saved["session"]["session_id"]
+        if identity not in sources:
+            print(f"{name}: from shutdown record")
+        decision = choices[identity]
+        if isinstance(decision, RestoreAccountConflict):
+            reason = "conflicting account evidence: " + ", ".join(decision.accounts)
+            print(f"{name}: {reason}")
+            recovery_failures.append(FailedSessionRestart(name, reason))
+            continue
+        if decision.source_login != login.casefold():
+            print(f"{name}: skipped obsolete copy on {saved['label']}; current account {decision.login}")
+            continue
+        if decision.login != login.casefold() and identity in live_ids:
+            print(f"{name}: already running on {decision.login}; skipped")
+            continue
+        saved = _restore_target(saved, decision, dry_run=dry_run)
+        if saved["requested_by"]["kind"] == "snapshot" and saved["progress"]["kind"] in {"already gone", "restart failed"}:
+            observed = _owner_liveness(saved["session"])
+            if isinstance(observed, SessionLive):
+                print(f"{name}: already running; skipped")
+                continue
+            if isinstance(observed, SessionLivenessUnknown):
+                print(f"{name}: recovery refused: {observed.reason}")
+                recovery_failures.append(FailedSessionRestart(name, observed.reason))
+                continue
+        recovered = _recover_incomplete_shutdown(saved, dry_run=dry_run)
+        if isinstance(recovered, IncompleteShutdownStillLive):
+            print(f"{name}: already running; skipped")
+            selected_records.append(saved)
+        elif isinstance(recovered, IncompleteShutdownRefused):
+            print(f"{name}: recovery refused: {recovered.reason}")
+            recovery_failures.append(FailedSessionRestart(name, recovered.reason))
+            selected_records.append(saved)
+        else:
+            if identity in live_ids:
+                print(f"{name}: already running; launch skipped")
+            selected_records.append(recovered)
+    records = selected_records
     finished: list[SessionShutdown] = []
     if not dry_run:
         checked = clear_running_on_target(records)
@@ -1932,8 +2391,8 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         for record in finished:
             print(f"{record['machine']}: {record['session']['name']} is already running on {record.get('target') or record['label']}")
     refused: list[RestartRefusal] = []
-    local_ids = {saved["session"]["session_id"] for saved in all_records}
-    for identity, name in settle.unrecorded_local_sessions(login, ids, all_records).items():
+    local_ids = {saved["session"]["session_id"] for saved in all_records} | snapshot_ids
+    for identity, name in settle.unrecorded_local_sessions(login, tuple(item for item in ids if item not in snapshot_ids), all_records).items():
         local_ids.add(identity)
         refusal = RestartNoShutdown(kind="no shutdown", session_id=identity, name=name)
         refused.append(refusal)
@@ -1957,21 +2416,36 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
     ]
     label = eligible[0]["label"] if eligible else hold_outcome.hold["label"] if isinstance(hold_outcome, AccountHeld) else login
     machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else settle.local_machine()
-    if not eligible:
+    if not eligible and not codex_entries:
         if not ids and not dry_run and isinstance(hold_outcome, AccountHeld) and not any(
             item["request_id"] == hold_outcome.hold["request_id"] for item in all_records
         ):
             clear_finished_account_hold(login)
-        return MachineRestartResult(machine, label, "nothing", refused=refused, local_session_ids=frozenset(local_ids))
+        if not records and not recovery_failures and not ids:
+            print(f"nothing to restore for {label}")
+        return MachineRestartResult(machine, label, "partial" if recovery_failures else "nothing",
+            failed=len(recovery_failures), failed_sessions=tuple(recovery_failures),
+            refused=refused, local_session_ids=frozenset(local_ids))
     state = DesktopLaunchState()
     started_at = time.monotonic()
     attempted: list[SessionShutdown] = []
+    codex_restarted = 0
     try:
         if dry_run:
             for record in sorted(eligible, key=_dry_run_entry_order):
                 if record["progress"]["kind"] != "restarted":
                     _ = relaunch_session(record, dry_run=True, desktop_state=state)
-            return MachineRestartResult(machine, label, "done", refused=refused, local_session_ids=frozenset(local_ids))
+            for snapshot, entry in codex_entries:
+                _launch_codex_snapshot(snapshot, entry, state, dry_run=True)
+            return MachineRestartResult(machine, label, "partial" if recovery_failures else "done",
+                failed=len(recovery_failures), failed_sessions=tuple(recovery_failures),
+                refused=refused, local_session_ids=frozenset(local_ids))
+        for snapshot, entry in codex_entries:
+            try:
+                _launch_codex_snapshot(snapshot, entry, state, dry_run=False)
+                codex_restarted += 1
+            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+                recovery_failures.append(FailedSessionRestart(entry["session"]["name"], _error_reason(error)))
         previous_manual_ids = {record["session"]["session_id"] for record in eligible
                                if _prior_progress(record)["kind"] == "manual restart"}
         ordered = sorted(eligible, key=_entry_order)
@@ -2017,6 +2491,10 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             elif finished_requests:
                 clear_finished_account_hold(login, request_ids=finished_requests)
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
+        result = replace(result, restarted=result.restarted + codex_restarted)
+        if recovery_failures:
+            result = replace(result, status="partial", failed=result.failed + len(recovery_failures),
+                             failed_sessions=(*result.failed_sessions, *recovery_failures))
         result = replace(result, refused=refused, local_session_ids=frozenset(local_ids))
         reported = tuple(ManualSessionRestart(record["session"]["name"], record["progress"]["command"])
                              for record in attempted if record["progress"]["kind"] == "manual restart"
