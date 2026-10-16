@@ -1331,7 +1331,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:** `Path.rename` replaces a destination created after a clash check, so every move goes through `_move_shared_entry` (renameat2 `RENAME_NOREPLACE` on Linux, renamex_np `RENAME_EXCL` on macOS); a destination appearing mid-repair is a clash, and a losing concurrent repair accepts the winner's state. Any check reachable from `set_role` must pass `repair=False`, or it creates `~/.codex`. A move refused by its target prints one line, the first problem.
 
-### Phase 45 — No Codex daemon descendant escapes the stop  · status: todo
+### Phase 45 — No Codex daemon descendant escapes the stop  · status: done
 
 **Depends on:** Phase 42
 
