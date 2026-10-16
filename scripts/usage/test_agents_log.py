@@ -698,6 +698,23 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
                          "contract")
 
+    def test_backfill_reads_review_logs_in_phase_directories(self) -> None:
+        archive, live, _, _ = self.backfill_fixture()
+        run = archive / "archived-run"
+        old_log = run / "review_agent_adversary.log"
+        phase_log = run / "phases" / "4" / "review_agent_2_contract.log"
+        phase_log.parent.mkdir(parents=True)
+        _ = phase_log.write_text("worker=project-test; role=review\n", encoding="utf-8")
+        for index, path in enumerate((old_log, phase_log)):
+            stamp = 1_700_000_000 + index * 100
+            os.utime(path, (stamp, stamp))
+
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
+                         "contract")
+
     def test_backfill_leaves_review_lens_absent_without_a_log_naming_the_worker(self) -> None:
         archive, live, _, _ = self.backfill_fixture()
         run = archive / "archived-run"
