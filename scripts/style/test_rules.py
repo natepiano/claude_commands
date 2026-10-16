@@ -29,11 +29,20 @@ class RuleTests(unittest.TestCase):
         self.global_dir = self.root / "nate_style" / "rust"
         self.global_dir.mkdir(parents=True)
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.global_dir.parent))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / "state")})))
 
     def write_rule(self, name: str, metadata: str) -> Path:
         path = self.global_dir / f"{name}.md"
         _ = path.write_text(f"---\n{metadata}---\n# {name}\n")
         return path
+
+    def member_repo(self) -> Path:
+        repo = self.root / "repo"
+        member = repo / "crates" / "member"
+        member.mkdir(parents=True, exist_ok=True)
+        _ = (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/member"]\n')
+        _ = (member / "Cargo.toml").write_text('[package]\nname = "public-member"\nversion = "0.1.0"\n')
+        return repo
 
     def test_loads_each_tier_and_preserves_scheduling_metadata(self) -> None:
         _ = self.write_rule("tool", "tier: A\nmechanism: clippy\n")
@@ -161,16 +170,16 @@ class RuleTests(unittest.TestCase):
         command = [sys.executable, str(Path(rules.__file__)), "list"]
         text = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
         self.assertEqual(text.stdout.splitlines(), [
-            "name\ttier\tfamily\tinput_scope\tsurface",
-            "bare\tunclassified\t-\tcrate\t-",
-            "listed\tunclassified\t-\tcrate\tunclassified",
-            "read\tunclassified\t-\tcrate\t-",
-            "tool\tunclassified\t-\tcrate\t-",
+            "rule_id\tname\ttier\tfamily\tinput_scope\tsurface",
+            "global:rust/bare.md\tbare\tunclassified\t-\tcrate\t-",
+            "global:rust/listed.md\tlisted\tunclassified\t-\tcrate\tunclassified",
+            "global:rust/read.md\tread\tunclassified\t-\tcrate\t-",
+            "global:rust/tool.md\ttool\tunclassified\t-\tcrate\t-",
         ])
         output = subprocess.run([*command, "--json"], env=environment, capture_output=True, text=True, check=True)
         rows = cast(list[rules.RuleListing], json.loads(output.stdout))
         self.assertEqual(rows, [
-            {"name": name, "tier": "unclassified", "family": None, "input_scope": "crate",
+            {"rule_id": f"global:rust/{name}.md", "name": name, "tier": "unclassified", "family": None, "input_scope": "crate",
              "surface": "unclassified" if name == "listed" else None}
             for name in ("bare", "listed", "read", "tool")
         ])
@@ -256,7 +265,7 @@ class RuleTests(unittest.TestCase):
 
     def test_discovers_root_and_member_rules_without_filtering_tool_or_bevy_rules(self) -> None:
         global_path = self.write_rule("same-name", "tier: A\nmechanism: mend\ntags:\n  - bevy\nmode: auto\n")
-        repo = self.root / "repo"
+        repo = self.member_repo()
         root_dir = repo / "docs" / "style"
         member_dir = repo / "docs" / "member" / "style"
         nested_dir = repo / "docs" / "nested" / "other" / "style"
@@ -273,9 +282,95 @@ class RuleTests(unittest.TestCase):
         self.assertEqual([rule.path for rule in loaded], [global_path, root_path, member_path])
         self.assertEqual([rule.origin for rule in loaded], ["global", "local", "local"])
         self.assertEqual([rule.family for rule in loaded], [None, "values", "modules"])
+        self.assertEqual([rule.rule_id for rule in loaded], [
+            "global:rust/same-name.md", "local:docs/style/same-name.md", "local:docs/member/style/member-rule.md",
+        ])
+        self.assertEqual([rule.reach for rule in loaded], [
+            rules.RepoReach(), rules.RepoReach(), rules.MemberReach("member", Path("crates/member")),
+        ])
+
+    def test_member_reach_resolves_package_name_as_well_as_directory_name(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "public-member" / "style"
+        local_dir.mkdir(parents=True)
+        _ = (local_dir / "local.md").write_text("---\ntier: C\nfamily: types\n---\n# Local rule\n")
+
+        rule, = rules.load_rules(repo)
+
+        self.assertEqual(rule.rule_id, "local:docs/public-member/style/local.md")
+        self.assertEqual(rule.reach, rules.MemberReach("public-member", Path("crates/member")))
+
+    def test_root_member_reach_resolves_checkout_directory_and_package_names(self) -> None:
+        repo = self.root / "sample"
+        repo.mkdir()
+        _ = (repo / "Cargo.toml").write_text('[package]\nname = "root-package"\nversion = "0.1.0"\n')
+        for name in ("sample", "root-package"):
+            local_dir = repo / "docs" / name / "style"
+            local_dir.mkdir(parents=True)
+            _ = (local_dir / "local.md").write_text("---\ntier: C\nfamily: types\n---\n# Local rule\n")
+
+        loaded = rules.load_rules(repo)
+
+        self.assertEqual([rule.rule_id for rule in loaded], [
+            "local:docs/root-package/style/local.md", "local:docs/sample/style/local.md",
+        ])
+        self.assertEqual([rule.reach for rule in loaded], [
+            rules.MemberReach("root-package", Path(".")), rules.MemberReach("sample", Path(".")),
+        ])
+
+    def test_member_rule_without_a_matching_workspace_member_names_the_error(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "absent" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "local.md"
+        _ = path.write_text("---\ntier: C\nfamily: types\n---\n# Local rule\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("member-local rule names no workspace member absent", str(raised.exception))
+
+    def test_member_reach_follows_recursive_in_tree_path_dependencies(self) -> None:
+        repo = self.member_repo()
+        manifest = repo / "crates/member/Cargo.toml"
+        _ = manifest.write_text(manifest.read_text() + '\n[dependencies]\nhelper = { path = "../helper" }\n')
+        for name, dependency in (("helper", '\n[target.\'cfg(unix)\'.build-dependencies]\nleaf = { path = "../leaf" }\n'), ("leaf", "")):
+            directory = repo / "crates" / name
+            directory.mkdir()
+            _ = (directory / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n' + dependency)
+        local_dir = repo / "docs/leaf/style"
+        local_dir.mkdir(parents=True)
+        _ = (local_dir / "local.md").write_text("---\ntier: C\nfamily: types\n---\n# Leaf\n")
+
+        rule, = rules.load_rules(repo)
+
+        self.assertEqual(rule.reach, rules.MemberReach("leaf", Path("crates/leaf")))
+
+    def test_implicit_member_reach_honors_workspace_exclusions(self) -> None:
+        repo = self.member_repo()
+        _ = (repo / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["crates/member"]\nexclude = ["crates/excluded"]\n'
+            + '[workspace.dependencies]\nhelper = { path = "crates/excluded" }\n'
+        )
+        manifest = repo / "crates/member/Cargo.toml"
+        _ = manifest.write_text(manifest.read_text() + '\n[dev-dependencies]\nhelper.workspace = true\n')
+        directory = repo / "crates/excluded"
+        directory.mkdir()
+        _ = (directory / "Cargo.toml").write_text('[package]\nname = "excluded"\nversion = "0.1.0"\n')
+        local_dir = repo / "docs/excluded/style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "local.md"
+        _ = path.write_text("---\ntier: C\nfamily: types\n---\n# Excluded\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("member-local rule names no workspace member excluded", str(raised.exception))
 
     def test_local_rules_must_declare_tier_and_family(self) -> None:
-        repo = self.root / "repo"
+        repo = self.member_repo()
         local_dir = repo / "docs" / "member" / "style"
         local_dir.mkdir(parents=True)
         path = local_dir / "local.md"
@@ -293,7 +388,7 @@ class RuleTests(unittest.TestCase):
                 self.assertIn(reason, str(raised.exception))
 
     def test_local_candidate_rules_require_a_declared_surface(self) -> None:
-        repo = self.root / "repo"
+        repo = self.member_repo()
         local_dir = repo / "docs" / "member" / "style"
         local_dir.mkdir(parents=True)
         path = local_dir / "local.md"
@@ -349,12 +444,12 @@ class RuleTests(unittest.TestCase):
         command = [sys.executable, str(Path(rules.__file__)), "list"]
         text = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
         self.assertEqual(text.stdout.splitlines(), [
-            "name\ttier\tfamily\tinput_scope\tsurface", "listed\tB\tnames\tcrate\twhole",
+            "rule_id\tname\ttier\tfamily\tinput_scope\tsurface", "global:rust/listed.md\tlisted\tB\tnames\tcrate\twhole",
         ])
         output = subprocess.run([*command, "--json"], env=environment, capture_output=True, text=True, check=True)
         rows = cast(list[rules.RuleListing], json.loads(output.stdout))
         self.assertEqual(rows, [{
-            "name": "listed", "tier": "B", "family": "names", "input_scope": "crate", "surface": "whole",
+            "rule_id": "global:rust/listed.md", "name": "listed", "tier": "B", "family": "names", "input_scope": "crate", "surface": "whole",
         }])
         invalid = self.write_rule("invalid", "tier: C\n")
         error = subprocess.run(command, env=environment, capture_output=True, text=True, check=False)
