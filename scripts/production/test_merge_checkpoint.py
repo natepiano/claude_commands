@@ -1028,6 +1028,45 @@ class MergeCheckpointTests(unittest.TestCase):
         if isinstance(latest, LastMerged):
             self.assertEqual(latest.hash, code)
 
+    def test_merge_history_follows_a_unit_rename_commit(self) -> None:
+        code = self.checkpoint()
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge old-alpha-unit phase 2 ({code[:7]}) into production", "alpha-branch")
+        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit old-alpha-unit to alpha-unit")
+        history = merge_branch_history(self.checkout, "production")
+        entry = history.last_code_for_unit("alpha-unit")
+        if isinstance(entry, NoMerge):
+            self.fail("the merge before the rename was not carried to the new name")
+        self.assertEqual((entry.unit, entry.phase, entry.short), ("alpha-unit", "2", code[:7]))
+        self.assertTrue(history.has_code_merge("alpha-unit", "2"))
+        self.assertIsInstance(history.last_for_unit("old-alpha-unit"), NoMerge)
+        request = request_from(argparse.Namespace(
+            production=str(self.doc), unit="alpha-unit", phase="3", hash=code,
+            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+            cancel_prior=False, started=STARTED, regime="after", holds=0,
+            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+        ))
+        latest = merge_history(request)
+        if not isinstance(latest, LastMerged):
+            self.fail("a renamed unit read as never merged, so its first-merge gate would fire again")
+        self.assertEqual(latest.hash, code)
+
+    def test_merge_history_follows_a_rename_chain_and_keeps_a_reused_name(self) -> None:
+        for subject in (
+            "Merge a-unit phase 1 (aaaaaaa) into production",
+            "chore(example): rename unit a-unit to b-unit",
+            "Merge b-unit phase 2 (bbbbbbb) into production",
+            "chore(example): rename unit b-unit to c-unit",
+            "Merge a-unit phase 1 (ccccccc) into production",
+        ):
+            _ = self.git("commit", "--allow-empty", "-m", subject)
+        history = merge_branch_history(self.checkout, "production")
+        self.assertEqual([(entry.unit, entry.short) for entry in history.entries],
+                         [("a-unit", "ccccccc"), ("c-unit", "bbbbbbb"), ("c-unit", "aaaaaaa")])
+        self.assertTrue(history.has_code_merge("c-unit", "1"))
+        self.assertIsInstance(history.last_for_unit("b-unit"), NoMerge)
+        self.assertEqual(history.code_merge_count(), 3)
+
     def test_merge_branch_reader_queries_last_any_last_unit_and_code_count(self) -> None:
         alpha_code = self.checkpoint(content="alpha phase two\n")
         _ = self.git("merge", "--no-ff", "-m",

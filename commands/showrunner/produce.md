@@ -35,7 +35,9 @@ State:
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
   `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
-  merge commit subjects on `MERGE_BRANCH`, never from memory.
+  merge commit subjects on `MERGE_BRANCH`, never from memory. A
+  `chore(<slug>): rename unit <old> to <new>` commit carries the merges under
+  `<old>` before it over to `<new>`.
 - `NOTIFIER` — `zsh ~/.claude/scripts/message/notifier.sh`.
 - `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
   name less `-production.md`.
