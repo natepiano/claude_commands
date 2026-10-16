@@ -5,15 +5,16 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import chdir, nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TypedDict, cast, override
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 import herdr
 import herdr_sessions
@@ -29,6 +30,11 @@ class SessionListReply(TypedDict):
     result: herdr.SessionListResult
 
 
+def setUpModule() -> None:
+    """These fixtures supply Linux proc trees and systemd stand-ins."""
+    _ = unittest.enterModuleContext(patch.object(herdr, "_PLATFORM", "linux"))
+
+
 class HerdrSessionsTests(unittest.TestCase):
     root: Path = Path()
     proc: Path = Path()
@@ -39,7 +45,7 @@ class HerdrSessionsTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
         self.records = self.root / "sessions"
         self.state = self.root / "state"
@@ -252,6 +258,17 @@ class HerdrSessionsTests(unittest.TestCase):
         with patch.object(os, "execvp", side_effect=OSError("attach failed")):
             self.assertEqual(self.call("attach", "target"), (3, "", "herdr_sessions: attach failed\n"))
 
+    def test_ctrl_c_during_list_and_attach_returns_130_with_one_line(self) -> None:
+        self.respond(["target"])
+        for owner, operation, arguments in (
+                (herdr, "live_sessions", ("list",)),
+                (herdr_sessions, "claude_names", ("list",)),
+                (herdr_sessions, "unit_roles", ("list",)),
+                (herdr_sessions, "registered_showrunners", ("list",)),
+                (os, "execvp", ("attach", "target"))):
+            with self.subTest(operation=operation), patch.object(owner, operation, side_effect=KeyboardInterrupt):
+                self.assertEqual(self.call(*arguments), (130, "", "herdr_sessions: stopped\n"))
+
     def test_usage_errors_do_not_call_herdr(self) -> None:
         for arguments in ((), ("unknown",), ("list", "extra"), ("attach",), ("attach", ""),
                           ("attach", "one", "extra")):
@@ -270,7 +287,7 @@ class StandaloneLaunchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
         self.proc.mkdir()
         self.log = self.root / "commands"
@@ -343,6 +360,38 @@ class StandaloneLaunchTests(unittest.TestCase):
             "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
         }))
         return directory
+
+    def test_ctrl_c_during_launch_returns_130_and_releases_the_barrier(self) -> None:
+        for verb, options in (("start", ["--name", "solo"]),
+                              ("resume", ["solo", "--session-id", "recorded"])):
+            for operation in ("start_new_server", "open_pane", "start_agent"):
+                self.log.unlink(missing_ok=True)
+                (self.proc / "net/unix").unlink(missing_ok=True)
+                self.destination("solo")
+                barrier = MagicMock()
+                release = Mock(return_value=False)
+                barrier.__exit__ = release
+                with (self.subTest(verb=verb, operation=operation),
+                      patch.object(launch_permission, "launch_barrier", return_value=barrier),
+                      patch.object(herdr, operation, side_effect=KeyboardInterrupt)):
+                    self.assertEqual(self.call(verb, *options, "--cwd", str(self.root)),
+                                     (130, "herdr_sessions: stopped\n"))
+                release.assert_called_once_with(None, None, None)
+                self.assertEqual(self.attachments, [])
+
+    def test_ctrl_c_before_launch_barrier_returns_130_without_starting_commands(self) -> None:
+        with patch.object(launch_permission, "launch_barrier", side_effect=KeyboardInterrupt):
+            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)),
+                             (130, "herdr_sessions: stopped\n"))
+        self.assertEqual(self.commands(), [])
+
+    def test_launch_server_failure_prints_only_its_message(self) -> None:
+        message = f"herdr server for solo did not start; see {self.root}/herdr-server.log"
+        with patch.object(herdr, "start_new_server", side_effect=herdr.HerdrFailure(message)):
+            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)),
+                             (1, f"herdr_sessions: {message}\n"))
+        self.assertEqual(self.attachments, [])
+        self.assertEqual(self.commands(), [])
 
     def test_start_after_cutover_uses_showrunners_account_for_pane_and_admission(self) -> None:
         directory = self.numbered_account()
@@ -444,12 +493,54 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertFalse(any(command[2:4] == ["agent", "prompt"] for command in self.commands()))
 
     def test_untrusted_folder_refuses_with_account_trust_command_before_server_start(self) -> None:
-        _ = (self.root / "home/.claude.json").write_text('{"projects": {}, "oauthAccount": {"emailAddress": "legacy@example.invalid"}}')
-        for verb in (("start", "--name", "solo"), ("resume", "solo", "--session-id", "recorded")):
-            code, error = self.call(*verb, "--cwd", str(self.root))
+        folder = self.root / "folder with 'quotes' and spaces"
+        folder.mkdir()
+        directory = self.numbered_account()
+        claude_arguments = ["--model", "opus", "--settings", '{"text":"keep $(literal) and quotes"}']
+        for verb in ("start", "resume"):
+            if verb == "start":
+                trust_file = self.root / "home/.claude.json"
+                trust_command = (f"cd {shlex.quote(str(folder))} && env -u CLAUDE_CONFIG_DIR "
+                                 + "-u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude")
+                options = ["--name", "solo"]
+                rerun_options = options
+            else:
+                trust_file = directory / ".claude.json"
+                trust_command = accounts.trust_command(folder, accounts.NamedAccount("claude4", directory))
+                options = ["solo", "--session-id", "recorded", "--config-dir", str(directory.relative_to(self.root)),
+                           "--restore", "--prompt-file", "opening note.txt", "--attach"]
+                rerun_options = ["solo"]
+            original = json.dumps({"projects": {}, "oauthAccount": {"emailAddress": (
+                "legacy@example.invalid" if verb == "start" else "numbered@example.invalid")}})
+            _ = trust_file.write_text(original)
+            with self.subTest(verb=verb), chdir(self.root):
+                code, error = self.call(verb, *options, "--cwd", folder.name, "--", *claude_arguments)
             self.assertEqual(code, 1)
-            self.assertIn("Run: cd ", error)
-            self.assertIn("claude", error)
+            self.assertEqual(error.splitlines()[:2], [f"herdr_sessions: Claude has not trusted {folder}.",
+                "Paste this, accept Claude's trust prompt, then exit Claude; the session then starts:"])
+            command = error.splitlines()[2]
+            self.assertTrue(command.startswith(trust_command + " && "), command)
+            expected = [sys.executable, str(Path(herdr_sessions.__file__).resolve()), verb,
+                        *rerun_options, "--cwd", str(folder)]
+            if verb == "resume":
+                expected.extend(["--session-id", "recorded", "--config-dir", str(directory), "--restore",
+                                 "--prompt-file", str(self.root / "opening note.txt"), "--attach"])
+            expected.extend(["--", *claude_arguments])
+            self.assertEqual(shlex.split(command.removeprefix(trust_command + " && ")), expected)
+            self.assertEqual(trust_file.read_text(), original)
+        self.assertEqual(self.commands(), [])
+        self.assertEqual(self.attachments, [])
+
+    def test_unreadable_trust_file_keeps_its_repair_message_without_a_launch_rerun(self) -> None:
+        _ = (self.root / "home/.claude.json").write_text('{"oauthAccount":{"emailAddress":"legacy@example.invalid"}}')
+        with patch.object(herdr, "claude_trust", return_value=herdr.UnreadableTrustFile(
+                self.root, self.root / "home/.claude.json", "PermissionError")):
+            code, error = self.call("start", "--name", "solo", "--cwd", str(self.root))
+        self.assertEqual(code, 1)
+        self.assertIn("PermissionError", error)
+        self.assertIn(". Run: cd ", error)
+        self.assertNotIn("Paste this", error)
+        self.assertNotIn(str(Path(herdr_sessions.__file__).resolve()), error)
         self.assertEqual(self.commands(), [])
 
     def test_inherited_default_account_variables_refuse_before_agent_start(self) -> None:

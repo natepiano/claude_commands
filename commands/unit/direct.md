@@ -161,7 +161,7 @@ that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/
 in full at <PrepareSession/> and after every compaction, and apply it
 throughout. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
-  branch into this branch;
+  branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
 - it runs independent phases in parallel, mapped at plan start and at each
@@ -451,7 +451,7 @@ Rust delegates run only exact prompt lines using
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that must run on Linux, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it must run on Linux>"` |
+| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it cannot pass on macOS>"` |
 | phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
 | final workspace gate | `bash ~/.claude/scripts/delegate/verify.sh final` |
