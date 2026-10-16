@@ -261,7 +261,7 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 - `scripts/shutdown/settle.py` — holdout render call without `host`
 - `commands/agent_send.md`, `commands/idle_timeout.md`, `commands/issue.md` — plain-text questions
 
-**Binds later work:** `PushText.session: SessionTemplate | NoSessionLine`; `user_action.NotificationSession`, `NO_SESSION_LINE`, `split_session`, `first_line(action, session)`. Every reader of the leading `Action:` line (review.py parse/record/check, send.py, pushover.py) keeps a `Session:` line above it, and the length test counts the Session line. A user-spec text's approval entry in `push_texts_reviewed.json` uses `push_texts.fingerprint(entry)` with a reviewer string naming the user spec. The `shutdown.remote_control` entry is unchanged here; the remote-control alert gives it a Session line. A question mode in the review.py engine must not route a question through the push first-line parser.
+**Binds later work:** `PushText.session: SessionTemplate | NoSessionLine`; `user_action.NotificationSession`, `NO_SESSION_LINE`, `split_session`, `first_line(action, session)`. Every reader of the leading `Action:` line (review.py parse/record/check, send.py, pushover.py) keeps a `Session:` line above it, and the length test counts the Session line. A user-spec text's approval entry in `push_texts_reviewed.json` uses `push_texts.fingerprint(entry)` with a reviewer string naming the user spec. A question mode in the review.py engine must not route a question through the push first-line parser.
 
 **Gotchas:**
 - `review.py texts --approve` writes only passing texts; a user-spec text's entry is written by hand with `push_texts.fingerprint(entry)`.
@@ -273,17 +273,13 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 #### As-built
 
-- `shutdown.remote_control` holds the user's four lines: Title `{who} remote-control is off`, `Session: {session}`, `Action: run /remote-control`, and a body opening `Reason: Remote control is off.`. `{who}` (from `remote_control.remote_control_who`) is `<unit> unit` for a production unit, `<production> showrunner` for a showrunner, else the session name. Examples: typical, unit, showrunner; `{who}` differs from the session name in the last two.
-- The session name passes through the fixer chain: `restart.remote_control_missing` passes `item["name"]` to `launch_fixer(…, alerts, session)` → `fix(…, session)` → `alert_failed(who, session)`, and straight to `alert_failed` when the fixer cannot launch. `alert_failed` calls `render("shutdown.remote_control", who=..., session=...)` with no `machine`. The fixer CLI in `shutdown.py` requires `--session`.
+- The `shutdown.remote_control` push and `alert_failed` this phase reworded were later removed at the user's request (quiet-alerts Phase 1): a restart turns Remote Control on itself and never reports it.
 - `review.py texts --id <id> --approve --user-spec SOURCE` runs the review and writes the `push_texts_reviewed.json` entry whatever the verdict. Authority is `ReviewerApprovalRequired | UserSpecifiedText`; a user-spec record's reviewer reads `user-spec: <source>; reviewer: <model>` and carries `objections` (`RuleFailureRecord` list, rule and quote each). The command still exits 1 on objections. Without `--user-spec`, `--approve` writes only passing texts.
 - `text_approvals()` types the approval file at the JSON boundary. Approving an id keeps records for exactly its current examples and drops the rest.
 
 **Files:**
-- `scripts/notify/push_catalog.py` — the remote-control entry
 - `scripts/notify/review.py` — user-spec approval, typed approval file, per-id pruning
-- `scripts/notify/push_texts_reviewed.json` — user-spec approvals with objections for the three examples
-- `scripts/shutdown/remote_control.py`, `restart.py`, `shutdown.py` — the session through the fixer chain
-- `scripts/shutdown/test_support.py`, `test_send_guard.py`, `test_settle.py` — fakes and expectations for the session argument
+- `scripts/notify/push_texts_reviewed.json` — user-spec approvals with objections
 
 **Binds later work:** the approval file is read only through `review.text_approvals()`; user-spec approvals carry `objections`; approving an id keeps records for exactly its current examples.
 
@@ -368,7 +364,7 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Ruled out:** telling questions to the user apart from questions to peers in the nightly count, left to measure once 48 h of history exists.
 
-### Phase 7 — The nightly question count measures only questions put to the user  · status: todo
+### Phase 7 — The nightly question count measures only questions put to the user  · status: done
 
 **Depends on:** Phase 5, Phase 6
 
