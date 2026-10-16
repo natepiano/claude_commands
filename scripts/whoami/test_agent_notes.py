@@ -962,6 +962,7 @@ class AgentNotesTests(unittest.TestCase):
         default = self.account_dir("default", "main@example.com", "main-token")
         unfit = self.account_dir("claude3", "unfit@example.com", "unfit-token")
         (unfit / "projects").unlink()
+        _ = (unfit / "projects").write_text("local file against the shared projects folder")
         external = self.root / "external account"
         external.mkdir()
         _ = (external / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "external@example.com"}}))

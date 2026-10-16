@@ -1313,7 +1313,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - An interrupted backfill leaves `backfill_state.status = running`, and Codex holds startup for 15 minutes on that lease; a `codexN` run that meets a first backfill fails with "app server did not become ready", and `accounts.py setup codexN` repairs the home.
 - Tests fake `prepare_codex_home`; a suite run against the real one starts Codex.
 
-### Phase 44 — Shared links repair themselves  · status: todo
+### Phase 44 — Shared links repair themselves  · status: done
 
 **Depends on:** Phase 43
 
@@ -1335,6 +1335,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Files:**
 
 - `scripts/accounts/accounts.py` — `_repair_link` and its callers: create, adopt, replace, merge; `prepared_account` and `check_codex_target` repair before checking; `ALWAYS_LINKED`.
+- `scripts/accounts/refusal_watch.py` — a preview judges repairable entries as ready and changes nothing on disk.
+- `scripts/accounts/test_refusal_watch.py` — a preview leaves both homes untouched.
+- `scripts/whoami/test_agent_notes.py`, `scripts/production/test_add_showrunner.py`, `scripts/shutdown/test_account_move.py` — fixtures follow the repair rules: an unfit account is unfit for a reason repair cannot fix, a wrong link is relinked at launch, a refused move names its first problem.
 - `scripts/accounts/test_accounts.py` — launch repairs (no refusal for a missing link once another account created the target), folder target created, missing file target not created, account entry adopted into a missing target, empty folder replaced, merge without clash, clash kept with the step, real file refused against an existing target; Codex home the same.
 
 **Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_accounts.py`.
