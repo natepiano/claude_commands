@@ -375,3 +375,33 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 - Under the one-in-four bar, so no recipient filter was built: `reply_questions`, `sample` and the Stop hook's choice-line check are unchanged. No repository code changed.
 
 **Ruled out:** a recipient filter in the nightly count; peer requests are too small a share to matter.
+
+### Phase 15 — Every question a showrunner puts to the user is registered and reviewed  · status: done
+
+**Depends on:** Phase 5, Phase 7
+
+#### Work Order
+
+**Goal:** A question or request a showrunner puts to the user in a reply ("Say go and I'll …", "Want me to …?", `(recommended` choice lines) is registered and goes through Phase 5's question review, so the open-questions count is right.
+
+**Spec:**
+- Showrunner's call 2026-10-16 after Phase 7's measurement: 28 of 29 counted replies were asks of the user that were never registered, so the open-questions count was wrong. This phase fixes that result.
+- `commands/showrunner/produce.md`, where `open_for_user` is described: any reply that asks the user something — a question, a request such as "Say go and I'll …", or `(recommended` choice lines — registers it first as an `open_for_user` item with its full `question`, and the reply carries the `reviewed question` text. One or two sentences.
+- `scripts/hooks/showrunner_footer.py` `block_reason`: block a showrunner reply holding an ask of the user that matches no registered text. Asks come from `review.reply_questions` (sentences and choice lines), imported the way the existing choice-line check imports it. Registered text is the instance's pending record plus the current outstanding items' `text`, `reviewed` and `question`, compared through `review.question_prose` on both sides (either containing the other, as `sample` does). The reason names the sentence and says to register it with `update_registration.py footer --state` and paste the reviewed text. It runs where the existing reviewed-text check runs (before the footers-off return and the `stop_hook_active` skip).
+- Not an ask of the user (no block): a question or choice inside a message relayed to another session or unit (a recipient heading or lead-in naming it, as in Phase 7's reply 28), a choice line quoted from a unit director in its own words, and anything in `>` quotes or code (already excluded by `reply_questions`). If recipient detection needs a helper, it lives in `scripts/notify/review.py` beside `reply_questions`, with `reply_questions`' result and `sample`'s count unchanged.
+- Dry check (unit director runs it): over Phase 7's frozen inputs in `${SESSION_DIR}/phases/7/inputs` (classification in `phases/7/classification.md`), the new check flags all 28 user asks and not reply 28.
+
+**Files:**
+- `scripts/hooks/showrunner_footer.py` — the unregistered-ask check
+- `scripts/hooks/test_stop_showrunner_footer.py` — its cases
+- `scripts/notify/review.py` — recipient helper, only if needed
+- `scripts/notify/test_review.py` — its cases, only if needed
+- `commands/showrunner/produce.md` — the registration sentence
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `showrunner_footer.py`, `review.py`, `produce.md`; hub: `scripts/hooks/showrunner_footer.py`
+- `test` — `test_stop_showrunner_footer.py`, `test_review.py`
+
+**Constraints from prior phases:** Phase 5: `showrunner_footer.read_pending_reviewed`, `pending_question_text`, the reviewed-text and choice-line checks in `block_reason`; `review` is imported inside functions in any module `test_update_registration.py` loads (`showrunner_footer.py` included), never at module level. Phase 7: `reply_questions` and `sample` stay unchanged. No test reaches the phone; tests use temp state directories (`SHOWRUNNER_STATE_DIR`). Codex workers start no build, test, lint or type check: they end with `Run request:` and the unit director runs it.
+
+**Acceptance gate:** test lines for `scripts/hooks`, `scripts/production`, `scripts/notify` and `scripts/lib` green; basedpyright 0/0 on changed files; tests: an unregistered "Say go and I'll …" reply blocks, an unregistered `(recommended` choice blocks, a registered one passes, a question relayed to another session passes, a choice quoted from a unit director passes; the dry check above flags 28 and not reply 28.
