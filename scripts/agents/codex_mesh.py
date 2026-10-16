@@ -4295,9 +4295,47 @@ DaemonTarget = CodexDaemon | UnclassifiedCodexProcess | UnreadCodexProcess
 
 
 @dataclass(frozen=True)
+class ProcessSession:
+    sid: int
+
+
+@dataclass(frozen=True)
+class SessionUnread:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SessionGone:
+    """The listed process exited before its session could be read."""
+
+
+@dataclass(frozen=True)
 class FamilyProcess:
     parent: int
     identity: ProcessIdentity | UnreadCodexProcess
+    session: ProcessSession | SessionGone | SessionUnread
+
+
+def _process_session(pid: int) -> ProcessSession | SessionGone | SessionUnread:
+    """Read a session id for a candidate from the own-user process listing."""
+    try:
+        return ProcessSession(os.getsid(pid))
+    except ProcessLookupError:
+        return SessionGone()
+    except OSError:
+        return SessionUnread("process session could not be read")
+
+
+@contextlib.contextmanager
+def _daemon_stop_lock() -> Generator[None, None, None]:
+    path = Path.home() / ".local/state/codex-mesh/daemon-stop.lock"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _list_codex_processes() -> str:
@@ -4367,6 +4405,8 @@ def _running_daemons() -> list[DaemonTarget]:
         target = _daemon_record(int(fields[0]))
         if isinstance(target, (UnreadCodexProcess, CodexDaemon)):
             targets.append(target)
+        elif _daemon_process_state(target.pid) is ProcessRunState.STOPPED:
+            targets.append(target)
     return targets
 
 
@@ -4396,21 +4436,81 @@ def _daemon_verdict(target: DaemonTarget) -> SweepVerdict:
     return _process_cleanup_verdict(target)
 
 
-def _daemon_process_tree() -> dict[int, FamilyProcess]:
-    """Bind identity evidence to a verified ancestry snapshot before returning it.
+def _list_family_processes() -> str:
+    return _cleanup_command(("ps", "-u", str(os.getuid()), "-o", "pid=,ppid=,args="))
 
-    Read identities before the authoritative second table. A pid newly appearing or
-    changing its parent/command between tables has no trusted snapshot identity.
+
+def _own_process_table() -> dict[int, process_table.Process]:
+    table: dict[int, process_table.Process] = {}
+    for line in _list_family_processes().splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            raise OSError("ps -u: unreadable process family listing")
+        pid, parent = int(fields[0]), int(fields[1])
+        # Only the last column is free text. A path containing spaces cannot
+        # shift the ancestry columns or be mistaken for part of argv.
+        table[pid] = process_table.Process(pid, parent, "", fields[2])
+    return table
+
+
+def _table_process_sessions(
+    table: Mapping[int, process_table.Process],
+) -> dict[int, ProcessSession | SessionGone | SessionUnread]:
+    return {pid: _process_session(pid) for pid in table}
+
+
+def _session_process_ids(
+    process_sessions: Mapping[int, ProcessSession | SessionGone | SessionUnread],
+    swept_sessions: frozenset[int],
+) -> set[int]:
+    members: set[int] = set()
+    if not swept_sessions:
+        return members
+    for pid, session in process_sessions.items():
+        if isinstance(session, SessionUnread):
+            raise DaemonFreezeRefused(pid, session.reason)
+        if isinstance(session, ProcessSession) and session.sid in swept_sessions:
+            members.add(pid)
+    return members
+
+
+def _family_candidate_ids(
+    table: Mapping[int, process_table.Process], parent: int,
+    tracked: Mapping[int, ProcessIdentity], swept_sessions: frozenset[int],
+    process_sessions: Mapping[int, ProcessSession | SessionGone | SessionUnread],
+) -> set[int]:
+    members = {parent, *tracked} & table.keys()
+    members.update(_session_process_ids(process_sessions, swept_sessions))
+    pending = list(members)
+    while pending:
+        current = pending.pop()
+        for pid, process in table.items():
+            if process.parent == current and pid not in members:
+                members.add(pid)
+                pending.append(pid)
+    return {pid for pid in members if not isinstance(process_sessions[pid], SessionGone)}
+
+
+def _daemon_process_tree(
+    parent: int, tracked: Mapping[int, ProcessIdentity], swept_sessions: frozenset[int],
+) -> dict[int, FamilyProcess]:
+    """Read candidate identities against consistent own-user ancestry snapshots.
+
+    Each table's session results are read once and retained for its consumers.
     """
-    before = process_table.snapshot()
-    identities = {pid: _process_identity(pid) for pid in before}
-    table = process_table.snapshot()
+    before = _own_process_table()
+    before_sessions = _table_process_sessions(before)
+    identities = {pid: _process_identity(pid) for pid in _family_candidate_ids(
+        before, parent, tracked, swept_sessions, before_sessions)}
+    table = _own_process_table()
+    process_sessions = _table_process_sessions(table)
     result: dict[int, FamilyProcess] = {}
-    for pid, process in table.items():
+    for pid in _family_candidate_ids(table, parent, tracked, swept_sessions, process_sessions):
+        process = table[pid]
         identity = identities.get(pid, UnreadCodexProcess(pid, "process appeared during family snapshot"))
         if before.get(pid) != process or _process_identity(pid) != identity:
             identity = UnreadCodexProcess(pid, "process changed during family snapshot")
-        result[pid] = FamilyProcess(process.parent, identity)
+        result[pid] = FamilyProcess(process.parent, identity, process_sessions[pid])
     return result
 
 
@@ -4557,13 +4657,146 @@ def _family_kept(pid: int, reason: str) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class ProcessTerminal:
+    name: str
+
+
+@dataclass(frozen=True)
+class TerminalUnread:
+    reason: str
+
+
+def _process_terminal(pid: int) -> ProcessTerminal | TerminalUnread:
+    try:
+        terminal = _cleanup_command(("ps", "-p", str(pid), "-o", "tty="), empty_selection=True).strip()
+    except (OSError, subprocess.SubprocessError):
+        return TerminalUnread("controlling terminal could not be read")
+    if not terminal:
+        return TerminalUnread("controlling terminal could not be read")
+    return ProcessTerminal(terminal)
+
+
+def _recover_stopped_codex_members(
+    members: Sequence[ProcessIdentity | UnreadCodexProcess], *, resume: bool = True,
+) -> None:
+    """Report prior stops; recover verified detached default-home members only."""
+    for member in members:
+        try:
+            if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
+                continue
+            reason = ""
+            if isinstance(member, UnreadCodexProcess):
+                reason = member.reason
+            elif _application_codex(str(member.executable)):
+                reason = "executable belongs to an application bundle"
+            elif not _identity_matches(member):
+                reason = "member identity could not be confirmed"
+            else:
+                setting = account.process_codex_home(member.pid)
+                if isinstance(setting, account.ProcessEnvironmentUnread):
+                    reason = "process environment could not be read"
+                elif isinstance(setting, account.ProcessCodexHome) and setting.home != Path.home() / ".codex":
+                    reason = "member uses another Codex home"
+                else:
+                    terminal = _process_terminal(member.pid)
+                    if isinstance(terminal, TerminalUnread):
+                        reason = terminal.reason
+                    elif terminal.name not in ("?", "??"):
+                        reason = f"member has controlling terminal {terminal.name}"
+            if reason:
+                _ = _family_kept(member.pid, f"found stopped; kept: {reason}")
+            elif not resume:
+                _ = _family_kept(member.pid, "found stopped; report only, member kept")
+            elif isinstance(member, ProcessIdentity):
+                # Recovery of a prior stop needs a full identity match, unlike
+                # rollback of a STOP issued by this invocation.
+                if sessions.process_start(member.pid) != member.started or not _signal_daemon_process(member, signal.SIGCONT):
+                    _ = _family_kept(member.pid, "found stopped; kept: could not resume member; may still be stopped")
+                else:
+                    print(f"codex_mesh: daemon family: pid {member.pid} found stopped; resuming kept member", file=sys.stderr)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            _ = _family_kept(member.pid, "stopped member kept: could not be checked; may still be stopped")
+
+
+def _recover_kept_daemon(target: ProcessIdentity, *, resume: bool = True) -> bool:
+    def recover() -> bool:
+        table = _daemon_process_tree(target.pid, {}, frozenset())
+        root = table.get(target.pid)
+        if root is None:
+            return _family_kept(target.pid, "kept family identity could not be confirmed")
+        members = [root, *_family_members(table, target.pid)]
+        if (not isinstance(root.identity, ProcessIdentity)
+                or (root.identity.pid, root.identity.started, root.identity.arguments, root.identity.executable)
+                != (target.pid, target.started, target.arguments, target.executable)):
+            _recover_stopped_codex_members([member.identity for member in members], resume=False)
+            return _family_kept(target.pid, "kept family identity could not be confirmed")
+        was_stopped = False
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            was_stopped = _daemon_process_state(target.pid) is ProcessRunState.STOPPED
+        _recover_stopped_codex_members([member.identity for member in members], resume=resume)
+        return (resume and was_stopped and _identity_matches(target)
+                and _daemon_process_state(target.pid) is ProcessRunState.RUNNING)
+
+    try:
+        if not resume:
+            return recover()
+        with _daemon_stop_lock():
+            return recover()
+    except BlockingIOError:
+        return _family_kept(target.pid, "another daemon cleanup holds the stop lock")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return _family_kept(target.pid, "stopped member recovery failed; may still be stopped")
+
+
+def _daemon_home(target: DaemonTarget) -> str:
+    if isinstance(target, UnreadCodexProcess):
+        return "unread"
+    setting = account.process_codex_home(target.pid)
+    if isinstance(setting, account.ProcessEnvironmentUnread):
+        return "unread"
+    home = setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex"
+    return codex_home_display(home)
+
+
+def _frozen_daemon_sessions(frozen: Sequence[FrozenDaemonMember]) -> frozenset[int]:
+    leaders: set[int] = set()
+    for member in frozen:
+        session = _process_session(member.identity.pid)
+        if isinstance(session, SessionUnread):
+            raise DaemonFreezeRefused(member.identity.pid, session.reason)
+        if isinstance(session, ProcessSession) and session.sid == member.identity.pid:
+            leaders.add(session.sid)
+    return frozenset(leaders)
+
+
 def _stop_daemon(target: DaemonTarget) -> bool:
-    """Freeze a fixed family before killing it, and release survivors on failure."""
+    """Serialize family cleanup, including rollback and recovery of earlier stops."""
     if not isinstance(target, CodexDaemon):
         return False
-    frozen: list[FrozenDaemonMember] = []
     try:
-        table = _daemon_process_tree()
+        with _daemon_stop_lock():
+            return _stop_daemon_locked(target)
+    except BlockingIOError:
+        return _family_kept(target.pid, "another daemon cleanup holds the stop lock")
+    except OSError:
+        return _family_kept(target.pid, "daemon stop lock could not be acquired")
+
+
+def _stop_daemon_locked(target: CodexDaemon) -> bool:
+    """Freeze ancestry and sessions led by frozen members before killing them.
+
+    An unseen descendant that calls setsid leaves those sessions and is out of
+    reach. Mac daemon session leadership has not been checked live. Never sweep
+    a session led by a process outside the tracked family.
+    """
+    frozen: list[FrozenDaemonMember] = []
+    tracked: dict[int, FamilyProcess] = {}
+    succeeded = False
+    try:
+        measured = time.monotonic()
+        table = _daemon_process_tree(target.pid, {}, frozenset())
+        listing_seconds = time.monotonic() - measured
         root = table.get(target.pid)
         if root is None or isinstance(root.identity, UnreadCodexProcess) or not _identity_matches(target):
             return _family_kept(target.pid, "parent identity could not be confirmed")
@@ -4575,7 +4808,11 @@ def _stop_daemon(target: DaemonTarget) -> bool:
         tracked = {target.pid: root}
         for member in _family_members(table, target.pid):
             tracked[member.identity.pid] = member
-        deadline = time.monotonic() + REAP_WAIT_SECS
+        # Budget from the measured candidate listing on this machine, including
+        # Darwin's kernel/start-time reads, rather than a fixed five seconds.
+        started = time.monotonic()
+        deadline = started + max(REAP_WAIT_SECS, listing_seconds * 4)
+        swept_sessions: frozenset[int] = frozenset()
         while True:
             for member in list(tracked.values())[len(frozen):]:
                 identity = member.identity
@@ -4586,13 +4823,29 @@ def _stop_daemon(target: DaemonTarget) -> bool:
                 if isinstance(verdict, ServerInUse):
                     raise DaemonFreezeRefused(identity.pid, verdict.reason)
                 _freeze_daemon_process(identity, frozen)
-            table = _daemon_process_tree()
+            swept_sessions = swept_sessions | _frozen_daemon_sessions(frozen)
+            identities = {member.identity.pid: member.identity for member in frozen}
+            measured = time.monotonic()
+            table = _daemon_process_tree(target.pid, identities, swept_sessions)
+            listing_seconds = max(listing_seconds, time.monotonic() - measured)
+            deadline = max(deadline, started + max(REAP_WAIT_SECS, listing_seconds * 4))
             added = False
             for pid in list(tracked):
                 for member in _family_members(table, pid):
                     if member.identity.pid not in tracked:
                         tracked[member.identity.pid] = member
                         added = True
+            # Session membership reaches an orphan even after its intermediate
+            # parent has exited. The user-filtered table bounds all session reads.
+            for pid, member in table.items():
+                if pid in tracked:
+                    continue
+                session = member.session
+                if isinstance(session, SessionUnread):
+                    raise DaemonFreezeRefused(pid, session.reason)
+                if isinstance(session, ProcessSession) and session.sid in swept_sessions:
+                    tracked[pid] = member
+                    added = True
             for frozen_member in frozen:
                 member = frozen_member.identity
                 if _daemon_process_state(member.pid) is not ProcessRunState.STOPPED:
@@ -4625,6 +4878,12 @@ def _stop_daemon(target: DaemonTarget) -> bool:
         while True:
             remaining = [member.identity for member in frozen if not _daemon_identity_gone(member.identity)]
             if not remaining:
+                # A new unrelated ps pid is not family evidence. Only surviving
+                # members of sessions whose leaders we froze can prevent success.
+                for pid in sorted(_session_process_ids(_table_process_sessions(_own_process_table()), swept_sessions)):
+                    if _daemon_process_state(pid) is not ProcessRunState.GONE:
+                        return _family_kept(pid, "process remains in a swept session after shutdown")
+                succeeded = True
                 return True
             if time.monotonic() >= deadline:
                 return _family_kept(remaining[0].pid, "family member remains after shutdown")
@@ -4635,6 +4894,12 @@ def _stop_daemon(target: DaemonTarget) -> bool:
         return _family_kept(target.pid, "process family could not be read")
     finally:
         _resume_daemon_family(frozen)
+        if not succeeded:
+            frozen_ids = {member.identity.pid for member in frozen if member.stopped_by_cleanup}
+            _recover_stopped_codex_members([
+                member.identity for pid, member in tracked.items()
+                if pid not in frozen_ids
+            ])
 
 
 def _record_names_server(record: dict[str, object], pid: int, port: int) -> bool:
@@ -4931,8 +5196,14 @@ def command_sweep(args: argparse.Namespace) -> int:
     for daemon in daemons:
         if not isinstance(daemon, CodexDaemon):
             reason = daemon.reason if isinstance(daemon, UnreadCodexProcess) else "not an app-server daemon"
-            print(f"{daemon.pid}\tunclassified\tkept\t{reason}\t-")
+            label, kind = "kept", "unclassified"
+            if isinstance(daemon, ProcessIdentity):
+                kind, reason = "stopped member", "Codex-family process found stopped"
+                if _recover_kept_daemon(daemon, resume=stop):
+                    label = "resumed"
+            print(f"{daemon.pid}\t{kind}\t{label}\t{reason}\t{_daemon_home(daemon)}")
             continue
+        home = _daemon_home(daemon)
         verdict = _daemon_verdict(daemon)
         label = "unused" if isinstance(verdict, ServerUnused) else "in use"
         reason = verdict.reason
@@ -4943,7 +5214,12 @@ def command_sweep(args: argparse.Namespace) -> int:
                 label = "stopped"
             elif stop:
                 label, reason = "kept", "unused at the first look, not stopped at the second"
-        print(f"{daemon.pid}\tdaemon\t{label}\t{reason}\t~/.codex")
+        if label != "stopped":
+            if _daemon_process_state(daemon.pid) is ProcessRunState.STOPPED:
+                reason += "; found stopped"
+            if _recover_kept_daemon(daemon, resume=stop):
+                label = "resumed"
+        print(f"{daemon.pid}\tdaemon\t{label}\t{reason}\t{home}")
     tail = f"{stopped} stopped" if stop else "report only, nothing was stopped"
     print(f"{len(servers) + sum(isinstance(target, CodexDaemon) for target in daemons)} app-server(s), {unused} unused; {tail}")
     return 0
