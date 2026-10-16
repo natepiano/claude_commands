@@ -53,7 +53,7 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 
 
 def setUpModule() -> None:
-    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
@@ -129,7 +129,7 @@ class AccountsTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home with spaces"
         _ = self.home.mkdir()
         self.main_dir = self.home / ".claude"
@@ -2282,6 +2282,14 @@ class AccountsTests(unittest.TestCase):
         login_read.assert_not_called()
 
     def test_status_describes_accounts_without_creating_any(self) -> None:
+        with patch.object(sys, "platform", "linux"):
+            self.assert_status_describes_accounts_without_creating_any("run accounts.py cutover-home")
+
+    def test_mac_status_describes_accounts_without_creating_any(self) -> None:
+        with patch.object(sys, "platform", "darwin"):
+            self.assert_status_describes_accounts_without_creating_any(accounts.MAC_HOME_LOGIN_STEP)
+
+    def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
         self.write_main_config()
         before = set(self.home.iterdir())
@@ -2296,7 +2304,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertNotRegex(stdout, r"\| ~/\.claude +\|")
-        self.assertIn("~/.claude holds a login; run accounts.py cutover-home", stdout)
+        self.assertIn(f"~/.claude holds a login; {home_step}", stdout)
         self.assertNotIn("unit directors", stdout)
         self.assertNotIn("unclassified:", stdout)
         self.assertNotIn("mcpServers:", stdout)
@@ -4101,7 +4109,7 @@ class PickerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
         }, clear=True)))

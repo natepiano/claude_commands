@@ -33,7 +33,7 @@ class RoleMapTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home, self.server_home = root / "mac home", root / "natedev home"
         for home in (self.home, self.server_home):
             (home / ".claude").mkdir(parents=True)
