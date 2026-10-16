@@ -159,9 +159,21 @@ def _tmux(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([binary, *arguments], capture_output=True, text=True, check=False)
 
 
+def installed_tmux_binary() -> str:
+    """Resolve tmux for observation, without building or fetching a missing binary."""
+    binary = os.environ.get("UNIT_LOOKUP_TMUX") or shutil.which("tmux")
+    if not binary:
+        raise OSError("tmux is not installed; cannot read its sessions")
+    return binary
+
+
+def _observe_tmux(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([installed_tmux_binary(), *arguments], capture_output=True, text=True, check=False)
+
+
 def tmux_sessions() -> dict[str, tuple[str, list[str]]]:
     """Each tmux session id to its label and its pane ids. No tmux server means no sessions."""
-    listed = _tmux("list-panes", "-a", "-F", "#{session_id}\t#{pane_id}\t#{session_name}")
+    listed = _observe_tmux("list-panes", "-a", "-F", "#{session_id}\t#{pane_id}\t#{session_name}")
     if listed.returncode != 0:
         detail = listed.stderr.strip()
         if "no server running" in detail or "error connecting" in detail:
@@ -176,7 +188,7 @@ def tmux_sessions() -> dict[str, tuple[str, list[str]]]:
 
 def _marks(session: str) -> dict[str, str]:
     """The marks in one tmux session's environment. A session that ended meanwhile has none."""
-    shown = _tmux("show-environment", "-t", session)
+    shown = _observe_tmux("show-environment", "-t", session)
     if shown.returncode != 0:
         return {}
     pairs = (line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
@@ -236,7 +248,7 @@ def _every_marks(sessions: list[str]) -> dict[str, dict[str, str]]:
                   ";", "show-environment", "-t", session]
     found: dict[str, dict[str, str]] = {}
     current = ""
-    for line in (_tmux(*chain).stdout if chain else "").splitlines():
+    for line in (_observe_tmux(*chain).stdout if chain else "").splitlines():
         if line.startswith(MARKS_HEADER):
             current = line.removeprefix(MARKS_HEADER)
             found[current] = {}

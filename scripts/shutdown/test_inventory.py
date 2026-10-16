@@ -1027,10 +1027,18 @@ elif "comm=" in joined:
                 format_text = "\t".join(field for field in format_text.split("\t") if field != "#{pid}")
             return subprocess.CompletedProcess(argv, 0,
                 pane_display(format_text, name, session_id, pid, "", started_at, server_pid), "")
-        with patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
+        with patch.object(unit_lookup, "installed_tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
             found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(len(calls), 1)
         return found
+
+    def test_tmux_host_observation_never_builds_when_its_binary_is_gone(self) -> None:
+        with (patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
+              patch.object(shutil, "which", return_value=None),
+              patch.object(subprocess, "run", side_effect=FileNotFoundError("no executable")) as run):
+            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(found, ("", {"kind": "not recorded"}, {"kind": "not recorded"}, {"kind": "not recorded"}))
+        run.assert_not_called()
 
     def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
         self.assertEqual(self.discover_tmux("production work", "$8", "62008"),

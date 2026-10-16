@@ -309,7 +309,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Ruled out:**
 - A phone push or alert for a failed snapshot; the outcome file under `snapshots/` (`all_snapshots` reads every `.json` there as a login's snapshot).
 
-### Phase 12 — Standalone tmux sessions move to herdr; the tmux-free check  · status: todo
+### Phase 12 — Standalone tmux sessions move to herdr; the tmux-free check  · status: done
 
 **Depends on:** Phase 7, Phase 8, Phase 9, Phase 10 (Spec 1); Spec 2 also on Phase 11, which edits the same `shutdown.py`
 
@@ -333,6 +333,8 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 - `scripts/shutdown/test_restart.py` — standalone tmux migration.
 - `scripts/shutdown/shutdown.py` — `tmux-free`.
 - `scripts/shutdown/test_shutdown_cli.py` — `tmux-free` refuses a partial inventory, an unknown host, an unreadable tmux and a shell-only tmux session; passes when every observation is empty.
+- `scripts/production/unit_lookup.py`, `test_unit_lookup.py` — `installed_tmux_binary()` resolves tmux for observation without building it; session listing and mark reads use it, and a missing tmux is unreadable rather than built.
+- `scripts/shutdown/inventory.py`, `test_inventory.py` — `_tmux_session` uses `installed_tmux_binary()`.
 
 **Workers:** 2 writers (no test lane; `test` opens as impl); the two specs share no file.
 - `test` (opens as impl) — `restart.py`, `test_restart.py`; hub: `scripts/shutdown/restart.py` (Spec 1). Starts beside Phase 11.
