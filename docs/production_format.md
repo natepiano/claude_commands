@@ -100,10 +100,16 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
-- **Change review:** <path to the user's change-review list>; required. A new production
-  uses `~/rust/hanadocs/change-review/<slug>.md`; Hana keeps `~/rust/hanadocs/change-review.md`.
+- **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`;
+  required. One list per top-level showrunner, named for its session name, never the
+  production slug (`change-review - natedev.md`); a child production names its root's
+  list. `change_review.py` resolves the list from the root showrunner while it runs and
+  falls back to this path when it does not, warning when the two differ.
   `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
-  `/change_review` adds the rest; a missing file is created on its first row
+  `/change_review` adds the rest; a missing file is created on its first row with
+  frontmatter (`date_created`, `date_modified` as `"[[YYYY-MM-DD]]"`, a `productions`
+  list of production doc paths, `showrunner`), and every write moves `date_modified`
+  and adds the writing production's doc to `productions`
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <the issues folder the production files its proposals in, e.g.
   `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged

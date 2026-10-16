@@ -610,9 +610,9 @@ For each distinct user-visible result:
    check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
    from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
    `--unit`, and one `--old` per replaced live entry. When the merge has
-   several results, pass `--separate-result` for every row. A Hana row is the
-   bare `C<n>`; any other list's row names the list, `<slug>/C<n>`
-   (`build-followups/C3`).
+   several results, pass `--separate-result` for every row. A row on hana's
+   list is the bare `C<n>`; a row on any other list names its showrunner,
+   `<showrunner>/C<n>` (`natedev/C3`).
 
 Several results get several rows. Internal-only work gets none; write
 `feature log: none — <reason>` to the production log. The merge is not complete
@@ -659,9 +659,9 @@ beginning `works` or `fine` lands the row; any other returns it to its unit.
 1. **Feature log.** Only when the production's project closes out by change
    review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
-   review id is the row: bare `C<n>` on Hana's list, `<list>/C<n>` on any other,
-   where `<list>` is the list file's name without `.md`
-   (`build-followups/C3`).
+   review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
+   other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
+   is named for (`natedev/C3`).
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
      its proposal has `--old`. Propose a missing row first; correct wrong
      meaning by rerunning `propose` while it is open.
