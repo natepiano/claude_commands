@@ -2926,10 +2926,50 @@ class AccountsTests(unittest.TestCase):
                 header = "Workers would move" if dry_run else "Workers moving"
                 self.assertEqual(stdout, f"{header} codex2 → codex1:\n" +
                     "  natedev · two-accounts · impl-worker → codex1\n" +
-                    "  macbook · natedev · herdr-trial · review-worker → codex1 (mid-turn; switches when its turn ends)\n" +
+                    "  macbook · natedev · herdr-trial · review-worker → codex1, interrupted and resumed\n" +
                     "  natedev · scratch session · test-worker → codex1\n" +
                     "  unknown session (orphan-run) · fix-worker → codex1\n")
                 self.assertNotIn("private-run", stdout)
+
+    def test_workers_swap_reports_each_failed_worker_with_manual_resume_and_keeps_new_role(self) -> None:
+        _, target = self.workers_fixture()
+        run = self.root / "run with spaces"
+        interrupt_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-impl"
+        resume_command = f"python3 mesh.py resume-account-move --session-dir '{run}' --to project-review"
+        switches = (codex_mesh.WorkersRunSwitch(run, (), (
+            codex_mesh.SwitchingWorker("project-impl", True,
+                codex_mesh.WorkerMoveFailed("interrupt failed: access denied", interrupt_command)),
+            codex_mesh.SwitchingWorker("project-review", True,
+                codex_mesh.WorkerMoveFailed("resume failed: server unavailable", resume_command)),
+            codex_mesh.SwitchingWorker("project-test", False),
+        )),)
+        with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
+              patch.object(roster, "roster", return_value=roster.Roster([], []))):
+            code, output, errors = self.run_cli("swap", "workers", "codex1")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(agent_accounts.workers_home(), target)
+        lines = output.splitlines()
+        self.assertEqual(len(lines), 4)
+        for worker, reason, command in (("impl-worker", "interrupt failed: access denied", interrupt_command),
+                                         ("review-worker", "resume failed: server unavailable", resume_command)):
+            line = next(line for line in lines if f" · {worker} → codex1" in line)
+            self.assertIn(reason, line)
+            self.assertIn(command, line)
+            self.assertNotIn("interrupted and resumed", line)
+        idle = next(line for line in lines if " · test-worker → codex1" in line)
+        self.assertNotIn("failed", idle)
+        self.assertNotIn("interrupted", idle)
+
+    def test_workers_swap_role_write_failure_exits_one_before_interrupting_workers(self) -> None:
+        _ = self.workers_fixture()
+        before = self.role_files()
+        with (patch.object(accounts, "_write_role", side_effect=accounts.AccountsError("role write refused")),
+              patch.object(codex_mesh, "retire_workers_servers") as retire):
+            code, output, errors = self.run_cli("swap", "workers", "codex1")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("role write refused", errors)
+        self.assertEqual(self.role_files(), before)
+        retire.assert_not_called()
 
     def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
         records = self.home / ".claude/sessions"

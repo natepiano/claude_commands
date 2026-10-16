@@ -546,7 +546,7 @@ class WorkersSwapDryRun:
 
 @dataclass(frozen=True)
 class WorkersSwapStarted:
-    """The workers role has moved; live turns finish on their existing server."""
+    """The workers role has moved; each interrupted worker reports its resume outcome."""
 
     lines: tuple[str, ...]
 
@@ -3004,6 +3004,10 @@ class SwitchingWorkerDetail(Protocol):
     def name(self) -> str: ...
     @property
     def mid_turn(self) -> bool: ...
+    @property
+    def failure(self) -> str: ...
+    @property
+    def resume_command(self) -> str: ...
 
 
 class WorkersRunSwitchDetail(Protocol):
@@ -3064,7 +3068,9 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitchDetail], previous: Pa
             slot = stem.rpartition("-")[2] or stem
             name = f"{slot}-worker"
             context = " · ".join([*parts, name])
-            suffix = " (mid-turn; switches when its turn ends)" if worker.mid_turn else ""
+            suffix = ", interrupted and resumed" if worker.mid_turn else ""
+            if worker.failure:
+                suffix = f", {worker.failure}; resume with {worker.resume_command}"
             lines.append(f"  {context} → {target}{suffix}")
     return tuple(lines)
 
@@ -3092,9 +3098,17 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     if dry_run:
         switches = _retire_workers_servers(target_home, account_label, dry_run=True)
         return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
-    _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
-    switches = _retire_workers_servers(target_home, account_label, dry_run=False)
-    return WorkersSwapStarted(_workers_swap_lines(switches, workers_home, account_label, dry_run=False))
+    try:
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, account_label)
+    except OSError as error:
+        raise AccountsError(f"accounts: could not move the workers role: {error}") from error
+    try:
+        switches = _retire_workers_servers(target_home, account_label, dry_run=False)
+        lines = _workers_swap_lines(switches, workers_home, account_label, dry_run=False)
+    except (ConnectionError, OSError, SystemExit) as error:
+        lines = (f"Workers role now uses {account_label}; worker move failed: {error}. "
+                 + "Resume affected workers with codex_mesh.py resume-account-move --session-dir <run> --to <worker>.",)
+    return WorkersSwapStarted(lines)
 
 
 def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:

@@ -23,6 +23,7 @@ import io
 import json
 import os
 import select
+import shlex
 import signal
 import socket
 import struct
@@ -157,6 +158,9 @@ class StubAppServer:
         self.requests: list[dict[str, object]] = []
         self.errors: list[Exception] = []
         self.close_after_turn_start: bool = False
+        self.hold_turn_completion: bool = False
+        self.held_turn_interrupted: threading.Event = threading.Event()
+        self.release_held_turn: threading.Event = threading.Event()
         self.block_compact_turn_completion: bool = False
         self.compaction_event_sent: threading.Event = threading.Event()
         self.release_compact_turn_completion: threading.Event = threading.Event()
@@ -174,6 +178,7 @@ class StubAppServer:
     def close(self) -> None:
         self.stopping.set()
         self.release_compact_turn_completion.set()
+        self.release_held_turn.set()
         _ = self.close_writer.send(b"close")
         self.thread.join(timeout=300)
         self.listener.close()
@@ -234,6 +239,20 @@ class StubAppServer:
                     self.compaction_event_sent.set()
                     _ = self.release_compact_turn_completion.wait(timeout=2)
                 _send_frame(connection, frame)
+            if self.hold_turn_completion and request.get("method") == "turn/interrupt":
+                if any("result" in frame for frame in frames):
+                    self.held_turn_interrupted.set()
+                    self.release_held_turn.set()
+            if self.hold_turn_completion and request.get("method") == "turn/start":
+                released = self.release_held_turn.wait(timeout=30)
+                if not self.stopping.is_set():
+                    params = _as_test_dict(request.get("params"))
+                    result = _as_test_dict(frames[0].get("result"))
+                    turn_id = _as_test_dict(result.get("turn")).get("id")
+                    turn = {"id": turn_id, "status": "interrupted"} if self.held_turn_interrupted.is_set() else {
+                        "id": turn_id, "error": {"message": "held test turn was not interrupted" if released
+                                                 else "held test turn timed out"}}
+                    _send_frame(connection, _notice("turn/completed", {"threadId": params["threadId"], "turn": turn}))
             if request.get("method") == "turn/start" and self.close_after_turn_start:
                 return
 
@@ -2786,6 +2805,350 @@ class MeshCommandTests(unittest.TestCase):
         _ = self.patches.enter_context(patch.object(codex_mesh, "_start_watcher"))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_holds_old_sign_in", return_value=False))
         return target, new
+
+    def prepare_running_account_swap(self) -> tuple[Path, StubAppServer]:
+        run = self.session_dir / "scratch-runs" / "run"
+        run.mkdir(parents=True)
+        _ = (run / "prompt.txt").write_text("Original delegate task")
+        self.session_dir = run
+        target, new = self.prepare_workers_move()
+        active = run.parent / "active"
+        active.mkdir()
+        _ = (active / "scratch-holder").write_text(str(run) + "\n")
+        self.outcomes = ["disconnect", "completed"]
+        self.server.hold_turn_completion = True
+        respond = self.server.respond
+        def old(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            if request.get("method") == "turn/start":
+                self.live_turn = "turn-1"
+            if request.get("method") == "turn/interrupt":
+                marker_path = self.session_dir / "worker.account-move.json"
+                self.assertTrue(marker_path.exists(), "account-move intent must precede the interrupt")
+                marker = _as_test_dict(cast(object, json.loads(marker_path.read_text())))
+                self.assertEqual(marker["thread_id"], THREAD_ID)
+                self.assertEqual(marker["turn_id"], "turn-1")
+                self.assertFalse((self.session_dir / "worker.end").exists())
+            return frames
+        self.server.respond = old
+        _ = self.patches.enter_context(patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_stop_unused", return_value=False))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_notify_holder"))
+        return target, new
+
+    def assert_account_move_continuation(self, new: StubAppServer) -> None:
+        starts = [request for request in new.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(starts), 1)
+        params = _as_test_dict(starts[0]["params"])
+        self.assertEqual(params["threadId"], THREAD_ID)
+        inputs = cast(list[dict[str, object]], params["input"])
+        self.assertEqual([item["text"] for item in inputs], [
+            "Your turn was interrupted to move your Codex account; any command you had running was stopped "
+            + "with it, so run it again. Continue where you stopped."])
+        self.assertFalse(any(request.get("method") in ("thread/start", "thread/fork") for request in new.requests))
+        resumes = [request for request in new.requests if request.get("method") == "thread/resume"]
+        self.assertTrue(resumes)
+        self.assertTrue(all(_as_test_dict(request["params"])["threadId"] == THREAD_ID for request in resumes))
+
+    def assert_waiting_launcher_account_move(self, *, sign_in_change: bool) -> None:
+        target, new = self.prepare_running_account_swap()
+        label = "codex9" if sign_in_change else "codex1"
+        if sign_in_change:
+            _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_HOME": str(target.parent / ".codex")})))
+            _ = self.patches.enter_context(patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000))
+        waiting = threading.Event()
+        failures: list[BaseException] = []
+        switches: list[codex_mesh.WorkersRunSwitch] = []
+        read = codex_mesh.Client.next_frame
+        def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            path = self.session_dir / codex_mesh.ROSTER_FILE
+            if client.port == self.server.port and path.exists():
+                worker = _as_test_dict(_as_test_dict(cast(object, json.loads(path.read_text()))).get("worker"))
+                if worker.get("status") == "running" and worker.get("turn_id") == "turn-1":
+                    waiting.set()
+            return read(client, deadline)
+        def swap() -> None:
+            try:
+                if not waiting.wait(timeout=30):
+                    raise AssertionError("launcher never waited for its running turn")
+                if sign_in_change:
+                    def old_sign_in(_pid: int, _home: Path) -> bool:
+                        path = self.session_dir / codex_mesh.SERVER_FILE
+                        return path.exists() and _as_test_dict(cast(object, json.loads(path.read_text()))).get("port") == self.server.port
+                    with patch.object(codex_mesh, "_holds_old_sign_in", side_effect=old_sign_in):
+                        self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(
+                            root=str(self.session_dir.parent))), 0)
+                else:
+                    self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+                    switches.extend(codex_mesh.retire_workers_servers(target, "codex1"))
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                self.server.release_held_turn.set()
+        mover = threading.Thread(target=swap, daemon=True)
+        with (patch.object(codex_mesh.Client, "next_frame", frame),
+              patch.object(codex_mesh, "_notify_holder") as notify,
+              contextlib.redirect_stdout(io.StringIO())):
+            mover.start()
+            try:
+                code, errors = self.run_start()
+            finally:
+                self.server.release_held_turn.set()
+                mover.join(timeout=30)
+        self.assertFalse(mover.is_alive(), "swap did not finish after launcher continuation")
+        if failures:
+            raise failures[0]
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(_as_test_dict(self.methods("turn/interrupt")[0]["params"]),
+                         {"threadId": THREAD_ID, "turnId": "turn-1"})
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertFalse((self.session_dir / "worker.end").exists())
+        board = (self.session_dir / "board.log").read_text()
+        self.assertEqual(board.count(f"account moved to {label}; resumed"), 1)
+        notify.assert_called_once()
+        notice = str(cast(object, notify.call_args.args[1]))
+        self.assertIn("running workers were interrupted and resumed", notice)
+        self.assertNotIn("finish first", notice)
+        self.assertEqual(notify.call_args.args[2], codex_mesh.CodexNoticeKind.SIGN_IN_CHANGED if sign_in_change
+                         else codex_mesh.CodexNoticeKind.WORKERS_CHANGED)
+        if not sign_in_change:
+            self.assertEqual(len(switches), 1)
+            self.assertTrue(switches[0].workers[0].mid_turn)
+
+    def assert_account_move_interrupts_all_runs_before_waiting(self, *, sign_in_change: bool) -> None:
+        target, new = self.prepare_running_account_swap()
+        first_run = self.session_dir
+        second_run = first_run.with_name("run-z")
+        second_run.mkdir()
+        source = target.parent / ".codex"
+        _ = (second_run / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(source),
+        }))
+        locations = {"thread-a": (first_run, "first"), "thread-b": (first_run, "second"),
+                     "thread-c": (second_run, "third")}
+        for folder in (first_run, second_run):
+            _ = (folder / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+                name: {"thread_id": thread_id, "turn_id": "live-turn", "status": "running", "role": "impl",
+                       "port": self.server.port, "launcher_pid": os.getpid()}
+                for thread_id, (run, name) in locations.items() if run == folder
+            }))
+        interrupts: list[tuple[str, float]] = []
+        respond = self.respond
+        def old(request: dict[str, object]) -> list[dict[str, object]] | None:
+            params = _as_test_dict(request.get("params"))
+            thread_id = str(params.get("threadId", ""))
+            if request.get("method") == "thread/read":
+                return [_reply(request, {"thread": {"id": thread_id, "status": {"type": "active"},
+                    "turns": [{"id": "live-turn", "status": "inProgress"}]}})]
+            if request.get("method") == "turn/interrupt":
+                folder, name = locations[thread_id]
+                marker = _as_test_dict(cast(object, json.loads((folder / f"{name}.account-move.json").read_text())))
+                self.assertEqual(marker["thread_id"], thread_id)
+                interrupts.append((thread_id, self.elapsed))
+                return [_reply(request, {})]
+            return respond(request)
+        self.server.respond = old
+        def advance(seconds: float) -> None:
+            self.elapsed += seconds
+        with (patch.object(codex_mesh, "ACCOUNT_MOVE_RESUME_TIMEOUT_SECS", 0.2),
+              patch.object(time, "monotonic", side_effect=self.clock),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(codex_mesh, "_resume_account_move_detached") as detached,
+              contextlib.redirect_stdout(io.StringIO())):
+            if sign_in_change:
+                with (patch.dict(os.environ, {"CODEX_HOME": str(source)}),
+                      patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+                      patch.object(codex_mesh, "_holds_old_sign_in", return_value=True)):
+                    self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(first_run.parent))), 0)
+            else:
+                switches = codex_mesh.retire_workers_servers(target, "codex1")
+                self.assertEqual([len(run.workers) for run in switches], [2, 1])
+                self.assertTrue(all("timeout" in worker.failure for run in switches for worker in run.workers))
+        self.assertEqual(interrupts, [("thread-a", 0.0), ("thread-b", 0.0), ("thread-c", 0.0)],
+                         "all runs must be interrupted before a stalled continuation is awaited")
+        self.assertAlmostEqual(self.elapsed, 0.2, msg="all continuations share a single acknowledgement deadline")
+        detached.assert_not_called()
+        self.assertEqual(new.requests, [])
+
+    def test_swap_interrupts_all_runs_before_a_stalled_account_move_times_out(self) -> None:
+        self.assert_account_move_interrupts_all_runs_before_waiting(sign_in_change=False)
+
+    def test_sign_in_change_interrupts_all_runs_before_a_stalled_account_move_times_out(self) -> None:
+        self.assert_account_move_interrupts_all_runs_before_waiting(sign_in_change=True)
+
+    def test_swap_interrupts_waiting_launcher_and_finishes_the_same_pass_on_new_account(self) -> None:
+        self.assert_waiting_launcher_account_move(sign_in_change=False)
+
+    def test_sign_in_change_interrupts_and_resumes_a_waiting_launcher_on_a_fresh_server(self) -> None:
+        self.assert_waiting_launcher_account_move(sign_in_change=True)
+
+    def assert_detached_account_move(
+        self, *, recorded_launcher: int, review_lens: agents_log.Lens | None = None,
+    ) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.outcomes = ["completed"]
+        self.live_turn = "turn-1"
+        worker: dict[str, object] = {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+                                   "role": "impl", "port": self.server.port}
+        if recorded_launcher:
+            worker["launcher_pid"] = recorded_launcher
+        if review_lens:
+            worker["role"] = "review"
+            agents_log.append(THREAD_ID, "review", review_lens, datetime.now(timezone.utc))
+        self.write_pool_roster({"worker": worker})
+        results: list[int] = []
+        failures: list[BaseException] = []
+        launchers: list[threading.Thread] = []
+        def detached(session_dir: str, name: str) -> None:
+            def resume() -> None:
+                try:
+                    results.append(codex_mesh.command_resume_account_move(argparse.Namespace(
+                        session_dir=session_dir, to=name)))
+                except BaseException as error:
+                    failures.append(error)
+            launcher = threading.Thread(target=resume, daemon=True)
+            launchers.append(launcher)
+            launcher.start()
+        with (patch.object(codex_mesh, "_resume_account_move_detached", side_effect=detached),
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+            switches = codex_mesh.retire_workers_servers(target, "codex1")
+            for launcher in launchers:
+                launcher.join(timeout=30)
+        self.assertEqual(len(launchers), 1)
+        self.assertTrue(all(not launcher.is_alive() for launcher in launchers))
+        if failures:
+            raise failures[0]
+        self.assertEqual((results, errors.getvalue()), ([0], ""))
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertEqual(switches[0].workers[0].failure, "")
+        self.assertEqual((self.session_dir / "board.log").read_text().count("account moved to codex1; resumed"), 1)
+        if review_lens:
+            assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                                            THREAD_ID, datetime.now(timezone.utc))
+            self.assertIsInstance(assignment, agents_log.Assignment)
+            assert isinstance(assignment, agents_log.Assignment)
+            self.assertEqual((assignment.role, assignment.lens), ("review", review_lens))
+            self.assertEqual(self.worker_record()["role"], "review")
+
+    def test_swap_detached_account_move_keeps_the_review_lens(self) -> None:
+        self.assert_detached_account_move(recorded_launcher=0, review_lens="craft")
+
+    def test_swap_resumes_running_worker_with_dead_launcher_using_detached_continuation(self) -> None:
+        self.assert_detached_account_move(recorded_launcher=99999999)
+
+    def test_swap_resumes_running_worker_without_launcher_pid_using_detached_continuation(self) -> None:
+        self.assert_detached_account_move(recorded_launcher=0)
+
+    def test_swap_reports_interrupt_rejection_without_detaching_or_resuming_worker(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.live_turn = "turn-1"
+        self.interrupt_error = "interrupt rejected by app-server"
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+            "role": "impl", "port": self.server.port}})
+        with patch.object(codex_mesh, "_resume_account_move_detached") as detach:
+            switches = codex_mesh.retire_workers_servers(target, "codex1")
+        worker = switches[0].workers[0]
+        self.assertIn("interrupt failed", worker.failure)
+        self.assertIn("interrupt rejected by app-server", worker.failure)
+        self.assertIn("resume-account-move", worker.resume_command)
+        self.assertIn("--to worker", worker.resume_command)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(self.live_turn, "turn-1")
+        self.assertEqual(new.requests, [])
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertFalse((self.session_dir / "worker.end").exists())
+        detach.assert_not_called()
+
+    def test_swap_detached_resume_rejection_keeps_assignment_for_the_manual_retry(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.live_turn = "turn-1"
+        self.outcomes = ["completed"]
+        agents_log.append(THREAD_ID, "review", "contract", datetime.now(timezone.utc))
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+            "role": "review", "port": self.server.port}})
+        respond = new.respond
+        def rejected_resume(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "resume rejected by app-server"}}]
+            return respond(request)
+        new.respond = rejected_resume
+        results: list[int] = []
+        def detached(session_dir: str, name: str) -> None:
+            results.append(codex_mesh.command_resume_account_move(argparse.Namespace(session_dir=session_dir, to=name)))
+        with (patch.object(codex_mesh, "_resume_account_move_detached", side_effect=detached),
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+            self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+            switches = codex_mesh.retire_workers_servers(target, "codex1")
+        worker = switches[0].workers[0]
+        self.assertEqual(len(results), 1)
+        self.assertNotEqual(results[0], 0)
+        self.assertIn("resume failed", worker.failure)
+        self.assertIn("resume-account-move", worker.resume_command)
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
+        self.assertFalse(any(request.get("method") in ("thread/start", "thread/fork", "turn/start") for request in new.requests))
+        self.assertEqual(agent_accounts.workers_home(), target)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertTrue((self.session_dir / "worker.account-move.json").exists())
+        self.assertEqual(self.worker_record()["role"], "review")
+        new.respond = respond
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = codex_mesh.main(shlex.split(worker.resume_command)[2:])
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertEqual(self.worker_record()["role"], "review")
+        assignment = agents_log.role_at(agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+                                        THREAD_ID, datetime.now(timezone.utc))
+        self.assertIsInstance(assignment, agents_log.Assignment)
+        assert isinstance(assignment, agents_log.Assignment)
+        self.assertEqual((assignment.role, assignment.lens), ("review", "contract"))
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+
+    def test_swap_preview_does_not_interrupt_or_write_account_move_intent(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.live_turn = "turn-1"
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+            "role": "impl", "port": self.server.port, "launcher_pid": os.getpid()}})
+        before = {path.name: path.read_bytes() for path in self.session_dir.iterdir() if path.is_file()}
+        with patch.object(codex_mesh, "_resume_account_move_detached") as detach:
+            switches = codex_mesh.retire_workers_servers(target, "codex1", dry_run=True)
+        after = {path.name: path.read_bytes() for path in self.session_dir.iterdir()
+                 if path.is_file() and path.name in before}
+        self.assertEqual(after, before)
+        self.assertTrue(switches[0].workers[0].mid_turn)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(new.requests, [])
+        self.assertEqual(self.live_turn, "turn-1")
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
+        detach.assert_not_called()
+
+    def test_interrupted_turn_without_account_move_intent_keeps_failure_handling(self) -> None:
+        respond = self.server.respond
+        def interrupted(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                return [_reply(request, {"turn": {"id": "turn-1"}}), _notice("turn/completed", {
+                    "threadId": THREAD_ID, "turn": {"id": "turn-1", "status": "interrupted"}})]
+            return respond(request)
+        self.server.respond = interrupted
+        code, errors = self.run_start()
+        self.assertNotEqual(code, 0)
+        self.assertIn("turn failed", errors)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(self.worker_record()["status"], "failed")
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        board = self.session_dir / "board.log"
+        self.assertFalse(board.exists() and "account moved" in board.read_text())
 
     def test_automatic_continuation_after_a_role_change_starts_once_on_the_new_home(self) -> None:
         target, new = self.prepare_workers_move()
@@ -5669,8 +6032,11 @@ class SignInChangeTests(unittest.TestCase):
                 line = told[0][1]
                 self.assertIn(f"app-server {old.pid}", line)
                 self.assertIn("run-a", line)
-                self.assertIn("when that turn ends", line)
-                self.assertIn("app-server", (root / "run-a" / codex_mesh.SERVER_LOG).read_text())
+                self.assertIn("running workers were interrupted and resumed on a new server", line)
+                self.assertNotIn("when that turn ends", line)
+                log = (root / "run-a" / codex_mesh.SERVER_LOG).read_text()
+                self.assertIn("app-server", log)
+                self.assertIn("running workers were interrupted and resumed on a new server", log)
                 # The same change seen again moves nothing and tells no one.
                 self.assertEqual(self.signin_changed(root, starts, stops=False), ([], []))
         finally:
@@ -6041,7 +6407,8 @@ class WorkersHomeTests(unittest.TestCase):
             lines = codex_mesh.retire_workers_servers(home, "codex1")
         self.assertEqual([line.folder for line in lines], [self.session_dir])
         log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
-        self.assertIn("move from ~/.codex at their next turn", log)
+        self.assertIn("interrupted and resumed on the new account", log)
+        self.assertNotIn("working worker finishes first", log)
         self.assertIn("codex1 (~/.codex1)", log)
 
     def test_unsubscribe_not_loaded_proves_release_without_another_state_read(self) -> None:
@@ -6292,21 +6659,27 @@ class WorkersHomeTests(unittest.TestCase):
                 self.record(self.home / ".codex")
                 with (patch.object(codex_mesh, "SWEEP_ROOTS", (root,)),
                       patch.object(codex_mesh, "_stop_unused", return_value=True),
-                      patch.object(codex_mesh, "_notify_holder") as notify):
+                      patch.object(codex_mesh, "_notify_holder") as notify,
+                      patch.object(codex_mesh, "_interrupt_worker_for_account_move", return_value=
+                          codex_mesh.SwitchingWorker("project-review", True, codex_mesh.WorkerMoveResumed()))):
                     result = codex_mesh.retire_workers_servers(home, "codex1", dry_run=dry_run)
                 self.assertEqual(result, (codex_mesh.WorkersRunSwitch(self.session_dir, ("holder-id",), (
                     codex_mesh.SwitchingWorker("project-impl", False),
-                    codex_mesh.SwitchingWorker("project-review", True),
+                    codex_mesh.SwitchingWorker("project-review", True,
+                        codex_mesh.WorkerMoveReady() if dry_run else codex_mesh.WorkerMoveResumed()),
                 )),))
                 if dry_run:
                     notify.assert_not_called()
                 else:
                     self.assertEqual(notify.call_args.args[0], "holder-id")
                     notice = cast(str, notify.call_args.args[1])
-                    self.assertIn("Continue dispatching as usual.", notice)
+                    self.assertIn("running workers were interrupted and resumed on the new account", notice)
+                    self.assertNotIn("working workers finish first", notice)
+                    self.assertEqual(notify.call_args.args[2], codex_mesh.CodexNoticeKind.WORKERS_CHANGED)
                     self.assertIn(self.session_dir.name, notice)
-                    self.assertIn("Continue dispatching as usual.",
-                                  (self.session_dir / codex_mesh.SERVER_LOG).read_text())
+                    log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
+                    self.assertIn("interrupted and resumed on the new account", log)
+                    self.assertNotIn("working worker finishes first", log)
 
 
 class ServerRecordTests(unittest.TestCase):
