@@ -1159,7 +1159,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - The resume relies on no build surviving the interrupted turn: the continuation tells the worker its command stopped and to rerun it.
 - The detached resume claims the roster row keeping role, previous_role and lens (read from the agents ledger), with previous_status `failed`, so a rejected resume leaves the printed manual retry usable.
 
-### Phase 36 — A swap leaves ended sessions' workers alone  · status: todo
+### Phase 36 — A swap leaves ended sessions' workers alone  · status: done
 
 **Depends on:** Phase 35
 
