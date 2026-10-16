@@ -1331,29 +1331,55 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:** `Path.rename` replaces a destination created after a clash check, so every move goes through `_move_shared_entry` (renameat2 `RENAME_NOREPLACE` on Linux, renamex_np `RENAME_EXCL` on macOS); a destination appearing mid-repair is a clash, and a losing concurrent repair accepts the winner's state. Any check reachable from `set_role` must pass `repair=False`, or it creates `~/.codex`. A move refused by its target prints one line, the first problem.
 
-### Phase 45 — No Codex daemon descendant escapes the stop  · status: todo
+### Phase 45 — No Codex daemon descendant escapes the stop  · status: done
 
 **Depends on:** Phase 42
 
+#### As-built
+
+- `_stop_daemon` takes the nonblocking `_daemon_stop_lock()` (`~/.local/state/codex-mesh/daemon-stop.lock`) and runs `_stop_daemon_locked`; a held lock keeps the family and states the reason.
+- `_own_process_table()` lists only this user's processes (`ps -u <uid> -o pid=,ppid=,args=`, split on the two numeric columns only); `_daemon_process_tree()` reads identities only for family members and swept-session candidates.
+- `_process_session(pid)` returns `ProcessSession | SessionGone | SessionUnread`, read once per candidate per table. After the freeze, every session led by a frozen member (`_frozen_daemon_sessions`) is swept to a fixed point before the kill; new processes join the family with exclusions checked before STOP. A session whose leader is outside the family is never swept; `SessionUnread` refuses the stop.
+- After the kill, a survivor in a swept session is reported by pid and the stop is not a success. The fixed-point deadline is `max(REAP_WAIT_SECS, 4 × slowest listing)`.
+- `_recover_kept_daemon` / `_recover_stopped_codex_members` read the whole family of a kept daemon (in use, signed in, refused or failed stop) or a stopped daemon: a stopped member of any name on `~/.codex` with no controlling terminal and unchanged identity is reported and, under `--stop`, resumed under the lock. A member with a terminal, an unread terminal or environment, a numbered home, or the bundled ChatGPT codex is reported as kept and never signalled.
+- The sweep's daemon line prints the daemon's own home via `_daemon_home` (from `account.process_codex_home`).
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — session reader, session sweep and survivor check in `_stop_daemon_locked`, candidate-only identity reads, the stop lock, stopped-member recovery, the daemon home column.
+- `scripts/agents/test_codex_mesh.py` — orphan found by session, survivor reported, exclusions before STOP, untracked-leader session never swept, stopped member resumed, daemon home column; `MeshCommandTests` isolates its run folder.
+
+**Gotchas:** `getsid` on an exited pid is `SessionGone`, never a refusal; match on the type, never the message. macOS `ps comm` is a full path with spaces, so the own-user table splits only pid and ppid. macOS `os.getsid` reads every own-user process, so the session sweep works on Darwin. A stopped process with a controlling terminal is a job-control stop and is never resumed. A descendant that calls `setsid` itself leaves every tracked session and is out of reach; the `_stop_daemon_locked` doc comment states this limit.
+
+**Ruled out:** resuming every stopped `~/.codex` process (wakes a user's Ctrl-Z job); sweeping a session whose leader is outside the family; reading identities for every process on the machine.
+
+### Phase 46 — Role map stays inside a test's home  · status: done
+
+**Depends on:** Phase 40
+
 #### Work Order
 
-**Goal:** `_stop_daemon` reports success only when no process the daemon family spawned survives. Follow-up from Phase 42 under the hard-landing rule: after two repairs (re-listing, then freezing the family with SIGSTOP to a fixed point), a process that a not-yet-frozen member spawns, which forks again and exits between two listings, leaves an orphan under pid 1 outside the tracked set. It is not a regression, an unused daemon runs no turns, so it does not show in normal use, and no gate fails.
+**Goal:** a process whose `HOME` is not the login's own home reads and writes only that home's role map, on both machines, so a test can never reach natedev's real map.
 
-**Constraints from prior phases:** Phase 42 freezes members by identity (pid, start time, argv, executable), checks every exclusion before each STOP and again at the fixed point, kills with SIGKILL, and resumes only members it stopped. On natedev the daemon is a session leader, and its `app-server --listen` child calls `setsid`, so one session id does not cover the family; whether the Mac's daemon leads its own session is unchecked: check it live, or record it as an open limit beside `setsid`. No session-id reader exists: `process_table.snapshot()`'s `Process` holds only pid, ppid, comm and args. Add one in `codex_mesh.py` from `os.getsid(pid)` (or `/proc/<pid>/stat` field 6); macOS `ps -o sess` is a pointer, not the id. It returns `ProcessSession(sid) | SessionUnread`, never `int | None`, as `_process_identity` turns `sessions.process_start`'s `str | None` into `UnreadCodexProcess`. `ps -eo` lists every user: take the uid filter from `ps -u <uid>`, as `_list_codex_processes` does. `_daemon_process_tree()` reads `_process_identity` for every pid twice per snapshot; on darwin that is about four `ps` spawns per process (estimated 10–20 s, unmeasured) against `REAP_WAIT_SECS` 5.0, so a round that adds a member refuses at the deadline: read identities only for candidates (family members and processes in swept sessions), and set the fixed-point deadline from a measured Mac listing time. `_stop_daemon` takes no lock and runs from `end_session.sh` (`|| true`, output unseen), `remove_workers.py`, `shutdown/stop.py`, `end_friend.sh` and the showrunner's 30-minute `sweep --stop` job; a killed sweep or a failed resume leaves members stopped, and the next sweep lists only `CodexDaemon` processes, so a stopped non-daemon member is never resumed. The sweep's daemon line prints a fixed `~/.codex` home column (`print(f"{daemon.pid}\tdaemon\t{label}\t{reason}\t~/.codex")`), so a daemon on `~/.codex1` reads "uses another Codex home … ~/.codex". See the project memory attempts log `attempts-daemon-family-escape`.
+**Why:** on the Mac, `scripts/herdr/test_herdr_sessions.py` `StandaloneLaunchTests.test_start_after_cutover_uses_showrunners_account_for_pane_and_admission` fails: it writes `showrunners: claude4` to its scratch `groups.json`, but `start` refuses with "showrunners is on claude1, which is not set up on this machine". `role_map.is_role_map_host()` asks only the hostname, so off natedev `read_role_map()` fetches the real map over ssh (`ssh_role_map`), and the scratch `groups.json` is never read. The same rule sends `write_role_map` from a scratch home on the Mac to natedev's real map. It passes on natedev only because natedev is the host. Phase 40 defect, found by herdr-trial.
+
+**Constraints from prior phases:** Phase 40 made natedev (`ROLE_MAP_HOST`) the one role map; the Mac reads it over ssh with `role_map_cache.json` as fallback and writes through `role-map-write`. Callers of `is_role_map_host()`: `read_role_map`, `write_role_map`, `accounts.set_group_account`, `accounts.set_role`, and `accounts.main`'s `role-map-read`/`role-map-write` refusal. Tests that pin `is_role_map_host` stay valid.
 
 **Spec:**
 
-1. After the family is frozen, sweep every session led by a frozen member: a process of this user in such a session and not yet tracked joins the family (exclusions checked first) and is frozen, repeated to a fixed point, before any kill. A session whose leader is not a tracked member is never swept.
-2. After the kill, a surviving process in any of those sessions reports the family as not stopped, naming the pid.
-3. A process that left the session with its own `setsid` is out of reach; the doc comment says so.
-4. `_stop_daemon` is serialized by a lock, and sweep reports any Codex-family process on `~/.codex` found in stopped state, resuming it when its family is kept.
-5. The daemon line prints the daemon's own home (from `account.process_codex_home`), not a fixed `~/.codex`.
+1. `role_map.is_role_map_host()` is true on natedev, and also on any machine when `Path.home()` is not the login's own home (the password-database home for the current uid, compared after resolving both). A scratch `HOME` therefore holds its own map: reads come from its `groups.json` and `config/accounts.json`, writes go to its own files and `roles.jsonl`, and no ssh runs. An unreadable login home counts as a scratch home.
+2. The login-home read is one small private function, so tests pin it beside the hostname.
+3. On the Mac with the real `HOME`, behavior is unchanged: ssh to natedev, cache on success, cache fallback when unreachable.
+4. The remote side (`role-map-read`/`role-map-write` on natedev) is unchanged.
+
+**Tests** (`scripts/accounts/test_role_map.py`; fake hostname, login home and `ssh_role_map`; scratch homes only):
+- off natedev with a scratch `HOME`: `read_role_map()` returns the scratch `groups.json` selection and `ssh_role_map` is never called; `write_role_map` writes the scratch `groups.json` and `roles.jsonl` and never calls ssh;
+- off natedev with `HOME` equal to the login home: read and write go through `ssh_role_map` as today (existing remote tests pin the login home to their `HOME` so they keep testing that path);
+- an unreadable login home is a scratch home.
+
+**Live check:** on the Mac, from a scratch copy of this branch's tree, run `StandaloneLaunchTests.test_start_after_cutover_uses_showrunners_account_for_pane_and_admission`, then `scripts/accounts/test_role_map.py`; both pass. The same pair passes on natedev.
 
 **Files:**
+- `scripts/accounts/role_map.py` — `is_role_map_host` and its login-home reader.
+- `scripts/accounts/test_role_map.py` — the tests above; existing remote tests pin the login home.
 
-- `scripts/agents/codex_mesh.py` — session reader and session sweep in `_stop_daemon`, candidate-only identity reads, the lock, stopped-member report and resume, the daemon line's home.
-- `scripts/agents/test_codex_mesh.py` — the unseen-intermediate orphan found by session, a survivor reported, exclusions before STOP, an untracked-leader session never swept, a stopped member resumed, the daemon home column.
-
-**Workers:** 1 writer + 1 tester. impl: `codex_mesh.py`. test: `test_codex_mesh.py`.
-
-**Acceptance gate:** tests pin: the orphan found by session (fails on Phase 42's code); a survivor in a swept session reports "not stopped" with its pid; an excluded process found by session is never stopped, the stop is refused and the rest resumed; a session with an untracked leader is never swept; a stopped member of a kept family is resumed; the daemon line names its own home. The doc comment states the `setsid` limit. Every changed file reads 0 errors, 0 warnings; the merge gate is green.
+**Workers:** impl takes `role_map.py`, test takes `test_role_map.py`.
