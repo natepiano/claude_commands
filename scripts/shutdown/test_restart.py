@@ -308,7 +308,8 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.desktop_state = restart.DesktopLaunchState()
         self.addCleanup(self.desktop_state.restore, dry_run=True)
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Model the physical cwd a launched process sees, including on macOS.
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state_root = self.root / "shutdown"
         environment = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.state_root),
@@ -3035,6 +3036,7 @@ class RestartTests(ShutdownTestCase):
             launched.append(current)
             return restart.SessionLaunched()
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_process_liveness", return_value=restart.SessionNotLive()),
               patch.object(stop_work, "stop_session", side_effect=cleanup) as stop,
               patch.object(restart, "_retire"),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),

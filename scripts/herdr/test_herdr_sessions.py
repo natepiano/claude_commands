@@ -29,6 +29,11 @@ class SessionListReply(TypedDict):
     result: herdr.SessionListResult
 
 
+def setUpModule() -> None:
+    """These fixtures supply Linux proc trees and systemd stand-ins."""
+    _ = unittest.enterModuleContext(patch.object(herdr, "_PLATFORM", "linux"))
+
+
 class HerdrSessionsTests(unittest.TestCase):
     root: Path = Path()
     proc: Path = Path()

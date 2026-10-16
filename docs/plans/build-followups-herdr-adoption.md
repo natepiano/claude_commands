@@ -488,7 +488,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Acceptance gate:** `merge_gate.py --tests-only` green; `basedpyright scripts/herdr` prints `0 errors, 0 warnings`; the Spec 3 live check passes both ways.
 
-### Phase 16 — herdr and shutdown tests green on the Mac  · status: todo
+### Phase 16 — herdr and shutdown tests green on the Mac  · status: done
 
 **Depends on:** Phase 14
 

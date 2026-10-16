@@ -334,6 +334,8 @@ class InventoryTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # The shared process fixture builds Linux /proc files, including socket ownership.
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.notes = self.root / "agents"
