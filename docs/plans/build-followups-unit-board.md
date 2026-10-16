@@ -15,6 +15,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 ## Delegation Context
 
 - **Project:** `~/.claude` (claude_commands) — the recorder and phase tables behind `/unit:direct`, and a new Claude Code mod `mods/unit-board/`.
+- **Project started:** 2026-10-16T20:40:19.366+00:00
 - **Worktree:** `/home/natepiano/worktrees/claude-build-followups-unit-board`, branch `build-followups-unit-board`. Every path below is relative to it.
 - **Stack:** Python 3 (stdlib only, `unittest`, basedpyright strict); TypeScript Claude Code mod API (early access, Claude Code 2.1.296), JSX with `h` as the factory, no DOM, no Node — everything outside the module goes through `$`.
 - **Layout:**
@@ -52,7 +53,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ## Phases
 
-### Phase 1 — Every stated ETA is recorded  · status: todo
+### Phase 1 — Every stated ETA is recorded  · status: done
 **Depends on:** none
 
 #### Work Order

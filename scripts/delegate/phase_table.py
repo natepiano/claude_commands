@@ -474,7 +474,7 @@ def _newest_open_instance(
     for instance in reversed(started):
         if instance.instance_id not in closed:
             progress_event = _last_progress(runs, instance.instance_id)
-            stated_event = _latest_stated_eta(runs, instance.instance_id)
+            stated_event = _latest_stated_eta(runs, instance)
             projection = _reported_eta(progress_event, instance.start)
             if isinstance(stated_event, LatestStatedEtaEvent):
                 first_stated: FirstStatedEtaTarget | EtaNeverStated = (
@@ -702,41 +702,78 @@ def _repair_rounds_started_after(
     return sum(started > stated_at for started in starts.values())
 
 
+def _instance_eta_events(
+    runs: list[list[dict[str, object]]], instance: PhaseInstance
+) -> list[dict[str, object]]:
+    """Keep pre-start promises, but exclude other runs and earlier attempts."""
+    for events in runs:
+        start = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if _text(event.get("event_type")) == "phase_started"
+                and _text(event.get("phase_instance_id")) == instance.instance_id
+            ),
+            -1,
+        )
+        if start < 0:
+            continue
+        first = 0
+        last = len(events)
+        for index, event in enumerate(events[:start]):
+            if (
+                _text(event.get("phase_id")) == instance.phase
+                and _text(event.get("event_type")) in ("phase_started", "phase_finished")
+            ):
+                first = index + 1
+        for index in range(start + 1, len(events)):
+            event = events[index]
+            if (
+                _text(event.get("event_type")) == "phase_started"
+                and _text(event.get("phase_id")) == instance.phase
+            ):
+                last = index
+                break
+        return [
+            event
+            for event in events[first:last]
+            if _text(event.get("event_type")) == "eta_stated"
+            and _text(event.get("eta_phase_id", event.get("phase_id"))) == instance.phase
+        ]
+    return []
+
+
 def _latest_stated_eta(
-    runs: list[list[dict[str, object]]], instance_id: str
+    runs: list[list[dict[str, object]]], instance: PhaseInstance
 ) -> LatestStatedEtaEvent | NoStatedEtaEvent:
     first: FirstStatedEtaTarget | EtaNeverStated = EtaNeverStated()
     latest: StatedEta | NoStatedEtaEvent = NoStatedEtaEvent()
-    for events in runs:
-        for event in events:
-            if (
-                _text(event.get("event_type")) != "eta_stated"
-                or _text(event.get("phase_instance_id")) != instance_id
-            ):
-                continue
-            time = _moment(event.get("eta_at"))
-            stated_at = _moment(event.get("timestamp_epoch"))
-            if time is None or stated_at is None:
-                continue
-            earliest = _moment(event.get("eta_earliest_at"))
-            latest_range = _moment(event.get("eta_latest_at"))
-            eta_range: EtaRange | NoEtaRange
-            if earliest is not None and latest_range is not None:
-                eta_range = EtaRange(earliest=earliest, latest=latest_range)
-            else:
-                eta_range = NoEtaRange()
-            stated = StatedEta(
-                time=time,
-                range=eta_range,
-                stated_at=stated_at,
-                basis=_text(event.get("basis")),
+    for event in _instance_eta_events(runs, instance):
+        time = _moment(event.get("eta_at"))
+        stated_at = _moment(event.get("timestamp_epoch"))
+        if time is None or stated_at is None:
+            continue
+        earliest = _moment(event.get("eta_earliest_at"))
+        latest_range = _moment(event.get("eta_latest_at"))
+        eta_range: EtaRange | NoEtaRange
+        if earliest is not None and latest_range is not None:
+            eta_range = EtaRange(earliest=earliest, latest=latest_range)
+        else:
+            eta_range = NoEtaRange()
+        stated = StatedEta(
+            time=time,
+            range=eta_range,
+            stated_at=stated_at,
+            basis=_text(event.get("basis")),
+        )
+        if isinstance(first, EtaNeverStated):
+            first = FirstStatedEtaTarget(
+                time=stated.time,
+                repair_rounds=_repair_rounds_started_after(
+                    runs, instance.instance_id, stated.stated_at
+                ),
             )
-            if isinstance(first, EtaNeverStated):
-                first = FirstStatedEtaTarget(
-                    time=stated.time,
-                    repair_rounds=_repair_rounds_started_after(runs, instance_id, stated.stated_at),
-                )
-            latest = stated
+        latest = stated
     if isinstance(latest, NoStatedEtaEvent) or isinstance(first, EtaNeverStated):
         return NoStatedEtaEvent()
     return LatestStatedEtaEvent(eta=latest, first=first)
