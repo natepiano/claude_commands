@@ -922,6 +922,19 @@ class RosterTests(unittest.TestCase):
         )
         self.assertNotIn("contract reviewer", entries)
 
+    def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
+        phase = self.director_run / "phases" / "4"
+        phase.mkdir(parents=True)
+        for name in ("review_status_adversary", "review_pid_adversary"):
+            _ = (self.director_run / name).rename(phase / name)
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        reviewer = entries["adversary reviewer"]
+        self.assertEqual(
+            (reviewer.kind, reviewer.assignment),
+            ("codex", roster.WorkerAssignment("review (adversary)", str(self.director_run))),
+        )
+
     def test_review_markers_without_a_process_add_no_rows_or_unattributed_sessions(self) -> None:
         _ = self.account_note(2)
         processes = self.ps_state.read_text()
