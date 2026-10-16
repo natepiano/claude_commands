@@ -1375,49 +1375,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 46
 
-#### Work Order
+#### As-built
 
-**Goal:** `accounts.py status --json` gives programs the table's readings: cargo-handler's summary (handler-enh-unit, phase 5 waits on it) and unit-board-unit's accounts view. `--stored` makes it cheap enough to rerun every two minutes, and `--with-login` adds the login only for a caller that asks for it.
-
-**Constraints from prior phases:** `status_report` (`scripts/accounts/accounts.py`) builds the table: `account_statuses()` and `codex_statuses()` (filesystem reads; a Codex login is the `email` claim the table already reads from the home's `auth.json`), `_stored_usage` (the stored readings in `usage_store`, refreshed first for each signed-in login whose reading is older than `STALE_AFTER`, via `agent_accounts.claude_live` (`claude auth status` and the HTTPS usage endpoint) and `_codex_live` (`codex app-server`)), the group roles from `group_accounts()` and `_claude_role_selection`, and the Codex workers role from `role_account("workers")`. Both role reads go through `role_map.read_role_map()`. Off the role-map host (the Mac), that function asks natedev over ssh, writes `role_map_cache.json`, and falls back to the cache when natedev cannot be reached. It is scoped once per command by `@role_map.role_map_command`. Since Phase 46, a scratch `HOME` is its own host and never runs ssh. Both groups may sit on one account (`docs/accounts.md`, "Picking an account"). A Codex row with a failed first startup shows its setup step in place of readings (`agent_accounts.CodexStartupFailure`). The credits setting is the account note's `use_credits` (`agent_accounts.codex_credits_setting`: `CreditsOn` unless `off`).
-
-**Spec:**
-
-1. **One code path.** Split `status_report` into one reader that returns a typed status reading (each account row, in the table's order, with the reading and role values that render its cells, plus the notes list) and two renderers: the existing table (byte-identical output for every case the current tests cover) and JSON. The JSON never recomputes a value: every field comes from the same typed row the table renders. `--detail` stays table-only; `--json --detail` is a usage error.
-2. **`status --json`** prints one JSON object to stdout: `{"accounts": [...], "problems": [string, ...]}`. `problems` holds exactly the note lines the table prints under it without `--detail`, in the same order. Each account object holds exactly these keys:
-   - `label`: the account label (`claude4`, `codex1`).
-   - `tool`: `"claude"` or `"codex"`.
-   - `roles`: a list in `CLAUDE_GROUPS` order of `"units"`/`"showrunners"`, or `["workers"]` / `["spare"]` for Codex. It is empty for a Claude account no group selects, and for a row whose role the table shows as `—`. It is a list because both groups may sit on one account.
-   - `weekly_left_percent`: the stored weekly `left` number, or null wherever the table shows `unavailable` or `—`.
-   - `resets_at`: the weekly reset as an ISO 8601 UTC string, or null.
-   - `credits`: Codex only. The balance as a number, `"unlimited"`, or null when unavailable. Always null for Claude.
-   - `use_credits`: Codex only; true unless the note says `use_credits: off`. Always false for Claude.
-   - `read_at`: the reading's time (`_read_at`) as an ISO 8601 UTC string, or null.
-
-   A row that is not set up, unavailable, not logged in, or has a failed startup carries null readings, exactly where the table shows `—` or the setup step. No email, folder or path field appears in the default output.
-3. **Cost.** `status --json` makes the same reads as the table and nothing more: the same live refresh of stale readings, one role-map read per command.
-4. **`--stored`** works with or without `--json`. Its readings are the table's with every live read skipped: no `claude_live`, no `_codex_live`, no subprocess of any kind, no network. Off the role-map host, the role map comes from `role_map_cache.json` alone, never ssh. With no usable cache, the role reads fail as they do today when natedev cannot be reached and no cache exists: each role is empty and its problem line is in `problems`. On the role-map host the map is the local file, as today. Stored readings are shown however old they are; `read_at` tells their age. The cache and fetch rules for every other command stay unchanged. Model the choice as a type (for example, a usage source that is either "refresh stale readings" or "stored only"), never a bare bool parameter.
-5. **`--with-login`** (JSON only; without `--json` it is a usage error) adds `login` to each account object: the table's Login value for a signed-in row, else null. It adds no read; in particular it opens no file the table does not already read.
-6. Exit 0 on success. On a refusal, print the error on stderr and exit as today.
-7. Update `docs/accounts.md` "Every account in one table" with the three flags, the JSON keys and the `--stored` cost rule.
-
-**Tests (test_accounts.py, test_role_map.py):**
-
-- The table renders byte-identically through the new reader for the existing status cases.
-- JSON from one fixture has one Claude row (signed in, one group), one Claude row on both groups, one not set up, one Codex workers row with credits and `use_credits: off`, one Codex spare row with a failed startup, and one unlimited balance. It asserts every key, value and order, and asserts `problems` equals the table's note lines.
-- No email or folder in default JSON. `--with-login` gives each signed-in row's login and null elsewhere.
-- `--json` makes the same live reads as the table: the same count of faked `claude_live`/`_codex_live` calls on one stale fixture.
-- `--stored` with stale readings: `claude_live`, `_codex_live`, `ssh_role_map` and `subprocess.run`/`Popen` patched to fail the test. It prints the stored readings with their old `read_at`.
-- `--stored` off the role-map host (`is_role_map_host` false) uses the cache, writes nothing to it, and never runs ssh. With no cache, roles are empty and the problem line is present.
+- `accounts.py status --json [--stored] [--with-login]` prints one object, `{"accounts": [...], "problems": [...]}`. Accounts follow the table's order; `problems` holds the note lines the table prints without `--detail`. Each account carries `label`, `tool` (`claude`/`codex`), `roles` (a list, because both groups may share an account; `["workers"]`/`["spare"]` for Codex), `weekly_left_percent`, `resets_at` and `read_at` (ISO 8601 UTC), `credits` (a number, `"unlimited"` or null; null for Claude) and `use_credits` (false for Claude; true for Codex unless its note says `use_credits: off`). Readings the table shows as `—`, `unavailable` or a setup step are null. `login` appears only with `--with-login` and adds no read.
+- One reader, `read_status(*, source, detail)`, returns a `StatusReading` of typed `StatusRow`s plus notes; `render_status_table` and `render_status_json` both draw from it, and `status_report` is the table renderer over that reader. A missing value is `StatusUnavailable(cell)`, which keeps the table's cell text and renders as JSON null.
+- `UsageSource = RefreshStaleUsage | StoredUsageOnly` chooses the usage reads; `role_map.RoleMapSource = FetchRoleMap | StoredRoleMap` chooses the role-map read, set for the command by the `role_map.stored_role_map()` context.
+- `--stored` (table or JSON) makes no live read and starts no subprocess. Off natedev it reads `role_map_cache.json` only: never ssh, never a cache write. With no cache, roles are empty, the problem line is in `problems`, and the command exits 0. Without `--stored`, an unreadable role map still refuses status with exit 1, for table and JSON.
 - `--json --detail` and `--with-login` without `--json` are usage errors.
-- Scratch homes only; never touch a real account folder, `usage_store` file or role map.
 
 **Files:**
+- `scripts/accounts/accounts.py` — `RefreshStaleUsage`, `StoredUsageOnly`, `UsageSource`, `StatusUnavailable`, `StatusRow`, `StatusReading`, `StatusAccountDocument`, `StatusDocument`, `read_status`, `_read_status`, `render_status_table`, `render_status_json`, the `status` flags.
+- `scripts/accounts/role_map.py` — `FetchRoleMap`, `StoredRoleMap`, `RoleMapSource`, `stored_role_map()`.
+- `docs/accounts.md` — "Every account in one table" documents the three flags, the JSON keys and the `--stored` cost rule.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — byte-identical table through the reader, the full JSON fixture, `--with-login`, equal live-read counts for table and JSON, `--stored` with every live read and subprocess patched to fail, and the cache-only role map off natedev.
 
-- `scripts/accounts/accounts.py`, `scripts/accounts/role_map.py`, `docs/accounts.md` — implementation (impl).
-- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — tests (test).
-- `docs/plans/build-followups-two-accounts.md` — this Work Order.
+**Binds later work:** handler-enh-unit (cargo-handler's summary) and unit-board-unit (the accounts view) consume `status --json`; `--stored` is the cheap rerun form, 0.21 s with no ssh on the Mac real home.
 
-**Workers:** impl takes `accounts.py`, `role_map.py` and `docs/accounts.md`; test takes `test_accounts.py` and `test_role_map.py`. They agree on the reader's and the usage source's names over the board before the test worker patches against them.
-
-**Acceptance gate:** both suites pass on natedev and on the Mac (a scratch tree copy). On the Mac, `status --json --stored` runs on the real home without ssh (checked by the director: no ssh process, exit 0, valid JSON). The table output is unchanged, and merge_gate is green.
+**Gotchas:** 32 failures in the accounts suites on the Mac predate this phase; a follow-up phase owns them.
