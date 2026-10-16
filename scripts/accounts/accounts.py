@@ -2259,6 +2259,21 @@ def _cutover_session_check(folder: Path) -> None:
 MAC_HOME_LOGIN_STEP = "Mac's own step: one /login in ~/.claude2, never /logout"
 
 
+def _mac_login_keychain_visible() -> bool:
+    try:
+        result = subprocess.run(
+            ("security", "list-keychains"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15,
+        )
+        paths = shlex.split(result.stdout)
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as error:
+        raise AccountsError("accounts: cannot read the keychain search list") from error
+    if result.returncode:
+        raise AccountsError("accounts: cannot read the keychain search list")
+    keychains = accounts_home() / "Library/Keychains"
+    return any(str(keychains / name) in paths for name in ("login.keychain-db", "login.keychain"))
+
+
 def _mac_keychain_has_entry(folder: Path) -> bool:
     try:
         result = subprocess.run(
@@ -2366,6 +2381,9 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         if (not isinstance(expected, ExpectedAccountLogin) or not isinstance(login, str)
                 or expected.login.casefold() != login.casefold()):
             raise AccountsError("accounts: cutover-home requires a matching account note and home login")
+        if not _mac_login_keychain_visible():
+            raise AccountsError("accounts: this session cannot see the Mac's login keychain; "
+                                + "run cutover-home in a Terminal on the Mac")
         if not _mac_keychain_has_entry(destination):
             raise AccountsError("accounts: the numbered keychain entry is missing; complete its /login first")
         if not raw:

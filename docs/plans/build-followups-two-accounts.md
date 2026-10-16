@@ -1118,7 +1118,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:** no real Mac keychain or `sysctl` call has run in tests; `security` and the kernel read are stubbed.
 
-### Phase 34 — Cutover on the Mac: the live step  · status: todo
+### Phase 34 — Cutover on the Mac: the live step  · status: done
 
 **Depends on:** Phase 33
 
@@ -1132,14 +1132,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 1. The Mac `claude` alias text (`accounts.py exec showrunners`, same flags as natedev) goes to the showrunner for the darwin side of `shell.nix`; the Mac's showrunners group is set with `accounts.py move showrunners <claudeN>`.
 2. Live: ask the showrunner for the user's `/login` in `~/.claude2` with the condition-3 line; move every Mac process on `~/.claude`; run the cutover; `docs/accounts.md` records that `~/.claude` holds no login on either machine.
+3. A Mac cutover in a session that cannot see the user's login keychain refuses with `accounts: this session cannot see the Mac's login keychain; run cutover-home in a Terminal on the Mac`, before any keychain read or write and before the journal or either identity file changes. A session sees it when `security list-keychains` (no domain: the search list `find-generic-password` uses) lists `~/Library/Keychains/login.keychain-db` (or `login.keychain`); over ssh it lists only `/Library/Keychains/System.keychain`, while `-d user` still lists the login keychain, and the entries then read as absent, so the cutover used to name a missing `/login`. The check runs on the forward path only; `--undo` touches no keychain. Showrunner, 2026-10-16 (live run that day).
 
 **Files:**
 
-- `docs/accounts.md` — the Mac cutover line.
+- `scripts/accounts/accounts.py` — the login-keychain check in `_cutover_home_macos`.
+- `scripts/accounts/test_cutover_home.py` — the fake keychain answers `list-keychains`; a test of the refusal with nothing changed.
+- `docs/accounts.md` — the Mac cutover line, and that the cutover runs in a Terminal on the Mac.
 
-**Workers:** none; the director runs each step.
+**Workers:** 1 writer + 1 tester. impl: `scripts/accounts/accounts.py`, `docs/accounts.md` (the Terminal note). test: `scripts/accounts/test_cutover_home.py`. The director runs the live steps.
 
-**Acceptance gate:** `check claude2` exits 0 on the Mac; a usage reading for claude2 succeeds; `~/.claude` holds no login; a new `claude` on the Mac lands on the showrunners group's numbered folder.
+**Acceptance gate:** `check claude2` exits 0 on the Mac; a usage reading for claude2 succeeds; `~/.claude` holds no login; a new `claude` on the Mac lands on the showrunners group's numbered folder; a test pins the login-keychain refusal with the journal, both identity files and the keychain unchanged; `test_cutover_home` passes and every changed file reads 0 errors, 0 warnings.
+
+**Live check outstanding (with the user):** the user ran the cutover in a Terminal on the Mac on 2026-10-16; over ssh `check claude2` exits 0, the journal reads `complete`, `~/.claude.json` has no `oauthAccount`, and showrunners sit on claude2 (units not configured). Two checks need a Terminal on the Mac, since an ssh session cannot read the keychain: a claude2 usage reading (`accounts.py` there shows a weekly number for claude2), and a new `claude` landing in `~/.claude2` once the macrebuild brings the darwin alias.
 
 ### Phase 35 — A workers swap moves running workers at once  · status: done
 

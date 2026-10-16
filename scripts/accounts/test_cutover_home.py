@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -246,11 +247,29 @@ class HomeCutoverTests(unittest.TestCase):
         self.assertIsNone(account.claude_account(self.home / ".claude"))
 
 
+class CutoverKeychain(ServiceKeychain):
+    """A service-only fake with the effective keychain search list."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_list: tuple[Path, ...] = ()
+        self.search_calls: list[tuple[str, ...]] = []
+
+    @override
+    def run(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+        argv = tuple(arguments)
+        if argv == ("security", "list-keychains"):
+            self.search_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0,
+                "".join(f"    {json.dumps(str(path))}\n" for path in self.search_list), "")
+        return super().run(arguments, **_options)
+
+
 class MacHomeCutoverTests(unittest.TestCase):
     """A verified named login permits removal of the Mac's legacy local copy."""
 
     home: Path = Path()
-    keychain: ServiceKeychain = ServiceKeychain()
+    keychain: CutoverKeychain = CutoverKeychain()
     output: io.StringIO = io.StringIO()
     errors: io.StringIO = io.StringIO()
     identity: dict[str, str] = {}
@@ -260,7 +279,7 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
-        self.keychain = ServiceKeychain()
+        self.keychain = CutoverKeychain()
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.keychain.run))
         _ = self.enterContext(patch.object(sys, "platform", "darwin"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", return_value=[]))
@@ -272,6 +291,7 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.initialize_home()
 
     def initialize_home(self) -> None:
+        self.keychain.search_list = (self.home / "Library/Keychains/login.keychain-db",)
         (self.home / ".claude").mkdir()
         (self.home / "notes").mkdir()
         _ = (self.home / "notes/claude2.md").write_text("---\nlogin: synthetic-owner@example.invalid\n---\n")
@@ -298,6 +318,38 @@ class MacHomeCutoverTests(unittest.TestCase):
 
     def deletes(self) -> list[tuple[str, ...]]:
         return [call for call in self.keychain.calls if call[1] == "delete-generic-password"]
+
+    def test_system_only_search_list_refuses_before_journal_identity_or_keychain_changes(self) -> None:
+        self.keychain.search_list = (Path("/Library/Keychains/System.keychain"),)
+        before = self.snapshot()
+        self.assertNotEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertIn("accounts: this session cannot see the Mac's login keychain; "
+                      + "run cutover-home in a Terminal on the Mac", self.errors.getvalue())
+        self.assertTrue(self.snapshot() == before, "search-list refusal changed identity or keychain state")
+        self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
+        self.assertEqual(self.keychain.calls, [])
+        self.assertEqual(self.keychain.search_calls, [("security", "list-keychains")])
+
+    def test_completed_cutover_undo_needs_no_login_keychain_or_keychain_calls(self) -> None:
+        original = self.snapshot()
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.keychain.search_list = (Path("/Library/Keychains/System.keychain"),)
+        self.keychain.calls.clear()
+        self.keychain.search_calls.clear()
+        entries_before = dict(self.keychain.entries)
+        self.assertEqual(accounts.main(["cutover-home", "--undo"]), 0)
+        restored = cast(dict[str, object], json.loads((self.home / ".claude.json").read_text()))
+        self.assertTrue(restored["oauthAccount"] == self.identity)
+        self.assertTrue((self.home / ".claude2/.claude.json").read_bytes() == original[1])
+        self.assertTrue(self.keychain.entries == entries_before, "undo changed keychain state")
+        self.assertEqual(self.keychain.calls, [])
+        self.assertEqual(self.keychain.search_calls, [])
+
+    def test_forward_cutover_accepts_the_legacy_login_keychain_filename(self) -> None:
+        self.keychain.search_list = (self.home / "Library/Keychains/login.keychain",)
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertIsInstance(account.home_account_state(), account.ConfigOnlyHome)
+        self.assertEqual(len(self.deletes()), 1)
 
     def test_completed_undo_allows_another_forward_cutover(self) -> None:
         self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
