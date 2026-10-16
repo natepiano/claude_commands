@@ -463,7 +463,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Gotchas:** `merge_gate.py` refuses on the Mac (no `/dev/shm`); run Mac suites as `PYTHONPATH=<clone> ~/.claude/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`. On macOS `/tmp` resolves to `/private/tmp`. Patching `sys.platform` after import does not change `herdr._PLATFORM`.
 
-### Phase 15 — herdr sessions across machines  · status: todo
+### Phase 15 — herdr sessions across machines  · status: done
 
 **Depends on:** Phase 19
 
@@ -475,8 +475,8 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Spec:**
 
-1. Research first (the unit director, before any worker): what herdr itself offers for remote or ssh attach (its docs and `herdr --help` on both machines), and whether `ssh -t <host> herdr --session <name> session attach` works from a Ghostty window on each machine. Record the findings and the chosen design in this Work Order before dispatch; the showrunner settles the design. First finding (natedev, herdr 0.9.0, 2026-10-16): herdr has its own remote attach, `herdr --remote <ssh-target> [--session <name>]`, and saved SSH machines (`herdr machine add|list|remove|enable|disable`; `add` prepares the remote herdr server). The Mac has herdr (Phases 14–19): its servers start detached through `scripts/lib/detached.py`, ready only when the session socket's listener is our child, with no launchctl; a design that starts a Mac server remotely proves it survives the ssh exit. Still to check: whether a saved machine's sessions show up in the local herdr, and whether `--remote` works both ways from Ghostty. If it does, the design is a thin wrapper or no code at all. Any design that adds code names how a remote session is told apart from a local one of the same name (an explicit destination, never an optional host whose absence means local), what happens on a name collision and on an unreachable host, and keeps `list` and `attach` for local sessions unchanged.
-2. Default design unless research finds a simpler one: `herdr_sessions.py` gains a manual way to name a remote session (for example `herdr_sessions.py add-remote <host> <name>`, kept in a small per-machine file), `list` shows those remote entries beside local sessions with their host, and `attach <name>` runs the ssh attach for a remote entry. No automatic mirroring, no background sync.
+1. Research (done, 2026-10-16): herdr 0.9.0 on both machines has native remote attach, `herdr --remote <ssh-target> --session <name>`, and saved machines (`herdr machine add|list|remove`, where `add` changes the remote server). ssh works both ways without a prompt (natedev to `mac`, the Mac to `natedev`). Settled design (showrunner, 2026-10-16): a thin wrapper over herdr's own remote attach — no saved machines, no stored state, no sync.
+2. `herdr_sessions.py list --on <host>` lists that host's herdr sessions by running the same list over ssh (`ssh <host> herdr_sessions.py list`, through the host's `~/.claude/scripts/lib/py`). `herdr_sessions.py attach-remote <host> <name>` replaces the process with `herdr --remote <host> --session <name>`. Remote is its own verb and flag: no optional host whose absence means local, and local `list` and `attach` stay unchanged. An unreachable host or a failed remote list prints one line naming the host and exits 1, never a traceback.
 3. Live check on both machines: attach from natedev to a Mac session and from the Mac to a natedev session.
 
 **Files:**
