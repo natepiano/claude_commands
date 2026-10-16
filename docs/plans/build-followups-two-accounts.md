@@ -1291,7 +1291,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** macOS listing, client counts and folder, `lsof`'s empty selection against its failure, the unread folder as a keep reason in `sweep`, `idle-stop` and `signin-changed`, the daemon verdict with `~/.codex` signed in, signed out and unreadable, its descendants stopped, identity checked again before signalling, its exclusions, and a failed command refusing are pinned by tests with faked commands; a workers change keeps `home_cutovers`; every changed file reads 0 errors, 0 warnings; the merge gate is green.
 
-### Phase 43 — Codex cutover finishes the first startup  · status: todo
+### Phase 43 — Codex cutover finishes the first startup  · status: done
 
 **Depends on:** Phase 41
 
@@ -1311,6 +1311,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 - `scripts/accounts/accounts.py` — `cutover_codex_home` runs the first startup.
 - `scripts/accounts/test_cutover_home.py` — preparation run after the move, success, failure leaving the move complete with the setup step, undo untouched.
+- `docs/accounts.md` — the cutover section describes the first startup and its setup recovery.
 
 **Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_cutover_home.py`.
 
@@ -1324,23 +1325,25 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Goal:** the user never sees "is a real file; move it aside or merge it into ~/.claude". Showrunner, 2026-10-16: on the Mac, the user's herdr start refused with "accounts: ~/.claude1/shell-snapshots is a real file; move it aside or merge it into ~/.claude". The Mac had no `~/.claude/shell-snapshots`, so no account dir linked it, and a claude1 session created an empty real folder at 12:40 EDT; claude2–4 had no entry. The showrunner repaired it by hand.
 
-**Constraints from prior phases:** `_repair_link(path, target, shared_home)` in `accounts.py` relinks a wrong link and refuses a real entry with `_real_entry_problem`. Setup and the repair path call it for each shared name of a Claude account dir and of a Codex home (`_link_codex_home`). A missing target is skipped, so an account dir gets no link, and Claude then creates a real folder there.
+**Constraints from prior phases:** `_repair_link(path, target, shared_home)` (`accounts.py:605`) relinks a wrong link and refuses a real entry with `_real_entry_problem`; only `setup` and `_link_codex_home` call it. A missing target is skipped, so an account dir gets no link, and Claude then creates a real folder there. The refusal the user saw comes from launch, which only checks: `prepared_account` (`:1043`) → `_inspect_account_directory` (`:826`) → `_link_problems` → `_shared_link_problems` (`:734`) reports and never repairs, and `check_codex_target` (`:2959`) also only checks. `ALWAYS_LINKED` (`:133`, `projects`, `sessions`) names the folders setup creates even when missing. The farm links only entries that exist (Delegation Context); most shared names are files (`settings.json`, `keybindings.json`, `history.jsonl`, `config.toml`, `hooks.json`, `models_cache.json`, `session_index.jsonl`), and an empty one is not valid content, so a missing file target is never created.
 
 **Spec:**
 
-1. Setup and repair create a missing shared target in the shared home (`~/.claude` or `~/.codex`) before linking, as the kind the shared entry is (a folder for `shell-snapshots`), with private permissions.
-2. An empty real folder where a link belongs is removed and linked, with no message.
-3. A non-empty real folder is merged into the shared target, each entry moved, when no name exists in both; the folder is then removed and linked, and one line says what was merged. A name in both keeps everything in place and prints a repair step naming the clashing entries; it is never the old refusal wording, and no file is overwritten or deleted.
-4. A real file (not a folder) where a link belongs keeps today's refusal.
+1. One repair runs on setup and on every launch path (`prepared_account`; `check_codex_target` for Codex) before the check, so a launch never refuses on something the repair fixes, and creating a shared target for one account never leaves another account's launch refused.
+2. Only a declared set of folder targets is created when missing: `shell-snapshots` joins `ALWAYS_LINKED` (with any other folder Claude or Codex creates on demand), created in the shared home with private permissions. A missing file target is never created.
+3. When the shared target is missing and an account holds a real entry (file or folder) under that name, the entry is moved into the shared home and linked, with one line saying so.
+4. An empty real folder where a link belongs is removed and linked, with no message.
+5. A non-empty real folder is merged into the existing shared target, each entry moved, when no name exists in both; the folder is then removed and linked, and one line says what was merged. A name in both keeps everything in place and prints a repair step naming the clashing entries; it is never the old refusal wording, and no file is overwritten or deleted.
+6. A real file where a link belongs keeps today's refusal only when the shared target already exists.
 
 **Files:**
 
-- `scripts/accounts/accounts.py` — `_repair_link` and its callers: create, replace, merge.
-- `scripts/accounts/test_accounts.py` — missing target created, empty folder replaced, merge without clash, clash kept with the step, real file refused; Codex home the same.
+- `scripts/accounts/accounts.py` — `_repair_link` and its callers: create, adopt, replace, merge; `prepared_account` and `check_codex_target` repair before checking; `ALWAYS_LINKED`.
+- `scripts/accounts/test_accounts.py` — launch repairs (no refusal for a missing link once another account created the target), folder target created, missing file target not created, account entry adopted into a missing target, empty folder replaced, merge without clash, clash kept with the step, real file refused against an existing target; Codex home the same.
 
 **Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_accounts.py`.
 
-**Live (director):** after merge and promote, run `accounts.py check` for every account on both machines and confirm no shared-link problem.
+**Live (director):** after merge and promote, run a launch (or `setup`) for every account on both machines, then `accounts.py check`, and confirm no shared-link problem.
 
 **Acceptance gate:** each case above pinned by tests on scratch homes; every changed file reads 0 errors, 0 warnings; the merge gate is green.
 
@@ -1352,19 +1355,21 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Goal:** `_stop_daemon` reports success only when no process the daemon family spawned survives. Follow-up from Phase 42 under the hard-landing rule: after two repairs (re-listing, then freezing the family with SIGSTOP to a fixed point), a process that a not-yet-frozen member spawns, which forks again and exits between two listings, leaves an orphan under pid 1 outside the tracked set. It is not a regression, an unused daemon runs no turns, so it does not show in normal use, and no gate fails.
 
-**Constraints from prior phases:** Phase 42 freezes members by identity (pid, start time, argv, executable), checks every exclusion before each STOP and again at the fixed point, kills with SIGKILL, and resumes only members it stopped. On natedev the daemon is a session leader, and its `app-server --listen` child calls `setsid`, so one session id does not cover the family. See the project memory attempts log `attempts-daemon-family-escape`.
+**Constraints from prior phases:** Phase 42 freezes members by identity (pid, start time, argv, executable), checks every exclusion before each STOP and again at the fixed point, kills with SIGKILL, and resumes only members it stopped. On natedev the daemon is a session leader, and its `app-server --listen` child calls `setsid`, so one session id does not cover the family; whether the Mac's daemon leads its own session is unchecked: check it live, or record it as an open limit beside `setsid`. No session-id reader exists: `process_table.snapshot()`'s `Process` holds only pid, ppid, comm and args. Add one in `codex_mesh.py` from `os.getsid(pid)` (or `/proc/<pid>/stat` field 6); macOS `ps -o sess` is a pointer, not the id. It returns `ProcessSession(sid) | SessionUnread`, never `int | None`, as `_process_identity` turns `sessions.process_start`'s `str | None` into `UnreadCodexProcess`. `ps -eo` lists every user: take the uid filter from `ps -u <uid>`, as `_list_codex_processes` does. `_daemon_process_tree()` reads `_process_identity` for every pid twice per snapshot; on darwin that is about four `ps` spawns per process (estimated 10–20 s, unmeasured) against `REAP_WAIT_SECS` 5.0, so a round that adds a member refuses at the deadline: read identities only for candidates (family members and processes in swept sessions), and set the fixed-point deadline from a measured Mac listing time. `_stop_daemon` takes no lock and runs from `end_session.sh` (`|| true`, output unseen), `remove_workers.py`, `shutdown/stop.py`, `end_friend.sh` and the showrunner's 30-minute `sweep --stop` job; a killed sweep or a failed resume leaves members stopped, and the next sweep lists only `CodexDaemon` processes, so a stopped non-daemon member is never resumed. The sweep's daemon line prints a fixed `~/.codex` home column (`print(f"{daemon.pid}\tdaemon\t{label}\t{reason}\t~/.codex")`), so a daemon on `~/.codex1` reads "uses another Codex home … ~/.codex". See the project memory attempts log `attempts-daemon-family-escape`.
 
 **Spec:**
 
-1. After the family is frozen, sweep every session led by a frozen member: a process of this user in such a session and not yet tracked joins the family (exclusions checked first) and is frozen, repeated to a fixed point, before any kill.
+1. After the family is frozen, sweep every session led by a frozen member: a process of this user in such a session and not yet tracked joins the family (exclusions checked first) and is frozen, repeated to a fixed point, before any kill. A session whose leader is not a tracked member is never swept.
 2. After the kill, a surviving process in any of those sessions reports the family as not stopped, naming the pid.
 3. A process that left the session with its own `setsid` is out of reach; the doc comment says so.
+4. `_stop_daemon` is serialized by a lock, and sweep reports any Codex-family process on `~/.codex` found in stopped state, resuming it when its family is kept.
+5. The daemon line prints the daemon's own home (from `account.process_codex_home`), not a fixed `~/.codex`.
 
 **Files:**
 
-- `scripts/agents/codex_mesh.py` — session sweep in `_stop_daemon`.
-- `scripts/agents/test_codex_mesh.py` — the unseen-intermediate orphan found by session, a survivor reported, exclusions before STOP.
+- `scripts/agents/codex_mesh.py` — session reader and session sweep in `_stop_daemon`, candidate-only identity reads, the lock, stopped-member report and resume, the daemon line's home.
+- `scripts/agents/test_codex_mesh.py` — the unseen-intermediate orphan found by session, a survivor reported, exclusions before STOP, an untracked-leader session never swept, a stopped member resumed, the daemon home column.
 
 **Workers:** 1 writer + 1 tester. impl: `codex_mesh.py`. test: `test_codex_mesh.py`.
 
-**Acceptance gate:** the orphan case is pinned by a test that fails on Phase 42's code; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+**Acceptance gate:** tests pin: the orphan found by session (fails on Phase 42's code); a survivor in a swept session reports "not stopped" with its pid; an excluded process found by session is never stopped, the stop is refused and the rest resumed; a session with an untracked leader is never swept; a stopped member of a kept family is resumed; the daemon line names its own home. The doc comment states the `setsid` limit. Every changed file reads 0 errors, 0 warnings; the merge gate is green.
