@@ -482,7 +482,6 @@ else:
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         environment["REVIEW_POOL_STATE"] = str(self.root / "pool-state")
-        _ = environment.pop("REVIEW_LEASE", None)
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
         # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
@@ -859,7 +858,6 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
         worker = self.open_worker(session)
-        environment["REVIEW_LEASE"] = "production/unit/3"
         retry = subprocess.run(self.review_command(session, "contract", "", worker), env=environment,
                                capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(retry.returncode, 0, retry.stderr)
