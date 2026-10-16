@@ -2,21 +2,24 @@
 # verify.sh — The only build/test/lint commands a delegate may run.
 #
 # Work Orders list exact invocations of this script; the delegate composes no
-# cargo flags and makes no scope choices. Cargo's default target selection
-# compiles examples, so every dev-loop subcommand pins explicit targets
-# (--lib/--bins/--tests). `test` includes examples with test = true; other
-# examples are left out. Nothing below `final` uses --all-targets (mend
-# excepted, see `lint`); `final` is the plan-final full
-# gate, run by the unit director, never by a phase delegate.
+# cargo flags and makes no scope choices. `check` pins lib and bin targets;
+# `test` selects the package's test targets, including examples with test = true.
+# `lint` runs clippy with --all-targets --all-features to match CI, and mend
+# also uses --all-targets. It checks TOML formatting with taplo at the workspace
+# root. `example` runs clippy on one named example while
+# iterating. `final` is the plan-final full gate, run by the unit director,
+# never by a phase delegate.
 #
-# Package selection is always --workspace, with default features. Cargo
-# resolves features per invocation from the selected packages, so `-p <pkg>`
+# Package selection is always --workspace. Commands use default features unless
+# the Work Order supplies --features; `lint`'s clippy always uses all features.
+# Cargo resolves features per invocation from the selected packages, so `-p <pkg>`
 # gives every member its own feature set for bevy and the rest of the
 # dependency tree, and each set is a separate compile of that tree in the
 # shared target directory: nine to eleven copies of bevy_render across the
 # members, which evict one another under the sweep budget and rebuild in
 # minutes each time a phase moves to a new package. --workspace resolves one
-# set for the whole tree, so every command below reuses one compiled copy.
+# set for the whole tree, so commands with the same feature set reuse one
+# compiled copy. `lint`'s all-features clippy shares its set with the push gate.
 # The package argument still decides what runs and what is reported: nextest
 # filters to it with -E 'package(<pkg>)', and --features qualifies its list
 # with it. `test` builds the named package's test targets, plus workspace libs
@@ -30,9 +33,10 @@
 # the whole workspace.
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
-# it with /lint_config), so one switch silences a check across /clippy, the fix
-# pipeline, and every delegate phase. A phase runs all four; only the
-# branch-wide style review is left to the plan-final gate. A gated-off check
+# it with /lint_config), so one switch silences a check across the fix pipeline
+# and every delegate phase. `lint` also always runs taplo fmt --check at the
+# workspace root, using its taplo.toml. A phase runs all five; its unit director
+# runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
 # configurable: the target pinning and the single package selection above are
 # correctness and cache constraints, not preferences. cargo check and cargo
@@ -40,7 +44,8 @@
 #
 # A delegate session remembers passes. With PLAN_DELEGATE_BOARD_DIR or
 # PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
-# <session>/verify_cache/, keyed by the working tree as the run left it, the
+# <session>/verify_cache/, keyed by the working tree its verdict was judged on,
+# the
 # arguments, rustc -vV, lint.conf, these scripts and the RUST*/CARGO_*/NEXTEST_*
 # environment. A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
@@ -48,14 +53,17 @@
 # `test --filter` key holds its names sorted, each once, so one set of names
 # finds one record whatever order a call gives them in. The same call on the
 # same tree then prints that record and its log and exits 0 without the cargo
-# token: seats re-ran unchanged trees 416 times in the week to 2026-10-01. A
+# token: workers re-ran unchanged trees 416 times in the week to 2026-10-01. A
 # `test --filter` reuse prints one line instead, since iteration feedback needs
 # only the verdict. A failed `lint` is recorded the same way
 # and replayed with its full output and exit status, since lint on an
-# unchanged tree fails the same way (one seat ran 12 in a row on 2026-10-01).
+# unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
-# usage error, the sandbox or a kill. A `test` that changed the tree records
-# nothing, and a run outside a delegate session is never cached.
+# usage error, the sandbox or a kill. The judged tree is the tree when the run
+# starts, or for `lint` the tree its last rewrite (mend --fix, then fmt) leaves
+# for taplo, clippy and rustdoc. A run that ends on any other tree records
+# nothing: an edit landed while it ran, and its verdict belongs to neither tree.
+# A run outside a delegate session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
@@ -88,21 +96,27 @@
 #                                          build nothing
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
-#                                          workspace clippy (warnings denied), then
+#                                          workspace taplo fmt --check,
+#                                          workspace clippy on all targets with
+#                                          all features (warnings denied), then
 #                                          rustdoc on the members that differ
-#                                          — every stage gated by config/lint.conf
+#                                          — cargo stages gated by config/lint.conf;
+#                                          taplo always checks TOML formatting
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
-#                                          it: code behind a non-default feature has
-#                                          no other route to a gate. Names without a
-#                                          `/` are qualified as <package>/<name>
+#                                          it. For lint, the list reaches mend and
+#                                          rustdoc; clippy always checks all features.
+#                                          Names without a `/` are qualified as
+#                                          <package>/<name>
 #   … --no-cache                           test and lint: run even when this
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
-#   verify.sh test <package> --local "<why>"   run on natedev; only for a test that must run on Linux
-#   verify.sh fmt <package>               format only (checkpoint-commit backstop)
-#                                          — gated by config/lint.conf
+#   verify.sh test <package> --local "<why>"   run on natedev; only for a test that cannot pass on macOS.
+#                                          Before CI either machine answers a test,
+#                                          merge gates included; CI is the protection
+#                                          (user, 2026-10-16). A pass the Mac ran
+#                                          does not answer --local
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
 #   verify.sh final                        full workspace gate; refuse examples
@@ -118,9 +132,13 @@
 # release checks) use the lint CLI in that directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
-# the same command unsandboxed; anything else is the underlying cargo status.
+# the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
+BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
+source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
+build_override_refusal "${BASH_SOURCE[0]}" delegate/verify.sh || exit 2
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -132,6 +150,7 @@ PY="${HOME}/.claude/scripts/lib/py"
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
+LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -168,6 +187,11 @@ run() {
         ) &
         RUN_STEP_PID=$!
         if [[ "$monitor" == 0 ]]; then set +m; fi
+        # The Mac copy watcher (copy_watch.py) reads the step's group and log here.
+        if [[ -n "${VERIFY_STEP_INFO_FILE:-}" ]]; then
+            printf 'pgid=%s\nlog=%s\n' "$RUN_STEP_PID" "$step_log" > "$VERIFY_STEP_INFO_FILE.new"
+            mv -f "$VERIFY_STEP_INFO_FILE.new" "$VERIFY_STEP_INFO_FILE"
+        fi
         if wait "$RUN_STEP_PID"; then
             RUN_STEP_PID=""
             RUN_LAST_ATTEMPT_KILLED=0
@@ -176,6 +200,11 @@ run() {
         else
             status=$?
             RUN_STEP_PID=""
+        fi
+        # A Mac copy that finished first stopped this step: no memory retry.
+        if [[ -n "${VERIFY_STEP_INFO_FILE:-}" && -e "$VERIFY_STEP_INFO_FILE.stopped" ]]; then
+            rm -f "$step_log"
+            return "$status"
         fi
         ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
         RUN_LAST_ATTEMPT_KILLED=0
@@ -439,6 +468,13 @@ require_member() {
     fi
 }
 
+require_taplo() {
+    if ! command -v taplo >/dev/null 2>&1; then
+        echo "taplo is required" >&2
+        exit 2
+    fi
+}
+
 example_features() {
     cargo metadata --no-deps --format-version 1 \
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
@@ -544,19 +580,39 @@ compose_nextest_args() {
     # and the package's own bins and test-enabled targets. --bins
     # --tests linked every member's test executables, 78 in hana, to
     # run one package's; this links 4 (2026-10-04). The integration
-    # tests stay in, matching what the lint half compiles under
-    # clippy: without them a phase could lint an integration test,
-    # pass its gate, and checkpoint without ever running it.
+    # tests stay in so a phase runs the package's integration tests
+    # alongside its unit tests. The lint half's clippy checks all
+    # workspace targets with all features.
     take_test_targets
     NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}" \
         -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}")
 }
 
+VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
 if [[ "${1:-}" == "--session-dir" ]]; then
     export PLAN_DELEGATE_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
+fi
+
+# A Codex mesh worker's command dies with its turn, and a worker that waits on
+# one spends a model call per wait. So a worker's call detaches: mesh_runs.py
+# runs this same call under a supervisor outside the worker's process group,
+# returns at once, and sends the result to the worker as its next message.
+# Exit 3 means the caller is not a mesh worker; this call then runs attached.
+# The detached run sets PLAN_DELEGATE_DETACHED_RUN, so it does not detach again.
+MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
+if [[ -z "${PLAN_DELEGATE_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
+    VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    DETACH_STATUS=0
+    "$PY" "$MESH_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+        bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
+    case "$DETACH_STATUS" in
+        0) exit 0 ;;
+        3) ;;
+        *) echo "verify.sh: mesh_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
+    esac
 fi
 
 CMD="${1:-}"
@@ -585,7 +641,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --local)
             if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
-                echo 'verify.sh: --local needs a reason: --local "<why this test must run on Linux>". Leave it off to run on the Mac.' >&2
+                echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
                 exit 2
             fi
             LOCAL_ONLY=1
@@ -609,6 +665,8 @@ fi
 # the call record note_event writes.
 export BUILDLOG_CALLER=verify
 export BUILDLOG_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+# The newest call wins a Mac copy (copy_watch.py); bash 3.2 has no EPOCHREALTIME.
+VERIFY_CALL_STARTED="${EPOCHREALTIME:-$(date +%s)}"
 export BUILDLOG_HOLD_PID=$$
 export BUILDLOG_HOLD_WAIT_S=0
 HOLD_WAIT_DIR=""
@@ -660,7 +718,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
 RUN_LOG=""
-RUN_KEY=""
+VERDICT_KEY=""
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
@@ -669,8 +727,16 @@ LOOKUP_STATUS=0
 EXIT_STATUS=0
 FILTER_RUN=0
 BUILDLOG_MAC=""
+BUILDLOG_MAC_HOLDER=""
 BUILDLOG_MAC_REASON=""
 BUILDLOG_MAC_S=""
+# The Mac copy of a natedev run (copy_watch.py): the last outcome word, the
+# copies started and the seconds they held the Mac across leave-hook passes,
+# and how long natedev's step had run when the call's result was decided.
+BUILDLOG_MAC_COPY=""
+BUILDLOG_MAC_COPY_S=""
+BUILDLOG_MAC_COPY_COUNT=""
+BUILDLOG_MAC_COPY_NATEDEV_S=""
 export BUILDLOG_TARGET=""
 if [[ "$CMD" == test && " ${ARGS[*]} " == *" --filter "* ]]; then
     FILTER_RUN=1
@@ -728,14 +794,29 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
+        BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
+        BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" \
+        "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
 
 MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
+MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
+MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
+COPY_WATCH_PID=""
+COPY_WATCH_DIR=""
+VERIFY_STEP_INFO_FILE=""
+COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
 MAC_RESULT_FILE=""
+MAC_LOG_FILE=""
 MAC_RUNNER_PID=""
+# The Mac settings a local test may still leave for (run_local_test): a Mac
+# that declined busy or blocked. MAC_LEAVE_REASON is that decline, passed back
+# as --last-decline.
+MAC_LEAVE_SETTINGS=""
+MAC_LEAVE_REASON=""
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2
@@ -751,16 +832,21 @@ forward_mac_runner_signal() {
             rm -f "$MAC_RESULT_FILE"
         fi
     fi
+    if [[ -n "$MAC_LOG_FILE" ]]; then
+        rm -f "$MAC_LOG_FILE"
+    fi
     note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
     exit "$exit_status"
 }
 
 try_mac_test() {
+    local caller_traps
+    caller_traps="$(trap -p INT TERM HUP)"
     trap 'forward_mac_runner_signal INT 130' INT
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     local runner_status result_text="" result_word="" result_reason=""
-    local result_seconds="" mac_words=0 line
+    local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "$(git rev-parse --show-toplevel)"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
     if [[ $# -gt 1 ]]; then
@@ -774,16 +860,21 @@ try_mac_test() {
     runner_args+=(-- "${NEXTEST_ARGS[@]}")
 
     export BUILDLOG_TARGET=mac
-    "$PY" "$MAC_RUNNER" "${runner_args[@]}" &
+    # A Mac pass is recorded like a natedev one, judged on the tree as it was
+    # when the Mac run began, with the output it printed.
+    if [[ -n "${CACHE_DIR}" ]]; then
+        VERDICT_KEY="$(tree_key)"
+    fi
+    MAC_LOG_FILE="$(mktemp)"
+    "$PY" "$MAC_RUNNER" "${runner_args[@]}" > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
         runner_status=0
     else
         runner_status=$?
     fi
-    trap 'hold_interrupted INT 130' INT
-    trap 'hold_interrupted TERM 143' TERM
-    trap 'hold_interrupted HUP 129' HUP
+    trap - INT TERM HUP
+    eval "$caller_traps"
     MAC_RUNNER_PID=""
 
     if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
@@ -797,6 +888,7 @@ try_mac_test() {
                     ;;
                 reason=*) result_reason="${line#reason=}" ;;
                 seconds=*) result_seconds="${line#seconds=}" ;;
+                holder=*) result_holder="${line#holder=}" ;;
             esac
         done <<< "$result_text"
     fi
@@ -814,6 +906,9 @@ try_mac_test() {
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
+        BUILDLOG_MAC_HOLDER=""
+        rm -f "$MAC_LOG_FILE"
+        MAC_LOG_FILE=""
         export BUILDLOG_TARGET=""
         return
     fi
@@ -821,25 +916,41 @@ try_mac_test() {
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
+    BUILDLOG_MAC_HOLDER=""
+    if [[ "$result_word" == declined && "$result_reason" == busy ]]; then
+        BUILDLOG_MAC_HOLDER="$result_holder"
+    fi
     case "$result_word" in
         declined|lost)
+            rm -f "$MAC_LOG_FILE"
+            MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
             return
             ;;
         failed)
+            rm -f "$MAC_LOG_FILE"
+            MAC_LOG_FILE=""
             note_event failed "${SECONDS}" 0 "" 0 "$runner_status"
             exit "$runner_status"
             ;;
         passed)
-            if [[ "$FILTER_RUN" -eq 1 ]]; then
-                BUILDLOG_MAC=passed_filter
-                echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
-                note_event ran "${SECONDS}" 0 "" 0 0
-                exit 0
-            fi
-            echo "verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate."
+            finish_mac_pass "$MAC_LOG_FILE" "$result_seconds"
             ;;
     esac
+}
+
+# Ends the call on a Mac pass, filtered or full. Before CI either machine
+# answers a test; CI is the protection (user, 2026-10-16).
+finish_mac_pass() {
+    if [[ "$FILTER_RUN" -eq 1 ]]; then
+        BUILDLOG_MAC=passed_filter
+    else
+        BUILDLOG_MAC=passed_full
+    fi
+    record_mac_pass "$1" "$2"
+    echo "verify.sh: PASS on the Mac (macOS), so nothing ran on natedev."
+    note_event ran "${SECONDS}" 0 "" 0 0
+    exit 0
 }
 
 # Registration is local demand, not a reservation to retain while another
@@ -857,6 +968,7 @@ withdraw_local_demand() {
 # when the holder, reason or escalation message changes during this wait.
 register_routing_demand() {
     local admission=0
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
@@ -864,6 +976,12 @@ register_routing_demand() {
         cp "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"
     fi
     return "$admission"
+}
+
+# Status 0 when mac_test.py says a claim for this repository made now could
+# start a run on the Mac these settings name: local records only, no SSH.
+mac_free_now() {
+    "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" --repo-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1
 }
 
 route_test() {
@@ -891,7 +1009,7 @@ route_test() {
         [[ "$eligibility" == eligible ]] || continue
         if [[ "$settings" == - ]]; then
             admission=0
-            python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID" || admission=$?
+            build_hold_check_admission || admission=$?
             case "$admission" in
                 0) return 0 ;;
                 10|12) continue ;;
@@ -903,9 +1021,13 @@ route_test() {
         if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
             retry_settings+=("$settings")
             retry_reasons+=("$BUILDLOG_MAC_REASON")
+            if [[ -z "$MAC_LEAVE_SETTINGS" ]]; then
+                MAC_LEAVE_SETTINGS="$settings" MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+            fi
         else
-            # A full Mac pass needs the local gate; a lost attempt or another
-            # decline needs the existing local wait, without more Mac tries.
+            # A lost attempt or another decline needs the existing local
+            # wait, without more Mac tries.
+            MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
             return 0
         fi
     done <<< "$table"
@@ -923,37 +1045,168 @@ route_test() {
             echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
-        ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
-        sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
+            ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
+        fi
+        "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
         wait "$HOLD_WAITER_PID"
         HOLD_WAITER_PID=""
 
-        # A release can admit this call while the holder file remains. Renew
-        # demand each pass and use the admission decision before another try.
-        admission=0
-        register_routing_demand || admission=$?
-        case "$admission" in
-            0) collect_routing_wait; return 0 ;;
-            10) ;;
-            *) exit "$admission" ;;
-        esac
-        collect_routing_wait
-        withdraw_local_demand
+        # A Mac that freed wins over a release turn: try it before renewing
+        # demand, which a release may already have admitted. The demand is
+        # withdrawn before a Mac attempt (see withdraw_local_demand), so
+        # free-now gates the attempt: a busy Mac must not cost a held turn.
         for ((retry_index=0; retry_index<${#retry_settings[@]}; retry_index++)); do
+            mac_free_now "${retry_settings[$retry_index]}" || continue
+            collect_routing_wait
+            withdraw_local_demand
             try_mac_test "${retry_settings[$retry_index]}" "${retry_reasons[$retry_index]}"
             if [[ "$BUILDLOG_MAC" != declined || ( "$BUILDLOG_MAC_REASON" != busy && "$BUILDLOG_MAC_REASON" != blocked ) ]]; then
+                MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
                 return 0
             fi
             # A declined claim is more hold wait; a runner that executes tests
             # returns or exits above, so its runtime is never added here.
             printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
             retry_reasons[$retry_index]="$BUILDLOG_MAC_REASON"
+            if [[ "${retry_settings[$retry_index]}" == "$MAC_LEAVE_SETTINGS" ]]; then
+                MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+            fi
             if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
                 echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
                 announced_reason="$BUILDLOG_MAC_REASON"
             fi
         done
+    done
+}
+
+# Starts copy_watch.py beside the natedev step run() is about to start: while
+# the step compiles, it may run a copy of the same test on the Mac, and the
+# first result wins (see docs/as-built/mac-test-offload.md).
+start_copy_watch() {
+    COPY_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-copy.XXXXXX")"
+    VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
+    local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
+        --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
+        --repo-root "$(git rev-parse --show-toplevel)" --package "$PKG"
+        --call-id "$BUILDLOG_CALL_ID" --call-started "$VERIFY_CALL_STARTED")
+    if [[ "$FILTER_RUN" -eq 1 ]]; then
+        watch_args+=(--filter-run)
+    fi
+    "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
+    COPY_WATCH_PID=$!
+}
+
+# Stops the watcher, which stops a copy still running, and reads its result
+# into COPY_* and the call's BUILDLOG_MAC_COPY* words. Safe to call twice.
+stop_copy_watch() {
+    local line copy_s="" copy_count="" natedev_s=""
+    COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
+    [[ -n "$COPY_WATCH_PID" ]] || return 0
+    kill -TERM "$COPY_WATCH_PID" 2>/dev/null || true
+    wait "$COPY_WATCH_PID" 2>/dev/null || true
+    COPY_WATCH_PID=""
+    if [[ -f "$COPY_WATCH_DIR/result" ]]; then
+        while IFS= read -r line; do
+            case "$line" in
+                copy=*) COPY_WORD="${line#copy=}" ;;
+                copy_s=*) copy_s="${line#copy_s=}" ;;
+                copy_count=*) copy_count="${line#copy_count=}" ;;
+                natedev_s_at_end=*) natedev_s="${line#natedev_s_at_end=}" ;;
+                mac=*) COPY_MAC="${line#mac=}" ;;
+                reason=*) COPY_REASON="${line#reason=}" ;;
+                seconds=*) COPY_SECONDS="${line#seconds=}" ;;
+                runner_status=*) COPY_RUNNER_STATUS="${line#runner_status=}" ;;
+                stopped_natedev=*) COPY_STOPPED="${line#stopped_natedev=}" ;;
+            esac
+        done < "$COPY_WATCH_DIR/result"
+    fi
+    rm -rf "$COPY_WATCH_DIR"
+    COPY_WATCH_DIR="" VERIFY_STEP_INFO_FILE=""
+    if [[ -n "$COPY_WORD" && "$copy_count" =~ ^[0-9]+$ && "$copy_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        BUILDLOG_MAC_COPY="$COPY_WORD"
+        BUILDLOG_MAC_COPY_COUNT=$(( ${BUILDLOG_MAC_COPY_COUNT:-0} + copy_count ))
+        BUILDLOG_MAC_COPY_S="$(LC_ALL=C awk -v total="${BUILDLOG_MAC_COPY_S:-0}" -v more="$copy_s" \
+            'BEGIN { printf "%.3f", total + more }')"
+        if [[ -n "$natedev_s" ]]; then
+            BUILDLOG_MAC_COPY_NATEDEV_S="$natedev_s"
+        fi
+    else
+        COPY_WORD=""
+    fi
+}
+
+# The Mac copy finished first and stopped the natedev step: end the call as
+# try_mac_test ends it for a Mac result. The run log holds both machines'
+# output; a pass keeps it as the Mac's pass record.
+finish_copy_win() {
+    local log="$RUN_LOG"
+    BUILDLOG_MAC="$COPY_MAC"
+    BUILDLOG_MAC_REASON="$COPY_REASON"
+    BUILDLOG_MAC_S="$COPY_SECONDS"
+    BUILDLOG_MAC_HOLDER=""
+    export BUILDLOG_TARGET=mac
+    RUN_LOG=""
+    if [[ "$COPY_MAC" == failed ]]; then
+        [[ -z "$log" ]] || rm -f "$log"
+        note_event failed "${SECONDS}" 0 "" 0 "$COPY_RUNNER_STATUS"
+        exit "$COPY_RUNNER_STATUS"
+    fi
+    if [[ -z "$log" ]]; then
+        log="$(mktemp)"
+    fi
+    finish_mac_pass "$log" "$COPY_SECONDS"
+}
+
+# Runs the tests on natedev. While MAC_LEAVE_SETTINGS names a Mac, a run held
+# in the memory wait leaves once mac_test.py free-now says that Mac is free,
+# and its Mac result counts as one from route_test: a failure or a pass ends
+# the call; busy or blocked waits here again, still free to leave; a lost run
+# or another decline runs here with no way out. Once the step compiles,
+# copy_watch.py may run a copy on the Mac; a copy result that finishes first
+# ends the call (finish_copy_win).
+run_local_test() {
+    local status hook copy_watch
+    while true; do
+        hook=""
+        copy_watch=0
+        if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
+            hook="$(printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$MAC_LEAVE_SETTINGS" \
+                --repo-root "$(git rev-parse --show-toplevel)")"
+            if [[ -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
+                copy_watch=1
+            fi
+        fi
+        export BUILDLOG_TARGET=natedev
+        echo "verify.sh: running on natedev"
+        status=0
+        if [[ "$copy_watch" -eq 1 ]]; then
+            start_copy_watch
+        fi
+        LINT_QUEUE_LEAVE_HOOK="$hook" run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+        if [[ "$copy_watch" -eq 1 ]]; then
+            stop_copy_watch
+            if [[ "$COPY_WORD" == won ]]; then
+                if [[ "$COPY_STOPPED" == 1 && "$status" -ne 0 \
+                      && ( "$COPY_MAC" == failed || "$COPY_MAC" == passed ) ]]; then
+                    finish_copy_win
+                fi
+                # natedev ended before the stop reached it: its result stands.
+                BUILDLOG_MAC_COPY=natedev_won
+            fi
+        fi
+        if [[ -z "$hook" || "$status" -ne "$LINT_LEFT_QUEUE_STATUS" ]]; then
+            return "$status"
+        fi
+        # The step never started; its hold turn goes to the next session.
+        withdraw_local_demand
+        try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
+        if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
+            MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+        else
+            MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
+        fi
     done
 }
 
@@ -966,7 +1219,8 @@ cache_lookup() {
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    if [[ -f "${record}.pass" ]]; then
+    # --local asks for Linux: a pass the Mac ran does not answer it.
+    if [[ -f "${record}.pass" && ! ( "${LOCAL_ONLY}" -eq 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) ]]; then
         record+=.pass outcome=reused word=PASS
     elif [[ -f "${record}.fail" ]]; then
         record+=.fail outcome=replayed word=FAIL
@@ -1006,26 +1260,59 @@ build_seconds() {
                END { printf "%d", total }'
 }
 
-# Records a pass, or a lint failure, under the tree as the run left it (lint's
-# rewrites are part of the result), before the token is released so a peer
-# queued on the same call finds it. A record replaces the other kind on the
-# same tree. Fails when there is nothing to record.
+# Records a pass, or a lint failure, under the tree its verdict was judged on
+# (VERDICT_KEY; lint's rewrites are part of it), before the token is released
+# so a peer queued on the same call finds it. A record replaces the other kind
+# on the same tree. A third word `mac` marks a pass the Mac ran (`host=mac`),
+# which a --local call does not reuse. Fails when there is nothing to record,
+# or when the tree has changed since that verdict.
 cache_record() {
-    local kind=$1 repeat=$2 key verb=passed other=fail
+    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
     key="$(tree_key)"
-    if [[ -z "${key}" || ( "$CMD" == test && "${key}" != "${RUN_KEY}" ) ]]; then
+    [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
+    if [[ "${key}" != "${VERDICT_KEY}" ]]; then
+        echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
         return 1
     fi
     if [[ "${kind}" == fail ]]; then
         verb="failed with status ${EXIT_STATUS}" other=pass
+    elif [[ "${host}" == mac ]]; then
+        verb="passed on the Mac"
     fi
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
-    printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
-        "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}" \
-        > "${CACHE_DIR}/${key}.${kind}.tmp"
+    {
+        printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
+            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
+        if [[ "${host}" == mac ]]; then
+            printf 'host=mac\n'
+        fi
+    } > "${CACHE_DIR}/${key}.${kind}.tmp"
     mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
     rm -f "${CACHE_DIR}/${key}.${other}"
+}
+
+# Records a Mac pass, whose output is in the file $1, as this call's pass
+# record. The tree is read before the Mac run (VERDICT_KEY) and again now, so
+# an edit made while the Mac ran leaves nothing recorded. $2 is the Mac's
+# seconds, what a reuse saves.
+record_mac_pass() {
+    local log=$1 mac_seconds=${2%%.*}
+    if [[ -z "${CACHE_DIR}" ]] || ! mkdir -p "${CACHE_DIR}"; then
+        rm -f "$log" "${RUN_LOG}"
+        RUN_LOG=""
+        return 0
+    fi
+    # A natedev log from before the Mac took the call has nothing to keep.
+    if [[ -n "${RUN_LOG}" && "${RUN_LOG}" != "$log" ]]; then
+        rm -f "${RUN_LOG}"
+    fi
+    RUN_LOG="$log"
+    EXIT_STATUS=0
+    if ! cache_record pass "${mac_seconds:-0}" mac; then
+        rm -f "$log"
+    fi
+    RUN_LOG=""
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
@@ -1104,12 +1391,14 @@ if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test
 fi
-python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
-HOLD_WAITER_PID=$!
-HOLD_WAIT_STATUS=0
-wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
-HOLD_WAITER_PID=""
-if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+if ! build_hold_nothing_held; then
+    python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
+    HOLD_WAITER_PID=$!
+    HOLD_WAIT_STATUS=0
+    wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
+    HOLD_WAITER_PID=""
+    if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+fi
 trap - INT TERM HUP
 
 # Open a progress window for the duration of this run when a delegate session is
@@ -1132,9 +1421,26 @@ ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
 BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
+# The unit director's own run (a session dir, no board, no team role) takes the
+# token too, as slot `director` on the session's board, so it queues with the
+# workers' detached runs instead of building beside them.
+if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
+    BOARD_DIR="${PLAN_DELEGATE_SESSION_DIR}"
+    BOARD_SLOT=director
+fi
 TOKEN_HELD=0
+token_wait_clock() {
+    # Tests can advance a disposable clock while acquisition still blocks on
+    # the real board. Normal calls retain Bash's elapsed-seconds clock.
+    if [[ -n "${PLAN_DELEGATE_TOKEN_CLOCK_FILE:-}" ]]; then
+        read -r TOKEN_CLOCK_NOW < "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+    else
+        TOKEN_CLOCK_NOW=$SECONDS
+    fi
+}
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
-    TOKEN_WAIT_STARTED=$SECONDS
+    token_wait_clock
+    TOKEN_WAIT_STARTED=$TOKEN_CLOCK_NOW
     if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
         --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
@@ -1142,7 +1448,8 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
         echo "verify.sh: waited for the cargo token and did not get it." >&2
         exit 1
     fi
-    TOKEN_WAIT_S=$(( SECONDS - TOKEN_WAIT_STARTED ))
+    token_wait_clock
+    TOKEN_WAIT_S=$(( TOKEN_CLOCK_NOW - TOKEN_WAIT_STARTED ))
 fi
 
 # Fork before starting each step. The child creates its own session, records
@@ -1190,7 +1497,15 @@ if child:
 os.setsid()
 with (lock.parent / "cargo.guard").open("a+") as guard:
     fcntl.flock(guard, fcntl.LOCK_EX)
-    if (lock / "holder_pid").read_text() != holder:
+    # A token released or reclaimed during the memory wait leaves no holder_pid,
+    # or a holder that recorded none: either way this run no longer holds it.
+    try:
+        recorded = (lock / "holder_pid").read_text()
+    except OSError:
+        recorded = ""
+    if recorded != holder:
+        print("verify.sh: this run lost the cargo token before its step started; run it again.",
+              file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
@@ -1234,7 +1549,9 @@ fi
 RUN_STARTED=${SECONDS}
 MEM_KILL_FILE="$(mktemp)"
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
-    RUN_KEY="${LOOKUP_KEY}"
+    # Taken now, after the token and hold waits: an edit made while this call
+    # waited is part of the tree it runs on.
+    VERDICT_KEY="$(tree_key)"
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -1274,6 +1591,7 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
+    stop_copy_watch || true
     if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
     finish_run "${status}" || true
     # finish_run notes only a run with a record log; every other call is noted
@@ -1322,20 +1640,20 @@ case "$CMD" in
         run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
         ;;
     test)
-        export BUILDLOG_TARGET=natedev
-        echo "verify.sh: running on natedev"
-        run_nextest "${NEXTEST_ARGS[@]}"
+        run_local_test
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
         shift
         take_features "$@"
         require_member "$PKG"
-        # Order: mend rewrites first, fmt formats what mend wrote, then clippy
-        # and rustdoc read the settled tree. Every stage is gated by lint.conf.
-        # mend is the one stage below `final` that passes --all-targets: it
-        # needs the test and example targets to see every import and
-        # visibility site. It covers the workspace like the other stages, so
+        require_taplo
+        # Order: mend rewrites first, fmt formats what mend wrote, then taplo
+        # checks TOML before clippy and rustdoc read the settled tree.
+        # Cargo stages are gated by lint.conf; the Taplo check always runs.
+        # mend passes --all-targets because it needs the test and example
+        # targets to see every import and visibility site. It covers the
+        # workspace like the other stages, so
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
@@ -1375,7 +1693,29 @@ case "$CMD" in
             fi
         done <<< "$FMT_MEMBERS"
         fmt_cargo "${FMT_SCOPE[@]}"
-        invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        # The last rewrite is done: taplo, clippy and rustdoc judge this tree.
+        if [[ -n "${RUN_LOG}" ]]; then
+            VERDICT_KEY="$(tree_key)"
+        fi
+        # Cargo's workspace root can differ from the caller's directory.
+        # Run there so Taplo uses the same config and scope as the push gate.
+        TAPLO_WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+            | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+        if (cd "$TAPLO_WORKSPACE_ROOT" && run taplo fmt --check); then
+            :
+        else
+            taplo_status=$?
+            if (( taplo_status == 101 )); then
+                if [[ "$(uname)" == Darwin ]]; then
+                    echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+                    exit 3
+                fi
+                echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+                exit 2
+            fi
+            exit "$taplo_status"
+        fi
+        invoke_clippy --workspace --all-targets --all-features
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then
@@ -1395,16 +1735,12 @@ case "$CMD" in
             echo "verify.sh: no workspace member differs from HEAD; rustdoc skipped"
         fi
         ;;
-    fmt)
-        PKG="${1:?verify.sh fmt <package>}"
-        fmt_cargo -p "$PKG"
-        ;;
     example)
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
-        # clippy, not check: `lint` never sees an example, so a check here let
-        # lint errors in a changed example reach the merge branch twice.
+        # Clippy gives focused lint feedback on one changed example while
+        # iterating; the full `lint` command checks every workspace target.
         # Example names are unique across the workspace, so --workspace
         # --example builds this one example under the workspace's feature
         # resolution. A required feature that resolution leaves off still
@@ -1417,7 +1753,6 @@ case "$CMD" in
         fi
         ;;
     final)
-        fmt_cargo --check
         run cargo check --workspace --all-targets
         run_nextest --workspace
         ;;

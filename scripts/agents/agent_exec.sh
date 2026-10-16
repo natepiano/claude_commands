@@ -58,7 +58,7 @@ agents_exec_main() {
     local prompt_file="$4"
     local output_file="$5"
     local log_file="$6"
-    local script_dir prompt family_args_line claude_code
+    local script_dir prompt family_args_line claude_code workers_home
     local -a family_args extra_args command
 
     if [[ ! -f "$prompt_file" ]]; then
@@ -86,9 +86,19 @@ agents_exec_main() {
 
     case "$AGENT_FAMILY" in
         codex)
+            workers_home="$("$PY" - "$script_dir/../whoami" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from agent_accounts import workers_home
+try:
+    print(workers_home())
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
+PY
+            )"
             family_args_line="$(agents_codex_args)"
             read -r -a family_args <<< "$family_args_line"
-            command=(codex exec "${family_args[@]}")
+            command=(env "CODEX_HOME=$workers_home" codex exec "${family_args[@]}")
             if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
                 command+=("${extra_args[@]}")
             fi
@@ -116,6 +126,8 @@ agents_exec_main() {
             "${command[@]}" < "$prompt_file" > "$log_file" 2>&1
             ;;
         claude)
+            source "$script_dir/claude_account.sh"
+            claude_launch_environment || return 1
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
             command=(claude --print)

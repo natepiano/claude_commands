@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
+import os
 import socket
 import struct
 import subprocess
@@ -133,6 +135,7 @@ class CodexDaemonTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
 
     def test_loaded_sessions_initializes_pages_and_reads_each_thread(self) -> None:
         methods: list[str] = []
@@ -266,6 +269,110 @@ class CodexDaemonTests(unittest.TestCase):
             codex_daemon.daemon_socket({"ROSTER_CODEX_SOCKET": str(chosen)}), chosen,
         )
 
+    def test_daemon_discovery_follows_process_home_before_default(self) -> None:
+        chosen = self.root / "custom home"
+        suffix = Path("app-server-control/app-server-control.sock")
+        self.assertEqual(codex_daemon.daemon_socket({"HOME": str(self.root)}), self.root / ".codex" / suffix)
+        self.assertEqual(codex_daemon.daemon_socket({"HOME": str(self.root), "CODEX_HOME": str(chosen)}), chosen / suffix)
+        override = self.root / "override.sock"
+        self.assertEqual(codex_daemon.daemon_socket({"HOME": str(self.root), "CODEX_HOME": str(chosen),
+            "ROSTER_CODEX_SOCKET": str(override)}), override)
+
+    def test_default_daemon_stays_reachable_when_workers_select_a_numbered_home(self) -> None:
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "codex1.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        home = self.root / ".codex1"
+        home.mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "workers@example.invalid"}).encode()).decode().rstrip("=")
+        _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        with mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
+            module = importlib.import_module("scripts.accounts.accounts")
+            run_accounts = cast(Callable[[list[str]], int], module.main)
+            self.assertEqual(run_accounts(["set-role", "workers", "codex1"]), 0)
+        self.assertEqual(codex_daemon.daemon_socket(os.environ),
+            self.root / ".codex" / "app-server-control" / "app-server-control.sock")
+        completed = subprocess.CompletedProcess(["codex", "queue"], 0, stdout="", stderr="")
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            self.assertEqual(codex_daemon.queue("default-thread", "message"), codex_daemon.Queued())
+        environment = cast(dict[str, str], run.call_args.kwargs.get("env", dict(os.environ)))
+        self.assertEqual(Path(environment.get("CODEX_HOME", str(self.root / ".codex"))), self.root / ".codex")
+
+    def test_daemon_queue_keeps_the_home_used_for_discovery(self) -> None:
+        home = self.root / "freestanding home"
+        completed = subprocess.CompletedProcess(["codex", "queue"], 0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), mock.patch.object(subprocess, "run", return_value=completed) as run:
+            self.assertEqual(codex_daemon.daemon_socket(os.environ), home / "app-server-control" / "app-server-control.sock")
+            self.assertEqual(codex_daemon.queue("thread", "message"), codex_daemon.Queued())
+            environment = cast(dict[str, str], run.call_args.kwargs.get("env", dict(os.environ)))
+            self.assertEqual(environment["CODEX_HOME"], str(home))
+
+    def test_explicit_daemon_socket_receives_the_message_at_its_exact_path(self) -> None:
+        chosen = self.root / "arbitrary.sock"
+        methods: list[str] = []
+        def conversation(connection: socket.socket) -> None:
+            initialize = _receive_frame(connection)
+            methods.append(cast(str, initialize["method"]))
+            params = cast(dict[str, object], initialize["params"])
+            self.assertEqual(params["capabilities"], {"experimentalApi": True})
+            _reply(connection, initialize, {})
+            initialized = _receive_frame(connection)
+            methods.append(cast(str, initialized["method"]))
+            request = _receive_frame(connection)
+            methods.append(cast(str, request["method"]))
+            params = cast(dict[str, object], request["params"])
+            self.assertEqual(params["threadId"], "thread")
+            self.assertEqual(params["input"], [{"type": "text", "text": "message"}])
+            _reply(connection, request, {"queuedSubmission": {"id": "queued-message"}})
+        with FakeDaemon(chosen, conversation), mock.patch.dict(os.environ, {
+            "CODEX_HOME": str(self.root / "caller"), "ROSTER_CODEX_SOCKET": str(chosen),
+        }), mock.patch.object(subprocess, "run") as run:
+            self.assertEqual(codex_daemon.daemon_socket(os.environ), chosen)
+            self.assertEqual(codex_daemon.queue("thread", "message", timeout=1), codex_daemon.Queued())
+        run.assert_not_called()
+        self.assertEqual(methods, ["initialize", "initialized", "thread/queue/add"])
+
+    def test_explicit_daemon_socket_failure_does_not_fall_back_to_another_home(self) -> None:
+        chosen = self.root / "refused.sock"
+        def conversation(connection: socket.socket) -> None:
+            initialize = _receive_frame(connection)
+            _reply(connection, initialize, {})
+            _ = _receive_frame(connection)
+            request = _receive_frame(connection)
+            _send_frame(connection, {"id": request["id"], "error": {"message": "thread refused"}})
+        with FakeDaemon(chosen, conversation), mock.patch.dict(os.environ, {
+            "CODEX_HOME": str(self.root / "caller"), "ROSTER_CODEX_SOCKET": str(chosen),
+        }), mock.patch.object(subprocess, "run") as run:
+            result = codex_daemon.queue("thread", "message", timeout=1)
+        self.assertIsInstance(result, codex_daemon.QueueFailed)
+        if not isinstance(result, codex_daemon.QueueFailed):
+            self.fail("A selected daemon refusal must be returned to its caller")
+        self.assertIn("thread refused", result.reason)
+        run.assert_not_called()
+
+    def test_explicit_daemon_socket_timeout_never_falls_back_to_the_process_home(self) -> None:
+        for waiting_on in ("initialize", "thread/queue/add"):
+            with self.subTest(waiting_on=waiting_on):
+                chosen = self.root / f"{waiting_on.replace('/', '-')}.sock"
+
+                def conversation(connection: socket.socket) -> None:
+                    initialize = _receive_frame(connection)
+                    self.assertEqual(initialize["method"], "initialize")
+                    if waiting_on == "thread/queue/add":
+                        _reply(connection, initialize, {})
+                        self.assertEqual(_receive_frame(connection)["method"], "initialized")
+                        self.assertEqual(_receive_frame(connection)["method"], "thread/queue/add")
+                    connection.settimeout(2)
+                    self.assertEqual(connection.recv(1), b"")
+
+                with FakeDaemon(chosen, conversation), mock.patch.dict(os.environ, {
+                    "CODEX_HOME": str(self.root / "caller"), "ROSTER_CODEX_SOCKET": str(chosen),
+                }), mock.patch.object(subprocess, "run") as run:
+                    result = codex_daemon.queue("thread", "message", timeout=0.25)
+
+                self.assertEqual(result, codex_daemon.QueueTimedOut(0.25))
+                run.assert_not_called()
+
     def test_queue_runs_codex_for_one_thread(self) -> None:
         self.assertEqual(codex_daemon.QUEUE_TIMEOUT_SECONDS, 30)
         completed = subprocess.CompletedProcess(
@@ -284,6 +391,7 @@ class CodexDaemonTests(unittest.TestCase):
             text=True,
             timeout=4.5,
             check=False,
+            env={**os.environ, "CODEX_HOME": str(self.root / ".codex")},
         )
 
     def test_queue_reports_the_first_stderr_line_or_exit_status(self) -> None:

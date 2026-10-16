@@ -11,6 +11,7 @@ import os
 import shlex
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import zlib
@@ -20,7 +21,6 @@ from dataclasses import dataclass
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO, cast
-from zoneinfo import ZoneInfo
 
 if __package__:
     from .changes import Change, MeasurementChange, ProductChange, read_changes
@@ -45,7 +45,9 @@ else:
         PersistentScanCache, UnavailableTimingSource, scan_calls, survey_counts,
     )
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone, user_zone_name  # noqa: E402
+
 STATE_DIR = Path.home() / ".local/state/screenshot-analysis"
 CLAUDE_ROOT = Path.home() / ".claude/projects"
 CODEX_ROOT = Path.home() / ".codex/sessions"
@@ -332,8 +334,8 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
         _ = output_path.unlink(missing_ok=True)
 
 
-def _pacific(value: datetime) -> str:
-    return value.astimezone(PACIFIC).strftime("%Y-%m-%d %H:%M %Z (%z)")
+def _user_time(value: datetime) -> str:
+    return value.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z (%z)")
 
 
 def _utc_now() -> datetime:
@@ -357,9 +359,9 @@ def _save_object(path: Path, value: dict[str, object]) -> None:
 
 def _window_stamp(value: str) -> datetime:
     if "T" not in value:
-        return datetime.combine(datetime.fromisoformat(value).date(), clock_time(), PACIFIC)
+        return datetime.combine(datetime.fromisoformat(value).date(), clock_time(), user_zone())
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=PACIFIC)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -443,7 +445,7 @@ def _coverage_summary(coverage: dict[str, CoveredHostSourcesThrough]) -> str:
     values: list[str] = []
     for host, covered in sorted(coverage.items()):
         sources = ",".join(sorted(covered.sources))
-        values.append(f"{host} through {_pacific(covered.at)} ({sources})")
+        values.append(f"{host} through {_user_time(covered.at)} ({sources})")
     return "; ".join(values)
 
 
@@ -510,7 +512,7 @@ def _longest_episode_rows(episodes: Iterable[Episode], mac_claude: str) -> list[
                                                                GAP_CATEGORIES.index(category)))[:2]
         rows.append([
             _host_label(episode.source_host, mac_claude), episode.agent, episode.project, episode.session_id,
-            episode.start.astimezone(PACIFIC).isoformat(timespec="minutes"), f"{episode.minutes:.1f}",
+            episode.start.astimezone(user_zone()).isoformat(timespec="minutes"), f"{episode.minutes:.1f}",
             largest[0], f"{category_minutes[largest[0]]:.1f}",
             largest[1], f"{category_minutes[largest[1]]:.1f}",
         ])
@@ -593,15 +595,15 @@ def _weekly_trend(episodes: Iterable[Episode]) -> list[str]:
     for episode in episodes:
         if episode.split != 300:
             continue
-        local = episode.start.astimezone(PACIFIC)
+        local = episode.start.astimezone(user_zone())
         monday = (local - timedelta(days=local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         weeks[monday][episode.method].append(episode)
     rows: list[list[str]] = []
     for week, methods in sorted(weeks.items()):
         by_hand, hana = methods["by hand"], methods["/hana_shot"]
-        rows.append([_pacific(week), str(len(by_hand)), f"{sum(item.minutes for item in by_hand)/60:.2f}",
+        rows.append([_user_time(week), str(len(by_hand)), f"{sum(item.minutes for item in by_hand)/60:.2f}",
                      str(len(hana)), f"{sum(item.minutes for item in hana)/60:.2f}"])
-    return ["Weekly agent-hours, 5-min split; weeks start Monday in Pacific time; n counts episodes",
+    return [f"Weekly agent-hours, 5-min split; weeks start Monday in {user_zone_name()}; n counts episodes",
             *_aligned_table(["week_start", "by_hand_n", "by_hand_h", "hana_shot_n", "hana_shot_h"], rows)]
 
 
@@ -677,7 +679,7 @@ def _change_rows(episodes: list[Episode], changes: list[Change], state_dir: Path
                 if end <= start:
                     continue
                 label = f"incomplete:{host}" if _coverage_incomplete(host, end, coverage) else "complete"
-                window = f"{_pacific(start)} to {_pacific(end)}"
+                window = f"{_user_time(start)} to {_user_time(end)}"
                 for method in ("by hand", "/hana_shot"):
                     for split in (300, 900):
                         group = [episode for episode in episodes if episode.method == method
@@ -777,13 +779,13 @@ def report(state_dir: Path, since: str = "", until: str = "", project: str = "")
         and (end is None or episode.start < end)
         and (not project or episode.project == project)
     ]
-    start_label = _pacific(start) if start else "all available"
-    end_label = _pacific(end) if end else "latest saved"
-    lines = [f"Window: {start_label} to {end_label} (America/Los_Angeles); n counts episodes; duration in hours and minutes"]
+    start_label = _user_time(start) if start else "all available"
+    end_label = _user_time(end) if end else "latest saved"
+    lines = [f"Window: {start_label} to {end_label} ({user_zone_name()}); n counts episodes; duration in hours and minutes"]
     status = _read_object(state_dir / "scan_status.json")
     last_scan = status.get("last_success")
     if isinstance(last_scan, str):
-        lines.append(f"Last successful scan: {_pacific(datetime.fromisoformat(last_scan.replace('Z', '+00:00')))}")
+        lines.append(f"Last successful scan: {_user_time(datetime.fromisoformat(last_scan.replace('Z', '+00:00')))}")
     else:
         lines.append("Last successful scan: never")
     coverage = _host_coverage(state_dir)
@@ -791,12 +793,12 @@ def report(state_dir: Path, since: str = "", until: str = "", project: str = "")
         names = [name for source, name in (("claude", "Claude transcripts"),
                                           ("codex", "Codex transcripts"),
                                           ("timings", "timings")) if source in covered.sources]
-        lines.append(f"{host} evidence covered through {_pacific(covered.at)}; sources: {', '.join(names)}")
+        lines.append(f"{host} evidence covered through {_user_time(covered.at)}; sources: {', '.join(names)}")
     state = status.get("mac_read_state", "unavailable")
     if state not in ("finished", "catching up", "unavailable"):
         state = "unavailable"
     mac_covered = coverage.get("mac")
-    covered_label = _pacific(mac_covered.at) if mac_covered is not None else "never"
+    covered_label = _user_time(mac_covered.at) if mac_covered is not None else "never"
     lines.append(f"Mac: {state}; evidence covered through {covered_label}")
     lines.append(f"Mac Claude transcripts: {status.get('mac_claude', 'out')}")
     lines.extend(_report_rows(selected))
@@ -937,8 +939,8 @@ def scan(state_dir: Path, claude_root: Path, codex_root: Path,
     return "\n".join((
         f"Scanned {len(calls)} calls from {candidate_count} candidate files; read {bytes_read} transcript and timing bytes; saved {len(episodes)} episodes at 300 s and 900 s in {time.monotonic()-started:.1f} s.",
         mac_line,
-        f"Claude MCP baseline Sep 9 PDT to 2026-10-06T16:35Z, 300 s: n={len(baseline)} total_h={sum(episode.minutes for episode in baseline)/60:.2f}",
-        f"Full by hand Sep 9 PDT to 2026-10-06T16:35Z, 300 s: n={len(full)} total_h={sum(episode.minutes for episode in full)/60:.2f}",
+        f"Claude MCP baseline {_user_time(window_start)} to {_user_time(rollout)}, 300 s: n={len(baseline)} total_h={sum(episode.minutes for episode in baseline)/60:.2f}",
+        f"Full by hand {_user_time(window_start)} to {_user_time(rollout)}, 300 s: n={len(full)} total_h={sum(episode.minutes for episode in full)/60:.2f}",
     ))
 
 
@@ -957,7 +959,7 @@ def scan_hourly(state_dir: Path | None = None, now: datetime | None = None) -> s
                 if previous.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0) == (
                     stamp.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
                 ):
-                    return f"Screenshot scan skipped: already ran this UTC hour at {_pacific(previous)}"
+                    return f"Screenshot scan skipped: already ran this UTC hour at {_user_time(previous)}"
             except ValueError:
                 pass
         result = scan(state_dir, CLAUDE_ROOT, CODEX_ROOT, AvailableTimingSource(TIMINGS_PATH, "natedev"), True)

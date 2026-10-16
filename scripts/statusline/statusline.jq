@@ -4,12 +4,54 @@
 # sessions -- so process count is the thing to minimise. The shell version it
 # replaced spawned seven processes per refresh (sh, cat, four jq, basename) and
 # was the second largest source of short-lived processes on this machine, behind
-# only cargo-tile. This is sh plus jq: two.
+# only cargo-tile. statusline.sh reads its inputs with builtins and execs this:
+# one process.
 #
-# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" -f statusline.jq
-# Input:      the status line JSON on stdin.
-# Output:     Line 1: "<machine> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
-#             Line 2, when present: "5-hour <N>% left | weekly <M>% left"
+# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
+#                --arg showrunner "<session JSON>" --slurpfile labels <by-label.json>
+#                --rawfile colors <statusline.conf> -f statusline.jq
+# Input:      the status line JSON on stdin; labels, showrunner, showrunners and
+#             colors are optional; /dev/null stands in for missing input files.
+#             Empty or damaged showrunner text leaves the unit director unnamed.
+# Output:     Line 1: "<role> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
+#             A unit director's role reads "unit director for <showrunner name>"
+#             when the live showrunner record has a name.
+#             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
+#             each " until ..." only when its window carries a reset time.
+#             ANSI colors wrap the role, account, tokens and percentages only.
+
+def trim: gsub("^\\s+|\\s+$"; "");
+
+# Parse once per render. Values remain text until their field validates them.
+def color_config:
+  reduce (split("\n")[] | (split("#")[0] // "") | trim
+          | select(. != "") | index("=") as $equals
+          | select($equals != null)
+          | {key: (.[:$equals] | trim), value: (.[$equals + 1:] | trim)}) as $entry
+    ({}; .[$entry.key] = $entry.value);
+
+def color($config; $key):
+  . as $text
+  | ({black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35,
+      cyan: 36, white: 37, "bright-black": 90, "bright-red": 91,
+      "bright-green": 92, "bright-yellow": 93, "bright-blue": 94,
+      "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97,
+      orange: "38;5;208", purple: "38;5;141", pink: "38;5;211",
+      teal: "38;5;30", brown: "38;5;137"}
+     [($config[$key] // "")]) as $code
+  | if $code == null then $text else "\u001b[\($code)m\($text)\u001b[0m" end;
+
+def level_color($config; $family; $value):
+  (try ($config[$family + ".warn"] | tonumber
+        | if isfinite and (isnan | not) then . else null end) catch null) as $warn
+  | (try ($config[$family + ".alarm"] | tonumber
+          | if isfinite and (isnan | not) then . else null end) catch null) as $alarm
+  | if ($warn | type) != "number" or ($alarm | type) != "number" then .
+    else color($config; "level." +
+      (if (if $family == "tokens" then $value >= $alarm else $value <= $alarm end) then "alarm"
+       elif (if $family == "tokens" then $value >= $warn else $value <= $warn end) then "warn"
+       else "ok" end))
+    end;
 
 # Thousands separators, matching `printf "%'d"` under en_US: walk the digits
 # from the right and insert a comma (codepoint 44) before every third one. The
@@ -19,10 +61,21 @@ def commas: tostring | explode | reverse | to_entries
   | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
   | flatten | reverse | implode;
 
-# The machine's ssh name, told apart by platform as the shell prompt does
-# (modules/common/shell.nix in the nixos repo). macOS keeps homes under /Users;
-# reading $ENV costs no process.
-def machine: if ($ENV.HOME // "" | startswith("/Users/")) then "mac" else "natedev" end;
+# The part this session plays, from the signals the production scripts use
+# (shutdown's session kinds, docs/as-built/shutdown-and-restart.md), first match wins.
+# showrunner:    its session id is one a showrunner update timer targets.
+# worker:        agent_bg.sh hands a delegate worker PLAN_DELEGATE_TEAM_ROLE through
+#                --settings. It comes before unit director because a background
+#                session inherits the daemon's environment, and a daemon a unit
+#                director started carries SHOWRUNNER_UNIT.
+# unit director: add_unit.py launches the unit director's tmux session with SHOWRUNNER_UNIT.
+def role:
+  (.session_id // "") as $id
+  | if $id != "" and ($ARGS.named.showrunners // "" | split(" ") | any(. == $id)) then "showrunner"
+    elif ($ENV.PLAN_DELEGATE_TEAM_ROLE // "") != "" then "worker"
+    elif ($ENV.SHOWRUNNER_UNIT // "") != "" then "unit director"
+    else "unassigned"
+    end;
 
 def remaining($window):
   ($window.used_percentage? // null) as $used
@@ -32,7 +85,56 @@ def remaining($window):
     else empty
     end;
 
-($ARGS.named.account // "") as $account
+# 00:00 UTC on the $n-th Sunday of $month (0-based) in $year, as epoch seconds.
+def nth_sunday($year; $month; $n):
+  ([$year, $month, 1, 0, 0, 0, 0, 0] | mktime) as $first
+  | $first + ((7 - ($first | gmtime | .[6])) % 7 + 7 * ($n - 1)) * 86400;
+
+# Epoch seconds as wall-clock time in the user's zone, formatted by strftime
+# $fmt and followed by the zone's abbreviation. The zone is America/New_York,
+# from config/user_zone.conf, written out here: jq cannot read that file unless
+# statusline.sh passes it in, and strflocaltime would use the
+# machine's zone, which is Pacific on the Mac. EDT runs from 02:00 EST on the
+# second Sunday in March (07:00 UTC) to 02:00 EDT on the first Sunday in
+# November (06:00 UTC).
+def user_time($fmt):
+  . as $t
+  | ($t | gmtime | .[0]) as $year
+  | ($t >= nth_sunday($year; 2; 2) + 7 * 3600
+     and $t < nth_sunday($year; 10; 1) + 6 * 3600) as $dst
+  | ($t + (if $dst then -4 else -5 end) * 3600 | gmtime | strftime($fmt))
+    + (if $dst then " EDT" else " EST" end);
+
+# The window as agent_notes last read it for this session's account label
+# (~/.local/state/agent-notes/by-label.json), which is the number the quota
+# alerts use. The response's own figure is a different counter and lags it.
+# That reading stands only while it is under 10 minutes old and its window has
+# not reset; otherwise the response's figure does, so the line never goes blank.
+def window($name; $live):
+  (($ARGS.named.labels // [])[0] // {} | .[(($ARGS.named.account // "") | gsub(" "; ""))] // {} | .[$name] // null) as $stored
+  | if ($stored | type) == "object"
+       and ($stored.at | type) == "number" and (now - $stored.at) <= 600
+       and (($stored.resets_at | type) != "number" or $stored.resets_at > now)
+       and ($stored.left | type) == "number"
+    then {used_percentage: (100 - $stored.left), resets_at: $stored.resets_at}
+    else $live
+    end;
+
+# "<label> <N>% left", then " until <reset time>" when the window carries one.
+def usage($config; $label; $window; $fmt):
+  remaining($window) as $left
+  | ($window.resets_at? // null) as $reset
+  | $label + " " + ("\($left)% left" | level_color($config; "left"; $left))
+    + (if ($reset | type) == "number" then " until " + ($reset | user_time($fmt)) else "" end);
+
+($ARGS.named.colors // "" | color_config) as $colors
+| (if ($ARGS.named.legacy_home // "") == "1" then
+     ($ARGS.named.home_config // "" | try (fromjson | .oauthAccount.emailAddress // "") catch "") as $login
+     | if ($login | type) == "string" and $login != "" then ($ARGS.named.account // "") else "" end
+   else ($ARGS.named.account // "") end) as $account
+| ($ARGS.named.showrunner // "" | try fromjson catch null
+   | if type == "object" then .name else null end
+   | if type == "string" and . != "" then . else null end) as $showrunner_name
 | ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
 # Trailing slashes stripped first, so "/etc/nixos/" gives "nixos" and not "".
 # "/" survives that to become "", and falls back to the path itself.
@@ -41,14 +143,26 @@ def remaining($window):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
-     machine,
-     (if $account == "" then empty else $account end),
+     (role as $role
+      | (if $role == "unit director" and ($showrunner_name | type) == "string"
+            and $showrunner_name != ""
+         then $role + " for " + $showrunner_name else $role end)
+      | color($colors; "role." + ($role | gsub(" "; "-")))),
+     # A label is a note name; an address never reaches the line.
+     (if $account == "" or ($account | contains("@")) then empty
+      elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
+      else $account end | . as $label | color($colors; "account." + $label)),
      $base,
-     ((.context_window.total_input_tokens // 0) | commas),
+     (.context_window as $context
+      | (($context.total_input_tokens // 0) | commas)
+      | if ($context.context_window_size | type) == "number" and $context.context_window_size > 0
+           and ($context.total_input_tokens | type) == "number"
+        then level_color($colors; "tokens"; $context.total_input_tokens * 100 / $context.context_window_size)
+        else . end),
      $m
    ] | join(" | ")) as $first_line
 | ([
-     (remaining(.rate_limits.five_hour?) | "5-hour \(.)% left"),
-     (remaining(.rate_limits.seven_day?) | "weekly \(.)% left")
+     usage($colors; "5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
+     usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
 | $first_line + (if $second_line == "" then "" else "\n" + $second_line end)

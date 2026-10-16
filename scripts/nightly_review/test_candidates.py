@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import socket
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import candidates
 from candidates import Candidate, TimeGain, TokenGain, Unmeasured
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Eastern; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+
 
 LEDGER: str = """\
 - 2026-09-28 config: Put cargo on the job PATH — accepted, applied; from Also found: merge two hooks — accepted 2026-10-01
@@ -48,12 +58,17 @@ Denied tonight:
 @final
 class CandidatesTests(unittest.TestCase):
     root: Path = Path()
+    note: Path = Path()
 
     @override
     def setUp(self) -> None:
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        self.note = self.root / "nightly improvement list.md"
+        with contextlib.ExitStack() as environment:
+            _ = cast(object, environment.enter_context(mock.patch.dict(os.environ, {"NIGHTLY_REVIEW_NOTE": str(self.note)})))
+            self.addCleanup(environment.pop_all().close)
         patch = mock.patch.object(candidates, "ROOT", self.root)
         _ = patch.start()
         self.addCleanup(patch.stop)
@@ -115,6 +130,274 @@ class CandidatesTests(unittest.TestCase):
     def test_no_ledger_or_nothing_open_says_so(self) -> None:
         self.assertEqual(self.run_main([]), (0, "no open candidates\n", ""))
 
+    def test_printing_writes_the_table_with_read_time_and_host(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        moment = datetime(2026, 10, 12, 19, 30, 45, tzinfo=ZoneInfo("America/New_York"))
+        with (
+            mock.patch.object(candidates, "now", return_value=moment),
+            mock.patch.object(socket, "gethostname", return_value="natedev.example.org"),
+        ):
+            code, out, err = self.run_main([])
+
+        self.assertEqual((code, err), (0, ""))
+        read_line = (
+            "Read 2026-10-12 19:30 EDT from the nightly review's ledger on natedev. "
+            "The nightly review rewrites this note; edits made here are lost."
+        )
+        text = self.note.read_text(encoding="utf-8")
+        self.assertEqual(text, f"{read_line}\n\n{out}")
+        self.assertEqual(text.split("\n\n", 1)[1], out)
+        self.assertEqual(self.note.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(list(self.root.glob(".*")), [])
+
+    def test_january_read_time_uses_est(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        moment = datetime(2026, 1, 12, 19, 30, tzinfo=ZoneInfo("America/New_York"))
+        with (
+            mock.patch.object(candidates, "now", return_value=moment),
+            mock.patch.object(socket, "gethostname", return_value="macbook"),
+        ):
+            code, out, err = self.run_main([])
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            self.note.read_text(encoding="utf-8"),
+            "Read 2026-01-12 19:30 EST from the nightly review's ledger on macbook. "
+            + "The nightly review rewrites this note; edits made here are lost.\n\n" + out,
+        )
+
+    def test_ledger_with_no_open_candidates_writes_the_empty_list(self) -> None:
+        _ = (self.root / "ledger.md").write_text(
+            "- 2026-10-12 config: Earlier — accepted 2026-10-13\n", encoding="utf-8"
+        )
+        moment = datetime(2026, 10, 12, 19, 30, tzinfo=ZoneInfo("America/New_York"))
+        with (
+            mock.patch.object(candidates, "now", return_value=moment),
+            mock.patch.object(socket, "gethostname", return_value="natedev"),
+        ):
+            self.assertEqual(self.run_main([]), (0, "no open candidates\n", ""))
+
+        self.assertEqual(
+            self.note.read_text(encoding="utf-8"),
+            "Read 2026-10-12 19:30 EDT from the nightly review's ledger on natedev. "
+            + "The nightly review rewrites this note; edits made here are lost.\n\n"
+            + "no open candidates\n",
+        )
+
+    def test_record_writes_current_ledger_and_rewrites_when_nothing_is_new(self) -> None:
+        night = self.root / "2026-10-12"
+        night.mkdir()
+        report = night / "rust.md"
+        _ = report.write_text(REPORT, encoding="utf-8")
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text("- 2026-10-11 config: Earlier — proposed\n", encoding="utf-8")
+        moment = datetime(2026, 10, 12, 19, 30, tzinfo=ZoneInfo("America/New_York"))
+        with (
+            mock.patch.object(candidates, "now", return_value=moment),
+            mock.patch.object(socket, "gethostname", return_value="natedev"),
+        ):
+            code, out, err = self.run_main(["record", str(report)])
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("8 at a time", out)
+            body = candidates.table(candidates.ranked(ledger.read_text(encoding="utf-8").splitlines()))
+            expected = (
+                "Read 2026-10-12 19:30 EDT from the nightly review's ledger on natedev. "
+                + "The nightly review rewrites this note; edits made here are lost.\n\n"
+                + body + "\n"
+            )
+            self.assertEqual(self.note.read_text(encoding="utf-8"), expected)
+            _ = self.note.write_text("old copy\n", encoding="utf-8")
+            self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
+            self.assertEqual(self.note.read_text(encoding="utf-8"), expected)
+
+    def test_record_with_no_new_or_open_candidates_writes_the_empty_list(self) -> None:
+        night = self.root / "2026-10-12"
+        night.mkdir()
+        report = night / "config.md"
+        _ = report.write_text("# Earlier\n**Target:** config\n", encoding="utf-8")
+        _ = (self.root / "ledger.md").write_text(
+            "- 2026-10-12 config: Earlier — accepted 2026-10-13\n", encoding="utf-8"
+        )
+
+        self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
+        self.assertEqual(self.note.read_text(encoding="utf-8").split("\n\n", 1)[1], "no open candidates\n")
+
+    def test_missing_note_folder_is_not_created(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        note = self.root / "missing" / "nightly.md"
+        with mock.patch.dict(os.environ, {"NIGHTLY_REVIEW_NOTE": str(note)}):
+            code, out, err = self.run_main([])
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(out.startswith("| Pick |"))
+        self.assertFalse(note.parent.exists())
+
+    def test_missing_ledger_keeps_an_existing_note(self) -> None:
+        _ = self.note.write_text("table from another machine\n", encoding="utf-8")
+
+        self.assertEqual(self.run_main([]), (0, "no open candidates\n", ""))
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "table from another machine\n")
+
+    def test_note_path_reads_current_environment_and_expands_home(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        alternate = self.root / "alternate.md"
+        with (
+            mock.patch.dict(os.environ, {"NIGHTLY_REVIEW_NOTE": "~/alternate.md"}),
+            mock.patch.object(Path, "expanduser", autospec=True, return_value=alternate) as expand_home,
+        ):
+            code, out, err = self.run_main([])
+
+        self.assertEqual((code, err), (0, ""))
+        expand_home.assert_called_once_with(Path("~/alternate.md"))
+        self.assertEqual(alternate.read_text(encoding="utf-8").split("\n\n", 1)[1], out)
+        self.assertFalse(self.note.exists())
+
+    def test_empty_or_unset_note_path_uses_the_default_under_a_temporary_home(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        default = self.root / "rust" / "hanadocs" / "nightly improvement list.md"
+        default.parent.mkdir(parents=True)
+        for value in ("", None):
+            with self.subTest(value=value), mock.patch.dict(os.environ), mock.patch.object(Path, "home", return_value=self.root):
+                if value is None:
+                    del os.environ["NIGHTLY_REVIEW_NOTE"]
+                else:
+                    os.environ["NIGHTLY_REVIEW_NOTE"] = value
+                code, out, err = self.run_main([])
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(default.read_text(encoding="utf-8").split("\n\n", 1)[1], out)
+                default.unlink()
+        self.assertFalse(self.note.exists())
+
+    def test_record_creates_ledger_and_note_when_neither_exists(self) -> None:
+        night = self.root / "2026-10-12"
+        night.mkdir()
+        report = night / "config.md"
+        _ = report.write_text("# New item\n**Target:** config\n", encoding="utf-8")
+
+        self.assertEqual(
+            self.run_main(["record", str(report)]),
+            (0, "- 2026-10-12 config: New item — proposed\n", ""),
+        )
+        body = self.note.read_text(encoding="utf-8").split("\n\n", 1)[1]
+        self.assertEqual(
+            body,
+            "| Pick | Night | Area | Candidate | Gain per week | State |\n"
+            + "| --- | --- | --- | --- | --- | --- |\n"
+            + "|  | 2026-10-12 | config | New item |  | proposed |\n",
+        )
+
+    def test_record_skips_missing_note_folder_after_updating_ledger(self) -> None:
+        night = self.root / "2026-10-12"
+        night.mkdir()
+        report = night / "config.md"
+        _ = report.write_text("# New item\n**Target:** config\n", encoding="utf-8")
+        note = self.root / "missing" / "nightly.md"
+        with mock.patch.dict(os.environ, {"NIGHTLY_REVIEW_NOTE": str(note)}):
+            code, out, err = self.run_main(["record", str(report)])
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual((self.root / "ledger.md").read_text(encoding="utf-8"), out)
+        self.assertFalse(note.parent.exists())
+
+    def test_folder_check_failure_keeps_printed_table_and_success(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        error = PermissionError("folder unavailable")
+        with mock.patch.object(Path, "is_dir", autospec=True, side_effect=error) as folder_check:
+            code, out, err = self.run_main([])
+
+        folder_check.assert_called_once_with(self.note.parent)
+        self.assertEqual((code, out), (0, candidates.table(candidates.ranked(LEDGER.splitlines())) + "\n"))
+        self.assertEqual(err, f"candidates: cannot write {self.note}: {error}\n")
+        self.assertFalse(self.note.exists())
+        self.assertEqual(list(self.root.glob(".*")), [])
+
+    def test_ledger_check_failure_keeps_printed_table_and_success(self) -> None:
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text(LEDGER, encoding="utf-8")
+        error = OSError("ledger check unavailable")
+        with mock.patch.object(Path, "is_file", autospec=True, side_effect=error) as ledger_check:
+            code, out, err = self.run_main([])
+
+        ledger_check.assert_called_once_with(ledger)
+        self.assertEqual((code, out), (0, candidates.table(candidates.ranked(LEDGER.splitlines())) + "\n"))
+        self.assertEqual(err, f"candidates: cannot write {self.note}: {error}\n")
+        self.assertFalse(self.note.exists())
+        self.assertEqual(list(self.root.glob(".*")), [])
+
+    def test_hostname_failure_keeps_printed_table_and_success(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        error = OSError("hostname unavailable")
+        with mock.patch.object(socket, "gethostname", side_effect=error) as hostname:
+            code, out, err = self.run_main([])
+
+        hostname.assert_called_once_with()
+        self.assertEqual((code, out), (0, candidates.table(candidates.ranked(LEDGER.splitlines())) + "\n"))
+        self.assertEqual(err, f"candidates: cannot write {self.note}: {error}\n")
+        self.assertFalse(self.note.exists())
+        self.assertEqual(list(self.root.glob(".*")), [])
+
+    def test_hostname_failure_keeps_record_lines_and_success(self) -> None:
+        night = self.root / "2026-10-12"
+        night.mkdir()
+        report = night / "config.md"
+        _ = report.write_text("# New item\n**Target:** config\n", encoding="utf-8")
+        line = "- 2026-10-12 config: New item — proposed\n"
+        error = OSError("hostname unavailable")
+        for expected in (line, "nothing new to record\n"):
+            with self.subTest(expected=expected):
+                with mock.patch.object(socket, "gethostname", side_effect=error) as hostname:
+                    code, out, err = self.run_main(["record", str(report)])
+
+                hostname.assert_called_once_with()
+                self.assertEqual((code, out), (0, expected))
+                self.assertEqual(err, f"candidates: cannot write {self.note}: {error}\n")
+                self.assertEqual((self.root / "ledger.md").read_text(encoding="utf-8"), line)
+                self.assertFalse(self.note.exists())
+                self.assertEqual(list(self.root.glob(".*")), [])
+
+    def test_failed_note_write_keeps_success_and_removes_temporary_file(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        self.note.mkdir()
+
+        code, out, err = self.run_main([])
+
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("| Pick |"))
+        self.assertTrue(err.startswith(f"candidates: cannot write {self.note}: "))
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertTrue(self.note.is_dir())
+        self.assertEqual(list(self.root.glob(".*")), [])
+
+    def test_failed_note_write_keeps_record_success_with_and_without_new_lines(self) -> None:
+        night = self.root / "2026-10-12"
+        night.mkdir()
+        report = night / "config.md"
+        _ = report.write_text("# New item\n**Target:** config\n", encoding="utf-8")
+        self.note.mkdir()
+        for expected in ("- 2026-10-12 config: New item — proposed\n", "nothing new to record\n"):
+            with self.subTest(expected=expected):
+                code, out, err = self.run_main(["record", str(report)])
+                self.assertEqual((code, out), (0, expected))
+                self.assertTrue(err.startswith(f"candidates: cannot write {self.note}: "))
+                self.assertEqual(len(err.splitlines()), 1)
+                self.assertEqual(list(self.root.glob(".*")), [])
+        self.assertEqual(
+            (self.root / "ledger.md").read_text(encoding="utf-8"),
+            "- 2026-10-12 config: New item — proposed\n",
+        )
+
+    def test_refused_report_and_usage_error_keep_an_existing_note(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        _ = self.note.write_text("previous copy\n", encoding="utf-8")
+        report = self.root / "config.md"
+        _ = report.write_text("No report title or target.\n", encoding="utf-8")
+        for arguments, expected_code in ((["record", str(report)], 1), (["rank"], 2)):
+            with self.subTest(arguments=arguments):
+                code, out, err = self.run_main(arguments)
+                self.assertEqual((code, out), (expected_code, ""))
+                self.assertTrue(err)
+                self.assertEqual(self.note.read_text(encoding="utf-8"), "previous copy\n")
+
     def test_record_adds_the_proposal_and_each_smaller_item_once(self) -> None:
         night = self.root / "2026-10-12"
         night.mkdir()
@@ -163,11 +446,13 @@ class CandidatesTests(unittest.TestCase):
         self.assertEqual((code, out), (1, ""))
         self.assertIn("to record", err)
         self.assertFalse((self.root / "ledger.md").exists())
+        self.assertFalse(self.note.exists())
 
     def test_main_rejects_other_arguments(self) -> None:
         code, _, err = self.run_main(["rank", "everything"])
         self.assertEqual(code, 2)
         self.assertIn("usage: candidates.py", err)
+        self.assertFalse(self.note.exists())
 
 
 if __name__ == "__main__":

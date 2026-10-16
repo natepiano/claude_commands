@@ -7,30 +7,30 @@ Read at the point of use from `/unit:direct`. Defines `<FinalGateCommit/>`,
 
 <FinalGateCommit>
 Loop and verbose only, at most once per run, after <FinalGate/> is green. It
-commits what the gate itself produced — the style cleanup from step 4 and any
-synthetic-final repairs — so the run leaves no uncommitted work behind.
+commits synthetic-final repairs and source-comment edits left by the last
+phase review, so the run leaves no uncommitted work behind.
 
 1. With no changes in `git status --short`, skip it silently.
-2. Confirm the changed paths are only the ones the gate touched: the
-   before/after snapshots in <RunProjectStyleReview/> plus the synthetic phase's
-   own baseline name them, plus any source-comment edit the last phase's plan
+2. Confirm the changed paths are only the repairs named by the synthetic
+   phase's baseline and any source-comment edit the last phase's plan
    review left in the tree (`~/.claude/docs/delegate/phase_end.md` →
    <PhaseEnd/> step 3). Anything else stays uncommitted and is reported
    instead; never sweep an unrelated path into this commit.
-3. Run `verify.sh fmt <package>` for every touched package and include the
-   result.
+3. The repair workers' `lint` covers formatting; do not repeat it here.
 4. Stage those paths and commit exactly once:
 
    ```
    checkpoint(<plan-slug>): final gate
 
-   <what the style pass and any final repairs changed>
+   <what the closing repairs changed>
 
+   Change-Review: none — <why nothing visible changes>, or one `<change> | <how to check>` line each
    Claude-Session: <session url>
    ```
 
-   Keep the `checkpoint(<plan-slug>)` subject: <ResolveStyleDiffBase/> reads it
-   to place a later run's diff base.
+   Its `Change-Review:` lines follow <CheckpointCommit/>
+   (`commands/unit/checkpoint.md`) step 6.
+
 5. This commit holds no phase reservation, so it invokes no drift check and no
    release. Run <PushCheckpoint/> (`commands/unit/checkpoint.md`), then
    report `Final gate <short hash> — style review and closing repairs.` with its
@@ -57,6 +57,19 @@ the user, so it needs no gate here. It changes no code and commits nothing itsel
 <AsBuiltCommit/> after it and leave the run's tree clean. Carry both reports into
 <RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
 commit.
+
+When the plan header carries a `> **Issues:**` line, note its issue paths
+before `/plan:to_as_built` runs, since it deletes the plan. Once the as-built
+doc is written, close each issue:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/proposal_issue.py close <issue> --as-built <doc>
+```
+
+`<doc>` is the as-built doc's repo-relative path, e.g.
+`docs/hana/as-built/<file>.md`; under `amend`, the doc the work was folded
+into. The issues live in the hanadocs vault, outside this worktree, so
+<AsBuiltCommit/> never sees them.
 
 Correcting an as-built doc under `docs/as-built/` that contradicts the code is
 always allowed in this pass, in any unit's doc, without asking the user, the
@@ -89,9 +102,8 @@ this and reports the doc edits as uncommitted.
    Claude-Session: <session url>
    ```
 
-   The subject is deliberately not `checkpoint(<plan-slug>)`. This commit carries
-   no phase, and a later run resolving its diff base scans for checkpoint
-   subjects — it must not find this one among them.
+   This documentation commit carries no phase and is excluded from
+   <PeriodicCI/>'s checkpoint count.
 4. This commit holds no phase reservation, so it invokes no drift check and no
    release. Run <PushCheckpoint/>, then report `As-built <short hash> — <n>
    docs.` with its push note, if any.

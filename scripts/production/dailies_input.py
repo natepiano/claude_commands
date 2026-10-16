@@ -13,20 +13,42 @@ from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
+import showrunners
 import unit_lookup
-from add_unit import Refusal, cell_value, live_unit_table, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, live_unit_table, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
-from dailies_render import (InputError, StateRefused, as_list, as_map, check_render_state,
-                            local_now, parse_range_end, parse_report, parse_time)
+from dailies_render import (LENGTHS, InputError, StateRefused, as_list, as_map, check_render_state, due, last_report,
+                            local_now, parse_child_report, parse_range_end, parse_report, parse_time,
+                            read_outstanding)
 from merge_checkpoint import NoMerge, git, merge_branch_history
-from update_registration import RegistrationFailure, UpdatesOnDemand, update_schedule
+from update_registration import RegistrationFailure, UpdatesOnDemand, outstanding_file, update_schedule
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from build_hold import ActiveHolders, read_holders
+import override_guard
 
 JsonMap = dict[str, object]
+LAST_REPORT = "dailies_last.json"
+EXPAND_ALL = "all"
+
+
+class OpenBevyUpgradeWatch(NamedTuple):
+    update: str
+    needs_user: bool
+
+
+class NoOpenBevyUpgradeWatch(NamedTuple):
+    pass
+
+
+class BevyUpgradeUnavailable(NamedTuple):
+    reason: str
+
+
+BevyUpgradeWatch = OpenBevyUpgradeWatch | NoOpenBevyUpgradeWatch | BevyUpgradeUnavailable
 
 
 class SessionGone(NamedTuple):
@@ -195,16 +217,11 @@ class PhaseTablesUnavailable(NamedTuple):
 
 class PhaseTablesAvailable(NamedTuple):
     units: dict[str, UnitPhaseState]
+    # Waiting phases whose dependencies are all done, by unit.
+    could_start: dict[str, tuple[str, ...]]
 
 
 PhaseTablesState = PhaseTablesUnavailable | PhaseTablesAvailable
-
-
-class PhaseTablesPruned(NamedTuple):
-    pass
-
-
-PrunePhaseTablesState = PhaseTablesPruned | PhaseTablesUnavailable
 
 
 class JudgmentNumberedPlanPhase(NamedTuple):
@@ -236,6 +253,41 @@ class DailiesFailure(Exception):
 
 def report(step: str, state: str, detail: str) -> None:
     print(f"{step}: {state} — {detail.replace(chr(10), '; ')}", flush=True)
+
+
+def bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch:
+    script = os.environ.get("DAILIES_BEVY_UPGRADE", str(
+        Path(__file__).resolve().parent.parent / "bevy_upgrade/bevy_upgrade.py"))
+    try:
+        result = subprocess.run([sys.executable, script, "--production", str(production.doc),
+                                 "line", "--json"], capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired as error:
+        stderr = error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr
+        return BevyUpgradeUnavailable(stderr.strip().splitlines()[0] if stderr and stderr.strip()
+                                      else "timed out after 30 seconds")
+    except OSError as error:
+        return BevyUpgradeUnavailable(str(error))
+    if result.returncode:
+        return BevyUpgradeUnavailable(result.stderr.strip().splitlines()[0] if result.stderr.strip()
+                                      else f"command exited {result.returncode}")
+    if not result.stdout.strip():
+        return NoOpenBevyUpgradeWatch()
+    try:
+        raw = cast(object, json.loads(result.stdout))
+        fields = cast(JsonMap, raw) if isinstance(raw, dict) else {}
+        update, needs_user = fields.get("update"), fields.get("needs_user")
+        if (not isinstance(update, str) or not update.strip() or "\n" in update or "\r" in update
+                or not isinstance(needs_user, bool)):
+            raise ValueError("expected an object with update text and needs_user boolean")
+    except ValueError as error:
+        return BevyUpgradeUnavailable(result.stderr.strip().splitlines()[0] if result.stderr.strip()
+                                      else str(error))
+    return OpenBevyUpgradeWatch(update, needs_user)
+
+
+def bounded_bevy_update(text: str) -> str:
+    limit = min(limit for limit in LENGTHS.values() if limit is not None)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
@@ -514,19 +566,22 @@ def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
     try:
         raw = cast(object, json.loads(result.stdout))
         fields = as_map(raw, "phase tables")
-        return PhaseTablesAvailable({
-            unit: unit_phase_state(value, f"phase tables.{unit}", zone)
-            for unit, value in fields.items()
-        })
+        return PhaseTablesAvailable(
+            {unit: unit_phase_state(value, f"phase tables.{unit}", zone) for unit, value in fields.items()},
+            {unit: could_start(value, f"phase tables.{unit}") for unit, value in fields.items()},
+        )
     except (InputError, ValueError, json.JSONDecodeError) as error:
         return PhaseTablesUnavailable(str(error))
 
 
-def prune_phase_tables(production_doc: Path) -> PrunePhaseTablesState:
-    result = command(phase_table_path(), "prune", "--production-doc", str(production_doc))
-    if result.returncode:
-        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
-    return PhaseTablesPruned()
+def could_start(value: object, where: str) -> tuple[str, ...]:
+    parallel = as_map(value, where).get("parallel")
+    if parallel is None:
+        return ()
+    phases = as_list(as_map(parallel, f"{where}.parallel").get("could_start"), f"{where}.parallel.could_start")
+    if not all(isinstance(phase, str) for phase in phases):
+        raise ValueError(f"{where}.parallel.could_start: expected phase ids")
+    return tuple(cast(list[str], phases))
 
 
 def judgment_phase_number(text: str) -> JudgmentPlanPhase:
@@ -694,6 +749,48 @@ def next_due(output: str, now: datetime, zone: ZoneInfo) -> str:
     return due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
 
 
+def last_report_path(slug: str) -> Path:
+    """Where a production saves what the showrunner above it shows of it."""
+    return showrunners.SHOWRUNNER_STATE_DIR / slug / LAST_REPORT
+
+
+def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> JsonMap:
+    """One production directly below this one: its saved report, and what waits on the user in it and below it."""
+    fields: JsonMap = {"name": child, "expand": expand}
+    path = last_report_path(child)
+    try:
+        saved = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        _ = parse_child_report(saved, str(path), zone)
+    except FileNotFoundError:
+        pass
+    except (InputError, OSError, ValueError) as error:
+        # A saved report that cannot be used costs the row its numbers, never the parent its report.
+        report("children", "unavailable", f"{child}: {error}")
+    else:
+        fields["report"] = saved
+    waiting = 0
+    unreadable: list[str] = []
+    for slug in (child, *showrunners.descendants_of(child)):
+        try:
+            waiting += len(due(read_outstanding(outstanding_file(slug)), now))
+        except (InputError, OSError, ValueError):
+            unreadable.append(slug)
+    fields["open"] = waiting
+    if unreadable:
+        fields["unreadable"] = unreadable
+    return fields
+
+
+def save_last_report(slug: str, saved: JsonMap) -> Path:
+    path = last_report_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside the file and renamed, so the showrunner above never reads half of one.
+    scratch = path.with_name(f".{path.name}.{os.getpid()}")
+    _ = scratch.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+    _ = scratch.replace(path)
+    return path
+
+
 def validate_report(result: JsonMap, holders_path: Path, judgment_path: Path) -> None:
     previous_holders = os.environ.get("BUILD_HOLD_DIR")
     os.environ["BUILD_HOLD_DIR"] = str(holders_path)
@@ -721,10 +818,8 @@ def run(args: argparse.Namespace) -> int:
     user_run = cast(bool, args.user_run)
     at = cast(str | None, args.at)
     render_state = cast(Path, args.render_state)
+    expand = cast(list[str], args.expand)
     production = read_production(production_path)
-    prune_failure = prune_phase_tables(production.doc)
-    if isinstance(prune_failure, PhaseTablesUnavailable):
-        report("phase tables", "unavailable", prune_failure.reason)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug)
@@ -744,6 +839,10 @@ def run(args: argparse.Namespace) -> int:
         units = tuple(unit for unit in units if unit.name not in finished)
         blocks = tuple(block for block in blocks if block.session not in finished)
         report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
+    if isinstance(table_state, PhaseTablesAvailable):
+        for unit in units:
+            for phase in table_state.could_start.get(unit.name, ()):
+                print(f"parallel check: {unit.name}: Phase {phase} could start")
     for block in blocks:
         first: list[str] = []
         if isinstance(block.state, SessionGone):
@@ -784,10 +883,13 @@ def run(args: argparse.Namespace) -> int:
         fields = by_session.get(unit.name, {})
         result = dict(fields)
         result["unit"] = unit.name
-        if "build_hold" in result:
-            raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].build_hold: supplied by holder files")
-        if holder_names and unit.session not in holder_names and unit.name not in holder_names:
-            result["build_hold"] = True
+        for key in ("build_hold", "holds_builds"):
+            if key in result:
+                raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].{key}: supplied by holder files")
+        # A holder is named by its session, which the renderer never sees: its own unit is marked as holding.
+        if holder_names:
+            holds = unit.session in holder_names or unit.name in holder_names
+            result["holds_builds" if holds else "build_hold"] = True
         if "needs_user" not in result and any(isinstance(flag, WAITS_ON_USER) for flag in block.flags):
             result["needs_user"] = True
         phase = fields.get("phase")
@@ -845,8 +947,6 @@ def run(args: argparse.Namespace) -> int:
         units_out.append(result)
     if missing:
         raise DailiesFailure("judgment", f"{judgment_path}: " + "; ".join(missing))
-    if bool(holder_names) != any(bool(unit.get("build_hold")) for unit in units_out):
-        raise DailiesFailure("build hold", "units.build_hold: holder files and unit markers disagree")
     report("build hold", "ok", f"{len(holder_names)} active holders checked")
     try:
         review = review_watch(production, state_dir)
@@ -861,6 +961,16 @@ def run(args: argparse.Namespace) -> int:
     report("review watch", "ok", review_line or "no open review watch")
     if isinstance(review, WatchFirstAlert):
         print(review.table)
+    upgrade = bevy_upgrade_watch(production)
+    if isinstance(upgrade, NoOpenBevyUpgradeWatch):
+        report("bevy upgrade", "ok", "no open watch")
+    else:
+        update = bounded_bevy_update(upgrade.update if isinstance(upgrade, OpenBevyUpgradeWatch)
+                                     else f"the record could not be read: {upgrade.reason}")
+        topics_out.append({"title": "Bevy upgrade", "update": update,
+                           "eta": "no ETA stated yet",
+                           "needs_user": isinstance(upgrade, OpenBevyUpgradeWatch) and upgrade.needs_user})
+        report("bevy upgrade", "ok" if isinstance(upgrade, OpenBevyUpgradeWatch) else "unavailable", update)
     history = merge_branch_history(production.checkout, production.merge_branch)
     last = history.last_merge()
     local = git(production.checkout, "rev-parse", production.merge_branch)
@@ -881,6 +991,19 @@ def run(args: argparse.Namespace) -> int:
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    root = showrunners.place_of(production.slug).root
+    if root:
+        result["reports_to"] = root
+    children = showrunners.children_of(production.slug)
+    strangers = [name for name in expand if name != EXPAND_ALL and name not in children]
+    if strangers:
+        raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.slug}; "
+                             + (f"choose from {', '.join(children)} or {EXPAND_ALL}" if children
+                                else "no production reports to it"))
+    if children:
+        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand)
+                              for child in children]
+        report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
     try:
         counts = production_counts(production.slug)
@@ -900,10 +1023,10 @@ def run(args: argparse.Namespace) -> int:
         with production.log.open("a", encoding="utf-8"):
             pass
     try:
-        on_demand = isinstance(update_schedule(lines), UpdatesOnDemand)
+        schedule = update_schedule(lines)
     except RegistrationFailure as failure:
         raise DailiesFailure("clock", str(failure)) from failure
-    if on_demand:
+    if isinstance(schedule, UpdatesOnDemand):
         # No schedule runs, so there is no clock to restart and the report names no next run.
         report("clock", "ok", "on demand: no scheduled dailies")
     else:
@@ -940,10 +1063,19 @@ def run(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     _ = out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     report("input", "ok", f"wrote {out}")
+    # What the showrunner above this one shows of it. Failing to save it never costs this report.
+    interval = None if isinstance(schedule, UpdatesOnDemand) else schedule.minutes
+    try:
+        saved_at = save_last_report(production.slug, last_report(result, render_state, at, interval))
+    except (InputError, OSError) as error:
+        report("saved report", "unavailable", str(error))
+    else:
+        report("saved report", "ok", f"wrote {saved_at}")
     return 0
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "production/dailies_input.py")
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("production", "status", "judgment", "state-dir", "out"):
         _ = parser.add_argument(f"--{name}", required=True, type=Path)
@@ -953,6 +1085,8 @@ def main() -> int:
     _ = parser.add_argument("--render-state", required=True, type=Path)
     _ = parser.add_argument("--at")
     _ = parser.add_argument("--user-run", action="store_true")
+    _ = parser.add_argument("--expand", action="append", default=[], metavar="CHILD",
+                            help=f"also print this lower production's own rows; `{EXPAND_ALL}` for every one")
     args = parser.parse_args()
     try:
         return run(args)

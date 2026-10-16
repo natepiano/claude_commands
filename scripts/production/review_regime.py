@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Track whether the extra review seats pay for themselves.
+"""Track whether the extra review workers pay for themselves.
 
 Usage:
-  review_regime.py add --unit <unit> --phase <N> --regime before|trial|after
+  review_regime.py add --unit <unit> --plan <plan path> --phase <N> --regime before|trial|after
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
                        [--ux-check-minutes <U>] [--ux-repair-minutes <R>]
@@ -19,7 +19,7 @@ a phase started after that is `after`. The showrunner adds one row per merged
 phase; `report` compares the phases before, under and after the trial:
 
 - better: fewer holds at merge and fewer defects found by the merge design check;
-- cost: longer phases (start to merge) and more review-seat minutes.
+- cost: longer phases (start to merge) and more review-worker minutes.
 
 From 2026-10-07, the code number is every code finding the phase's review
 raised; before that it was the code-quality reviewer's alone.
@@ -61,6 +61,8 @@ NO_VISIBLE_CHANGE = "no visible change"
 @dataclass(frozen=True)
 class Row:
     unit: str
+    # The unit's plan as its production doc names it; None on a row written before 2026-10-12.
+    plan: str | None
     phase: str
     regime: str
     started: str
@@ -97,9 +99,11 @@ def read_rows() -> list[Row]:
         repair_minutes = record.get("ux_repair_minutes")
         note = record.get("note")
         excluded = record.get("excluded")
+        plan = record.get("plan")
         rows.append(
             Row(
                 unit=str(record["unit"]),
+                plan=plan if isinstance(plan, str) else None,
                 phase=str(record["phase"]),
                 regime=str(record["regime"]),
                 started=str(record["started"]),
@@ -131,6 +135,7 @@ def add(arguments: argparse.Namespace) -> None:
         excluded = NO_VISIBLE_CHANGE
     row = Row(
         unit=cast(str, arguments.unit),
+        plan=cast(str, arguments.plan),
         phase=cast(str, arguments.phase),
         regime=cast(str, arguments.regime),
         started=started,
@@ -147,8 +152,9 @@ def add(arguments: argparse.Namespace) -> None:
     )
     if row.hours() < 0:
         raise SystemExit("review_regime: --merged is before --started")
-    if any(existing.unit == row.unit and existing.phase == row.phase for existing in read_rows()):
-        raise SystemExit(f"review_regime: {row.unit} phase {row.phase} already has a row")
+    # A unit that runs a second plan starts again at phase 1, so the plan is part of what names a row.
+    if any((existing.unit, existing.plan, existing.phase) == (row.unit, row.plan, row.phase) for existing in read_rows()):
+        raise SystemExit(f"review_regime: {row.unit} phase {row.phase} of {row.plan} already has a row")
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a") as ledger:
         _ = ledger.write(json.dumps(asdict(row)) + "\n")
@@ -176,7 +182,7 @@ def report(since: str | None) -> None:
     line("merge design-check defects per phase (mean)", lambda group: mean_of([float(row.merge_defects) for row in group]))
     line("hours, start to merge (median)", lambda group: median_of([row.hours() for row in group]))
     line(
-        "review-seat minutes per phase (mean)",
+        "review-worker minutes per phase (mean)",
         lambda group: mean_of([row.review_minutes for row in group if row.review_minutes is not None]),
     )
     line(
@@ -231,6 +237,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     adding = commands.add_parser("add")
     _ = adding.add_argument("--unit", required=True)
+    _ = adding.add_argument("--plan", required=True, help="the unit's plan, as its production doc names it")
     _ = adding.add_argument("--phase", required=True)
     _ = adding.add_argument("--regime", choices=REGIMES, required=True)
     _ = adding.add_argument("--started", required=True)

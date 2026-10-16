@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable
 from contextlib import closing
@@ -40,6 +41,7 @@ class StreamReport(TypedDict):
     compaction_records: int
     opening_records: int
     edit_records: int
+    folder_records: int
     outcome_records: int
     history_cursor_records: int
     altered_outcome_records: int
@@ -52,7 +54,7 @@ class StreamReport(TypedDict):
     altered_evidence_records: int
 
 
-StreamKind = Literal["turn", "compaction", "opening", "edit", "cursor", "other"]
+StreamKind = Literal["turn", "compaction", "opening", "edit", "folder", "cursor", "other"]
 
 
 def stream_kind(value: object) -> StreamKind:
@@ -61,7 +63,7 @@ def stream_kind(value: object) -> StreamKind:
     fields = cast(dict[str, object], value)
     for name in ("kind", "type"):
         tag = fields.get(name)
-        if tag in ("turn", "compaction", "opening", "edit", "cursor"):
+        if tag in ("turn", "compaction", "opening", "edit", "folder", "cursor"):
             return cast(StreamKind, tag)
     for child in fields.values():
         kind = stream_kind(child)
@@ -89,16 +91,23 @@ def save_stream_report(path: Path, report: StreamReport) -> None:
     _ = pending.replace(path)
 
 
+def relay_remote_errors(stream: BinaryIO) -> None:
+    errors = cast(BinaryIO, sys.stderr.buffer)
+    for line in cast(Iterable[bytes], stream):
+        _ = errors.write(line)
+        errors.flush()
+
+
 def main() -> int:
     configuration = cast(SshConfiguration, json.loads(
         Path(os.environ["USAGE_TEST_SSH_CONFIG"]).read_text(encoding="utf-8")))
-    stdin = sys.stdin.buffer.read()
+    stdin = b"" if configuration["behavior"] == "early_disconnect" else sys.stdin.buffer.read()
     output = cast(BinaryIO, sys.stdout.buffer)
     report: StreamReport = {
         "measurement_records": 0, "cursor_records": 0, "forwarded_bytes": 0,
         "stdin_bytes": len(stdin), "options": sys.argv[1:-1],
         "turn_records": 0, "compaction_records": 0,
-        "opening_records": 0, "edit_records": 0, "outcome_records": 0, "history_cursor_records": 0,
+        "opening_records": 0, "edit_records": 0, "folder_records": 0, "outcome_records": 0, "history_cursor_records": 0,
         "altered_outcome_records": 0, "altered_lifecycle_records": 0,
         "role_snapshots": [],
         "director_records": 0, "history_file_records": 0, "history_chunks": 0,
@@ -106,8 +115,16 @@ def main() -> int:
     }
     behavior = configuration["behavior"]
     try:
-        if behavior == "unreachable":
-            print("fixture SSH is unreachable", file=sys.stderr)
+        if behavior == "wait_for_release":
+            marker = Path(configuration["report"])
+            _ = marker.with_suffix(".waiting").write_bytes(b"")
+            deadline = time.monotonic() + 15
+            while not marker.with_suffix(".release").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("fixture pass was never released")
+                time.sleep(0.01)
+        if behavior in ("unreachable", "early_disconnect"):
+            print("\nfixture SSH is unreachable\nsecond fixture diagnostic", file=sys.stderr)
             return 255
         if behavior == "python_error":
             print("fixture remote Python error", file=sys.stderr)
@@ -121,11 +138,16 @@ def main() -> int:
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         with subprocess.Popen(
             ["/bin/sh", "-c", sys.argv[-1]], cwd=configuration["execution_directory"],
-            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         ) as process:
             try:
-                if process.stdin is None or process.stdout is None:
+                if process.stdin is None or process.stdout is None or process.stderr is None:
                     raise RuntimeError("fixture remote command has no stream")
+                # Carry remote stderr through this process, as SSH does: once the
+                # collector terminates it, a remote writer that outlives the
+                # connection can no longer reach the collector's diagnostics.
+                remote_errors = threading.Thread(target=relay_remote_errors, args=(process.stderr,), daemon=True)
+                remote_errors.start()
                 with process.stdin:
                     _ = process.stdin.write(stdin)
                 second_file_turns = 0
@@ -180,16 +202,22 @@ def main() -> int:
                         line = json.dumps(fields).encode("utf-8") + b"\n"
                         report["altered_outcome_records"] += 1
                     if not changed_record and ((behavior == "missing_opening_time" and kind == "opening")
-                                               or (behavior == "invalid_edit_time" and kind == "edit")):
+                                               or (behavior == "invalid_edit_time" and kind == "edit")
+                                               or (behavior in ("missing_folder", "invalid_folder") and kind == "folder")):
                         changed_record = True
                         if behavior == "missing_opening_time":
                             del fields["at"]
-                        else:
+                        elif behavior == "invalid_edit_time":
                             fields["at"] = "invalid-time"
+                        elif behavior == "missing_folder":
+                            del fields["folder"]
+                        else:
+                            fields["folder"] = []
                         line = json.dumps(fields).encode("utf-8") + b"\n"
                         report["altered_lifecycle_records"] += 1
                     if behavior in ("malformed_record", "unknown_measurement", "missing_output",
-                                    "oversized_output", "cut_inside_record") and (
+                                    "oversized_output", "cut_inside_record", "invalid_activity",
+                                    "wait_without_action", "missing_activity") and (
                             transcript_file and report["cursor_records"] == 1 and kind == "turn" and not changed_record):
                         changed_record = True
                         if behavior == "malformed_record":
@@ -201,6 +229,13 @@ def main() -> int:
                             record = cast(dict[str, object], json.loads(line))
                             if behavior == "unknown_measurement":
                                 record["kind"] = "unknown-measurement"
+                            elif behavior == "invalid_activity":
+                                record["activity"] = "napping"
+                            elif behavior == "wait_without_action":
+                                record["activity"] = "wait"
+                                record["wait_action"] = None
+                            elif behavior == "missing_activity":
+                                del record["activity"]
                             else:
                                 tokens = cast(dict[str, object], record["tokens"])
                                 if behavior == "missing_output":
@@ -209,7 +244,7 @@ def main() -> int:
                                     tokens["output"] = 2**63
                             line = json.dumps(record).encode("utf-8") + b"\n"
                     report["forwarded_bytes"] += len(line)
-                    if kind in ("turn", "compaction", "opening", "edit"):
+                    if kind in ("turn", "compaction", "opening", "edit", "folder"):
                         report["measurement_records"] += 1
                     if kind == "turn":
                         report["turn_records"] += 1
@@ -221,6 +256,8 @@ def main() -> int:
                         report["opening_records"] += 1
                     elif kind == "edit":
                         report["edit_records"] += 1
+                    elif kind == "folder":
+                        report["folder_records"] += 1
                     elif kind == "cursor":
                         if history_file:
                             report["history_cursor_records"] += 1
@@ -233,7 +270,10 @@ def main() -> int:
                         _ = output.write(line)
                         output.flush()
                     except BrokenPipeError:
-                        return 0
+                        # Python's documented SIGPIPE idiom: drop the unsent
+                        # buffer so the exit flush cannot report a broken pipe.
+                        _ = os.dup2(os.open(os.devnull, os.O_WRONLY), output.fileno())
+                        break
                     if behavior == "cut_inside_first_file" and kind == "turn":
                         report["role_snapshots"].append(observe_role_snapshot(configuration))
                         break
@@ -248,7 +288,17 @@ def main() -> int:
                     if behavior == "cut_inside_second_file" and second_file_turns == 2:
                         break
                 else:
-                    return process.wait()
+                    status = process.wait()
+                    remote_errors.join()
+                    return status
+                # Cut only the forwarded stream, also when the collector stopped
+                # reading. Closing the pipe or killing the shell now can leave its
+                # Python writer raising BrokenPipeError on stderr, hiding the
+                # collector's own diagnostic.
+                for _ in cast(Iterable[bytes], process.stdout):
+                    pass
+                _ = process.wait()
+                remote_errors.join()
             finally:
                 if process.poll() is None:
                     process.terminate()

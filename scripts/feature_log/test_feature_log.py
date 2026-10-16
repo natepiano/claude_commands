@@ -97,6 +97,11 @@ Start builds in two sessions. Both draw from the same natedev build capacity.
 """
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class CliResult(NamedTuple):
     status: int
     stdout: str
@@ -551,6 +556,7 @@ class FeatureLogTests(unittest.TestCase):
         cases = (
             ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner"),
             ("https://github.com/natepiano/bevy_brp\n", "bevy_brp"),
+            ("git@github.com:natepiano/claude_commands\n", "claude"),
             ("https://github.com/someone/unknown.git\n", "none"),
         )
         checkout = self.root / "checkout"
@@ -685,14 +691,9 @@ class FeatureLogTests(unittest.TestCase):
             ("bullet summary", self.add_arguments(summary="- not a summary"), "summary"),
             ("multiline summary", self.add_arguments(summary="first\nsecond"), "summary"),
             (
-                "production outside hana",
-                self.add_arguments(project="natedev", crates=()) + ["--production", "machine"],
-                "production",
-            ),
-            (
-                "unit outside hana",
-                self.add_arguments(project="natedev", crates=()) + ["--unit", "system"],
-                "unit",
+                "claude crate",
+                self.add_arguments(project="claude", crates=("hana",)),
+                "claude does not accept crates",
             ),
             ("empty normalized title", self.add_arguments(title="--- !!!"), "title"),
             ("long normalized title", self.add_arguments(title="a" * 51), "50"),
@@ -721,7 +722,7 @@ class FeatureLogTests(unittest.TestCase):
             title="Explicit release derivation",
             link=SHA_THREE,
             crates=("hana_lagrange",),
-        ) + ["--release", "hana_lagrange@1.2.3-alpha.1"]
+        ) + ["--backfill", "--release", "hana_lagrange@1.2.3-alpha.1"]
 
         self.assertEqual(self.cli(ordinary).status, 0)
         self.assertEqual(self.cli(backfill).status, 0)
@@ -736,7 +737,7 @@ class FeatureLogTests(unittest.TestCase):
             self.note("hana", "backfill release derivation").read_text(encoding="utf-8"),
         )
         self.assertIn(
-            "release:\n  - hana_lagrange@1.2.3-alpha.1\n  - hana_lagrange@Unreleased\n",
+            "release:\n  - hana_lagrange@1.2.3-alpha.1\n",
             self.note("hana", "explicit release derivation").read_text(encoding="utf-8"),
         )
 
@@ -751,6 +752,54 @@ class FeatureLogTests(unittest.TestCase):
         contents = self.note("hana", "released backfill").read_text(encoding="utf-8")
         self.assertIn("release:\n  - hana_lagrange@2.3.4\n", contents)
         self.assertNotIn("Unreleased", contents)
+
+    def test_add_refuses_pending_and_exact_releases_before_any_write(self) -> None:
+        for backfill, releases in (
+            (True, ["hana_lagrange@Unreleased", "hana_lagrange@1.2.3"]),
+            (True, ["hana_lagrange@1.2.3", "hana_lagrange@Unreleased"]),
+            (True, ["hana_lagrange@2.3.4", "hana_lagrange@Unreleased",
+                    "hana_lagrange@1.2.3"]),
+            (False, ["hana_lagrange@1.2.3"]),
+        ):
+            with self.subTest(backfill=backfill, releases=releases):
+                arguments = self.add_arguments(crates=("hana_lagrange",))
+                if backfill:
+                    arguments.append("--backfill")
+                arguments.extend(("--release", *releases))
+                before_vault = self.vault_snapshot()
+
+                result = self.cli(arguments)
+
+                self.assertEqual(result, CliResult(
+                    2, "", "feature_log: release cannot hold both "
+                    + "hana_lagrange@Unreleased and hana_lagrange@1.2.3\n",
+                ))
+                self.assertEqual(self.vault_snapshot(), before_vault)
+                self.assertFalse(self.note("hana", "a useful result").exists())
+                self.assertFalse((self.state / "events.jsonl").exists())
+                self.assert_no_temporary_files()
+
+    def test_release_value_errors_are_reported_before_mixed_releases(self) -> None:
+        for release, reason in (
+            ("hana_lagrange", "invalid release hana_lagrange"),
+            ("hana_lagrange@1.2", "invalid release version 1.2"),
+            ("hana@1.2.3", "release crate hana is not published"),
+            ("hana_liminal@1.2.3", "release crate hana_liminal is not in --crate"),
+        ):
+            with self.subTest(release=release):
+                arguments = self.add_arguments(crates=("hana", "hana_lagrange"))
+                arguments.extend((
+                    "--backfill", "--release", "hana_lagrange@Unreleased",
+                    "hana_lagrange@1.2.3", release,
+                ))
+                before_vault = self.vault_snapshot()
+
+                result = self.cli(arguments)
+
+                self.assertEqual(result, CliResult(2, "", f"feature_log: {reason}\n"))
+                self.assertEqual(self.vault_snapshot(), before_vault)
+                self.assertFalse((self.state / "events.jsonl").exists())
+                self.assert_no_temporary_files()
 
     def test_title_normalization_keeps_underscores_and_enforces_the_limit(self) -> None:
         result = self.cli(self.add_arguments(title="  Hello--Crate_name!!  There  "))
@@ -839,6 +888,37 @@ class FeatureLogTests(unittest.TestCase):
 
         self.assertEqual(allowed.status, 0)
         self.assertTrue(self.note("hana", "second result").is_file())
+
+    def test_supersede_refuses_mixed_releases_and_keeps_the_old_note_live(self) -> None:
+        added = self.cli(
+            self.add_arguments(title="Old pending result", crates=("hana_lagrange",))
+        )
+        self.assertEqual(added.status, 0, added.stderr)
+        old_path = self.note("hana", "old pending result")
+        before_vault = self.vault_snapshot()
+        before_events = (self.state / "events.jsonl").read_bytes()
+        arguments = self.add_arguments(
+            title="Replacement result", crates=("hana_lagrange",), link=SHA_TWO,
+        )
+        arguments[0] = "supersede"
+        arguments.extend((
+            "--old", "Old pending result", "--backfill", "--release",
+            "hana_lagrange@Unreleased", "hana_lagrange@1.2.3",
+        ))
+
+        result = self.cli(arguments)
+
+        self.assertEqual(result, CliResult(
+            2, "", "feature_log: release cannot hold both "
+            + "hana_lagrange@Unreleased and hana_lagrange@1.2.3\n",
+        ))
+        self.assertEqual(self.vault_snapshot(), before_vault)
+        self.assertEqual((self.state / "events.jsonl").read_bytes(), before_events)
+        old = feature_log.parse_note(old_path)
+        self.assertEqual(old["state"], "live")
+        self.assertEqual(old["replaced_by"], [])
+        self.assertFalse(self.note("hana", "replacement result").exists())
+        self.assert_no_temporary_files()
 
     def test_supersede_writes_the_new_note_and_updates_each_old_note(self) -> None:
         with patch.object(feature_log, "today", return_value="2026-10-01"):
@@ -1473,6 +1553,64 @@ class FeatureLogTests(unittest.TestCase):
 
                 self.assertEqual((self.state / "events.jsonl").read_bytes(), before_events)
 
+    def test_amend_exact_release_on_a_pending_crate_refuses_every_change(self) -> None:
+        title = "Pending result"
+        added = self.cli(self.add_arguments(title=title, crates=("hana_lagrange",)))
+        self.assertEqual(added.status, 0, added.stderr)
+        path = self.note("hana", title.lower())
+        self.assertEqual(feature_log.parse_note(path)["release"], ["hana_lagrange@Unreleased"])
+        before_vault = self.vault_snapshot()
+        before_events = (self.state / "events.jsonl").read_bytes()
+        for other_flags in ([], ["--summary", "This must not replace the summary.",
+                                 "--kind", "fix"]):
+            with self.subTest(other_flags=other_flags):
+                result = self.cli([
+                    "amend", "--project", "hana", "--title", title, "--backfill",
+                    "--release", "hana_lagrange@1.2.3", *other_flags,
+                ])
+
+                self.assertEqual(result, CliResult(
+                    2, "", "feature_log: pending result already holds hana_lagrange@Unreleased\n",
+                ))
+                self.assertEqual(self.vault_snapshot(), before_vault)
+                self.assertEqual((self.state / "events.jsonl").read_bytes(), before_events)
+                self.assert_no_temporary_files()
+
+    def test_amend_exact_release_of_another_crate_preserves_pending_and_applies_changes(self) -> None:
+        title = "Shared pending result"
+        added = self.cli(
+            self.add_arguments(title=title, crates=("hana_lagrange", "hana_liminal"))
+            + ["--backfill", "--release", "hana_lagrange@Unreleased"]
+        )
+        self.assertEqual(added.status, 0, added.stderr)
+        path = self.note("hana", title.lower())
+        original = feature_log.parse_note(path)
+        summary = "People can use the corrected shared result."
+
+        result = self.cli([
+            "amend", "--project", "hana", "--title", title, "--backfill",
+            "--release", "hana_liminal@1.2.3", "--summary", summary, "--kind", "fix",
+        ])
+
+        self.assertEqual(result, CliResult(
+            0, "amended: feature-log/hana/shared pending result.md (summary, kind, release)\n", "",
+        ))
+        expected = original.copy()
+        expected["summary"] = summary
+        expected["kind"] = "fix"
+        expected["release"] = ["hana_lagrange@Unreleased", "hana_liminal@1.2.3"]
+        self.assertEqual(feature_log.parse_note(path), expected)
+        event: AmendEvent = {
+            "at": EVENT_TIME, "verb": "amend", "project": "hana",
+            "title": title.lower(), "fields": ["summary", "kind", "release"],
+            "backfill": True, "old_link": original["link"], "new_link": original["link"],
+            "old_completed": TODAY, "new_completed": TODAY,
+            "releases_added": ["hana_liminal@1.2.3"],
+        }
+        self.assertEqual(self.events()[-1], event)
+        self.assertEqual(len(self.events()), 2)
+        self.assert_no_temporary_files()
+
     def test_amend_cannot_mark_a_superseded_note_pending(self) -> None:
         added = self.cli(
             self.add_arguments(title="Retired result", crates=("hana_lagrange",))
@@ -1524,7 +1662,7 @@ class FeatureLogTests(unittest.TestCase):
                 ])
 
                 self.assertEqual(result, CliResult(
-                    2, "", "feature_log: --release cannot add both "
+                    2, "", "feature_log: release cannot hold both "
                     + "hana_lagrange@Unreleased and hana_lagrange@1.2.3\n",
                 ))
                 self.assertEqual(self.vault_snapshot(), before_vault)
@@ -2043,6 +2181,32 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("feature-log/hana/colon scalar.md: malformed bare scalar", result.stdout)
         self.assertIn("feature-log/hana/comment scalar.md: malformed bare scalar", result.stdout)
         self.assertNotIn("feature-log/hana/valid scalar.md:", result.stdout)
+
+    def test_check_reports_a_stored_note_with_pending_and_exact_releases(self) -> None:
+        added = self.cli(
+            self.add_arguments(title="Mixed stored release", crates=("hana_lagrange",))
+        )
+        self.assertEqual(added.status, 0, added.stderr)
+        path = self.note("hana", "mixed stored release")
+        _ = path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "release:\n  - hana_lagrange@Unreleased\n",
+                "release:\n  - hana_lagrange@1.2.3\n  - hana_lagrange@Unreleased\n",
+            ),
+            encoding="utf-8",
+        )
+        before_vault = self.vault_snapshot()
+        before_events = (self.state / "events.jsonl").read_bytes()
+
+        result = self.cli(["check"])
+
+        self.assertEqual(result, CliResult(
+            1, "feature-log/hana/mixed stored release.md: release cannot hold both "
+            + "hana_lagrange@Unreleased and hana_lagrange@1.2.3\n", "",
+        ))
+        self.assertEqual(self.vault_snapshot(), before_vault)
+        self.assertEqual((self.state / "events.jsonl").read_bytes(), before_events)
+        self.assert_no_temporary_files()
 
     def test_check_reports_each_kind_of_broken_fixture(self) -> None:
         fixtures = (
@@ -2597,6 +2761,66 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(refused.status, 2)
         self.assertIn("dropped", refused.stderr)
 
+    def test_claude_review_rows_name_their_list_and_land_beside_hana_rows(self) -> None:
+        claude_link = f"https://github.com/natepiano/claude_commands/commit/{SHA_TWO}"
+        claude = self.add_arguments(
+            project="claude", title="Change Review List", crates=(), link=SHA_TWO,
+            summary="Every production keeps a change review list.",
+        ) + ["--production", "build-followups", "--unit", "build-report"]
+        self.assert_rejected(self.proposal_arguments("C1", claude), "<list>/C1")
+        self.assertFalse((self.state / "proposals/C1.json").exists())
+
+        hana = self.proposal_arguments("C1", self.add_arguments(title="Hana Row One"))
+        self.assertEqual(self.cli(hana).status, 0)
+        proposed = self.cli(self.proposal_arguments("build-followups/C1", claude))
+        self.assertEqual(
+            proposed,
+            CliResult(0, "proposed: build-followups/C1 (add change review list)\n", ""),
+        )
+        self.assertEqual(self.vault_snapshot(), {})
+        self.assertEqual(self.proposal("C1")["args"]["project"], "hana")
+
+        landed = self.cli(["add", "--review", "build-followups/C1"])
+
+        path = self.note("claude", "change review list")
+        self.assertEqual(landed, CliResult(
+            0, f"added: {path.relative_to(self.vault)}\n[[change review list]]\n", "",
+        ))
+        contents = path.read_text(encoding="utf-8")
+        for line in (
+            "crate: []\n",
+            f"link: {claude_link}\n",
+            "production: build-followups\n",
+            'project: "[[claude]]"\n',
+            "release: []\n",
+            '  - "[[feature-log - claude.base]]"\n',
+            "unit:\n  - build-report\n",
+        ):
+            self.assertIn(line, contents)
+        landed_proposal = self.proposal("build-followups/C1")
+        self.assertEqual(landed_proposal["status"], "landed")
+        self.assertEqual(landed_proposal["row"], "build-followups/C1")
+        self.assertEqual(self.proposal("C1")["status"], "open")
+        self.assertEqual(self.cli(["check"]), CliResult(0, "ok: 1 notes\n", ""))
+        self.assertIn(
+            "claude:\n+ change review list — Every production keeps a change review list.\n",
+            self.cli(["digest"]).stdout,
+        )
+
+        dropped_row = self.proposal_arguments(
+            "build-followups/C2",
+            self.add_arguments(project="claude", title="Dropped Claude Row", crates=(), link=SHA_THREE),
+        )
+        self.assertEqual(self.cli(dropped_row).status, 0)
+        self.assertEqual(
+            self.cli(["drop", "--review", "build-followups/C2", "--verdict", "the list is empty"]),
+            CliResult(0, "dropped: build-followups/C2\n", ""),
+        )
+        self.assertFalse(self.note("claude", "dropped claude row").exists())
+        self.assert_rejected(
+            self.proposal_arguments("../C3", claude), "review row must match"
+        )
+
     def test_digest_groups_each_live_event_and_advances_past_backfill(self) -> None:
         cargo_add: AddEvent = {
             "at": EVENT_TIME,
@@ -3134,6 +3358,9 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_release_stamps_reviewed_contents_and_repeat_is_unchanged(self) -> None:
         self.add_crate_note("reviewed result", "Use the reviewed result.", kind="fix")
+        path = self.note("cargo-liner", "reviewed result")
+        original = feature_log.parse_note(path)
+        self.assertEqual(original["release"], ["cargo-mend@Unreleased"])
         contents = self.save_match(
             "cargo-mend", "## [Unreleased]\n\n### Fixed\n\n- Use the reviewed result.\n",
         )
@@ -3146,6 +3373,9 @@ class FeatureLogTests(unittest.TestCase):
 
         self.assertEqual(result.status, 0, result.stderr)
         self.assertEqual(self.releases("reviewed result"), ["cargo-mend@1.2.3"])
+        expected = original.copy()
+        expected["release"] = ["cargo-mend@1.2.3"]
+        self.assertEqual(feature_log.parse_note(path), expected)
         self.assertEqual(self.release_events(), [{
             "at": EVENT_TIME, "verb": "release", "project": "cargo-liner",
             "crate": "cargo-mend", "version": "1.2.3", "titles": ["reviewed result"],
@@ -3159,10 +3389,10 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual((self.state / "events.jsonl").read_bytes(), event_bytes)
         self.assert_no_temporary_files()
 
-    def test_release_preserves_other_versions_and_other_crates_on_shared_note(self) -> None:
+    def test_release_preserves_an_exact_release_of_another_crate_on_shared_note(self) -> None:
         self.add_crate_note(
             "shared result", "Use the shared result.", crates=("cargo-mend", "cargo-port"),
-            releases=("cargo-mend@0.9.0",),
+            releases=("cargo-mend@Unreleased", "cargo-port@0.9.0"), backfill=True,
         )
         contents = self.save_match(
             "cargo-mend", "## [Unreleased]\n\n### Added\n\n- Use the shared result.\n",
@@ -3172,7 +3402,7 @@ class FeatureLogTests(unittest.TestCase):
 
         self.assertEqual(result.status, 0, result.stderr)
         self.assertCountEqual(self.releases("shared result"), [
-            "cargo-mend@0.9.0", "cargo-mend@1.0.0", "cargo-port@Unreleased",
+            "cargo-mend@1.0.0", "cargo-port@0.9.0",
         ])
 
     def test_note_added_after_snapshot_keeps_unreleased_on_stamp_and_retry(self) -> None:
@@ -3290,8 +3520,9 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_precomparison_superseded_note_is_absent_and_loses_unreleased(self) -> None:
         self.add_crate_note(
-            "old result", "Use the old result.", crates=("cargo-mend", "cargo-port"),
-            releases=("cargo-mend@0.9.0",),
+            "old result", "Use the old result.", crates=("cargo-mend", "cargo-port", "tui_pane"),
+            releases=("cargo-mend@Unreleased", "cargo-port@0.9.0", "tui_pane@Unreleased"),
+            backfill=True,
         )
         self.supersede_crate_note("old result", "current result", "Use the current result.")
         contents = self.save_match(
@@ -3310,7 +3541,7 @@ class FeatureLogTests(unittest.TestCase):
         result = self.cli(self.release_arguments("cargo-mend", "1.2.3", contents))
 
         self.assertEqual(result.status, 0, result.stderr)
-        self.assertCountEqual(self.releases("old result"), ["cargo-mend@0.9.0", "cargo-port@Unreleased"])
+        self.assertCountEqual(self.releases("old result"), ["cargo-port@0.9.0", "tui_pane@Unreleased"])
         self.assertEqual(self.releases("current result"), ["cargo-mend@1.2.3"])
         self.assertEqual(len(self.release_events()), 1)
         self.assertCountEqual(self.release_events()[0]["titles"], ["old result", "current result"])

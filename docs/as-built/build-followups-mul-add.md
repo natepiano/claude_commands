@@ -2,7 +2,7 @@
 
 ## What it is
 
-A Rust PostToolUse hook in `~/.claude` tells Claude and Codex to rewrite locally provable scalar float multiply-adds as `mul_add`. It shares its payload parser, Rust scanner and Cargo lint reader with the function-length hook. Both hooks run after an edit and return the correction to the editing agent. The nightly Rust release check also enables FMA for its Linux clippy build, and buildlog records a Codex seat's own thread as its session. The hooks fire on both machines, but the measured hana lint failures still exceed their reduction targets.
+A Rust PostToolUse hook in `~/.claude` tells Claude and Codex to rewrite locally provable scalar float multiply-adds as `mul_add`. It shares its payload parser, Rust scanner and Cargo lint reader with the function-length hook. Both hooks run after an edit and return the correction to the editing agent. The nightly Rust release check also enables FMA for its Linux clippy build, and buildlog records a Codex worker's own thread as its session. The hooks fire on both machines, but the measured hana lint failures still exceed their reduction targets.
 
 ## How it works
 
@@ -17,7 +17,7 @@ A Rust PostToolUse hook in `~/.claude` tells Claude and Codex to rewrite locally
 | `scripts/hooks/codex_hooks.py` | Installs, trusts and checks both Codex `apply_patch` handlers. |
 | `settings.json` | Claude's `Edit\|MultiEdit\|Write` group: basedpyright, fn-length, then mul_add. |
 | `scripts/buildlog/rust_release.py` | `trial_release` sets the clippy environment's FMA target flags. |
-| `scripts/buildlog/record.py` | `who()` supplies seat, delegate session and agent session for step and call records. |
+| `scripts/buildlog/record.py` | `who()` supplies worker, delegate session and agent session for step and call records. |
 | `scripts/hooks/test_mul_add.py`, `test_fn_length.py`, `test_codex_hooks.py` | Synthetic packages, payloads, scope and exemption cases, error handling, scaling and a stub Codex app-server. |
 | `scripts/buildlog/test_rust_release.py`, `test_record.py` | Pin the clippy flags and agent-session precedence with isolated fixtures. |
 
@@ -64,7 +64,7 @@ For multiply-add, `target_may_be_no_std` checks the edited target's root. A std 
 
 The release check's clippy environment sets `CARGO_INCREMENTAL=0` and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=x86-64-v3"`. Its build takes place in the release trial's clone. Rustflags enter compilation hashes, so an existing target rebuilds organically on its next build after a flag change.
 
-`record.py` chooses `CODEX_THREAD_ID`, then `CLAUDE_CODE_SESSION_ID`, then no session. A Codex seat inherits its director's Claude variable, so this precedence identifies the seat itself. Claude attribution and `caller` are unchanged; existing rows retain their recorded identities. Comparisons grouped by seat/session must keep records from either side of an attribution change separate.
+`record.py` chooses `CODEX_THREAD_ID`, then `CLAUDE_CODE_SESSION_ID`, then no session. A Codex worker inherits its director's Claude variable, so this precedence identifies the worker itself. Claude attribution and `caller` are unchanged; existing rows retain their recorded identities. Comparisons grouped by worker/session must keep records from either side of an attribution change separate.
 
 ## Invariants
 
@@ -139,11 +139,11 @@ The earlier `cost.py`, `loop.py`, `clippy_fail_lints.py` and `tml_lengths.py` co
 | --- | ---: | ---: | ---: | ---: |
 | Failed steps per 100 | 7.916 | **8.126** (62 steps); ≤1.979: **FAIL** | 13.3 | **3.539** (27 steps); ≤3.3: **FAIL** |
 | Sole-cause failed steps per 100 | 2.573 | 1.573 (12 steps) | 4.9 | 0.393 (3 steps) |
-| Sole-cause seat-hours per day | 0.402 | **0.576**; ≤0.100: **FAIL** | 1.07 | **0.116**; ≤0.27: **PASS** |
+| Sole-cause worker-hours per day | 0.402 | **0.576**; ≤0.100: **FAIL** | 1.07 | **0.116**; ≤0.27: **PASS** |
 | Claude/Codex controls on natedev/Mac | — | **4/4 PASS** | — | **4/4 PASS** |
 | Overall verdict | — | **FAIL** | — | **FAIL** |
 
-Neither lint meets the required 75% reduction in both failure rate and seat time. All eight controls have the delivered block text and a matching hook log record, proving that both hooks fire for both agents on both machines.
+Neither lint meets the required 75% reduction in both failure rate and worker time. All eight controls have the delivered block text and a matching hook log record, proving that both hooks fire for both agents on both machines.
 
 For multiply-add, **0 of 159 diagnostics** match an earlier block on the same file, line and expression; **145** have no earlier block in that file at all. The 40 diagnostics with matching committed source yield no detector findings (33 enabled, 7 exempt); the remaining 119 snippet-only cases yield four findings in three failed steps. Confirmed real-file reach is **0/763**; snippet-only reach is **3/763 = 0.393 per 100**, with actual reach unresolved where file declarations are missing. For long functions, **5 of 27** diagnostics match an earlier block naming that function; **22** remain unknown.
 

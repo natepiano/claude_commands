@@ -8,11 +8,112 @@ import sqlite3
 import subprocess
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
-from scripts.whoami import run_out, seat_usage
+from scripts.accounts.worker_names import journal_entry
+from scripts.usage.rollouts import parse_timestamp
+from scripts.whoami import run_out
+
+
+@dataclass(frozen=True)
+class ReportSources:
+    baseline_readings: Path
+    claude_repo: Path
+    production_docs: Path
+
+
+def git_text(repo: Path, *arguments: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def cell_value(value: str) -> str:
+    quoted = re.search(r"`([^`]+)`", value)
+    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
+
+
+def production_paths(path: Path) -> tuple[Path, ...]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ()
+    paths: list[Path] = []
+    for line in lines:
+        if line.startswith("- **Repository:** "):
+            value = cell_value(line.removeprefix("- **Repository:** "))
+            if value:
+                paths.append(Path(value).expanduser())
+    try:
+        units = lines.index("## Units")
+    except ValueError:
+        return tuple(paths)
+    headings: list[str] = []
+    for line in lines[units + 1:]:
+        if not line.startswith("|"):
+            if headings:
+                break
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not headings:
+            headings = cells
+            continue
+        if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            continue
+        if "Worktree" not in headings:
+            break
+        values = dict(zip(headings, cells, strict=False))
+        worktree = cell_value(values.get("Worktree", ""))
+        if worktree:
+            paths.append(Path(worktree).expanduser())
+    return tuple(paths)
+
+
+def repositories(claude_repo: Path, production_docs: Path) -> tuple[Path, ...]:
+    candidates = [claude_repo]
+    candidates.extend(
+        path
+        for document in sorted(production_docs.glob("*-production.md"))
+        for path in production_paths(document)
+    )
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        common_text = git_text(candidate, "rev-parse", "--git-common-dir")
+        if common_text is None:
+            continue
+        raw = Path(common_text.strip())
+        common = (raw if raw.is_absolute() else candidate / raw).resolve()
+        _ = unique.setdefault(str(common), candidate)
+    return tuple(unique.values())
+
+
+def default_sources() -> ReportSources:
+    home = Path.home()
+    claude = home / ".claude"
+    state = home / ".local" / "state" / "usage-model"
+    baseline = state / "workers-baseline"
+    previous = state / "seats-baseline"
+    if not baseline.exists() and previous.exists():
+        try:
+            _ = previous.rename(baseline)
+        except FileNotFoundError:
+            if not baseline.is_dir():
+                raise
+    return ReportSources(
+        baseline / "readings-2026-10-10.jsonl",
+        claude,
+        claude / "docs" / "plans",
+    )
 
 
 @dataclass(frozen=True)
@@ -36,7 +137,7 @@ class PartialSourceRead:
 
 
 LocalReadState = CompleteSourceRead | MissingSource | UnreadableSource | PartialSourceRead
-LocalSourceFamily = Literal["readings", "account_roles", "checkpoints"]
+LocalSourceFamily = Literal["readings", "baseline_readings", "account_roles", "checkpoints"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +158,7 @@ class IncrementalLogReader:
 @dataclass(frozen=True)
 class LocalOutcomeSources:
     readings: Path
+    baseline_readings: Path
     account_roles: Path
     claude_repo: Path
     production_docs: Path
@@ -121,8 +223,8 @@ def default_paths() -> LocalOutcomeSources:
     # Only the local process imports account configuration; no live account read is needed.
     from scripts.accounts import accounts
 
-    sources = seat_usage.default_sources()
-    return LocalOutcomeSources(run_out.READINGS_LOG, accounts.roles_history_file(),
+    sources = default_sources()
+    return LocalOutcomeSources(run_out.READINGS_LOG, sources.baseline_readings, accounts.roles_history_file(),
                                sources.claude_repo, sources.production_docs)
 
 
@@ -146,21 +248,35 @@ def amount_columns(amount: AccountAmount) -> tuple[str, float | None]:
     return ("not_reported" if isinstance(amount, AmountNotReported) else "unreadable"), None
 
 
-def save_reading(db: sqlite3.Connection, record: dict[str, object]) -> int:
+class ReadingOrigin(Enum):
+    LIVE = "live"
+    BASELINE = "baseline"
+
+
+def save_reading(db: sqlite3.Connection, record: dict[str, object], *,
+                 origin: ReadingOrigin = ReadingOrigin.LIVE) -> int:
     account = record.get("account")
-    at = seat_usage.parse_timestamp(record.get("at"))
+    at = parse_timestamp(record.get("at"))
     if not isinstance(account, str) or at is None:
         return 0
     reading = AccountReading(account, at, account_amount(record.get("remaining"), remaining=True),
                              account_amount(record.get("credits"), remaining=False))
-    row = db.execute("INSERT OR IGNORE INTO account_readings VALUES (?, ?, ?, ?, ?, ?, ?)",
+    conflict = ("" if origin is ReadingOrigin.BASELINE else
+                " ON CONFLICT(machine, account, at) DO UPDATE SET "
+                + "remaining_state = excluded.remaining_state, remaining = excluded.remaining, "
+                + "credits_state = excluded.credits_state, credits = excluded.credits "
+                + "WHERE (remaining_state, remaining, credits_state, credits) IS NOT "
+                + "(excluded.remaining_state, excluded.remaining, excluded.credits_state, excluded.credits)")
+    insert = "INSERT OR IGNORE" if origin is ReadingOrigin.BASELINE else "INSERT"
+    row = db.execute(insert + " INTO account_readings VALUES (?, ?, ?, ?, ?, ?, ?)" + conflict,
                      ("natedev", reading.account, reading.at.isoformat(),
                       *amount_columns(reading.remaining), *amount_columns(reading.credits)))
     return row.rowcount
 
 
 def save_account_role(db: sqlite3.Connection, record: dict[str, object]) -> int:
-    at = seat_usage.parse_timestamp(record.get("at"))
+    record = cast(dict[str, object], journal_entry(record))
+    at = parse_timestamp(record.get("at"))
     role, label = record.get("role"), record.get("label")
     if at is None or not isinstance(role, str) or not isinstance(label, str):
         return 0
@@ -232,13 +348,13 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
     added = 0
     try:
         candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
-                                     for path in seat_usage.production_paths(document)))
+                                     for path in production_paths(document)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.
         for candidate in candidates:
-            if candidate.exists() and seat_usage.git_text(candidate, "rev-parse", "--git-common-dir") is None:
+            if candidate.exists() and git_text(candidate, "rev-parse", "--git-common-dir") is None:
                 state = PartialSourceRead()
-        repos = seat_usage.repositories(claude_repo, production_docs)
+        repos = repositories(claude_repo, production_docs)
         if not repos:
             state = PartialSourceRead()
         for repo in repos:
@@ -277,7 +393,7 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
             phase = cast(object, row["phase_id"])
             subject = (CheckpointPhaseNamed(slug, phase) if isinstance(slug, str) and isinstance(phase, str)
                        else CheckpointPhaseNotNamed())
-            at = seat_usage.parse_timestamp(cast(str, row["at"]))
+            at = parse_timestamp(cast(str, row["at"]))
             if at is None:
                 continue
             columns = mapping_columns(checkpoint_mapping(db, subject, at))
@@ -287,8 +403,10 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
     return LocalSourceResult("checkpoints", added, state)
 
 
-def collect(db: sqlite3.Connection, readings: Path, account_roles: Path,
+def collect(db: sqlite3.Connection, readings: Path, baseline_readings: Path, account_roles: Path,
             claude_repo: Path, production_docs: Path, reader: IncrementalLogReader) -> tuple[LocalSourceResult, ...]:
-    return (collect_account_file(db, readings, "readings", save_reading, reader),
+    return (collect_account_file(db, baseline_readings, "baseline_readings",
+                                 lambda ledger, record: save_reading(ledger, record, origin=ReadingOrigin.BASELINE), reader),
+            collect_account_file(db, readings, "readings", save_reading, reader),
             collect_account_file(db, account_roles, "account_roles", save_account_role, reader),
             collect_checkpoints(db, claude_repo, production_docs))

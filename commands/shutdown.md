@@ -1,29 +1,37 @@
 ---
-description: Safely stop or restart every Claude session of one account on natedev and the Mac, watch it, force it, or cancel it.
-argument-hint: "[account] | --here [account] | status [account] | now [account] | cancel [account] | restart [account]"
+description: Safely stop or restart an account or selected sessions on natedev and the Mac.
+argument-hint: "[account; omitted = this session, or all accounts from a terminal] [--here] [--only NAME[,NAME...]] [--restart] | status | follow ACCOUNT --request ID | now | cancel | restart | snapshot | forget NAME_OR_ID [--account ACCOUNT]"
 ---
 
-Account: act on the account named in `$ARGUMENTS`, or otherwise this session's own account as `/whoami` reports it.
+In this terminal, run `agents <verb> [arguments]` for `down`, `restart`, `status`, `cancel`, `now`, `follow`, `snapshot` or `forget` (equivalent to `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> [arguments]`). `/shutdown` remains the in-Claude form. Lead with the account label and show its output unchanged.
 
-Run the matching command and lead the reply with that account's label:
+| Request | CLI verb |
+| --- | --- |
+| Stop safely | `down [account]` |
+| Show progress | `status [account]` |
+| Follow one local request | `follow ACCOUNT --request ID` |
+| Stop without readiness | `now [account]` |
+| Take unstopped sessions out | `cancel [account]` |
+| Restore stopped or crashed sessions | `restart [account]` |
+| Save a read-only recovery observation | `snapshot` |
+| Retire one recovery entry | `forget NAME_OR_ID [--account ACCOUNT]` |
 
-- `/shutdown [account]`: run `shutdown.py down [account]`. When it starts, run `shutdown.py ready --where "<what this session was doing before /shutdown>"`, report its output, and end the turn; this requesting session is stopped last.
-- `/shutdown --here [account]`: run `shutdown.py down [account] --here`. This is the way to shut down only this machine while the other is unreachable; then run `ready` and end the turn as above.
-- `/shutdown status [account]`: run `shutdown.py status [account]` and show its output unchanged.
-- `/shutdown now [account]`: run `shutdown.py now [account]` and show its output unchanged. This stops busy sessions too; never infer `now` from urgency.
-- `/shutdown cancel [account]`: run `shutdown.py cancel [account]` and show its output unchanged.
-- `/shutdown restart [account]`: run `shutdown.py restart [account]` and show its output unchanged. It resumes every recorded session on both machines, restores its timers, and leaves manual commands in the output when a host cannot be launched automatically.
+Pass flags as given: `--here` limits work to this machine; `--only NAME[,NAME...]` selects exact ids or names and their owned workers on down, status, now, cancel and restart; `down --restart` restores each stopped owner; `down --to ACCOUNT --restart` moves it; `restart --dry-run` previews; `--no-alert` suppresses phone alerts. Never infer now from urgency. Use the given account. With none, down, restart and status use this session's account when `CLAUDE_CODE_SESSION_ID` is set; from a terminal they cover every configured Claude account (restart covers accounts with shutdown records, holds or recovery snapshots, including hand-run Codex sessions). A named Claude account restores only its Claude sessions. `--only` and `--here` apply in either form. An unreadable session account refuses attribution; an in-session restart can infer one from stored records or ask for an explicit account.
 
-Use the optional account exactly as given. A session on another account is never touched.
+After a crash or reboot, run `agents restart`. Each session names its source: `from shutdown record` or `from snapshot taken <time> (<age>)`, using the entry’s last-seen time in the user’s zone. A record takes precedence for its id; other sessions with a crash signal still restore from snapshots. A snapshot session is restorable when its boot id changed or its herdr server, tmux server or terminal process is gone. A session that exits while its host stays alive leaves the snapshot; sessions stopped by agents down restore through their shutdown records. Running sessions are skipped. Conflicting account evidence refuses a restore and names the accounts. An incomplete shutdown restores only after the owner is positively dead and cleanup is confirmed; unreadable liveness refuses it. A successful restore removes its snapshot entry; a failure keeps it for retry.
 
-Your phone hears from a shutdown only when you must act: a stop left something running, sessions are not ready to stop, or a restart is not fully back; the session that asked always gets the stop result, including after its own restart.
+`agents snapshot` changes no session. An incomplete observation keeps every previous recovery file and names its failed sources. Status lists unresolved sessions with their last-seen times in the user's zone. `agents forget NAME_OR_ID [--account ACCOUNT]` removes one local recovery entry without stopping it; the account login or label selects between cross-account copies. Snapshot-only names participate in restart and forget, while down, now, cancel and status selections use membership and shutdown records. Codex restores in herdr with its recorded home and session id; without an id it opens Codex's resume picker. Snapshots stay on the machine that observed them.
 
-While an account is shut down or restarting on a machine, or its shutdown state cannot be read, the nightly review and fix pipeline skip their runs there and no unit launches except by restart.
+An idle session stops with no pause; a busy one gets a pause message and stops after ready, or once idle after the pause. A newest transcript refusal or a fresh exhausted account reading starts reaping immediately, without a pause or readiness wait. Identity checks precede every signal. A refusal after the pause also reaps, on every host. If this session has a record after down, in this terminal run `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py ready --where "<work in progress and next step>"` and end the turn. The requester goes last; a showrunner never waits for its units.
 
-`down` means every attributable session is resumably stopped: units also lose their exact tmux session, each non-seat owner's Codex server is stopped, and Ghostty windows close when Ghostty still owns them. Showrunners and top-level sessions resume through `/shutdown restart`. Seats keep their job and transcript but no process; their next message respawns them. `stop partial` keeps what was left running and why on the record, and `/shutdown status` shows it under each machine. A stop runs to its end; a second stop on the same machine waits for it. Unknown-account and process-identity-mismatch sessions are listed as left running.
+A single-account terminal down with tty output follows automatically, including the original requests when repeated. A terminal down covering several accounts starts each account and prints its follow command. Follow prints each timed trail step once, including archived outcomes; stopped is intermediate when a restart is pending. Cancelled sessions print taken out once and count as done in the summary. It exits 0 when done, 1 when the user must act, or 130 on Ctrl-C. Detaching leaves the shutdown running and prints the exact follow command to run in this terminal. Session and redirected requests print commands naming the account, request, selected ids and machine instead.
 
-From a terminal, the same restart is:
+Every next-step command must say `in this terminal`, `in a terminal on <machine>`, or `in any Claude session on <machine>`. Use full script paths and the explicit account and --only ids. A move's cancel takes out only sessions not yet stopped; it does not undo completed moves. Each machine conducts independently; follow reads the local machine's request records. Follow the peer separately in a terminal on that machine using its printed command.
 
-```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart [account]
-```
+Status shows progress, message delivery, hold details, cleanup issues and the timed trail. Its actions contain runnable scoped commands. Cancel restores timers and footers, retires pending pause messages and lets unstopped sessions continue. Stopped records remain available to restart. Now also accepts reaping records and retries incomplete cleanup. Restart refuses incomplete records whose owner or cleanup cannot be confirmed gone; a relaunch already in progress is never duplicated. A selected request without a record or recovery entry reports no shutdown in progress.
+
+After four minutes without a ready reply, a waiting owner sends one push naming its window or pane and the exact now command and place; unreadable Ghostty panes are included. It explains the safe-point pause, continued waiting, and that now stops Claude mid-step, keeps uncommitted work, and resumes it when restart was requested. A reaping owner gets no holdout push. The requester receives the same guidance, and follow displays it.
+
+Restart alerts follow the selected records' saved policy on both machines; --here reads no peer. If the peer is unavailable, account-wide restart uses all local records: no local record or any alerts=user allows the alert. A selected restart uses only chosen records. The Remote Control fixer runs quietly for each restarted local session still missing it; outcomes stay in the service log. Probe records always use alerts=none, preserved through restart and move. Partial stops and incomplete restores name what needs attention.
+
+A selected shutdown holds only its sessions; an account-wide shutdown also blocks new launches and scheduled work. Other accounts remain isolated. Legacy record migration conflicts write nothing: report the diagnostic and preserve the files for repair.

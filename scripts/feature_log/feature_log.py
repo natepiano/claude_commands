@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):
@@ -107,6 +109,7 @@ PROJECTS: dict[str, ProjectSpec] = {
     "nateroids": ProjectSpec(
         "natepiano/nateroids", frozenset({"nateroids"}), frozenset()
     ),
+    "claude": ProjectSpec("natepiano/claude_commands", frozenset(), frozenset()),
 }
 
 KINDS = ("feature", "fix", "change", "perf", "deprecation", "removal", "security")
@@ -426,7 +429,8 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 VERSION_RE = re.compile(
     r"^(?:Unreleased|\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$"
 )
-REVIEW_ROW_RE = re.compile(r"^[AC]\d+$")
+# A bare row is a row of hana's list; a row of another showrunner's list names it: natedev/C3.
+REVIEW_ROW_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_-]*/)?[AC]\d+$")
 BODY_SECTION_HEADINGS = frozenset({"## See it", "## Evidence"})
 UNSAFE_BARE_SCALAR_PREFIXES = frozenset("-?:,[]{}#&*!|>'\"%@`")
 
@@ -726,9 +730,9 @@ def _validate_project(project: str) -> ProjectSpec:
 def _validate_crates(project: str, crates: list[str]) -> list[str]:
     spec = _validate_project(project)
     unique = sorted(set(crates))
-    if project == "natedev":
+    if not spec.crates:
         if unique:
-            raise FeatureLogError("natedev does not accept crates")
+            raise FeatureLogError(f"{project} does not accept crates")
         return []
     if not unique:
         raise FeatureLogError(f"project {project} requires at least one crate")
@@ -752,7 +756,14 @@ def _validate_release_values(project: str, crates: list[str], releases: list[str
         if not VERSION_RE.fullmatch(version):
             raise FeatureLogError(f"invalid release version {version}")
         validated.add(release)
-    return sorted(validated)
+    sorted_releases = sorted(validated)
+    for release in sorted_releases:
+        crate, _, version = release.partition("@")
+        if version != "Unreleased" and f"{crate}@Unreleased" in validated:
+            raise FeatureLogError(
+                f"release cannot hold both {crate}@Unreleased and {release}"
+            )
+    return sorted_releases
 
 
 def _canonical_link(project: str, value: str) -> str:
@@ -817,10 +828,6 @@ def validate_note(note: Note, expected_project: str | None = None) -> None:
         raise FeatureLogError("a live note must have replaced_by: []")
     if note["state"] == "superseded" and not note["replaced_by"]:
         raise FeatureLogError("a superseded note must name a replacement")
-    if note["project"] != "hana" and note["production"] is not None:
-        raise FeatureLogError("production is only valid for hana")
-    if note["project"] != "hana" and note["unit"]:
-        raise FeatureLogError("unit is only valid for hana")
     if note["production"] is not None and not note["production"].strip():
         raise FeatureLogError("production is empty")
     if any(not unit.strip() for unit in note["unit"]):
@@ -867,10 +874,6 @@ def _new_note(arguments: argparse.Namespace) -> Note:
     )
     production = cast(str | None, arguments.production)
     units = sorted(set(_flatten(cast(list[list[str]] | None, arguments.unit))))
-    if project != "hana" and production is not None:
-        raise FeatureLogError("--production is only valid for hana")
-    if project != "hana" and units:
-        raise FeatureLogError("--unit is only valid for hana")
     if production is not None and not production.strip():
         raise FeatureLogError("production is empty")
     if any(not unit.strip() for unit in units):
@@ -960,7 +963,7 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _event_time() -> str:
-    return datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0).isoformat()
+    return datetime.now(user_zone()).replace(microsecond=0).isoformat()
 
 
 def _append_event(event: FeatureLogEvent) -> None:
@@ -1363,7 +1366,7 @@ def _run_supersede(arguments: argparse.Namespace, policy: ReplacementPolicy) -> 
 
 def _review_row(value: str) -> str:
     if not REVIEW_ROW_RE.fullmatch(value):
-        raise FeatureLogError("review row must match A<number> or C<number>")
+        raise FeatureLogError("review row must match A<number>, C<number> or <list>/C<number>")
     return value
 
 
@@ -1571,6 +1574,9 @@ def _validate_proposal_old_notes(note: Note, old_titles: list[str]) -> None:
 def _run_propose(arguments: argparse.Namespace) -> int:
     row = _review_row(cast(str, arguments.review))
     _require_new_note_arguments(arguments)
+    project = cast(str, arguments.project)
+    if "/" not in row and project != "hana":
+        raise FeatureLogError(f"a {project} review row names its list: <list>/{row}")
     old_titles = _proposal_old_titles(arguments)
     verb: Literal["add", "supersede"] = "supersede" if old_titles else "add"
     with locked():
@@ -1768,10 +1774,12 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                 ]
                 changed.append("crate")
         validated_releases = _validate_release_values(project, updated["crate"], release_additions)
-        pending_crates: set[str] = set()
         for release in validated_releases:
             crate, _, version = release.partition("@")
             if version != "Unreleased":
+                pending_release = f"{crate}@Unreleased"
+                if pending_release in note["release"]:
+                    raise FeatureLogError(f"{title} already holds {pending_release}")
                 continue
             if note["state"] != "live":
                 raise FeatureLogError("a superseded note cannot be pending")
@@ -1779,13 +1787,6 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                 existing_crate, _, existing_version = existing_release.partition("@")
                 if existing_crate == crate and existing_version != "Unreleased":
                     raise FeatureLogError(f"{title} already holds {existing_release}")
-            pending_crates.add(crate)
-        for release in validated_releases:
-            crate, _, version = release.partition("@")
-            if version != "Unreleased" and crate in pending_crates:
-                raise FeatureLogError(
-                    f"--release cannot add both {crate}@Unreleased and {release}"
-                )
         releases = sorted(set(updated["release"]) | set(validated_releases))
         if releases != updated["release"]:
             updated["release"] = releases
@@ -2144,7 +2145,7 @@ def _event_datetime(value: str) -> datetime:
         raise FeatureLogError(f"event time is invalid: {value}") from error
     if parsed.tzinfo is None:
         raise FeatureLogError(f"event time has no timezone: {value}")
-    return parsed.astimezone(ZoneInfo("America/Los_Angeles"))
+    return parsed.astimezone(user_zone())
 
 
 def _digest_time_label(value: str) -> str:
@@ -2181,9 +2182,7 @@ def _run_digest(arguments: argparse.Namespace) -> int:
     if since is not None:
         _validate_date(since, "since")
         events = _read_events()
-        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(
-            tzinfo=ZoneInfo("America/Los_Angeles")
-        )
+        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(tzinfo=user_zone())
         selected = [event for event in events if _event_datetime(event["at"]) >= boundary]
         return _print_digest(selected, boundary.strftime("%Y-%m-%d %H:%M %Z"))
 

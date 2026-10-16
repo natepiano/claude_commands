@@ -96,6 +96,7 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
                             "SHOWRUNNERS_SESSIONS": str(sessions_script),
                             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
+                            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
                             "STALL_WATCH_STATE_DIR": str(self.root / "stall-state"),
                             "TMUX_NAMES_PROC_DIR": str(self.proc),
                             "TMUX_NAMES_TMUX": "tmux", "TMUX_NAMES_SEND": str(sender),
@@ -205,6 +206,21 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(len((self.root / "faults").read_text().splitlines()), 2)
 
+    def test_a_session_joining_or_leaving_a_shared_tmux_session_sends_no_second_fault(self) -> None:
+        _ = self.tmux.write_text(json.dumps({"old": ["%1", "%2", "%3"]}))
+        first = self.session("new", "%1")
+        _ = self.session("another", "%2")
+        self.assertEqual(self.tick().returncode, 0)
+        faults = (self.root / "faults").read_text().splitlines()
+        self.assertEqual(len(faults), 1)
+        self.assertIn("skipped old (sessions another, new): more than one Claude session", faults[0])
+        _ = self.session("third", "%3")
+        self.assertEqual(self.tick().returncode, 0)
+        (self.sessions / f"{first}.json").unlink()
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual((self.root / "faults").read_text().splitlines(), faults)
+        self.assertEqual(self.names(), {"old": ["%1", "%2", "%3"]})
+
     def test_a_fault_waits_for_the_next_tick_when_the_session_records_cannot_be_read(self) -> None:
         settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
                                                   faults_to="director", always=[])
@@ -218,15 +234,20 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertIn("tmux-names: cannot tell whether director is running", errors.getvalue())
         self.assertEqual(list(state.iterdir()), [])
 
-    def test_a_fault_for_a_session_that_is_not_live_goes_to_every_running_showrunner_and_says_so(self) -> None:
+    def test_a_fault_for_a_session_that_is_not_live_goes_to_each_trees_highest_running_showrunner_and_says_so(self) -> None:
         settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
                                                   faults_to="director", always=[])
         state = self.root / "fault-state"
         runners = [showrunners.Showrunner(session="one", socket="/tmp/one.sock", slug="one", zone="UTC", doc="/d"),
+                   showrunners.Showrunner(session="below", socket="/tmp/below.sock", slug="below", zone="UTC", doc="/d"),
                    showrunners.Showrunner(session="", socket="", slug="stopped", zone="UTC", doc="/d")]
+        # `below` reports to `one`, which runs, so only `one` is told.
+        (self.root / "tree" / "below").mkdir(parents=True)
+        _ = (self.root / "tree" / "below" / "parent").write_text("one\n")
         sent = subprocess.CompletedProcess[str]([], 0, "", "")
         errors = io.StringIO()
         with mock.patch.object(tmux_names, "FAULT_STATE_DIR", state), \
+                mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.root / "tree"), \
                 mock.patch.object(showrunners, "socket_for", return_value=None), \
                 mock.patch.object(showrunners, "registered_showrunners", return_value=runners), \
                 mock.patch.object(subprocess, "run", return_value=sent) as run:
@@ -235,7 +256,8 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
             self.assertEqual(run.call_count, 1)
             self.assertEqual(command[command.index("--to") + 1], "uds:/tmp/one.sock")
             self.assertIn("director, which", command[-1])
-            self.assertIn("is not a live session, so every running showrunner is told.", command[-1])
+            self.assertIn("is not a live session, so every running showrunner that reports to no running one is told.",
+                          command[-1])
             self.assertEqual(len(list(state.iterdir())), 1)
             # With no showrunner running either, the fault is printed and tried again at the next tick.
             with mock.patch.object(showrunners, "registered_showrunners", return_value=[]), redirect_stderr(errors):

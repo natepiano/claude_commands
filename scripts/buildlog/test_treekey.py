@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
 
 import treekey
 from test_index import use_test_log
@@ -108,11 +109,22 @@ class TreeKeyTests(unittest.TestCase):
         self.assertNotEqual(key(self.repo), self.clean)
         self.assertEqual(key(self.repo / "src"), key(self.repo))
 
-    def test_symlink_target(self) -> None:
+    def test_file_read_error_leaves_tree_key_unavailable(self) -> None:
+        source = self.repo / "src" / "new.rs"
+        _ = source.write_text("pub fn two() {}\n")
+        self.assertNotEqual(key(self.repo), self.clean)
+        with patch("treekey.open", side_effect=FileNotFoundError("file removed")) as read:
+            self.assertIsNone(treekey.tree_key(str(self.repo)))
+        read.assert_called_once_with(os.fsencode(source), "rb")
+
+    def test_symlink_read_error_leaves_tree_key_unavailable(self) -> None:
         link = self.repo / "link"
         link.unlink()
         link.symlink_to("src/lib.rs")
         self.assertNotEqual(key(self.repo), self.clean)
+        with patch("treekey.os.readlink", side_effect=OSError("link replaced")) as read:
+            self.assertIsNone(treekey.tree_key(str(self.repo)))
+        read.assert_called_once_with(os.fsencode(link))
 
     def test_index_is_left_alone(self) -> None:
         # A new mtime with the same bytes makes the index's stat data stale;

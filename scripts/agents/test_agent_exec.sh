@@ -6,6 +6,29 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-exec.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+export HOME="$TEST_DIR/home"
+export PYTHONDONTWRITEBYTECODE=1
+export XDG_CACHE_HOME="$TEST_DIR/cache"
+export XDG_STATE_HOME="$TEST_DIR/state"
+mkdir -p "$HOME/.claude/scripts/lib"
+ln -s "$SCRIPT_DIR/../lib/py" "$HOME/.claude/scripts/lib/py"
+ln -s "$SCRIPT_DIR/../whoami" "$HOME/.claude/scripts/whoami"
+ln -s "$SCRIPT_DIR/../accounts" "$HOME/.claude/scripts/accounts"
+unset CODEX_HOME
+export AGENT_NOTES_DIR="$TEST_DIR/notes"
+mkdir -p "$AGENT_NOTES_DIR"
+python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
+from scripts.accounts import accounts
+notes = Path.home().parent / "notes"
+_ = (notes / "claude2.md").write_text("---\nlogin: launcher@example.invalid\n---\n")
+assert accounts.setup("claude2") == []
+_ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "launcher@example.invalid"}}))
+PYTHON
+export CLAUDE_CONFIG_DIR="$HOME/.claude2"
+
 export AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
 export CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 export CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
@@ -77,12 +100,12 @@ run_dry() {
 
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "env CODEX_HOME=$HOME/.codex codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$codex_write"
 
 codex_readonly="$(run_dry codex_case.task readonly)"
 assert_equal "codex readonly command is wrong" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "env CODEX_HOME=$HOME/.codex codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$codex_readonly"
 
 claude_write="$(run_dry claude_case.task write)"
@@ -97,12 +120,12 @@ assert_equal "claude readonly command is wrong" \
 
 bare_command="$(run_dry bare_case.task write)"
 assert_equal "bare pair did not omit the effort flag" \
-    "codex exec -m gpt-bare --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "env CODEX_HOME=$HOME/.codex codex exec -m gpt-bare --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$bare_command"
 
 tier_command="$(run_dry tier_case.task readonly)"
 assert_equal "codex command did not carry the function's service tier" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" -c service_tier=\\\"fast\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "env CODEX_HOME=$HOME/.codex codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" -c service_tier=\\\"fast\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$tier_command"
 
 tier_claude_command="$(run_dry tier_case.claude_task readonly)"
@@ -112,7 +135,7 @@ assert_equal "claude command carried a codex service tier" \
 
 extra_command="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task write)"
 assert_equal "extra arguments were not appended" \
-    "codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "env CODEX_HOME=$HOME/.codex codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$extra_command"
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"
@@ -125,5 +148,37 @@ fi
 assert_equal "missing prompt error was not written to the log" \
     "Prompt not found: $MISSING_PROMPT" \
     "$(cat "$MISSING_LOG")"
+
+mkdir -p "$TEST_DIR/bin" "$HOME/.codex1" "$TEST_DIR/notes"
+cat > "$TEST_DIR/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$CODEX_HOME" > "$TEST_CODEX_HOME_FILE"
+cat > "$TEST_CODEX_PROMPT_FILE"
+EOF
+chmod +x "$TEST_DIR/bin/codex"
+export TEST_CODEX_HOME_FILE="$TEST_DIR/child-home"
+export TEST_CODEX_PROMPT_FILE="$TEST_DIR/child-prompt"
+export PATH="$TEST_DIR/bin:$PATH"
+export AGENT_NOTES_DIR="$TEST_DIR/notes"
+
+CODEX_HOME="$TEST_DIR/caller" bash "$SCRIPT_DIR/agent_exec.sh" \
+    codex_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+assert_equal "unassigned workers did not use the default home" "$HOME/.codex" "$(cat "$TEST_CODEX_HOME_FILE")"
+assert_equal "fallback lost its prompt" "test prompt" "$(cat "$TEST_CODEX_PROMPT_FILE")"
+
+python3 - "$HOME/.codex1/auth.json" "$AGENT_NOTES_DIR/codex 1.md" <<'PY'
+import base64
+import json
+import sys
+from pathlib import Path
+login = "workers@example.invalid"
+claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+_ = Path(sys.argv[1]).write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+_ = Path(sys.argv[2]).write_text(f"---\nlogin: {login}\n---\n")
+PY
+python3 "$SCRIPT_DIR/../accounts/accounts.py" set-role workers "codex 1"
+CODEX_HOME="$TEST_DIR/caller" bash "$SCRIPT_DIR/agent_exec.sh" \
+    codex_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
 
 echo "agent_exec tests passed"

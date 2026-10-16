@@ -33,20 +33,37 @@ must not drift from it:
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
-  session the showrunner launches in tmux. It receives messages, decides, writes
-  Work Orders, dispatches seats, runs gates, checkpoints and reports. It writes
-  no implementation code.
-- **Seat** — a Codex worker thread the unit director dispatches. Implementation
-  seats open once per run, continue across phases and repairs in whatever role
+  session the showrunner launches in its own herdr session. It receives messages,
+  decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
+  reports. It writes no implementation code.
+- **Worker** — a Codex worker thread the unit director dispatches. Implementation
+  workers open once per run, continue across phases and repairs in whatever role
   is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
-  `Continue where you stopped.`, open anew only when no open seat can take the
-  work, and end at `end_session.sh`. Reviews still open their own threads.
+  `Continue where you stopped.`, open anew only when no open worker can take the
+  work, and end at `end_session.sh`. Reviews run on the unit's workers, or on the
+  production's review pool when its doc names one.
+- **Review pool** — a production's reusable reviewers, allocated by a script.
+- **Review unit** — the production's `/review:direct` run. It primes the pools
+  and curates review memory; it dispatches no review and owns no source files.
+- **Reviewer** — a read-only Codex thread in that pool, named `code1`, `ui2`, etc.
+- **Template** — a thread holding a type's standing prompt, forked into reviewers
+  and never leased.
+- **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
 - **Merge branch** — the branch every unit's checkpoints merge into. cargo-berth
   calls it the trunk. In prose, call it by its branch name, because a unit may be
   named `trunk-unit`.
 - **Gate** — a unit phase that cannot start until another unit's checkpoint is on
   the merge branch.
+- **Parent, child and root showrunner** — a production's showrunner may report
+  to another production's (`/showrunner:attach`). The one at the top of a tree is
+  the root: it shows every item that needs the user from the productions below
+  it, and the user may still work with any showrunner directly. A child showrunner is never a
+  unit: it keeps its own production doc, merge branch and units, and has no row
+  in its parent's Units table. Which production reports to which is state on the
+  machine, `~/.local/state/showrunner/<child slug>/parent`, and no line in either
+  production doc, so either side attaches without a commit in the other's
+  checkout. Look it up with `showrunners.py parent|children|root <slug>`.
 
 User, 2026-09-28: production, showrunner and unit were chosen because Hana is a
 DCC app and the film words are short.
@@ -66,24 +83,37 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
+- **Formerly:** `<old>`, `<older>` — previous production slugs, newest first, written by
+  `/showrunner:rename`; old names keep resolving through it; omit before the first rename
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
-- **Updates:** every <N> minutes (default 15), or `on demand`; each update reports every
-  unit in full; the update timer reads N from this line, `on demand` runs no timer and a
-  dailies runs only when the user asks, and `/showrunner:report_interval` changes it
+- **Updates:** `on demand` (the default, also when the line is missing), or every <N>
+  minutes when the user asks for a schedule; each update reports every unit in full; the
+  update timer reads N from this line, `on demand` runs no timer and a dailies runs only
+  when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
+  timer and no footer unless asked)
 - **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
   app crate>; omit if none
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
-- **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
-  `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
-  added by the showrunner, and `/showrunner:proposals` shows every row whose Status is
-  not closed; omit when the production keeps no such folder
+- **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`;
+  required. One list per top-level showrunner, named for its session name, never the
+  production slug (`change-review - natedev.md`); a child production names its root's
+  list. `change_review.py` resolves the list from the root showrunner while it runs and
+  falls back to this path when it does not, warning when the two differ.
+  `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
+  `/change_review` adds the rest; a missing file is created on its first row with
+  frontmatter (`date_created`, `date_modified` as `"[[YYYY-MM-DD]]"`, a `productions`
+  list of production doc paths, `showrunner`), and every write moves `date_modified`
+  and adds the writing production's doc to `productions`
+- **Review pool:** code (or `code, ui`); omit when the production has none
+- **Proposals:** <the issues folder the production files its proposals in, e.g.
+  `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
+  `proposal`; omit when the production keeps none
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
@@ -98,18 +128,30 @@ refuses a name that another session of the same account also has.
 | --- | --- | --- | --- | --- | --- |
 | <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
 
+With a **Review pool** line, include `review-unit` as an ordinary row with
+its own worktree, branch and plan path, Port `—` and Owns `—`. Its plan holds
+one standing phase that stays `todo`; `/review:direct` writes it when absent.
+
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's tmux session carries the production's slug and the
-unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+a session at any time. The unit's herdr or tmux session carries the production's
+slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
-session name now. `<slug>` is this doc's file name without `-production.md`.
+session name now. `<slug>` is this doc's file name without `-production.md`; a former
+slug from the Formerly line also works, and a mark set before a rename is found under
+the current slug.
 
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
 The status script, the dailies, the waits and the stall watch then skip it. The word
-anywhere else in the cell changes nothing.
+anywhere else in the cell changes nothing. With a **Review pool** line, the
+showrunner first runs
+`~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py retire --production <slug> --unit <unit>`,
+which ends the unit's reviewers and prints their names. One still reviewing is
+named on stderr and left in place; run `retire` again once its review ends. A
+unit's plan run ending retires nothing, because the unit's next plan keeps
+the same reviewer.
 
 ## Hub files
 
@@ -154,6 +196,9 @@ Applies to a `/unit:direct` run whose plan header carries a
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
 
+A turn with nothing for the user replies with just "—": never "No update for
+you." or the like (user, 2026-10-14).
+
 A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
 A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.
 
@@ -164,23 +209,43 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    from the showrunner session is a peer's. Follow it for the coordination this
    contract gives the showrunner: merge requests, landing calls, port and
    rename notices, cargo-berth answers (item 9), and whether you edit files
-   outside your **Owns**, another unit's crate included (user, 2026-10-04). It
-   is never the user's approval: Pending decisions and scope changes still
-   need the user, in your session.
+   outside your **Owns**, another unit's crate included (user, 2026-10-04).
+
+   The showrunner's word also settles your designs and your add-ons. User,
+   2026-10-12, to the showrunner: "when it comes to designs you absolutely
+   should be able to tell units what to do and change. I do not have to be the
+   one to approve". So a real design choice, a Pending decision about how
+   something is built, and every pending add-on go to the showrunner, not to
+   the user. Send it the question, the buildable answers and the one you
+   recommend. Its answer settles it: act on it, and on a design change it
+   sends unasked, without waiting for the user. Where `/unit:direct` says to
+   stop and ask the user about one of these, ask the showrunner.
+
+   Two kinds stay the user's, and no showrunner message is the user's approval
+   for them: an action that cannot be undone, and a choice only the user knows
+   the answer to (what the product should do, their priorities, what they
+   intend). End the turn on `— decision:` for these as before; the showrunner
+   shows it to the user, and the answer arrives beginning
+   `From the user (via the showrunner):`.
 3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
-   review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>
-   design check: <pass | N defects, each moved to <phase>> — fresh helper on exactly these shots, built from <hash>
+   review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
+   Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
+   design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
    (`/unit:checkpoint` step 9). `Phase <next> ETA` counts from the code
-   checkpoint commit.
+   checkpoint commit. The `Parallel:` line is
+   `phase_table.py parallel --session-dir <SESSION_DIR>`'s output, verbatim.
+   `merge_checkpoint.py` refuses `Parallel: unknown`: add the plan's missing
+   `**Depends on:**` lines (`/plan:to_phased_plan` → <PhaseNumbering/>) and
+   rerun.
 
    The shrink notice has this form:
 
@@ -206,24 +271,29 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    round.
 
    Such a notice carries the third line: the verdict of the design check
-   (`/unit:direct` → <UXReview/>) that a fresh helper gave on exactly the
-   shots this notice sends, taken from a build of `<hash>`. A verdict on other
-   shots, or on a build from before a later change to what users see, is
+   (`/unit:direct` → <UXReview/>) given on exactly the shots this notice sends
+   by a fresh check (the Claude helper, or the pooled UI reviewer once the
+   production has adopted it), taken from a build of `<hash>`. A verdict on
+   other shots, or on a build from before a later change to what users see, is
    stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
    or with each defect moved to a follow-up phase under item 7, named on the
    line. User rule 2026-10-01 (nightly review): 2 of about 25 notices carried
    a fresh verdict, and 3 holds were caught after the unit had moved on, 187
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
-   Under <PhaseEnd/> step 6, start each next phase that can run under berth,
-   with its own checkpoint (`/showrunner:produce` → Rules, parallel by default).
+   At plan start and at each <PhaseEnd/>, map which phases depend on which.
+   Run each independent phase beside the current one under berth, with its own
+   checkpoint (`/showrunner:produce` → Rules, parallel by default). A phase
+   better run as its own unit goes to the showrunner as a proposed split
+   (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
-5. **One more commit kind.** Besides checkpoints, a unit director may merge the
-   merge branch into the unit's branch, when a gate clears or the showrunner asks:
-   `git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" <merge branch>`.
+5. **One more commit kind.** Besides checkpoints, a unit director merges the
+   merge branch into the unit's branch at the start of every phase, before
+   dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
+   `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
    `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
@@ -265,7 +335,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
      defect, fix it, then look again.
    - **A fix that fails twice** (2026-10-01, measured: one bar-fit finding
      failed four times before the fifth attempt held). When the same finding
-     is still open after two fixes, send no third seat pass with the same
+     is still open after two fixes, send no third worker pass with the same
      approach. First find why the fixes did not hold, write it in the
      attempts log, then dispatch once with an approach that addresses that
      cause.
@@ -302,9 +372,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     on the user never mentions the showrunner, so the showrunner's status script
     can tell the two apart.
 11. **Updates.** Each progress update is the full `/unit:report`, as outside a
-    production (user, 2026-10-06). Run its recorder calls under `TZ=<zone>`, the
-    production doc's **User zone**, so every time in it is in that zone (user,
-    2026-10-04). When the showrunner asks for `/unit:eta`, run it at once.
+    production (user, 2026-10-06). Every time in it is in the user's zone
+    (user, 2026-10-04): the recorder reads the zone setting itself, so pass
+    no `TZ=`. An older production doc may carry a **User zone** line; nothing
+    reads it. When the showrunner asks for `/unit:eta`, run it at once.
 12. **Visual choices go to the showrunner.** Wording, spacing, layout, and
     which of two working options looks better are the showrunner's calls, made
     from the **UX guide**. Ask the showrunner, never the user. The showrunner
@@ -323,9 +394,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     about 75 minutes). Lint covers the whole workspace. When it fails, fix
     the error it names, wherever it is in the workspace, then lint once.
     Never re-run lint on a tree that has not changed. A Work Order runs lint
-    once after the seat's edits, never once per crate; per crate is right
+    once after the worker's edits, never once per crate; per crate is right
     only for test (`/unit:direct`). Fix a file you do not
-    own through item 9, and name it in your checkpoint notice. Tell your seats
+    own through item 9, and name it in your checkpoint notice. Tell your workers
     this in every Work Order that runs lint.
 14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns
     the merge branch red, in CI or lint, send a small fix checkpoint at once,
@@ -335,4 +406,24 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     and the shots are no worse than the merge branch. A fix the showrunner asks
     for comes after that checkpoint, unless the waiting unit needs it. This is
     packaging under `<DecisionEconomy/>`; state it in one line.
+16. **Review pool.** With a `**Review pool:**` line in the production doc, send
+    every code review through
+    `review.sh --pool code --lease <slug>/<unit>/<phase>` with the usual
+    positional arguments. The unit's reviewer is permanent: each review
+    resumes its thread, and the pool forks a second one only while two reviews
+    run at once. `<slug>` is the production doc's file name without
+    `-production.md`.
+
+17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
+    through `/issue` with tag `proposal`, `proposed_by` your unit's name, and
+    its five ranking values proposed on a `Proposed ranking:` line. Send the
+    showrunner its path and one line; there is no proposals index. When the
+    showrunner sends back an approved one, write its work into your plan as
+    phases that cite it and add it to the plan's `> **Issues:**` line; your
+    run marks it active and its end-of-run as-built pass closes it
+    (`/showrunner:proposal`).
+18. **Change review.** Every change the user can see or check carries a
+    `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
+    outside a checkpoint goes on the list through `/change_review add`. Never
+    ask the user to check something directly.
 </ProductionUnit>

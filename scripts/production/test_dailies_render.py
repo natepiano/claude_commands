@@ -4,17 +4,22 @@
 from __future__ import annotations
 
 import json
+import sys
+import signal
+import dailies_render
+from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
-                            check_render_state, load_state)
+                            check_render_state, last_report, load_state)
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -97,7 +102,7 @@ def holder(release: str = "unknown", name: str = "frame-time", since: str = "202
     return {"holder": name, "since": since, "for": purpose, "release_eta": release}
 
 
-def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None) -> Run:
+def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None, *, subprocess_cli: bool = False) -> Run:
     # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
     (Path(scratch) / "rust/hanadocs/agents").mkdir(parents=True, exist_ok=True)
     (Path(scratch) / ".local/state/agent-notes").mkdir(parents=True, exist_ok=True)
@@ -105,14 +110,15 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     hold_dir.mkdir(exist_ok=True)
     for index, record in enumerate(holders or []):
         _ = (hold_dir / f"holder-{index}").write_text(json.dumps(record) + "\n")
-    result = subprocess.run(
-        ["python3", str(SCRIPT), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
-             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")},
-    )
+    environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
+                   "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
+    if subprocess_cli:
+        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+    else:
+        result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
+                            environment, Path(scratch), production_state=True)
+
     return Run(result.returncode, result.stdout.splitlines(), result.stderr)
 
 
@@ -140,6 +146,57 @@ def timeline(lines: list[str]) -> list[str]:
 
 
 class ReportFooterTests(unittest.TestCase):
+    def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
+        question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            _ = path.write_text(json.dumps([
+                {"since": AT, "text": "reminder"},
+                {"since": AT, "text": "facts needed", "question": question},
+                {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+                {"since": AT, "text": "review failed", "question": question,
+                 "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+            ]))
+            items = dailies_render.read_outstanding(path)
+            self.assertIsInstance(items[0], dailies_render.OutstandingReminder)
+            awaiting = items[1]
+            self.assertIsInstance(awaiting, dailies_render.OutstandingQuestion)
+            assert isinstance(awaiting, dailies_render.OutstandingQuestion)
+            self.assertEqual(awaiting.question, question)
+            reviewed = items[2]
+            self.assertIsInstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            assert isinstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            self.assertEqual(reviewed.reviewed, "Use the short route?")
+            unavailable = items[3]
+            self.assertIsInstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            assert isinstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            self.assertEqual(unavailable.question, question)
+            self.assertEqual(unavailable.reason, "reviewer unavailable")
+            self.assertEqual(dailies_render.due(items, datetime.fromisoformat(AT)), items[:3])
+            self.assertEqual(dailies_render.due(items, datetime(2026, 10, 4, 12)), items)
+            output = self.lines(footer("--nothing-needed", "--outstanding", str(path)))
+            self.assertFalse(output[-1].endswith(" - nothing needed"))
+            self.assertFalse(any("Which route?" in line for line in output))
+
+    def test_outstanding_reader_refuses_conflicting_or_incomplete_review_evidence(self) -> None:
+        cases: list[dict[str, object]] = [
+            {"reviewed": "Choose now?"},
+            {"question": "Choose now?", "reviewed": "Choose now?", "review_unavailable": "offline"},
+            {"question": ""},
+            {"question": "Choose now?", "reviewed": 42},
+            {"question": "Choose now?", "review_unavailable": 42},
+            {"question": None},
+            {"question": "Choose now?", "reviewed": None},
+            {"question": "Choose now?", "review_unavailable": None},
+        ]
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            for fields in cases:
+                with self.subTest(fields=fields):
+                    _ = path.write_text(json.dumps([{"since": AT, "text": "route", **fields}]))
+                    with self.assertRaises(dailies_render.InputError):
+                        _ = dailies_render.read_outstanding(path)
+
     def lines(self, result: Run) -> list[str]:
         self.assertEqual(result.code, 0, result.error)
         return result.lines
@@ -150,6 +207,71 @@ class ReportFooterTests(unittest.TestCase):
 
     def tail(self, result: Run) -> list[str]:
         return after_timeline(self.lines(result))
+
+    def test_render_calls_keep_home_configuration_separate_and_restore_the_caller(self) -> None:
+        caller_environment = os.environ.copy()
+        caller_directory = Path.cwd()
+        caller_arguments = sys.argv.copy()
+        caller_path = sys.path.copy()
+        caller_chart = dailies_render.CHART_CONF
+        caller_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for home, chart in ((first, "ascii"), (second, "default")):
+                result = run(["--chart", chart], home)
+                self.assertEqual(result.code, 0, result.error)
+                self.assertIn(str(Path(home) / ".local/state/showrunner/dailies.conf"), result.error)
+            self.assertIn("ascii", (Path(first) / ".local/state/showrunner/dailies.conf").read_text())
+            self.assertIn("default", (Path(second) / ".local/state/showrunner/dailies.conf").read_text())
+        self.assertEqual(os.environ, caller_environment)
+        self.assertEqual(Path.cwd(), caller_directory)
+        self.assertEqual(sys.argv, caller_arguments)
+        self.assertEqual(sys.path, caller_path)
+        self.assertEqual(dailies_render.CHART_CONF, caller_chart)
+        self.assertEqual({sig: signal.getsignal(sig) for sig in caller_signals}, caller_signals)
+
+    def test_cold_imported_production_paths_return_to_the_callers_home_after_each_case(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            caller = Path(scratch) / "caller"
+            caller.mkdir()
+            environment = {**os.environ, "HOME": str(caller)}
+            for name in ("SHOWRUNNERS_CONFIG", "NOTIFIER_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+                         "SHOWRUNNER_STATE_DIR", "SHOWRUNNERS_SESSIONS", "SHOWRUNNERS_SEND"):
+                _ = environment.pop(name, None)
+            program = '''import os, sys
+from pathlib import Path
+from types import ModuleType
+sys.path.insert(0, str(Path.cwd()))
+from cli_fixture import invoke_cli
+assert "showrunners" not in sys.modules
+assert "dailies_render" not in sys.modules
+caller = Path.home()
+caller_path = sys.path.copy()
+command = ModuleType("fixture_command")
+command.__file__ = "fixture_command.py"
+def paths(home):
+    import dailies_render, showrunners, note_file
+    assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
+    assert note_file.notes_dir() == home / "rust/hanadocs/agents"
+    assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
+    assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
+    assert showrunners.SESSIONS_DIR == home / ".claude/sessions"
+    assert showrunners.SHOWRUNNER_STATE_DIR == home / ".local/state/showrunner"
+for name in ("first", "second"):
+    home = caller.parent / name
+    home.mkdir()
+    def main():
+        paths(home)
+        return 0
+    result = invoke_cli(command, main, [], {**os.environ, "HOME": str(home)}, home,
+                        production_state=True)
+    assert result.returncode == 0, result.stderr
+    assert Path.home() == caller
+    assert sys.path == caller_path
+    paths(caller)
+'''
+            result = subprocess.run([sys.executable, "-c", program], env=environment,
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:
         counts = [{"label": "nightly queue", "count": 8}, {"label": "proposals", "not_found": True}]
@@ -192,12 +314,21 @@ class ReportFooterTests(unittest.TestCase):
         self.assertTrue(any("expected to release 02:30 EST (in 180 minutes)" in line for line in tail))
 
     def test_plumbing_in_holder_purpose_is_refused_in_report_and_footer(self) -> None:
-        record = holder(purpose="the writer's timings")
-        for result in (render(report(True), holders=[record]), footer(holders=[record])):
-            with self.subTest(result=result):
-                self.refused(result, "frame-time")
-                self.assertIn("'writer'", result.error)
-                self.assertIn("/build_hold hold again with other words", result.error)
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {
+            "HOME": scratch, "BUILDLOG_DIR": str(Path(scratch) / "buildlog"),
+            "BUILD_HOLD_DIR": str(Path(scratch) / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
+            "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-state"),
+            "NOTIFIER_SESSIONS_DIR": str(Path(scratch) / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(Path(scratch) / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }):
+            record = holder(purpose="the writer's timings")
+            for result in (render(report(True), holders=[record]), footer(holders=[record])):
+                with self.subTest(result=result):
+                    self.refused(result, "frame-time")
+                    self.assertIn("'writer'", result.error)
+                    self.assertIn("have frame-time run /build:hold hold again with other words", result.error)
 
     def test_multiple_holders_share_footer(self) -> None:
         records = [holder(), holder("2026-10-04T10:54:00-07:00", "other", "2026-10-04T10:57:00-07:00")]
@@ -240,6 +371,28 @@ class ReportFooterTests(unittest.TestCase):
         self.assertEqual(before[-1], "* next dailies: 11:30 PDT - nothing needed")
         self.assertEqual(after, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"])
 
+    def test_root_footer_counts_lower_lists_and_names_one_it_cannot_read(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            kid, grandkid = Path(scratch) / "kid.json", Path(scratch) / "grandkid.json"
+            _ = kid.write_text(json.dumps([{"since": "2026-10-03T09:05", "text": "send the Bevy PR"}]))
+            counted = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--below", str(kid),
+                                        "--below", str(grandkid)))
+            _ = kid.write_text("[]")
+            _ = grandkid.write_text("{bad")
+            unread = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--below", str(kid),
+                                       "--below", str(grandkid)))
+            _ = grandkid.write_text("[]")
+            quiet = self.lines(footer("--next-run", "11:30", "--nothing-needed", "--below", str(kid),
+                                      "--below", str(grandkid)))
+        self.assertEqual(counted, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT"])
+        self.assertEqual(unread, [*FOOTER_HEAD, *AGENT_LINES, "* grandkid: needs-user list unreadable",
+                                  "* next dailies: 11:30 PDT"])
+        self.assertEqual(quiet, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
+
+    def test_lower_showrunner_footer_names_its_root(self) -> None:
+        self.assertEqual(self.lines(footer("--next-run", "11:30", "--reports-to", "build-followups")),
+                         [*FOOTER_HEAD, *AGENT_LINES, "* reports to build-followups", "* next dailies: 11:30 PDT"])
+
     def test_held_unit_has_no_section_line(self) -> None:
         lines = self.lines(render(report(True), holders=[holder("2026-10-04T11:15:00-07:00")]))
         section = lines[: lines.index(FENCE)]
@@ -251,6 +404,20 @@ class ReportFooterTests(unittest.TestCase):
     def test_stale_marker_and_unmarked_active_hold_are_refused(self) -> None:
         self.refused(render(report(True)), "remove the stale unit marker")
         self.refused(render(report(False), holders=[holder()]), "mark the held unit")
+
+    def test_a_report_whose_only_units_hold_the_builds_needs_no_marker(self) -> None:
+        # A holder's own unit is never marked, so with no other unit there is none to mark.
+        by_name = render({**report(False), "units": [{**unit(False), "unit": "frame-time"}]}, holders=[holder()])
+        # A holder is named by its session; the builder says which unit that session directs.
+        by_session = render({**report(False), "units": [{**unit(False), "holds_builds": True}]}, holders=[holder()])
+        for result in (by_name, by_session):
+            self.assertEqual(result.code, 0, result.error)
+            self.assertEqual([line for line in timeline(result.lines) if "build hold" in line], [])
+            self.assertEqual(len([line for line in result.lines if line.startswith("* build hold: frame-time ")]), 1)
+        both = [{**unit(False), "holds_builds": True}, {**unit(False), "unit": "other", "label": "other"}]
+        self.refused(render({**report(False), "units": both}, holders=[holder()]), "mark the held unit")
+        marked = render({**report(False), "units": [{**unit(True), "holds_builds": True}]}, holders=[holder()])
+        self.refused(marked, "holds the build hold itself")
 
     def test_top_level_hold_is_refused(self) -> None:
         self.refused(render({**report(False), "build_hold": {"since": "10:56"}}), "holds are read from the holder files")
@@ -449,7 +616,7 @@ class TimelineWindowTests(unittest.TestCase):
             _ = input_path.write_text(json.dumps(fields))
             for chart, marker in (("default", "🟦"), ("ascii", "● ")):
                 with self.subTest(chart=chart):
-                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch)
+                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch, subprocess_cli=True)
                     self.assertEqual(result.code, 0, result.error)
                     row = next(line for line in timeline(result.lines) if line.startswith("widget"))
                     self.assertIn(marker, row)
@@ -933,6 +1100,163 @@ class GanttTests(unittest.TestCase):
     def test_a_unit_the_last_report_had_and_this_one_lacks_is_named(self) -> None:
         state = {"widget-enhancements": self.last_report(), "retired-unit": self.last_report()}
         self.assertEqual(self.above_chart(self.gantt([unit(False)], state)), ["- retired-unit: no longer in the report"])
+
+
+def saved_row(name: str, started: str = "", eta: str = "") -> dict[str, object]:
+    """One row of a lower production's saved report; with no times, a row whose ETA is not known."""
+    if not eta:
+        return {"name": name}
+    return {"name": name, "started": started, "eta": eta, "earliest": eta, "latest": eta}
+
+
+def saved(written: str, *rows: dict[str, object], units: int = 2, held: int = 0, interval: int | None = 30,
+          zone: str = ZONE) -> dict[str, object]:
+    return {"written": written, "zone": zone, "interval": interval, "units": units, "held": held, "rows": list(rows)}
+
+
+def child(name: str, saved_report: dict[str, object] | None = None, **fields: object) -> dict[str, object]:
+    lower: dict[str, object] = {"name": name, "open": 0, **fields}
+    if saved_report is not None:
+        lower["report"] = saved_report
+    return lower
+
+
+class LowerProductionTests(unittest.TestCase):
+    """A showrunner's report shows each production directly below it as one row."""
+
+    ROWS: ClassVar[tuple[dict[str, object], ...]] = (
+        saved_row("fps", "2026-10-04T09:10", "2026-10-04T13:20"),
+        saved_row("docs", "2026-10-04T10:05", "2026-10-04T14:40"),
+        saved_row("idle"),
+    )
+    lines: list[str] = []
+    # The chart opens at 06:00 for the unit's 08:50 start, so a 09:10 start sits three empty cells in.
+    LEAD: ClassVar[str] = "  " * 3
+
+    def rows(self, *children: dict[str, object], reports_to: str = "") -> list[str]:
+        fields: dict[str, object] = {**report(False), "children": list(children)}
+        if reports_to:
+            fields["reports_to"] = reports_to
+        result = render(fields)
+        self.assertEqual(result.code, 0, result.error)
+        self.lines = result.lines
+        return timeline(result.lines)[2:]
+
+    def refused(self, message: str, *children: dict[str, object]) -> None:
+        result = render({**report(False), "children": list(children)})
+        self.assertEqual(result.code, 2)
+        self.assertIn(message, result.error)
+
+    def test_no_units_and_nothing_below_renders_one_line_and_no_chart(self) -> None:
+        # Seen 2026-10-12: every unit's run had finished, so the builder left them all out.
+        result = render({**report(False), "units": []})
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual(result.lines[:4], ["**Dailies (Simple)**, 11:00 PDT", "",
+                                            "No unit is working: every run has finished.", ""])
+        self.assertNotIn("```", result.lines)
+        self.assertIn("* next dailies: 11:30 PDT - nothing needed", result.lines)
+
+    def test_no_units_still_charts_the_productions_below(self) -> None:
+        below = child("tool-based-ui", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1))
+        result = render({**report(False), "units": [], "children": [below]})
+        self.assertEqual(result.code, 0, result.error)
+        self.assertNotIn("No unit is working: every run has finished.", result.lines)
+        rows = timeline(result.lines)[1:]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("tool-based-ui "), rows[0])
+        self.assertTrue(rows[0].endswith("  3 units, 1 held"), rows[0])
+
+    def test_a_production_with_nothing_below_it_renders_as_before(self) -> None:
+        plain = render(report(False))
+        self.assertEqual(render({**report(False), "children": []}).lines, plain.lines)
+        self.assertEqual(timeline(plain.lines)[1][:9], "widget   ")
+
+    def test_a_current_child_is_one_row_from_its_earliest_start_to_its_latest_eta(self) -> None:
+        rows = self.rows(child("tool-based-ui", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1)))
+        self.assertEqual(rows, [f"tool-based-ui {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  3 units, 1 held"])
+        # The label column widens for the name, and the unit's row keeps its plan column.
+        self.assertTrue(timeline(self.lines)[1].startswith("widget          "), timeline(self.lines)[1])
+        self.assertIn("Phase 2 of 3", timeline(self.lines)[1])
+
+    def test_a_stale_child_says_when_its_report_is_from(self) -> None:
+        # Two intervals old is still current; a minute more is not.
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T10:00", *self.ROWS))),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held"])
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T09:59", *self.ROWS))),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held, as of 09:59"])
+        self.assertTrue(self.rows(child("kid", saved("2026-10-03T21:15", *self.ROWS, units=1)))[0]
+                        .endswith("  1 unit, 0 held, as of Sat 21:15"))
+
+    def test_a_child_that_reports_on_demand_always_says_when(self) -> None:
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T10:58", *self.ROWS, interval=None))),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held, as of 10:58"])
+
+    def test_a_child_with_no_saved_report_reads_no_report_yet(self) -> None:
+        self.assertEqual(self.rows(child("kid")), ["kid      ?  no report yet"])
+
+    def test_a_child_with_no_eta_keeps_its_counts(self) -> None:
+        self.assertEqual(self.rows(child("kid", saved("2026-10-04T10:40", saved_row("idle"), units=1))),
+                         ["kid      ?  1 unit, 0 held"])
+
+    def test_times_come_over_from_the_child_s_zone(self) -> None:
+        eastern = saved("2026-10-04T13:40", saved_row("fps", "2026-10-04T12:10", "2026-10-04T17:40"),
+                        zone="America/New_York")
+        self.assertEqual(self.rows(child("kid", eastern)),
+                         [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held"])
+
+    def test_expand_prints_the_child_s_rows_under_its_own(self) -> None:
+        rows = self.rows(child("kid", saved("2026-10-04T10:40", *self.ROWS), expand=True),
+                         child("other", saved("2026-10-04T10:40", *self.ROWS)))
+        self.assertEqual(rows, [f"kid      {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held",
+                                f"kid/fps  {self.LEAD}⬜⬜⬜⬜🟦 13:20",
+                                f"kid/docs {self.LEAD}  ⬜⬜⬜⬜🟦 14:40",
+                                "kid/idle ?",
+                                f"other    {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40  2 units, 0 held"])
+
+    def test_what_waits_on_the_user_below_marks_the_row_and_the_footer(self) -> None:
+        quiet = self.rows(child("kid", saved("2026-10-04T10:40", *self.ROWS)))
+        self.assertEqual(after_timeline(self.lines)[-1], "* next dailies: 11:30 PDT - nothing needed")
+        self.assertNotIn("open question", quiet[0])
+        marked = self.rows(child("kid", saved("2026-10-04T10:40", *self.ROWS), open=1), child("new", open=2),
+                           reports_to="top")
+        self.assertTrue(marked[0].endswith("  2 units, 0 held, 1 open question"), marked[0])
+        self.assertEqual(marked[1], "new      ?  no report yet, 2 open questions")
+        self.assertEqual(after_timeline(self.lines)[-2:], ["* reports to top", "* next dailies: 11:30 PDT"])
+
+    def test_a_list_below_that_cannot_be_read_is_named_in_the_footer(self) -> None:
+        _ = self.rows(child("other", unreadable=["other"]),
+                      child("kid", saved("2026-10-04T10:40", *self.ROWS), unreadable=["leaf", "kid"]))
+        self.assertEqual(after_timeline(self.lines)[-4:],
+                         ["* kid: needs-user list unreadable", "* leaf: needs-user list unreadable",
+                          "* other: needs-user list unreadable", "* next dailies: 11:30 PDT"])
+
+    def test_a_saved_report_carries_the_counts_and_one_row_of_each_production_below(self) -> None:
+        # Three levels: this production saves the leaf's counts inside its own, so its parent reads one file.
+        middle = {**report(False), "children": [child("leaf", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1),
+                                                      expand=True)]}
+        with tempfile.TemporaryDirectory() as scratch:
+            summary = last_report(middle, Path(scratch) / "none.json", AT, 30)
+        self.assertEqual({key: summary[key] for key in ("written", "zone", "interval", "units", "held")},
+                         {"written": AT, "zone": ZONE, "interval": 30, "units": 4, "held": 1})
+        self.assertEqual(summary["rows"], [
+            {"name": "widget", "started": "2026-10-04T08:50", "eta": "2026-10-04T12:40",
+             "earliest": "2026-10-04T12:40", "latest": "2026-10-04T12:40"},
+            {"name": "leaf", "started": "2026-10-04T09:10", "eta": "2026-10-04T14:40",
+             "earliest": "2026-10-04T14:40", "latest": "2026-10-04T14:40"}])
+        # The top reads that file as it is and draws the middle with the leaf inside its numbers.
+        rows = self.rows(child("middle", summary, expand=True))
+        self.assertEqual(rows, ["middle            ⬜⬜⬜⬜⬜⬜🟦 14:40  4 units, 1 held",
+                                "middle/widget     ⬜⬜⬜⬜🟦 12:40",
+                                f"middle/leaf   {self.LEAD}⬜⬜⬜⬜⬜🟦 14:40"])
+
+    def test_a_malformed_child_is_refused(self) -> None:
+        self.refused("children: widget is also a unit's label", child("widget"))
+        self.refused("children[0].open: a whole number of 0 or more", {"name": "kid"})
+        self.refused("children[0].report.written: required", child("kid", {"zone": ZONE}))
+        self.refused("children[0].report.zone: 'Mars/Base' is not an IANA zone name",
+                     child("kid", saved("2026-10-04T10:40", zone="Mars/Base")))
+        self.refused("children[0].report.rows[0].eta: required",
+                     child("kid", saved("2026-10-04T10:40", {"name": "fps", "started": "2026-10-04T09:10"})))
 
 
 if __name__ == "__main__":

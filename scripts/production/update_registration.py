@@ -8,19 +8,27 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
-    from ..hooks.showrunner_footer import FooterState, footer_state
+    from ..hooks.showrunner_footer import (FooterState, footer_state, set_footer_state,
+        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
+        read_pending_reviewed, delete_pending_reviewed)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from showrunner_footer import FooterState, footer_state
-from dailies_render import footer_main, read_outstanding
+    from showrunner_footer import (FooterState, footer_state, set_footer_state,
+        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
+        read_pending_reviewed, delete_pending_reviewed)
+import showrunners
+from dailies_render import (UNREADABLE_LIST, InputError, footer_main, read_outstanding,
+    DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
+    ReviewUnavailableOutstandingQuestion)
 
 if TYPE_CHECKING:
     from ..usage import agents_log
@@ -40,7 +48,17 @@ class InstanceAbsent(NamedTuple):
 class OutstandingItem(TypedDict):
     since: str
     text: str
-    after: str
+    after: NotRequired[str]
+    question: NotRequired[str]
+    reviewed: NotRequired[str]
+    review_unavailable: NotRequired[str]
+
+
+class QuestionRegistration(TypedDict):
+    time: str
+    text: str
+    reviewed: NotRequired[str]
+    question: NotRequired[str]
 
 
 class UnitJudgment(NamedTuple):
@@ -49,9 +67,23 @@ class UnitJudgment(NamedTuple):
     wait: str
 
 
-class OpenForUserItem(NamedTuple):
+class OpenReminder(NamedTuple):
     text: str
     after: str
+
+
+class QuestionForReview(NamedTuple):
+    text: str
+    after: str
+    question: str
+
+
+class OpenQuestionWithoutText(NamedTuple):
+    text: str
+    after: str
+
+
+OpenForUserItem = OpenReminder | QuestionForReview | OpenQuestionWithoutText
 
 
 class KeepOutstanding(NamedTuple):
@@ -105,15 +137,16 @@ DEFAULT_MINUTES = 15
 
 
 class UpdatesOnDemand(NamedTuple):
-    """The doc's Updates line reads `on demand`: a dailies runs only when the user asks for one."""
+    """The doc's Updates line reads `on demand`, or there is none: a dailies runs only when the user asks for one."""
 
 
 def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
-    if re.search(r"\bon demand\b", line):
-        return UpdatesOnDemand()
     match = re.search(r"every (\d+) minutes", line)
-    minutes = int(match.group(1)) if match else DEFAULT_MINUTES
+    # Quiet by default (user, 2026-10-13): only a line asking for a schedule makes one.
+    if match is None or re.search(r"\bon demand\b", line):
+        return UpdatesOnDemand()
+    minutes = int(match.group(1))
     if minutes <= 0:
         raise RegistrationFailure("prompt", "Updates interval must be positive")
     return ScheduledUpdates(minutes, "on the hour" in line)
@@ -160,11 +193,17 @@ def register(production: Production) -> None:
     if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
         _ = prompt_file.write_text(prompt, encoding="utf-8")
     check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
+    # No instance yet means a new production, which starts with its footer off (user, 2026-10-13). A
+    # restart finds its instance, so an existing production keeps the footer it has.
+    new_production = isinstance(instance(updates), InstanceAbsent)
     _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
               "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
               "--check", check, *(["--aligned"] if aligned else [])])
     if isinstance(schedule, UpdatesOnDemand):
         _ = notifier(["stop", updates])
+    if new_production:
+        set_footer_state(production.slug, FooterState.OFF)
+        report("footer", "ok", "off — new production; /showrunner:footer on turns it on")
     for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
         if isinstance(instance(name), InstanceAbsent):
             run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
@@ -239,31 +278,78 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
             if isinstance(raw, str):
                 if not raw.strip() or "\n" in raw:
                     raise state_error(step, path, key, "one nonempty line of text")
-                items.append(OpenForUserItem(raw, ""))
+                items.append(OpenReminder(raw, ""))
                 continue
             if not isinstance(raw, dict):
                 raise state_error(step, path, key, "text or an object")
             item = cast(dict[str, object], raw)
             for field in item:
-                if field not in {"text", "after"}:
+                if field not in {"text", "after", "question"}:
                     raise state_error(step, path, f"{key}.{field}", "a known key")
             if not isinstance(item.get("text"), str) or not cast(str, item["text"]).strip() or "\n" in cast(str, item["text"]):
                 raise state_error(step, path, f"{key}.text", "one nonempty line of text")
-            after = item.get("after")
-            if not isinstance(after, str) or re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d", after) is None:
+            after = item.get("after", "")
+            if not isinstance(after, str) or (after and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d", after) is None):
                 raise state_error(step, path, f"{key}.after", "YYYY-MM-DDTHH:MM")
             try:
-                _ = datetime.fromisoformat(after)
+                if after:
+                    _ = datetime.fromisoformat(after)
             except ValueError:
                 raise state_error(step, path, f"{key}.after", "YYYY-MM-DDTHH:MM") from None
-            items.append(OpenForUserItem(cast(str, item["text"]), after))
+            if "question" in item:
+                question = item["question"]
+                if not isinstance(question, str) or not question.strip():
+                    raise state_error(step, path, f"{key}.question", "nonempty text")
+                items.append(QuestionForReview(cast(str, item["text"]), after, question))
+            else:
+                items.append(OpenQuestionWithoutText(cast(str, item["text"]), after))
         outstanding = ReplaceOutstanding(tuple(items))
     return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding)
 
 
-def outstanding_path(production: Production) -> Path:
+def outstanding_file(slug: str) -> Path:
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    return root / "outstanding" / f"{production.slug}.json"
+    return root / "outstanding" / f"{slug}.json"
+
+
+def outstanding_path(production: Production) -> Path:
+    return outstanding_file(production.slug)
+
+
+# An item can wait longer than a week, so the day is named in full.
+WHEN = "%a %b %d %H:%M"
+
+
+def open_items(production: Production) -> None:
+    """Print in full what waits on the user: this production's items and, for a root, every lower one's.
+
+    Replies show only the count, so this list is what the showrunner gives when the user asks what
+    the open questions are. Each line is led by the production that owns the item.
+    """
+    now = datetime.now(production.zone).replace(tzinfo=None)
+    due: list[tuple[datetime, str, str]] = []
+    deferred: list[tuple[datetime, str, str]] = []
+    unreadable: list[str] = []
+    for slug in showrunners.user_facing(production.slug):
+        try:
+            items = read_outstanding(outstanding_file(slug))
+        except (InputError, OSError, ValueError):
+            unreadable.append(slug)
+            continue
+        for item in items:
+            text = item.text if isinstance(item, OutstandingReminder) else item.question
+            if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
+                deferred.append((item.timing.at, slug, text))
+            else:
+                due.append((item.since, slug, text))
+    for number, (since, slug, text) in enumerate(sorted(due), 1):
+        print(f"{number}. {slug}, since {since:{WHEN}}: {text}")
+    for after, slug, text in sorted(deferred):
+        print(f"deferred until {after:{WHEN}}: {slug}: {text}")
+    for slug in unreadable:
+        print(f"{slug}: {UNREADABLE_LIST}")
+    report("open", "ok", f"{len(due)} due, {len(deferred)} deferred"
+           + (f", {len(unreadable)} unreadable" if unreadable else ""))
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -300,35 +386,129 @@ def append_log(production: Production, event: str, path: Path | None, before_com
     report("log", "ok", f"event {count}" + (" with STATE" if block else ""))
 
 
+def record_question_history(outstanding: Path, items: list[OutstandingItem], now: datetime) -> None:
+    """Retain two days of registrations, including questions that have closed."""
+    history = outstanding.with_suffix(".history.jsonl")
+    retained: list[QuestionRegistration] = []
+    cutoff = now - timedelta(hours=48)
+    if history.exists():
+        for line in history.read_text(encoding="utf-8").splitlines():
+            try:
+                value = cast(object, json.loads(line))
+                if not isinstance(value, dict):
+                    continue
+                fields = cast(dict[str, object], value)
+                stamp, text = fields.get("time"), fields.get("text")
+                if not isinstance(stamp, str) or not isinstance(text, str):
+                    continue
+                dated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                if dated.tzinfo is not None and dated >= cutoff:
+                    entry = QuestionRegistration(time=stamp, text=text)
+                    for field in ("question", "reviewed"):
+                        content = fields.get(field)
+                        if isinstance(content, str):
+                            if field == "question":
+                                entry["question"] = content
+                            else:
+                                entry["reviewed"] = content
+                    retained.append(entry)
+            except ValueError:
+                continue
+    for item in items:
+        entry = QuestionRegistration(time=now.isoformat(), text=item["text"])
+        if "question" in item:
+            entry["question"] = item["question"]
+        if "reviewed" in item:
+            entry["reviewed"] = item["reviewed"]
+        retained.append(entry)
+    _ = history.write_text("".join(json.dumps(item) + "\n" for item in retained), encoding="utf-8")
+
+
+def keep_question_fields(entry: OutstandingItem, previous: Outstanding) -> None:
+    if not isinstance(previous, OutstandingReminder):
+        entry["question"] = previous.question
+    if isinstance(previous, ReviewedOutstandingQuestion):
+        entry["reviewed"] = previous.reviewed
+    elif isinstance(previous, ReviewUnavailableOutstandingQuestion):
+        entry["review_unavailable"] = previous.reason
+
+
+class HeldRegistrationQuestion(NamedTuple):
+    details: str
+
+
+def review_open_question(slug: str, item: QuestionForReview) -> PendingQuestion | HeldRegistrationQuestion:
+    # Copied registration trees can run reminder-only commands without notify installed.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+    if TYPE_CHECKING:
+        from ..notify import review
+    else:
+        import review
+    outcome = review.review_question(review.QuestionKey(slug, item.text), item.question)
+    if isinstance(outcome, review.QuestionAccepted):
+        return PendingReviewedQuestion(item.text, outcome.question)
+    if isinstance(outcome, review.QuestionReviewUnavailable):
+        return PendingReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
+    details = outcome.questions if isinstance(outcome, review.QuestionAwaitingFacts) else outcome.details
+    return HeldRegistrationQuestion("; ".join(details + tuple(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
+
+
 def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
-    if footer_state(production.slug) is FooterState.OFF:
-        report("footer", "ok", "footers off")
-        return
     state = judgment_state(path, "footer")
     outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
-        previous: dict[str, OutstandingItem] = {}
-        if outstanding.exists():
-            saved = cast(object, json.loads(outstanding.read_text(encoding="utf-8")))
-            if isinstance(saved, list):
-                for value in cast(list[object], saved):
-                    if isinstance(value, dict):
-                        fields = cast(dict[str, object], value)
-                        text = fields.get("text")
-                        since = fields.get("since")
-                        if isinstance(text, str) and isinstance(since, str):
-                            previous[text] = OutstandingItem(since=since, text=text,
-                                                             after=str(fields.get("after", "")))
-        since = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
-        entries: list[dict[str, str]] = []
+        previous = {item.text: item for item in read_outstanding(outstanding)} if outstanding.exists() else {}
+        now = datetime.now(production.zone)
+        since = now.strftime("%Y-%m-%dT%H:%M")
+        entries: list[OutstandingItem] = []
+        pending: list[PendingQuestion] = []
+        held: list[str] = []
+        items_by_text: dict[str, OpenForUserItem] = {}
         for item in state.outstanding.items:
-            entry = {"since": previous[item.text]["since"] if item.text in previous else since,
-                     "text": item.text}
+            if item.text not in items_by_text:
+                items_by_text[item.text] = item
+        # Validate all new object questions before starting any review.
+        for item in items_by_text.values():
+            if item.text not in previous and isinstance(item, OpenQuestionWithoutText):
+                raise RegistrationFailure("footer", f"{item.text}: a new question needs its full text in `question`")
+        for item in items_by_text.values():
+            entry = OutstandingItem(since=previous[item.text].since.strftime("%Y-%m-%dT%H:%M")
+                                    if item.text in previous else since, text=item.text)
             if item.after:
                 entry["after"] = item.after
+            if item.text in previous:
+                keep_question_fields(entry, previous[item.text])
+            elif isinstance(item, QuestionForReview):
+                accepted = review_open_question(production.slug, item)
+                if isinstance(accepted, PendingReviewedQuestion):
+                    entry["question"], entry["reviewed"] = item.question, accepted.reviewed
+                    pending.append(accepted)
+                elif isinstance(accepted, PendingReviewUnavailableQuestion):
+                    entry["question"], entry["review_unavailable"] = item.question, accepted.reason
+                    pending.append(accepted)
+                else:
+                    held.append(f"{item.text}: {accepted.details}")
             entries.append(entry)
+        if held:
+            raise RegistrationFailure("footer", "question held for review: " + "; ".join(held))
         outstanding.parent.mkdir(parents=True, exist_ok=True)
+        instance_dir = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{production.slug}"
+        if (instance_dir / "conf").exists():
+            existing_pending = read_pending_reviewed(instance_dir)
+            retained_pending = [item for item in existing_pending if item.text in items_by_text]
+            if retained_pending != existing_pending or pending:
+                delete_pending_reviewed(instance_dir)
+                add_pending_reviewed(instance_dir, retained_pending + pending)
+        record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+        for item in pending:
+            accepted_text = item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
+            print("reviewed question: " + accepted_text)
+    # The switch hides the printed footer only. What waits on the user is stored above either way,
+    # so the dailies and the open-questions count still see it.
+    if footer_state(production.slug) is FooterState.OFF:
+        report("footer", "ok", "footers off")
+        return
     schedule = instance(f"showrunner-{production.slug}")
     next_run: str | None = None
     if isinstance(schedule, InstancePresent) and not schedule.output.splitlines()[0].endswith(", stopped"):
@@ -337,7 +517,9 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             due = datetime.fromtimestamp(int(match.group(1)), production.zone)
             days = (due.date() - datetime.now(production.zone).date()).days
             next_run = due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
-    if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed):
+    place = showrunners.place_of(production.slug)
+    if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed,
+                   below=[outstanding_file(slug) for slug in place.below], root=place.root):
         raise RegistrationFailure("footer", "renderer refused the footer")
     report("footer", "ok", "rendered")
 
@@ -345,7 +527,7 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("register", "time", "log", "footer"):
+    for action in ("register", "time", "log", "footer", "open"):
         subcommand = commands.add_parser(action)
         _ = subcommand.add_argument("--production", type=Path, required=True)
         if action == "register":
@@ -357,7 +539,7 @@ def main() -> int:
             _ = subcommand.add_argument("event")
             _ = subcommand.add_argument("--state", type=Path)
             _ = subcommand.add_argument("--before-compaction", action="store_true")
-        else:
+        elif action == "footer":
             _ = subcommand.add_argument("--state", type=Path)
             _ = subcommand.add_argument("--nothing-needed", action="store_true")
     args = parser.parse_args()
@@ -370,6 +552,8 @@ def main() -> int:
             report("time", "ok", production_time(production, cast(str, args.stamp)))
         elif action == "log":
             append_log(production, cast(str, args.event), cast(Path | None, args.state), cast(bool, args.before_compaction))
+        elif action == "open":
+            open_items(production)
         else:
             footer(production, cast(Path | None, args.state), cast(bool, args.nothing_needed))
         return 0

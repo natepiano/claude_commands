@@ -5,38 +5,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import os
 from pathlib import Path
 import sys
-from typing import Literal
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-for directory in ("build_hold", "mac_test", "lint"):
+for directory in ("build_hold", "mac_test", "lint", "lib"):
     sys.path.insert(0, str(SCRIPTS / directory))
 import build_hold
 import mac_test
 import offload
-import sweep
-
-
-Platform = Literal["linux", "macos"]
-
-
-@dataclass(frozen=True)
-class LocalTarget:
-    name: str
-    platform: Platform
-
-
-@dataclass(frozen=True)
-class SshTarget:
-    name: str
-    platform: Platform
-    settings: Path
-
-
-Target = LocalTarget | SshTarget
+from target_config import (
+    ConfigError as ConfigError,
+    LocalTarget as LocalTarget,
+    Platform as Platform,
+    SshTarget as SshTarget,
+    Target as Target,
+    read_targets as read_targets,
+)
 
 
 @dataclass(frozen=True)
@@ -62,10 +48,6 @@ class EligibleTarget:
 class ExcludedTarget:
     target: Target
     reason: str
-
-
-class ConfigError(ValueError):
-    """A build-target key is missing or has an unsupported value."""
 
 
 @dataclass(frozen=True)
@@ -97,9 +79,35 @@ class Free:
 
 
 @dataclass(frozen=True)
-class Running:
+class IdleSince:
+    """The claim watcher has seen the Mac idle since this time."""
+
+    when: datetime
+
+
+@dataclass(frozen=True)
+class NotSeenIdle:
+    """The claim watcher has not seen the Mac idle during this claim."""
+
+
+ClaimIdle = IdleSince | NotSeenIdle
+NOT_SEEN_IDLE = NotSeenIdle()
+
+
+@dataclass(frozen=True)
+class RunningJob:
+    """One live Mac claim: a job for one repository, or for the whole Mac."""
+
     what: str
     since: datetime
+    idle: ClaimIdle
+
+
+@dataclass(frozen=True)
+class Running:
+    """Every live Mac claim, oldest first."""
+
+    jobs: tuple[RunningJob, ...]
 
 
 @dataclass(frozen=True)
@@ -121,35 +129,6 @@ class StateUnreadable:
 
 
 TargetState = Free | Running | Held | Unreachable | StateUnreadable
-
-
-def read_targets(path: Path | None = None) -> tuple[Target, ...]:
-    default = path if path is not None else SCRIPTS.parent / "config/build_targets.conf"
-    config = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(default))).expanduser().resolve()
-    values = sweep.config_values(str(config))
-    names = tuple(name.strip() for name in values.get("targets", "").split(","))
-    if not all(names) or len(set(names)) != len(names):
-        raise ConfigError(f"targets: expected distinct target names in {config}")
-    targets: list[Target] = []
-    for name in names:
-        kind = values.get(f"kind.{name}", "")
-        if kind not in ("local", "ssh"):
-            raise ConfigError(f"kind.{name}: expected local or ssh, got {kind!r}")
-        platform = values.get(f"platform.{name}", "")
-        if platform not in ("linux", "macos"):
-            raise ConfigError(f"platform.{name}: expected linux or macos, got {platform!r}")
-        if kind == "local":
-            targets.append(LocalTarget(name, platform))
-            continue
-        key = f"settings.{name}"
-        setting = values.get(key, "")
-        if not setting:
-            raise ConfigError(f"{key}: expected a settings file")
-        settings = (config.parent / Path(setting).expanduser()).resolve()
-        if not settings.is_file():
-            raise ConfigError(f"{key}: settings file does not exist: {settings}")
-        targets.append(SshTarget(name, platform, settings))
-    return tuple(targets)
 
 
 def target_eligibility(
@@ -181,6 +160,15 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def running_job(claim: mac_test.HeldClaim) -> RunningJob:
+    record = claim.record
+    since = mac_test.aware_timestamp(record["since"], claim.path, "since")
+    if "idle_since" not in record:
+        return RunningJob(record["what"], since, NOT_SEEN_IDLE)
+    idle = mac_test.aware_timestamp(record["idle_since"], claim.path, "idle_since")
+    return RunningJob(record["what"], since, IdleSince(idle))
+
+
 def target_state(target: Target) -> TargetState:
     """Read state without probing a host or changing coordination files."""
     try:
@@ -196,7 +184,7 @@ def target_state(target: Target) -> TargetState:
             )
             return Held(holder.name, holder.purpose, holder.since, end)
         paths = mac_test.state_paths()
-        run = mac_test.read_run(paths.run)
+        claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
         if not isinstance(block, mac_test.NoMacBlock):
             block_end = (
@@ -205,9 +193,7 @@ def target_state(target: Target) -> TargetState:
                 else AwaitingBlockRemoval()
             )
             return Held(block.holder, block.reason, block.since, block_end)
-        if isinstance(run, mac_test.NoRun) or not mac_test.run_is_live(run):
-            return Free()
-        since = mac_test.aware_timestamp(run["since"], paths.run, "since")
-        return Running(run["what"], since)
+        jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
+        return Running(jobs) if jobs else Free()
     except (OSError, UnicodeError, mac_test.StateReadError) as error:
         return StateUnreadable(str(error))

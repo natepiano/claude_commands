@@ -14,7 +14,7 @@ from pathlib import Path
 def write_timer(notifier_dir: Path, slug: str, session_id: str, zone: str, doc: Path | str) -> Path:
     """Write the update timer of the production `slug`, addressed to `session_id`.
 
-    The zone is the doc's own User zone line, so the doc is given one unless `zone` is empty.
+    Older docs carry a User zone line, so the doc is given one unless `zone` is empty. It is not read.
     """
     instance = notifier_dir / f"showrunner-{slug}"
     instance.mkdir(parents=True, exist_ok=True)

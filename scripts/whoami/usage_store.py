@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from agent_accounts import Quota, Report
+from note_file import canonical_label
 
 
 class StoredWindow(TypedDict):
@@ -49,8 +50,31 @@ def key(tool: str, login: str) -> str:
     return f"codex:{folded}" if tool == "Codex" else folded
 
 
+class LabelWindow(TypedDict):
+    # Percent of the window left.
+    left: float
+    # When the window resets, epoch seconds; None when no window is open.
+    resets_at: int | None
+    # When this was read, epoch seconds.
+    at: int
+
+
+class LabelUsage(TypedDict, total=False):
+    five_hour: LabelWindow
+    weekly: LabelWindow
+
+
 def store_file() -> Path:
     return Path.home() / ".local" / "state" / "agent-notes" / "usage.json"
+
+
+def label_file() -> Path:
+    """Each Claude account's readings under its note label, for the status line.
+
+    The status line knows its session's label (CLAUDE_CONFIG_DIR/account-label)
+    and not its login, and runs too often to look one up. It holds no login.
+    """
+    return store_file().with_name("by-label.json")
 
 
 def _window(value: object) -> StoredWindow | None:
@@ -140,20 +164,59 @@ def merge(stored: dict[str, StoredUsage], reports: list[Report], checked_at: dat
 
 def write(stored: dict[str, StoredUsage]) -> None:
     """Replace the store in one step, readable by this user only."""
-    path = store_file()
+    _replace(store_file(), json.dumps(stored, indent=1, sort_keys=True) + "\n")
+
+
+def _label_window(window: StoredWindow) -> LabelWindow | None:
+    try:
+        at = int(datetime.fromisoformat(window["at"]).timestamp())
+        resets_at = int(datetime.fromisoformat(window["resets"]).timestamp()) if window["resets"] else None
+    except ValueError:
+        return None
+    return LabelWindow(left=window["left"], resets_at=resets_at, at=at)
+
+
+def by_label(stored: dict[str, StoredUsage], logins: dict[str, str]) -> dict[str, LabelUsage]:
+    """The stored Claude readings of each label in `logins` (label to login).
+
+    A label that is itself a login is left out, so no address reaches the file.
+    """
+    labelled: dict[str, LabelUsage] = {}
+    for label, login in sorted(logins.items()):
+        usage = stored.get(key("Claude", login))
+        if usage is None or "@" in label:
+            continue
+        entry = LabelUsage()
+        if "five_hour" in usage and (five_hour := _label_window(usage["five_hour"])) is not None:
+            entry["five_hour"] = five_hour
+        if "weekly" in usage and (weekly := _label_window(usage["weekly"])) is not None:
+            entry["weekly"] = weekly
+        if entry:
+            labelled[canonical_label(label)] = entry
+    return labelled
+
+
+def _replace(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            _ = output.write(json.dumps(stored, indent=1, sort_keys=True) + "\n")
+            _ = output.write(text)
         os.replace(temporary, path)
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
 
 
-def save(reports: list[Report], checked_at: datetime) -> None:
-    """Keep every reading `reports` hold beside the ones already stored."""
+def save(reports: list[Report], checked_at: datetime, logins: dict[str, str] | None = None) -> None:
+    """Keep every reading `reports` hold beside the ones already stored.
+
+    With `logins` (Claude note label to login), also rewrite the by-label file
+    from the whole store, so a label keeps its last good reading when this read
+    was refused; the status line judges its age.
+    """
     stored = load()
     if merge(stored, reports, checked_at):
         write(stored)
+    if logins is not None:
+        _replace(label_file(), json.dumps(by_label(stored, logins), indent=1, sort_keys=True) + "\n")
