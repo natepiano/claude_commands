@@ -1187,29 +1187,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 38 — Swap rows name a run's launching session  · status: done
 
-**Depends on:** Phase 37
+#### As-built
 
-#### Work Order
-
-**Goal:** a swap row for a live run with no holder marker names the Claude session that launched it (showrunner · unit · worker), in place of `unknown session (<run folder>)`. Showrunner, 2026-10-16: 14 of 35 rows in a live preview read `unknown session`.
-
-**Constraints from prior phases:** `_run_is_live(folder, holders)` in `scripts/agents/codex_mesh.py` keeps a run with no holder live only while a roster `launcher_pid` is alive (Phase 36); liveness must not change. `_workers_swap_lines` in `scripts/accounts/accounts.py` names a holder through the roster (`roster.roster`, `UnderShowrunner`, `DirectsUnit`), then a saved session name, then `unknown session (<run folder>)`; rows fold per (holder, slot) (Phases 36–37).
-
-**Spec:**
-
-1. `WorkersRunSwitch` gains `launcher_sessions: tuple[str, ...]`: for a run with no holder, the Claude session ids found by walking each live `launcher_pid`'s parent-process chain to the first process that a session record (`scripts/message/sessions.py`, pid plus process start) names. Reuse an existing process-ancestry helper when the repository has one; it must work on Linux and macOS.
-2. `_workers_swap_lines` names such a run from its launcher session exactly as it names a holder (machine, showrunner or production, unit or session name), and folds its rows under that session.
-3. `unknown session (<run folder>)` remains only when neither a holder nor a launcher session resolves.
-4. Liveness, interrupts, resumes and leftover-server handling are unchanged; `--dry-run` prints the same rows.
-5. `docs/accounts.md` and `commands/showrunner/accounts.md` say a run without a holder marker is named by the session that launched it.
+- `_launcher_sessions(folder)` in `scripts/agents/codex_mesh.py` names a run with no holder by each live roster `launcher_pid`'s nearest ancestor that a running session record names, counting only records whose `procStart` matches the process. It reuses `codex_winddown.owner` and `process_table.snapshot`, so it works on Linux and macOS.
+- `WorkersRunSwitch` and `WorkersRunMove` carry `launcher_sessions`; the swap and the sign-in change fill it for live runs with no holder. Liveness, interrupts, resumes and leftover servers are unchanged.
+- `_workers_swap_lines` names and folds such a run like a holder (`showrunner · unit · worker`); `unknown session (<run folder>)` remains only when nothing resolves.
 
 **Files:**
-
-- `scripts/agents/codex_mesh.py` — launcher sessions on `WorkersRunSwitch`.
+- `scripts/agents/codex_mesh.py` — launcher sessions.
 - `scripts/accounts/accounts.py` — naming from a launcher session.
-- `scripts/agents/test_codex_mesh.py`, `scripts/accounts/test_accounts.py` — tests.
 - `docs/accounts.md`, `commands/showrunner/accounts.md` — swap row naming.
-
-**Workers:** impl (code and docs), test (tests).
-
-**Acceptance gate:** a test gives a holderless run a live launcher whose parent chain reaches a recorded session under a showrunner and prints `showrunner · unit · worker`; a run whose launcher chain reaches no session still prints `unknown session (<run folder>)`; a live preview shows no `unknown session` row for a run whose launcher session is live; the merge gate is green.
