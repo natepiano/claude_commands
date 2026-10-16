@@ -491,7 +491,7 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(sample.call_args.kwargs["since"], datetime.fromisoformat("2026-10-12T00:00:00+00:00"))
 
     def test_sample_still_counts_a_relayed_question_as_a_detected_ask(self) -> None:
-        # Phase 7 reply 28: recipient filtering belongs to the Stop check, not measurement.
+        # Recipient filtering belongs to the Stop check, not to the sample count.
         body = ('**Also sent to the hana showrunner:** distant picking is listed as "waiting for review". '
                 + 'Did you approve it? It stays "waiting for review" until hana answers.')
         path = self.transcript("relay.jsonl", [("2026-10-15T21:49:10Z", body, "end_turn")])
@@ -551,7 +551,7 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((), False))
 
     def test_naming_a_unit_as_the_subject_or_executor_keeps_the_user_ask(self) -> None:
-        # Phase 7 replies 10, 17 and 19 are user decisions despite their unit names.
+        # Real user decisions that name a unit as subject or executor.
         question = "Should handler-enh go ahead with phases 1 and 2?"
         request = "Say go and I'll have cargo-liner do it."
         choice = ("Allow (recommended, since both requests are a day old): "
