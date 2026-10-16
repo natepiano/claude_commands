@@ -47,6 +47,7 @@ class RoleMapTests(unittest.TestCase):
         }, clear=True)))
         _ = self.enterContext(patch.object(role_map, "ROLE_MAP_HOST", "natedev"))
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="macbook"))
+        _ = self.enterContext(patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)))
         # Every test must opt in to a fake transport; never attempt real ssh.
         _ = self.enterContext(patch.object(role_map, "ssh_role_map",
             side_effect=AssertionError("test did not configure fake role-map ssh")))
@@ -77,6 +78,82 @@ class RoleMapTests(unittest.TestCase):
     def files(self, home: Path) -> dict[str, bytes]:
         return {str(path.relative_to(home)): path.read_bytes()
                 for path in home.rglob("*") if path.is_file()}
+
+    def test_scratch_home_reads_its_groups_and_workers_without_transport_or_cache_changes(self) -> None:
+        self.seed(self.home, groups={"units": "claude3", "showrunners": "claude2"}, workers="codex3")
+        self.seed(self.server_home, groups={"units": "claude1"}, workers="codex1")
+        cache = role_map.role_map_cache_file()
+        _ = cache.write_text(json.dumps({"at": RoleMapReadTime.now(timezone.utc).isoformat(),
+                                        "map": {"groups": {"units": "claude1"}, "workers": "codex1"}}))
+        before = self.files(self.home), self.files(self.server_home)
+        with (patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.server_home)),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("scratch read reached ssh")) as ssh):
+            selected = role_map.read_role_map()
+        ssh.assert_not_called()
+        self.assertEqual(selected.groups, {"units": "claude3", "showrunners": "claude2"})
+        self.assertEqual(selected.workers, "codex3")
+        self.assertEqual((self.files(self.home), self.files(self.server_home)), before)
+
+        alias = self.home.parent / "login home alias"
+        alias.symlink_to(self.home, target_is_directory=True)
+        for process_home, login_home in ((alias, self.home), (self.home, alias)):
+            with (self.subTest(process_home=process_home, login_home=login_home),
+                  patch.dict(os.environ, {"HOME": str(process_home)}),
+                  patch.object(role_map, "_login_home", return_value=role_map.LoginHome(login_home)),
+                  patch.object(role_map, "ssh_role_map", side_effect=self.remote) as ssh):
+                selected = role_map.read_role_map()
+            ssh.assert_called_once_with(("role-map-read",))
+            self.assertEqual((selected.groups, selected.workers), ({"units": "claude1"}, "codex1"))
+
+    def test_scratch_home_writes_its_groups_workers_and_history_without_remote_changes(self) -> None:
+        self.seed(self.home, groups={"units": "claude3", "showrunners": "claude1"})
+        self.seed(self.server_home, groups={"units": "claude1"}, workers="codex1")
+        remote_before = self.files(self.server_home)
+        at = RoleMapReadTime.now(timezone.utc).isoformat()
+        group = role_map.RoleMapChange("units", "claude2", "scratch selection", at, "scratch-move")
+        workers = role_map.RoleMapChange("workers", "codex3", "scratch workers", at)
+        with (patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.server_home)),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("scratch write reached ssh")) as ssh):
+            role_map.write_role_map(group)
+            role_map.write_role_map(workers)
+            selected = role_map.read_role_map()
+        ssh.assert_not_called()
+        groups = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
+        self.assertEqual(groups["units"], {"label": "claude2", "move_id": "scratch-move",
+                                          "cause": "by hand", "window": "unknown"})
+        self.assertEqual(groups["showrunners"], "claude1")
+        self.assertEqual(selected.groups, groups)
+        self.assertEqual(selected.workers, "codex3")
+        self.assertEqual(json.loads(accounts.accounts_config_file().read_text()), {"workers": "codex3"})
+        history = [json.loads(line) for line in accounts.groups_file().with_name("roles.jsonl").read_text().splitlines()]
+        self.assertEqual(history, [
+            {"at": at, "group": "units", "label": "claude2", "why": "scratch selection",
+             "move_id": "scratch-move", "cause": "by hand", "window": "unknown"},
+            {"at": at, "role": "workers", "label": "codex3", "account_label": "codex3",
+             "why": "scratch workers", "cause": "by hand", "window": "unknown"},
+        ])
+        self.assertEqual(self.files(self.server_home), remote_before)
+        self.assertFalse(role_map.role_map_cache_file().exists())
+
+    def test_unreadable_login_home_keeps_reads_and_writes_in_the_process_home(self) -> None:
+        self.seed(self.home, groups={"units": "claude3"}, workers="codex3")
+        change = role_map.RoleMapChange("units", "claude2", "isolated selection",
+                                        RoleMapReadTime.now(timezone.utc).isoformat(), "unread-login-move")
+        with (patch.object(role_map, "_login_home", return_value=role_map.LoginHomeUnread()),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unread login home reached ssh")) as ssh):
+            before = role_map.read_role_map()
+            role_map.write_role_map(change)
+            after = role_map.read_role_map()
+        ssh.assert_not_called()
+        self.assertEqual((before.groups, before.workers), ({"units": "claude3"}, "codex3"))
+        stored = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
+        self.assertEqual(stored["units"], {"label": "claude2", "move_id": "unread-login-move",
+                                          "cause": "by hand", "window": "unknown"})
+        self.assertEqual((after.groups, after.workers), (stored, "codex3"))
+        history = accounts.groups_file().with_name("roles.jsonl").read_text().splitlines()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(json.loads(history[0])["move_id"], "unread-login-move")
+        self.assertFalse(role_map.role_map_cache_file().exists())
 
     def test_mac_group_write_changes_only_natedev_and_preserves_transition_history(self) -> None:
         self.seed(self.home, groups={"units": "claude3"})
