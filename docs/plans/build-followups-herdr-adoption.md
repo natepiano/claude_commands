@@ -554,38 +554,28 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 19 — Mac suites green and restart focus  · status: done
 
-**Depends on:** Phase 18
+#### As-built
 
-**User sees:** before — five shutdown tests and six relaunch tests fail on the Mac, and a restart into a still-running herdr server leaves the restored conversation hidden behind an empty shell; after — every Mac suite is green and the restored conversation is the one in front.
-
-#### Work Order
-
-**Goal:** make every Mac suite green on Phase 18's code and show the restored conversation after a restart into a running server (split from the live checks, now Phase 20, so the repair ships first).
-
-**Spec:**
-
-0. Mac suite repairs, first, on Phase 18's checkpoint (the showrunner holds its merge until this lands). Five shutdown tests went red on the Mac with Phase 18: four `test_shutdown_cli` migration-conflict cases for `conduct`, because the conductor now prints its Darwin readiness line before the migration error, so the one-error output gains a line — print the conductor's and the fixer's readiness line only when the detached start asked for it (the launcher sets it in the child's environment), never on a plain `conduct` or `fix`; and `test_missing_tmux_never_builds_during_tmux_free_or_recovery_observation`, which now reports the Darwin `ps` reader failing (`ps: no executable: ps`) instead of the missing tmux it tests — the test pins the platform it fakes. Six `scripts/lib/test_relaunch.py` cases fail on the Mac because the child reports `/private/tmp/...` for a `/tmp/...` root: resolve the temp root. Restart into a herdr server that is still running focuses the restored pane's workspace (`Herdr.focus_workspace`): live on the Mac, the user's window stayed attached through `agents down`, herdr gave it an empty shell workspace, and the restored conversation landed unfocused behind it; restart never closes a workspace it did not create, and a failed focus is one issue line. A conductor or fixer that fails to start names its log path in the error. `detached.start_detached` takes `DiscardOutput | AppendLog` and `InheritEnvironment | ExplicitEnvironment` in place of its two optional arguments, converted to `subprocess` arguments at that boundary. Each repair keeps the suites green on natedev.
+- `conduct` and `fix` print their readiness line only when `DETACHED_STARTUP_SIGNAL=1` is in their environment; each pops it at once. The Darwin detached launchers set it through `ExplicitEnvironment`; a plain `conduct` or `fix` prints no readiness line.
+- `detached.start_detached(argv, *, ready, within, output: DiscardOutput | AppendLog, environment: InheritEnvironment | ExplicitEnvironment)`; conversion to `/dev/null`, a log stream and `env` happens only at the `subprocess` call.
+- A conductor or fixer start failure raises a `RuntimeError` ending `; log: <path>`.
+- `Herdr.focus_workspace(workspace_id)` runs `herdr workspace focus`. Restart focuses the restored Claude workspace after adopting a running server, and the restored Codex workspace after its start. A failed focus prints one line, `<name> restart issue: restored workspace not focused: …`, and the launch still succeeds. Restart never closes a workspace it did not create.
+- Every `scripts/herdr`, `scripts/shutdown` and `scripts/lib` suite is green on the Mac and on natedev.
 
 **Files:**
-- `scripts/shutdown/settle.py` — conductor readiness line only under a detached start.
-- `scripts/shutdown/remote_control.py` — fixer readiness line only under a detached start.
-- `scripts/shutdown/test_settle.py` — that case.
-- `scripts/shutdown/test_remote_control.py` — that case.
-- `scripts/shutdown/test_shutdown_cli.py` — the tmux case pins its platform.
-- `scripts/lib/test_relaunch.py` — resolved temp root.
-- `scripts/lib/detached.py` — semantic output and environment arguments.
-- `scripts/lib/test_detached.py` — those cases.
-- `scripts/shutdown/restart.py` — focus the restored workspace.
-- `scripts/shutdown/test_restart.py` — that case.
+- `scripts/lib/detached.py`, `scripts/lib/test_detached.py` — semantic output and environment arguments.
+- `scripts/shutdown/settle.py`, `scripts/shutdown/remote_control.py` — readiness line by environment marker; log path in start errors.
 - `scripts/herdr/herdr.py` — `Herdr.focus_workspace`.
-- `scripts/herdr/test_herdr.py` — that case.
+- `scripts/shutdown/restart.py` — focuses the restored workspace.
+- `scripts/shutdown/test_settle.py`, `test_remote_control.py`, `test_restart.py`, `test_shutdown_cli.py` (missing-tmux case uses the Linux process fixture; migration-conflict case selects Darwin), `scripts/herdr/test_herdr.py`, `scripts/lib/test_relaunch.py` (resolved temp root) — regressions.
 
-**Workers:** 1 writer.
-- `test` (as impl) — every file above.
+**Binds later work:** every caller of `start_detached` passes the semantic `output` and `environment` values, never raw `subprocess` arguments. The live Mac checks of restart focus and fixer start rely on the focus behavior, the readiness marker and the `log: <path>` error suffix.
 
-**Constraints from prior phases:** the Mac clone `~/scratch/herdr-mac` pulls the pushed branch; copying the worktree to the Mac is refused, so every Mac run is from a pushed commit. Throwaway sessions are picked with `--only <name> --here --no-alert`, and every herdr command names `--session`. `accounts.py exec --probe '<account>' -n <name>` launches only Claude, never inside herdr and never Codex; a herdr-hosted Claude probe on the Mac is `herdr_sessions.py start --name <probe> --cwd <a trusted folder>` from a Mac Ghostty window (ssh cannot open it), a Codex fixture is `codex` run by hand in a pane of that probe session, and cleanup is `herdr --session <probe> server stop` plus removing `~/.config/herdr/sessions/<probe>`. Mac background programs start through `scripts/lib/detached.py`, never launchd.
-
-**Acceptance gate:** `merge_gate.py --tests-only` green on natedev, `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean, and `scripts/herdr`, `scripts/shutdown` and the whole `scripts/lib` suite green on the Mac from the pushed commit.
+**Gotchas:**
+- herdr gives a window still attached through `server stop` a new empty shell workspace, focused in front; anything restored afterwards sits behind it until focused.
+- The readiness line is requested by environment, not by platform; a platform check changes plain CLI output.
+- On the Mac `/tmp` resolves to `/private/tmp`; a child reports the resolved path, so tests compare against the resolved temp root.
+- A test that fakes a platform's process reader pins that platform, or the Darwin `ps` reader fails first (`ps: no executable: ps`).
 
 ### Phase 20 — Crash recovery on the Mac, live check with the user  · status: todo
 
