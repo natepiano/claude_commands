@@ -221,36 +221,15 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 ### Phase 6 — First live rewrite  · status: done
 
-**Depends on:** Phase 5
-**Blocked by:** G3, G5
+#### As-built
 
-#### Work Order
-
-**Goal:** the first real hana lint call that fails on a multiply-add after Phase 5 is live shows the rewrite count and passes, and the showrunner hears it the moment it happens.
-
-**Spec:**
-
-The user, via the showrunner, 2026-10-16: "i think 96 hours is too late to find out if this is working"; the showrunner: "As soon as Phase 5 is promoted, prove the rewrite fires: the first real hana clippy step with a multiply-add warning shows the rewrite count and passes; report it the moment it happens."
-
-The wake: at Phase 5's checkpoint, the unit director creates the notifier instance (`docs/as-built/session-notifier.md`; no polling, no agent re-arms a timer):
-`zsh ~/.claude/scripts/message/notifier.sh new mul-add-first-fire --every 5 --to session:<this session's id> --from mul-add-first-fire --command "mul-add first fire: run phase 6" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py first-fire <phase-5-checkpoint>"`
-The check sends only when G5 clears. On the wake, the unit director removes the instance (`notifier.sh remove mul-add-first-fire`), runs `watch.py first-fire` once more, and sends the showrunner the call's time, its rewrite count and the passing verdict before dispatching anything.
-
-Then `impl` reads that call's steps from the build log (judging clippy failed with `#suboptimal_flops`; the JSON step and the saved count line; fmt; judging clippy status 0) and confirms in the hana repository that the commit following the call carries the `mul_add` rewrite. It adds one paragraph to the as-built's "Lint-step rewrite" section: the call's time in EDT and UTC, the count, the passing verdict, and the commit.
+- The first passing live rewrite was hana lint call `v20261017T014232-1432240-10080`, started 2026-10-16 21:42:32 EDT (2026-10-17T01:42:32Z): judging clippy failed with `#suboptimal_flops` (101), the JSON replay (101) supplied one suggestion, the count line read `rewrote 1 multiply-add(s) in 1 file(s)`, fmt passed and the final judging clippy passed (0). The showrunner heard it at the wake.
+- The fix was `crates/hana_diegetic/src/layout/element.rs:2511`; it sat uncommitted in `~/rust/widget-enhancements`, whose branch still pointed at the call's starting commit. The paragraph is in the as-built's "Lint-step rewrite" section.
 
 **Files:**
 - `docs/as-built/build-followups-mul-add.md` — the first-fire paragraph
 
-**Workers:** 1 writer; nothing to test.
-- `impl` — the as-built paragraph, from the build log and the hana history (read-only)
-
-**Constraints from prior phases:**
-- Phase 5 marks the rewrite's JSON step by `--message-format=json` in its argv; judging clippy steps have none. Both share the lint call's `call_id`.
-- `watch.py` is in `~/.local/state/mul-add-hook/lint-rewrite/`.
-- Each successful rewrite saves its count line (`verify.sh: rewrote <n> multiply-add(s) in <m> file(s)`) as `<call_id>.log` in that folder; a lint run with nothing to rewrite prints `verify.sh: clippy's multiply-add rewrite changed nothing` and keeps the first verdict. Both notifier instances were created at Phase 5's checkpoint, so Phase 6 starts at the wake.
-- Never write `~/.local/state/buildlog` or the hana tree.
-
-**Acceptance gate:** `watch.py first-fire <phase-5-checkpoint>` exits 0 and names the call the paragraph describes; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
+**Binds later work:** a rewrite lands as an uncommitted edit in the calling worktree, so no hana commit marks it. Three earlier count logs in the window (2026-10-16 20:43Z, 21:12Z, 21:42Z) rewrote without a passing verdict in their call.
 
 ### Phase 7 — Re-measure the lint-step rewrite  · status: todo
 
@@ -288,6 +267,7 @@ If both limits PASS, the as-built proposes retiring the edit hook (one moving pa
 **Constraints from prior phases:**
 - Phase 4's limits: 1.979 per 100 and 0.100 seat-hours a day. Its own result (8.235 and 1.104) is the baseline row.
 - Phase 6's first-fire paragraph names the first rewrite; the window still starts at T_lint, not at that call.
+- Phase 6 found three earlier count logs in the window (2026-10-16 20:43Z, 21:12Z, 21:42Z) whose calls rewrote but did not end in a passing verdict; the first passing rewrite came at 2026-10-17 01:42Z. A rewrite lands as an uncommitted edit in the calling worktree and is committed later with that agent's own work, so no hana commit marks a rewrite.
 - Rewrite counts come from the saved `<call_id>.log` count lines in `~/.local/state/mul-add-hook/lint-rewrite/`; a JSON step with no saved log rewrote nothing (or its save failed, which lint reports and does not fail on).
 - The build log index is UTC; state times in EDT with UTC beside them.
 - Never write `~/.local/state/buildlog`, the block log or the hana tree.
