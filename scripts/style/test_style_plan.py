@@ -265,6 +265,9 @@ class StylePlanTests(unittest.TestCase):
             + "A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
             + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
             + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+            + "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+            + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+            + "follow the converted value to the parameter it fills. "
             + "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
             + "is no accessor: its result is another value. "
             + "A binding fills several parameters only when that same value fills them: "
@@ -294,6 +297,9 @@ class StylePlanTests(unittest.TestCase):
             + "A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
             + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
             + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+            + "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+            + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+            + "follow the converted value to the parameter it fills. "
             + "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
             + "is no accessor: its result is another value. "
             + "A binding fills several parameters only when that same value fills them: "
@@ -369,6 +375,21 @@ class StylePlanTests(unittest.TestCase):
                 self.assertIn(guidance, text)
                 self.assertLess(text.index(guidance), text.index("The rule renames a binding that already exists"))
         self.assertIn(exclusions[0] + " " + exclusions[1] + " The rule renames a binding that already exists", text)
+
+    def test_written_names_phase_never_targets_a_conversion_parameter_before_following_the_call(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        guidance = (
+            "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+            + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+            + "follow the converted value to the parameter it fills."
+        )
+        self.assertIn(guidance, text)
+        self.assertIn(
+            "name the binding after the parameter the converted value fills. "
+            + guidance + " A method that takes arguments", text)
 
     def test_written_names_phase_for_other_rules_keeps_the_existing_spec_without_conversion_guidance(self) -> None:
         _ = self.rule("name-bindings-to-match-parameters-extra")
