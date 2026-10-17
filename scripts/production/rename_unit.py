@@ -38,7 +38,7 @@ import issues  # noqa: E402
 import phase_table  # noqa: E402
 import production_units  # noqa: E402
 import proposal_issue  # noqa: E402
-import proposals_table  # noqa: E402
+import proposals_folder  # noqa: E402
 import rename_state  # noqa: E402
 import retarget_fix  # noqa: E402
 import review_pool  # noqa: E402
@@ -477,13 +477,13 @@ def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
 
 def _unit_proposals(rename: UnitRename, unit: str) -> list[issues.Issue]:
     """The production's active proposal issues that name `unit` for one of this unit's plans."""
-    folder = proposals_table.issues_folder(Path(rename.doc))
+    folder = proposals_folder.issues_folder(Path(rename.doc))
     if folder is None:
         return []
     plans = [str(path.relative_to(Path(rename.checkout))) for path in _plans(rename)]
     # The issues folder is shared by every production; unit ids are only unique within one, so an
     # issue counts only when its plan is one of this unit's plans.
-    return [issue for issue in issues.open_issues(folder, proposals_table.PROPOSAL_TAG)
+    return [issue for issue in issues.open_issues(folder, proposals_folder.PROPOSAL_TAG)
             if issue.value("unit") == unit and any(plan in (issue.value("plan") or "") for plan in plans)]
 
 
