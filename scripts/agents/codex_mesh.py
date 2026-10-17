@@ -843,9 +843,11 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
         if isinstance(port, int) and port > 0:
             stored["port"] = port
     if (
-        previous.get("status") == "ended"
-        and previous.get("thread_id") == record["thread_id"]
-        and record["status"] != "ended"
+        previous.get("thread_id") == record["thread_id"]
+        and (
+            (previous.get("status") == "ended" and record["status"] != "ended")
+            or (previous.get("status") == "paused" and record["status"] not in ("ended", "paused"))
+        )
     ):
         stored = dict(previous)
     if isinstance(size, KnownContextSize):
@@ -3971,12 +3973,79 @@ def command_reopen(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pause_roster(session_dir: str) -> None:
+    """Fence launcher completion writes before interrupting each retained thread."""
+    path = _session_path(session_dir, ROSTER_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        for name, raw in roster.items():
+            record = _as_dict(raw)
+            status = _as_str(record.get("status"))
+            if status == "ended":
+                continue
+            with _pending_file(session_dir, name) as pending:
+                _ = pending.seek(0)
+                _ = pending.truncate()
+            if status != "paused":
+                record.update({"status": "paused", "paused_from": status,
+                               "paused_turn": status in ("running", "starting")})
+            _advance_roster_revision(record)
+            roster[name] = record
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        handle.flush()
+    for name, raw in roster.items():
+        record = _as_dict(raw)
+        thread_id = _as_str(record.get("thread_id"))
+        if record.get("status") != "paused" or not thread_id:
+            continue
+        port = _as_int(record.get("port"))
+        servers = _recorded_run_servers(session_dir)
+        server = next((server for server in servers
+                       if (port <= 0 or server.get("port") == port)
+                       and _pid_alive(_as_int(server.get("pid")))), dict[str, object]())
+        live_port = _as_int(server.get("port"))
+        if live_port <= 0:
+            continue
+        try:
+            client = Client(live_port, f"pause-{os.getpid()}")
+        except OSError as error:
+            print(f"codex_mesh: {name}: could not connect to paused worker: {error}", file=sys.stderr)
+            continue
+        try:
+            _ = _drop_queued_messages(client, thread_id)
+            state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+            if isinstance(state, ThreadLive):
+                _ = _interrupt_turn(client, thread_id, state.turn_id)
+            # Record server evidence even if a completion raced the original roster read.
+            if isinstance(state, (ThreadLive, ThreadIdle)):
+                with path.open("r+", encoding="utf-8") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    current = _as_dict(_loads(handle.read()))
+                    entry = _as_dict(current.get(name))
+                    if entry.get("status") == "paused" and entry.get("thread_id") == thread_id:
+                        entry["paused_turn"] = isinstance(state, ThreadLive)
+                        current[name] = entry
+                        _ = handle.seek(0)
+                        _ = handle.truncate()
+                        _ = handle.write(json.dumps(current, indent=2, sort_keys=True))
+        except (OSError, RuntimeError, TimeoutError) as error:
+            print(f"codex_mesh: {name}: could not interrupt paused worker: {error}", file=sys.stderr)
+        finally:
+            client.close()
+
+
 def command_stop(args: argparse.Namespace) -> int:
-    """Reap the session app-server. Nothing else does: it is deliberately
-    detached so it outlives each delegate, which means the end of the run is the
-    only place that knows it is finished with."""
+    """Reap the run servers, ending seats unless a director restart pauses them."""
     session_dir = _as_str(_attr(args, "session_dir"))
-    _mark_all_roster_ended(session_dir)
+    if _attr(args, "pause"):
+        _pause_roster(session_dir)
+    else:
+        _mark_all_roster_ended(session_dir)
     retired_path = _session_path(session_dir, RETIRED_FILE)
     stored = _read_json_object(retired_path).get("servers")
     retired = cast("list[object]", stored) if isinstance(stored, list) else []
@@ -6194,6 +6263,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stop = subparsers.add_parser("stop", help="stop the session app-server")
     _ = stop.add_argument("--session-dir", required=True)
+    _ = stop.add_argument("--pause", action="store_true", help="retain worker threads for a director restart")
     stop.set_defaults(handler=command_stop)
 
     reopen = subparsers.add_parser("reopen", help="recover an ended or abandoned seat on its recorded thread")

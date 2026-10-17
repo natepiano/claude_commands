@@ -375,6 +375,112 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         return saved
 
+    def test_confirmed_unit_restart_sends_one_resume_message_for_all_recorded_seats(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        for moved in (False, True):
+            with self.subTest(account_move=moved):
+                owner = unit("resume-moved" if moved else "resume-plain")
+                owner["cwd"] = str(self.root / "working directory")
+                run = self.root / "worker run"
+                run.mkdir(exist_ok=True)
+                old_prompt = str(run / "old prompt.md")
+                launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
+                            "task", "task instructions", "impl", "continue task", "0", "impl", "mesh-prefix"]
+                seats = [
+                    record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
+                    record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="private-thread-review", turn_live=False, launcher_command=[]),
+                ]
+                saved = entry(owner)
+                saved["codex_seats"] = seats
+                if moved:
+                    saved["target"] = "claude3"
+                    saved["source_label"] = LABEL
+                self.create([saved])
+                run_commands = CommandRecorder()
+                live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                with (patch.object(restart, "_run", run_commands),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude3"))):
+                    restart.confirm_entry(saved, RESTARTED, True)
+                sends = [argv for argv in run_commands.calls if "--key" in argv and "resume-workers-" + owner["session_id"] in argv]
+                self.assertEqual(len(sends), 1)
+                argv = sends[0]
+                self.assertIn(str(restart.SEND), argv)
+                self.assertEqual(argv[argv.index("--to") + 1], "session:" + owner["session_id"])
+                self.assertEqual(argv[argv.index("--from") + 1], "shutdown")
+                text = argv[argv.index("--text") + 1]
+                lines = text.splitlines()
+                self.assertEqual(lines[0], "Resume your Codex workers; do not open new ones.")
+                self.assertEqual(lines[-1], "Each seat continues its own thread; after resuming, send later work with --to as usual.")
+                work_line = next(line for line in lines if line.startswith("impl (impl, was working):"))
+                expected = list(launcher) if moved else [*launcher[:4], "--to", "impl", *launcher[4:]]
+                expected[expected.index(old_prompt)] = str(run / "impl.resume-prompt.md")
+                # Shell parsing preserves every original argument, including spaces.
+                self.assertIn(shlex.join(expected), work_line)
+                idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
+                self.assertIn("review.sh --to review", idle_line)
+                self.assertIn(owner["cwd"], text)
+                self.assertNotIn(old_prompt, text)
+                self.assertNotIn("private-thread-", text)
+                persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
+                self.assertEqual(persisted["progress"]["kind"], "restarted")
+
+    def test_move_on_the_source_account_receives_no_worker_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        saved = entry(unit("source-still-live"))
+        saved["target"] = "claude3"
+        saved["source_label"] = LABEL
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept", turn_live=True, launcher_command=[])]
+        self.create([saved])
+        owner = saved["session"]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        commands = CommandRecorder()
+        with (patch.object(restart, "_run", commands),
+              patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2"))):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(commands.calls, [])
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
+
+    def test_confirmed_restart_without_seats_and_unconfirmed_restart_send_no_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        for live, seats in ((True, []), (False, [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread", turn_live=True, launcher_command=[])])):
+            with self.subTest(live=live):
+                saved = entry(unit("empty" if live else "not-back"))
+                saved["codex_seats"] = seats
+                self.create([saved])
+                commands = CommandRecorder()
+                with patch.object(restart, "_run", commands):
+                    restart.confirm_entry(saved, RESTARTED, live)
+                self.assertFalse(any("--key" in argv and any(value.startswith("resume-workers-") for value in argv) for argv in commands.calls))
+                self.assertEqual(saved["progress"]["kind"], "restarted" if live else "restart failed")
+
+    def test_resume_message_failure_is_logged_once_and_does_not_fail_restart(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        saved = entry(unit("queued-workers"))
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread", turn_live=True, launcher_command=[])]
+        self.create([saved])
+        calls: list[list[str]] = []
+
+        def failed_send(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.CompletedProcess[str]:
+            del dry_run, check
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "QUEUED: director has no socket\n", "")
+
+        with (patch.object(restart, "_run", failed_send),
+              patch.object(syslog, "syslog") as logged,
+              redirect_stderr(io.StringIO()) as errors,
+              redirect_stdout(io.StringIO()) as output):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(saved["progress"]["kind"], "restarted")
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
+        log_lines = [*errors.getvalue().splitlines(), *output.getvalue().splitlines(), *[str(cast(object, call.args[-1])) for call in logged.call_args_list]]
+        self.assertEqual(len(log_lines), 1)
+        self.assertIn("resume", log_lines[0].lower())
+
     def test_live_source_account_cannot_confirm_a_move(self) -> None:
         saved = self.moved_record()
         owner = saved["session"]

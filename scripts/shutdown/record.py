@@ -454,6 +454,16 @@ class ProgressStep(TypedDict):
     detail: str
 
 
+class PausedSeat(TypedDict):
+    """A director's worker thread and the launcher needed to continue its task."""
+    run_dir: str
+    seat: str
+    role: str
+    thread_id: str
+    turn_live: bool
+    launcher_command: list[str]
+
+
 class SessionShutdown(TypedDict):
     move_id: NotRequired[str]
     login: str
@@ -469,6 +479,7 @@ class SessionShutdown(TypedDict):
     probe: bool
     session: Session
     workers: list[Session]
+    codex_seats: NotRequired[list[PausedSeat]]
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
@@ -1118,6 +1129,18 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
         raise InvalidRecord(f"{place}.then is invalid")
 
 
+def _paused_seat(value: object, place: str) -> PausedSeat:
+    fields = _mapping(value, place)
+    return PausedSeat(
+        run_dir=_string(_required(fields, "run_dir", place), f"{place}.run_dir"),
+        seat=_string(_required(fields, "seat", place), f"{place}.seat"),
+        role=_string(_required(fields, "role", place), f"{place}.role"),
+        thread_id=_string(_required(fields, "thread_id", place), f"{place}.thread_id"),
+        turn_live=_boolean(_required(fields, "turn_live", place), f"{place}.turn_live"),
+        launcher_command=_strings(fields.get("launcher_command", []), f"{place}.launcher_command"),
+    )
+
+
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
@@ -1149,6 +1172,11 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     if not isinstance(probe, bool):
         raise InvalidRecord(f"{place}.probe must be a boolean")
     values["probe"] = probe
+    if "codex_seats" in values:
+        values["codex_seats"] = [
+            _paused_seat(seat, f"{place}.codex_seats[{index}]")
+            for index, seat in enumerate(_items(values["codex_seats"], f"{place}.codex_seats"))
+        ]
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")

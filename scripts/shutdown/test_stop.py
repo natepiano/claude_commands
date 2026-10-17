@@ -583,7 +583,7 @@ class StopTests(ShutdownTestCase):
             codex_mesh=lambda args: codex.append(args) or 0,
             tmux=lambda args: tmux.append(args) or (1 if args[0] == 'has-session' else 0),
         )
-        self.assertEqual(codex, [['stop', '--session-dir', pending]])
+        self.assertEqual(codex, [['stop', '--pause', '--session-dir', pending]])
         self.assertEqual(tmux, [['kill-session', '-t', '=tmux-owner'], ['has-session', '-t', '=tmux-owner']])
         self.assertEqual(finished['stop_issues'], [])
         self.assertEqual(finished['progress'], saved['progress'])
@@ -671,7 +671,7 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(report['stop_issues'], [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-    def test_now_ends_busy_codex_workers_before_stopping_their_owner(self) -> None:
+    def test_now_pauses_codex_run_without_ending_busy_workers(self) -> None:
         run_dir = str(self.root / 'run')
         owned_server = server(run_dir, 900, busy_workers=['impl', 'test'])
         stored = top_level('busy', 101, status='busy', run_dirs=[run_dir], codex_servers=[owned_server])
@@ -682,8 +682,61 @@ class StopTests(ShutdownTestCase):
             events.append('codex ' + ' '.join(arguments))
             return 0
         report = stop.stop_session(self.stored_record(), kill=lambda pid, sent: events.append(f'kill {pid} {sent}'), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
-        self.assertEqual(events[:3], [f'codex end --session-dir {run_dir} --to impl', f'codex end --session-dir {run_dir} --to test', f'kill 101 {signal.SIGTERM}'])
+        self.assertIn(f'codex stop --pause --session-dir {run_dir}', events)
+        self.assertEqual([event for event in events if event.startswith('codex ')], [f'codex stop --pause --session-dir {run_dir}'])
+        self.assertEqual([event for event in events if event.startswith('kill ')], [f'kill 101 {signal.SIGTERM}'])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
+
+    def test_stop_persists_owned_busy_and_idle_seats_before_pause_removes_launcher_evidence(self) -> None:
+        run = self.root / "owned run"
+        other = self.root / "another directors run"
+        run.mkdir()
+        other.mkdir()
+        launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "task", "worker instructions", "impl", "resume task", "0", "impl", "prefix"]
+        proc = self.root / "proc"
+        for pid, parent, argv in ((800, 801, ["python3", "codex_mesh.py", "start"]), (801, 1, launcher)):
+            path = proc / str(pid)
+            path.mkdir(parents=True)
+            _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
+            _ = (path / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+        roster = run / "mesh_roster.json"
+        _ = roster.write_text(json.dumps({
+            "busy": {"thread_id": "busy-thread", "role": "impl", "status": "running", "turn_id": "turn-1", "launcher_pid": 800},
+            "review": {"thread_id": "review-thread", "role": "review", "status": "done"},
+            "ended": {"thread_id": "ended-thread", "role": "impl", "status": "ended"},
+        }))
+        foreign = other / "mesh_roster.json"
+        _ = foreign.write_text(json.dumps({"foreign": {"thread_id": "foreign-thread", "status": "running"}}))
+        stored = unit("director", 101, run_dirs=[str(run)], codex_servers=[server(str(run), 900, busy_workers=["busy"])])
+        self.create(records_for_test([entry(stored)], force="now"))
+        calls: list[list[str]] = []
+
+        def pause(arguments: list[str]) -> int:
+            calls.append(arguments)
+            # Persistence must precede cleanup, which can destroy process evidence.
+            seats = self.stored_record().get("codex_seats", [])
+            self.assertEqual({seat["seat"] for seat in seats}, {"busy", "review"})
+            roster.unlink()
+            return 0
+
+        def launcher_alive(pid: int) -> bool:
+            return pid in {800, 801}
+
+        with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+            finished = stop.stop_session(self.stored_record(), kill=lambda _pid, _sent: None,
+                is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([stored]),
+                clock=lambda: NOW_UTC, codex_mesh=pause, tmux=lambda _args: 1,
+                sleep=lambda _seconds: None)
+        self.assertEqual(calls, [["stop", "--pause", "--session-dir", str(run)]])
+        seats = {seat["seat"]: seat for seat in finished.get("codex_seats", [])}
+        self.assertEqual(seats["busy"], record.PausedSeat(run_dir=str(run), seat="busy", role="impl", thread_id="busy-thread", turn_live=True, launcher_command=launcher))
+        self.assertEqual(seats["review"], record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="review-thread", turn_live=False, launcher_command=[]))
+        prompt = run / "busy.resume-prompt.md"
+        self.assertEqual(prompt.read_text().strip(), "You were paused when your unit director stopped for an account move or restart. Continue the task you were on from where you stopped; your earlier instructions still hold.")
+        self.assertFalse((run / "review.resume-prompt.md").exists())
+        self.assertTrue(foreign.exists())
+        self.assertEqual(self.stored_record().get("codex_seats"), finished.get("codex_seats"))
 
     def test_absent_entry_is_not_signalled_or_refused_for_readiness(self) -> None:
         stored = top_level('gone', 101)
@@ -709,7 +762,7 @@ class StopTests(ShutdownTestCase):
             tmux_calls.append(arguments)
             return 1 if arguments[0] == 'has-session' else 0
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: self.fail('an absent owner was signalled'), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([]), clock=lambda: NOW_UTC, codex_mesh=codex, tmux=tmux, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
-        self.assertEqual(codex_calls, [['stop', '--session-dir', run_dir]])
+        self.assertEqual(codex_calls, [['stop', '--pause', '--session-dir', run_dir]])
         self.assertEqual(tmux_calls, [['kill-session', '-t', '=exact-unit-pane'], ['has-session', '-t', '=exact-unit-pane']])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
@@ -963,7 +1016,7 @@ class StopTests(ShutdownTestCase):
         self.create(records_for_test([entry(stored)]))
         codex_calls: list[list[str]] = []
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda arguments: codex_calls.append(arguments) or 0, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
-        self.assertEqual(codex_calls, [['stop', '--session-dir', run_dir]])
+        self.assertEqual(codex_calls, [['stop', '--pause', '--session-dir', run_dir]])
         self.assertEqual(report['progress'], record.SessionStopped(kind='stopped', at=NOW))
         self.assertEqual(report['stop_issues'], [])
 
@@ -997,7 +1050,7 @@ class StopTests(ShutdownTestCase):
         ]
         self.assertEqual(first["progress"], record.SessionStopped(kind="stopped", at=NOW))
         self.assertEqual(first["stop_issues"], expected_issues)
-        self.assertEqual(first_codex, [["stop", "--session-dir", run] for run in runs])
+        self.assertEqual(first_codex, [["stop", "--pause", "--session-dir", run] for run in runs])
         calls: list[list[str]] = []
         tmux_calls: list[list[str]] = []
         second = stop.stop_session(
@@ -1008,7 +1061,7 @@ class StopTests(ShutdownTestCase):
             codex_mesh=lambda args: calls.append(args) or 0,
             tmux=lambda args: tmux_calls.append(args) or (1 if args[0] == "has-session" else 0),
         )
-        self.assertEqual(calls, [["stop", "--session-dir", runs[1]]])
+        self.assertEqual(calls, [["stop", "--pause", "--session-dir", runs[1]]])
         self.assertEqual(tmux_calls, [["kill-session", "-t", "=tmux-owner"], ["has-session", "-t", "=tmux-owner"]])
         self.assertEqual(second["progress"], first["progress"])
         self.assertEqual(second["stop_issues"], [])
@@ -1022,7 +1075,7 @@ class StopTests(ShutdownTestCase):
         self.create(records_for_test([entry(stored)]))
 
         def codex(arguments: list[str]) -> int:
-            self.assertEqual(arguments, ['stop', '--session-dir', str(run_dir)])
+            self.assertEqual(arguments, ['stop', '--pause', '--session-dir', str(run_dir)])
             server_file.unlink()
             return 0
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda pid: pid == 900, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _arguments: 1, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
@@ -1080,7 +1133,7 @@ class StopTests(ShutdownTestCase):
             codex_mesh=lambda args: calls.append(args) or 0,
             tmux=lambda args: 1 if args[0] == "has-session" else 0,
         )
-        self.assertEqual(calls, [["stop", "--session-dir", pending]])
+        self.assertEqual(calls, [["stop", "--pause", "--session-dir", pending]])
         self.assertEqual(finished["progress"]["kind"], "already gone")
 
     def test_process_disappearing_at_first_signal_is_already_gone(self) -> None:
@@ -1409,7 +1462,7 @@ class StopTests(ShutdownTestCase):
             is_alive=lambda _pid: False, clock=lambda: NOW_UTC, codex_mesh=codex,
             tmux=lambda _args: self.fail("stale tmux cleanup ran"),
         )
-        self.assertEqual(calls, [["stop", "--session-dir", runs[0]]])
+        self.assertEqual(calls, [["stop", "--pause", "--session-dir", runs[0]]])
         self.assertEqual(finished["progress"], replacement)
         self.assertEqual(finished["stop_issues"], saved["stop_issues"])
 
@@ -1460,7 +1513,7 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(signals, [signal.SIGTERM])
         self.assertEqual(finished["progress"], replacement)
 
-    def test_stop_rechecks_ownership_between_forced_codex_workers(self) -> None:
+    def test_stop_rechecks_ownership_after_pausing_codex_run(self) -> None:
         run = str(self.root / "run")
         saved = entry(unit("owner", 101, codex_servers=[server(run, 900, busy_workers=["one", "two"])]))
         saved["force"] = "now"
@@ -1476,11 +1529,11 @@ class StopTests(ShutdownTestCase):
             return 0
 
         finished = stop.stop_session(
-            saved, kill=lambda _pid, _sent: self.fail("a replaced owner was signalled"),
-            fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
+            saved, kill=lambda _pid, _sent: None, is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False, fresh_inventory=lambda _login, _only: machine_inventory([saved["session"]]),
             clock=lambda: NOW_UTC, codex_mesh=codex, tmux=lambda _args: self.fail("stale cleanup ran"),
         )
-        self.assertEqual(calls, [["end", "--session-dir", run, "--to", "one"]])
+        self.assertEqual(calls, [["stop", "--pause", "--session-dir", run]])
         self.assertEqual(finished["progress"], replacement)
 
     def test_stop_cleanup_rechecks_ownership_before_the_ghostty_signal(self) -> None:

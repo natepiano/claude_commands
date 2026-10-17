@@ -60,6 +60,7 @@ from record import (  # noqa: E402
     NoLiveRecord,
     PendingTimer,
     SessionShutdown,
+    PausedSeat,
     SessionRestoredTimersPending,
     SessionNeedsManualRestart,
     SessionProgress,
@@ -594,7 +595,8 @@ def restart_note(
     """Build the exact first prompt given to a resumed session."""
     if "target" in record and record["requested_by"]["kind"] != "snapshot":
         note = account_move_note(record["session"], record["target"],
-                                 record.get("source_label", record["label"]), record.get("why", ""))
+                                 record.get("source_label", record["label"]), record.get("why", ""),
+                                 codex_seats=record.get("codex_seats", []))
         where = record["where"]
         if where["kind"] == "said":
             punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
@@ -755,13 +757,16 @@ def _resume_command(session: Session, prompt: str, target: str = "", *, login: s
     return _resume_shell(_resume_parts(session, prompt, target, login=login, at=at, probe=probe))
 
 
-def account_move_note(session: Session, target: str, source_label: str, why: str = "") -> str:
+def account_move_note(session: Session, target: str, source_label: str, why: str = "", *,
+                      codex_seats: Sequence[PausedSeat] = ()) -> str:
     """One stable explanation for every moved conversation and host."""
     reason = why or f"{source_label} is out of usage"
     continuation = (" Continue your /unit:direct run." if session["kind"] == "unit" else "")
+    workers = (" Your Codex workers are paused, not ended; a message lists the command that resumes each."
+               if codex_seats else "")
     return (f"You were moved from {source_label} to {target} because {reason}. "
             + "This was an account move, not a stop. Continue where you stopped."
-            + continuation + " First run `~/.claude/scripts/lib/py "
+            + continuation + workers + " First run `~/.claude/scripts/lib/py "
             + "~/.claude/scripts/message/send.py pending` for messages kept while you "
             + "were down; if you were waiting on the user, keep waiting.")
 
@@ -1699,6 +1704,62 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
+def _resume_worker_command(seat: PausedSeat) -> str:
+    """Rebuild a launcher invocation without changing its task or role arguments."""
+    launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
+    fallback = shlex.join([str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"]])
+    command = seat["launcher_command"]
+    if not seat["turn_live"] or not command:
+        return fallback + " (supply your usual arguments)"
+    command = list(command)
+    index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
+    if index < 0:
+        return fallback + " (supply your usual arguments)"
+    # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
+    position = index + 1
+    options: list[str] = []
+    while position < len(command) and command[position].startswith("--"):
+        option = command[position]
+        if position + 1 >= len(command):
+            return fallback + " (supply your usual arguments)"
+        value = command[position + 1]
+        if option not in {"--slot", "--pool", "--lease", "--to"}:
+            options.extend((option, value))
+        position += 2
+    arguments = command[position:]
+    if not arguments:
+        return fallback + " (supply your usual arguments)"
+    if len(arguments) < 2:
+        arguments.append(".")
+    prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
+    if len(arguments) < 3:
+        arguments.append(prompt)
+    else:
+        arguments[2] = prompt
+    return shlex.join([*command[:index + 1], *options, "--to", seat["seat"], *arguments])
+
+
+def _send_worker_resume(record: SessionShutdown) -> None:
+    seats = record.get("codex_seats", [])
+    if record["session"]["kind"] != "unit" or not seats:
+        return
+    lines = ["Resume your Codex workers; do not open new ones."]
+    cwd = shlex.quote(record["session"]["cwd"])
+    for seat in seats:
+        state = "was working" if seat["turn_live"] else "idle"
+        lines.append(f"{seat['seat']} ({seat['role']}, {state}): {_resume_worker_command(seat)}, run from {cwd}.")
+    lines.append("Each seat continues its own thread; after resuming, send later work with --to as usual.")
+    identity = record["session"]["session_id"]
+    try:
+        result = _run([*_send_command(), "--to", f"session:{identity}", "--from", "shutdown",
+                       "--key", f"resume-workers-{identity}", "--text", "\n".join(lines)],
+                      dry_run=False, check=False)
+        if result is not None and result.returncode != 0:
+            print(f"shutdown: worker resume message: {_first_line(result.stderr, 'send failed')}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"shutdown: worker resume message: {_error_reason(error)}", file=sys.stderr)
+
+
 def confirm_entry(
     record: SessionShutdown,
     restarted_at: str,
@@ -1728,6 +1789,7 @@ def confirm_entry(
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
             return
+    _send_worker_resume(current)
     timer_failures = _restore_timers(record["timers"], dry_run=False)
     _record_timer_restore_progress(record, timer_failures)
 
