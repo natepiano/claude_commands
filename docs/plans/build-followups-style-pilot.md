@@ -255,6 +255,13 @@ Pending: parent's saved style child summary and rendered style line.
   refill records a sync wait and exits 3 with `waiting for sync: <branch point>
   <tip7> is not in the synced tip <synced7>`. An assigned or checkpointed ticket
   still resumes or waits for merge.
+- **Fix I — filing waits until the ticket that held a finding closes** (commit `5c8e823b`):
+  approving 15d2bb1b would have filed every unfiled held finding, including
+  those of modules-unit-8 and types-unit-7, whose tickets were still open and
+  could still revise them. Filing now leaves the findings of an assigned or
+  checkpointed ticket unfiled, prints `held for open ticket <id>: <count>
+  findings` for each such ticket, and files them on the first run after the
+  ticket closes.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
 Live verification of the fixes and subsequent measurements remain pending.
