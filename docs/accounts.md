@@ -320,6 +320,19 @@ On natedev, the two-minute notes timer checks `auto_moves` in `~/.claude/config/
 
 `left_at_most` tests the current group's weekly percentage. `after_reset` first records the target's weekly reset without moving; once that reset passes, it returns the group to the target when its fresh reading has room above every configured low threshold. It acts once per observed reset, recording both the observed and acted-on resets in `refusal_watch.json`.
 
+Add `hold_minutes` inside a `left_at_most` condition to require a continuous low-reading period before moving. It must be a finite nonnegative number; absent or `0` moves without a hold. For example, these rules give each group a 30-minute hold at 1%, then move it to claude4 first and claude2 when claude4 later reads low:
+
+```json
+"auto_moves": [
+  {"name": "units-to-four", "group": "units", "to": "claude4", "when": {"left_at_most": 1, "hold_minutes": 30}},
+  {"name": "units-to-two", "group": "units", "to": "claude2", "when": {"left_at_most": 1, "hold_minutes": 30}},
+  {"name": "showrunners-to-four", "group": "showrunners", "to": "claude4", "when": {"left_at_most": 1, "hold_minutes": 30}},
+  {"name": "showrunners-to-two", "group": "showrunners", "to": "claude2", "when": {"left_at_most": 1, "hold_minutes": 30}}
+]
+```
+
+Rules are tried in config order and skip a target that is already the group's account. The first fresh reading at or below the threshold starts the clock; a fresh reading above it clears the clock, while stale or missing readings leave it alone. `refusal_watch.json` stores `auto_move_holds[rule name]` as `{"account": "claude1", "at": "<ISO 8601 time with zone>", "move_id": "<group selection transition>", "percent": 1}`. A legacy selection without a transition uses an empty `move_id` in the file. A changed selection transition or rule percent clears the hold, including a move away and back between timer passes. Older saved holds without these fields start a new clock. Dry runs leave these starts unchanged.
+
 Rules require fresh readings (at most ten minutes old), a ready, signed-in target with room above the configured thresholds, and no unresolved target refusal. They skip the current account, groups with a shutdown transition in flight and groups the refusal pass already moved this run. Malformed rules print a problem and leave valid rules active. Both groups may select one account; the table then shows `units, showrunners` on that account.
 
 Each rule move records cause `auto`, reason `auto: <name>` and one transition ID in the role and move histories. Off-target members use the usual safe shutdown and restart, including the existing production-showrunner stopping and outcome notices; automatic rules send no phone alert. `refusal_watch.py --dry-run` previews without changing homes, selections or rule state. A conductor's final report includes only the requests it handled, including matching peer requests; older stopped records remain for `shutdown.py forget`.

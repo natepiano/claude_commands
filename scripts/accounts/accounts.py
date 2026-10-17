@@ -53,6 +53,8 @@ from scripts.accounts.refusals import (  # noqa: E402
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
+    TransitionReason as TransitionReason, RecordedTransitionReason as RecordedTransitionReason,
+    UnavailableTransitionReason as UnavailableTransitionReason,
 )
 
 if TYPE_CHECKING:
@@ -1752,7 +1754,7 @@ def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
 class GroupTransition:
     move_id: str
     origin: MoveOrigin
-    why: str = ""
+    why: TransitionReason = field(default_factory=UnavailableTransitionReason)
 
 
 @dataclass(frozen=True)
@@ -1806,7 +1808,7 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
         origin = RefusalOrigin(selection["window"], reset)
     elif selection["cause"] == "auto":
         origin = AutoOrigin()
-    return GroupTransition(selection["move_id"], origin, selection.get("why", ""))
+    return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection))
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -1963,7 +1965,7 @@ def set_group_account(group: ClaudeGroup, label: str, *, why: str,
         selection["reset"] = fields["reset"]
     write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
         fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin, why)
+    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why))
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:

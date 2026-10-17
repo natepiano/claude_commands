@@ -4204,6 +4204,7 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(accounts.group_transition("units"), accounts.NoGroupTransition)
         self.assertEqual(path.read_bytes(), original)
         transition = accounts.set_group_account("units", "claude2", why="operator choice", now=self.now)
+        self.assertEqual(transition.why, accounts.RecordedTransitionReason("operator choice"))
         stored = cast(dict[str, object], json.loads(path.read_text()))
         selection = cast(dict[str, object], stored["units"])
         self.assertEqual((selection["label"], selection["cause"], selection["window"]), ("claude2", "by hand", "unknown"))
@@ -4212,6 +4213,25 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(stored["showrunners"], "claude3")
         self.assertEqual(accounts.group_transition("units"), transition)
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+
+    def test_historical_transition_reason_is_unavailable_only_when_the_field_is_absent(self) -> None:
+        path = self.groups()
+        selection: dict[str, object] = {"label": "claude1", "move_id": "historical-transition",
+                                      "cause": "by hand", "window": "unknown"}
+        cases: tuple[tuple[dict[str, object], accounts.TransitionReason], ...] = (
+            (selection, accounts.UnavailableTransitionReason()),
+            ({**selection, "why": ""}, accounts.RecordedTransitionReason("")),
+            ({**selection, "why": "operator selection"}, accounts.RecordedTransitionReason("operator selection")),
+        )
+        for stored, expected in cases:
+            with self.subTest(selection=stored):
+                _ = path.write_text(json.dumps({"units": stored, "showrunners": "claude3"}))
+                before = path.read_bytes()
+                transition = accounts.group_transition("units")
+                assert isinstance(transition, accounts.GroupTransition)
+                self.assertEqual(transition.move_id, "historical-transition")
+                self.assertEqual(transition.why, expected)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_mixed_group_writes_keep_every_sibling_field_and_log_only_the_changed_group(self) -> None:
         transition = {"label": "claude1", "move_id": "original-transition", "cause": "refusal",
