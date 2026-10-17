@@ -426,6 +426,21 @@ class RestartTests(ShutdownTestCase):
                 persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
                 self.assertEqual(persisted["progress"]["kind"], "restarted")
 
+    def test_confirmed_top_level_restart_with_a_paused_seat_also_gets_the_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        owner = top_level("standalone-run")
+        saved = entry(owner)
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread",
+                                                  turn_live=False, launcher_command=[])]
+        self.create([saved])
+        commands = CommandRecorder()
+        with patch.object(restart, "_run", commands):
+            restart.confirm_entry(saved, RESTARTED, True)
+        sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][sends[0].index("--to") + 1], "session:" + owner["session_id"])
+        self.assertIn("implement.sh --to impl", sends[0][sends[0].index("--text") + 1])
+
     def test_move_on_the_source_account_receives_no_worker_resume_message(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
         saved = entry(unit("source-still-live"))

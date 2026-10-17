@@ -1741,7 +1741,7 @@ def _resume_worker_command(seat: PausedSeat) -> str:
 
 def _send_worker_resume(record: SessionShutdown) -> None:
     seats = record.get("codex_seats", [])
-    if record["session"]["kind"] != "unit" or not seats:
+    if not seats:
         return
     lines = ["Resume your Codex workers; do not open new ones."]
     cwd = shlex.quote(record["session"]["cwd"])
