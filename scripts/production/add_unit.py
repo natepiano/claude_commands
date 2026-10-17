@@ -688,12 +688,18 @@ def prompt_for(request: UnitLaunch) -> str:
 
 
 def host_session_name(request: UnitLaunch) -> str:
-    """The destination name, limited to characters supported by named herdr sessions."""
-    name = (request.launch_kind.host_session if isinstance(request.launch_kind, UnitRestoreLaunch)
-            else request.identity.session)
+    """The destination name, limited to characters supported by named herdr sessions.
+
+    A new launch's name leads with the production slug, since every production may have a unit of
+    the same name (each has a review-unit); a restore keeps the name its session was recorded under.
+    """
     import herdr
 
-    return herdr.generated_session_name(name)
+    if isinstance(request.launch_kind, UnitRestoreLaunch):
+        return herdr.generated_session_name(request.launch_kind.host_session)
+    slug = request.production.slug
+    name = request.identity.session
+    return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
 
 
 def launch_session(
