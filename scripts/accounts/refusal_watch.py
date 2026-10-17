@@ -119,6 +119,7 @@ class WatchState(TypedDict):
     sessions: dict[str, WatchedSession]
     notices: dict[str, str]
     auto_moves: NotRequired[dict[str, AutoResetObservation]]
+    auto_move_holds: NotRequired[dict[str, HoldStarted]]
 
 
 class AutoResetObservationDocument(TypedDict):
@@ -126,10 +127,30 @@ class AutoResetObservationDocument(TypedDict):
     acted_reset: str
 
 
+class HoldStartedDocument(TypedDict):
+    account: str
+    at: str
+    move_id: str
+    percent: float
+
+
 class WatchStateDocument(TypedDict):
     sessions: dict[str, WatchedSession]
     notices: dict[str, str]
     auto_moves: NotRequired[dict[str, AutoResetObservationDocument]]
+    auto_move_holds: NotRequired[dict[str, HoldStartedDocument]]
+
+
+@dataclass(frozen=True)
+class HoldStarted:
+    account: str
+    at: datetime
+    move_id: str | accounts.NoGroupTransition
+    percent: float
+
+    def __post_init__(self) -> None:
+        if self.at.utcoffset() is None:
+            raise ValueError("hold start needs a zone")
 
 
 @dataclass(frozen=True)
@@ -159,6 +180,7 @@ class AutoResetObservation:
 @dataclass(frozen=True)
 class LeftAtMost:
     percent: float
+    hold_minutes: float = 0
 
 
 @dataclass(frozen=True)
@@ -209,12 +231,22 @@ def read_auto_move_rules() -> tuple[AutoMoveRule | MalformedAutoMoveRule, ...]:
             label = accounts.numbered_account_label(target, "claude").label
             condition = cast(dict[str, object], when)
             trigger: LeftAtMost | AfterReset
-            if set(condition) == {"left_at_most"}:
+            if "left_at_most" in condition and set(condition) <= {"left_at_most", "hold_minutes"}:
                 percent = condition["left_at_most"]
                 if (not isinstance(percent, (int, float)) or isinstance(percent, bool)
-                        or not math.isfinite(percent) or not 0 <= percent <= 100):
+                        or not 0 <= percent <= 100 or not math.isfinite(percent)):
                     raise ValueError("left_at_most must be a percent from 0 to 100")
-                trigger = LeftAtMost(float(percent))
+                hold_minutes = condition.get("hold_minutes", 0)
+                if (not isinstance(hold_minutes, (int, float)) or isinstance(hold_minutes, bool)
+                        or hold_minutes < 0):
+                    raise ValueError("hold_minutes must be a finite nonnegative number")
+                try:
+                    hold_minutes = float(hold_minutes)
+                except OverflowError as error:
+                    raise ValueError("hold_minutes must be a finite nonnegative number") from error
+                if not math.isfinite(hold_minutes):
+                    raise ValueError("hold_minutes must be a finite nonnegative number")
+                trigger = LeftAtMost(float(percent), hold_minutes)
             elif condition == {"after_reset": True}:
                 if condition["after_reset"] is not True:
                     raise ValueError("after_reset must be true")
@@ -286,6 +318,24 @@ def _load_state() -> WatchState:
                         # An invalid observation is first sight on the next fresh reading.
                         continue
         result["auto_moves"] = observations
+    raw_holds = held.get("auto_move_holds")
+    if isinstance(raw_holds, dict):
+        holds: dict[str, HoldStarted] = {}
+        for name, raw in cast(dict[str, object], raw_holds).items():
+            if not isinstance(raw, dict):
+                continue
+            fields = cast(dict[str, object], raw)
+            label, at = fields.get("account"), fields.get("at")
+            move_id, percent = fields.get("move_id"), fields.get("percent")
+            if (isinstance(label, str) and isinstance(at, str) and isinstance(move_id, str)
+                    and isinstance(percent, (int, float)) and not isinstance(percent, bool)
+                    and 0 <= percent <= 100 and math.isfinite(percent)):
+                try:
+                    holds[name] = HoldStarted(label, datetime.fromisoformat(at),
+                                             move_id if move_id else accounts.NoGroupTransition(), float(percent))
+                except ValueError:
+                    continue
+        result["auto_move_holds"] = holds
     return result
 
 
@@ -298,6 +348,13 @@ def _state_document(state: WatchState) -> WatchStateDocument:
                 acted_reset=observation.acted_reset.at.isoformat()
                 if isinstance(observation.acted_reset, ActedOnReset) else "")
             for name, observation in state["auto_moves"].items()
+        }
+    if "auto_move_holds" in state:
+        document["auto_move_holds"] = {
+            name: HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
+                                     move_id=hold.move_id if isinstance(hold.move_id, str) else "",
+                                     percent=hold.percent)
+            for name, hold in state["auto_move_holds"].items()
         }
     return document
 
@@ -854,6 +911,7 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
     state = _load_state()
     original = deepcopy(state)
     observations = state.setdefault("auto_moves", {})
+    holds = state.get("auto_move_holds", {})
     threshold = max((rule.when.percent for rule in rules if isinstance(rule.when, LeftAtMost)), default=0)
     selected = accounts.group_accounts()
     members = accounts.live_group_members()
@@ -863,6 +921,34 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
     moved = set(moved_groups)
     held_refusals = refusals.load()
     for rule in rules:
+        source_label = accounts.group_label(selected, rule.group)
+        transition = accounts.group_transition(rule.group)
+        selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
+        hold = holds.get(rule.name)
+        if hold is not None and (hold.account != source_label or hold.move_id != selection_id
+                                 or not isinstance(rule.when, LeftAtMost) or hold.percent != rule.when.percent):
+            del holds[rule.name]
+        if isinstance(rule.when, LeftAtMost) and rule.when.hold_minutes > 0:
+            if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
+                    or rule.group in moved):
+                continue
+            try:
+                source_identity = accounts.account_identity(accounts.claude_account_dir(source_label))
+            except accounts.AccountsError:
+                continue
+            if not isinstance(source_identity, agent_accounts.NumberedAccount):
+                continue
+            source = refusals.stored_reading("claude", source_identity.login, now)
+            if not isinstance(source, refusals.FreshReading):
+                continue
+            if source.weekly.left > rule.when.percent:
+                _ = holds.pop(rule.name, None)
+                continue
+            if rule.name not in holds:
+                holds[rule.name] = HoldStarted(source_label, now, selection_id, rule.when.percent)
+                state["auto_move_holds"] = holds
+            if (now - holds[rule.name].at).total_seconds() / 60 < rule.when.hold_minutes:
+                continue
         try:
             target_identity = accounts.account_identity(accounts.claude_account_dir(rule.to))
         except accounts.AccountsError as error:
@@ -891,7 +977,6 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
             if previous.observed_reset > now:
                 continue
             progress = ActedOnReset(previous.observed_reset)
-        source_label = accounts.group_label(selected, rule.group)
         if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
                 or rule.group in moved or rule.group in in_flight):
             continue
@@ -900,7 +985,7 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         held = held_refusals.get(refusals.key("claude", target_identity.login))
         if held is not None and not refusals.resolved(held, target, now):
             continue
-        if isinstance(rule.when, LeftAtMost):
+        if isinstance(rule.when, LeftAtMost) and rule.when.hold_minutes == 0:
             source_identity = accounts.account_identity(accounts.claude_account_dir(source_label))
             if not isinstance(source_identity, agent_accounts.NumberedAccount):
                 continue
@@ -919,6 +1004,9 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
             continue
         transition = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
         selected[rule.group] = rule.to
+        for group_rule in rules:
+            if group_rule.group == rule.group:
+                _ = holds.pop(group_rule.name, None)
         if isinstance(rule.when, AfterReset):
             assert isinstance(target.weekly.reset, refusals.KnownReset)
             observations[rule.name] = AutoResetObservation(

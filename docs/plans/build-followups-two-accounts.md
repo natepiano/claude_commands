@@ -1464,3 +1464,100 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Binds later work:** an auto transition's `GroupTransition.why` is `RecordedTransitionReason("auto: <rule name>")`, and the journalled why text is the same as before.
 
 **Gotchas:** an unparsable or naive `observed_reset` or `acted_reset` drops that observation at load, so the next fresh reading is a first sight; the bad entry stays on disk until another state change rewrites the file. Observations compare by instant, so a reset reported under another UTC offset is the same reset. State changes are detected by comparing a `deepcopy` of the loaded state by value.
+
+### Phase 51 — Hold before an automatic move, and chained targets  · status: done
+
+**Depends on:** Phase 50
+
+#### Work Order
+
+**Goal:** the user's move rule (2026-10-16 20:14 EDT): when a group's account reads 1% weekly, hold for a set time, then move to claude4; when claude4 reaches 1%, hold the same, then move to claude2.
+
+**Constraints from prior phases:** Phase 49-50's `run_auto_moves` reads `auto_moves` rules from `~/.claude/config/accounts.json` in order; the first matching rule for a group wins, with the existing guards (fresh readings, target room above every low threshold, no in-flight transition, not the current account, not moved this run). `refusal_watch.json` holds rule state. Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
+
+**Spec:**
+1. **Hold.** A `left_at_most` rule takes an optional `hold_minutes` (absent or 0 means no hold). The rule fires only when the group's current account has read ≤ the percent continuously for at least that long: the first fresh reading at or under it is stored per rule in `refusal_watch.json` (aware time, typed in code, string only at the file boundary); a fresh reading above it clears the start; a stale or missing reading neither starts nor clears it. A malformed `hold_minutes` makes the rule malformed with a printed problem. Dry runs read without writing.
+2. **Chains.** Rules for one group are tried in config order, and a rule whose target is the group's current account is skipped, so `units → claude4` then `units → claude2` moves units to claude4 first and to claude2 once claude4 reads low. A hold started on one account never carries to another: the start is cleared when the group's account changes.
+3. **Docs.** `docs/accounts.md` documents `hold_minutes`, the chain example from the Goal, and the stored hold start.
+
+**Files:**
+- `scripts/accounts/refusal_watch.py`
+- `docs/accounts.md`
+- `scripts/accounts/test_refusal_watch.py`
+
+**Workers:** `impl` owns `refusal_watch.py` and `docs/accounts.md`; `test` owns `test_refusal_watch.py`.
+
+**Acceptance gate:** tests cover no move before the hold elapses, a move after it, a reading above the percent resetting the clock, a stale reading leaving it alone, a group move clearing a hold, the chain picking claude4 first and claude2 after, `hold_minutes` absent behaving as Phase 49, a malformed value, and dry runs. The account suites pass on natedev and the Mac; the merge gate is green.
+
+### Phase 52 — What happens next: one-shot Claude moves replace the low-quota alert  · status: todo
+
+**Depends on:** Phase 51
+
+#### Work Order
+
+**Goal:** the user's rule (2026-10-16): a "what happens next" log on natedev holds entries like "when units reach X% switch to claude2". An entry that covers a group replaces the alert; an entry runs once and is removed when its move happens, so the log empties out. With no entry, the user's phone is told once at 2% that what happens next needs setting up. The Claude session alert, its 30-minute repeat, its showrunner relay and `/quota_ack` go away.
+
+**Constraints from prior phases:** Phase 49's `run_auto_moves` (refusal_watch.py) runs on natedev after the refusal pass, under the watch lock, from rules in `~/.claude/config/accounts.json` `auto_moves`; moves record cause `auto`, reason `auto: <name>`, `alerts="none"`, and use the guards documented in `docs/accounts.md` (fresh readings, target room, no in-flight transition, not the current account, not moved this run). Phase 50 typed the reasons and reset progress. The role map lives on natedev; Mac reads go through `read_role_map()`. Codex alerting is unchanged in this phase (Phase 52). Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
+
+**Spec:**
+1. **The log.** A new module `scripts/accounts/next_moves.py` stores entries in `~/.local/state/accounts/next_moves.json` on natedev: `{id, group: units|showrunners, at_percent, hold_minutes, to, added_at}` as typed values in code, JSON only at the file boundary, atomic writes under a lock. Reads on the Mac go through natedev the way the role map does.
+2. **CLI.** `accounts.py next add <units|showrunners> <percent> <account>`, `accounts.py next list`, `accounts.py next remove <id>`. `add` refuses an unknown account or group and prints the stored entry; `list` prints one line per entry in the user's words ("when units reach 1% → claude2") or "nothing set up".
+3. **Skill.** `commands/next_moves.md` (`/next_moves`): turns plain words ("when showrunners get to 1% switch to claude2", "what's set up", "drop the units one") into those commands and prints the list after every change.
+4. **Engine.** `run_auto_moves` takes its rules from the log instead of the config key; a rule is a `left_at_most` entry with Phase 51's hold, and log order is chain order. When an entry's group move is recorded, the entry is removed in the same locked pass; a skipped or refused move keeps it. Remove `after_reset`, the `auto_moves` config key and the reset-progress state (`auto_moves` in `refusal_watch.json` is ignored on load and dropped on the next write). Cause `auto` and reason `auto: <id>` stay.
+5. **Claude alert.** In `scripts/whoami/quota_alert.py`, for Claude accounts: no session message, no repeat, no `Quota restored:` notice, and no "start no new Claude work" line. When an in-use account reads ≤ the threshold (2%) and some group on it has no log entry, send one phone push per episode: "<account> is at N% weekly. Set up what happens next: tell natedev, for example, when units reach 1% switch to claude2." When log entries cover every group on that account, send nothing. Remove `/quota_ack` (`commands/quota_ack.md`, the `ack` verb and acknowledgement state); `/quota_refresh` stays.
+6. **Showrunner relay.** Remove the Claude quota relay from `scripts/production/waiting.py quota` and `commands/showrunner/produce.md`; the Codex relay stays for Phase 52.
+7. **Docs.** `docs/quota_alerts.md`, `docs/accounts.md` and `commands/showrunner/accounts.md` describe the log, the one phone alert and the removed pieces; `commands/message.md` drops `/quota_ack`.
+
+**Files:**
+- `scripts/accounts/next_moves.py`
+- `scripts/accounts/accounts.py`
+- `scripts/accounts/refusal_watch.py`
+- `scripts/whoami/quota_alert.py`
+- `scripts/production/waiting.py`
+- `commands/next_moves.md`
+- `commands/quota_ack.md`
+- `commands/showrunner/produce.md`
+- `commands/showrunner/accounts.md`
+- `commands/message.md`
+- `docs/quota_alerts.md`
+- `docs/accounts.md`
+- `scripts/accounts/test_next_moves.py`
+- `scripts/accounts/test_accounts.py`
+- `scripts/accounts/test_refusal_watch.py`
+- `scripts/whoami/test_quota_alert.py`
+- `scripts/production/test_waiting.py`
+
+**Workers:** `impl` owns the production, command and doc files; `test` owns the five test files.
+
+**Acceptance gate:** tests cover add/list/remove and refusals, an entry firing once and being removed, a skipped move keeping its entry, a legacy `refusal_watch.json` with `auto_moves` loading, one phone push per Claude episode with no session send and no repeat, no push when entries cover every group on the account, and the waiting.py relay no longer forwarding a Claude alert. Account, whoami and production suites pass on natedev and the Mac; the merge gate is green. After install the director moves the two live config rules into the log and removes the config key.
+
+### Phase 53 — What happens next for Codex workers  · status: todo
+
+**Depends on:** Phase 52
+
+#### Work Order
+
+**Goal:** Codex follows the same rule. A log entry "when workers reach X% switch to <codex or claude account>" runs once and is removed; with no entry, the phone is told once at 2% to set one up. When Codex runs out with no entry, workers move to the Codex account with the most room, else to Claude.
+
+**Constraints from prior phases:** Phase 52's `next_moves.py` log, CLI and `/next_moves`. Codex low episodes today send a session message with a 30-minute repeat and no phone push; zero and refusal paths already swap workers to a picked Codex account or switch delegation to Claude (`quota_alert.py` `_codex_zero_alert`, `blocked`, `switch_to_claude`). Tests never touch live state or credentials.
+
+**Spec:**
+1. The log accepts group `workers` with a Codex account or `claude` as target; the notes-timer pass runs a covering entry when the workers account reads ≤ its percent (fresh reading), swapping through the existing worker swap, records it in the moves journal with cause `auto`, and removes the entry.
+2. Codex low episode: no session message, no repeat; one phone push per episode at ≤ 2% when no entry covers workers, worded like Phase 52's; nothing when an entry covers it.
+3. With no entry, a zero reading or refusal moves workers to the Codex account with the most room, else to Claude (today's picker and switch), unchanged except that it is the documented default.
+4. Remove the Codex quota relay from `waiting.py quota` and `produce.md`; update `docs/quota_alerts.md` and `/next_moves`.
+
+**Files:**
+- `scripts/accounts/next_moves.py`
+- `scripts/whoami/quota_alert.py`
+- `scripts/production/waiting.py`
+- `commands/next_moves.md`
+- `commands/showrunner/produce.md`
+- `docs/quota_alerts.md`
+- `scripts/accounts/test_next_moves.py`
+- `scripts/whoami/test_quota_alert.py`
+- `scripts/production/test_waiting.py`
+
+**Workers:** `impl` owns the production, command and doc files; `test` owns the three test files.
+
+**Acceptance gate:** tests cover a workers entry firing once and being removed, the single phone push, no push when covered, and the default move order. Suites pass on natedev and the Mac; the merge gate is green.
