@@ -244,12 +244,12 @@ class RefusalWatchTests(unittest.TestCase):
             next_moves.write_next_moves(entries)
 
     def low_rule(self, name: str = "units-low", *, group: accounts.ClaudeGroup = "units",
-                 target: str = "claude2", threshold: float = 1) -> next_moves.NextMove:
-        return next_moves.NextMove(name, group, threshold, 0, target, NOW)
+                 target: str = "claude2", threshold: float = 1) -> next_moves.ClaudeGroupMove:
+        return next_moves.ClaudeGroupMove(name, group, threshold, 0, target, NOW)
 
     def hold_rule(self, name: str = "units-low", *, target: str = "claude2",
-                  minutes: float = 10) -> next_moves.NextMove:
-        return next_moves.NextMove(name, "units", 1, minutes, target, NOW)
+                  minutes: float = 10) -> next_moves.ClaudeGroupMove:
+        return next_moves.ClaudeGroupMove(name, "units", 1, minutes, target, NOW)
 
     def test_consumed_entry_does_not_move_a_group_again_after_an_operator_returns_it(self) -> None:
         path = self.groups()
@@ -265,6 +265,35 @@ class RefusalWatchTests(unittest.TestCase):
         history = [cast(dict[str, object], json.loads(line))
                    for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual([entry["why"] for entry in history], ["auto: units-low", "operator return"])
+
+    def test_workers_entries_are_never_claude_group_rules(self) -> None:
+        entry = self.low_rule()
+        self.next_entries(entry)
+        worker = next_moves.add_next_move("workers", 1, "claude")
+        rules = refusal_watch.read_auto_move_rules()
+        self.assertEqual(len(rules), 1)
+        rule = rules[0]
+        assert isinstance(rule, refusal_watch.AutoMoveRule)
+        self.assertEqual((rule.entry_id, rule.group), (entry.id, "units"))
+        self.assertEqual(next_moves.read_next_moves(), (entry, worker))
+
+    def test_torn_last_role_history_line_does_not_block_a_runnable_group_entry(self) -> None:
+        for suffix in (b'{"cause":', b'\xff'):
+            with self.subTest(suffix=suffix):
+                path = self.groups()
+                entry = self.low_rule(f"units-torn-{suffix.hex()}")
+                self.next_entries(entry)
+                self.reading(SOURCE_LOGIN, 1)
+                history = accounts.roles_history_file()
+                history.parent.mkdir(parents=True, exist_ok=True)
+                _ = history.write_bytes(b'{}\n' + suffix)
+                code, output, error = self.cli()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(stored_group_labels(path)["units"], "claude2")
+                self.assertEqual(next_moves.read_next_moves(), ())
+                lines = [line for line in output.splitlines() if "torn final line" in line]
+                self.assertEqual(len(lines), 1)
+                self.assertIn("roles.jsonl", lines[0])
 
     def test_failed_consumption_cannot_replay_a_recorded_move_after_an_operator_returns_the_group(self) -> None:
         path = self.groups()
@@ -327,7 +356,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(history.read_text(), recorded)
 
     def test_unreadable_role_history_reports_once_and_leaves_all_log_entries_untouched(self) -> None:
-        read_text = Path.read_text
+        read_bytes = Path.read_bytes
         for problem in ("permission", "malformed", "encoding"):
             with self.subTest(problem=problem):
                 path = self.groups()
@@ -342,13 +371,12 @@ class RefusalWatchTests(unittest.TestCase):
                                               b"\xff\n" if problem == "encoding" else b"")
                 _ = history.write_bytes(original)
 
-                def read_with_failure(file: Path, encoding: str | None = None,
-                                      errors: str | None = None) -> str:
+                def read_with_failure(file: Path) -> bytes:
                     if file == history and problem == "permission":
                         raise PermissionError("fixture history unreadable")
-                    return read_text(file, encoding=encoding, errors=errors)
+                    return read_bytes(file)
 
-                with patch.object(Path, "read_text", read_with_failure):
+                with patch.object(Path, "read_bytes", read_with_failure):
                     code, output, error = self.cli()
                     self.assertEqual((code, error), (0, ""))
                     self.assertEqual(len([line for line in output.splitlines()
@@ -575,7 +603,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 1)
         code, _, error = self.cli()
         self.assertEqual((code, error), (0, ""))
-        self.next_entries(next_moves.NextMove("units-low", "units", 0, 10, "claude2", NOW))
+        self.next_entries(next_moves.ClaudeGroupMove("units-low", "units", 0, 10, "claude2", NOW))
         for minute in (10, 19, 20):
             WatchTime.at = NOW + timedelta(minutes=minute)
             self.reading(SOURCE_LOGIN, 0, at=WatchTime.at)
@@ -1026,7 +1054,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = other.write_text(json.dumps({"uuid": "unrelated", "timestamp": NOW.isoformat(),
             "window": "weekly", "reset": ""}))
         routing: moves.RoutedToClaude = {"kind": "routed to claude", "at": NOW.isoformat(),
-            "tool": "codex", "fallback_at": NOW.isoformat(), "owner": "codex1", "cause": "refusal", "moved": ["delegate"]}
+            "tool": "codex", "fallback_at": NOW.isoformat(), "owner": "codex1", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["delegate"]}
         moves.append_routing(routing)
         WatchTime.at = NOW + timedelta(minutes=19)
         # Other is not live on the continuation tick; its proof file must survive.
