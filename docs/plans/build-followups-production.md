@@ -48,7 +48,7 @@
 | herdr-panes-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr-panes | build-followups-herdr-panes | — | — |
 | nightly-review-unit | permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
 | style-unit | docs/plans/build-followups-style.md | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
-| unit-board-unit | docs/plans/build-followups-unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
+| unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
 | hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 
