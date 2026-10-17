@@ -129,7 +129,7 @@ class RemoveWorkersTest(unittest.TestCase):
         )
 
     def run_remove_workers(
-        self, session_dir: Path | None = None, caller: str = ""
+        self, session_dir: Path | list[Path] | None = None, caller: str = ""
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         environment = os.environ.copy()
         environment.update(
@@ -141,8 +141,8 @@ class RemoveWorkersTest(unittest.TestCase):
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
         command = [sys.executable, str(SCRIPT), "--delegate-root", str(self.root)]
-        if session_dir is not None:
-            command += ["--session-dir", str(session_dir)]
+        for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
+            command += ["--session-dir", str(run)]
         result = subprocess.run(
             command, env=environment, capture_output=True, text=True, check=False
         )
@@ -153,7 +153,7 @@ class RemoveWorkersTest(unittest.TestCase):
         )
         return result, sorted(removed)
 
-    def remove_workers(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
+    def remove_workers(self, session_dir: Path | list[Path] | None = None, caller: str = "") -> tuple[int, list[str]]:
         result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
 
@@ -191,6 +191,16 @@ class RemoveWorkersTest(unittest.TestCase):
         own = self.run_dir("own", ["own1", "own2"], orchestrator=ORCHESTRATOR)
         self.list_rows([row("own1", "p-impl"), row("own2", "p-test")])
         self.assertEqual(self.remove_workers(own), (0, ["own1", "own2"]))
+
+    def test_every_given_run_goes_and_another_live_run_stays(self) -> None:
+        """Run end passes each run its director holds; another director's live run is kept."""
+        marked = self.run_dir("marked", ["mark1"], orchestrator=ORCHESTRATOR)
+        side = self.run_dir("side", ["side1"])
+        other = self.run_dir("other", ["other1"])
+        for run in (side, other):
+            _ = (run / "heartbeat.log").write_text("beat\n", encoding="utf-8")
+        self.list_rows([row("mark1", "a-impl"), row("side1", "b-impl"), row("other1", "c-impl")])
+        self.assertEqual(self.remove_workers([marked, side]), (0, ["mark1", "side1"]))
 
     def test_live_run_is_kept_and_dead_runs_are_swept(self) -> None:
         _ = self.run_dir("live", ["live1"], orchestrator=ORCHESTRATOR)
