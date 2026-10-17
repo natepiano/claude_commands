@@ -1574,7 +1574,7 @@ def _production_document(plan_path: Path, reference: ProductionReference) -> Pat
 def _phase_note_name(production: str, unit: str) -> str:
     name = unit
     try:
-        marked = unit_lookup.marked_units(production).get(unit)
+        marked = unit_lookup.marked_unit(production, unit)
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
             if marked.claude.name:
                 name = marked.claude.name

@@ -431,7 +431,7 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
         rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
         return
     try:
-        found = unit_lookup.marked_units(rename.slug).get(rename.old)
+        found = unit_lookup.marked_unit(rename.slug, rename.old)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):

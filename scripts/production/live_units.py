@@ -53,8 +53,8 @@ def _listed(doc: Path) -> tuple[str, list[str]]:
 
 
 def _joined(slug: str, units: list[str], every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
-    if slug in every.faults:
-        raise OSError(every.faults[slug])
+    if fault := every.production_fault(slug):
+        raise OSError(fault)
     marked = every.units.get(slug, {})
     return [LiveUnit(unit, marked.get(unit)) for unit in units]
 

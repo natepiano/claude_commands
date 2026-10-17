@@ -648,8 +648,7 @@ class _ProductionUnitMarks(production_units.SessionMarks):
         super().__init__(slug)
         self._known: set[str] | OSError = (
             every if isinstance(every, OSError)
-            else OSError(every.faults[slug]) if slug in every.faults
-            else set(every.units.get(slug, {}))
+            else set(every.units.get(slug, {})) | set(every.faults.get(slug, {}))
         )
 
     @override
@@ -694,8 +693,8 @@ def _production_places(
         try:
             if isinstance(every, OSError):
                 raise every
-            if runner["slug"] in every.faults:
-                raise OSError(every.faults[runner["slug"]])
+            if fault := every.production_fault(runner["slug"]):
+                _problem(problems, f"unit hosts left out under {runner['slug']}", OSError(fault))
             rows = _production_rows(doc, runner["slug"], every)
             units = every.units.get(runner["slug"], {})
         except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:

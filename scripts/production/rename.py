@@ -492,7 +492,7 @@ def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
 
 def _stopped_unit(plan: RenamePlan, name: str) -> None:
     try:
-        found = unit_lookup.marked_units(plan.new).get(name)
+        found = unit_lookup.marked_unit(plan.new, name)
     except OSError as error:
         raise RenameRefused(f"{name}: cannot tell whether Claude is running: {error}") from error
     state = found.claude if found else unit_lookup.ClaudeNotRunning()
