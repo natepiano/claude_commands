@@ -81,8 +81,8 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 | --- | --- | --- | --- |
 | G1 | Phase 3 | Phase 2's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 2 checkpoint> HEAD` succeeds |
 | G2 | Phase 4 | 96 hours after T_reach (2026-10-12 14:13:42 EDT) | the clock reads 2026-10-16 14:13:42 EDT or later |
-| G3 | Phases 6, 7 | Phase 5's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 5 checkpoint> HEAD` succeeds; T_lint is the committer time of the first `~/.claude` commit that contains it |
-| G4 | Phase 7 | 24 hours after T_lint | the clock reads T_lint + 24 h or later, in EDT; the notifier instance `mul-add-remeasure` wakes this session then |
+| G3 | Phases 6, 8 | Phase 5's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 5 checkpoint> HEAD` succeeds; T_lint is the committer time of the first `~/.claude` commit that contains it |
+| G4 | Phase 8 | 24 hours after T_lint | the clock reads T_lint + 24 h or later, in EDT; the notifier instance `mul-add-remeasure` wakes this session then |
 | G5 | Phase 6 | the first live rewrite | a hana `verify.sh lint` call that started after T_lint ran the rewrite step and its final clippy verdict passed; the notifier instance `mul-add-first-fire` wakes this session then |
 
 ## Phases
@@ -231,7 +231,35 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 **Binds later work:** a rewrite lands as an uncommitted edit in the calling worktree, so no hana commit marks it. Three earlier count logs in the window (2026-10-16 20:43Z, 21:12Z, 21:42Z) rewrote without a passing verdict in their call.
 
-### Phase 7 — Re-measure the lint-step rewrite  · status: todo
+### Phase 7 — Complete step logs under load  · status: done
+
+**Depends on:** Phase 6
+
+#### Work Order
+
+**Goal:** a step run through `run_json_stdout` returns only once its log holds every line the command wrote, also on a machine at load 400.
+
+**Spec:**
+
+The showrunner, 2026-10-16 23:43 EDT: `test_verify_lint_scope.InvokeOutputTests.test_json_stdout_stays_separate_and_both_logs_are_complete_on_return` failed in a merge gate at one-minute load 400. The log was missing one of its 1000 `cargo stderr` lines (line 488 absent, the rest shifted), so under load a log is not complete when the call returns. "That makes it a real race in the stderr tee, not just a flaky test. Please fix it in a follow-up."
+
+First reproduce: run the test (or a loop of the nested call it makes) many times in parallel under heavy CPU load until a line is lost, and name which log loses it (inner step log, outer log) and why — a short write, a FIFO open or close race, the two `tee -a` writers sharing one file, or the subshell trap removing the FIFO. Fix the cause in `run_json_stdout`; keep bash 3.2 constructs (no named descriptors), JSON alone on stdout, every step returning its command's own status (also when `tee` fails), and the existing tests passing. Add a regression test that fails on the old code under the reproduction's load, if one can be made reliable in a few seconds; otherwise state the reproduction and its result in the summary.
+
+**Files:**
+- `scripts/lint/invoke.sh` — `run_json_stdout`
+- `scripts/delegate/test_verify_lint_scope.py` — the regression test
+
+**Workers:** 1 writer; the test lives beside the fix.
+- `impl` — reproduction, fix and test
+
+**Constraints from prior phases:**
+- `run_json_stdout` (Phase 5) runs the command with stderr into a temporary FIFO read by a background `tee -a "$log" >&2`, stdout through `tee -a "$log"`, then `wait`s for the stderr `tee`. `run_once` nests it when `LINT_JSON_STDOUT=1`, so a JSON replay passes through two levels.
+- Named descriptor redirections (`{fd}>`) break the Mac's bash 3.2; `test_shell_libraries_use_no_named_descriptor_redirections` guards it. `PIPESTATUS[0]` (not `$?`) carries the command status under pipefail.
+- Saved run output stays under a few GB; delete reproduction logs after reading them.
+
+**Acceptance gate:** the reproduction no longer loses a line under the load that made it fail; `python3 -m unittest discover -s scripts/delegate -p 'test_verify_lint_scope.py'` and `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` pass; `bash -n scripts/lint/invoke.sh` passes.
+
+### Phase 8 — Re-measure the lint-step rewrite  · status: todo
 
 **Depends on:** Phase 6
 **Blocked by:** G3, G4
@@ -245,7 +273,7 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 The showrunner, 2026-10-16: "The re-measure window is 24 hours, not 96 (about 185 hana clippy steps: at today's 8.2 per 100 we would expect about 15 failures, at the 1.979 limit about 4, so a day separates them clearly). Same two limits."
 
 The wake: at Phase 5's checkpoint, the unit director also creates
-`zsh ~/.claude/scripts/message/notifier.sh new mul-add-remeasure --every 15 --to session:<this session's id> --from mul-add-remeasure --command "mul-add re-measure due: run phase 7" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py window <phase-5-checkpoint> 24"`
+`zsh ~/.claude/scripts/message/notifier.sh new mul-add-remeasure --every 15 --to session:<this session's id> --from mul-add-remeasure --command "mul-add re-measure due: run phase 8" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py window <phase-5-checkpoint> 24"`
 and removes it on the wake.
 
 Method: copy Phase 4's `measure.py`, `commits.py` and `audit.py` from `~/.local/state/mul-add-hook/reach-2026-10-16/` into `~/.local/state/mul-add-hook/lint-rewrite/` and run the copies with the window T_lint ≤ start < T_lint + 24 h. One change of unit: the verdict is per lint call, not per clippy step. A judging step that a rewrite followed in the same `call_id` is not the call's verdict; the last judging clippy step of each call is (a step with no `call_id` stands alone). Rewrite JSON steps (`--message-format=json` in argv) are never verdicts. Report:

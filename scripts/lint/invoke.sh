@@ -206,18 +206,21 @@ LINT_LEFT_QUEUE_STATUS=75
 
 # Record both streams without putting stderr into a JSON consumer's stdout.
 run_json_stdout() (
-    local log=$1 stderr_dir stderr_pid status=0
+    local log=$1 stream_dir stderr_pid status=0
     shift
     : > "$log" || return $?
-    stderr_dir="$(mktemp -d)" || return $?
-    trap 'rm -rf "$stderr_dir"' EXIT
-    mkfifo "$stderr_dir/stderr" || return $?
+    stream_dir="$(mktemp -d)" || return $?
+    trap 'rm -rf "$stream_dir"' EXIT
+    mkfifo "$stream_dir/stderr" || return $?
     # An ordinary background process can be waited for on Bash 3.2 too.
-    tee -a "$log" < "$stderr_dir/stderr" >&2 &
+    tee -a "$log" < "$stream_dir/stderr" >&2 &
     stderr_pid=$!
-    "$@" 2> "$stderr_dir/stderr" | tee -a "$log" || status=${PIPESTATUS[0]}
+    # Two tee writers can insert stdout chunks inside stderr lines in the log.
+    # Stream stdout to its caller now, then append its copy after stderr drains.
+    "$@" 2> "$stream_dir/stderr" | tee "$stream_dir/stdout" || status=${PIPESTATUS[0]}
     # Drain stderr before callers inspect or remove the completed step's log.
     wait "$stderr_pid" || true
+    cat "$stream_dir/stdout" >> "$log" || true
     return "$status"
 )
 
