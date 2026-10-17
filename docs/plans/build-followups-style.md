@@ -468,7 +468,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - The parent reads only the child's saved report, and a style production reports on demand, so the line is as fresh as the child's last report.
 - A middle production's saved report does not carry its style child's summary, so a grandparent's `expand` shows no style line; `commands/showrunner/dailies.md` "Productions below" does not describe the line.
 
-### Phase 14 — Per-rule counts: one public ledger reader for the style report  · status: todo
+### Phase 14 — Per-rule counts: one public ledger reader for the style report  · status: done
 **Depends on:** Phase 11, Phase 12
 
 #### Work Order
