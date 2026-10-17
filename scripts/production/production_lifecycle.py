@@ -500,7 +500,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     print("| Area | Result |\n| --- | --- |")
     for unit in rows:
         merges = [entry for entry in history.entries
-                  if entry.unit == unit.name and isinstance(entry.kind, CodeCheckpoint)]
+                  if isinstance(entry, MergeEntry) and entry.unit == unit.name
+                  and isinstance(entry.kind, CodeCheckpoint)]
         last = history.last_code_for_unit(unit.name)
         detail = (f"{unit.name}: {len(merges)} phases merged, last {last.merge_hash[:7]}"
                   if isinstance(last, MergeEntry) else f"{unit.name}: no phases merged")

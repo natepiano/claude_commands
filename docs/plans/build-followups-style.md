@@ -387,7 +387,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** rewrite-and-rollback lint in the sync (the check form never touches the tree); a `--no-ff` merge commit for standing units (it breaks no-change ticket ancestry).
 
-### Phase 11 — Child hand-off contract  · status: todo
+### Phase 11 — Child hand-off contract  · status: done
 **Depends on:** Phase 6, Phase 7, Phase 10
 
 #### Work Order

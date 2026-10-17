@@ -121,8 +121,16 @@ State:
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
-  - **A child showrunner is never a unit.** It has no Units row, and you never
-    merge its branch, type into its pane or type into its units' panes.
+  - **A child showrunner is never a unit.** It has no Units row. Never type
+    into its pane or its units' panes. One merge exception: a same-repository
+    child with `**Kind:** style` sends
+    `From the showrunner of <style slug>: hand-off <hash>`. Correctness-review
+    its diff against the branch point as for a unit checkpoint, then run
+    `merge_checkpoint.py --from-child <style slug> --checkpoint <hash> --production <your doc> --started <time>`.
+    A locally merged hand-off is pushed before acknowledgment; a duplicate
+    already on origin is acknowledged without another merge or push. A root
+    uses `--root-self`, receives no acknowledgment and runs ledger `reconcile`
+    after the merge. Other child branches are never merged.
   - **A broadcast** (a build hold, an announcement) already
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
