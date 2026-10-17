@@ -75,6 +75,45 @@ class TranscriptReadCounter(io.BufferedReader):
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
+        run = self.root / "paused run"
+        run.mkdir()
+        command = ["bash", "/config/scripts/delegate/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/delegate/implement.sh", "outer arguments"]
+        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
+        self.herdr_process(811, 812, command, {})
+        self.herdr_process(812, 1, outer, {})
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "busy": {"role": "review", "thread_id": "busy-thread", "turn_id": "turn", "status": "running", "launcher_pid": 810},
+            "idle": {"role": "impl", "thread_id": "idle-thread", "status": "done"},
+            "orphan": {"role": "impl", "thread_id": "orphan-thread", "status": "starting", "launcher_pid": 99999999},
+            "ended": {"role": "impl", "thread_id": "ended-thread", "status": "ended"},
+        }))
+        def launcher_alive(pid: int) -> bool:
+            return pid in {810, 811, 812}
+
+        with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+            found = inventory.codex_seats([run])
+        seats = {seat["seat"]: seat for seat in found}
+        self.assertEqual(set(seats), {"busy", "idle", "orphan"})
+        self.assertEqual(seats["busy"], record.PausedSeat(run_dir=str(run), seat="busy", role="review", thread_id="busy-thread", turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], record.PausedSeat(run_dir=str(run), seat="idle", role="impl", thread_id="idle-thread", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["orphan"]["launcher_command"], [])
+
+    def test_old_shutdown_record_reads_back_without_codex_seats_and_new_seats_survive_wire_roundtrip(self) -> None:
+        saved = entry(top_level("legacy-director"))
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        _ = document.pop("codex_seats", None)
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertNotIn("codex_seats", parsed)
+        seats = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="thread-kept", turn_live=True, launcher_command=["bash", "/scripts/implement.sh", "argument with spaces"])]
+        document["codex_seats"] = seats
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed.get("codex_seats"), seats)
+        document["codex_seats"] = [{**seats[0], "turn_live": "true"}]
+        with self.assertRaisesRegex(record.InvalidRecord, "turn_live"):
+            _ = record.parse_session_records(json.dumps([document]))
+
     def test_updated_at_preserves_registry_milliseconds_through_inventory_wire_parse(self) -> None:
         timestamp = 1_791_563_350_123
         self.write_session(DESKTOP_PID, DESKTOP_ID, "notes", self.root / "plain", updated_at=timestamp)
@@ -507,6 +546,10 @@ class InventoryTests(ShutdownTestCase):
             )
             _ = self.git("add", f"ahead-{number}.txt")
             _ = self.git("commit", "-m", f"ahead {number}")
+        # A snapshot commit is pushed by its own job, so the ahead count leaves it out.
+        _ = (self.checkout / "snapshot.md").write_text("sessions\n", encoding="utf-8")
+        _ = self.git("add", "snapshot.md")
+        _ = self.git("commit", "-m", "agent-sessions-snapshot: update agent sessions")
         _ = (self.checkout / "dirty.txt").write_text("changed\n", encoding="utf-8")
         self.head = self.git("rev-parse", "HEAD")
 

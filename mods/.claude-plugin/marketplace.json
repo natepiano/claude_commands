@@ -1,0 +1,19 @@
+{
+  "name": "nate-local",
+  "owner": {
+    "name": "Nate"
+  },
+  "plugins": [
+    {
+      "name": "postmaster",
+      "source": "./postmaster",
+      "description": "File-driven session messaging."
+    },
+    {
+      "name": "unit-board",
+      "source": "./unit-board",
+      "description": "Production board and unit detail pane."
+    }
+  ],
+  "description": "Local Claude Code mods for session messaging and production views."
+}

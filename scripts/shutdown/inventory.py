@@ -27,6 +27,7 @@ import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
+    from record import PausedSeat
     from ..delegate.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
@@ -200,6 +201,7 @@ class UnitMarks:
 
 DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
 SNAPSHOT_SESSION = re.compile(r"^`(.+)` · (\S+) · (.+?)\s*$")
+SNAPSHOT_COMMIT_PREFIX = "agent-sessions-snapshot: "
 RESUME_ID = re.compile(r"(?:^|\s)--resume\s+['\"]?([^\s'\"]+)")
 
 
@@ -716,7 +718,10 @@ def _checkout(cwd: str) -> CheckoutState:
     if any(result is None or result.returncode != 0 for result in (root, branch, head)):
         return {"kind": "not a checkout"}
     assert root is not None and branch is not None and head is not None
-    ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
+    # The vault's snapshot job commits every minute or two and hanadocs-push pushes them,
+    # so they never block a stop; counting them, no session in the vault reads as pushed.
+    ahead_result = _git(cwd, "rev-list", "--count", "--invert-grep",
+                        f"--grep=^{SNAPSHOT_COMMIT_PREFIX}", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
         try:
@@ -799,6 +804,61 @@ def _model(session_id: str, config_dir: Path) -> LastModel:
         if model is not None
         else {"kind": "no reply yet"}
     )
+
+
+def _launcher_command(pid: int) -> list[str]:
+    """Find the nearest live launcher ancestor without flattening argv boundaries."""
+    try:
+        darwin = _DarwinSnapshotProcesses().processes if sys.platform == "darwin" else {}
+    except (OSError, herdr.HerdrFailure):
+        return []
+    visited: set[int] = set()
+    while pid > 1 and pid not in visited and len(visited) < 64:
+        visited.add(pid)
+        if not _pid_alive(pid):
+            return []
+        try:
+            if sys.platform == "linux":
+                process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
+                argv = [os.fsdecode(part) for part in process.joinpath("cmdline").read_bytes().split(b"\0") if part]
+                fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
+                parent = int(fields[1])
+            else:
+                process = darwin.get(pid)
+                if process is None or isinstance(process.arguments, herdr.UnreadableProcessArguments):
+                    return []
+                parent = process.parent
+                argv = list(process.arguments.argv)
+        except (OSError, ValueError, IndexError, UnicodeError, subprocess.SubprocessError):
+            return []
+        if any(Path(arg).name in {"implement.sh", "review.sh"} for arg in argv):
+            return argv
+        pid = parent
+    return []
+
+
+def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
+    from record import PausedSeat
+
+    seats: list[PausedSeat] = []
+    for directory in run_directories:
+        run_dir = str(directory)
+        for name, raw in sorted(_json_object(Path(run_dir) / "mesh_roster.json").items()):
+            if not isinstance(raw, dict):
+                continue
+            entry = cast(dict[str, object], raw)
+            if entry.get("status") == "ended":
+                continue
+            thread_id, role = entry.get("thread_id", ""), entry.get("role", "impl")
+            launcher = entry.get("launcher_pid", 0)
+            turn_live = entry.get("status") in {"running", "starting"} or entry.get("paused_turn") is True
+            seat = PausedSeat(run_dir=run_dir, seat=name,
+                              role=role if isinstance(role, str) else "impl",
+                              thread_id=thread_id if isinstance(thread_id, str) else "",
+                              turn_live=turn_live,
+                              launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
+            seats.append(seat)
+    return seats
 
 
 def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:

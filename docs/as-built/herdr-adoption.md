@@ -135,7 +135,7 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
 
 - Pane environment: both marks, `ENABLE_TOOL_SEARCH=true`, and the account variables. A resume uses `accounts.prepared_account(selected.label, resume=True)` variables minus its `remove` names, and refuses a `target` other than the selected group account. Other launches use `named_account_environment(selected.dir)`. `PROBE_ENV=1` is added only for a `--probe` restore. The caller's `CLAUDE_*` never reaches the pane.
 - Claude arguments: `--model`, `--effort` when set, `--resume <id>` on a resume, `--remote-control <session name> -n <session name>`, then the profile's flags or `--settings '{"disableAgentView": true}'`.
-- The host name is `host_session_name(request)`: `generated_session_name` of `--host-session` on a restore, else the unit's session name.
+- The host name is `host_session_name(request)`: `generated_session_name` of `--host-session` on a restore when it leads with `<slug>-`, else `<slug>-<session name>` (a session name already leading with `<slug>-` is not prefixed twice). Each production's `review-unit` gets its own session (`build-followups-review`, `hana-review`), and a record from before the prefix cannot reach another production's live session.
 - It runs `start_new_server(name, --timeout * 1000)` (default 90 s), `open_pane(name, name, session_cwd, env)`, and `start_agent(..., opening=OpeningPrompt(prompt))`. On `AgentExited` it runs `stop_session(name)`.
 
 `add_unit.main` does this:

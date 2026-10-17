@@ -1308,6 +1308,11 @@ def _done(saved: SessionShutdown) -> bool:
         progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop")
 
 
+def shutdown_in_progress(saved: SessionShutdown) -> bool:
+    """Exclude retained terminal outcomes from current shutdown work."""
+    return not _done(saved)
+
+
 def _action_failed(saved: SessionShutdown, error: Exception, *, stopping: bool) -> None:
     reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
     if not stopping:
@@ -1337,12 +1342,14 @@ def report_stop(records: list[SessionShutdown]) -> None:
     records = checked.remaining + checked.finished
     first = records[0]
     status, output = run_remote(["records", "--json", "--here"])
+    request_ids = {saved["request_id"] for saved in records}
     lines = [f"{saved['machine']} {saved['session']['name']}: {saved['progress']['kind']}" for saved in records]
     if status == 0:
         try:
             peer = store.parse_session_records(output)
             lines.extend(f"{saved['machine']} {saved['session']['name']}: {saved['progress']['kind']}"
-                         for saved in peer if saved["login"].casefold() == first["login"].casefold())
+                         for saved in peer if saved["login"].casefold() == first["login"].casefold()
+                         and saved["request_id"] in request_ids)
         except store.InvalidRecord:
             lines.append(f"{other_machine()}: shutdown state unreadable")
     else:
@@ -1735,13 +1742,20 @@ def conduct(login: str) -> int:
         print(line)
     session_kind = herdr.security_session()
     archived: dict[str, SessionShutdown] = {}
+    handled_requests: set[str] = set()
     while True:
         with store.conductor_lock(login) as ownership:
             if isinstance(ownership, store.ConductorAlreadyRunning):
                 return 0
             archived.update(_read_conduct_archive(login))
-            outcome = _conduct_owned(login, archived, fingerprint, session_kind)
+            handled_requests.update(saved["request_id"] for saved in archived.values())
+            handled_requests.update(saved["request_id"] for saved in store.session_records(login) if not _done(saved))
+            outcome = _conduct_owned(login, archived, fingerprint, session_kind, handled_requests)
+            handled_requests.update(saved["request_id"] for saved in archived.values())
             if isinstance(outcome, _ReloadRequested):
+                archived.update({saved["session"]["session_id"]: saved
+                                 for saved in store.session_records(login)
+                                 if saved["request_id"] in handled_requests and _done(saved)})
                 _write_conduct_archive(login, archived)
         if isinstance(outcome, _ReloadRequested):
             os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
@@ -1749,12 +1763,13 @@ def conduct(login: str) -> int:
         if any(not _done(saved) for saved in records):
             continue
         outcomes = {**archived, **{saved["session"]["session_id"]: saved for saved in records}}
-        report_stop(list(outcomes.values()))
+        report_stop([saved for saved in outcomes.values() if saved["request_id"] in handled_requests])
         return 0
 
 
 def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
-                   fingerprint: _ModuleFingerprint, session_kind: herdr.SecuritySession) -> _ConductorFinished | _ReloadRequested:
+                   fingerprint: _ModuleFingerprint, session_kind: herdr.SecuritySession,
+                   handled_requests: set[str]) -> _ConductorFinished | _ReloadRequested:
     """Advance one locked account while long actions run independently."""
     import restart as restart_work
 
@@ -1858,6 +1873,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                             print(f"shutdown notification failed: {error}", file=sys.stderr)
 
                 records = store.session_records(login)
+                handled_requests.update(saved["request_id"] for saved in records if not _done(saved))
                 _clear_finished_hold(login, archived)
                 drained = not pending and not confirmations and not launched and not messages and not sends
                 if drained and (isinstance(reload_state, _ReloadRequested) or not records or all(_done(saved) for saved in records)):

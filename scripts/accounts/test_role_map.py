@@ -121,7 +121,7 @@ class RoleMapTests(unittest.TestCase):
         ssh.assert_not_called()
         groups = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
         self.assertEqual(groups["units"], {"label": "claude2", "move_id": "scratch-move",
-                                          "cause": "by hand", "window": "unknown"})
+                                          "cause": "by hand", "window": "unknown", "why": "scratch selection"})
         self.assertEqual(groups["showrunners"], "claude1")
         self.assertEqual(selected.groups, groups)
         self.assertEqual(selected.workers, "codex3")
@@ -149,7 +149,7 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual((before.groups, before.workers), ({"units": "claude3"}, "codex3"))
         stored = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
         self.assertEqual(stored["units"], {"label": "claude2", "move_id": "unread-login-move",
-                                          "cause": "by hand", "window": "unknown"})
+                                          "cause": "by hand", "window": "unknown", "why": "isolated selection"})
         self.assertEqual((after.groups, after.workers), (stored, "codex3"))
         history = accounts.groups_file().with_name("roles.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 1)
@@ -173,13 +173,36 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(stored["showrunners"], "claude1")
         selected = cast(dict[str, object], stored["units"])
         self.assertEqual(selected, {"label": "claude2", "cause": "refusal", "window": "weekly",
-                                   "reset": reset.isoformat(), "move_id": "move-from-mac"})
+                                   "reset": reset.isoformat(), "move_id": "move-from-mac", "why": "weekly refusal"})
         history = (self.server_home / ".local/state/accounts/roles.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 1)
         change = cast(dict[str, object], json.loads(history[0]))
         self.assertEqual(change, {"at": RoleMapReadTime.now(timezone.utc).isoformat(), "group": "units",
             "label": "claude2", "why": "weekly refusal", "cause": "refusal", "window": "weekly",
             "reset": reset.isoformat(), "move_id": "move-from-mac"})
+
+    def test_automatic_group_cause_and_rule_reason_survive_remote_transport_and_transition_readback(self) -> None:
+        self.seed(self.home, groups={"units": "claude1"})
+        self.seed(self.server_home, groups={"units": "claude1", "showrunners": "claude3"})
+        before = self.files(self.home)
+        change = role_map.RoleMapChange("units", "claude2", "auto: units-low",
+            RoleMapReadTime.now(timezone.utc).isoformat(), "automatic-transition", cause="auto")
+        with patch.object(role_map, "ssh_role_map", side_effect=self.remote):
+            role_map.write_role_map(change)
+            transition = accounts.group_transition("units")
+        self.assertIsInstance(transition, accounts.GroupTransition)
+        assert isinstance(transition, accounts.GroupTransition)
+        self.assertEqual(transition.move_id, "automatic-transition")
+        self.assertEqual(transition.why, accounts.RecordedTransitionReason("auto: units-low"))
+        self.assertEqual(accounts.move_origin_fields(transition.origin), {"cause": "auto", "window": "unknown"})
+        history = self.server_home / ".local/state/accounts/roles.jsonl"
+        self.assertEqual(json.loads(history.read_text()), {
+            "at": change.at, "group": "units", "label": "claude2", "why": "auto: units-low",
+            "move_id": "automatic-transition", "cause": "auto", "window": "unknown"})
+        # The readback may create a transport cache, but it never changes local selections or history.
+        for path, contents in before.items():
+            self.assertEqual((self.home / path).read_bytes(), contents)
+        self.assertFalse((self.home / ".local/state/accounts/roles.jsonl").exists())
 
     def test_failed_mac_write_refuses_once_without_changing_local_map_history_or_cache(self) -> None:
         self.seed(self.home, groups={"units": "claude3"})

@@ -364,6 +364,136 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         return saved
 
+    def test_confirmed_unit_restart_sends_one_resume_message_for_all_recorded_seats(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        for moved in (False, True):
+            with self.subTest(account_move=moved):
+                owner = unit("resume-moved" if moved else "resume-plain")
+                owner["cwd"] = str(self.root / "working directory")
+                run = self.root / "worker run"
+                run.mkdir(exist_ok=True)
+                old_prompt = str(run / "old prompt.md")
+                launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
+                            "task", "task instructions", "impl", "continue task", "0", "impl", "mesh-prefix"]
+                seats = [
+                    record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
+                    record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="private-thread-review", turn_live=False, launcher_command=[]),
+                    record.PausedSeat(run_dir=str(run), seat="test", role="test", thread_id="private-thread-test", turn_live=True, launcher_command=[]),
+                ]
+                saved = entry(owner)
+                saved["codex_seats"] = seats
+                if moved:
+                    saved["target"] = "claude3"
+                    saved["source_label"] = LABEL
+                self.create([saved])
+                run_commands = CommandRecorder()
+                live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                with (patch.object(restart, "_run", run_commands),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude3"))):
+                    restart.confirm_entry(saved, RESTARTED, True)
+                sends = [argv for argv in run_commands.calls if "--key" in argv and "resume-workers-" + owner["session_id"] in argv]
+                self.assertEqual(len(sends), 1)
+                argv = sends[0]
+                self.assertIn(str(restart.SEND), argv)
+                self.assertEqual(argv[argv.index("--to") + 1], "session:" + owner["session_id"])
+                self.assertEqual(argv[argv.index("--from") + 1], "shutdown")
+                text = argv[argv.index("--text") + 1]
+                lines = text.splitlines()
+                self.assertEqual(lines[0], "Resume your Codex workers; do not open new ones.")
+                self.assertEqual(lines[-1], "Each seat continues its own thread; after resuming, send later work with --to as usual.")
+                work_line = next(line for line in lines if line.startswith("impl (impl, was working):"))
+                expected = list(launcher) if moved else [*launcher[:4], "--to", "impl", *launcher[4:]]
+                expected[expected.index(old_prompt)] = str(run / "impl.resume-prompt.md")
+                # Shell parsing preserves every original argument, including spaces.
+                self.assertIn(shlex.join(expected), work_line)
+                # Seats with no readable launcher get every launcher argument, ready to run as pasted.
+                idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
+                self.assertTrue(idle_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "review.sh"), "--to", "review", str(run), owner["cwd"],
+                    str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
+                unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
+                self.assertTrue(unread_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
+                self.assertNotIn("usual arguments", text)
+                self.assertIn(owner["cwd"], text)
+                self.assertNotIn(old_prompt, text)
+                self.assertNotIn("private-thread-", text)
+                persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
+                self.assertEqual(persisted["progress"]["kind"], "restarted")
+
+    def test_confirmed_top_level_restart_with_a_paused_seat_also_gets_the_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        owner = top_level("standalone-run")
+        saved = entry(owner)
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread",
+                                                  turn_live=False, launcher_command=[])]
+        self.create([saved])
+        commands = CommandRecorder()
+        with patch.object(restart, "_run", commands):
+            restart.confirm_entry(saved, RESTARTED, True)
+        sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][sends[0].index("--to") + 1], "session:" + owner["session_id"])
+        self.assertIn("implement.sh --to impl", sends[0][sends[0].index("--text") + 1])
+
+    def test_move_on_the_source_account_receives_no_worker_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        saved = entry(unit("source-still-live"))
+        saved["target"] = "claude3"
+        saved["source_label"] = LABEL
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept", turn_live=True, launcher_command=[])]
+        self.create([saved])
+        owner = saved["session"]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        commands = CommandRecorder()
+        with (patch.object(restart, "_run", commands),
+              patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2"))):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(commands.calls, [])
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
+
+    def test_confirmed_restart_without_seats_and_unconfirmed_restart_send_no_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        for live, seats in ((True, []), (False, [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread", turn_live=True, launcher_command=[])])):
+            with self.subTest(live=live):
+                saved = entry(unit("empty" if live else "not-back"))
+                saved["codex_seats"] = seats
+                self.create([saved])
+                commands = CommandRecorder()
+                with patch.object(restart, "_run", commands):
+                    restart.confirm_entry(saved, RESTARTED, live)
+                self.assertFalse(any("--key" in argv and any(value.startswith("resume-workers-") for value in argv) for argv in commands.calls))
+                self.assertEqual(saved["progress"]["kind"], "restarted" if live else "restart failed")
+
+    def test_resume_message_failure_is_logged_once_and_does_not_fail_restart(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        saved = entry(unit("queued-workers"))
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread", turn_live=True, launcher_command=[])]
+        self.create([saved])
+        calls: list[list[str]] = []
+
+        def failed_send(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.CompletedProcess[str]:
+            del dry_run, check
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "QUEUED: director has no socket\n", "")
+
+        with (patch.object(restart, "_run", failed_send),
+              patch.object(syslog, "syslog") as logged,
+              redirect_stderr(io.StringIO()) as errors,
+              redirect_stdout(io.StringIO()) as output):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(saved["progress"]["kind"], "restarted")
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
+        log_lines = [*errors.getvalue().splitlines(), *output.getvalue().splitlines(), *[str(cast(object, call.args[-1])) for call in logged.call_args_list]]
+        self.assertEqual(len(log_lines), 1)
+        self.assertIn("resume", log_lines[0].lower())
+
     def test_live_source_account_cannot_confirm_a_move(self) -> None:
         saved = self.moved_record()
         owner = saved["session"]
@@ -2688,6 +2818,13 @@ class RestartTests(ShutdownTestCase):
         lines = [line for line in result["lines"] if "manual restart kept name:" in line]
         self.assertEqual(len(lines), 1, "\n".join(result["lines"]))
         self.assertIn(restart.resume_command(saved["session"], "claude3", LABEL), lines[0])
+
+    def test_a_renamed_unit_hears_its_new_names_first(self) -> None:
+        saved = entry(unit("unit"))
+        saved["renamed"] = "While you were stopped the showrunner renamed you: you are now gamma-unit."
+        note = restart.restart_note(saved, RESTARTED)
+        self.assertTrue(note.startswith(saved["renamed"] + " Restarted after /shutdown"), note)
+        self.assertNotIn("renamed you", restart.restart_note(entry(unit("unit")), RESTARTED))
 
     def test_move_restart_note_names_source_target_reason_and_continuation_for_every_session_kind(self) -> None:
         for owner in (top_level("top"), unit("unit"), showrunner("runner")):

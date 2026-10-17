@@ -27,6 +27,7 @@ import settle
 import shutdown
 import showrunners
 import stop as stop_work
+import restart
 from importlib import import_module
 import account
 import agent_accounts
@@ -38,6 +39,20 @@ from test_support import ShutdownTestCase
 class AccountMoveTests(ShutdownTestCase):
     root: Path = Path()
     owner: inventory.Session = top_level("move-id", name="kept name")
+
+    def test_move_opening_note_points_to_resume_message_only_when_workers_were_paused(self) -> None:
+        director = unit("moved-director")
+        saved = entry(director)
+        saved["target"] = "claude3"
+        saved["source_label"] = "claude1"
+        sentence = "Your Codex workers are paused, not ended; a message lists the command that resumes each."
+        self.assertNotIn(sentence, restart.restart_note(saved, saved["requested_at"]))
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="private-thread", turn_live=True, launcher_command=[])]
+        note = restart.restart_note(saved, saved["requested_at"])
+        self.assertEqual(note.count(sentence), 1)
+        self.assertIn("message/send.py pending", note)
+        self.assertIn("Continue your /unit:direct run", note)
+        self.assertNotIn("private-thread", note)
 
     @override
     def setUp(self) -> None:

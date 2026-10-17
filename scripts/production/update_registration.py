@@ -19,12 +19,14 @@ from merge_checkpoint import NoMerge, merge_branch_history, report
 if TYPE_CHECKING:
     from ..hooks.showrunner_footer import (FooterState, footer_state, set_footer_state,
         PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
-        read_pending_reviewed, delete_pending_reviewed)
+        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
+        NoDailiesSchedule, Production as FooterProduction)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import (FooterState, footer_state, set_footer_state,
         PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
-        read_pending_reviewed, delete_pending_reviewed)
+        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
+        NoDailiesSchedule, Production as FooterProduction)
 import showrunners
 from dailies_render import (UNREADABLE_LIST, InputError, footer_main, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
@@ -94,10 +96,19 @@ class ReplaceOutstanding(NamedTuple):
     items: tuple[OpenForUserItem, ...]
 
 
+class KeepReports(NamedTuple):
+    pass
+
+
+class ReplaceReports(NamedTuple):
+    items: tuple[ReportItem, ...]
+
+
 class ShowrunnerState(NamedTuple):
     units: tuple[UnitJudgment, ...]
     merges_held: tuple[str, ...]
     outstanding: KeepOutstanding | ReplaceOutstanding
+    reports: KeepReports | ReplaceReports = KeepReports()
 
 
 class RegistrationFailure(Exception):
@@ -243,7 +254,7 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
         raise state_error(step, path, "root", "an object")
     fields = cast(dict[str, object], value)
     for key in fields:
-        if key not in {"units", "merges_held", "open_for_user"}:
+        if key not in {"units", "merges_held", "open_for_user", "report_to_user"}:
             raise state_error(step, path, key, "a known key")
     raw_units = fields.get("units", [])
     if not isinstance(raw_units, list):
@@ -303,7 +314,37 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
             else:
                 items.append(OpenQuestionWithoutText(cast(str, item["text"]), after))
         outstanding = ReplaceOutstanding(tuple(items))
-    return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding)
+    return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding,
+                           report_items(fields, path, step))
+
+
+def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReports | ReplaceReports:
+    """`report_to_user`: what the user asked to be told about, each until an ISO time."""
+    if "report_to_user" not in fields:
+        return KeepReports()
+    raw_reports = fields["report_to_user"]
+    if not isinstance(raw_reports, list):
+        raise state_error(step, path, "report_to_user", "a list")
+    reports: list[ReportItem] = []
+    for index, raw in enumerate(cast(list[object], raw_reports)):
+        key = f"report_to_user[{index}]"
+        if not isinstance(raw, dict):
+            raise state_error(step, path, key, "an object")
+        item = cast(dict[str, object], raw)
+        for field in item:
+            if field not in {"text", "until"}:
+                raise state_error(step, path, f"{key}.{field}", "a known key")
+        text, until = item.get("text"), item.get("until")
+        if not isinstance(text, str) or not text.strip() or "\n" in text:
+            raise state_error(step, path, f"{key}.text", "one nonempty line of text")
+        if not isinstance(until, str):
+            raise state_error(step, path, f"{key}.until", "an ISO time")
+        try:
+            _ = datetime.fromisoformat(until)
+        except ValueError:
+            raise state_error(step, path, f"{key}.until", "an ISO time") from None
+        reports.append(ReportItem(text=text, until=until))
+    return ReplaceReports(tuple(reports))
 
 
 def outstanding_file(slug: str) -> Path:
@@ -503,9 +544,21 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
         for item in pending:
             accepted_text = item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
             print("reviewed question: " + accepted_text)
+    if isinstance(state.reports, ReplaceReports):
+        reports = reports_path(production.slug)
+        reports.parent.mkdir(parents=True, exist_ok=True)
+        _ = reports.write_text(json.dumps(list(state.reports.items)) + "\n", encoding="utf-8")
     # The switch hides the printed footer only. What waits on the user is stored above either way,
     # so the dailies and the open-questions count still see it.
+    place = showrunners.place_of(production.slug)
     if footer_state(production.slug) is FooterState.OFF:
+        # The reply ends with the counts line instead, the open questions counted in it.
+        counted = FooterProduction(production.slug, production.doc, str(production.zone),
+                                   NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
+        questions = open_questions([counted], {production.slug: place.below})
+        line = counts_line([counted], questions or 0)
+        if line is not None:
+            print(line)
         report("footer", "ok", "footers off")
         return
     schedule = instance(f"showrunner-{production.slug}")
@@ -516,9 +569,8 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             due = datetime.fromtimestamp(int(match.group(1)), production.zone)
             days = (due.date() - datetime.now(production.zone).date()).days
             next_run = due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
-    place = showrunners.place_of(production.slug)
     if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed,
-                   below=[outstanding_file(slug) for slug in place.below], root=place.root):
+                   below=[outstanding_file(slug) for slug in place.below], root=place.root, doc=production.doc):
         raise RegistrationFailure("footer", "renderer refused the footer")
     report("footer", "ok", "rendered")
 

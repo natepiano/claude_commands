@@ -663,6 +663,27 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
 
+    def test_footer_state_replaces_reports_only_when_report_to_user_is_present(self) -> None:
+        written = self.outstanding().parent.parent / "reports/example.json"
+        state = self.root / "judgment.json"
+        report = {"text": "hanadocs is back", "until": "2026-10-17T09:00"}
+        _ = state.write_text(json.dumps({"report_to_user": [report]}), encoding="utf-8")
+        saved = self.run_command("footer", "--state", str(state))
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
+        kept = self.run_command("footer", "--state", str(state))
+        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        for bad in ([{"text": "x", "until": "tomorrow"}], [{"text": "", "until": "2026-10-17T09:00"}],
+                    [{"text": "x", "until": "2026-10-17T09:00", "question": "?"}], "x"):
+            with self.subTest(bad=bad):
+                _ = state.write_text(json.dumps({"report_to_user": bad}), encoding="utf-8")
+                refused = self.run_command("footer", "--state", str(state))
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertIn("report_to_user", refused.stdout)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+
     def test_footer_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-01T08:00", "text": "Choose a compiler."}]))
@@ -742,14 +763,15 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
         stored = self.run_command("footer", "--state", str(state))
         self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
-        self.assertEqual(stored.stdout.strip(), "footer: ok — footers off")
+        # The deferred item is not counted until its `after` time.
+        self.assertEqual(stored.stdout.strip(), "For you: 1 question\nfooter: ok — footers off")
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
         self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
         before = outstanding.read_bytes()
         _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
         kept = self.run_command("footer", "--state", str(state))
-        self.assertEqual(kept.stdout.strip(), "footer: ok — footers off")
+        self.assertEqual(kept.stdout.strip(), "For you: 1 question\nfooter: ok — footers off")
         self.assertEqual(outstanding.read_bytes(), before)
         _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
                              encoding="utf-8")

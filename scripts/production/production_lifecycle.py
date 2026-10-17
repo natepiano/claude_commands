@@ -305,6 +305,14 @@ def close_out_items(lines: list[str]) -> tuple[str, ...]:
     return tuple(line[2:].strip() for line in lines[start:end] if line.startswith("- "))
 
 
+def archived_doc(production: Production) -> Path | None:
+    """Where a wrapped doc kept in a productions/ folder goes: archive/<repository>/<slug>/ beside it."""
+    if production.doc.parent.name != "productions":
+        return None
+    common = Path(checked(production.checkout, "wrap", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    return production.doc.parent.parent / "archive" / common.parent.name / production.slug / production.doc.name
+
+
 def retire_reservations(worktree: Path) -> None:
     board = subprocess.run(["cargo-berth", "board", "--json"], capture_output=True,
                            text=True, check=False)
@@ -461,11 +469,17 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    doc_path = doc_path_in_checkout(production, production.doc)
-    if git(production.checkout, "diff", "--quiet", "HEAD", "--", doc_path).returncode == 1:
-        _ = checked(production.checkout, "wrap", "add", "--", doc_path)
+    doc_paths = [doc_path_in_checkout(production, production.doc)]
+    archive = archived_doc(production)
+    if archive is not None:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        doc_paths.append(doc_path_in_checkout(production, archive))
+        _ = checked(production.checkout, "wrap", "mv", "--", *doc_paths)
+        report("wrap", "ok", f"moved the doc out of productions/ to {doc_paths[1]}")
+    if git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
+        _ = checked(production.checkout, "wrap", "add", "--", doc_paths[-1])
         _ = checked(production.checkout, "wrap", "commit", "--only", "-m",
-                    f"production({production_name(lines)}): wrapped", "--", doc_path)
+                    f"production({production_name(lines)}): wrapped", "--", *doc_paths)
         report("wrap", "ok", "production doc committed")
     else:
         report("wrap", "ok", "production doc already committed")

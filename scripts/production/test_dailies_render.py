@@ -389,6 +389,20 @@ for name in ("first", "second"):
                                   "* next dailies: 11:30 PDT"])
         self.assertEqual(quiet, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
 
+    def test_the_counts_line_follows_the_header_in_footer_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            ledger = Path(folder) / "ledger.md"
+            _ = ledger.write_text("- 2026-10-16 One (one.md) — proposed\n- 2026-10-16 Two (two.md) — accepted 2026-10-16\n")
+            doc = Path(folder) / "production.md"
+            _ = doc.write_text(f"# Production\n\n- **Improvement queue:** {ledger}\n")
+            head = [*FOOTER_HEAD[:-1], "For you: 2 projects", ""]
+            self.assertEqual(self.lines(footer("--doc", str(doc))), [*head, *AGENT_LINES, "* no dailies scheduled"])
+            tail = after_timeline(self.lines(render({**report(False), "doc": str(doc)})))
+            self.assertEqual(tail, ["", *head, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
+            # A doc with nothing counted adds no line.
+            _ = doc.write_text("# Production\n")
+            self.assertEqual(self.lines(footer("--doc", str(doc))), [*FOOTER_HEAD, *AGENT_LINES, "* no dailies scheduled"])
+
     def test_lower_showrunner_footer_names_its_root(self) -> None:
         self.assertEqual(self.lines(footer("--next-run", "11:30", "--reports-to", "build-followups")),
                          [*FOOTER_HEAD, *AGENT_LINES, "* reports to build-followups", "* next dailies: 11:30 PDT"])
