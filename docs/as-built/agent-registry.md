@@ -145,7 +145,8 @@ codex_mesh.py send   --session-dir --to <name> (--message <text> | --message-fil
 codex_mesh.py steer  --session-dir --to <name> (--message <text> | --message-file <path>)
 codex_mesh.py end    --session-dir --to <name>
 codex_mesh.py list   --session-dir                            # roster: name, status, thread id
-codex_mesh.py stop   --session-dir
+codex_mesh.py stop   --session-dir [--pause]                # --pause: seats paused, not ended
+codex_mesh.py reopen --session-dir --to <name>              # ended or abandoned seat back to paused
 codex_mesh.py sweep  [--root <dir>] [--stop]
 ```
 
@@ -216,18 +217,19 @@ it calls `thread/queue/add`, and the message lands at the start of the target's
 **next** turn; to a `waiting_capacity` worker it stores the message in
 `<worker>.pending.json` under an `flock`, for the resume turn. It refuses a
 `capacity_exhausted` worker or one being ended (exit 2), and any other status
-(`starting`, `done`, `failed`, `ended`) with `<worker> is <status>, not running; read its summary file`
+(`starting`, `done`, `failed`, `paused`, `ended`) with `<worker> is <status>, not running; read its summary file`
 (exit 1): the thread outlives the launcher, so the server would start a turn for
 a late message with nothing streaming it and nothing writing the summary.
 `steer` needs a `running` worker; it calls `turn/steer` with the roster's
 `expectedTurnId` and interrupts the turn in flight. `end` accepts `starting`,
-`running`, `done`, `failed`, `waiting_capacity` and `capacity_exhausted`
+`running`, `done`, `failed`, `paused`, `waiting_capacity` and `capacity_exhausted`
 (`ENDABLE_STATUSES`): it drops the thread's queued messages, leaves the marker
 the `start` loop polls for, sets the worker's roster status to `ended`, and
 interrupts any live turn. Any other status, `ended` included, prints `<worker> is
 <status>; nothing to end` and exits 0.
 
-`stop` sets every roster worker to `ended`, SIGTERMs each recorded pid (SIGKILL
+`stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
+non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
 after `REAP_WAIT_SECS`, 5 s, checked every `REAP_POLL_SECS`, 0.2 s) and removes the
 server file. `scripts/delegate/end_session.sh` calls it, reading the session directory
 out of the run-active marker: the server is detached on purpose so it outlives
@@ -314,7 +316,7 @@ A thin dispatcher over the resolver:
 | `scripts/delegate/findings.py` | The delegate fix loop's convergence test — what replaced the fix-pass counter. Stable finding IDs (`F001…`) with states `open` / `fixed_pending_review` / `accepted`, held in `findings_state.json` beside the progress state for the current phase's `instance_id`; a displaced phase's ledger waits in `findings_state-<instance_id>.json` until it is current again. `gate` returns `converged` / `dispatch` / `stop`, gating on blocker+minor in round 1 and blocker only afterwards (nits never gate); `dispatch --covers` refuses a partial batch so one fix round repairs everything gating together. Stops on: a finding that failed to close twice, a finding reopened twice, two rounds with no decrease in the gating-open count, or a 10-round runaway backstop. Appends `finding_opened` / `finding_batch_dispatched` / `finding_verdict` / `finding_gate` to the same durable run JSONL. |
 | `scripts/delegate/test_progress_history.py`, `test_findings.py` | `python3 -m unittest scripts.delegate.test_progress_history scripts.delegate.test_findings` from `~/.claude`. Both drive the real CLIs in a temp session dir with `PLAN_DELEGATE_NOW_EPOCH` / `PLAN_DELEGATE_HISTORY_DIR` pinning time and storage; `test_progress_history` runs the recorder's `main()` in-process through `recorder_fixture.invoke_recorder` and keeps one subprocess case for the CLI contract. |
 | `scripts/cli_agent/cli_agent.sh` | zshrc-alias dispatcher (`review`, `commit_no`, `commit_yes`, `merge`, `code`). `cli_agent_print_status` prints the four `cli.*` rows via `agents_resolve_print`; `cli_agent_run` maps no args → `cli.interactive` REPL and a skill name → `cli.<skill>` (unknown skill errors with the known list), then `exec`s codex with `agents_codex_args` (the registry tier included) or claude with `-- "/$invocation"`. It has no assignment editor — assignment changes go through `/agent`. |
-| `scripts/production/add_unit.py` | `production.director`, resolved directly (not through `agent_exec`) because a unit director is a long-lived herdr session: `director_agent` runs `bash -c` sourcing `agents_config.sh` and `agents_resolve production.director`, refuses any family but `claude`, and launches it through `herdr.start_agent(kind="claude", agent_arguments=[--model <agent>, [--effort <effort>], --remote-control …])`. `produce.md`'s Resume resolves the same row and runs `agents_claude_args` before `claude --resume`. |
+| `scripts/production/add_unit.py` | `production.director`, resolved directly (not through `agent_exec`) because a unit director is a long-lived herdr session: `director_agent` runs `bash -c` sourcing `agents_config.sh` and `agents_resolve production.director`, refuses any family but `claude`, and launches it through `herdr.start_agent(kind="claude", agent_arguments=[--model <agent>, [--effort <effort>], --remote-control …])`. `produce.md`'s Resume runs `add_unit.py ... --resume <session-id> --cwd <cwd>`, which resolves the same row and keeps the transcript's last model unless `--model` is given. |
 | `scripts/fix/agent_assignments.sh` | `cf_load_stage_assignment <section> <enabled_var> <family_var> <agent_var> <effort_var>` reads `enabled=` from `agent-assignments.conf`, validates it with `cf_validate_bool`, then fills family/agent/effort from `agents_resolve fix.<section>` (surfacing resolver errors). `cf_print_stage_assignment` / `cf_print_agent_assignments` back the `/fix agent` status view; `cf_trim` and `cf_resolve_checkout` also live here. |
 | `scripts/fix/agent-assignments.conf` | Stage enablement only — `[style_eval]` / `[style_eval_review]` / `[style_fix]` with `enabled=`. Scheduled-run policy: consulted only when `FIX_SCHEDULED=1`. |
 | `scripts/fix/fix.sh` | Driver: loads all three stage assignments before checking `enabled` through `stage_runs()` (which only consults it on a scheduled run), logs `family/agent`, and renders the report through `agent_exec fix.report write "$HOME/.claude" <prompt> /tmp/fix-report.txt <log_dir>/report_render.txt` behind an activity grep, with a guarded prompt build and WARN-and-continue. |

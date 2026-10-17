@@ -1434,7 +1434,10 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     if _PLATFORM == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
     try:
-        pane = _process_environment(_proc_root() / str(pid)).get("HERDR_PANE_ID", "")
+        environment = _process_environment(_proc_root() / str(pid))
+        if environment.get("TMUX_PANE"):
+            return NotInHerdr()
+        pane = environment.get("HERDR_PANE_ID", "")
         if not pane:
             return NotInHerdr()
         candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
@@ -1729,7 +1732,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
                 continue
             environment = darwin_process_environment(pid)
             pane = environment.get("HERDR_PANE_ID", "")
-            if not pane:
+            if environment.get("TMUX_PANE") or not pane:
                 continue
             marks = {key: environment[key] for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID") if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
@@ -1755,7 +1758,7 @@ def herdr_processes() -> list[HerdrProcess]:
                 continue
             environment = _process_environment(process)
             pane = environment.get("HERDR_PANE_ID", "")
-            if not pane:
+            if environment.get("TMUX_PANE") or not pane:
                 continue
             arguments = _process_arguments(process)
             if not arguments:

@@ -41,7 +41,7 @@ What it does:
      where the session resumes (`/showrunner:add_showrunner` names what
      counts as trusted).
 2. **Stops** the unit: it types `/exit` into the unit's pane and waits until its
-   Claude is gone, then ends its session on its host, tmux or herdr. Two processes on one session
+   Claude is gone, then ends its session on its host, herdr. Two processes on one session
    corrupt it, so nothing restarts while the old one runs.
 3. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
    same session in the unit's worktree: in its own herdr session named for the
