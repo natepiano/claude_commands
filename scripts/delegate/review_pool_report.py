@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare pooled and own-seat review costs and phase finding quality."""
+"""Report review costs and phase finding quality from turn records."""
 from __future__ import annotations
 
 import argparse
@@ -27,7 +27,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 from scripts.production import review_regime
 from scripts.usage import collect, usage_report, weights
-from scripts.whoami.seat_usage import parse_boundary
+from scripts.whoami.worker_usage import parse_boundary
 
 Arm = Literal["pool", "own"]
 Kind = Literal["broad", "closure", "ux"]
@@ -492,50 +492,47 @@ def quality_lines(records: Sequence[ReviewRecord], sources: ReportSources) -> li
     for record in sources.records:
         if record.kind != "ux" and record.phase_key in selected_phases:
             phases.setdefault(record.phase_key, []).append(record)
-    mixed = {key for key, group in phases.items() if len({record.arm for record in group}) > 1}
-    lines = ["Code review quality by arm", "| Arm | Phases | Raised | Confirmed | Precision | Escapes per phase |",
-             "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    lines = ["Code review quality", "| Phases | Raised | Confirmed | Precision | Escapes per phase |",
+             "| ---: | ---: | ---: | ---: | ---: |"]
     warnings: list[str] = []
-    for arm in ("pool", "own"):
-        groups = [group for key, group in phases.items() if key not in mixed and group[0].arm == arm]
-        raised = confirmed = escapes = 0
-        for group in groups:
-            record = group[0]
-            raised += sum(item.raised for item in group if item.outcome == "reviewed")
-            events = sources.histories.get((record.machine, record.history_file), [])
-            for event in events:
-                if (event.get("event_type") != "finding_opened" or
-                        event.get("phase_instance_id") != record.phase_instance_id or event.get("lens") == "ux"):
+    groups = list(phases.values())
+    raised = confirmed = escapes = 0
+    for group in groups:
+        record = group[0]
+        raised += sum(item.raised for item in group if item.outcome == "reviewed")
+        events = sources.histories.get((record.machine, record.history_file), [])
+        for event in events:
+            if (event.get("event_type") != "finding_opened" or
+                    event.get("phase_instance_id") != record.phase_instance_id or event.get("lens") == "ux"):
+                continue
+            if event.get("caught_by") in ("delegate", "both"):
+                confirmed += 1
+            elif event.get("caught_by") == "main":
+                escapes += 1
+        # Merge holds describe the whole phase, not a particular lens.
+        plan = review_plan(record, sources)
+        unmatched = False
+        for row in sources.holds.get(record.machine, []):
+            if row.get("unit") != record.unit or str(row.get("phase")) != record.phase:
+                continue
+            value = row.get("holds")
+            if not isinstance(value, int):
+                continue
+            held_plan = row.get("plan")
+            if isinstance(held_plan, str):
+                if isinstance(plan, PlanUnavailable):
+                    unmatched = True
                     continue
-                if event.get("caught_by") in ("delegate", "both"):
-                    confirmed += 1
-                elif event.get("caught_by") == "main":
-                    escapes += 1
-            # Merge holds describe the whole phase, not a particular lens.
-            plan = review_plan(record, sources)
-            unmatched = False
-            for row in sources.holds.get(record.machine, []):
-                if row.get("unit") != record.unit or str(row.get("phase")) != record.phase:
+                if normalize_plan(held_plan) != plan.path:
                     continue
-                value = row.get("holds")
-                if not isinstance(value, int):
-                    continue
-                held_plan = row.get("plan")
-                if isinstance(held_plan, str):
-                    if isinstance(plan, PlanUnavailable):
-                        unmatched = True
-                        continue
-                    if normalize_plan(held_plan) != plan.path:
-                        continue
-                escapes += value
-            if unmatched and isinstance(plan, PlanUnavailable):
-                warnings.append(f"source warning: merge holds unmatched: {record.unit} phase {record.phase}: "
-                                + f"review plan unavailable ({plan.reason})")
-        precision = f"{confirmed / raised * 100:.1f}%" if raised else "-"
-        escape_rate = f"{escapes / len(groups):.1f}" if groups else "-"
-        lines.append(f"| {arm} | {len(groups)} | {raised} | {confirmed} | {precision} | {escape_rate} |")
-    lines.extend((f"mixed phases: {len(mixed)} (excluded from comparison)",
-                  "ui checks: compared by --shadow, not in this table"))
+            escapes += value
+        if unmatched and isinstance(plan, PlanUnavailable):
+            warnings.append(f"source warning: merge holds unmatched: {record.unit} phase {record.phase}: "
+                            + f"review plan unavailable ({plan.reason})")
+    precision = f"{confirmed / raised * 100:.1f}%" if raised else "-"
+    escape_rate = f"{escapes / len(groups):.1f}" if groups else "-"
+    lines.append(f"| {len(groups)} | {raised} | {confirmed} | {precision} | {escape_rate} |")
+    lines.append("ui checks: compared by --shadow, not in this table")
     lines.extend(warnings)
     return lines
 
@@ -543,12 +540,11 @@ def quality_lines(records: Sequence[ReviewRecord], sources: ReportSources) -> li
 def render_report(records: Sequence[ReviewRecord], costs: Mapping[RecordKey, ReviewCost],
                   quality: bool, *, sources: ReportSources) -> str:
     reviewed = [record for record in records if record.outcome == "reviewed"]
-    lines = ["Tokens by arm and kind", "| Arm | Kind | Reviews | Median weighted tokens | Mean weighted tokens | Cached input share |",
-             "| --- | --- | ---: | ---: | ---: | ---: |"]
-    for arm in ("pool", "own"):
-        for kind in ("broad", "closure", "ux"):
-            group = [record for record in reviewed if record.arm == arm and record.kind == kind]
-            lines.append(f"| {arm} | {kind} | {cost_cells(group, costs)} |")
+    lines = ["Tokens by kind", "| Kind | Reviews | Median weighted tokens | Mean weighted tokens | Cached input share |",
+             "| --- | ---: | ---: | ---: | ---: |"]
+    for kind in ("broad", "closure", "ux"):
+        group = [record for record in reviewed if record.kind == kind]
+        lines.append(f"| {kind} | {cost_cells(group, costs)} |")
     lines += ["", "Pool tokens by lease ordinal", "| Lease ordinal | Reviews | Median weighted tokens | Mean weighted tokens | Cached input share |",
               "| --- | ---: | ---: | ---: | ---: |"]
     for label in ("1", "2", "3+"):
@@ -556,37 +552,17 @@ def render_report(records: Sequence[ReviewRecord], costs: Mapping[RecordKey, Rev
                  (str(record.lease_ordinal) == label or (label == "3+" and record.lease_ordinal >= 3))]
         lines.append(f"| {label} | {cost_cells(group, costs)} |")
     lines.append("")
-    for arm in ("pool", "own"):
-        counts = [sum(record.arm == arm and record.outcome == outcome for record in records)
-                  for outcome in ("void", "canceled", "error")]
-        lines.append(f"{arm} outcomes: void {counts[0]}; canceled {counts[1]}; error {counts[2]}")
+    counts = [sum(record.outcome == outcome for record in records) for outcome in ("void", "canceled", "error")]
+    lines.append(f"outcomes: void {counts[0]}; canceled {counts[1]}; error {counts[2]}")
     incomplete = [(record, cost) for record in reviewed if isinstance(cost := costs[record.key], IncompleteCost)]
     details = "; ".join(f"{record.machine}:{record.path} ({cost.reason})" for record, cost in incomplete)
     lines.append(f"cost incomplete: {len(incomplete)}" + (f": {details}" if details else ""))
-    began_with_compaction = {
-        arm: sum(record.arm == arm and isinstance(cost := costs[record.key], CompleteCost)
-                 and cost.began_with_compaction for record in reviewed)
-        for arm in ("pool", "own")
-    }
-    lines.append(f"began with a compaction: pool {began_with_compaction['pool']}; own {began_with_compaction['own']}")
+    began_with_compaction = sum(isinstance(cost := costs[record.key], CompleteCost) and cost.began_with_compaction
+                                for record in reviewed)
+    lines.append(f"began with a compaction: {began_with_compaction}")
     if quality:
         lines.extend(("", *quality_lines(records, sources)))
     lines.extend(f"source warning: {warning}" for warning in sources.warnings)
-    code_reviews = [record for record in reviewed if record.kind in ("broad", "closure")]
-    pool_count = sum(record.arm == "pool" for record in code_reviews)
-    if pool_count < 20:
-        lines.append(f"pool reviews: {pool_count} of 20 for the first reading")
-    else:
-        means: dict[str, float] = {}
-        for arm in ("pool", "own"):
-            values = [cost.weighted_tokens for record in code_reviews if record.arm == arm
-                      and isinstance(cost := costs[record.key], CompleteCost)]
-            if values:
-                means[arm] = statistics.mean(values)
-        if "pool" in means and means.get("own", 0) > 0:
-            lines.append(f"pool is at {means['pool'] / means['own'] * 100:.1f}% of own-seat tokens per review")
-        else:
-            lines.append("pool tokens per review: no comparison yet (complete costs needed for both arms)")
     return "\n".join(lines)
 
 

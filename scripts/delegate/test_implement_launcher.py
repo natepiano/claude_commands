@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Integration tests for implement.sh's seat arguments.
+"""Integration tests for implement.sh's worker arguments.
 
 The failure these exist for left no error anywhere. A repair round went out with
-the pass kind on one seat, the other two launchers ran their agents normally,
+the pass kind on one worker, the other two launchers ran their agents normally,
 and the ledger kept describing the round before it -- two records closed `error`
 an hour earlier -- until the one live window closed and the recorder began
 refusing every progress call while two agents were still working.
@@ -12,14 +12,20 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, override
+from unittest.mock import patch
+
+from scripts.accounts import accounts
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -42,6 +48,7 @@ import os
 import pathlib
 import sys
 import time
+import signal
 
 verb = sys.argv[1]
 def option(name):
@@ -76,6 +83,9 @@ elif verb == 'compact':
     else:
         print(f'compacted {name}: {before} -> {after} tokens')
 elif verb == 'can-follow':
+    status_file = session / 'impl_status_impl'
+    if status_file.exists():
+        (session / 'status_before_claim.txt').write_text(status_file.read_text())
     name = option('--to')
     entry = roster.get(name, {})
     status = entry.get('status')
@@ -87,7 +97,7 @@ elif verb == 'can-follow':
             alive = True
         except ProcessLookupError:
             pass
-    if status not in ('done', 'failed') and not (
+    if status not in ('done', 'failed', 'paused') and not (
         status in ('running', 'starting') and pid and not alive
     ):
         sys.exit(2)
@@ -109,7 +119,7 @@ elif verb == 'follow':
         roster_path.write_text(json.dumps(roster))
         sys.exit(1)
     if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
-        time.sleep(60)
+        signal.pause()
     roster[name]['role'] = option('--role')
     (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
     if os.environ.get('STUB_FOLLOW_FAIL') == '1':
@@ -122,7 +132,11 @@ elif verb == 'follow':
         roster[name]['launcher_pid'] = os.getpid()
     roster_path.write_text(json.dumps(roster))
     if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
-        time.sleep(60)
+        if os.environ.get('STUB_LAUNCH_RELEASE'):
+            import subprocess
+            subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
+        else:
+            signal.pause()
         roster[name]['status'] = 'done'
     pathlib.Path(option('--summary-file')).write_text('follow-up summary\\n')
 elif verb == 'release-follow':
@@ -134,6 +148,9 @@ elif verb == 'release-follow':
 else:
     sys.exit(2)
 roster_path.write_text(json.dumps(roster))
+if verb == 'start' and os.environ.get('STUB_LAUNCH_RELEASE'):
+    import subprocess
+    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
 """
 
 CLAUDE_REGISTRY = """[assignments]
@@ -156,7 +173,11 @@ import sys
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
     (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
-    (root / 'seat_state').write_text('busy')
+    (root / 'launch_environment.json').write_text(json.dumps({
+        key: os.environ.get(key, '')
+        for key in ('CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_REMOTE_MEMORY_DIR')
+    }))
+    (root / 'worker_state').write_text('busy')
     own_summary = root / 'own_summary.bin'
     if own_summary.exists():
         pathlib.Path(os.environ['STUB_SUMMARY']).write_bytes(own_summary.read_bytes())
@@ -168,9 +189,9 @@ elif sys.argv[1:3] == ['agents', '--json']:
         unreadable.unlink()
         print('not JSON')
         sys.exit(0)
-    status = (root / 'seat_state').read_text().strip()
+    status = (root / 'worker_state').read_text().strip()
     if status == 'busy':
-        (root / 'seat_state').write_text('idle')
+        (root / 'worker_state').write_text('idle')
     launch_args = root / 'launch_args.json'
     name = 'fixture-impl'
     if launch_args.exists():
@@ -202,7 +223,7 @@ with transcript.open('a') as output:
     output.write(json.dumps({'type': 'assistant', 'message': {'stop_reason': 'end_turn'}}) + '\\n')
 pathlib.Path(os.environ['STUB_SUMMARY']).write_text('Claude follow-up summary\\n')
 if behavior == 'gone':
-    (root / 'seat_state').write_text('gone\\n')
+    (root / 'worker_state').write_text('gone\\n')
 if behavior == 'unreadable_once':
     (root / 'unreadable_listing_once').write_text('yes\\n')
 print('DELIVERED')
@@ -233,8 +254,8 @@ gpt-blind=low,medium,high,xhigh,max
 """
 
 
-class ImplementLauncherSeatTests(unittest.TestCase):
-    """Every seat carries a kind, and the board line says which."""
+class ImplementLauncherWorkerTests(unittest.TestCase):
+    """Every worker carries a kind, and the board line says which."""
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -252,7 +273,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         self.working_dir = self.root / "project"
         self.working_dir.mkdir()
         _ = subprocess.run(
-            ["git", "init", "-b", "feature/seats"],
+            ["git", "init", "-b", "feature/workers"],
             cwd=self.working_dir,
             check=True,
             capture_output=True,
@@ -273,6 +294,12 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         registry = self.root / ".claude" / "config" / "agents.conf"
         registry.parent.mkdir(parents=True)
         _ = registry.write_text(AGENTS_REGISTRY, encoding="utf-8")
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
+        _ = (self.root / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "worker@example.invalid"},
+        }))
         self.prompt_file = self.root / "implementation_prompt.md"
         _ = self.prompt_file.write_text("Write the retry path.\n", encoding="utf-8")
         self.implement_script = self.build_script_tree()
@@ -293,10 +320,11 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "seat_name.sh", "progress_history.py", "findings.py", "board.sh"):
+        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         launcher = delegate / "implement.sh"
         _ = launcher.write_text(
@@ -304,7 +332,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
+        for name in ("agents_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
@@ -324,6 +352,23 @@ class ImplementLauncherSeatTests(unittest.TestCase):
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["HOME"] = str(self.root)
+        environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
+        # The copied shell helper uses the real account policy, while identity
+        # and configuration stay in this fixture's home.
+        environment["PYTHONPATH"] = str(DELEGATE_DIR.resolve().parents[1])
+        for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+                     "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
+            _ = environment.pop(name, None)
+        environment["XDG_CACHE_HOME"] = str(self.root / "cache")
+        cache = self.root / "cache" / "claude" / "python3-3.10"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(sys.executable + "\n")
+        _ = environment.pop("CLAUDE_PYTHON", None)
+        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
+        environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+        environment["TEST_WAIT_HELPER"] = str(DELEGATE_DIR.resolve() / "wait_for_test_state.py")
+        environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
@@ -339,13 +384,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
-        result = subprocess.run(
-            ["python3", str(DELEGATE_DIR / "progress_history.py"), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def start_phase(self, name: str) -> Path:
@@ -378,8 +417,25 @@ class ImplementLauncherSeatTests(unittest.TestCase):
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
+
+    def test_a_launch_naming_its_phase_writes_in_that_phase_directory(self) -> None:
+        # Two phases running the same role each name their own, so neither overwrites the
+        # other's status, summary or log, and the name stays off the worker's address.
+        session_dir = self.start_phase("phase-directory")
+        result = subprocess.run(
+            ["bash", str(self.implement_script), "--phase", "3", str(session_dir), str(self.working_dir),
+             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            check=False, capture_output=True, text=True, env=self.environment(), timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        phase_dir = session_dir / "phases" / "3"
+        self.assertEqual((phase_dir / "impl_status_impl").read_text(encoding="utf-8").strip(), "implemented")
+        self.assertTrue((phase_dir / "impl_agent_impl.log").is_file())
+        self.assertEqual(sorted(path.name for path in session_dir.glob("impl_status*")), [])
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertNotIn("3-impl", board)
 
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()
@@ -387,6 +443,103 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         if fail:
             environment["STUB_FOLLOW_FAIL"] = "1"
         return environment
+
+    def test_identity_probes_default_to_thirty_one_second_waits_for_new_and_followed_workers(self) -> None:
+        for follow in (False, True):
+            with self.subTest(follow=follow):
+                session = self.start_phase(f"default-probes-{follow}")
+                arguments = ["bash", str(self.implement_script)]
+                if follow:
+                    initial = self.mesh_launch(session)
+                    self.assertEqual(initial.returncode, 0, initial.stderr)
+                    roster = cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))
+                    arguments.extend(["--to", next(iter(roster))])
+                arguments.extend([str(session), str(self.working_dir), str(self.prompt_file),
+                                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"])
+                binaries = session / "bin"
+                binaries.mkdir()
+                sleep = binaries / "sleep"
+                _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_PROBES"\n')
+                sleep.chmod(0o755)
+                watcher = self.root / "scripts/agents/heartbeat_watch.sh"
+                _ = watcher.write_text('#!/bin/bash\nif [[ -n "${TEST_PROBES_FINISHED:-}" ]]; then '
+                                       + ': > "$TEST_PROBES_FINISHED"; fi\n')
+                mesh = self.root / "scripts/agents/codex_mesh.py"
+                _ = mesh.write_text(STUB_MESH.replace(
+                    "verb = sys.argv[1]", "verb = sys.argv[1]\n"
+                    + "if verb in ('start', 'follow'):\n"
+                    + "    import subprocess\n"
+                    + "    agent_pid = pathlib.Path(os.environ['TEST_AGENT_PID'])\n"
+                    + "    agent_pid.with_name(agent_pid.name + '.tmp').write_text(str(os.getpid()))\n"
+                    + "    os.replace(agent_pid.with_name(agent_pid.name + '.tmp'), agent_pid)\n"
+                    + "    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['TEST_DEFAULT_RELEASE']], check=True)"
+                ))
+                probes = session / "probes"
+                finished = session / "probes-finished"
+                release = session / "release"
+                pid_file = session / "agent-pid"
+                environment = self.mesh_environment()
+                for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                            "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+                    _ = environment.pop(key, None)
+                environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                                    "TEST_PROBES": str(probes), "TEST_PROBES_FINISHED": str(finished),
+                                    "TEST_AGENT_PID": str(pid_file), "TEST_DEFAULT_RELEASE": str(release)})
+                process = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
+                try:
+                    wait_until(lambda: finished.exists(), session, processes=(process,))
+                    os.kill(wait_for_pid(pid_file, processes=(process,)), 0)
+                    self.assertIsNone(process.poll())
+                    self.assertEqual(probes.read_text().splitlines(), ["1"] * 30)
+                    if follow:
+                        claim = cast("dict[str, object]", json.loads((session / "impl_claim_impl.json").read_text()))
+                        self.assertEqual(claim["turn_id"], "")
+                    else:
+                        self.assertFalse((session / "impl_worker_impl.json").exists())
+                finally:
+                    output, errors = self.finish_default_launcher(process, release, mesh)
+                self.assertEqual(process.returncode, 0, output + errors)
+
+    def finish_default_launcher(self, process: subprocess.Popen[str], release: Path,
+                                mesh: Path, timeout: float = 300) -> tuple[str, str]:
+        try:
+            release.touch()
+            return communicate_launcher(process, timeout)
+        finally:
+            # A timeout must also restore the fixture for the next subcase.
+            _ = mesh.write_text(STUB_MESH)
+
+    def test_default_launcher_timeout_reaps_its_group_and_restores_the_mesh(self) -> None:
+        ready = self.root / "blocked-launcher-child"
+        child_code = ("import os, signal, sys; from pathlib import Path; "
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                      "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
+                      "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
+        program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(ready)!r}]); child.wait()"
+        process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        mesh = self.root / "scripts/agents/codex_mesh.py"
+        _ = mesh.write_text("blocked fixture")
+        try:
+            descriptor = os.pidfd_open(wait_for_pid(ready, processes=(process,)))
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _ = self.finish_default_launcher(process, self.root / "release", mesh, timeout=0)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(select.select([descriptor], [], [], 300)[0], [descriptor])
+                self.assertEqual(mesh.read_text(), STUB_MESH)
+                self.assertTrue(process.stdout is not None and process.stdout.closed)
+                self.assertTrue(process.stderr is not None and process.stderr.closed)
+            finally:
+                os.close(descriptor)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
+            _ = mesh.write_text(STUB_MESH)
 
     def mesh_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",
@@ -410,7 +563,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
             environment["PLAN_DELEGATE_RESOLVES_ROUND"] = "1"
         return subprocess.run(
             arguments, check=False, capture_output=True, text=True,
-            env=environment, timeout=120,
+            env=environment, timeout=300,
         )
 
     def set_mesh_context(self, session_dir: Path, name: str, tokens: int) -> None:
@@ -473,7 +626,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     def observed_status(self, session_dir: Path, command: str) -> str:
         return (session_dir / f"observed_{command}.txt").read_text(encoding="utf-8")
 
-    def claude_seat(self, session_dir: Path) -> Path:
+    def claude_worker(self, session_dir: Path) -> Path:
         registry = self.root / ".claude" / "config" / "agents.conf"
         _ = registry.write_text(CLAUDE_REGISTRY, encoding="utf-8")
         sessions = self.root / "sessions"
@@ -489,20 +642,20 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn"}})
             + "\n", encoding="utf-8"
         )
-        _ = (session_dir / "seats").write_text(
+        _ = (session_dir / "workers").write_text(
             "abc12345\tfixture-impl\n", encoding="utf-8"
         )
         _ = (session_dir / "impl_bg_id_impl").write_text(
             "abc12345\n", encoding="utf-8"
         )
-        _ = (session_dir / "impl_seat_impl.json").write_text(json.dumps({
+        _ = (session_dir / "impl_worker_impl.json").write_text(json.dumps({
             "name": "fixture-impl", "slot": "impl", "family": "claude",
-            "model": "opus", "seat_id": session_id,
+            "model": "opus", "worker_id": session_id,
         }), encoding="utf-8")
         _ = (session_dir / "impl_status_impl").write_text(
             "implemented\n", encoding="utf-8"
         )
-        _ = (self.root / "seat_state").write_text("idle\n", encoding="utf-8")
+        _ = (self.root / "worker_state").write_text("idle\n", encoding="utf-8")
         for name, content in (("claude", STUB_CLAUDE), ("send", STUB_SEND)):
             script = self.root / name
             _ = script.write_text(content, encoding="utf-8")
@@ -528,7 +681,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 ["bash", str(self.implement_script), "--to", "fixture-impl",
                  str(session_dir), str(self.working_dir), str(self.prompt_file),
                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-                check=False, capture_output=True, text=True, env=environment, timeout=30,
+                check=False, capture_output=True, text=True, env=environment, timeout=300,
             )
         except subprocess.TimeoutExpired as error:
             delivered = self.root / "delivered_message.txt"
@@ -536,7 +689,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 " ".join((
                     f"Claude follow timed out: transcript={transcript.read_text()!r},",
                     f"delivered={delivered.exists()},",
-                    f"seat_state={(self.root / 'seat_state').read_text()!r},",
+                    f"worker_state={(self.root / 'worker_state').read_text()!r},",
                     f"stdout={error.stdout!r}, stderr={error.stderr!r}",
                 ))
             ) from error
@@ -568,7 +721,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
              str(self.prompt_file), "impl", "the retry path", "impl",
              "writing the retry path", "0", "impl"],
-            check=False, capture_output=True, text=True, env=environment, timeout=30,
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
         )
 
     def open_passes(self, session_dir: Path) -> dict[str, OpenPass]:
@@ -578,7 +731,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         )
         return stored["pass"]
 
-    def test_new_claude_seat_uses_registry_effort(self) -> None:
+    def test_new_claude_worker_uses_registry_effort(self) -> None:
         for row, expected_effort in (("sonnet:low", "low"), ("sonnet", "")):
             with self.subTest(row=row):
                 session_dir = self.start_phase(f"effort-{row.replace(':', '-')}")
@@ -602,8 +755,31 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                     "abc12345\n",
                 )
                 self.assertIn(
-                    "abc12345\t", (session_dir / "seats").read_text(encoding="utf-8")
+                    "abc12345\t", (session_dir / "workers").read_text(encoding="utf-8")
                 )
+
+    def test_copied_claude_launcher_keeps_legacy_home_then_uses_showrunners_after_cutover(self) -> None:
+        with patch.dict(os.environ, self.environment(), clear=True):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "worker@example.invalid"},
+            }))
+            groups = accounts.groups_file()
+            groups.parent.mkdir(parents=True, exist_ok=True)
+            _ = groups.write_text(json.dumps({"showrunners": "claude2"}))
+        for cutover in (False, True):
+            with self.subTest(cutover=cutover):
+                if cutover:
+                    _ = (self.root / ".claude.json").write_text("{}")
+                session_dir = self.start_phase(f"copied-account-{cutover}")
+
+                result = self.claude_launch(session_dir, "sonnet:low")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads((self.root / "launch_environment.json").read_text()), {
+                    "CLAUDE_CONFIG_DIR": str(self.root / ".claude2") if cutover else "",
+                    "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / ".claude") if cutover else "",
+                })
 
     def test_claude_pane_fallback_strips_controls_before_character_cut(self) -> None:
         session_dir = self.start_phase("pane-cleanup")
@@ -658,7 +834,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_written_summary_is_preserved_byte_for_byte(self) -> None:
         session_dir = self.start_phase("own-summary")
-        original = b"Seat summary\r\n\x1b[31mcolour\x1b[0m\n"
+        original = b"Worker summary\r\n\x1b[31mcolour\x1b[0m\n"
         _ = (self.root / "own_summary.bin").write_bytes(original)
         _ = (self.root / "pane.bin").write_bytes(b"Other pane output\n")
 
@@ -668,7 +844,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual((session_dir / "impl_summary_impl.txt").read_bytes(), original)
 
     def test_a_dispatch_with_no_pass_kind_is_refused(self) -> None:
-        # What the incident actually looked like on the wire: a seat launched
+        # What the incident actually looked like on the wire: a worker launched
         # with the sixth argument dropped. It used to run the agent and record
         # nothing; now nothing runs at all.
         session_dir = self.start_phase("dropped")
@@ -682,11 +858,11 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("pass_kind must be impl, test, fix, or review", result.stderr)
-        # Refused before anything ran: no status file to be read as a live seat,
+        # Refused before anything ran: no status file to be read as a live worker,
         # and no register line for peers to answer.
         self.assertFalse((session_dir / "impl_status_test").exists())
         self.assertFalse((session_dir / "board.log").exists())
@@ -697,14 +873,14 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("got 'implementation'", result.stderr)
 
-    def test_every_seat_records_its_own_pass_and_stamps_its_role(self) -> None:
+    def test_every_worker_records_its_own_pass_and_stamps_its_role(self) -> None:
         session_dir = self.start_phase("team")
         for kind, slot in (("impl", "impl"), ("impl", "test")):
             result = self.launch(session_dir, kind, slot)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-        # Two records, keyed by seat rather than by what each is doing: the
-        # `test` seat opened as a second writer and is still slot `test`.
+        # Two records, keyed by worker rather than by what each is doing: the
+        # `test` worker opened as a second writer and is still slot `test`.
         passes = self.open_passes(session_dir)
         self.assertEqual(
             {slot: record["kind"] for slot, record in passes.items()},
@@ -774,7 +950,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             board,
         )
 
-    def test_follow_up_to_an_unmeasured_seat_does_not_compact_again(self) -> None:
+    def test_follow_up_to_an_unmeasured_worker_does_not_compact_again(self) -> None:
         session_dir = self.start_phase("unmeasured-follow")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -885,7 +1061,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertIn("compaction failed", board)
         self.assertIn("continuing follow-up", board)
 
-    def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
+    def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
         session_dir = self.start_phase("compact-still-live")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -898,7 +1074,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         result = self.mesh_launch(session_dir, to=name, compact_still_live=True)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("still has a live turn after compaction; end the seat", result.stderr)
+        self.assertIn("still has a live turn after compaction; end the worker", result.stderr)
         self.assertFalse((session_dir / "follow_message.txt").exists())
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("follow-up not sent", board)
@@ -995,6 +1171,22 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    def test_follow_up_reads_an_old_identity_and_leaves_only_worker_names(self) -> None:
+        session_dir = self.start_phase("old-run-follow")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = session_dir / "impl_worker_impl.json"
+        identity = cast("dict[str, object]", json.loads(path.read_text()))
+        identity["seat_id"] = identity.pop("worker_id")
+        _ = (session_dir / "impl_seat_impl.json").write_text(json.dumps(identity))
+        path.unlink()
+        result = self.mesh_launch(session_dir, to=str(identity["name"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((session_dir / "impl_seat_impl.json").exists())
+        converted = cast("dict[str, object]", json.loads(path.read_text()))
+        self.assertEqual(converted["worker_id"], identity["seat_id"])
+        self.assertNotIn("seat_id", converted)
+
     def test_peer_turn_after_claim_closes_follow_up_as_error(self) -> None:
         session_dir = self.start_phase("peer-after-claim")
         first = self.mesh_launch(session_dir)
@@ -1010,7 +1202,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             ["bash", str(self.implement_script), "--to", name,
              str(session_dir), str(self.working_dir), str(self.prompt_file),
              "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-            env=environment, capture_output=True, text=True, check=False, timeout=120,
+            env=environment, capture_output=True, text=True, check=False, timeout=300,
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -1033,7 +1225,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         status_file = session_dir / "impl_status_impl"
         _ = status_file.write_text("previous\n", encoding="utf-8")
         before = self.open_passes(session_dir)
-        unknown = self.mesh_launch(session_dir, to="missing-seat")
+        unknown = self.mesh_launch(session_dir, to="missing-worker")
         self.assertEqual(unknown.returncode, 2, unknown.stderr)
         self.assertEqual(status_file.read_text(encoding="utf-8"), "previous\n")
         self.assertEqual(self.open_passes(session_dir), before)
@@ -1069,6 +1261,40 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(changed_model.returncode, 2, changed_model.stderr)
         self.assertEqual(self.open_passes(session_dir), before)
 
+    def test_follow_recovers_missing_claim_unless_the_roster_launcher_is_alive(self) -> None:
+        for launcher_pid in (None, 99999999, os.getpid()):
+            live = launcher_pid == os.getpid()
+            with self.subTest(launcher_pid=launcher_pid):
+                session_dir = self.start_phase(f"missing-claim-{launcher_pid}")
+                first = self.mesh_launch(session_dir)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                roster_path = session_dir / "mesh_roster.json"
+                roster = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+                name = next(iter(roster))
+                roster[name].update(status="paused", paused_from="running", paused_turn=True)
+                if launcher_pid is not None:
+                    roster[name]["launcher_pid"] = launcher_pid
+                _ = roster_path.write_text(json.dumps(roster))
+                status = session_dir / "impl_status_impl"
+                _ = status.write_text("implementing\n")
+                self.assertFalse((session_dir / "impl_claim_impl.json").exists())
+                before = self.open_passes(session_dir)
+
+                result = self.mesh_launch(session_dir, to=name)
+
+                if live:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(status.read_text(), "implementing\n")
+                    self.assertEqual(self.open_passes(session_dir), before)
+                    self.assertFalse((session_dir / "follow_message.txt").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((session_dir / "status_before_claim.txt").read_text(), "error\n")
+                    self.assertEqual(status.read_text(), "implemented\n")
+                    followed = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+                    self.assertEqual(followed[name]["thread_id"], roster[name]["thread_id"])
+                    self.assertTrue((session_dir / "follow_message.txt").exists())
+
     def test_live_claim_refuses_a_second_launcher_without_a_pass(self) -> None:
         session_dir = self.start_phase("claimed")
         first = self.mesh_launch(session_dir)
@@ -1078,7 +1304,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         ))
         name = next(iter(roster))
         _ = (session_dir / "impl_claim_impl.json").write_text(json.dumps({
-            "pid": os.getpid(), "seat": name, "turn_id": "",
+            "pid": os.getpid(), "worker": name, "turn_id": "",
         }), encoding="utf-8")
         before = self.open_passes(session_dir)
 
@@ -1088,7 +1314,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(self.open_passes(session_dir), before)
         self.assertEqual(
             (session_dir / "impl_claim_impl.json").read_text(encoding="utf-8"),
-            json.dumps({"pid": os.getpid(), "seat": name, "turn_id": ""}),
+            json.dumps({"pid": os.getpid(), "worker": name, "turn_id": ""}),
         )
 
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
@@ -1137,28 +1363,23 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 )
                 claim_path = session_dir / "impl_claim_impl.json"
                 try:
-                    deadline = time.monotonic() + 8
-                    while time.monotonic() < deadline:
-                        if claim_path.exists():
+                    def held_claim() -> bool:
+                        try:
                             claim = cast("dict[str, object]", json.loads(
                                 claim_path.read_text(encoding="utf-8")
                             ))
-                            if stage == "before" and claim.get("turn_id") == "":
-                                break
-                            if stage == "after" and roster[name]["status"] == "running":
-                                break
-                        time.sleep(0.05)
-                        try:
                             roster = cast("dict[str, dict[str, object]]", json.loads(
                                 roster_path.read_text(encoding="utf-8")
                             ))
-                        except json.JSONDecodeError:
-                            continue
-                    else:
-                        self.fail(f"launcher never held a {stage} claim")
+                        except (FileNotFoundError, json.JSONDecodeError):
+                            return False
+                        return (claim.get("turn_id") == "" if stage == "before"
+                                else roster[name]["status"] == "running")
+
+                    wait_until(held_claim, session_dir)
                 finally:
                     os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.wait(timeout=5)
+                    _ = process.wait(timeout=300)
 
                 result = self.mesh_launch(session_dir, to=name)
 
@@ -1185,23 +1406,66 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 "impl", "the retry path", "impl", "writing the retry path", "0", "impl"]
 
         refused = subprocess.run(args, env=self.environment(), capture_output=True,
-                                 text=True, check=False, timeout=30)
+                                 text=True, check=False, timeout=300)
 
         self.assertEqual(refused.returncode, 2, refused.stderr)
         self.assertEqual(status_path.read_text(encoding="utf-8"), before)
         self.assertEqual(self.open_passes(session_dir), passes)
         self.assertNotIn("follow-up to", (session_dir / "board.log").read_text())
 
+    def test_worker_and_turn_identity_are_recorded_before_the_heartbeat_watcher_starts(self) -> None:
+        for follow in (False, True):
+            with self.subTest(follow=follow):
+                session = self.start_phase(f"identity-before-heartbeat-{follow}")
+                arguments = ["bash", str(self.implement_script)]
+                if follow:
+                    initial = self.mesh_launch(session)
+                    self.assertEqual(initial.returncode, 0, initial.stderr)
+                    roster = cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))
+                    arguments.extend(["--to", next(iter(roster))])
+                arguments.extend([str(session), str(self.working_dir), str(self.prompt_file),
+                                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"])
+                witness = session / "watcher-identity"
+                source = session / ("impl_claim_impl.json" if follow else "impl_worker_impl.json")
+                watcher = self.root / "scripts" / "agents" / "heartbeat_watch.sh"
+                _ = watcher.write_text(
+                    '#!/bin/bash\nif [ -f "$TEST_IDENTITY_SOURCE" ]; then\n'
+                    + 'cat "$TEST_IDENTITY_SOURCE" > "$TEST_IDENTITY_WITNESS.tmp"\n'
+                    + 'else printf "{}\\n" > "$TEST_IDENTITY_WITNESS.tmp"; fi\n'
+                    + 'mv "$TEST_IDENTITY_WITNESS.tmp" "$TEST_IDENTITY_WITNESS"\n'
+                )
+                release = session / "launch-release"
+                environment = self.mesh_environment()
+                environment.update({"TEST_IDENTITY_SOURCE": str(source), "TEST_IDENTITY_WITNESS": str(witness),
+                                    "STUB_LAUNCH_RELEASE": str(release)})
+                if follow:
+                    environment.update({"STUB_FOLLOW_HOLD": "after", "STUB_LAUNCH_RELEASE": str(release)})
+                process = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
+                try:
+                    wait_for_file(witness)
+                    identity = cast("dict[str, object]", json.loads(witness.read_text()))
+                    self.assertIsNone(process.poll())
+                    if follow:
+                        self.assertEqual(identity.get("turn_id"), "turn-2")
+                        self.assertEqual(identity.get("pid"), process.pid)
+                    else:
+                        self.assertTrue(identity.get("worker_id"), identity)
+                finally:
+                    release.touch()
+                    output, errors = process.communicate(timeout=300)
+                self.assertEqual(process.returncode, 0, output + errors)
+
     def test_new_launch_keeps_heartbeat_watcher_output(self) -> None:
         watcher = self.root / "scripts" / "agents" / "heartbeat_watch.sh"
         _ = watcher.write_text(
-            "#!/usr/bin/env bash\nprintf 'heartbeat watcher output\\n'\n",
+            "#!/usr/bin/env bash\nprintf 'heartbeat watcher output\\n'\n: > \"$TEST_HEARTBEAT_READY\"\n",
             encoding="utf-8",
         )
         agent = self.root / "scripts" / "agents" / "agent_exec.sh"
         _ = agent.write_text(
             agent.read_text(encoding="utf-8").replace(
-                "set -euo pipefail", "set -euo pipefail\nsleep 0.2"
+                "set -euo pipefail", 'set -euo pipefail\npython3 "$TEST_WAIT_HELPER" "$TEST_HEARTBEAT_READY"'
             ), encoding="utf-8",
         )
         session_dir = self.start_phase("heartbeat-visible")
@@ -1211,7 +1475,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("heartbeat watcher output", result.stdout)
 
-    def test_failed_seat_with_live_turn_refuses_before_recording_a_pass(self) -> None:
+    def test_failed_worker_with_live_turn_refuses_before_recording_a_pass(self) -> None:
         session_dir = self.start_phase("failed-live-turn")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -1233,7 +1497,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_follow_counts_turn_completed_before_first_poll(self) -> None:
         session_dir = self.start_phase("claude-short-turn")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "complete")
 
@@ -1246,7 +1510,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_queued_send_is_a_worker_error(self) -> None:
         session_dir = self.start_phase("claude-queued")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "queued")
 
@@ -1257,9 +1521,9 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             session_dir / "board.log"
         ).read_text(encoding="utf-8"))
 
-    def test_claude_seat_gone_after_delivery_is_a_worker_error(self) -> None:
+    def test_claude_worker_gone_after_delivery_is_a_worker_error(self) -> None:
         session_dir = self.start_phase("claude-gone")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "gone")
 
@@ -1268,7 +1532,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_follow_retries_unreadable_agents_listing(self) -> None:
         session_dir = self.start_phase("claude-unreadable")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "unreadable_once")
 

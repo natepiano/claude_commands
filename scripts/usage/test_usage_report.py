@@ -188,12 +188,81 @@ class UsageReportTests(ReportFixture):
 
     def metric_request(self, thread: str, minute: int, uncached: int, cached: int = 0, *,
                        key: str = "rollout-metric.jsonl:100", role: str = "impl",
-                       model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev") -> None:
+                       model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev",
+                       activity: str = "work", wait_action: str | None = None) -> None:
         with closing(sqlite3.connect(self.db_path)) as db, db:
-            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (machine, "codex", "seat", parent, thread, key,
+            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (machine, "codex", "worker", parent, thread, key,
                             f"2026-10-11T12:{minute:02d}:00+00:00", model, "medium",
-                            uncached, 0, 0, cached, 10, 1, role, None, "recorded", "not_applicable"))
+                            uncached, 0, 0, cached, 10, 1, role, None, "recorded", "not_applicable",
+                            activity, wait_action))
+
+    def activity_requests(self) -> None:
+        """gpt-5.6-sol weighs cached input 0.1 and output 8; every request has 10 output, 80 weighted."""
+        self.clear_metric_turns()
+        self.metric_request("worker", 0, 100, 1000, key="rollout-metric.jsonl:0")  # 100 + 100 + 80 = 280
+        self.metric_request("worker", 1, 20, 200, key="rollout-metric.jsonl:1",
+                            activity="wait", wait_action="empty write_stdin")  # 20 + 20 + 80 = 120
+        self.metric_request("worker", 2, 0, key="rollout-metric.jsonl:2", activity="status")  # 80
+        self.metric_request("reviewer", 3, 50, role="review", key="rollout-metric.jsonl:3",
+                            activity="unclassified")  # 50 + 80 = 130
+
+    def table_rows(self, *arguments: str) -> list[list[str]]:
+        result = self.report(*arguments)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        lines = result.stdout.split("\nCoverage\n", 1)[0].splitlines()
+        return [[cell.strip() for cell in line.strip("|").split("|")] for line in lines
+                if line.startswith("| ") and not line.startswith("| ---")][1:]
+
+    def test_wait_status_and_context_shares_divide_their_weighted_parts_by_weighted_tokens(self) -> None:
+        self.activity_requests()
+        self.assertEqual(self.table_rows("wait_share", "--by", "role"),
+                         [["impl", "120", "480", "25.0%"], ["review", "0", "130", "0.0%"]])
+        self.assertEqual(self.table_rows("status_share", "--by", "role"),
+                         [["impl", "80", "480", "16.7%"], ["review", "0", "130", "0.0%"]])
+        self.assertEqual(self.table_rows("context_share", "--by", "role"),
+                         [["impl", "120", "480", "25.0%"], ["review", "0", "130", "0.0%"]])
+
+    def test_activity_dimension_groups_every_turn_metric_and_coverage_counts_unclassified_turns(self) -> None:
+        self.activity_requests()
+        self.assertEqual(self.table_rows("weighted", "--by", "activity"),
+                         [["status", "80", "1", "80"], ["unclassified", "130", "1", "130"],
+                          ["wait", "120", "1", "120"], ["work", "280", "1", "280"]])
+        self.assertEqual(self.table_rows("wait_share", "--by", "role,activity")[1],
+                         ["impl", "wait", "120", "120", "100.0%"])
+        result = self.report("wait_share")
+        self.assertIn("Review turns with unrecorded lens: 0.\nTurns with unclassified activity: 1.\n", result.stdout)
+        refused = self.report("compactions_per_thread", "--by", "activity")
+        self.assertEqual((refused.returncode, refused.stdout), (2, ""))
+        self.assertIn("cannot group by 'activity'", refused.stderr)
+
+    def test_activity_reads_the_same_through_a_general_aggregate(self) -> None:
+        self.activity_requests()
+        script = """
+import argparse
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from scripts.usage.usage_report import METRICS, Metric, ReportFormat, TurnAggregate, main
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--db', type=Path, required=True)
+parser.add_argument('--production-docs', type=Path, required=True)
+paths = parser.parse_args()
+METRICS['wait_share'] = Metric('wait_share', METRICS['wait_share'].description,
+    TurnAggregate('wait', "sum(CASE WHEN activity = 'wait' THEN weighted ELSE 0 END)", weighted=True),
+    TurnAggregate('weighted', 'sum(weighted)', weighted=True), ReportFormat.SHARE)
+output = StringIO()
+with redirect_stdout(output):
+    assert main(['--db', str(paths.db), '--production-docs', str(paths.production_docs),
+                 'wait_share', '--by', 'role,activity']) == 0
+print(output.getvalue(), end='')
+"""
+        general = self.report_script(script)
+        self.assertEqual((general.returncode, general.stderr), (0, ""))
+        additive = self.report("wait_share", "--by", "role,activity")
+        self.assertEqual(general.stdout, additive.stdout)
+        self.assertIn("Turns with unclassified activity: 1.\n", general.stdout)
 
     def metric_compaction(self, thread: str, minute: int) -> None:
         with closing(sqlite3.connect(self.db_path)) as db, db:
@@ -216,18 +285,18 @@ class UsageReportTests(ReportFixture):
 
     def test_compaction_reread_sums_only_first_positive_requests_in_text_key_order(self) -> None:
         self.clear_metric_turns()
-        self.metric_compaction("seat", 0)
-        self.metric_request("seat", 0, 999, key="rollout-metric.jsonl:0")  # Equal at is not after.
-        self.metric_request("seat", 1, 0, key="rollout-metric.jsonl:1")
+        self.metric_compaction("worker", 0)
+        self.metric_request("worker", 0, 999, key="rollout-metric.jsonl:0")  # Equal at is not after.
+        self.metric_request("worker", 1, 0, key="rollout-metric.jsonl:1")
         # :100 sorts before :20; insert the wrong candidate first.
-        self.metric_request("seat", 2, 70, 30, key="rollout-metric.jsonl:20")
-        self.metric_request("seat", 2, 20, 10, key="rollout-metric.jsonl:100")
-        self.metric_compaction("seat", 3)
-        self.metric_request("seat", 4, 40, 20, key="rollout-metric.jsonl:200")
-        self.metric_compaction("seat", 5)  # No later request.
+        self.metric_request("worker", 2, 70, 30, key="rollout-metric.jsonl:20")
+        self.metric_request("worker", 2, 20, 10, key="rollout-metric.jsonl:100")
+        self.metric_compaction("worker", 3)
+        self.metric_request("worker", 4, 40, 20, key="rollout-metric.jsonl:200")
+        self.metric_compaction("worker", 5)  # No later request.
         # Same id on another machine or under a parent must never become its successor.
-        self.metric_request("seat", 1, 500, key="rollout-metric.jsonl:foreign", machine="mac")
-        self.metric_request("seat", 1, 600, key="rollout-metric.jsonl:child", parent="parent")
+        self.metric_request("worker", 1, 500, key="rollout-metric.jsonl:foreign", machine="mac")
+        self.metric_request("worker", 1, 600, key="rollout-metric.jsonl:child", parent="parent")
         cells = self.metric_cells()[("impl", "gpt-5.6-sol")]
         # Numerator 20+40=60, no cached input or output. Denominator includes every turn.
         denominator = 1079 + 80 + 153 + 101 + 122 + 580 + 680
@@ -235,21 +304,21 @@ class UsageReportTests(ReportFixture):
 
     def test_compaction_reread_window_and_dimensions_come_from_the_request(self) -> None:
         self.clear_metric_turns()
-        self.metric_request("seat", 0, 100, role="impl", key="rollout-metric.jsonl:0")
-        self.metric_compaction("seat", 1)
-        self.metric_request("seat", 2, 25, 100, role="review", model="gpt-6.1-sol",
+        self.metric_request("worker", 0, 100, role="impl", key="rollout-metric.jsonl:0")
+        self.metric_compaction("worker", 1)
+        self.metric_request("worker", 2, 25, 100, role="review", model="gpt-6.1-sol",
                             key="rollout-metric.jsonl:1")
-        self.metric_compaction("seat", 3)
-        self.metric_request("seat", 5, 400, role="impl", key="rollout-metric.jsonl:2")
+        self.metric_compaction("worker", 3)
+        self.metric_request("worker", 5, 400, role="impl", key="rollout-metric.jsonl:2")
         cells = self.metric_cells("--since", "2026-10-11T12:02:00Z",
                                   "--until", "2026-10-11T12:05:00Z", "--zone", "UTC")
         self.assertEqual(cells, {("review", "gpt-6.1-sol"): ["25", "80", "31.2%"]})
 
     def test_unweighted_first_request_is_counted_and_not_replaced_by_a_later_weighted_one(self) -> None:
         self.clear_metric_turns()
-        self.metric_compaction("seat", 0)
-        self.metric_request("seat", 1, 30, model="invented-no-weight", key="rollout-metric.jsonl:1")
-        self.metric_request("seat", 2, 50, key="rollout-metric.jsonl:2")
+        self.metric_compaction("worker", 0)
+        self.metric_request("worker", 1, 30, model="invented-no-weight", key="rollout-metric.jsonl:1")
+        self.metric_request("worker", 2, 50, key="rollout-metric.jsonl:2")
         result = self.report("compaction_reread_share")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("| invented-no-weight | 1 |", result.stdout)
@@ -261,9 +330,9 @@ class UsageReportTests(ReportFixture):
         for attribution in ("estimated", "unassigned"):
             with self.subTest(attribution=attribution):
                 self.clear_metric_turns()
-                self.metric_compaction("seat", 0)
-                self.metric_request("seat", 1, 100, key="rollout-metric.jsonl:1")
-                self.metric_request("seat", 2, 1, key="rollout-metric.jsonl:2")
+                self.metric_compaction("worker", 0)
+                self.metric_request("worker", 1, 100, key="rollout-metric.jsonl:1")
+                self.metric_request("worker", 2, 1, key="rollout-metric.jsonl:2")
                 with closing(sqlite3.connect(self.db_path)) as db, db:
                     _ = db.execute("UPDATE turns SET attribution = ? WHERE turn_key = ?",
                                    (attribution, "rollout-metric.jsonl:1"))
@@ -275,9 +344,9 @@ class UsageReportTests(ReportFixture):
 
     def test_unknown_unit_reread_coverage_counts_rows_while_the_metric_sums_tokens(self) -> None:
         self.clear_metric_turns()
-        self.metric_compaction("unmapped-seat", 0)
-        self.metric_request("unmapped-seat", 1, 1000)
-        self.assertEqual(self.rows("SELECT * FROM folders WHERE agent_id = 'unmapped-seat'"), [])
+        self.metric_compaction("unmapped-worker", 0)
+        self.metric_request("unmapped-worker", 1, 1000)
+        self.assertEqual(self.rows("SELECT * FROM folders WHERE agent_id = 'unmapped-worker'"), [])
         result = self.report("compaction_reread_share")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -286,7 +355,7 @@ class UsageReportTests(ReportFixture):
 
     def test_reread_counts_a_shared_successor_once_per_request_across_threads(self) -> None:
         self.clear_metric_turns()
-        for thread in ("first-seat", "second-seat"):
+        for thread in ("first-worker", "second-worker"):
             self.metric_compaction(thread, 0)
             self.metric_compaction(thread, 1)
             self.metric_request(thread, 2, 100, 20)

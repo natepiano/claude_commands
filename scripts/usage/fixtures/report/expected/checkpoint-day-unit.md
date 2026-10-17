@@ -26,6 +26,7 @@ Unweighted:
 | invented-unweighted-model | 1 |
 
 Review turns with unrecorded lens: 1.
+Turns with unclassified activity: 0.
 Outcome rows with unknown unit (checkpoints): 1.
 
 Sources

@@ -26,6 +26,10 @@ STOP_HOOK = Path(__file__).with_name("stop-conversation-pause.py")
 SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
+# The hooks' real 5 s budget trips on a loaded machine; tests of the budget
+# itself set it to 1. The wall stays above the budget.
+TEST_HOOK_BUDGET = 60
+TEST_WALL = 90
 QUESTION = (
     "conversation-pause: the user has been quiet here for 15 minutes. Ask them this, "
     "word for word, and nothing else: Return to automatic updates? (yes / no) They "
@@ -262,6 +266,7 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SESSIONS": str(self.sessions_stub),
             "CONVERSATION_PAUSE_SEND": str(self.send_stub),
             "CONVERSATION_PAUSE_NOW_EPOCH": str(NOW),
+            "CONVERSATION_PAUSE_HOOK_BUDGET": str(TEST_HOOK_BUDGET),
             "NOTIFIER_LOG": str(self.notifier_log),
             "SESSIONS_LOG": str(self.sessions_log),
             "SEND_LOG": str(self.send_log),
@@ -355,7 +360,7 @@ print("SENT: delivered")
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()]
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + TEST_WALL
         while time.monotonic() < deadline and not path.exists():
             time.sleep(0.01)
         self.assertTrue(path.exists(), f"timed out waiting for {path}")
@@ -367,7 +372,7 @@ print("SENT: delivered")
         now: int = NOW,
         extra: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
-        timeout: float = 10,
+        timeout: float = TEST_WALL,
     ) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION, "prompt": prompt}
         if extra is not None:
@@ -394,7 +399,7 @@ print("SENT: delivered")
         now: int = NOW,
         extra: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
-        timeout: float = 10,
+        timeout: float = TEST_WALL,
     ) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION}
         if extra is not None:
@@ -435,7 +440,7 @@ print("SENT: delivered")
             text=True,
             check=False,
             env=environment,
-            timeout=10,
+            timeout=TEST_WALL,
         )
 
     def run_tick_with_prompt_during_send(
@@ -556,17 +561,9 @@ print("SENT: delivered")
 
     def test_pause_policy_for_each_source_and_session_kind(self) -> None:
         source = conversation_pause.PromptSource
-        self.assertTrue(conversation_pause.pauses(source.PEER, False))
-        self.assertFalse(conversation_pause.pauses(source.PEER, True))
-        self.assertTrue(conversation_pause.pauses(source.TYPED, False))
-        self.assertTrue(conversation_pause.pauses(source.TYPED, True))
-        for showrunner_session in (False, True):
-            self.assertFalse(
-                conversation_pause.pauses(source.SCHEDULED, showrunner_session)
-            )
-            self.assertFalse(
-                conversation_pause.pauses(source.NOTICE, showrunner_session)
-            )
+        self.assertTrue(conversation_pause.pauses(source.TYPED))
+        for other in (source.PEER, source.SCHEDULED, source.NOTICE):
+            self.assertFalse(conversation_pause.pauses(other))
 
     def test_typed_prompts_record_alert_stamp_with_and_without_reports(self) -> None:
         stamp = self.escalate_root / "typed"
@@ -641,10 +638,11 @@ print("SENT: delivered")
             {"kind": "replying", "user_wrote_at": 120},
         )
 
-    def test_report_names_for_unit_and_build_instances(self) -> None:
+    def test_report_names_for_unit_and_other_instances(self) -> None:
         for name, words in (
+            ("unit-abc", "status reports"),
             ("delegate-abc", "status reports"),
-            ("report-builds", "build report"),
+            ("report-nightly", "report-nightly"),
         ):
             with self.subTest(name=name):
                 instance = self.create_instance(name)
@@ -691,17 +689,17 @@ print("SENT: delivered")
     def test_existing_pause_adds_a_report_that_was_turned_on_later(self) -> None:
         first = self.create_instance("delegate-abc")
         _ = self.parsed_reply(self.run_prompt("first", now=100))
-        build = self.create_instance("report-builds")
+        later = self.create_instance("report-nightly")
         reply = self.parsed_reply(self.run_prompt("second", now=120))
         self.assertEqual(
             reply["systemMessage"],
-            f"Automatic updates paused while we talk: build report. {RETURN_SCHEDULE}",
+            f"Automatic updates paused while we talk: report-nightly. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
-            self.record()["instances"], ["delegate-abc", "report-builds"]
+            self.record()["instances"], ["delegate-abc", "report-nightly"]
         )
         self.assertTrue((first / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue((build / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((later / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_failed_watcher_creation_stops_nothing_and_writes_no_record(self) -> None:
         instance = self.create_instance("delegate-abc")
@@ -810,6 +808,21 @@ print("SENT: delivered")
         self.assertEqual(self.calls(self.notifier_log), [["unpause", "delegate-beta"]])
         self.assertTrue((failed / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((stopped / "state").read_text().startswith("ENABLED=1\n"))
+
+    def test_peer_message_does_not_pause_a_unit_director(self) -> None:
+        instance = self.create_instance("delegate-abc")
+        result = self.run_prompt(cross_session("natedev", "continue"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_the_sessions_own_tick_does_not_pause_it(self) -> None:
+        # A review unit's hourly health tick, from its own notifier instance.
+        instance = self.create_instance("review-health", sender="review-health")
+        result = self.run_prompt(cross_session("review-health", "/review:health"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_peer_prompt_does_not_pause_a_showrunner_session(self) -> None:
         instance = self.create_instance("showrunner-demo")
@@ -954,7 +967,7 @@ print("SENT: delivered")
             text=True,
             check=False,
             env=self.environment,
-            timeout=10,
+            timeout=TEST_WALL,
         )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
@@ -966,14 +979,11 @@ print("SENT: delivered")
         self.pause_root.mkdir(parents=True)
         with (self.pause_root / ".lock").open("w") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            started = time.monotonic()
             result = self.run_prompt(
                 "hello",
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
                 timeout=3,
             )
-            elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 3)
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("HookBudgetSpent", result.stderr)
@@ -982,20 +992,16 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
         with (self.pause_root / ".lock").open("w") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            started = time.monotonic()
             result = self.run_stop(
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
                 timeout=3,
             )
-            elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 3)
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("HookBudgetSpent", result.stderr)
 
     def test_prompt_hook_budget_expires_during_notifier_stop(self) -> None:
         instance = self.create_instance("delegate-abc")
-        started = time.monotonic()
         result = self.run_prompt(
             "hello",
             extra_env={
@@ -1004,8 +1010,6 @@ print("SENT: delivered")
             },
             timeout=3,
         )
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 3)
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("HookBudgetSpent", result.stderr)
@@ -1013,6 +1017,7 @@ print("SENT: delivered")
 
     def test_tick_releases_record_lock_during_session_lookup(self) -> None:
         marker = self.root / "lookup-started"
+        release = self.root / "lookup-release"
         sessions = self.root / "sessions-slow.py"
         _ = sessions.write_text(
             "".join((
@@ -1020,7 +1025,10 @@ print("SENT: delivered")
                 "import os, time\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['LOOKUP_MARKER']).touch()\n",
-                "time.sleep(2)\n",
+                "release = Path(os.environ['LOOKUP_RELEASE'])\n",
+                f"deadline = time.monotonic() + {TEST_WALL}\n",
+                "while not release.exists() and time.monotonic() < deadline:\n",
+                "    time.sleep(0.01)\n",
                 "print(os.environ['SESSION_SOCKET'])\n",
             ))
         )
@@ -1033,6 +1041,8 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SESSIONS": str(sessions),
             "CONVERSATION_PAUSE_NOW_EPOCH": "200",
             "LOOKUP_MARKER": str(marker),
+            # The lookup holds until the lock is tried, so a loaded machine cannot finish it first.
+            "LOOKUP_RELEASE": str(release),
         }
         process = subprocess.Popen(
             [sys.executable, str(LIBRARY), "tick"],
@@ -1047,7 +1057,8 @@ print("SENT: delivered")
                 fcntl.flock(
                     lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
-            _, stderr = process.communicate(timeout=10)
+            release.touch()
+            _, stderr = process.communicate(timeout=TEST_WALL)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -1549,6 +1560,7 @@ print("SENT: delivered")
 
     def test_delivery_does_not_overwrite_newer_replying_phase(self) -> None:
         marker = self.root / "send-started"
+        release = self.root / "send-release"
         send = self.root / "send-slow.py"
         _ = send.write_text(
             "".join((
@@ -1556,7 +1568,10 @@ print("SENT: delivered")
                 "import os, time\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['SEND_MARKER']).touch()\n",
-                "time.sleep(2)\n",
+                "release = Path(os.environ['SEND_RELEASE'])\n",
+                f"deadline = time.monotonic() + {TEST_WALL}\n",
+                "while not release.exists() and time.monotonic() < deadline:\n",
+                "    time.sleep(0.01)\n",
                 "print('SENT: delivered')\n",
             ))
         )
@@ -1572,6 +1587,8 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SEND": str(send),
             "CONVERSATION_PAUSE_NOW_EPOCH": "150",
             "SEND_MARKER": str(marker),
+            # The send holds until the typed prompt is done, however slowly a loaded machine runs it.
+            "SEND_RELEASE": str(release),
         }
         process = subprocess.Popen(
             [sys.executable, str(LIBRARY), "tick"],
@@ -1583,10 +1600,11 @@ print("SENT: delivered")
         try:
             self.wait_for_path(marker)
             typed = self.run_prompt("new topic", now=160)
+            release.touch()
             self.assertEqual(
                 (typed.returncode, typed.stdout, typed.stderr), (0, "", "")
             )
-            _, stderr = process.communicate(timeout=10)
+            _, stderr = process.communicate(timeout=TEST_WALL)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -1896,30 +1914,23 @@ print("SENT: delivered")
                         (instance / "state").read_text().startswith("ENABLED=0\n")
                     )
 
-    def test_asked_other_and_peer_yes_restart_replying(self) -> None:
+    def test_asked_other_restarts_replying_and_a_peer_yes_changes_nothing(self) -> None:
         instance = self.create_instance("delegate-abc", enabled=False, paused=True)
-        for prompt in ("later", cross_session("natedev", "yes")):
-            with self.subTest(prompt=prompt):
-                _ = self.write_record(
-                    asked_read(100, 1),
-                    instances=("delegate-abc",),
-                )
-                self.set_enabled(instance, False, paused=True)
-                result = self.run_prompt(prompt, now=200)
-                if prompt == "later":
-                    reply = self.parsed_reply(result)
-                    self.assertNotIn("systemMessage", reply)
-                    output = cast(dict[str, object], reply["hookSpecificOutput"])
-                    self.assertEqual(output["additionalContext"], OTHER_ANSWER_CONTEXT)
-                else:
-                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-                self.assertEqual(
-                    self.record()["phase"],
-                    {"kind": "replying", "user_wrote_at": 200},
-                )
-                self.assertTrue(
-                    (instance / "state").read_text().startswith("ENABLED=0\n")
-                )
+        _ = self.write_record(asked_read(100, 1), instances=("delegate-abc",))
+        reply = self.parsed_reply(self.run_prompt("later", now=200))
+        self.assertNotIn("systemMessage", reply)
+        output = cast(dict[str, object], reply["hookSpecificOutput"])
+        self.assertEqual(output["additionalContext"], OTHER_ANSWER_CONTEXT)
+        self.assertEqual(self.record()["phase"], {"kind": "replying", "user_wrote_at": 200})
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+        # A peer is never the user: its "yes" neither answers the question nor restarts the wait.
+        _ = self.write_record(asked_read(100, 1), instances=("delegate-abc",))
+        asked = self.record()["phase"]
+        result = self.run_prompt(cross_session("natedev", "yes"), now=200)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.record()["phase"], asked)
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_returned_yes_deletes_record_without_pausing_again(self) -> None:
         instance = self.create_instance("delegate-abc")
@@ -2271,7 +2282,7 @@ print("SENT: delivered")
             text=True,
             check=False,
             env=environment,
-            timeout=10,
+            timeout=TEST_WALL,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(

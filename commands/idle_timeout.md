@@ -21,7 +21,7 @@ Same semantics, different mechanisms, and only the mechanism matters when readin
 
     **STEP 1:** Convert $ARGUMENTS to whole minutes. No unit or `m`/`min`/`minute(s)` means minutes; `h`/`hr`/`hour(s)` multiplies by 60; `d`/`day(s)` by 1440. Empty means 60. Refuse anything that is not a positive whole number of minutes (say why, stop).
 
-    **STEP 2:** Ask the user (AskUserQuestion) whether this applies to **both machines** or **this one only**, offering "Both machines" first as recommended. Each host's setup check compares against *its own* `nate.idleLockMinutes`, and only the user knows which 1Password apps they have changed.
+    **STEP 2:** Ask in one plain-text line: "Apply to both machines (recommended), or this one only?" Use the user’s next message. Each host's setup check compares against *its own* `nate.idleLockMinutes`, and only the user knows which 1Password apps they have changed.
 
     **STEP 3:** Edit the entry file(s) for the chosen scope: `/etc/nixos/configuration.nix` and/or `darwin.nix`. Change only the `nate.idleLockMinutes = <n>;` line. If a nearby comment gives a rationale the new value falsifies — "kept tight because the screen never locks" at four hours — rewrite the comment to keep the fact and drop the false reason.
 
@@ -42,7 +42,7 @@ Same semantics, different mechanisms, and only the mechanism matters when readin
 
     A socket with no matching known host is still addressable: `ssh -O check -o ControlPath=<socket> dummy` reports it, and `-O exit` the same way closes it.
 
-    If any master is running, **ask the user (AskUserQuestion) whether to close them now** — name the hosts, and that closing costs one new connection setup on next use while leaving them holds the old window for up to that long. On yes, close each with `ssh -O exit <host>` (or the explicit `ControlPath` form), re-check, and report each gone. If none are open, say so in one line.
+    If any master is running, ask in one plain-text line whether to close them now (recommended) or leave them open; name the hosts and explain that closing costs one new connection setup on next use while leaving them holds the old window for up to that long. Use the user’s next message. On yes, close each with `ssh -O exit <host>` (or the explicit `ControlPath` form), re-check, and report each gone. If none are open, say so in one line.
 
     **STEP 7:** If STEP 2 chose both machines, message the other machine's standing session (/message) to pull and rebuild, naming the commit and what derives from it on *that* platform. If that session is unreachable, tell the user the machine still needs a pull and rebuild by hand.
 </ExecutionSteps>

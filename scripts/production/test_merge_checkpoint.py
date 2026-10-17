@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
 from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
-                              merge_branch_history, merge_history, promote, request_from)
+                              check_parallel, merge_branch_history, merge_history, promote, request_from)
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
-TRIAL = ("review trial: ux 2 findings, code 3 findings, review-seat minutes 14, "
+TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14, "
          "ux check minutes 4, ux repair minutes 1")
 SIMPLE_OWNS = "`src/alpha.txt`, `crates/alpha/`, `docs/plans/alpha.md`, `docs/plans/alpha-next.md`"
 REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/production/add_unit.py`, "
@@ -42,6 +43,7 @@ REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts
                     "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
                     "because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
+PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
 import json
 import os
@@ -182,10 +184,11 @@ class MergeCheckpointTests(unittest.TestCase):
 
     def production_doc(self, *, owns_cell: str = SIMPLE_OWNS,
                        merge_tests_line: str | None = SIMPLE_MERGE_TESTS,
-                       hub_files: bool = True) -> None:
+                       hub_files: bool = True, change_review: Path | None = None) -> None:
         rows = [
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`",
+            *([f"- **Change review:** `{change_review}`"] if change_review else []),
             f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`",
@@ -234,18 +237,20 @@ class MergeCheckpointTests(unittest.TestCase):
 
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
-                       delivers: str | None = DELIVERS) -> MergeResult:
+                       delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
         arguments = ["--production", str(self.doc), "alpha-unit", phase, sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
             arguments.extend(("--review-trial", trial))
-        if delivers is not None and "--shrink" not in extra:
+        if parallel is not None and "--shrink" not in extra and "--as-built" not in extra:
+            arguments.extend(("--parallel", parallel))
+        if delivers is not None and "--shrink" not in extra and "--as-built" not in extra:
             arguments.extend(("--delivers", delivers))
         arguments.extend(extra)
         process = subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
-                                 env=self.env, capture_output=True, text=True, check=False, timeout=25)
+                                 env=self.env, capture_output=True, text=True, check=False, timeout=300)
         return MergeResult(process, before)
 
     def events(self, command: str) -> list[list[str]]:
@@ -394,6 +399,21 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
 
+    def test_code_checkpoint_requires_a_known_parallel_line(self) -> None:
+        sha = self.checkpoint()
+        for parallel, expected in (
+            (None, "requires --parallel"),
+            ("Parallel: unknown — Phase 5 has no **Depends on:** line; add one under each phase heading and rerun",
+             "adds a **Depends on:** line"),
+            ("Parallel: maybe later", "--parallel must read"),
+        ):
+            result = self.run_checkpoint(sha, parallel=parallel)
+            self.assertEqual(result.process.returncode, 1)
+            self.assert_stopped_before_merge(result, "failed", expected)
+        for parallel in ("Parallel: none — Phase 4 needs Phase 3 (running)", "Parallel: Phase 4, Phase 6 could start"):
+            with self.subTest(parallel=parallel):
+                check_parallel(parallel)
+
     def test_alternate_review_trial_is_refused_and_canonical_numbers_reach_record(self) -> None:
         sha = self.checkpoint()
         alternate = self.run_checkpoint(sha, trial="review trial: UX 2, code 3, review 14 min, UX check 4 min, UX repair 1 min")
@@ -484,6 +504,46 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIn("--cancel-prior applies only to Push: validate_and_push", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
+
+    def dated_checkpoint(self, message: str) -> str:
+        """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        self.write(self.unit, "src/alpha.txt", message)
+        _ = self.git("add", "src/alpha.txt", cwd=self.unit)
+        _ = subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.unit, check=True,
+                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"})
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        return self.git("rev-parse", "HEAD", cwd=self.unit)
+
+    def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
+        sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
+        result = self.run_checkpoint(sha)
+        self.assertNotEqual(result.process.returncode, 0)
+        self.assert_stopped_before_merge(result, "held", "checkpoint(alpha): grid fades: no Change-Review line")
+        self.assertIn("Change-Review-Covers", result.process.stdout)
+
+    def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
+        review = self.root / "change-review.md"
+        _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
+                              + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
+        self.production_doc(change_review=review)
+        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\n"
+                                    + "Change-Review: The grid fades gently | Look across the floor\n"
+                                    + "Change-Review: none — the merge script")
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        merged = self.git("rev-parse", "--short=8", "HEAD")
+        self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Look across the floor \|$")
+        self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
+        self.assertNotIn("change review: drift", result.process.stdout)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_a_production_without_a_list_writes_no_rows(self) -> None:
+        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script")
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
+                      result.process.stdout)
 
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""
@@ -669,7 +729,7 @@ class MergeCheckpointTests(unittest.TestCase):
         _ = self.git("push", "--force", "origin", f"{base}:refs/heads/production")
         request = request_from(argparse.Namespace(
             production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
-            also=[], shrink=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
+            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
             cancel_prior=False, started=STARTED, regime="after", holds=0,
             merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
         ))
@@ -817,6 +877,55 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertNotIn("unblocks: G1", result.process.stdout)
         self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
 
+    def test_promote_none_merges_and_records_without_promotion(self) -> None:
+        self.promotions = "none"
+        self.production_doc()
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("promote: ok — no promotion configured", result.process.stdout)
+        self.assertIn("record: ok", result.process.stdout)
+
+    def test_a_missing_promote_checkout_is_refused_before_anything_is_pushed(self) -> None:
+        self.promotions = str(self.unit / "no-such-checkout")
+        self.production_doc()
+        before = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertNotEqual(result.process.returncode, 0)
+        self.assertIn("no-such-checkout does not exist", result.process.stdout + result.process.stderr)
+        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), before)
+
+    def as_built_commit(self, *extra: str) -> str:
+        """Land the plan through a shrink, then delete it beside a new as-built doc."""
+        shrink = self.checkpoint("docs/plans/alpha.md", "plan\n", subject="shrink")
+        landed = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(landed.process.returncode, 0, landed.process.stderr + landed.process.stdout)
+        _ = self.git("rm", "-q", "docs/plans/alpha.md", cwd=self.unit)
+        self.write(self.unit, "docs/as-built/alpha.md", "as built\n")
+        for path in extra:
+            self.write(self.unit, path, "extra\n")
+        _ = self.git("add", "docs/as-built/alpha.md", *extra, cwd=self.unit)
+        _ = self.git("commit", "-m", "docs(alpha): as-built", cwd=self.unit)
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        return self.git("rev-parse", "HEAD", cwd=self.unit)
+
+    def test_as_built_merges_the_docs_and_the_plans_deletion_after_code_checkpoint(self) -> None:
+        first = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        result = self.run_checkpoint(self.as_built_commit(), "--as-built", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("test: ok — as-built has no package tests", result.process.stdout)
+        tree = self.git("ls-tree", "-r", "--name-only", "HEAD")
+        self.assertIn("docs/as-built/alpha.md", tree)
+        self.assertNotIn("docs/plans/alpha.md", tree)
+        self.assertRegex(self.git("log", "-1", "--format=%s"), r"^Merge alpha-unit phase \S+ as-built \(")
+
+    def test_as_built_holds_a_commit_that_changes_code(self) -> None:
+        first = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        result = self.run_checkpoint(self.as_built_commit("src/alpha.rs"), "--as-built", review=False)
+        self.assertNotEqual(result.process.returncode, 0)
+        self.assertIn("an as-built commit carries only docs", result.process.stdout)
+
     def test_reruns_report_their_own_code_and_shrink_merge_hashes(self) -> None:
         code = self.checkpoint()
         first = self.run_checkpoint(code)
@@ -910,7 +1019,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIsInstance(last_code.kind, CodeCheckpoint)
         request = request_from(argparse.Namespace(
             production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
-            also=[], shrink=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
+            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
             cancel_prior=False, started=STARTED, regime="after", holds=0,
             merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
         ))
@@ -918,6 +1027,45 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIsInstance(latest, LastMerged)
         if isinstance(latest, LastMerged):
             self.assertEqual(latest.hash, code)
+
+    def test_merge_history_follows_a_unit_rename_commit(self) -> None:
+        code = self.checkpoint()
+        _ = self.git("merge", "--no-ff", "-m",
+                     f"Merge old-alpha-unit phase 2 ({code[:7]}) into production", "alpha-branch")
+        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit old-alpha-unit to alpha-unit")
+        history = merge_branch_history(self.checkout, "production")
+        entry = history.last_code_for_unit("alpha-unit")
+        if isinstance(entry, NoMerge):
+            self.fail("the merge before the rename was not carried to the new name")
+        self.assertEqual((entry.unit, entry.phase, entry.short), ("alpha-unit", "2", code[:7]))
+        self.assertTrue(history.has_code_merge("alpha-unit", "2"))
+        self.assertIsInstance(history.last_for_unit("old-alpha-unit"), NoMerge)
+        request = request_from(argparse.Namespace(
+            production=str(self.doc), unit="alpha-unit", phase="3", hash=code,
+            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+            cancel_prior=False, started=STARTED, regime="after", holds=0,
+            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+        ))
+        latest = merge_history(request)
+        if not isinstance(latest, LastMerged):
+            self.fail("a renamed unit read as never merged, so its first-merge gate would fire again")
+        self.assertEqual(latest.hash, code)
+
+    def test_merge_history_follows_a_rename_chain_and_keeps_a_reused_name(self) -> None:
+        for subject in (
+            "Merge a-unit phase 1 (aaaaaaa) into production",
+            "chore(example): rename unit a-unit to b-unit",
+            "Merge b-unit phase 2 (bbbbbbb) into production",
+            "chore(example): rename unit b-unit to c-unit",
+            "Merge a-unit phase 1 (ccccccc) into production",
+        ):
+            _ = self.git("commit", "--allow-empty", "-m", subject)
+        history = merge_branch_history(self.checkout, "production")
+        self.assertEqual([(entry.unit, entry.short) for entry in history.entries],
+                         [("a-unit", "ccccccc"), ("c-unit", "bbbbbbb"), ("c-unit", "aaaaaaa")])
+        self.assertTrue(history.has_code_merge("c-unit", "1"))
+        self.assertIsInstance(history.last_for_unit("b-unit"), NoMerge)
+        self.assertEqual(history.code_merge_count(), 3)
 
     def test_merge_branch_reader_queries_last_any_last_unit_and_code_count(self) -> None:
         alpha_code = self.checkpoint(content="alpha phase two\n")

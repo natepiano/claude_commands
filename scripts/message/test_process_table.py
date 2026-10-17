@@ -17,6 +17,33 @@ MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/delegate/../a
 
 
 class ProcessTableTests(unittest.TestCase):
+    def test_nearest_named_prefers_the_process_itself_over_named_parents(self) -> None:
+        process = process_table.Process(30, 20, "python3", "worker.py")
+        table = {30: process, 20: process_table.Process(20, 1, "claude", "claude")}
+        self.assertEqual(process_table.nearest_named(process, table, {30: "worker", 20: "director"}), "worker")
+
+    def test_nearest_named_walks_unnamed_parents_and_stops_at_the_nearest_name(self) -> None:
+        process = process_table.Process(40, 30, "python3", "worker.py")
+        table = {
+            40: process,
+            30: process_table.Process(30, 20, "sh", "launch worker.py"),
+            20: process_table.Process(20, 10, "claude", "claude"),
+            10: process_table.Process(10, 1, "claude", "claude"),
+        }
+        self.assertEqual(process_table.nearest_named(process, table, {20: "director", 10: "showrunner"}), "director")
+
+    def test_nearest_named_returns_none_when_the_unnamed_chain_ends(self) -> None:
+        for parent in (0, 999):
+            with self.subTest(parent=parent):
+                process = process_table.Process(30, 20, "python3", "worker.py")
+                table = {30: process, 20: process_table.Process(20, parent, "sh", "launch worker.py")}
+                self.assertIsNone(process_table.nearest_named(process, table, {10: "unrelated session"}))
+
+    def test_nearest_named_returns_none_for_an_unnamed_parent_loop(self) -> None:
+        process = process_table.Process(30, 20, "python3", "worker.py")
+        table = {30: process, 20: process_table.Process(20, 30, "sh", "launch worker.py")}
+        self.assertIsNone(process_table.nearest_named(process, table, {10: "unrelated session"}))
+
     def test_snapshot_reads_the_configured_process_table(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         listing = folder / "ps"
@@ -48,7 +75,7 @@ class ProcessTableTests(unittest.TestCase):
             process_table.Process(1, 0, "codex", "codex exec --json"),
         ))
 
-    def test_servers_wrappers_and_claude_seats_are_not_agents(self) -> None:
+    def test_servers_wrappers_and_claude_workers_are_not_agents(self) -> None:
         for command, arguments in (
             ("codex", "codex app-server --listen ws://127.0.0.1:1"),
             ("zsh", f"zsh -c {MESH} start --name a"),

@@ -14,13 +14,14 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import fake_tmux
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import fake_unit_host
 import showrunners
-from fake_tmux import FakeSession
+from fake_unit_host import HostedUnit
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
-FAKE = str(Path(__file__).with_name("fake_tmux.py"))
 LOS_ANGELES = "America/Los_Angeles"
 
 
@@ -37,7 +38,7 @@ class ShowrunnerRegistryTests(unittest.TestCase):
         self.notifier: Path = Path()
         self.sessions: Path = Path()
         self.sessions_script: Path = Path()
-        self.tmux: Path = Path()
+        self.hosted_units: list[HostedUnit] = []
         self.doc: Path = Path()
         self.state: Path = Path()
         self.send_script: Path = Path()
@@ -54,7 +55,8 @@ class ShowrunnerRegistryTests(unittest.TestCase):
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
         self.sessions_script = self.root / "sessions.py"
-        self.tmux = self.root / "tmux.json"
+        self.hosted_units = []
+        _ = fake_unit_host.environment(self.root)
         self.doc = self.root / "show-production.md"
         self.state = self.root / "showrunner-state"
         self.sent = self.root / "sent.jsonl"
@@ -90,6 +92,9 @@ raise SystemExit(1)
             child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.children.append(child)
             pid = child.pid
+        for unit in self.hosted_units:
+            if name in (unit.session, unit.marks.get("SHOWRUNNER_UNIT_ID"), unit.marks.get("SHOWRUNNER_UNIT_ID", "").removesuffix("-unit")):
+                fake_unit_host.place_process(self.environment(), pid, unit.pane)
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps({
             "pid": pid, "name": name, "sessionId": session_id,
             "messagingSocketPath": str(self.root / f"{session_id}.sock"),
@@ -117,14 +122,13 @@ raise SystemExit(1)
         _ = (directory / "conf").write_text("\n".join(fields) + "\n")
 
     def environment(self, pane: str = "", caller: str = "") -> dict[str, str]:
-        # `TMUX_PANE` and the session id are set here always: a test run from inside tmux, or from a
-        # showrunner's session, must not hand on its own pane or its own production.
+        # Keep the caller identity and host observations isolated from the running suite.
         return {**os.environ, "SHOWRUNNERS_CONFIG": str(self.config),
                 "NOTIFIER_STATE_DIR": str(self.notifier), "NOTIFIER_SESSIONS_DIR": str(self.sessions),
                 "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
                 "SHOWRUNNER_STATE_DIR": str(self.state), "SHOWRUNNERS_SEND": str(self.send_script),
                 "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller,
-                "UNIT_LOOKUP_TMUX": FAKE, "FAKE_TMUX_STATE": str(self.tmux), "TMUX_PANE": pane}
+                **fake_unit_host.environment(self.root), "HERDR_PANE_ID": pane}
 
     def cli(self, *args: str, pane: str = "", caller: str = "") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(pane, caller),
@@ -141,9 +145,14 @@ raise SystemExit(1)
         self.assertEqual(result.stdout, "")
         return result.stderr
 
-    def showrunner(self, slug: str, *, running: bool = True) -> None:
+    def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = ()) -> None:
         """One production with an update timer, its showrunner named `<slug>-name` when it runs."""
-        self.instance(f"showrunner-{slug}", target=f"session:{slug}-id", doc=self.root / f"{slug}-production.md")
+        doc = self.root / f"{slug}-production.md"
+        self.instance(f"showrunner-{slug}", target=f"session:{slug}-id", doc=doc)
+        if formerly:
+            names = ", ".join(f"`{old}`" for old in formerly)
+            _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
+                               encoding="utf-8")
         if running:
             _ = self.record(f"{slug}-name", f"{slug}-id")
 
@@ -160,11 +169,10 @@ raise SystemExit(1)
         _ = (self.state / child / "parent").write_text(f"{parent}\n")
 
     def unit_session(self, unit: str, pane: str) -> None:
-        """Give the production `show` one tmux session marked as `unit`."""
+        """Give the production `show` one marked herdr pane."""
         marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": unit}
-        sessions = fake_tmux.read(self.tmux) if self.tmux.exists() else {}
-        sessions[f"${len(sessions) + 1}"] = FakeSession(label=f"label-of-{unit}", panes=[pane], env=marks)
-        fake_tmux.write(self.tmux, sessions)
+        self.hosted_units.append(HostedUnit(f"label-of-{unit}", pane, marks))
+        fake_unit_host.write(self.environment(), self.hosted_units)
 
     def test_checked_doc_reads_absolute_path_after_check_script(self) -> None:
         directory = self.notifier / "showrunner-check"
@@ -213,6 +221,70 @@ raise SystemExit(1)
         _ = self.record("on-demand", "live-id")
         self.assertEqual(self.successful("name", "show"), "on-demand\n")
         self.assertIn("show\ton-demand\t", self.successful("list"))
+
+    def test_former_slug_reaches_the_current_showrunner_by_name_and_address(self) -> None:
+        self.showrunner("new", formerly=("old",))
+        address = f"uds:{self.root / 'new-id.sock'}"
+        self.assertEqual(self.successful("address", "old"), f"{address}\n")
+        self.assertEqual(self.successful("name", "old"), "new-name\n")
+        with (mock.patch.dict(os.environ, self.environment()),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
+              mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
+            self.assertEqual(showrunners.current_address("old"), address)
+            self.assertEqual(showrunners.current_name("old"), "new-name")
+
+    def test_named_accepts_a_live_session_name_and_a_former_production_slug(self) -> None:
+        self.showrunner("new", formerly=("old",))
+        with (mock.patch.dict(os.environ, self.environment()),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
+              mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
+            self.assertEqual(showrunners.named("new-name")["slug"], "new")
+            self.assertEqual(showrunners.named("old")["slug"], "new")
+
+    def test_named_prefers_the_production_a_former_slug_resolves_to_over_a_session_of_that_name(self) -> None:
+        # The session-named runner sorts first, so a first-match lookup would return it.
+        self.instance("showrunner-a-other", target="session:a-other-id", doc=self.root / "a-other-production.md")
+        _ = self.record("old", "a-other-id")
+        self.showrunner("z-new", formerly=("old",))
+        with (mock.patch.dict(os.environ, self.environment()),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
+              mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
+            self.assertEqual(showrunners.named("old")["slug"], "z-new")
+
+    def test_a_formerly_line_outside_production_context_claims_no_slug(self) -> None:
+        self.showrunner("new", running=False)
+        _ = (self.root / "new-production.md").write_text(
+            "# Production\n\n## Production Context\n\n- **Owner:** someone\n\n## Notes\n\n```\n- **Formerly:** `old`\n```\n",
+            encoding="utf-8")
+        self.assertEqual(showrunners.canonical_slug("old", self.notifier), "old")
+
+    def test_formerly_can_name_two_previous_slugs_without_a_running_showrunner(self) -> None:
+        self.showrunner("new", running=False, formerly=("old", "older"))
+        for slug in ("new", "old", "older"):
+            with self.subTest(slug=slug):
+                self.assertEqual(showrunners.canonical_slug(slug, self.notifier), "new")
+        self.assertEqual(showrunners.production_slug(str(self.root / "new-production.md")), "new")
+
+    def test_a_current_slug_takes_precedence_over_another_productions_former_slug(self) -> None:
+        # The former owner sorts first, so an alias match cannot win before all current slugs are checked.
+        self.showrunner("a-renamed", formerly=("z-current",))
+        self.showrunner("z-current")
+        self.assertEqual(showrunners.canonical_slug("z-current", self.notifier), "z-current")
+        self.assertEqual(self.successful("address", "z-current"), f"uds:{self.root / 'z-current-id.sock'}\n")
+
+    def test_an_unknown_slug_passes_through_but_showrunner_commands_refuse_it(self) -> None:
+        self.showrunner("new", running=False, formerly=("old",))
+        self.assertEqual(showrunners.canonical_slug("older", self.notifier), "older")
+        for verb in ("name", "address"):
+            with self.subTest(verb=verb):
+                self.assertIn("the showrunner of older is not running", self.refused(verb, "older"))
+        for arguments in (("attach", "older", "new"), ("parent", "older")):
+            with self.subTest(arguments=arguments):
+                self.assertIn("older has no update timer", self.refused(*arguments))
+        self.assertFalse(self.state.exists())
 
     def test_name_and_address_refuse_a_showrunner_that_is_not_running_or_has_no_timer(self) -> None:
         self.instance("showrunner-show", doc=self.doc)
@@ -279,14 +351,14 @@ raise SystemExit(1)
 
     def test_the_old_ready_and_status_commands_do_nothing_and_succeed(self) -> None:
         # Sessions started before a unit's run state was read from its run records still call them.
-        self.unit_session("alpha", "%4")
-        before = self.tmux.read_bytes()
+        self.unit_session("alpha", "w4:p1")
+        before = (self.root / "herdr-responses.json").read_bytes()
         for arguments in (("ready", "director", "--unit", "alpha"), ("ready", "no-such-showrunner", "--unit", "x"),
                           ("status", "--state", "run-finished"),
                           ("status", "director", "--unit", "any-name", "--state", "running")):
             with self.subTest(arguments=arguments):
-                self.assertEqual(self.successful(*arguments, pane="%4"), "")
-        self.assertEqual(self.tmux.read_bytes(), before)
+                self.assertEqual(self.successful(*arguments, pane="w4:p1"), "")
+        self.assertEqual((self.root / "herdr-responses.json").read_bytes(), before)
 
     def test_settings_ignore_a_showrunner_list_stored_before_showrunners_were_looked_up(self) -> None:
         document = {**showrunners.defaults(), "showrunners": [{
@@ -327,6 +399,27 @@ raise SystemExit(1)
         self.assertIn("never a unit: it has no Units row", to_parent)
         self.assertIn("leaf now reports to mid. It is a child showrunner", to_leafs_parent)
 
+    def test_tree_commands_accept_former_slugs_and_answer_with_current_slugs(self) -> None:
+        self.showrunner("top", running=False, formerly=("old-top",))
+        self.showrunner("leaf", running=False, formerly=("old-leaf",))
+        self.stored_parent("leaf", "top")
+        for arguments, expected in ((("parent", "old-leaf"), "top\n"),
+                                    (("children", "old-top"), "leaf\n"),
+                                    (("root", "old-leaf"), "top\n")):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.successful(*arguments), expected)
+
+    def test_attach_and_detach_former_slugs_use_the_current_state_directory(self) -> None:
+        self.showrunner("top", running=False, formerly=("old-top",))
+        self.showrunner("leaf", running=False, formerly=("old-leaf",))
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state)):
+            showrunners.attach("old-leaf", "old-top")
+            self.assertEqual((self.state / "leaf" / "parent").read_text(), "top\n")
+            self.assertFalse((self.state / "old-leaf").exists())
+            self.assertEqual(showrunners.detach("old-leaf"), "top")
+            self.assertFalse((self.state / "leaf" / "parent").exists())
+
     def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
@@ -339,7 +432,6 @@ raise SystemExit(1)
         self.showrunner("top")
         self.showrunner("mid")
         self.showrunner("leaf")
-        self.assertIn("gone has no update timer", self.refused("attach", "gone", "top"))
         self.assertIn("gone has no update timer", self.refused("attach", "mid", "gone"))
         self.assertIn("mid cannot report to itself", self.refused("attach", "mid", "mid"))
         self.assertFalse(self.state.exists())
@@ -398,7 +490,7 @@ raise SystemExit(1)
 
     def test_a_lookup_refuses_a_production_with_no_timer(self) -> None:
         self.showrunner("top")
-        for lookup in ("parent", "children", "root"):
+        for lookup in ("children", "root"):
             self.assertIn("gone has no update timer", self.refused(lookup, "gone"))
 
     def test_a_root_s_place_holds_every_level_below_it_and_a_lower_one_names_its_root(self) -> None:

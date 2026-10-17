@@ -20,6 +20,7 @@ import unittest
 import build_targets
 import build_hold
 import offload
+import mac_test
 import targets
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
 
@@ -59,9 +60,55 @@ class StatusTests(IsolatedTargetTest):
     def test_running_line_uses_local_zone(self) -> None:
         since = datetime(2026, 10, 11, 20, 20, tzinfo=timezone.utc)
         self.assertEqual(
-            build_targets.format_state("mac", targets.Running("nextest hana", since)),
+            build_targets.format_state(
+                "mac", targets.Running((targets.RunningJob("nextest hana", since, targets.NOT_SEEN_IDLE),)),
+            ),
             "mac: running nextest hana since 13:20 PDT",
         )
+
+    def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
+        self.write_claim()
+        path = self.mac_state / "run.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["idle_since"] = "2026-10-11T20:20:00+00:00"
+        _ = path.write_text(json.dumps(record))
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n",
+        )
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            code, output, errors = self.capture_status()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: free\n")
+
+    def test_mac_running_status_lists_every_repository_claim(self) -> None:
+        later = SINCE + timedelta(minutes=10)
+        self.write_claim("claims/cargo-liner.json", "nextest cargo-liner", later)
+        liner = self.mac_state / "claims" / "cargo-liner.json"
+        record = cast(dict[str, object], json.loads(liner.read_text()))
+        record["idle_since"] = "2026-10-11T20:20:00+00:00"
+        _ = liner.write_text(json.dumps(record))
+        self.write_claim("claims/hana.json")
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n",
+        )
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            code, output, errors = self.capture_status()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(
+            output,
+            "mac: running nextest hana since 13:05 PDT; "
+            + "running nextest cargo-liner since 13:15 PDT, idle since 13:20\nnatedev: free\n",
+        )
+
+    def test_mac_running_status_without_idle_time_keeps_existing_line(self) -> None:
+        self.write_claim()
+        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            state = targets.target_state(targets.SshTarget("mac", "macos", self.settings))
+            self.assertEqual(build_targets.format_state("mac", state), "mac: running nextest hana since 13:05 PDT")
 
     def test_expiring_hold_line(self) -> None:
         self.assertEqual(
@@ -111,7 +158,9 @@ class StatusTests(IsolatedTargetTest):
 
     def test_run_description_whitespace_collapses_to_one_line(self) -> None:
         self.assertEqual(
-            build_targets.format_state("mac", targets.Running("  nextest\n\t hana\r\nrun  ", SINCE)),
+            build_targets.format_state(
+                "mac", targets.Running((targets.RunningJob("  nextest\n\t hana\r\nrun  ", SINCE, targets.NOT_SEEN_IDLE),)),
+            ),
             "mac: running nextest hana run since 13:05 PDT",
         )
 
@@ -488,6 +537,42 @@ class WaitLocalTests(IsolatedTargetTest):
         self.assertIsInstance(decision, build_hold.AdmittedTurn)
         self.assertTrue((self.holders / "hana").exists())
 
+    def leave_wait(self, leave_hook: str) -> tuple[int, str]:
+        errors = io.StringIO()
+        with mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
+             mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN), \
+             redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            code = build_targets.command_wait_local("call-a", pid=os.getpid(), leave_hook=leave_hook)
+        return code, errors.getvalue()
+
+    def count_sleep(self, _seconds: float) -> None:
+        self.sleeps += 1
+
+    def test_held_call_leaves_for_a_free_mac_after_one_poll_and_gives_up_its_turn(self) -> None:
+        self.begin_hold()
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=self.count_sleep):
+            code, errors = self.leave_wait("exit 0")
+        self.assertEqual(code, build_targets.LEFT_QUEUE_STATUS, errors)
+        self.assertEqual(self.sleeps, 1)
+        self.assertIn("verify.sh: the Mac is free: leaving natedev's hold wait to run there.", errors)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual([call for entry in cycle["entries"] for call in entry.get("calls", [])], [])
+        self.assertTrue((self.root / "wait-seconds").read_text().strip())
+
+    def test_held_call_with_a_busy_or_blocked_mac_waits_for_natedev_release(self) -> None:
+        self.begin_hold()
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=self.release_turn):
+            code, errors = self.leave_wait("exit 1")
+        self.assertEqual(code, 0, errors)
+        self.assertNotIn("the Mac is free", errors)
+        self.assertIsInstance(build_hold.read_admission("verify:call-a", "call-a"), build_hold.AdmittedTurn)
+
+    def test_unheld_call_never_runs_the_leave_hook(self) -> None:
+        marker = self.root / "hook-ran"
+        self.assertEqual(self.leave_wait(f"touch {marker}"), (0, ""))
+        self.assertFalse(marker.exists())
+
     def test_waiting_line_collapses_holder_and_reason_whitespace(self) -> None:
         self.begin_hold()
         holder = targets.Held(" hana\nteam ", " render\nchecks ", SINCE, targets.UntilReleased())
@@ -584,6 +669,65 @@ class WaitLocalTests(IsolatedTargetTest):
         assert cycle is not None
         self.assertFalse(any(entry["state"] == "MemoryGateReturned" for entry in cycle["entries"]))
 
+    def check_launch(self, session_id: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": session_id}), \
+             redirect_stdout(output), redirect_stderr(errors):
+            code = build_targets.command_check_local()
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_holder_session_launch_is_admitted_without_changing_hold_or_release(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle_file = self.root / "release" / cycle["id"] / "cycle.json"
+        current = self.root / "release" / "current"
+        holder_file = build_hold.holder_path(self.holders, "holder-session")
+        before = (cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes())
+        with mock.patch.object(build_hold, "register_wait", wraps=build_hold.register_wait) as register, \
+             mock.patch.object(build_hold, "read_admission", wraps=build_hold.read_admission) as admission:
+            self.assertEqual(self.check_launch("holder-session"), (0, "", ""))
+        register.assert_not_called()
+        admission.assert_not_called()
+        self.assertEqual((cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes()), before)
+        self.assertEqual([path.name for path in self.holders.iterdir()], ["holder-session"])
+
+    def test_another_session_launch_is_refused_by_the_session_hold(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        self.assertEqual(self.check_launch("other-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_holder_session_launch_is_refused_when_another_hold_is_in_force(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
+                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+        self.assertEqual(self.check_launch("holder-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_holder_session_launch_is_refused_when_the_release_record_names_an_unusable_holder(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["holders"]["."] = {"since": NOW.isoformat(), "released_at": ""}
+        build_hold.save_cycle(cycle)
+        self.assertEqual(self.check_launch("holder-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_hold_under_a_name_refuses_every_launching_session(self) -> None:
+        self.begin_hold()
+        for session_id in ("holder-session", "other-session", ""):
+            with self.subTest(session_id=session_id):
+                self.assertEqual(self.check_launch(session_id), (
+                    10, "natedev is held by hana for render checks; launch after the release.\n", "",
+                ))
+
     def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
         self.begin_hold()
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Registration must return")):
@@ -665,24 +809,28 @@ class WaitLocalTests(IsolatedTargetTest):
              mock.patch.object(build_hold, "call_is_live", wraps=REAL_CALL_IS_LIVE):
             self.assertTrue(build_hold.call_is_live(call))
 
-    def test_finish_local_on_admitted_unmarked_call_releases_next_entry(self) -> None:
+    def test_finish_local_on_admitted_unmarked_call_ends_its_turn_without_another_notice(self) -> None:
         self.begin_hold()
         build_hold.record_recipients([("owner", "owner"), ("peer", "peer")])
         cycle = build_hold.read_cycle()
         assert cycle is not None
         cycle["release_started_at"] = NOW.isoformat()
         build_hold.save_cycle(cycle)
-        _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
-        with mock.patch.object(build_hold, "waiter_key", return_value="owner"):
-            self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-        self.assertEqual(build_targets.command_finish_local("call-a"), 0)
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
         with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as sent:
             _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
-        self.assertEqual(sent.call_count, 1)
-        self.assertEqual(sent.call_args.args[0]["session_id"], "peer")
+            with mock.patch.object(build_hold, "waiter_key", return_value="owner"):
+                self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
+            self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
+            self.assertEqual(build_targets.command_finish_local("call-a"), 0)
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            self.assertEqual(build_hold.advance_release(cycle, NOW, clock=lambda: NOW),
+                             (False, "peer [peer]: ReleasedAwaitingAdmission"))
+        self.assertEqual([call.args[0]["session_id"] for call in sent.call_args_list], ["owner", "peer"])
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual([(entry["session_id"], entry["state"], entry["active_call_id"]) for entry in cycle["entries"]],
+                         [("owner", "NoPendingTurn", ""), ("peer", "ReleasedAwaitingAdmission", "")])
 
 
 if __name__ == "__main__":

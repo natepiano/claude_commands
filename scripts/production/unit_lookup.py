@@ -1,33 +1,32 @@
 #!/usr/bin/env python3
-"""Find units by the marks on their tmux sessions: one production's, or every production's at once.
+"""Find production units by marks on herdr panes.
 
-A unit's tmux session carries two marks in its environment: the production slug and the unit id.
-Nothing else records which session is which unit. A unit's current name, pane and socket are read
-here, from tmux and the live session records, each time they are needed, so a rename or a relaunch
-leaves nothing to bring in step. Its run state is stored nowhere either: it is read from the
-records /unit:direct keeps of its runs. `every_marked_unit` is the one enumeration of units on this
-machine; a caller that wants every unit director, whatever its production, reads it once.
+Current names, places and messaging sockets come from herdr and live session
+records. Run state comes from /unit:direct records. Duplicate marks are refused.
 """
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
+sys.path.insert(0, str(MESSAGE.parent / "herdr"))
+import herdr  # noqa: E402
+import showrunners  # noqa: E402
+from herdr import HerdrPlace  # noqa: E402
 from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from showrunners import canonical_slug  # noqa: E402
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 UNIT_MARK = "SHOWRUNNER_UNIT_ID"
-USAGE = ("usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
-         + " | mark <production slug> <unit> <tmux session>")
+USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
 
 
 class UnitState(Enum):
@@ -56,14 +55,18 @@ class ClaudeUnknown(NamedTuple):
 Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 
-class MarkedUnit(NamedTuple):
+Place = HerdrPlace
+
+
+@dataclass(frozen=True)
+class MarkedUnit:
     unit: str
-    # The pane its live Claude runs in, else the first pane of the marked tmux session, as tmux
-    # addresses it ("%41").
-    pane: str
-    # The tmux session's label now. It is a display name: nothing finds a pane by it.
-    label: str
     claude: Claude
+    place: Place
+
+
+def place_text(place: Place) -> str:
+    return f"herdr:{place.session}:{place.pane}"
 
 
 class MarkedProductions(NamedTuple):
@@ -123,123 +126,99 @@ def sessions_dir() -> Path:
     return Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 
 
-def tmux_binary() -> str:
-    """The tmux to run. Read at each call, so a test can point every caller at its stand-in."""
-    found = os.environ.get("UNIT_LOOKUP_TMUX") or shutil.which("tmux")
-    if found:
-        return found
-    # `^out` alone: `nixpkgs#tmux` without it also prints the man output's path.
-    result = subprocess.run(["nix", "build", "--no-link", "--print-out-paths", "nixpkgs#tmux^out"],
-                            text=True, capture_output=True, check=True)
-    return str(Path(result.stdout.strip()) / "bin/tmux")
+class RecordsRead(NamedTuple):
+    """Every session record was readable."""
 
 
-def _tmux(*arguments: str) -> subprocess.CompletedProcess[str]:
-    try:
-        binary = tmux_binary()
-    except subprocess.CalledProcessError as error:
-        raise OSError(f"no tmux to run: {error}") from error
-    return subprocess.run([binary, *arguments], capture_output=True, text=True, check=False)
+class RecordsPartlyUnread(NamedTuple):
+    reason: str
 
 
-def tmux_sessions() -> dict[str, tuple[str, list[str]]]:
-    """Each tmux session id to its label and its pane ids. No tmux server means no sessions."""
-    listed = _tmux("list-panes", "-a", "-F", "#{session_id}\t#{pane_id}\t#{session_name}")
-    if listed.returncode != 0:
-        detail = listed.stderr.strip()
-        if "no server running" in detail or "error connecting" in detail:
-            return {}
-        raise OSError(f"tmux could not list panes: {detail or f'exit {listed.returncode}'}")
-    found: dict[str, tuple[str, list[str]]] = {}
-    for line in listed.stdout.splitlines():
-        session, pane, label = (line.split("\t", 2) + ["", ""])[:3]
-        found.setdefault(session, (label, []))[1].append(pane)
-    return found
-
-
-def _marks(session: str) -> dict[str, str]:
-    """The marks in one tmux session's environment. A session that ended meanwhile has none."""
-    shown = _tmux("show-environment", "-t", session)
-    if shown.returncode != 0:
-        return {}
-    pairs = (line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
-    return {name: value for name, value in pairs if name in (PRODUCTION_MARK, UNIT_MARK)}
-
-
-def _claudes() -> tuple[dict[str, LiveClaude], str]:
-    """The newest live Claude in each pane, and why the records were not all read (empty if they were)."""
+def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[HerdrPlace, LiveClaude], RecordsRead | RecordsPartlyUnread]:
+    """Newest live Claude per herdr pane, with the completeness of the records."""
+    places = {process.pid: process.place for process in processes}
     try:
         paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
     except OSError as error:
-        return {}, f"cannot list session records: {error}"
-    newest: dict[str, tuple[int, LiveClaude]] = {}
-    unread = ""
+        return {}, RecordsPartlyUnread(f"cannot list session records: {error}")
+    newest: dict[HerdrPlace, tuple[int, LiveClaude]] = {}
+    evidence: RecordsRead | RecordsPartlyUnread = RecordsRead()
     for path in paths:
         record = read_session(path)
         if isinstance(record, UnreadableSessionRecord):
-            unread = "one or more session records could not be read"
+            evidence = RecordsPartlyUnread("one or more session records could not be read")
             continue
-        pane = record["tmux"].rpartition(".")[2]
-        if not pane or not live_session(record):
+        if not live_session(record):
             continue
-        if pane not in newest or record["updatedAt"] > newest[pane][0]:
-            newest[pane] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
-                                                            record["messagingSocketPath"], record["pid"]))
-    return {pane: claude for pane, (_, claude) in newest.items()}, unread
+        place = places.get(record["pid"])
+        if place is None:
+            # A live registry PID may be absent from the snapshot because its
+            # working directory was deleted. Placement needs no cwd.
+            placement = herdr.herdr_place_of(record["pid"])
+            if isinstance(placement, herdr.NotInHerdr):
+                continue
+            place = placement
+        if place not in newest or record["updatedAt"] > newest[place][0]:
+            newest[place] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
+                                                           record["messagingSocketPath"], record["pid"]))
+    return {place: claude for place, (_, claude) in newest.items()}, evidence
 
 
-def _marked_sessions() -> Iterable[tuple[str, MarkedUnit]]:
-    """Each tmux session that carries both marks, with its production slug.
-
-    Raises OSError when tmux cannot say which sessions exist.
-    """
-    claudes, unread = _claudes()
-    for session, (label, panes) in tmux_sessions().items():
-        marks = _marks(session)
-        slug, unit = marks.get(PRODUCTION_MARK, ""), marks.get(UNIT_MARK, "")
+def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], evidence: RecordsRead | RecordsPartlyUnread,
+                  processes: list[herdr.HerdrProcess]) -> Iterable[tuple[str, MarkedUnit]]:
+    """Each running herdr pane carrying both marks, once per place."""
+    running = {session["name"] for session in herdr.live_sessions()}
+    seen: set[HerdrPlace] = set()
+    for process in processes:
+        place = process.place
+        if place.session not in running or place in seen:
+            continue
+        slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
         if not slug or not unit:
             continue
-        live = [pane for pane in panes if pane in claudes]
-        claude: Claude = (claudes[live[0]] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning())
-        yield slug, MarkedUnit(unit, live[0] if live else panes[0], label, claude)
+        seen.add(place)
+        claude: Claude = claudes.get(place, ClaudeUnknown(evidence.reason) if isinstance(evidence, RecordsPartlyUnread) else ClaudeNotRunning())
+        yield slug, MarkedUnit(unit, claude, place)
+
+
+def _lookup_slug(slug: str) -> str:
+    # A current notifier name needs no scan of Formerly entries or reread of its doc.
+    if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}").is_dir():
+        return slug
+    return canonical_slug(slug)
 
 
 def every_marked_unit() -> MarkedProductions:
-    """Every unit on this machine that has a tmux session, whatever its production.
-
-    One read of tmux and the session records serves every production. Raises OSError when tmux
-    cannot say which sessions exist. Two sessions carrying one unit's mark is a fault of whoever
-    marked them: that production's units are left out, with why, since no caller may pick one.
-    """
+    """Read all herdr units once. An unreadable host raises OSError."""
+    try:
+        processes = herdr.herdr_processes()
+        claudes, evidence = _claudes(processes)
+        marked = list(_herdr_marked(claudes, evidence, processes))
+    except herdr.HerdrFailure as error:
+        raise OSError(str(error)) from error
     units: dict[str, dict[str, MarkedUnit]] = {}
     faults: dict[str, str] = {}
-    for slug, marked in _marked_sessions():
+    current_slugs: dict[str, str] = {}
+    for slug, unit in marked:
+        if slug not in current_slugs:
+            current_slugs[slug] = _lookup_slug(slug)
+        slug = current_slugs[slug]
         production = units.setdefault(slug, {})
-        if marked.unit in production:
-            _ = faults.setdefault(slug, f"tmux sessions {production[marked.unit].label} and {marked.label}"
-                                  + f" both carry the mark of {marked.unit}")
-        production[marked.unit] = marked
+        if unit.unit in production:
+            previous = production[unit.unit]
+            hosts = f"herdr sessions {previous.place.session} and {unit.place.session}"
+            _ = faults.setdefault(slug, f"{hosts} both carry the mark of {unit.unit}")
+        production[unit.unit] = unit
     return MarkedProductions({slug: found for slug, found in units.items() if slug not in faults}, faults)
 
 
 def marked_units(slug: str) -> dict[str, MarkedUnit]:
-    """Every unit of the production that has a tmux session, by unit id.
-
-    Raises OSError when tmux cannot say which sessions exist, and when two sessions carry one of
-    the production's unit marks.
-    """
+    """The production's units. Unreadable herdr or duplicate marks raise OSError."""
+    slug = _lookup_slug(slug)
     found = every_marked_unit()
     if slug in found.faults:
         raise OSError(found.faults[slug])
     return found.units.get(slug, {})
-
-
-def mark(target: str, slug: str, unit: str) -> None:
-    """Mark the tmux session `target` names, or holds as a pane, as this unit of this production."""
-    for name, value in ((PRODUCTION_MARK, slug), (UNIT_MARK, unit)):
-        done = _tmux("set-environment", "-t", target, name, value)
-        if done.returncode != 0:
-            raise OSError(f"tmux could not mark {target}: {done.stderr.strip() or f'exit {done.returncode}'}")
 
 
 def main(arguments: list[str]) -> int:
@@ -253,14 +232,12 @@ def main(arguments: list[str]) -> int:
                             else ("", "", ""))
                     running = ("live" if isinstance(claude, LiveClaude)
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
-                    print("\t".join((unit.unit, unit.pane, unit.label, running, *told)))
+                    print("\t".join((unit.unit, place_text(unit.place), unit.place.session, running, *told)))
             case ["pane", slug, name]:
                 found = marked_units(slug).get(name)
                 if found is None:
                     return 1
-                print(found.pane)
-            case ["mark", slug, name, target]:
-                mark(target, slug, name)
+                print(place_text(found.place))
             case _:
                 print(USAGE, file=sys.stderr)
                 return 2

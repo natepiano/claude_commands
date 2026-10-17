@@ -32,12 +32,16 @@ CALL_ID = "natedev-20261002T120000-abcdef"
 SWEEP = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py"]
 NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 # What the ambient session would otherwise stamp on every record: the caller,
-# the delegate seat, the session and the call id all come from these.
+# the delegate worker, the session and the call id all come from these.
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
     "BUILDLOG_LOCAL_REASON",
     "BUILDLOG_MAC_HOLDER",
+    "BUILDLOG_MAC_COPY",
+    "BUILDLOG_MAC_COPY_S",
+    "BUILDLOG_MAC_COPY_COUNT",
+    "BUILDLOG_MAC_COPY_NATEDEV_S",
     "BUILDLOG_TARGET",
     "BUILDLOG_HOLD_WAIT_S",
     "LINT_OUTPUT_DIR",
@@ -47,6 +51,7 @@ AMBIENT = (
     "CLAUDE_CODE_SESSION_ID",
     "MANIFEST_PATH",
     "BUILDLOG_TREE_START",
+    "BUILDLOG_SENT_TREE_KEY",
     "BUILDLOG_MEM_WAIT_S",
 )
 Record = dict[str, object]
@@ -229,7 +234,11 @@ class RecordTests(unittest.TestCase):
             systemd_run.chmod(0o755)
             command = (
                 'source "$1"; BUILDLOG_RECORD="$2"; sweep_after_step() { :; }; '
-                'run_once bash -c "printf step\\n"'
+                'buildlog_now() { '
+                'if [[ -e "$TEST_STEP_FINISHED" ]]; then BUILDLOG_NOW=1790942507; '
+                'elif [[ "$(< "$BUILDLOG_MEMINFO")" == "MemAvailable: 12582912 kB" ]]; '
+                'then BUILDLOG_NOW=1790942500; else BUILDLOG_NOW=1790942400; fi; }; '
+                "run_once bash -c 'printf \"step\\n\"; touch \"$TEST_STEP_FINISHED\"'"
             )
             process = subprocess.Popen(
                 ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh"), str(SCRIPT)],
@@ -239,7 +248,7 @@ class RecordTests(unittest.TestCase):
                     XDG_RUNTIME_DIR=str(runtime.parent),
                     BUILDLOG_OFF="0", BUILDLOG_SCOPE="1",
                     BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="5",
-                    BUILDLOG_SYNC="1",
+                    BUILDLOG_SYNC="1", TEST_STEP_FINISHED=str(self.base / "step-finished"),
                 ),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
@@ -250,7 +259,6 @@ class RecordTests(unittest.TestCase):
                 first_message = cast(str, process.stderr.readline())
                 self.assertIn("waiting for memory since ", first_message)
                 time.sleep(1.1)
-                released_at = time.time()
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
                 output, remaining_errors = process.communicate(timeout=8)
                 errors = first_message + remaining_errors
@@ -269,8 +277,8 @@ class RecordTests(unittest.TestCase):
         assert isinstance(wait, int)
         assert isinstance(duration, (int, float))
         self.assertGreaterEqual(wait, 1)
-        self.assertGreaterEqual(started, released_at - 0.01)
-        self.assertLess(duration, 0.8)
+        self.assertEqual(started, 1790942500)
+        self.assertEqual(duration, 7)
 
     def test_memory_admission_explains_limit_once(self) -> None:
         meminfo = self.base / "meminfo"
@@ -533,6 +541,79 @@ class RecordTests(unittest.TestCase):
         _ = (self.repo / "new.rs").write_text("\n")
         self.assertNotEqual(self.key(*NEXTEST), key)
 
+    def test_verify_mac_step_without_git_records_the_sent_tree_key_and_call_id(self) -> None:
+        mirror = self.base / "mirror"
+        mirror.mkdir()
+        sent_key = "a" * 64
+        result = self.record(
+            "step", "1", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror,
+            extra={"BUILDLOG_CALLER": "verify-mac", "BUILDLOG_CALL_ID": CALL_ID,
+                   "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["caller"], row["call_id"], row["step"]), ("verify-mac", CALL_ID, "nextest"))
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def assert_unverified_mac_step_uses_sent_key(self) -> None:
+        # The fallback must work where the preceding step's guard does not apply.
+        mirror = self.base / "mirror-control"
+        mirror.mkdir()
+        sent_key = "a" * 64
+        result = self.record(
+            "step", "1", str(START + 20), str(START + 21), "0", "", "", *NEXTEST,
+            cwd=mirror, extra={"BUILDLOG_CALLER": "verify-mac", "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def test_local_step_with_changed_tree_does_not_use_the_sent_tree_key(self) -> None:
+        end_key = self.key(*NEXTEST)
+        start_key = "0" * 64
+        self.assertNotEqual(start_key, end_key)
+        row = self.step(0, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify", "BUILDLOG_TREE_START": start_key,
+            "BUILDLOG_SENT_TREE_KEY": "a" * 64,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, True))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_verify_mac_step_with_changed_tree_does_not_use_the_sent_tree_key(self) -> None:
+        end_key = self.key(*NEXTEST)
+        start_key = "0" * 64
+        self.assertNotEqual(start_key, end_key)
+        row = self.step(1, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_TREE_START": start_key,
+            "BUILDLOG_SENT_TREE_KEY": "a" * 64,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, True))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_verify_mac_step_keeps_its_own_verified_key_over_a_different_sent_key(self) -> None:
+        own_key = self.key(*NEXTEST)
+        sent_key = "a" * 64
+        self.assertNotEqual(own_key, sent_key)
+        row = self.step(1, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_TREE_START": own_key,
+            "BUILDLOG_SENT_TREE_KEY": sent_key,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (own_key, False))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_local_step_without_git_does_not_use_the_sent_tree_key(self) -> None:
+        mirror = self.base / "local-without-git"
+        mirror.mkdir()
+        result = self.record(
+            "step", "0", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror, extra={"BUILDLOG_CALLER": "verify", "BUILDLOG_SENT_TREE_KEY": "a" * 64},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, None))
+        self.assert_unverified_mac_step_uses_sent_key()
+
     def test_key_follows_the_manifest_and_is_empty_outside_git(self) -> None:
         elsewhere = self.base / "elsewhere"
         elsewhere.mkdir()
@@ -579,7 +660,7 @@ class RecordTests(unittest.TestCase):
             "cwd": str(self.repo),
             "repo_path": str(self.repo),
             "branch": "main",
-            "seat": "impl2",
+            "worker": "impl2",
             "delegate_session": "run-7",
             "session": "session-1",
             "backfilled": False,
@@ -683,6 +764,39 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(call_record["mac_reason"], "")
         self.assertEqual(call_record["mac_s"], 12.5)
         self.assertEqual(call_record["local_reason"], local_reason)
+
+    def test_call_records_the_mac_copy_outcome_and_times(self) -> None:
+        result = self.record(
+            "call", "failed", "1", "0", "9", "100", "", "0", "110", "test", "hana",
+            extra={
+                "BUILDLOG_MAC_COPY": "won",
+                "BUILDLOG_MAC_COPY_S": "41.5",
+                "BUILDLOG_MAC_COPY_COUNT": "2",
+                "BUILDLOG_MAC_COPY_NATEDEV_S": "95.25",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.records()[-1]
+        self.assertEqual(
+            [record[key] for key in ("copy", "copy_s", "copy_count", "copy_natedev_s")], ["won", 41.5, 2, 95.25]
+        )
+
+    def test_call_without_a_copy_records_empty_outcome_and_null_times(self) -> None:
+        for value in ("", "abc", "-1", "nan"):
+            with self.subTest(value=value):
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={
+                        "BUILDLOG_MAC_COPY_S": value,
+                        "BUILDLOG_MAC_COPY_COUNT": "" if value == "-1" else value,
+                        "BUILDLOG_MAC_COPY_NATEDEV_S": value,
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = self.records()[-1]
+                self.assertEqual(
+                    [record[key] for key in ("copy", "copy_s", "copy_count", "copy_natedev_s")], ["", None, None, None]
+                )
 
     def test_call_local_reason_defaults_to_empty(self) -> None:
         result = self.record(

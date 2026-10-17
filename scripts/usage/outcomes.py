@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
+from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
 
@@ -99,8 +100,17 @@ def repositories(claude_repo: Path, production_docs: Path) -> tuple[Path, ...]:
 def default_sources() -> ReportSources:
     home = Path.home()
     claude = home / ".claude"
+    state = home / ".local" / "state" / "usage-model"
+    baseline = state / "workers-baseline"
+    previous = state / "seats-baseline"
+    if not baseline.exists() and previous.exists():
+        try:
+            _ = previous.rename(baseline)
+        except FileNotFoundError:
+            if not baseline.is_dir():
+                raise
     return ReportSources(
-        home / ".local" / "state" / "usage-model" / "seats-baseline" / "readings-2026-10-10.jsonl",
+        baseline / "readings-2026-10-10.jsonl",
         claude,
         claude / "docs" / "plans",
     )
@@ -265,6 +275,7 @@ def save_reading(db: sqlite3.Connection, record: dict[str, object], *,
 
 
 def save_account_role(db: sqlite3.Connection, record: dict[str, object]) -> int:
+    record = cast(dict[str, object], journal_entry(record))
     at = parse_timestamp(record.get("at"))
     role, label = record.get("role"), record.get("label")
     if at is None or not isinstance(role, str) or not isinstance(label, str):

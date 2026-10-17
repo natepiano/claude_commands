@@ -556,6 +556,7 @@ class FeatureLogTests(unittest.TestCase):
         cases = (
             ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner"),
             ("https://github.com/natepiano/bevy_brp\n", "bevy_brp"),
+            ("git@github.com:natepiano/claude_commands\n", "claude"),
             ("https://github.com/someone/unknown.git\n", "none"),
         )
         checkout = self.root / "checkout"
@@ -690,14 +691,9 @@ class FeatureLogTests(unittest.TestCase):
             ("bullet summary", self.add_arguments(summary="- not a summary"), "summary"),
             ("multiline summary", self.add_arguments(summary="first\nsecond"), "summary"),
             (
-                "production outside hana",
-                self.add_arguments(project="natedev", crates=()) + ["--production", "machine"],
-                "production",
-            ),
-            (
-                "unit outside hana",
-                self.add_arguments(project="natedev", crates=()) + ["--unit", "system"],
-                "unit",
+                "claude crate",
+                self.add_arguments(project="claude", crates=("hana",)),
+                "claude does not accept crates",
             ),
             ("empty normalized title", self.add_arguments(title="--- !!!"), "title"),
             ("long normalized title", self.add_arguments(title="a" * 51), "50"),
@@ -2764,6 +2760,66 @@ class FeatureLogTests(unittest.TestCase):
         refused = self.cli(arguments)
         self.assertEqual(refused.status, 2)
         self.assertIn("dropped", refused.stderr)
+
+    def test_claude_review_rows_name_their_list_and_land_beside_hana_rows(self) -> None:
+        claude_link = f"https://github.com/natepiano/claude_commands/commit/{SHA_TWO}"
+        claude = self.add_arguments(
+            project="claude", title="Change Review List", crates=(), link=SHA_TWO,
+            summary="Every production keeps a change review list.",
+        ) + ["--production", "build-followups", "--unit", "build-report"]
+        self.assert_rejected(self.proposal_arguments("C1", claude), "<list>/C1")
+        self.assertFalse((self.state / "proposals/C1.json").exists())
+
+        hana = self.proposal_arguments("C1", self.add_arguments(title="Hana Row One"))
+        self.assertEqual(self.cli(hana).status, 0)
+        proposed = self.cli(self.proposal_arguments("build-followups/C1", claude))
+        self.assertEqual(
+            proposed,
+            CliResult(0, "proposed: build-followups/C1 (add change review list)\n", ""),
+        )
+        self.assertEqual(self.vault_snapshot(), {})
+        self.assertEqual(self.proposal("C1")["args"]["project"], "hana")
+
+        landed = self.cli(["add", "--review", "build-followups/C1"])
+
+        path = self.note("claude", "change review list")
+        self.assertEqual(landed, CliResult(
+            0, f"added: {path.relative_to(self.vault)}\n[[change review list]]\n", "",
+        ))
+        contents = path.read_text(encoding="utf-8")
+        for line in (
+            "crate: []\n",
+            f"link: {claude_link}\n",
+            "production: build-followups\n",
+            'project: "[[claude]]"\n',
+            "release: []\n",
+            '  - "[[feature-log - claude.base]]"\n',
+            "unit:\n  - build-report\n",
+        ):
+            self.assertIn(line, contents)
+        landed_proposal = self.proposal("build-followups/C1")
+        self.assertEqual(landed_proposal["status"], "landed")
+        self.assertEqual(landed_proposal["row"], "build-followups/C1")
+        self.assertEqual(self.proposal("C1")["status"], "open")
+        self.assertEqual(self.cli(["check"]), CliResult(0, "ok: 1 notes\n", ""))
+        self.assertIn(
+            "claude:\n+ change review list — Every production keeps a change review list.\n",
+            self.cli(["digest"]).stdout,
+        )
+
+        dropped_row = self.proposal_arguments(
+            "build-followups/C2",
+            self.add_arguments(project="claude", title="Dropped Claude Row", crates=(), link=SHA_THREE),
+        )
+        self.assertEqual(self.cli(dropped_row).status, 0)
+        self.assertEqual(
+            self.cli(["drop", "--review", "build-followups/C2", "--verdict", "the list is empty"]),
+            CliResult(0, "dropped: build-followups/C2\n", ""),
+        )
+        self.assertFalse(self.note("claude", "dropped claude row").exists())
+        self.assert_rejected(
+            self.proposal_arguments("../C3", claude), "review row must match"
+        )
 
     def test_digest_groups_each_live_event_and_advances_past_backfill(self) -> None:
         cargo_add: AddEvent = {

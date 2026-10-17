@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 
 import showrunners
 import unit_lookup
-from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, live_unit_table, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
 from dailies_render import (LENGTHS, InputError, StateRefused, as_list, as_map, check_render_state, due, last_report,
@@ -216,16 +217,11 @@ class PhaseTablesUnavailable(NamedTuple):
 
 class PhaseTablesAvailable(NamedTuple):
     units: dict[str, UnitPhaseState]
+    # Waiting phases whose dependencies are all done, by unit.
+    could_start: dict[str, tuple[str, ...]]
 
 
 PhaseTablesState = PhaseTablesUnavailable | PhaseTablesAvailable
-
-
-class PhaseTablesPruned(NamedTuple):
-    pass
-
-
-PrunePhaseTablesState = PhaseTablesPruned | PhaseTablesUnavailable
 
 
 class JudgmentNumberedPlanPhase(NamedTuple):
@@ -570,19 +566,22 @@ def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
     try:
         raw = cast(object, json.loads(result.stdout))
         fields = as_map(raw, "phase tables")
-        return PhaseTablesAvailable({
-            unit: unit_phase_state(value, f"phase tables.{unit}", zone)
-            for unit, value in fields.items()
-        })
+        return PhaseTablesAvailable(
+            {unit: unit_phase_state(value, f"phase tables.{unit}", zone) for unit, value in fields.items()},
+            {unit: could_start(value, f"phase tables.{unit}") for unit, value in fields.items()},
+        )
     except (InputError, ValueError, json.JSONDecodeError) as error:
         return PhaseTablesUnavailable(str(error))
 
 
-def prune_phase_tables(production_doc: Path) -> PrunePhaseTablesState:
-    result = command(phase_table_path(), "prune", "--production-doc", str(production_doc))
-    if result.returncode:
-        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
-    return PhaseTablesPruned()
+def could_start(value: object, where: str) -> tuple[str, ...]:
+    parallel = as_map(value, where).get("parallel")
+    if parallel is None:
+        return ()
+    phases = as_list(as_map(parallel, f"{where}.parallel").get("could_start"), f"{where}.parallel.could_start")
+    if not all(isinstance(phase, str) for phase in phases):
+        raise ValueError(f"{where}.parallel.could_start: expected phase ids")
+    return tuple(cast(list[str], phases))
 
 
 def judgment_phase_number(text: str) -> JudgmentPlanPhase:
@@ -821,9 +820,6 @@ def run(args: argparse.Namespace) -> int:
     render_state = cast(Path, args.render_state)
     expand = cast(list[str], args.expand)
     production = read_production(production_path)
-    prune_failure = prune_phase_tables(production.doc)
-    if isinstance(prune_failure, PhaseTablesUnavailable):
-        report("phase tables", "unavailable", prune_failure.reason)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug)
@@ -843,6 +839,10 @@ def run(args: argparse.Namespace) -> int:
         units = tuple(unit for unit in units if unit.name not in finished)
         blocks = tuple(block for block in blocks if block.session not in finished)
         report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
+    if isinstance(table_state, PhaseTablesAvailable):
+        for unit in units:
+            for phase in table_state.could_start.get(unit.name, ()):
+                print(f"parallel check: {unit.name}: Phase {phase} could start")
     for block in blocks:
         first: list[str] = []
         if isinstance(block.state, SessionGone):
@@ -990,7 +990,8 @@ def run(args: argparse.Namespace) -> int:
         topics_out.append({"title": "Merge branch", "update": "; ".join(details),
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
-    result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
+                       "doc": str(production.doc)}
     root = showrunners.place_of(production.slug).root
     if root:
         result["reports_to"] = root

@@ -226,6 +226,21 @@ class IndexTests(unittest.TestCase):
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
 
+    def test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends(self) -> None:
+        partial = encode(step("pending", worker="next"))[:20]
+        self.write(self.host_file, step("old-step", seat="impl"), call("old-call", seat="test"))
+        with self.host_file.open("ab") as output:
+            _ = output.write(partial)
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.rows("SELECT worker FROM steps"), [("impl",)])
+        self.assertEqual(self.rows("SELECT worker FROM calls"), [("test",)])
+        rewritten = self.host_file.read_bytes()
+        self.assertNotIn(b'"seat"', rewritten)
+        self.assertTrue(rewritten.endswith(partial))
+        modified = self.host_file.stat().st_mtime_ns
+        self.assertEqual(index.update(), 0)
+        self.assertEqual(self.host_file.stat().st_mtime_ns, modified)
+
     def test_reads_only_new_complete_lines(self) -> None:
         first, second, third = (encode(step(f"s{number}")) for number in range(3))
         _ = self.host_file.write_bytes(first + second + third[:20])
@@ -339,6 +354,36 @@ class IndexTests(unittest.TestCase):
         self.assertIn("TABLE samples", result.stdout)
         self.assertIn("mem_stall_some_s", result.stdout)
         self.assertIn("mem_stall_full_s", result.stdout)
+
+    def test_sample_power_profile_indexes_without_backfilling_old_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        since = "2026-10-02T12:00:30.000Z"
+        records = (sample(STAMP), sample("2026-10-02T12:01:00.000Z",
+                                         power_profile="performance", power_profile_since=since))
+        self.write(path, *records)
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(
+            self.rows("SELECT power_profile, power_profile_since FROM samples ORDER BY at"),
+            [(None, None), ("performance", since)],
+        )
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(index.SAMPLE_COLUMNS[-2:], [
+            ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
+            ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
+        ])
+
+    def test_schema_fourteen_rebuilds_sample_profiles_from_json_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP, power_profile="power-saver", power_profile_since=STAMP))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 14")
+            _ = connection.execute("UPDATE samples SET power_profile = NULL, power_profile_since = NULL")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(17,)])
+        self.assertEqual(self.rows("SELECT power_profile, power_profile_since FROM samples"), [("power-saver", STAMP)])
 
     def test_reindex_reads_everything_again(self) -> None:
         self.write(self.host_file, step("s0"), step("s1"), call("c0"))
@@ -543,7 +588,52 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 14)
+        self.assertEqual(index.SCHEMA_VERSION, 17)
+
+    def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
+        self.write(
+            self.host_file,
+            call("old"),
+            call("none", copy="", copy_s=None, copy_count=None, copy_natedev_s=None),
+            call("won", copy="won", copy_s=41.5, copy_count=2, copy_natedev_s=95.25),
+        )
+        _ = index.update()
+        self.assertEqual(
+            self.rows("SELECT id, copy, copy_s, copy_count, copy_natedev_s FROM calls ORDER BY id"),
+            [("none", "", None, None, None), ("old", None, None, None, None), ("won", "won", 41.5, 2, 95.25)],
+        )
+
+    def test_schema_sixteen_rebuilds_copy_fields_from_json_lines(self) -> None:
+        self.write(self.host_file, call("copied", copy="gave_way", copy_s=12.0, copy_count=1, copy_natedev_s=30.0))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 16")
+            _ = connection.execute("UPDATE calls SET copy = NULL, copy_s = NULL")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(17,)])
+        self.assertEqual(self.rows("SELECT copy, copy_s, copy_count FROM calls"), [("gave_way", 12.0, 1)])
+
+    def test_natedev_nextest_stopped_by_a_copy_win_is_not_a_failure(self) -> None:
+        self.write(
+            self.host_file,
+            call("copy-won", copy="won", mac="failed", mac_reason="", mac_s=40.0, status=1, outcome="failed"),
+            call("natedev-won", copy="natedev_won", status=1, outcome="failed"),
+            step("stopped", step="nextest", caller="verify", call_id="copy-won", status=143),
+            step("copy-won-clippy", caller="verify", call_id="copy-won", status=101),
+            step("finished-first", step="nextest", caller="verify", call_id="natedev-won", status=100),
+            step("mac-copy", host="Mac", step="nextest", caller="verify-mac", call_id="copy-won", status=100),
+        )
+        _ = index.update()
+        self.assertEqual(
+            self.rows("SELECT id, status FROM failures ORDER BY id"),
+            [("copy-won-clippy", 101), ("finished-first", 100), ("mac-copy", 100)],
+        )
+        self.assertEqual(
+            self.rows("SELECT host, step, runs, failed FROM step_days ORDER BY host, step"),
+            [("Mac", "nextest", 1, 1), ("natedev", "clippy", 1, 1), ("natedev", "nextest", 2, 1)],
+        )
+        self.assertEqual(self.rows("SELECT status FROM steps WHERE id = 'stopped'"), [(143,)])
 
     def test_schema_thirteen_rebuilds_call_fields_from_json_lines(self) -> None:
         self.write(self.host_file, call("recorded", target="mac", hold_wait_s=0.4))
@@ -553,7 +643,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE calls SET target = 'natedev', hold_wait_s = 99")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(14,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(self.rows("SELECT target, hold_wait_s FROM calls"), [("mac", 0.4)])
 
     def test_old_calls_have_null_target_and_hold_wait_but_new_empty_target_is_preserved(self) -> None:

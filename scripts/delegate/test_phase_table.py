@@ -19,7 +19,8 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.delegate import phase_table
-from scripts.production import fake_showrunner, fake_tmux, showrunners
+from scripts.delegate.recorder_fixture import invoke_recorder
+from scripts.production import fake_showrunner, fake_unit_host, showrunners
 
 
 SCRIPT = Path(__file__).with_name("phase_table.py")
@@ -42,7 +43,6 @@ class PhaseTableTests(unittest.TestCase):
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     plan: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     vault_root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    tmux_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     sessions_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     notifier_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     live_record_number: int = 0
@@ -61,7 +61,6 @@ class PhaseTableTests(unittest.TestCase):
         self.session_dir.mkdir()
         self.vault_root = self.root / "vault" / "showrunners"
         self.vault_root.parent.mkdir()
-        self.tmux_state = self.root / "tmux.json"
         self.sessions_dir = self.root / "sessions"
         self.sessions_dir.mkdir()
         self.notifier_dir = self.root / "notifier"
@@ -137,15 +136,12 @@ class PhaseTableTests(unittest.TestCase):
     def environment(self, at: int = 1_200) -> dict[str, str]:
         return {
             **os.environ,
-            "FAKE_TMUX_STATE": str(self.tmux_state),
             "NOTIFIER_STATE_DIR": str(self.notifier_dir),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
             "PHASE_TABLE_VAULT": str(self.vault_root),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
             "PLAN_DELEGATE_NOW_EPOCH": str(at),
-            "UNIT_LOOKUP_TMUX": str(
-                Path(__file__).parents[1] / "production" / "fake_tmux.py"
-            ),
+            **fake_unit_host.environment(self.root),
         }
 
     def write_production(self) -> Path:
@@ -277,6 +273,10 @@ class PhaseTableTests(unittest.TestCase):
             env=self.environment(),
         )
 
+    def production_file_line(self, production: str = "show") -> str:
+        doc = (self.working_dir / "docs" / f"{production}-production.md").resolve()
+        return f'production_file: "{doc.as_uri()}"'
+
     def write_phase_note(
         self,
         folder: str,
@@ -357,20 +357,12 @@ class PhaseTableTests(unittest.TestCase):
             self.write_showrunner()
 
     def mark_unit(self, live_name: str = "") -> None:
-        marked: fake_tmux.FakeSession = {
-            "label": "table-tmux",
-            "panes": ["%1"],
-            "env": {
-                "SHOWRUNNER_UNIT": "show",
-                "SHOWRUNNER_UNIT_ID": "table-unit",
-            },
-        }
-        fake_tmux.write(
-            self.tmux_state,
-            {"$1": marked},
-        )
+        fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         if not live_name:
             return
+        pid = fake_unit_host.live_pid(self)
+        fake_unit_host.place_process(self.environment(), pid, "w1:p1")
         self.live_record_number += 1
         socket_path = self.root / f"live-{self.live_record_number}.sock"
         held = socket.socket(socket.AF_UNIX)
@@ -379,12 +371,12 @@ class PhaseTableTests(unittest.TestCase):
         _ = (self.sessions_dir / f"record-{self.live_record_number}.json").write_text(
             json.dumps(
                 {
-                    "pid": os.getpid(),
+                    "pid": pid,
                     "sessionId": f"live-{self.live_record_number}",
                     "name": live_name,
                     "messagingSocketPath": str(socket_path),
                     "updatedAt": self.live_record_number,
-                    "tmux": "table-tmux:@1.%1",
+                    "tmux": "",
                 }
             ),
             encoding="utf-8",
@@ -572,7 +564,7 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assert_epoch(record.plan_finish.at, 1_400)
 
-    def test_stated_eta_wins_over_a_later_progress_report(self) -> None:
+    def test_legacy_stated_eta_wins_over_a_later_progress_report(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
         _ = self.write_run(
             "current",
@@ -612,7 +604,64 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
         self.assert_epoch(current.first_stated.time, 1_500)
 
-    def test_passed_stated_eta_yields_to_projection_and_keeps_first(self) -> None:
+    def test_checkpoint_eta_applies_to_its_named_phase_after_that_phase_starts(self) -> None:
+        self.write_plan(
+            plan_text(
+                "## Delegation Context",
+                "",
+                "- **Project:** Checkpoint ETA fixture",
+                "",
+                "### Phase 2 — Current delivery  · status: todo",
+                "",
+                "### Phase 3 — Next delivery  · status: todo",
+            )
+        )
+
+        def record(at: int, command: str, *arguments: str) -> None:
+            environment = {
+                **self.environment(at),
+                "HOME": str(self.root),
+                "USER_ZONE": "UTC",
+                "PLAN_DELEGATE_SYNC_WRITES": "0",
+            }
+            _ = environment.pop("CODEX_THREAD_ID", None)
+            _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+            result = invoke_recorder(
+                [command, "--session-dir", str(self.session_dir), *arguments],
+                environment,
+                self.working_dir,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        record(
+            900, "start-run", "--working-dir", str(self.working_dir),
+            "--plan-doc", str(self.plan), "--main-model", "fixture-model",
+        )
+        record(1_000, "start-phase", "--phase-id", "2", "--phase-title", "Current delivery")
+        record(1_050, "eta", "--phase-id", "3", "--time", "00:30", "--basis", "checkpoint")
+
+        previous = self.build(1_060).current
+
+        assert isinstance(previous, phase_table.OpenPhase)
+        self.assertEqual(previous.phase, "2")
+        self.assertIsInstance(previous.eta, phase_table.EtaUnavailable)
+        self.assertIsInstance(previous.first_stated, phase_table.EtaNeverStated)
+
+        record(1_100, "finish-phase", "--status", "completed")
+        record(1_150, "start-phase", "--phase-id", "3", "--phase-title", "Next delivery")
+
+        current = self.build(1_200).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual(current.phase, "3")
+        assert isinstance(current.eta, phase_table.StatedEta)
+        self.assert_epoch(current.eta.time, 1_800)
+        self.assert_epoch(current.eta.stated_at, 1_050)
+        self.assertEqual(current.eta.basis, "checkpoint")
+        assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
+        self.assert_epoch(current.first_stated.time, 1_800)
+
+    def test_passed_stated_eta_ends_at_now_and_keeps_first(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
         _ = self.write_run(
             "current",
@@ -641,9 +690,8 @@ class PhaseTableTests(unittest.TestCase):
         current = self.build(1_160).current
 
         assert isinstance(current, phase_table.OpenPhase)
-        self.assertIsInstance(current.eta, phase_table.ProjectedEta)
-        assert isinstance(current.eta, phase_table.ProjectedEta)
-        self.assert_epoch(current.eta.time, 1_200)
+        assert isinstance(current.eta, phase_table.StatedEta)
+        self.assert_epoch(current.eta.time, 1_160)
         assert isinstance(current.first_stated, phase_table.FirstStatedEtaTarget)
         self.assert_epoch(current.first_stated.time, 1_150)
 
@@ -758,6 +806,335 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(later.times, phase_table.PredictedPhaseTiming)
         self.assert_epoch(later.times.start, 1_300)
         self.assert_epoch(later.times.finish, 1_600)
+
+    def eta_chain_fixture(self, *, gate: str = "", production: bool = True) -> None:
+        """Ten-minute recorded work, a two-minute gap, then the Phase 5 promises."""
+        lines = [
+            "### Phase 4 — Finished delivery  · status: done",
+            "",
+            "### Phase 5 — Current delivery  · status: todo",
+            "",
+            "### Phase 6 — Next delivery  · status: todo",
+            "",
+        ]
+        if gate:
+            lines += ["**Blocked by:** G2", ""]
+        lines += ["### Phase 7 — Last delivery  · status: todo"]
+        if production:
+            production_doc = self.write_production()
+            _ = production_doc.write_text(
+                production_doc.read_text(encoding="utf-8")
+                + plan_text(
+                    "", "## Gates", "",
+                    "| Gate | Waiting | Waits on | Clears when |",
+                    "| --- | --- | --- | --- |",
+                    f"| G2 | this unit phase 6 | renderer phase 9 | {gate} |",
+                ),
+                encoding="utf-8",
+            )
+            lines.insert(
+                0,
+                "> **Production: show** — unit `unit-a`; production doc `docs/show-production.md`",
+            )
+        self.write_plan(plan_text(*lines))
+        _ = self.write_run(
+            "current", self.chain_time(16, 0),
+            self.phase_event("phase_started", "4", "four", self.chain_time(16, 18)),
+            self.phase_event(
+                "phase_finished", "4", "four", self.chain_time(16, 28),
+                status="completed", phase_elapsed_seconds=600,
+            ),
+            self.phase_event("phase_started", "5", "five", self.chain_time(16, 30)),
+            *[
+                self.phase_event(
+                    "eta_stated", "5", "five", self.chain_time(*stated),
+                    eta_phase_id="5", eta_at=self.chain_time(*target), basis="stated",
+                )
+                for stated, target in (
+                    ((17, 0), (17, 15)),
+                    ((17, 10), (17, 45)),
+                    ((17, 40), (18, 30)),
+                )
+            ],
+        )
+        self.write_state(None)
+
+    @staticmethod
+    def chain_time(hour: int, minute: int) -> int:
+        return int(datetime(2026, 10, 16, hour, minute, tzinfo=ZoneInfo("UTC")).timestamp())
+
+    def test_latest_stated_eta_chains_two_todo_phases_with_recorded_gaps(self) -> None:
+        self.eta_chain_fixture()
+
+        record = self.build(self.chain_time(18, 0))
+        for row, start, finish in zip(
+            record.phases[2:], ((18, 32), (18, 44)), ((18, 42), (18, 54)), strict=True,
+        ):
+            assert isinstance(row, phase_table.TodoPhase)
+            assert isinstance(row.times, phase_table.PredictedPhaseTiming)
+            self.assert_epoch(row.times.start, self.chain_time(*start))
+            self.assert_epoch(row.times.finish, self.chain_time(*finish))
+        assert isinstance(record.plan_finish, phase_table.PredictedFinish)
+        self.assert_epoch(record.plan_finish.at, self.chain_time(18, 54))
+
+    def test_passed_stated_eta_chains_from_now_instead_of_a_past_finish(self) -> None:
+        self.eta_chain_fixture()
+
+        record = self.build(self.chain_time(18, 35))
+        next_phase = record.phases[2]
+        assert isinstance(next_phase, phase_table.TodoPhase)
+        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(next_phase.times.start, self.chain_time(18, 37))
+        self.assert_epoch(next_phase.times.finish, self.chain_time(18, 47))
+        assert isinstance(record.plan_finish, phase_table.PredictedFinish)
+        self.assert_epoch(record.plan_finish.at, self.chain_time(18, 59))
+
+    def test_timed_gate_delays_the_chain_and_names_the_release_time(self) -> None:
+        self.eta_chain_fixture(gate="release 2026-10-16 19:00; fallback 2026-10-16 20:00")
+
+        record = self.build(self.chain_time(18, 0))
+        gated = record.phases[2]
+        assert isinstance(gated, phase_table.TodoPhase)
+        assert isinstance(gated.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(gated.times.start, self.chain_time(19, 0))
+        self.assert_epoch(gated.times.finish, self.chain_time(19, 10))
+        assert isinstance(record.plan_finish, phase_table.PredictedFinish)
+        self.assert_epoch(record.plan_finish.at, self.chain_time(19, 22))
+        rendered = phase_table.render(record, ZoneInfo("UTC"))
+        gated_row = next(line for line in rendered.splitlines() if line.startswith("| 6 |"))
+        self.assertIn("gated until Fri 16 Oct 19:00", gated_row)
+
+    def test_untimed_gate_removes_times_from_itself_and_every_later_phase(self) -> None:
+        self.eta_chain_fixture(gate="renderer checkpoint and review")
+
+        record = self.build(self.chain_time(18, 0))
+        rendered = phase_table.render(record, ZoneInfo("UTC"))
+
+        for phase in ("6", "7"):
+            row = next(line for line in rendered.splitlines() if line.startswith(f"| {phase} |"))
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            self.assertEqual(cells[2:], ["gated by G2: renderer phase 9", "—", "—"])
+
+    def test_timed_gate_uses_the_productions_local_zone(self) -> None:
+        self.eta_chain_fixture(gate="release 2026-10-16 19:00")
+        production = self.working_dir / "docs" / "show-production.md"
+        _ = production.write_text(
+            production.read_text(encoding="utf-8").replace(
+                "**User zone:** UTC", "**User zone:** America/New_York",
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            record = self.build(self.chain_time(18, 0))
+
+        gated = record.phases[2]
+        assert isinstance(gated, phase_table.TodoPhase)
+        assert isinstance(gated.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(gated.times.start, self.chain_time(23, 0))
+        rendered = phase_table.render(record, ZoneInfo("America/New_York"))
+        row = next(line for line in rendered.splitlines() if line.startswith("| 6 |"))
+        self.assertIn("gated until Fri 16 Oct 19:00", row)
+
+    def test_gate_release_before_the_chain_does_not_pull_a_phase_earlier(self) -> None:
+        self.eta_chain_fixture(gate="expected 2026-10-16 17:00")
+
+        record = self.build(self.chain_time(18, 0))
+        next_phase = record.phases[2]
+        assert isinstance(next_phase, phase_table.TodoPhase)
+        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
+
+    def test_cleared_gate_does_not_delay_predictions(self) -> None:
+        self.eta_chain_fixture(gate="cleared 2026-10-16 19:00 — merged")
+
+        record = self.build(self.chain_time(18, 0))
+        next_phase = record.phases[2]
+        assert isinstance(next_phase, phase_table.TodoPhase)
+        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
+        self.assertNotIn("gated", phase_table.render(record, ZoneInfo("UTC")))
+
+    def test_blocked_by_is_ignored_without_a_production_document(self) -> None:
+        self.eta_chain_fixture(gate="renderer checkpoint", production=False)
+
+        record = self.build(self.chain_time(18, 0))
+        next_phase = record.phases[2]
+        assert isinstance(next_phase, phase_table.TodoPhase)
+        assert isinstance(next_phase.times, phase_table.PredictedPhaseTiming)
+        self.assert_epoch(next_phase.times.start, self.chain_time(18, 32))
+
+    def test_phase_history_counts_moves_fixes_and_findings_across_attempts(self) -> None:
+        self.write_plan(plan_text(
+            "### Phase 1 — Repeated delivery  · status: done", "",
+            "### Phase 2 — Current delivery  · status: todo",
+        ))
+        _ = self.write_run(
+            "older", 800,
+            self.phase_event("eta_stated", "", "", 850, eta_phase_id="1", eta_at=1_200),
+            self.phase_event("phase_started", "1", "old-one", 900),
+            self.phase_event("pass_started", "1", "old-one", 920, pass_kind="fix"),
+            self.phase_event("finding_opened", "1", "old-one", 930, severity="blocker"),
+            self.phase_event("finding_opened", "1", "old-one", 940, severity="minor"),
+            self.phase_event(
+                "phase_finished", "1", "old-one", 1_100,
+                status="completed", phase_elapsed_seconds=200,
+            ),
+        )
+        _ = self.write_run(
+            "current", 1_300,
+            self.phase_event("eta_stated", "", "", 1_350, eta_phase_id="1", eta_at=1_700),
+            self.phase_event("phase_started", "1", "new-one", 1_400),
+            self.phase_event("pass_started", "1", "new-one", 1_420, pass_kind="review"),
+            self.phase_event("pass_started", "1", "new-one", 1_430, pass_kind="fix"),
+            self.phase_event("finding_opened", "1", "new-one", 1_440, severity="minor"),
+            self.phase_event("eta_stated", "1", "new-one", 1_450, eta_phase_id="1", eta_at=1_700),
+            self.phase_event("eta_stated", "1", "new-one", 1_500, eta_phase_id="1", eta_at=1_800),
+            self.phase_event("finding_opened", "1", "new-one", 1_505, severity="nit"),
+            self.phase_event("eta_stated", "1", "new-one", 1_510, eta_phase_id="1", eta_at=1_800),
+            self.phase_event("finding_verdict", "1", "new-one", 1_520, severity="blocker", verdict="fixed"),
+            self.phase_event("eta_stated", "1", "new-one", 1_550, eta_phase_id="1", eta_at=1_650),
+            self.phase_event("pass_started", "1", "new-one", 1_600, pass_kind="fix"),
+            self.phase_event(
+                "phase_finished", "1", "new-one", 1_770,
+                status="completed", phase_elapsed_seconds=370,
+            ),
+            self.phase_event("eta_stated", "1", "new-one", 1_790, eta_phase_id="2", eta_at=2_100),
+            self.phase_event("phase_started", "2", "two", 1_800),
+            self.phase_event("pass_started", "2", "two", 1_810, pass_kind="fix"),
+            self.phase_event("finding_opened", "2", "two", 1_820, severity="nit"),
+        )
+        self.write_state(None)
+
+        record = self.build(1_900)
+        done = record.phases[0]
+        current = record.phases[1]
+        assert isinstance(done, phase_table.DonePhase)
+        assert isinstance(current, phase_table.OpenPhase)
+
+        self.assert_epoch(done.first_eta, 1_200)
+        self.assertEqual(done.moves, 3)
+        self.assertEqual(
+            [(int(target.timestamp()), int(stated.timestamp())) for target, stated in done.eta_trail],
+            [(1_200, 850), (1_700, 1_350), (1_700, 1_450), (1_800, 1_500),
+             (1_800, 1_510), (1_650, 1_550)],
+        )
+        self.assert_epoch(done.finished_at, 1_770)
+        self.assertEqual(done.delta_minutes, 2.0)
+        self.assertEqual(done.fix_rounds, 3)
+        self.assertEqual(done.findings, {"blocker": 1, "minor": 2, "nit": 1})
+        self.assert_epoch(current.first_eta, 2_100)
+        self.assertEqual(current.moves, 0)
+        self.assertEqual(
+            [(int(target.timestamp()), int(stated.timestamp())) for target, stated in current.eta_trail],
+            [(2_100, 1_790)],
+        )
+        self.assertIsInstance(current.finished_at, phase_table.PhaseNotFinished)
+        self.assertIsInstance(current.delta_minutes, phase_table.FinishDeltaUnavailable)
+        self.assertEqual(current.fix_rounds, 1)
+        self.assertEqual(current.findings, {"blocker": 0, "minor": 0, "nit": 1})
+
+    def test_fix_rounds_split_completed_and_running_passes_across_instances(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Repeated delivery  · status: todo"))
+        _ = self.write_run(
+            "older", 800,
+            self.phase_event("phase_started", "1", "old-one", 900,
+                             phase_title="Repeated delivery"),
+            self.phase_event("pass_started", "1", "old-one", 920,
+                             pass_instance_id="old-fix", pass_kind="fix"),
+            self.phase_event("pass_finished", "1", "old-one", 950,
+                             pass_instance_id="old-fix", pass_kind="fix",
+                             status="completed", pass_elapsed_seconds=30),
+            self.phase_event("phase_finished", "1", "old-one", 1_000,
+                             status="completed", phase_elapsed_seconds=100),
+        )
+        events = [
+            self.phase_event("phase_started", "1", "new-one", 1_200,
+                             phase_title="Repeated delivery"),
+            self.phase_event("pass_started", "1", "new-one", 1_220,
+                             pass_instance_id="review", pass_kind="review"),
+            self.phase_event("pass_finished", "1", "new-one", 1_250,
+                             pass_instance_id="review", pass_kind="review",
+                             status="completed", pass_elapsed_seconds=30),
+            self.phase_event("pass_started", "1", "new-one", 1_260,
+                             pass_instance_id="finished-fix", pass_kind="fix"),
+            self.phase_event("pass_finished", "1", "new-one", 1_300,
+                             pass_instance_id="finished-fix", pass_kind="fix",
+                             status="completed", pass_elapsed_seconds=40),
+            self.phase_event("pass_started", "1", "new-one", 1_310,
+                             pass_instance_id="running-fix", pass_kind="fix"),
+        ]
+        _ = self.write_run("current", 1_100, *events)
+        self.write_state(None)
+
+        current = self.build(1_400).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual((current.fix_done, current.fix_running), (2, 1))
+        self.assertEqual(current.fix_rounds, 3)
+
+        events.append(self.phase_event(
+            "pass_finished", "1", "new-one", 1_450,
+            pass_instance_id="running-fix", pass_kind="fix",
+            status="completed", pass_elapsed_seconds=140,
+        ))
+        _ = self.write_run("current", 1_100, *events)
+        current = self.build(1_500).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual((current.fix_done, current.fix_running), (3, 0))
+        self.assertEqual(current.fix_rounds, 3)
+
+    def test_running_fix_indicator_is_binary_while_total_keeps_all_open_passes(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        events = [
+            self.phase_event("phase_started", "1", "one", 900,
+                             phase_title="Current delivery"),
+            self.phase_event("pass_started", "1", "one", 920,
+                             pass_instance_id="finished", pass_kind="fix"),
+            self.phase_event("pass_finished", "1", "one", 950,
+                             pass_instance_id="finished", status="completed"),
+            self.phase_event("pass_started", "1", "one", 960,
+                             pass_instance_id="first-open", pass_kind="fix"),
+            self.phase_event("pass_started", "1", "one", 980,
+                             pass_instance_id="second-open", pass_kind="fix"),
+        ]
+        self.write_state(None)
+
+        for closed, expected_done in ((0, 1), (1, 2), (2, 3)):
+            with self.subTest(closed=closed):
+                _ = self.write_run("current", 800, *events)
+                current = self.build(1_200).current
+
+                assert isinstance(current, phase_table.OpenPhase)
+                self.assertEqual(current.fix_done, expected_done)
+                self.assertEqual(current.fix_running, 0 if closed == 2 else 1)
+                self.assertEqual(current.fix_rounds, 3)
+
+                if closed < 2:
+                    events.append(self.phase_event(
+                        "pass_finished", "1", "one", 1_000 + closed * 100,
+                        pass_instance_id="first-open" if closed == 0 else "second-open",
+                        status="completed",
+                    ))
+
+    def test_phase_finished_before_its_last_eta_has_a_negative_delta(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Finished delivery  · status: done"))
+        _ = self.write_run(
+            "current", 800,
+            self.phase_event("phase_started", "1", "one", 900),
+            self.phase_event("eta_stated", "1", "one", 1_000, eta_phase_id="1", eta_at=1_800),
+            self.phase_event(
+                "phase_finished", "1", "one", 1_500,
+                status="completed", phase_elapsed_seconds=600,
+            ),
+        )
+        self.write_state(None)
+
+        done = self.build(1_600).phases[0]
+
+        assert isinstance(done, phase_table.DonePhase)
+        self.assertEqual(done.delta_minutes, -5.0)
 
     def test_prediction_is_unknown_without_history_or_a_current_report(self) -> None:
         self.write_plan(
@@ -887,6 +1264,80 @@ class PhaseTableTests(unittest.TestCase):
         self.assert_epoch(row.times.start, 2_000)
         self.assert_epoch(row.times.finish, 6_040)
         self.assertEqual(row.times.seconds, 4_040)
+
+    def test_reused_phase_number_history_matches_the_rows_title_family(self) -> None:
+        for state in ("done", "open", "todo"):
+            for earlier_attempt in (False, True):
+                with self.subTest(state=state, earlier_attempt=earlier_attempt):
+                    self.write_plan(plan_text(
+                        "### Phase 9 — Replacement delivery  · status: "
+                        + ("done" if state == "done" else "todo")
+                    ))
+                    events = [
+                        self.phase_event("phase_started", "9", "retired", 1_000,
+                                         phase_title="Retired investigation"),
+                        self.phase_event("eta_stated", "9", "retired", 1_050,
+                                         eta_phase_id="9", eta_at=1_500),
+                        self.phase_event("pass_started", "9", "retired", 1_060,
+                                         pass_kind="fix"),
+                        self.phase_event("finding_opened", "9", "retired", 1_070,
+                                         severity="blocker"),
+                        self.phase_event("phase_finished", "9", "retired", 1_200,
+                                         status="completed", phase_elapsed_seconds=200),
+                    ]
+                    if earlier_attempt:
+                        events += [
+                            self.phase_event("phase_started", "9", "earlier", 2_000,
+                                             phase_title="`REPLACEMENT   delivery`"),
+                            self.phase_event("eta_stated", "9", "earlier", 2_050,
+                                             eta_phase_id="9", eta_at=3_000),
+                            self.phase_event("pass_started", "9", "earlier", 2_060,
+                                             pass_kind="fix"),
+                            self.phase_event("finding_opened", "9", "earlier", 2_070,
+                                             severity="minor"),
+                            self.phase_event("phase_finished", "9", "earlier", 2_200,
+                                             status="stopped", phase_elapsed_seconds=200),
+                        ]
+                    events.append(self.phase_event(
+                        "phase_started", "9", "replacement", 2_400,
+                        phase_title="Replacement delivery",
+                    ))
+                    if state != "open":
+                        events.append(self.phase_event(
+                            "phase_finished", "9", "replacement", 2_600,
+                            status="completed" if state == "done" else "stopped",
+                            phase_elapsed_seconds=200,
+                        ))
+                    _ = self.write_run("history", 900, *events)
+                    self.write_state(None)
+
+                    row = self.build(2_700).phases[0]
+
+                    if earlier_attempt:
+                        self.assert_epoch(row.first_eta, 3_000)
+                        self.assertEqual(
+                            [(int(target.timestamp()), int(stated.timestamp()))
+                             for target, stated in row.eta_trail],
+                            [(3_000, 2_050)],
+                        )
+                    else:
+                        self.assertIsInstance(row.first_eta, phase_table.EtaNeverStated)
+                        self.assertEqual(row.eta_trail, [])
+                    self.assertEqual(row.fix_rounds, int(earlier_attempt))
+                    self.assertEqual(row.findings, {
+                        "blocker": 0, "minor": int(earlier_attempt), "nit": 0,
+                    })
+                    if state == "done" and earlier_attempt:
+                        assert isinstance(row.delta_minutes, float)
+                        self.assertAlmostEqual(row.delta_minutes, -400 / 60)
+                    else:
+                        self.assertIsInstance(row.delta_minutes, phase_table.FinishDeltaUnavailable)
+                    if isinstance(row, phase_table.DonePhase):
+                        assert isinstance(row.times, phase_table.CompletedPhaseTiming)
+                        self.assert_epoch(row.times.start, 2_000 if earlier_attempt else 2_400)
+                        self.assertEqual(row.times.seconds, 400 if earlier_attempt else 200)
+                    elif isinstance(row, phase_table.OpenPhase):
+                        self.assert_epoch(row.started, 2_000 if earlier_attempt else 2_400)
 
     def test_reworded_phase_heading_falls_back_to_recorded_id(self) -> None:
         self.write_plan(plan_text("### Phase 2 — Current wording  · status: done"))
@@ -1487,6 +1938,98 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(record.plan, self.plan.resolve())
         self.assertIsInstance(record.current, phase_table.NoOpenPhase)
 
+    def parallel_plan(self, *phases: str) -> None:
+        self.write_plan(plan_text("### Phase 1 — Base  · status: done", *phases))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "2", "two", 1_000, phase_title="Parser"),
+            self.phase_event("phase_started", "3", "three", 1_050, phase_title="Notice"),
+        )
+        self.write_state(None)
+
+    def test_parallel_names_waiting_phases_whose_dependencies_are_done(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 3 — Notice  · status: todo",
+            "**Depends on:** none",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 2",
+            "### Phase 5 — Docs  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 6 — Gated  · status: todo",
+            "**Blocked by:** G2 — trunk phase 3 merged",
+            "**Depends on:** none",
+        )
+
+        check = self.build(1_100).parallel
+
+        self.assertEqual(check, phase_table.CouldStart(("5",)))
+        self.assertEqual(phase_table.parallel_line(check), "Parallel: Phase 5 could start")
+
+    def test_parallel_none_names_what_the_first_waiting_phase_needs(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 3 — Notice  · status: todo",
+            "**Depends on:** Phase 2",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 2, Phase 5",
+            "### Phase 5 — Docs  · status: todo",
+            "**Blocked by:** G1 — trunk phase 2 merged",
+            "**Depends on:** none",
+        )
+
+        line = phase_table.parallel_line(self.build(1_100).parallel)
+
+        self.assertEqual(line, "Parallel: none — Phase 4 needs Phase 2 (running), Phase 5 (todo)")
+
+    def test_parallel_is_unknown_while_a_waiting_phase_states_no_dependencies(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "### Phase 3 — Notice  · status: todo",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 5 — Docs  · status: todo",
+        )
+
+        line = phase_table.parallel_line(self.build(1_100).parallel)
+
+        self.assertEqual(
+            line,
+            "Parallel: unknown — Phase 5 has no **Depends on:** line; "
+            + "add one under each phase heading and rerun",
+        )
+
+    def test_parallel_with_nothing_waiting(self) -> None:
+        self.parallel_plan("### Phase 2 — Parser  · status: todo")
+
+        line = phase_table.parallel_line(self.build(1_100).parallel)
+
+        self.assertEqual(line, "Parallel: none — no phase is waiting")
+
+    def test_production_json_carries_the_phases_that_could_start(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 1",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": "1100",
+            },
+        ):
+            shown = cast(dict[str, object], json.loads(phase_table.show(self.session_dir, ZoneInfo("UTC"), True)))
+
+        self.assertEqual(
+            shown["parallel"],
+            {"could_start": ["4"], "line": "Parallel: Phase 4 could start"},
+        )
+
     def test_render_is_exact_and_orders_newest_phase_first(self) -> None:
         zone = ZoneInfo("America/Los_Angeles")
 
@@ -1799,7 +2342,7 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(
             set(parsed),
-            {"plan", "updated", "plan_finish", "current", "phases"},
+            {"plan", "updated", "plan_finish", "current", "phases", "parallel"},
         )
         self.assertTrue(cast(str, parsed["updated"]).endswith("-07:00"))
         self.assertTrue(cast(str, current["started"]).endswith("-07:00"))
@@ -1976,7 +2519,8 @@ class PhaseTableTests(unittest.TestCase):
             )
 
         current = cast("dict[str, object]", parsed["current"])
-        self.assertIsNone(current["eta"])
+        eta = cast("dict[str, object]", current["eta"])
+        self.assertEqual(eta["time"], "1970-01-01T00:20:00+00:00")
         self.assertEqual(
             current["first_stated_eta_target"], "1970-01-01T00:18:20+00:00"
         )
@@ -2162,7 +2706,8 @@ class PhaseTableTests(unittest.TestCase):
                 (
                     "---",
                     "phase_table: true",
-                    "production: show",
+                    "showrunner: showrunner",
+                    self.production_file_line(),
                     "unit: table-unit",
                     'now: "Phase 1 of 1 — Current delivery"',
                     "---",
@@ -2230,9 +2775,36 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[4], 'now: "No phase running — 1 of 2 done"')
+        self.assertEqual(lines[5], 'now: "No phase running — 1 of 2 done"')
         heading = next(line for line in lines if line.startswith("**"))
-        self.assertEqual(json.loads(lines[4].removeprefix("now: ")), heading[2:-2])
+        self.assertEqual(json.loads(lines[5].removeprefix("now: ")), heading[2:-2])
+
+    def test_refresh_with_phase_outside_the_plan_drops_the_plan_count(self) -> None:
+        self.write_production_plan()
+        self.write_plan(
+            plan_text(
+                "# Delivery plan",
+                "",
+                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
+                "",
+                "### Phase 1 — Prior delivery  · status: done",
+                "",
+                "### Phase 2 — Next delivery  · status: todo",
+            )
+        )
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "14", "other", 1_000, phase_title="Placement disk"),
+        )
+        self.mark_unit("table")
+
+        result = self.run_refresh()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[5], 'now: "Phase 14 — Placement disk · not in this plan"')
+        self.assertIn("**Phase 14 — Placement disk · not in this plan**", lines)
 
     def test_refresh_escapes_title_in_now_and_replaces_owned_note(self) -> None:
         self.write_production_plan()
@@ -2256,7 +2828,7 @@ class PhaseTableTests(unittest.TestCase):
         note = self.vault_root / "showrunner" / "table.md"
         text = note.read_text(encoding="utf-8")
         self.assertEqual(
-            text.splitlines()[4],
+            text.splitlines()[5],
             'now: "Phase 1 of 1 — Delivery: \\"quoted\\" \\\\ path"',
         )
         self.assertIn(f"**Phase 1 of 1 — {title}**\n", text)
@@ -2281,11 +2853,12 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:6],
+            note.read_text(encoding="utf-8").splitlines()[:7],
             [
                 "---",
                 "phase_table: true",
-                "production: show",
+                "showrunner: showrunner",
+                self.production_file_line(),
                 "unit: table-unit",
                 'now: "Phase 1 of 1 — Current delivery"',
                 "---",
@@ -2446,7 +3019,9 @@ class PhaseTableTests(unittest.TestCase):
         target = newer_folder / "after.md"
         self.assertEqual(result.returncode, 0)
         self.assertTrue(target.is_file())
-        self.assertIn("| Updated | 01-01 00:21 UTC |", target.read_text(encoding="utf-8"))
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("| Updated | 01-01 00:21 UTC |", text)
+        self.assertIn("\nshowrunner: last-known-showrunner\n", text)
         self.assertEqual(
             [path.relative_to(self.vault_root) for path in self.vault_root.rglob("*.md")],
             [Path("last-known-showrunner/after.md")],
@@ -2785,15 +3360,8 @@ class PhaseTableTests(unittest.TestCase):
                 "### Phase 1 — Current delivery  · status: todo",
             )
         )
-        marked: fake_tmux.FakeSession = {
-            "label": "table-tmux",
-            "panes": ["%1"],
-            "env": {
-                "SHOWRUNNER_UNIT": "other",
-                "SHOWRUNNER_UNIT_ID": "table-unit",
-            },
-        }
-        fake_tmux.write(self.tmux_state, {"$1": marked})
+        fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         session_id = "other-showrunner"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,
@@ -2817,7 +3385,7 @@ class PhaseTableTests(unittest.TestCase):
             (0, "", ""),
         )
         refreshed_text = refreshed.read_text(encoding="utf-8")
-        self.assertIn("production: other\n", refreshed_text)
+        self.assertIn(f"{self.production_file_line('other')}\n", refreshed_text)
         self.assertIn("unit: table-unit\n", refreshed_text)
         self.assertEqual(archived.read_bytes(), source_bytes)
 
@@ -3014,6 +3582,103 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("--session-dir", result.stdout)
+
+
+class ProductionFileLinkTests(unittest.TestCase):
+    """The `production_file` link names the doc's main-branch copy."""
+
+    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    vault: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.vault = self.root / "vault"
+        self.vault.mkdir()
+
+    def make_checkout(self, path: Path, remote: str) -> None:
+        path.mkdir(parents=True)
+        for arguments in (
+            ("init", "--quiet", "--initial-branch=main"),
+            ("remote", "add", "origin", remote),
+        ):
+            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True)
+
+    def write_doc(self, checkout: Path, relative: str, promote: str) -> Path:
+        doc = checkout / relative
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        _ = doc.write_text(f"# Production\n\n- **Promote:** {promote}\n", encoding="utf-8")
+        return doc
+
+    def test_doc_promoted_into_the_vault_is_a_wiki_link(self) -> None:
+        trunk = self.root / "trunk"
+        self.make_checkout(trunk, "git@github.com:someone/vault.git")
+        doc = self.write_doc(trunk, "productions/notes-production.md", str(self.vault))
+
+        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(link, "[[productions/notes-production]]")
+
+    def test_doc_promoted_outside_the_vault_is_its_github_page(self) -> None:
+        main = self.root / "main"
+        self.make_checkout(main, "git@github.com:someone/tools.git")
+        _ = subprocess.run(
+            ["git", "-C", str(main), "symbolic-ref", "HEAD", "refs/heads/trunk-line"],
+            check=True,
+        )
+        trunk = self.root / "trunk"
+        self.make_checkout(trunk, "git@github.com:someone/tools.git")
+        doc = self.write_doc(trunk, "docs/plans/tools-production.md", f"{main}, mac ~/tools")
+
+        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(
+            link,
+            "https://github.com/someone/tools/blob/trunk-line/docs/plans/tools-production.md",
+        )
+
+    def test_doc_off_github_is_a_file_uri_of_the_main_copy(self) -> None:
+        main = self.root / "main"
+        self.make_checkout(main, str(self.root / "bare.git"))
+        trunk = self.root / "trunk"
+        self.make_checkout(trunk, str(self.root / "bare.git"))
+        doc = self.write_doc(trunk, "docs/tools-production.md", str(main))
+
+        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(link, (main / "docs" / "tools-production.md").as_uri())
+
+    def test_slug_is_read_from_each_link_form(self) -> None:
+        cases = {
+            '"[[productions/notes-production]]"': "notes",
+            '"https://github.com/someone/tools/blob/main/docs/tools-production.md"': "tools",
+            '"file:///home/someone/docs/tools-production.md"': "tools",
+            '"[[productions/notes]]"': "",
+            "": "",
+        }
+        for link, slug in cases.items():
+            with self.subTest(link=link):
+                self.assertEqual(
+                    phase_table._production_slug_from_link(link),  # pyright: ignore[reportPrivateUsage]
+                    slug,
+                )
+
+    def test_note_with_only_production_file_is_owned(self) -> None:
+        note = self.root / "note.md"
+        _ = note.write_text(
+            "---\nphase_table: true\nshowrunner: natedev\n"
+            + 'production_file: "[[productions/notes-production]]"\n'
+            + "unit: alpha-unit\n---\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            phase_table._note_ownership(note),  # pyright: ignore[reportPrivateUsage]
+            phase_table.NoteOwnership(production="notes", unit="alpha-unit"),
+        )
 
 
 if __name__ == "__main__":

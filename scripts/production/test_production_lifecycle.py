@@ -12,10 +12,11 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
-import fake_tmux
-from fake_tmux import FakeSession
+import fake_unit_host
+from fake_unit_host import HostedUnit
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
@@ -27,9 +28,6 @@ name = Path(sys.argv[0]).name
 with (state / "calls").open("a") as output:
     output.write(name + " " + " ".join(sys.argv[1:])
                  + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
-if name == "tmux" and sys.argv[1:2] == ["has-session"]:
-    session = sys.argv[-1].removeprefix("=")
-    raise SystemExit(0 if (state / ("live-" + session)).exists() else 1)
 if name == "ssh":
     print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
     raise SystemExit(0)
@@ -89,7 +87,7 @@ class LifecycleTests(unittest.TestCase):
         self.phase_table_vault.parent.mkdir()
         bin_path = self.root / "bin"
         bin_path.mkdir()
-        for name in ("tmux", "claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
+        for name in ("claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
             self.stub(bin_path / name)
         for relative in (".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py",
@@ -97,9 +95,6 @@ class LifecycleTests(unittest.TestCase):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
-                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
-                    "FAKE_TMUX_STATE": str(self.state / "tmux.json"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -108,6 +103,7 @@ class LifecycleTests(unittest.TestCase):
                     "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
+        self.env.update(fake_unit_host.environment(self.root))
         self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
@@ -184,7 +180,7 @@ class LifecycleTests(unittest.TestCase):
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), action, "--production", str(self.doc),
                                *extra], cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=25)
+                              text=True, check=False, timeout=300)
 
     def assert_step(self, result: subprocess.CompletedProcess[str], state: str) -> None:
         self.assertRegex(result.stdout, rf"(?m)^[\w-]+: {state} — .+")
@@ -319,12 +315,11 @@ class LifecycleTests(unittest.TestCase):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        fake_tmux.write(self.state / "tmux.json", {
-            # A session that only has the name the unit was launched under is not the unit.
-            "$1": FakeSession(label="alpha", panes=["%1"], env={}),
-            "$2": FakeSession(label="renamed-since-launch", panes=["%2"],
-                              env={"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
-        })
+        fake_unit_host.write(self.env, [
+            HostedUnit("alpha", "w1:p1", {}),
+            HostedUnit("renamed-since-launch", "w2:p1", {
+                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
+        ])
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
         self.assertIn("alpha-unit: gone", result.stdout)
@@ -717,6 +712,36 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
         self.assertEqual(self.sent(), [])
 
+    def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        kept = self.checkout / "productions/example-production.md"
+        kept.parent.mkdir()
+        _ = self.git("mv", str(self.doc), str(kept))
+        _ = self.git("commit", "-m", "keep the doc in productions/")
+        _ = self.git("push", "origin", "production")
+        self.doc = kept
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        relative = "archive/checkout/example/example-production.md"
+        archived = self.checkout / relative
+        self.assertIn(f"wrap: ok — moved the doc out of productions/ to {relative}", result.stdout)
+        self.assertFalse(kept.exists())
+        self.assertIn("wrapped", archived.read_text())
+        self.assertEqual(self.git("status", "--short"), "")
+        moved = self.git("show", "--name-status", "--format=%s", "HEAD")
+        self.assertIn("production(example): wrapped", moved)
+        self.assertIn(relative, moved)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
+
+    def test_wrap_names_herdr_sessions_for_close_out(self) -> None:
+        self.merged_units()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("| Next | close herdr sessions |", result.stdout)
+
     def test_wrap_detaches_from_its_parent_and_leaves_each_child_a_root(self) -> None:
         self.merged_units()
         for slug in ("top", "kid", "other"):
@@ -735,6 +760,22 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sent[sent.index("--to") + 1], f"uds:{self.root / 'top.sock'}")
         self.assertEqual(sent[sent.index("--text") + 1], "example wrapped, so it no longer reports to you.")
         self.assertIn("wrapped", self.doc.read_text())
+
+    def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
+        self.merged_units()
+        state = self.state / "showrunner"
+        own = (state / "footers-off/example", state / "review-paused/example.json",
+               state / "outstanding/example.json", state / "example/prompt.txt")
+        other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
+        for path in (*own, *other):
+            self.write(path, "[]\n")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertRegex(result.stdout, r"(?m)^tidy: ok — removed footers-off/example, review-paused/example.json, "
+                         + r"outstanding/example.json, example/$")
+        self.assertFalse(any(path.exists() for path in own))
+        self.assertFalse((state / "example").exists())
+        self.assertTrue(all(path.exists() for path in other))
 
     def test_wrap_holds_while_a_child_showrunner_runs(self) -> None:
         self.merged_units()
@@ -801,3 +842,17 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class PermanentUnitTests(unittest.TestCase):
+    def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
+        sys.path.insert(0, str(SCRIPT.parent))
+        import production_lifecycle
+        from add_unit import Production
+        from zoneinfo import ZoneInfo
+
+        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",
+                 "| alpha-unit | docs/plans/alpha.md | /w/alpha | demo-alpha | — | — |",
+                 "| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |", ""]
+        production = Production(Path("/c/docs/demo-production.md"), "demo", "demo", Path("/c"), Path("/c/log.md"), ZoneInfo("UTC"))
+        self.assertEqual([row.name for row in production_lifecycle.units(lines, production)], ["alpha-unit"])

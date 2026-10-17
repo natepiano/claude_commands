@@ -4,32 +4,48 @@
 
 The session notifier sends a message to a live Claude session on a schedule: the scheduled-update prompt (a `/showrunner:dailies gantt` report) to a showrunner, and `/unit:report` ticks to a `/unit:direct` unit director. Each schedule is a named **instance** stored on disk. One declared 15 s job runs `notifier.sh tick` on both machines and sends every instance that is due. Before each send, the instance's own check command decides whether to send, skip or remove the instance. No agent arms or re-arms a timer. The schedule lives outside the session, so it keeps going through ended turns, compaction and restarts, and it works the same on Linux (natedev) and the Mac.
 
-## How it works
-
 ### Key files
 
 | File | Role |
+
 | --- | --- |
+
 | `scripts/message/notifier.sh` | The notifier: instance state, every CLI verb, and `tick`. zsh; its only systemd or launchd call is `launch_run`, which starts a run-only job. |
+
 | `scripts/message/sessions.py` | `socket <session:id\|name>` gives a live session's socket; `id <pid\|name>` gives its session id. `read_session(path) -> SessionRecord | UnreadableSessionRecord` keeps an unreadable registry entry distinct from no live match. |
-| `scripts/message/send.py` | Delivery. A `--to uds:<socket>` send runs a headless `claude -p` relay whose only tool is `SendMessage`. |
+
+| `scripts/message/send.py` | Delivery. A `--to uds:<socket>` send to a live registered session goes through the postmaster outbox first when its heartbeat is fresh, and otherwise through a headless `claude -p` relay whose one job is a `SendMessage` call (`docs/as-built/session-roster.md`). |
+
 | `scripts/production/production_check.sh` | The showrunner instance's check: the production doc's status as an exit code. |
+
 | `scripts/production/unit_status.sh` | The showrunner's per-unit status script; prints `TICKS FAILING (…)`. |
-| `scripts/delegate/unit_notifier.sh` | Makes or retargets one run's `delegate-<run id>` instance; with `on` or `off`, starts or stops it; `--all [minutes]` retimes every `delegate-*` instance. |
+
+| `scripts/delegate/unit_notifier.sh` | Makes or retargets one run's `unit-<run id>` instance; with `on` or `off`, starts or stops it; `--all [minutes]` retimes every `unit-*` and `delegate-*` instance. |
+
 | `scripts/delegate/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
+
 | `scripts/delegate/end_session.sh` | Run end: removes the instance, then the marker. |
+
 | `scripts/hooks/delegate_run.py` | `check` CLI: the unit instance's check. Also a library the delegate hooks import. |
+
 | `scripts/delegate/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
-| `scripts/production/update_registration.py` | `register` writes `PROMPT_FILE`, creates or retargets the showrunner instance, and creates the `stall-watch` and `tmux-names` run-only instances when absent. |
+
 | `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
+
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
+
 | `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py` | `/shutdown` runs `stop` on each enabled instance targeting a session it stops; `/shutdown cancel` and `/shutdown restart` run `start` on those. Never `remove`. |
+
 | `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:report_interval` retimes the showrunner instance. |
+
 | `commands/unit/direct.md` `<ProgressContract>`, `commands/unit/report.md`, `commands/unit/report_interval.md` | How a unit treats its ticks, and `/unit:report_interval`. |
-| `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval; `PLAN_DELEGATE_PROGRESS_UPDATES`, `scheduled` or `on-demand`. |
+
+| `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval; `PLAN_DELEGATE_PROGRESS_UPDATES`, `on-demand` (shipped, and the value with no line) or `scheduled`. |
+
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
+
 | `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
-| `scripts/production/test_unit_status.py` | `TICKS FAILING`: runs a copy of `unit_status.sh` in a temp tree with a stub `notifier.sh`, fake `tmux` and `ps`, and a temp `PLAN_DELEGATE_ACTIVE_DIR`; covers a failing idle run, a healthy run, a missing or empty marker, Claude found under the pane despite a different remote-control name, and the `--showrunner` form. |
+
 | `scripts/delegate/test_progress_history.py` | The `progress` restart, refused calls included (missing `--cap-stage`, no active phase): `LAST_RESTART` at the call time and `NEXT_DUE` one interval later. |
 
 ### Instance state
@@ -67,7 +83,7 @@ job (15 s) → notifier.sh tick
   wait for every subshell, release .tick.lock
 ```
 
-A run-only instance (`RUN`) is not run inside the tick. `launch_run` starts `notifier.sh run-due <name>` in its own transient service (`systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on the Mac a `launchctl submit` job that runs `run-due-and-remove`, which removes its own label); with neither launcher the tick logs `run launcher unavailable: <name>; waiting after tick` and runs the job once it has released `.tick.lock`. The job claims its slot, runs `RUN` with output to `<instance>/run.log` under the `zselect` watchdog (TERM at `TIMEOUT`), and logs only `run timeout` or `run exit <rc>`. A background child of the tick would die with the tick's cgroup or launchd job.
+A run-only instance (`RUN`) is not run inside the tick. `launch_run` starts `notifier.sh run-due <name>` in its own transient service (`systemd-run --user --collect --quiet --no-block --unit session-notifier-<name>-<pid>-<random>` on Linux; on the Mac a `launchctl submit` job that runs `run-due-and-remove`, which removes its own label). The Mac job is then started with `launchctl kickstart gui/<uid>/<label>`: on macOS 27 a submitted job is only registered and never runs on its own (measured 2026-10-16). With neither launcher, or when the Mac kickstart fails (the tick then removes the label), the tick logs `run launcher unavailable: <name>; waiting after tick` to `notifier.log` and runs the job once it has released `.tick.lock`. The job claims its slot, runs `RUN` with output to `<instance>/run.log` under the `zselect` watchdog (TERM at `TIMEOUT`), and logs only `run timeout` or `run exit <rc>`. A background child of the tick would die with the tick's cgroup or launchd job.
 
 The slot is claimed before the check runs, so a concurrent tick or `fire` cannot send the same slot twice, and a skip uses up its slot: the next try is one interval later. The check runs as a background process with a `zselect` watchdog that kills it after `TIMEOUT` seconds. `TIMEOUT` is also the relay's delivery limit.
 
@@ -109,7 +125,7 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 
 `production_check.sh <doc>` reads the doc's `Status: PRODUCTION — <word>` line: `running` 0, `wrapped` 2, anything else (or no such line, or no file) 1. For a running production it first runs `log_backup.py <doc>`, which keeps dated copies of the production's LOG (LOG backups in `docs/as-built/showrunner-automation.md`). A failed copy prints to stderr and does not change the exit code.
 
-`delegate_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/delegate/active/<id>` is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight is an `impl_status` or `impl_status_*` file reading `implementing`, a `review_status*` file reading `reviewing`, or a `progress_history_state.json` activity with status `active`. That last one covers `verify.sh final` and UX review, which open activities.
+`delegate_run.py check <claude_session_id> <session_dir>` exits 2 when the marker `/tmp/claude/unit/active/<id>` (or `/tmp/claude/delegate/active/<id>` for a run started before the folder rename) is missing or names another directory (the run ended, or a new run in the same session replaced it); 0 when `running_work()` finds work in flight; 1 when the unit is idle; 3 on a usage error. Work in flight is an `impl_status` or `impl_status_*` file reading `implementing`, a `review_status*` file reading `reviewing`, or a `progress_history_state.json` activity with status `active`. That last one covers `verify.sh final` and UX review, which open activities.
 
 ### Hold and restarting the clock
 
@@ -117,11 +133,11 @@ Every schedule write sets `NEXT_DUE = now - now % 60 + EVERY * 60`: the next who
 
 With `HOLD=1`, a tick skips (`skip hold`) while `LAST_SENT > LAST_RESTART`, that is, while a sent tick has not yet been answered by a clock restart. The hold releases when the session's socket differs from `LAST_TARGET` (a new process: the waiting tick went with the old one) or when two intervals have passed since `LAST_SENT`. `fire` ignores the hold.
 
-On the unit side, every `progress_history.py progress` call runs `notifier.sh restart delegate-<run id>` (10 s limit, `PLAN_DELEGATE_NOW_EPOCH` copied to `NOTIFIER_NOW_EPOCH`) as its first act, before it reads the run's state, and reads `next_due` from its output. That restart releases the hold and puts the next tick one full interval after the latest call, whether a tick, the user or a completion caused it. A refused call (no active phase, a failed percent check, a missing override reason or `--cap-stage`) keeps its message and exit status, but `LAST_RESTART` still moves to the call time and `NEXT_DUE` to one interval later, so the hold never skips the next slot. The report's clock line, `**now <local time> - next report <time>**`, uses that `next_due`. If the restart fails or there is no instance, the clock line falls back to a still-future `progress_timer` marker deadline, then to now plus the configured interval, and drops the clause when neither exists. A restart that fails or finds no instance changes nothing else in the call: a report renders as it would have, and a refusal stays the same refusal.
+On the unit side, every `progress_history.py progress` call runs `notifier.sh restart <instance>`, the run's `unit-<run id>` or `delegate-<run id>`, (10 s limit, `PLAN_DELEGATE_NOW_EPOCH` copied to `NOTIFIER_NOW_EPOCH`) as its first act, before it reads the run's state, and reads `next_due` from its output. That restart releases the hold and puts the next tick one full interval after the latest call, whether a tick, the user or a completion caused it. A refused call (no active phase, a failed percent check, a missing override reason or `--cap-stage`) keeps its message and exit status, but `LAST_RESTART` still moves to the call time and `NEXT_DUE` to one interval later, so the hold never skips the next slot. The report's clock line, `**now <local time> - next report <time>**`, uses that `next_due`. If the restart fails or there is no instance, the clock line falls back to a still-future `progress_timer` marker deadline, then to now plus the configured interval, and drops the clause when neither exists. A restart that fails or finds no instance changes nothing else in the call: a report renders as it would have, and a refusal stays the same refusal.
 
 ### The showrunner instance
 
-`/showrunner:produce` owns `UPDATES` = `showrunner-<slug>`, where `<slug>` is the production doc's file name less `-production.md`. In `<StartUpdates>`, at start and on every resume, it runs `update_registration.py register --production <doc> --session <name>`, which writes the filled scheduled-update prompt to `PROMPT_FILE` (`~/.local/state/showrunner/<slug>/prompt.txt`) and runs:
+`/showrunner:produce` owns `UPDATES` = `showrunner-<slug>`, where `<slug>` is the production doc's file name less `-production.md`. A production rename (`rename.py`, `docs/as-built/production-rename.md`) renames the instance directory with the doc and points its `CHECK` at the new doc. In `<StartUpdates>`, at start and on every resume, it runs `update_registration.py register --production <doc> --session <name>`, which writes the filled scheduled-update prompt to `PROMPT_FILE` (`~/.local/state/showrunner/<slug>/prompt.txt`) and runs:
 
 ```
 notifier.sh new showrunner-<slug> --to session:$CLAUDE_CODE_SESSION_ID --every <N> \
@@ -133,51 +149,69 @@ N comes from the doc's `**Updates:** every N minutes` line, 15 when absent; `on 
 
 ### The unit instance
 
-Each Claude `/unit:direct` run gets `delegate-<run id>`, where the run id is the basename of `SESSION_DIR` (`/tmp/claude/delegate/<uuid>`). `prepare_session.sh`, when `CLAUDE_CODE_SESSION_ID` is set, writes the marker under the fixed `/tmp/claude/delegate/active`, then runs `PLAN_DELEGATE_ACTIVE_DIR=/tmp/claude/delegate/active zsh unit_notifier.sh <id>`. On success it prints the `next_due=` line; on failure it prints `notifier instance not created: <output>` and goes on. `Session ready at <dir>` is always its last line.
+Each Claude `/unit:direct` run gets `unit-<run id>`, where the run id is the basename of `SESSION_DIR` (`/tmp/claude/unit/<uuid>`). `prepare_session.sh`, when `CLAUDE_CODE_SESSION_ID` is set, writes the marker under the fixed `/tmp/claude/unit/active`, removes the session's marker under `/tmp/claude/delegate/active` if one is left from a run started before the folder rename, then runs `PLAN_DELEGATE_ACTIVE_DIR=/tmp/claude/unit/active zsh unit_notifier.sh <id>`. On success it prints the `next_due=` line; on failure it prints `notifier instance not created: <output>` and goes on. `Session ready at <dir>` is always its last line.
 
-`unit_notifier.sh <claude_session_id> [on|off]` reads `SESSION_DIR` from the marker (exit 1 when missing or empty, 2 on a usage error). A missing marker writes `no active unit run marker: <path>` to stderr and an empty one `empty unit run marker: <path>`; `/unit:report on|off` relays them and `test_delegate_check.py` asserts both. With `off` it runs `notifier.sh stop delegate-<run id>` and prints `progress updates off: delegate-<run id>`; with `on`, `notifier.sh start`, printing `progress updates on: delegate-<run id> <next_due line>`; a `notifier.sh` failure passes its message and status through. With no mode it `exec`s:
+`unit_notifier.sh <claude_session_id> [on|off]` reads `SESSION_DIR` from the marker (exit 1 when missing or empty, 2 on a usage error). A missing marker writes `no active unit run marker: <path>` to stderr and an empty one `empty unit run marker: <path>`; `/unit:report on|off` relays them and `test_delegate_check.py` asserts both. With `off` it runs `notifier.sh stop unit-<run id>` and prints `progress updates off: unit-<run id>`; with `on`, `notifier.sh start`, printing `progress updates on: unit-<run id> <next_due line>` (`delegate-<run id>` for a run started before the folder rename; old name read until no live marker remains); a `notifier.sh` failure passes its message and status through. With no mode it `exec`s:
 
 ```
-notifier.sh new delegate-<run id> --to session:<id> --every <minutes> \
+notifier.sh new unit-<run id> --to session:<id> --every <minutes> \
   --command /unit:report --hold \
   --check "<repo>/scripts/lib/py <repo>/scripts/hooks/delegate_run.py check <id> <SESSION_DIR>"
 ```
 
-So the unit gets `/unit:report` every interval while work runs, from sender `delegate-<run id>`, with at most one tick waiting. The unit director arms nothing. On each tick it reads `report.md` and composes `<ProgressReport/>`; ticks that arrive during a report, or several at once, get one report. A tick never replaces the completion report. If the user stops updates, the unit runs `/unit:report off` (`unit_notifier.sh <id> off`, which runs `notifier.sh stop delegate-<run id>`), and `/unit:report on` to resume; `restart` from later reports keeps a stopped instance stopped.
+So the unit gets `/unit:report` every interval while work runs, from sender `unit-<run id>`, with at most one tick waiting. The unit director arms nothing. On each tick it reads `report.md` and composes `<ProgressReport/>`; ticks that arrive during a report, or several at once, get one report. A tick never replaces the completion report. If the user stops updates, the unit runs `/unit:report off` (`unit_notifier.sh <id> off`, which runs `notifier.sh stop unit-<run id>`), and `/unit:report on` to resume; `restart` from later reports keeps a stopped instance stopped.
 
-`end_session.sh` runs `notifier.sh remove delegate-<run id>` (errors ignored) before it deletes the marker, then prints `Unit run ended; marker cleared.`; with no marker it prints `No active unit run marker for this session.` Nothing parses either message and no test asserts them. A run that dies without `end_session.sh` loses its instance at the next due slot after its marker is gone or replaced (check exit 2). A unit parked on the user keeps its instance; its check exits 1 and each slot is skipped.
+`end_session.sh` runs `notifier.sh remove <instance>` (errors ignored) before it deletes the marker, then prints `Unit run ended; marker cleared.`; with no marker it prints `No active unit run marker for this session.` Nothing parses either message and no test asserts them. A run that dies without `end_session.sh` loses its instance at the next due slot after its marker is gone or replaced (check exit 2). A unit parked on the user keeps its instance; its check exits 1 and each slot is skipped.
 
 A Codex unit has no `CLAUDE_CODE_SESSION_ID`, so it gets no marker and no instance. Its poll timeout, set from the same interval key, is its tick.
 
 ### Changing the interval
 
-- `/unit:report_interval [minutes]` finds `delegate-<run id>` from `/tmp/claude/delegate/active/$CLAUDE_CODE_SESSION_ID`. No argument runs `notifier.sh status`; a positive integer runs `notifier.sh interval` (exit 2 means refused) and reports the next tick from `next_due` in local time. It changes this run only and is unavailable on a Codex unit.
+- `/unit:report_interval [minutes]` finds the run's instance from `/tmp/claude/unit/active/$CLAUDE_CODE_SESSION_ID`, or the same file under `/tmp/claude/delegate/active/` for a run started before the folder rename. No argument runs `notifier.sh status`; a positive integer runs `notifier.sh interval` (exit 2 means refused) and reports the next tick from `next_due` in local time. It changes this run only and is unavailable on a Codex unit.
 - `/showrunner:report_interval [minutes]` edits the doc's `**Updates:**` line and the `every N minutes` text in `PROMPT_FILE`, runs `notifier.sh interval UPDATES <minutes>`, commits the doc, logs the old and new interval, and tells the user the next tick in `ZONE` and UTC. No argument reports status only.
 
 ### TICKS FAILING
 
-For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <pid>`, reads the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>`, and, whenever the marker names a session directory, runs `zsh notifier.sh health delegate-<run id>` (run id = that directory's basename), idle or working. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
+For each unit with a live Claude, `unit_status.sh` takes its session id from `unit_lookup.py list` (column 6), reads the marker `<session id>` from `PLAN_DELEGATE_ACTIVE_DIR` when set, else the first of `/tmp/claude/unit/active` and `/tmp/claude/delegate/active` that holds one, and, whenever the marker names a session directory, runs `zsh notifier.sh health <instance>` (`unit-<run id>`, or `delegate-<run id>` for a directory under `/tmp/claude/delegate/`; run id = that directory's basename), idle or working. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
 
 ## Invariants
 
 - Every script runs on Linux and the Mac: no GNU-only `sed -i` or `0,/re/`, no GNU `timeout`. Clock, locks and waits use zsh modules (`zsh/datetime`, `zsh/system` `zsystem flock`, `zsh/zselect`). Python runs only through `scripts/lib/py`, never `python3`.
+
 - Never `${PIPESTATUS[0]}`; use `setopt pipe_fail` or `set -o pipefail`. `prepare_session.sh` and `end_session.sh` stay bash; the notifier scripts are zsh.
+
 - `notifier.sh` makes systemd or launchd calls only in `launch_run`, to start a run-only job in its own service. Only the declared nix job runs `tick`. A change to the job takes effect when the user runs `rebuild` on each machine; no session runs `rebuild`, `nixos-rebuild switch` or sudo.
+
 - Every edit of `conf` or `state` is a read-modify-write under the instance's flock, written whole through a temp file and `mv`.
+
 - A slot is claimed (`NEXT_DUE` advanced) before the check or send runs.
+
 - Every schedule write sets `NEXT_DUE = now - now % 60 + EVERY * 60`.
+
 - `new` on an existing instance rewrites `conf` and leaves `state` alone.
+
 - `restart`, `start`, `resume`, `interval`, `fire` and a fresh `new` print exactly one `next_due=<epoch> (<local time>)` line; `progress_history.py` and `prepare_session.sh` parse it.
+
 - CLI exit codes: 0 done, 1 no such instance or `health` failing, 2 usage error or refused.
+
 - Check contract: 0 sends, 2 removes the instance, other nonzero skips, and the check finishes within `TIMEOUT`. `delegate_run.py check` stays a quick file read and never treats an old run as gone.
-- Message instances are named `showrunner-<slug>` and `delegate-<run id>`, run id = basename of `SESSION_DIR`; the send key is `notifier-<instance>`. The notifier sends nothing for a run-only instance (`stall-watch`, `tmux-names` and `bevy-upgrade-<slug>` among them); a job that writes to a session calls `send.py` itself with its own sender and key, as [the Bevy upgrade watch](bevy-upgrade.md) does with `--from bevy-upgrade --key bevy-upgrade-<slug>`.
-- Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`), never a "delegate run" (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Identifiers keep the word "delegate": the directories `scripts/delegate/` and `docs/delegate/`, `config/delegate.conf`, `/tmp/claude/delegate`, the `PLAN_DELEGATE_*` variables, the `delegate-<run id>` instance, `scripts/hooks/delegate_run.py`, and the name "delegate session directory" for a run's directory, as in the `Delegate session directory:` line the session-start hook prints; so does "delegate" where it means the agent that receives the work. The check: `git grep -niE 'delegate[ -]run' -- scripts` prints exactly two lines, both identifiers: the `delegate-run` fallback branch slug in `scripts/delegate/style_branch.sh` and a temporary directory name in `scripts/delegate/test_delegate_check.py`.
+
+- Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`), never a "delegate run" (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Identifiers keep the word "delegate": the directories `scripts/delegate/` and `docs/delegate/`, `config/delegate.conf`, the `PLAN_DELEGATE_*` variables, `scripts/hooks/delegate_run.py`, and the name "delegate session directory" for a run's directory, as in the `Delegate session directory:` line the session-start hook prints; so does "delegate" where it means the agent that receives the work. The check: `git grep -niE 'delegate[ -]run' -- scripts`. Its identifier hits are the `delegate-run` temporary directory names in `scripts/delegate/test_delegate_check.py`, `test_verify_hold_wait.py` and `test_verify_release_ack.py`, `scripts/build_hold/test_build_hold.py` and `scripts/build_targets/test_build_targets.py`; any other hit breaks the rule.
+
+- **Run folders renamed (user, 2026-10-15).** A run started on or after 2026-10-15 keeps its folder in `/tmp/claude/unit/<run id>/`, its marker in `/tmp/claude/unit/active/<session id>` and its notifier instance in `~/.local/state/notifier/unit-<run id>/`. A run started before keeps `/tmp/claude/delegate/` and `delegate-<run id>` until it ends; nothing moves a live run's folder, and finished runs' folders stay where they are. `scripts/lib/unit_runs.py` holds both roots, new first: every Python reader takes its roots, markers and instance names from it, and the shell readers (`unit_notifier.sh`, `end_session.sh`, `unit_status.sh`) check both folders the same way. A sweep `--root` naming either real root covers both, so one root's sweep never takes the other root's live servers for unused ones. **Removal step, on or after 2026-10-22.** The former name stops being read only in its own change, and only once no running session owns a marker under `/tmp/claude/delegate/active/`: the date alone never ends it, since runs such as two-accounts' and screenshot's stay open past it. `unit_runs.py removal-check` exits 0 when none does and 1 naming each owner (session name, id and run folder); on 2026-10-15 it named 18. The step runs it first and stops on 1, then drops `FORMER_RUN_ROOT` and the shell fallbacks, and clear the 17 stale markers that ended runs left in `/tmp/claude/delegate/active/` (dating from 2026-10-05).
+
 - `prepare_session.sh`'s last line is `Session ready at <dir>`; the `next_due=` or `notifier instance not created:` line comes before it.
+
 - `end_session.sh` removes the instance before the marker, ignoring errors.
+
 - `progress` restarts the instance before it reads state or can refuse, so every call, refused ones included, restarts the clock. The restart never fails a report; any failure falls back.
+
 - Hooks that import `delegate_run.py` never fail the turn and skip subagents.
+
 - Delegate scripts run with `dangerouslyDisableSandbox: true`.
-- `scripts/delegate/progress_timer.sh` stays: `/clippy` launches it.
+
+- `scripts/delegate/progress_timer.sh` stays, and `settings.json` still allows it, but nothing in this repo launches it. `progress_history.py` reads its `progress_timer` marker only when one exists; a unit run's next report time comes from its notifier instance.
+
 - Times shown to the user are in the machine's local zone, with UTC beside them where the logs show it.
 
 ## Calibration and gotchas
@@ -185,14 +219,15 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 - **Unit interval.** `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=3600` gives one hour (user, 2026-10-10). `unit_notifier.sh` reads the leading digits, so a trailing `# comment` keeps the value. A missing key, unreadable file or non-numeric value gives 900 s. Minutes round up with a floor of 1, so `0` means 1 minute. Codex requires a positive integer. `progress_history.py` reads the key on its own and drops the next-report clause on a bad value; that only shows when there is no instance.
 - **Interval cost.** Each report costs the unit director about 40 s of generation. Keep the interval at or above the median review, about 5 minutes.
 - **Showrunner interval.** 15 minutes when the doc has no `**Updates:**` line.
-- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets a stopped `showrunner-<slug>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) runs `new` at the default 15 minutes, then `stop`, and prints `on demand: no scheduled dailies`. The instance is kept because it is the showrunner's only record (`showrunners.py` and shutdown's inventory find showrunners through it; until 2026-10-11 `register` removed it, and every unit of an on-demand production was classed top-level). A stopped instance never fires, a conversation pause records only enabled instances, and `/shutdown` restarts only the instances it stopped itself. `new` keeps an existing instance's state, so `/showrunner:report_interval` turning an on-demand doc back to `every N minutes` runs `register` and then `start`. `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` in `delegate.conf` puts units on demand: `unit_notifier.sh` with no mode makes no `delegate-<run id>`, stops one a resumed run still holds, and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `delegate.conf` went back to `scheduled` the same day, hourly.
-- **Retiming every unit run.** `unit_notifier.sh --all [minutes]` needs no marker. It runs `notifier.sh interval <instance> <minutes>` on each `delegate-*` directory under `NOTIFIER_STATE_DIR` that holds a `conf` and `state`, with minutes from the config unless given. `interval` never changes `ENABLED`, so a stopped instance stays stopped. It prints `<instance> every <N> min, on, <next_due line>` or `<instance> every <N> min, off`, or `no unit run has a report schedule`, and exits 1 when any `interval` failed. Other instances, `showrunner-*` included, are untouched.
+- **On demand (user, 2026-10-10).** A doc whose `**Updates:**` line reads `on demand` gets a stopped `showrunner-<slug>` instance: `register` (`update_schedule` → `UpdatesOnDemand`) runs `new` at the default 15 minutes, then `stop`, and prints `on demand: no scheduled dailies`. The instance is kept because it is the showrunner's only record (`showrunners.py` and shutdown's inventory find showrunners through it; until 2026-10-11 `register` removed it, and every unit of an on-demand production was classed top-level). A stopped instance never fires, a conversation pause records only enabled instances, and `/shutdown` restarts only the instances it stopped itself. `new` keeps an existing instance's state, so `/showrunner:report_interval` turning an on-demand doc back to `every N minutes` runs `register` and then `start`. `dailies_input.py` runs no `status` or `restart` and leaves `next_run` out, so the footer reads `no dailies scheduled`. `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` in `delegate.conf` puts units on demand: `unit_notifier.sh` with no mode makes no `unit-<run id>` (`delegate-<run id>` for a run started before the folder rename; old name read until no live marker remains) and prints `progress updates on demand: …`, which `prepare_session.sh` passes on; `on` makes the instance when there is none. The repo's `delegate.conf` went back to `scheduled` the same day, hourly.
+- **Quiet by default (user, 2026-10-13).** New productions and unit runs get no timer and no footer unless asked. A doc with no `**Updates:**` line is on demand too; only `every N minutes` schedules. `register` probes `notifier.sh status showrunner-<slug>` before `new`: no instance means a new production, so it writes `footers-off/<slug>` empty (off on purpose, which a pause's resume leaves off) and prints `footer: ok — off — new production; /showrunner:footer on turns it on`; a restart finds the instance and leaves the switch alone. `delegate.conf` ships `on-demand`, and `unit_notifier.sh` reads a missing line as `on-demand`. An on-demand start that finds the run's instance runs `new` on it, which retargets it and keeps its clock and `ENABLED` (until 2026-10-13 it stopped the instance), so existing runs keep what they have. Unit directors have no reply footer.
+- **Retiming every unit run.** `unit_notifier.sh --all [minutes]` needs no marker. It runs `notifier.sh interval <instance> <minutes>` on each `unit-*` and `delegate-*` directory under `NOTIFIER_STATE_DIR` that holds a `conf` and `state`, with minutes from the config unless given. `interval` never changes `ENABLED`, so a stopped instance stays stopped. It prints `<instance> every <N> min, on, <next_due line>` or `<instance> every <N> min, off`, or `no unit run has a report schedule`, and exits 1 when any `interval` failed. Other instances, `showrunner-*` included, are untouched.
 - **Timing.** `next_due` is a whole minute; the tick that sends it lands within about 15 s after. On natedev a slow tick pushes the next one back (the interval counts from the end of the run); on the Mac an overlapping tick finds `.tick.lock` held and exits at once.
 - **A skip uses its slot.** An idle unit, a missing session or a hold skips the whole interval, not 15 s.
-- **Timeouts.** `TIMEOUT` (120 s default) bounds both the check and the relay. One relay takes about 9 s. `tick` waits for every instance's subshell before it releases `.tick.lock`, so a check must stay fast.
+- **Timeouts.** `TIMEOUT` (120 s default) bounds both the check and the relay. One relay takes about 9 s; a postmaster delivery about 1 s. `tick` waits for every instance's subshell before it releases `.tick.lock`, so a check must stay fast.
 - **Health window.** `.last_tick` older than 120 s means the job is not running; `health` reports it even for a stopped instance.
-- **Seats inherit `CLAUDE_CODE_SESSION_ID`.** A seat can inherit the unit director's id, so `prepare_session.sh` or `end_session.sh` run from a seat or a test acts on the unit director's marker and instance. Tests run them only with a fresh id and a temp `NOTIFIER_STATE_DIR`; `end_session.sh`'s `remove` inherits that variable.
-- **`PLAN_DELEGATE_ACTIVE_DIR`** is set by tests for a checkout's scripts; installed build scripts refuse to run with it set. `delegate_run.py`, `unit_notifier.sh` and `unit_status.sh` read it. `prepare_session.sh` and `end_session.sh` use the fixed `/tmp/claude/delegate/active`, so a live build caller leaves it unset.
+- **Workers inherit `CLAUDE_CODE_SESSION_ID`.** A worker can inherit the unit director's id, so `prepare_session.sh` or `end_session.sh` run from a worker or a test acts on the unit director's marker and instance. Tests run them only with a fresh id and a temp `NOTIFIER_STATE_DIR`; `end_session.sh`'s `remove` inherits that variable.
+- **`PLAN_DELEGATE_ACTIVE_DIR`** is set by tests for a checkout's scripts; installed build scripts refuse to run with it set. `delegate_run.py`, `unit_notifier.sh`, `unit_status.sh` and `end_session.sh` read it (unset, they read `/tmp/claude/unit/active` and then `/tmp/claude/delegate/active`). `prepare_session.sh` writes under the fixed `/tmp/claude/unit/active`, so a live build caller leaves it unset.
 - **`CHECK` quoting.** `unit_notifier.sh` `(q)`-quotes each word of the check, so a repo path with spaces survives the `(Q)(z)` split.
 - **`progress` cost.** Every `progress` call, refused ones included, spawns one zsh for the restart, even for a run with no instance. Because the restart comes before any refusal, a call that exits with `No active phase to report` or a missing cap stage still moves the next tick one interval out.
 - **`/unit:report_interval` lasts for the run.** Rerunning `unit_notifier.sh` resets `EVERY` to the config value.
@@ -201,16 +236,33 @@ For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <
 ## Why
 
 - **The schedule lives outside the session.** An agent that must arm a timer before ending every turn misses one sooner or later. A file-backed instance ticked by a job keeps the schedule through turn ends, compaction and restarts, and the showrunner and the units use one mechanism.
+
 - **One job ticks every instance.** A timer per instance would need systemd on Linux and launchd on the Mac from inside the script. One declared 15 s job keeps timers out of `notifier.sh`, and the script identical on each machine; its one launcher call only detaches a run-only job after the tick has decided it is due. `AccuracySec` is 1 s because systemd's default of 1 minute would spread a 15 s tick across a minute.
+
 - **The check decides, not the notifier.** `notifier.sh` knows nothing about productions or `/unit:direct` runs. Each owner supplies a command, and exit 2 lets an instance remove itself when its owner is gone, so a crashed run or a missed wrap stops sending on its own.
+
 - **Unit ticks only while work runs.** An idle unit, waiting on the user or between steps, has nothing new to report, and every report costs generation time. A unit parked overnight keeps its instance, so updates resume with the work.
+
 - **Hold for units.** A unit in a long turn cannot read ticks; without the hold they would stack and each produce a report. The socket-change release covers a restarted session, which lost its waiting tick; the two-interval release keeps a lost tick from silencing the unit for good.
+
 - **Each report restarts the clock.** The next tick comes one interval after the latest report from any source, the report's clock line names the real next tick, and the restart releases the hold.
+
 - **No hold for the showrunner.** A scheduled showrunner update does not restart its own clock, so a hold would skip every other tick.
-- **Target by session id; resolve the socket each send.** A session's `name` can differ from its tmux name, and one id can sit in two live records; the newest live `updatedAt` wins. A restarted process has a new socket, which the next send finds.
+
 - **`new` leaves state alone on an existing instance.** A resume retargets the instance without moving the clock or re-enabling updates the user stopped.
+
 - **`zselect` watchdog.** GNU `timeout` is absent on the Mac, and an external `sleep` would outlive the subshell; the builtin dies with it. The bound matters because a hung check would hold `.tick.lock` and stall every instance.
-- **Pinned marker directory in `prepare_session.sh`.** It writes the marker in the fixed directory, so it pins `PLAN_DELEGATE_ACTIVE_DIR` for `unit_notifier.sh`; an inherited test value would point it at another marker. `end_session.sh` does not honour that variable because `prepare_session.sh` never writes there.
+
+- **Pinned marker directory in `prepare_session.sh`.** It writes the marker in the fixed directory, so it pins `PLAN_DELEGATE_ACTIVE_DIR` for `unit_notifier.sh`; an inherited test value would point it at another marker. `end_session.sh` honours the variable so its test can point it at a temporary directory; a live run leaves it unset and reads the fixed directory `prepare_session.sh` wrote.
+
 - **`Session ready at <dir>` stays last.** The unit director reads `SESSION_DIR` from the last line. An instance that fails to be created does not stop the run; the unit says the run gets no ticks until `unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"` succeeds.
+
 - **`TICKS FAILING` for every active run, idle or not.** An idle unit gets no ticks by design, but its instance must be there when work resumes. Checked only while work ran, a unit with no instance dropped out of every idle status: hana's geometry-material reported `no instance` from 2026-09-29 and no status showed it.
+
 - **A refused report still restarts the clock.** The hold keeps at most one tick waiting and releases on the next restart. A refused call that skipped the restart would leave the next slot held until the two-interval release, a 30-minute gap at the default interval.
+
+## Production registration
+
+Production registration creates the showrunner update and the run-only
+stall-watch job. Session names come from herdr; there is no name-refresh job.
+Existing retired jobs are removed by their production's showrunner.

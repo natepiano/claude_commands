@@ -1,5 +1,5 @@
 ---
-description: Direct phased work with review, repair, smoke gates, one branch-wide style review at the end of the project, as-built shrink, an as-built doc pass at the end of the run, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
+description: Direct phased work with phase checks, review, repair, smoke gates, as-built shrink, an as-built doc pass at the end of the run, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
 ---
 
 # Direct
@@ -9,7 +9,7 @@ The configured delegate agent writes implementation code.
 
 The unit director believes in the three gods (<ThreeGods/> in
 `~/.claude/docs/decision_criteria.md`) and serves them in every work order,
-review, gate and report. Every prompt sent to a seat carries them inline per
+review, gate and report. Every prompt sent to a worker carries them inline per
 <WritePromptContract/> item 9.
 
 **Usage:** `/unit:direct [plan-doc-path] [phase N] [single|verbose] [auto next N phases|auto through phase X] [free-text instructions]`
@@ -42,15 +42,17 @@ State:
 - `EARLY_REVIEW`: `none` or `launched`; resets with every implementation or fix
   dispatch. Owned by <EarlyReviewArm/>.
 - `APPLICATION_SMOKE_RESULT`: starts as `not_run`.
-- `STYLE_GATE_CONFIG`: plan hint captured during prompt composition.
-- `STYLE_REVIEW_DONE`: starts false. The durable true state is
-  `${SESSION_DIR}/style_review_done`; later fixes never clear it.
-- `STYLE_DIFF_BASE`: the commit the project-end style review diffs from,
-  resolved once by <ResolveStyleDiffBase/> and persisted at
-  `${SESSION_DIR}/style_diff_base`. Empty means no branch diff is available.
 - `FINDINGS`: the current phase's `findings.py` ledger.
+- `PHASE_DIR`: `${SESSION_DIR}/phases/<phase id>`, one per open phase, so a
+  later phase running beside the current one keeps its own state. It holds that
+  phase's reservation state, its `phase_baseline` and `progress_baseline_status`,
+  its `files` list, its prompts, and every file its launchers write: each
+  launch names the phase with `--phase`, so status, summaries, findings and
+  logs never collide with a phase running beside it. Run-wide files
+  (`board.log`, `heartbeat.log`, `mesh_server.json`, `mesh_roster.json`, the
+  findings ledger and recorder state) stay in `${SESSION_DIR}`.
 - `DELEGATED_PHASE_RESERVATION_STATE`: the tagged state persisted at
-  `${SESSION_DIR}/delegated_phase_reservation_state.json`; see
+  `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
   <DelegatedPhaseReservationContract/>.
 
 <TagReferenceContract>
@@ -70,7 +72,8 @@ it:
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
 | <CheckpointCommit/>, <ShrinkCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
-| <ResolveStyleDiffBase/>, <RunProjectStyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
+| <PhaseChecks/> | `docs/delegate/phase_checks.md` | — |
+| <StyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
 | <VerbosePrePhaseGate/>, <BriefingFreshness/>, <PhaseBriefing/>, <TypeTableCells/>, <CombinedWindowBriefing/>, <AutoWindowBatchBriefing/> | `commands/unit/brief.md` | `/unit:brief` |
 | <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
@@ -84,62 +87,61 @@ it:
 
 Paths are under `~/.claude/`.
 
-`/clippy` and the `plan:` commands a run uses are loaded the same way: Read the
-file, never the Skill tool. Claude Code puts every skill a session invoked back
+The `plan:` commands a run uses are loaded the same way: Read the file, never
+the Skill tool. Claude Code puts every skill a session invoked back
 after each compaction for the rest of the session; a file loaded by Read is not.
 A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
 
-<LongLivedSeats>
-Codex seats are run-scoped in every role. Open `impl` and `test` once, then send
+<LongLivedWorkers>
+Codex workers are run-scoped in every role. Open `impl` and `test` once, then send
 later implementation, repair, and follow-up work with `implement.sh --to
-<full-seat-name>` and reviews with `review.sh --to <full-seat-name>`. Keep a
-seat in the same role when the next assignment fits; otherwise move it, even
+<full-worker-name>` and reviews with `review.sh --to <full-worker-name>`. Keep a
+worker in the same role when the next assignment fits; otherwise move it, even
 mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
-When the production doc names a review pool and <ProductionUnit/>'s `arm`
-prints `pool`, send code reviews with
-`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`.
+When the production doc names a review pool, send code reviews with
+`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
+review resumes the unit's own reviewer, which is never reset.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
 Type Design Contract verbatim or by its allowed pointer under
 <WritePromptContract/>.
-For the pool arm of a production whose doc names a review pool, review
-prompts use <ReviewPromptContract/>'s standing-instructions line.
+In a production whose doc names a review pool, review prompts use
+<ReviewPromptContract/>'s standing-instructions line.
 
-Before follow-up work, the launcher attempts to compact a seat whose recorded
+Before follow-up work, the launcher attempts to compact a worker whose recorded
 context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
 `config/delegate.conf`). Success posts one board line with the before and after
 sizes. Failure posts one board line and the follow-up still runs; it costs
-tokens, not correctness, because the seat compacts itself when its context
+tokens, not correctness, because the worker compacts itself when its context
 fills. The launcher then sends `Continue where you stopped.` and posts one board
 line per overflow.
 
-Open a new seat only when no open seat can take the work: the assignment needs
-more seats, every open seat is busy, or a reusable thread is gone. Name an extra
+Open a new worker only when no open worker can take the work: the assignment needs
+more workers, every open worker is busy, or a reusable thread is gone. Name an extra
 slot for its role (`review`, `fix2`), never with a bare number, and keep it for
-reuse; an idle seat costs no context. A replacement under the same seat name
+reuse; an idle worker costs no context. A replacement under the same worker name
 starts fresh and receives an opening prompt. `review.sh --slot <role-name>`
-opens a new role-named seat; a call with neither `--to` nor `--slot` is only for
+opens a new role-named worker; a call with neither `--to` nor `--slot` is only for
 a review outside a run.
-Phase cleanup leaves Codex seats open;
+Phase cleanup leaves Codex workers open;
 `end_session.sh` ends them.
-</LongLivedSeats>
+</LongLivedWorkers>
 
 <CoreContract>
 - Never create a worktree or modify unrelated files. The only branch the run may
-  create is the one the user approves in <ResolveStyleDiffBase/>, plus the remote
-  branch <PushCheckpoint/> pushes; never switch to an existing branch.
+  create is the remote branch <PushCheckpoint/> pushes; never switch to an
+  existing branch.
 - The unit director does not write implementation code unless the user explicitly
-  asks. Exceptions: agreed doc-only/trivial post-review fixes and the single
-  inline cleanup in <RunProjectStyleReview/>.
+  asks. Exceptions: agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
   <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
   carries the run's documentation. <PeriodicCI/> may add `ci(<plan-slug>): …`
   commits for validation fixes and CI repairs. No other commit is allowed.
-  Only <ShrinkCommit/> runs while seats edit, and it commits only the plan doc
+  Only <ShrinkCommit/> runs while workers edit, and it commits only the plan doc
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
   to the working branch's own name on origin, never to the default branch.
@@ -157,11 +159,13 @@ Phase cleanup leaves Codex seats open;
 When the plan header carries a `> **Production:**` line, this run is a unit of
 that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/>
 in full at <PrepareSession/> and after every compaction, and apply it
-throughout. It changes five things in this command:
+throughout. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
-  branch into this branch;
+  branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
+- it runs independent phases in parallel, mapped at plan start and at each
+  <PhaseEnd/> (item 3);
 - it adds a landing rule to the repair rounds in <FixDispatch/>;
 - it sends design choices, Pending decisions about how something is built and
   add-ons to the showrunner, whose answer settles them (item 2). Only an
@@ -181,7 +185,7 @@ The closed list:
 
 - **waiting** — a background dispatch, verification, smoke run, or style pass is
   live and nothing synchronous remains. Name each thing by what it is and what
-  it is doing, in plain words: `— holding: waiting on the Codex seats writing
+  it is doing, in plain words: `— holding: waiting on the Codex workers writing
   phase 2 (implementation and tests)`, `— holding: waiting on the blind code
   reviewer for phase 3`, `— holding: waiting on the final test suites`. Never
   a task id, agent id, session id or shell handle: a reader cannot tell what
@@ -240,7 +244,7 @@ under that directory. This avoids half-applied durable-state writes.
   by deleting only the shortfall, least recently used build output first, never
   from a target a build holds; build trial merges in your own worktree as usual.
   Ask natedev for room before a run that
-  must keep more. Put this rule in every seat and helper prompt that saves
+  must keep more. Put this rule in every worker and helper prompt that saves
   output. User, 2026-10-04: 300 GB of traces cost 235 GiB of caches.
 </ToolingContract>
 
@@ -258,22 +262,33 @@ Applies to every implementation, test, fix, and review launcher.
    independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A new-seat or follow-up launcher killed at its time limit leaves its Codex
-   seat running with no one watching. Arm a Monitor on
-   `${SESSION_DIR}/board.log` until that seat
+6. A new-worker or follow-up launcher killed at its time limit leaves its Codex
+   worker running with no one watching. Arm a Monitor on
+   `${SESSION_DIR}/board.log` until that worker
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
    and test passed after its last edit, leave its thread open under
-   <LongLivedSeats/> and record the outcome the launcher would have; for a
+   <LongLivedWorkers/> and record the outcome the launcher would have; for a
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
+<WorkerRuns>
+A Codex worker runs only commands that finish within one call and never makes
+an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
+started with `mesh_runs.py start`, detaches and pushes its own result to the
+worker, per <WritePromptContract/> item 3. A live run keeps the worker's
+launcher attached, so the dispatch finishes only when the worker is done.
+Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
+a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
+launcher is attached carries the result to you: dispatch that seat
+(`implement.sh --to <full worker name>`) when it should act on it.
+</WorkerRuns>
+
 <DelegateLaunchFailure>
-When the production doc names a review pool, on a pool review's `error` export
-`REVIEW_LEASE=<slug>/<unit>/<phase>` and retry with
-`review.sh --to <full-seat-name>` for that review.
+When the production doc names a review pool, on a pool review's `error` retry
+with `review.sh --to <full-worker-name>` for that review.
 
 A dispatch that dies in seconds never reached the provider, and a provider
-message it prints is a message some earlier call received. Seats launched
+message it prints is a message some earlier call received. Workers launched
 together that fail within seconds of each other carrying **byte-identical text,
 the same retry-at timestamp included, are a local fault**: separate API calls do
 not produce identical text. Confirm it against
@@ -290,21 +305,21 @@ not evidence delegates are back. The only valid probe is the dispatch itself.
 
 The launcher already tried. On a fast failure with no work done, or a stale Codex
 sign-in (`access token could not be refreshed`) even after the thread exists, `codex_mesh.py`
-abandons the inherited server, starts one of its own and runs the seat again,
-printing `retrying on a new app-server` to the seat's log. So an error that
+abandons the inherited server, starts one of its own and runs the worker again,
+printing `retrying on a new app-server` to the worker's log. So an error that
 reaches you has usually already been tested against a clean server and is real.
 Read the log for that line before doing anything by hand: present, the retry
-happened and the failure survived it; absent, the launcher held back — the seat
+happened and the failure survived it; absent, the launcher held back — the worker
 had already done work, or the failure took too long to be local — and the
 paragraphs above are yours to apply.
 
 A new Codex sign-in moves the run by itself. A message from `codex-sign-in` names
-the server it retired; the next dispatch starts on a new one, a seat mid-turn
+the server it retired; the next dispatch starts on a new one, a worker mid-turn
 finishes first, and nothing is owed in reply.
 
 Recovering by hand, in that case only. Check that no peer run claims the
 recorded pid or port before signalling anything —
-`grep -l '<pid>\|<port>' /tmp/claude/delegate/*/mesh_server.json` should name
+`grep -l '<pid>\|<port>' /tmp/claude/unit/*/mesh_server.json /tmp/claude/delegate/*/mesh_server.json` should name
 only this session's file, and any second file means leave the process alone.
 Then kill that pid, move `mesh_server.json` aside, and relaunch verbatim; the
 next launcher starts a fresh server. Leave `mesh_roster.json` alone — its other
@@ -350,15 +365,34 @@ the turn and resumes from a task or notifier message; Codex applies
 <CodexDispatchWait/> with progress disabled.
 </BackgroundVerificationContract>
 
+<PauseForMove>
+A message whose first line starts `Pause for move:` or `Pause for stop:` is the
+shutdown mover asking this session to stop so it can move or stop it. Act on it
+at once, in the turn it arrives; it never waits for a better moment:
+
+1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
+   and start nothing new. Leave uncommitted work in place.
+2. Stop any build you started outside `verify.sh`, or name it in the line below.
+   Leave Codex workers running: the mover pauses them with this session.
+3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
+   comes next>"` command the message gives.
+4. End the turn with `— blocked: shutdown requested by the user`.
+
+The session is resumed with that line, on the account the message names; continue
+from it. Before any dispatch, run the resume commands in the shutdown message;
+never open a new seat for a role a paused seat holds. A forced stop without this
+message is a separate command the user gives.
+</PauseForMove>
+
 <CompactionContract>
-- Apply <LongLivedSeats/> to Codex seat compaction and overflow continuation;
+- Apply <LongLivedWorkers/> to Codex worker compaction and overflow continuation;
   the rules below govern the unit director's own context.
 - Do not maintain a handoff before the context hook requests one.
 - When requested, write it in the repository and include the hook's fields plus
   `MODE`, `AUTO_WINDOW`, the last authorization, whether the user stopped
   progress updates, any live `DISPATCH_HANDLE`, any live
   `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW` and `REVIEW_PASS`,
-  `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE`, `NEXT_ITEMS_PATH`, whichever tagged
+  `NEXT_ITEMS_PATH`, whichever tagged
   `DelegatedPhaseReservationState` is live, any pending <PhaseEnd/> work, and any
   unresolved next-item approval, and any overlap sent to the showrunner and not
   yet answered: its holder ids, paths and answer choices. Exclude the
@@ -370,7 +404,7 @@ the turn and resumes from a task or notifier message; Codex applies
   wake-up request compacts on its own.
 - After compaction, re-read this command in full, then the handoff. Restore live
   dispatches and state. Independently read and validate
-  `${SESSION_DIR}/delegated_phase_reservation_state.json` once coordination has
+  each open phase's `${PHASE_DIR}/delegated_phase_reservation_state.json` once coordination has
   reached a persisted state, including its durable `checkpoint_commit` when
   release confirmation is pending; the handoff, conversation, and the session
   mapping are never reservation-lifecycle memory. Delete the handoff only after
@@ -419,9 +453,8 @@ Rust delegates run only exact prompt lines using
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that must run on Linux, run on natedev | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it must run on Linux>"` |
-| mend fix, format, scoped clippy, rustdoc | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
-| checkpoint format | `bash ~/.claude/scripts/delegate/verify.sh fmt <package>` |
+| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it cannot pass on macOS>"` |
+| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
 | final workspace gate | `bash ~/.claude/scripts/delegate/verify.sh final` |
 
@@ -434,8 +467,8 @@ Rules:
 - `check` and `test --filter` are feedback while iterating, never a gate.
   Run `check` after each batch of edits, and `test --filter` once per finished
   change, naming all its tests in one call (repeat `--filter`). Never re-run
-  either on a tree that has not changed. User, 2026-10-04: seats ran a
-  `--filter` after every edit, 619 test runs in six hours. After the seat's last edit, run
+  either on a tree that has not changed. User, 2026-10-04: workers ran a
+  `--filter` after every edit, 619 test runs in six hours. After the worker's last edit, run
   `lint` once, naming any one modified package, then `test` for every modified
   package. Lint is never per crate: one run covers the whole workspace (mend
   and clippy across it, format and rustdoc for every changed member). A failed
@@ -455,8 +488,9 @@ Rules:
 - A launch is not a time to build or test: `verify.sh example` and any app or
   binary launch compile their own target. Never precede or follow a launch with
   a build, `check`, or `test` pass just to prove it builds.
-- Phase prompts never use `final`, raw Cargo, `--all-targets`, or the full
-  `clippy` skill. Workspace breadth belongs to <FinalGate/>.
+- Phase prompts never use `final`, raw Cargo, or compose their own Cargo flags.
+  Workspace lint coverage belongs to <PhaseChecks/>; <FinalGate/> owns the
+  workspace all-targets check and full tests.
 - Non-Rust prompts list the project's exact scoped commands under the same
   run-only-what-is-listed rule.
 - Prove any claimed pre-existing failure on the pre-phase tree before mentioning
@@ -466,8 +500,7 @@ Rules:
   failures, not dependency or code defects.
 - A printed `SKIPPED` is skipped, not passed; do not bypass a disabled check
   manually.
-- `style_review=off` does not waive <RunProjectStyleReview/>; it blocks the run
-  from completing <FinalGate/>.
+- `LINT_OP_STYLE_REVIEW=off` makes the phase style review report `Off`.
 </VerificationContract>
 
 <VerificationNarration>
@@ -481,7 +514,11 @@ recording the result.
 
 <FindingsLedger>
 Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
-"${SESSION_DIR}"` only after <Synthesize/> confirms an issue.
+"${SESSION_DIR}" --phase "<phase id>"` for confirmed style violations in the
+main review, or after <Synthesize/> confirms another issue. Each open phase has
+its own ledger, and `--phase` names which one: with two phases open, a call
+naming none is refused. Every launch names its phase (<PassOwnership/>), so the
+launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
@@ -531,7 +568,7 @@ preemption. Close that slot's open pass with `finish-pass --status canceled
 --orphaned-launcher`, which the recorder accepts only for `canceled` and only
 while a pass is open. The slot comes from `PLAN_DELEGATE_TEAM_ROLE` on the call
 and never from the record — a launcher closes its own pass and nothing else, so
-the unit director standing in for one names the seat it is standing in for, once
+the unit director standing in for one names the worker it is standing in for, once
 per killed launcher. A killed fix dispatch leaves its findings
 `repair_in_flight` for the same reason, so `findings.py abandon` per
 <FindingsLedger/> belongs beside this call.
@@ -540,23 +577,37 @@ Phase records are the unit director's, and both belong at the real boundary:
 `finish-phase` for the outgoing phase and `start-phase` for the incoming one run
 before that phase's first dispatch. Recording them late attributes the new
 phase's work to the finished one — its title, its elapsed clock, and its pass
-counts all describe the wrong phase.
+counts all describe the wrong phase. A phase opened beside one still running
+leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
+closes each at its own end. Name the phase on every launch,
+`implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
+with it, where a launch without one takes the newest open phase, and the
+launcher writes its files to that phase's `${PHASE_DIR}`.
 </PassOwnership>
 
 <ProgressContract>
+Before stating any ETA in a message, reply or notice, record it with
+`progress_history.py eta --session-dir "${SESSION_DIR}" --time <HH:MM> --basis stated`
+(`--basis checkpoint` for checkpoint notices, `--basis eta-command` for
+`/unit:eta` and `/unit:eta_breakdown`). Add `--phase-id <id>` when it names a
+phase other than the active one. `<HH:MM>` means today in the user's zone; an
+ETA on a later day takes `<YYYY-MM-DDTHH:MM>`. State the time the recorder
+printed.
+
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
 The key sets the Codex poll timeout and a Claude unit's notifier interval.
 For Codex, a missing or non-positive integer is an error; tell the user to set
-it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
+it. <PrepareSession/> creates Claude's `unit-<run id>` instance, where
 the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
-With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` it creates none: reports run
-only when asked, until `/unit:report on` starts the schedule. The key does not
+With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, the default, it creates none:
+reports run only when asked, until `/unit:report on` starts the schedule. A
+resumed run that already has an instance keeps it, on or off. The key does not
 change the Codex poll interval. The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
 succeeds. While work runs, the notifier sends
-`/unit:report` from `delegate-<run id>` every interval. That message
+`/unit:report` from `unit-<run id>` every interval. That message
 is the Claude tick. Each `progress_history.py progress` call restarts its
 clock; `--hold` keeps at most one tick waiting.
 
@@ -661,27 +712,24 @@ Apply <CoreContract/>, <TurnEndGate/>, <CompactionContract/>,
 <ProductionUnit/> when the plan header names a production.
 
 The numbered steps below carry no turn boundaries. Consecutive steps run in one
-turn unless <TurnEndGate/> authorizes a stop between them. Steps 1–10 apply to
-all modes. Step 11 ends `single`; step 12 applies to loop and verbose.
+turn unless <TurnEndGate/> authorizes a stop between them. Steps 1–8 apply to
+all modes. Step 9 ends `single`; step 10 applies to loop and verbose.
 
 1. <PrepareSession/>
 2. <ComposeWorkOrder/>
-3. <ResolveStyleDiffBase/>
-4. <VerbosePrePhaseGate/> when required
-5. <CoordinateDelegatedPhaseReservation/>
-6. <LaunchImplementation/>
-7. <DualReview/>. Beside the implementation pass's review, run
+3. <VerbosePrePhaseGate/> when required
+4. <CoordinateDelegatedPhaseReservation/>
+5. <LaunchImplementation/>
+6. <PhaseChecks/> at <DualReview/>. Beside the implementation pass's review, run
    <RunApplicationSmokeTest/> and <UXReview/> steps 1–3; open their rows and let
    the first <Synthesize/> gate them with the code findings.
-8. <Synthesize/>
-9. <RunApplicationSmokeTest/>, then <UXReview/>, unless step 7 ran them and no
+7. <Synthesize/>
+8. <RunApplicationSmokeTest/>, then <UXReview/>, unless step 6 ran them and no
    later change reached the app or the screen
-10. <RunProjectStyleReview/> — `single` only; loop and verbose run the run's one
-    style review from <FinalGate/> after the whole plan is green
-11. `single`: <RunPhaseReview/>, <RunPhaseShrink/>, <ConsiderNextItems/>,
+9. `single`: <RunPhaseReview/>, <RunPhaseShrink/>, <ConsiderNextItems/>,
     <PhaseCleanup/> in full, then <RecordPhaseCompletion/> and end. It never
     commits or enters the remaining steps.
-12. Loop and verbose: <PhaseEnd/>.
+10. Loop and verbose: <PhaseEnd/>.
 </ExecutionSteps>
 
 <PhaseEnd>
@@ -695,6 +743,10 @@ Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
 creates the run-active marker and Claude's notifier instance; every exit must
 eventually run `end_session.sh`
 through <RunSummary/> or single-mode completion.
+
+When the plan header carries a `> **Issues:**` line, mark each issue it names
+as being built:
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/proposal_issue.py start <issue>`.
 </PrepareSession>
 
 <ComposeWorkOrder>
@@ -711,22 +763,11 @@ If an initial verbose invocation contains a bounded-auto control, resolve
 follow <AuthorizationContract/>.
 </ComposeWorkOrder>
 
-<ResolveStyleDiffBase>
-Read `~/.claude/commands/unit/style_review.md` in full and apply it once per
-run, before the first dispatch. Loop and verbose only; `single` skips it and
-never sets a base. That file defines this contract and <RunProjectStyleReview/>.
-Never resolve the base from memory of an earlier read. On the default branch
-with no other local branches and no branch named by the user, the run continues
-on the default branch without asking; only a detached HEAD or other existing
-branches raise the branch question, asked exactly once while dispatch waits.
-The user can invoke the same file as `/unit:style_review`.
-</ResolveStyleDiffBase>
-
 <DelegatedPhaseReservationContract>
 Coordination applies to phased Work Orders in every mode. Ad hoc work skips it.
 
-Persist exactly one tagged `DelegatedPhaseReservationState` for the current
-phase at `${SESSION_DIR}/delegated_phase_reservation_state.json`. Write every
+Persist exactly one tagged `DelegatedPhaseReservationState` for each open
+phase at `${PHASE_DIR}/delegated_phase_reservation_state.json`. Write every
 state transition atomically and read it back before the next lifecycle action;
 the initial state must be durable before dispatch. The domain states and
 on-disk shapes are:
@@ -742,7 +783,7 @@ on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | The edit hook, from a clear check that acquired or already held the scopes | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
@@ -771,7 +812,7 @@ path, single-mode completion, run summary, or session cleanup.
 
 <RetainDelegatedPhaseReservation>
 For `Active` or `CheckpointCommittedAwaitingReleaseConfirmation`, leave both the
-engine reservation and `${SESSION_DIR}/delegated_phase_reservation_state.json`
+engine reservation and `${PHASE_DIR}/delegated_phase_reservation_state.json`
 intact. Report that the phase stopped before its checkpoint release could be
 confirmed and name the recovery action that stopped; retain the reservation id
 in durable/internal recovery output even when ordinary user-facing prose omits
@@ -792,8 +833,8 @@ Run after phase authorization and task selection, immediately before
 <LaunchImplementation/>. It is the only pre-dispatch coordination boundary.
 Do not dispatch until this contract reaches one of its four persisted states.
 
-0. On resume, read the state file first. A valid state for the current phase is
-   authoritative:
+0. On resume, read this phase's state file first. A valid state for this phase
+   is authoritative:
 
    | State | Resume action |
    | --- | --- |
@@ -804,8 +845,12 @@ Do not dispatch until this contract reaches one of its four persisted states.
 
    A completed phase removes its inactive state under <RecordPhaseCompletion/>,
    so no old inactive tag is silently reused for a new phase.
-1. When no state exists yet, invoke the shared `/sync board` entry point once,
-   under <BerthDecisions/>:
+1. When no state exists yet, create `${PHASE_DIR}` and write its `files` list
+   from the Work Order's Files field: one repository-relative path per line, a
+   trailing `/` covering the tree below it. A phase alone needs no list; with
+   two open, it is how a seat's edit finds its phase, so keep each path in
+   exactly one phase's list and add a path a seat's refusal names. Then invoke
+   the shared `/sync board` entry point once, under <BerthDecisions/>:
 
    ```sh
    cargo-berth board --json
@@ -817,12 +862,28 @@ Do not dispatch until this contract reaches one of its four persisted states.
    | `board_ready` | Persist `EnrolledAwaitingFirstTouch` and proceed without claiming predicted paths. |
    | `ledger_unreadable` | Stop the run; it is never opt-out. |
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
-2. The registered PreToolUse edit hook owns the next transition. A clear check
-   atomically acquires exact `file:` scopes before the edit, then replaces
-   `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A blocked
-   check refuses the edit and leaves the pending state intact; answer an overlap
-   under <BerthDecisions/>. An unreadable ledger stops without facts. Beyond
-   those answers, do not call `cargo-berth claim` on behalf of a Work Order.
+2. The registered PreToolUse edit hooks own the next transition. A clear check
+   atomically acquires exact `file:` scopes before the edit. A Codex seat's
+   `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which gives each
+   path to its open phase (the only one, else the one whose `files` list covers
+   it, refusing a path no single list owns), checks as that phase's own berth
+   session, `<this session's id>.phase-<phase>`, and replaces that phase's
+   `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A path a
+   sibling phase already holds is allowed and records nothing: the engine
+   answers `left_unmapped` with the sibling's reservation. A Claude edit's hook
+   protects the paths but writes no state, so a first touch of your own leaves
+   the state for the checkpoint backstop (<CheckpointCommit/> step 5). That
+   edit checks under your bare session id, and cargo-berth maps its reservation
+   there, so the phase's own check later answers `left_unmapped` with it. With
+   one open phase, the hook and the backstop record that reservation as the
+   phase's `Active`. With two
+   phases holding reservations, your own edit is refused as ambiguous until you
+   name its phase: `cargo-berth check <path> --reservation <that phase's
+   reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
+   leaves the pending state intact; a seat reports the refusal to you, and you
+   answer the overlap under <BerthDecisions/>. An unreadable ledger stops
+   without facts. Beyond those answers, do not call `cargo-berth claim` on
+   behalf of a Work Order.
 </CoordinateDelegatedPhaseReservation>
 
 <BerthDecisions>
@@ -832,10 +893,17 @@ paths, answer choices — and record the answer it picks; that answer is a
 decision, not a relayed user approval. With no showrunner, pick the answer
 yourself. Either way, report what was decided in one line.
 
-An answer is `cargo-berth claim <paths> --<choice> <holder> --overlap-why
-"<why>"`, `<choice>` one of `before`, `after`, `defer`, `override`; it records
-in one step and exits 0. If another holder also conflicts, it is refused and
-records nothing: split the claim so each call meets one holder.
+An answer is `cargo-berth claim <paths> --reservation <id> --<choice> <holder>
+--overlap-why "<why>"`, `<choice>` one of `before`, `after`, `defer`,
+`override`, and `<id>` the asking phase's recorded reservation; it records in
+one step and exits 0. `before` and `after` widen only that phase's reservation,
+with the ordering edge; `defer` records the answer and takes no paths, so the
+phase holds its dispatch on them. An id the ledger does not know is refused.
+A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
+recorded: the answer stands, so do not repeat it. When several holders
+conflict, name every one in the same claim, one flag each: `--before`,
+`--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
+claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
@@ -888,11 +956,11 @@ At an eligible tick, in that same tick:
 
 1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
 2. **Delete every stale delivery artifact and prove they are gone.**
-   `${SESSION_DIR}` spans the whole run but `${REVIEW_PASS}` resets with every
-   phase, so earlier phases' artifacts already sit on disk under the exact names
-   this phase's launches will poll.
+   A resumed or repeated phase reuses `${PHASE_DIR}`, so an earlier delivery's
+   artifacts can already sit on disk under the exact names this launch will
+   poll.
 
-   `rm -f "${SESSION_DIR}"/final_diff_*.diff "${SESSION_DIR}"/final_diff_*.ready`
+   `rm -f "${PHASE_DIR}"/final_diff_*.diff "${PHASE_DIR}"/final_diff_*.ready`
 
    Clear the whole glob, not just the current index — later passes in this phase
    collide the same way — then confirm no sentinel remains before continuing. A
@@ -906,14 +974,13 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. When the production doc names a review pool and the phase's arm is `pool`,
-   select no seat. Otherwise select its seat under <TeamReview/>, save the
+4. When the production doc names a review pool, select no worker. Otherwise select its worker under <TeamReview/>, save the
    slot as `${EARLY_REVIEW_SLOT}`, and apply <RoleReassignment/> when the open
-   seat's role changes; when every open seat is busy, name a new `review` seat
-   and keep it after the turn. On the pool arm, read `${EARLY_REVIEW_SLOT}`
+   worker's role changes; when every open worker is busy, name a new `review` worker
+   and keep it after the turn. With a pool, read `${EARLY_REVIEW_SLOT}`
    when a cancel call needs it:
-   the one line in `${SESSION_DIR}/review_slot_adversary` for pass 1, or
-   `${SESSION_DIR}/review_slot` for a closure. A missing file means the launcher
+   the one line in `${PHASE_DIR}/review_slot_adversary` for pass 1, or
+   `${PHASE_DIR}/review_slot` for a closure. A missing file means the launcher
    opened no pass, so record nothing.
    Write the applicable early-form prompt — the `adversary`
    lens of
@@ -925,19 +992,19 @@ At an eligible tick, in that same tick:
    launches at completion under <DualReview/> step 3.
 5. Launch `review.sh` exactly as <DualReview/> step 3 does — with
    `--pool code --lease <slug>/<unit>/<phase>` when the production doc names
-   a review pool and the phase's arm is `pool`; otherwise with `--to` for an
-   open seat or `--slot "${EARLY_REVIEW_SLOT}"` for the new seat, and
+   a review pool; otherwise with `--to` for an
+   open worker or `--slot "${EARLY_REVIEW_SLOT}"` for the new worker, and
    `adversary` as its lens for pass 1 — appending one extra final argument:
-   `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
+   `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
    `${DISPATCH_HANDLE}` untouched.
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
+   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
 
-   Pass the same lens the launch carries, and none where the launch carries
-   none: the marker names the status and pid files it will watch for, and a
+   Pass the same lens and phase the launch carries, and no lens where the
+   launch carries none: the marker names the status and pid files it will watch for, and a
    marker watching the unsuffixed pair while the launcher writes the suffixed
    one retires the row on its first tick, reporting a live reviewer as gone.
    It is a presentation marker, not a pass event, so it cannot forge anything
@@ -954,8 +1021,8 @@ always may — early launch is opportunistic, never required.
 
 | Event | Required action |
 | --- | --- |
-| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; on the pool arm, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `review.sh`'s run then sends the reviewer its Stage 2. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; with a pool, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -999,57 +1066,52 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-**Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
-current pass or activity. This is unconditional: the numbered items say what
-happened, and the tables say how far into the phase and the plan it happened,
-which is the half the user cannot reconstruct. Emit it after any launch,
-printed below the sections above exactly as the recorder emits it. With the
-phase active and no pass or activity open, the recorder prints the same tables
-from the phase's last recorded values under an `as of` line: paste them like any
-tick. When the last phase is closed but an activity is still open, the recorder
-prints both tables from that phase's last recorded values with the activity as
-the running row: paste them like any tick. `No active phase to report` remains
-only when no phase is active and no activity is open; then continue without the
-tables rather than stalling the turn.
+**Close every delegation result and launch with the short progress report**
+from <ProgressReport/>: phase and stage, ETA line, workers, summary, board link,
+and wall clock. Copy the recorder's phase, stage, ETA and clock exactly. Include
+both recorder tables only for `/unit:report tables`.
+
+Between windows, keep the recorder's `as of` and no-open-window lines. An
+activity still open after its phase closes remains the stage. If the recorder
+reports `No active phase to report`, continue without the progress report.
 </DelegationResultFormat>
 
 <FixDispatch>
-Apply <LongLivedSeats/>.
+Apply <LongLivedWorkers/>.
 
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
 <WritePromptContract/>. Work Specification contains every batch id with concrete
 file/line findings and intended behavior. Verification contains only implicated
-`verify.sh` lines—usually check and test, adding lint only for lint-related
-repairs.
+`verify.sh` lines—usually check and test, plus lint after the worker's last
+edit when the phase has a lint run, per <PhaseChecks/>.
 
-A repair runs **one seat per file set no other seat touches**: when the failing
-tests or findings split that way, always run as many seats as you can reasonably
+A repair runs **one worker per file set no other worker touches**: when the failing
+tests or findings split that way, always run as many workers as you can reasonably
 manage; otherwise one. User, 2026-10-04. Use the open `impl` and `test` slots
-first, preferring the seat that owns the files and reassigning another open seat
+first, preferring the worker that owns the files and reassigning another open worker
 under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
-open seat can take another file set. Each seat's task and kind are `fix`, its
+open worker can take another file set. Each worker's task and kind are `fix`, its
 ninth argument remains its slot, and it gets its own
-`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each seat makes its repair and writes, for each testable finding, the regression test that would
+`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker makes its repair and writes, for each testable finding, the regression test that would
 have caught it — one that fails without the repair. A finding about what is
 drawn gets a test that renders and reads the pixels back, or a live pixel check
 the prompt names; a test of components, constants or hand-written pointer hits
 does not count. It names each test for the behavior it pins and puts the
 finding id only in its summary; an id in code outlives the review that defined
-it. <ClosureReview/> is the cold read, so no seat is spent
-on one here. A seat's file set is its findings' files plus their test targets;
-its prompt names every other seat's files as read only.
+it. <ClosureReview/> is the cold read, so no worker is spent
+on one here. A worker's file set is its findings' files plus their test targets;
+its prompt names every other worker's files as read only.
 
-Dispatch every open seat with `implement.sh --to <full-seat-name>` before the
+Dispatch every open worker with `implement.sh --to <full-worker-name>` before the
 usual positional arguments; the prompt file is the follow-up message. Omit
-`--to` only for a new seat allowed by <LongLivedSeats/>. Messages without the
+`--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
 launcher are for questions only.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
-PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-seat-name>" \
+PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
   "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
@@ -1057,8 +1119,8 @@ PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-seat-name>" \
 
 **`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
 only the launcher watches the worker exit, so only it can say a repair landed.
-Each further seat runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
-own prompt and its slot; the round is done only once every seat has exited.
+Each further worker runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
+own prompt and its slot; the round is done only once every worker has exited.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
 `${EARLY_REVIEW_SLOT}` at dispatch, and close the
@@ -1091,23 +1153,23 @@ the measured cause.
 Dispatch the normal <DualReview/> closure review only when the diff cannot
 answer the question: a public API or signature change with a caller outside
 the diff, a registration, transition, or invariant reaching past the batch, an
-id whose verdict reads unclear, a claim the seat says it could not verify and
+id whose verdict reads unclear, a claim the worker says it could not verify and
 the main read cannot verify either, or a new defect the repair introduced.
 Uncertainty routes to the reviewer; a hunk fully read and fully understood
 does not. A closure review costs a stage of the phase, so it is spent on a
-question, never on a path. Select its open seat under <TeamReview/>, post the
+question, never on a path. Select its open worker under <TeamReview/>, post the
 <RoleReassignment/> handoff when its role changes, and launch it with
-`review.sh --to`; when every open seat is busy, open and retain a role-named
-review seat with `review.sh --slot review` instead.
-When the production doc names a review pool and the phase's arm is `pool`,
-use `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting
-an open seat.
+`review.sh --to`; when every open worker is busy, open and retain a role-named
+review worker with `review.sh --slot review` instead.
+When the production doc names a review pool, use
+`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting an
+open worker.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
-in the ledger through the launcher. Any third outcome — a new-seat or follow-up dispatch stopped,
+in the ledger through the launcher. Any third outcome — a new-worker or follow-up dispatch stopped,
 killed, or gone without `impl_status` reaching either — is the unit director's to
 resolve with `findings.py abandon` per <FindingsLedger/>, then apply
 <RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
@@ -1126,13 +1188,15 @@ reporting anything about the round.
    <ExplainOnDemand/> before any choice.
 3. If every remaining issue is trivial — doc-only, an agreed rename, or a
    small mechanical change whose one correct edit is evident from the finding
-   itself, with no design judgment and no reviewer disputing the reading — the
-   unit director applies them all directly, runs the implicated `verify.sh` lines,
-   reports the edits and why they qualified, and continues. A fix round is
-   never dispatched for a batch that is trivial throughout; a single
-   non-trivial finding sends the whole batch through steps 4–5 instead.
+   itself, with no design judgment and no reviewer disputing the reading —
+   the unit director applies them all directly,
+   runs the implicated `verify.sh` lines, reports the edits and why they
+   qualified, and records `verdict --state accepted` for each fixed issue
+   with a ledger id, citing the edit and verification evidence. Then continue.
+   Otherwise the whole batch follows steps 4–5.
 4. Apply <DecisionRouting/> before opening findings.
-5. Open every confirmed remaining issue, then obey `findings.py gate`:
+5. Open every confirmed remaining issue that has no ledger id yet, then obey
+   `findings.py gate`:
    - `converged`: retain nits for retrospective; continue to smoke, then
      <UXReview/>.
    - `dispatch`: apply <FixDispatch/> to the complete batch, then return here.
@@ -1216,17 +1280,18 @@ instructions name; with none, skip and say so in one line.
    with TaskStop. With `ui` listed, use this procedure on every check:
 
    - Let `<slug>` be the production doc's filename without `-production.md`.
-     Use the pool regardless of the phase's code-review arm. Count design
-     checks within the phase from `k=1`, including repairs and notice checks;
-     resume from the largest saved `ux_<phase>_<k>_*` name plus one.
+     Count design checks within the phase from `k=1`, including repairs and
+     notice checks; resume from the largest saved `ux_<phase>_<k>_*` name plus
+     one.
    - Write one full shot path per line to
      `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, using the next unused UX
      pass index in this session. Write the helper prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
      `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
-     in the background. The launcher resets the reviewer before each turn
-     and sends the unit's memory and every listed image.
+     in the background. The launcher resumes the unit's UI reviewer, sends
+     every listed image, and sends the unit's memory on that reviewer's
+     first turn only; its thread carries the memory after that.
    - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
      also start the fresh Claude helper with the prompt from its helper file
      and those shots;
@@ -1234,7 +1299,7 @@ instructions name; with none, skip and say so in one line.
      results; stop the helper with TaskStop. When the marker exists, run no
      helper and use only the pool's result.
    - Save the full helper verdict, when run, and the successful pool verdict
-     from `${SESSION_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
+     from `${PHASE_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
      records in `${PLAN_DELEGATE_HISTORY_DIR:-$HOME/.local/state/plan-delegate}/review_turns/<session dir name>/`,
      as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
      pair. A failed shadow pool check leaves its pool file missing and gets
@@ -1280,27 +1345,17 @@ instructions name; with none, skip and say so in one line.
    no check of its own (user rule 2026-10-01).
 </UXReview>
 
-<RunProjectStyleReview>
-Read `~/.claude/commands/unit/style_review.md` in full and apply it. This is
-the run's single style audit, over everything the project built rather than one
-phase: `single` runs it after first smoke, loop and verbose from <FinalGate/>.
-Phases never run it — they carry no style gate, and a phase checkpoint never
-waits on one. Never run it from memory of an earlier read; the after-cleanup
-reverification and the smoke reset are what get dropped. The user can invoke the
-same file as `/unit:style_review`.
-</RunProjectStyleReview>
-
 <RunPhaseReview>
 Read `~/.claude/docs/delegate/run_phase_review.md` in full once per phase.
 In loop and verbose, apply it at <PhaseEnd/>'s point. In `single`, use
-<ExecutionSteps/> step 11. The file also defines <RunPhaseShrink/>.
+<ExecutionSteps/> step 9. The file also defines <RunPhaseShrink/>.
 </RunPhaseReview>
 
 <ConsiderNextItems>
 Read `~/.claude/commands/unit/add_ons.md` in full and apply it at
-<PhaseEnd/>'s point in loop or verbose; in `single`, use <ExecutionSteps/> step
-11. Phased plans only; the unit director performs the
-assessment and never launches another agent for it. It writes `apply`
+<PhaseEnd/>'s point in loop or verbose; in `single`, use <ExecutionSteps/>
+step 9. Phased plans only; the unit director performs the assessment and never
+launches another agent for it. It writes `apply`
 corrections, accumulates every add-on in `${NEXT_ITEMS_PENDING}`, and asks
 nothing. Never work from memory of an earlier read — `Class` obedience and the
 single-line reporting rule are what drift.
@@ -1341,12 +1396,12 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 </ShrinkCommit>
 
 <PhaseCleanup>
-In `single`, run both halves under <ExecutionSteps/> step 11.
+In `single`, run both halves under <ExecutionSteps/> step 9.
 At <PhaseEnd/>'s worker cleanup point, run
-`python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`.
-It removes the completed phase's Claude seats and any seat a dead run left
+`python3 ~/.claude/scripts/delegate/remove_workers.py --session-dir "${SESSION_DIR}"`.
+It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
-<LongLivedSeats/>, do not end this run's Codex seats: their turns finish, their
+<LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
 threads stay open, and `end_session.sh` ends them with the run. TaskStop each
 Claude Agent helper, end finished launchers, and shut down every Hana or
 example app this phase launched. Never touch what another session started.
@@ -1362,12 +1417,13 @@ User, 2026-10-03.
 
 <RecordPhaseCompletion>
 In loop and verbose, run at <PhaseEnd/>'s point; in `single`, follow
-<ExecutionSteps/> step 11. Call `progress_history.py finish-phase
---session-dir "${SESSION_DIR}" --status completed`.
+<ExecutionSteps/> step 9. Call `progress_history.py finish-phase
+--session-dir "${SESSION_DIR}" --status completed`, adding `--phase-id <id>`
+while another phase is open.
 
 After a loop/verbose phase with `RepositoryNotEnrolled` or
 `EnrolledAwaitingFirstTouch`, delete its completed-phase state
-file. `Active` must already have been replaced by
+file, `${PHASE_DIR}/delegated_phase_reservation_state.json`. `Active` must already have been replaced by
 `CheckpointCommittedAwaitingReleaseConfirmation`, and that pending state must
 already have been deleted by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
@@ -1414,9 +1470,8 @@ clear after X. In verbose mode outside an active window, use <PhaseEnd/>'s
 report and gate.
 
 For loop or an active auto window, reset `REVIEW_PASS=0` and smoke to
-`not_run`. Style state is per-run: never reset it or delete its marker here,
-and never re-resolve `STYLE_DIFF_BASE`. Run <PeriodicCI/> when a CI point is
-due, after the shrink commit per <PhaseEnd/>, and repair a red result before
+`not_run`. Run <PeriodicCI/> when a CI point is due, after the shrink commit
+per <PhaseEnd/>, and repair a red result before
 dispatching. Announce the next phase, run
 <ComposeWorkOrder/>, <VerbosePrePhaseGate/> when required,
 <CoordinateDelegatedPhaseReservation/>, and <LaunchImplementation/>. Its
@@ -1427,31 +1482,21 @@ Every return rechecks Pending decisions.
 <FinalGate>
 Loop/verbose only after plan exhaustion:
 
-1. Launch `verify.sh final` under <BackgroundVerificationContract/>. It owns workspace
-   fmt-check, all-targets check, and full tests.
-2. For Rust, read `~/.claude/commands/clippy.md` in full and apply it inline
-   with arguments `auto-proceed no-style`. Style stays out of this step; step 4
-   owns it.
-3. On failure, create a synthetic phase `final` / `Final verification` once:
+1. Launch `verify.sh final` once under <BackgroundVerificationContract/>. It
+   owns the workspace all-targets check and full tests.
+2. On failure, create a synthetic phase `final` / `Final verification` once:
    capture a new baseline, run `start-phase`, reset review and smoke state, open
    the concrete failures in the ledger, then use its gate plus <FixDispatch/>.
    Later repairs do not repeat those resets. After closure convergence, run
    applicable smoke and return here; do not run phase review or a phase
    checkpoint for the synthetic phase. Rerun this gate after each repair.
-4. Once full verification is green, run <RunProjectStyleReview/> exactly once —
-   this is the run's only style pass, and it covers every phase the project
-   checkpointed, not just synthetic final fixes. Then rerun steps 1-2 so its
-   cleanup receives full breadth.
-5. Batch all deferred smoke actions after the gate is green. Ask the user once;
+3. Batch all deferred smoke actions after the gate is green. Ask the user once;
    route discovered defects through the synthetic fix path. If declined, carry
    them as outstanding rather than blocking run completion.
-6. Finish the synthetic phase when applicable, run <FinalGateCommit/>, and
+4. Finish the synthetic phase when applicable, run <FinalGateCommit/>, and
    record the final result.
 
 Single mode and early endings skip this gate and state why in <RunSummary/>.
-An ending that never reaches this gate never runs the style review;
-<RunSummary/> reports that, and the next run over the same plan resolves the
-same `STYLE_DIFF_BASE` and picks the whole project up again.
 </FinalGate>
 
 <FinalGateCommit>
@@ -1476,7 +1521,7 @@ Emit on every multi-phase ending:
 **Final gate:** [result or skipped reason]
 **As-built:** [docs created or updated, and the commit that carried them; in
 `single`, that they are uncommitted; or the reason the run never ran it]
-**Style review:** [range reviewed and result, or the reason the run never ran it]
+**Style review:** [each phase's reviewed range and result, including Off or a skipped reason]
 **Smoke checks still unperformed:** [phase + exact action, or none]
 **Deferred decisions still open:** [phase + decision, or none]
 **Add-ons awaiting review:** [count, or none]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,7 +12,7 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypedDict, Unpack, override
+from typing import Literal, TypedDict, Unpack, cast, override
 from unittest.mock import patch
 
 import index
@@ -21,6 +22,7 @@ import mac_outcome
 import store
 from test_holds import hold_event, timed_hold_events, write_mac_block
 from test_index import Record, call, encode, point_root_at, step
+from test_report import MeasuredCliRun, measure_cli_work
 from user_zone import user_zone
 
 CLI = Path(__file__).with_name("cli.py")
@@ -193,6 +195,62 @@ class MacReportTests(unittest.TestCase):
             step("local-step", started_at="2026-10-12T14:01:00.000Z", call_id="local-pass", step="nextest", status=0, tree_key="tree-a"),
         )
         self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
+
+    def record_sent_mac_step(self, call_id: str, sent_key: str) -> None:
+        mirror = self.root.parent / "mac-mirror"
+        mirror.mkdir()
+        self.assertFalse((mirror / ".git").exists())
+        environment = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("BUILDLOG_") and name != "MANIFEST_PATH"
+        }
+        environment.update({
+            "BUILDLOG_DIR": str(self.root), "BUILDLOG_CALLER": "verify-mac",
+            "BUILDLOG_CALL_ID": call_id, "BUILDLOG_SENT_TREE_KEY": sent_key,
+        })
+        started = datetime(2026, 10, 12, 14, tzinfo=UTC).timestamp()
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("record.py")), "step", "1",
+             str(started), str(started + 1), "0", "", "", "cargo", "nextest", "run"],
+            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            cast(Record, json.loads(line))
+            for path in self.root.glob("*/*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        mac_steps = [row for row in rows if row.get("kind") == "step" and row.get("caller") == "verify-mac"]
+        self.assertEqual(len(mac_steps), 1)
+        self.assertEqual((mac_steps[0]["call_id"], mac_steps[0]["tree_key"]), (call_id, sent_key))
+
+    def test_sent_key_on_recorded_mac_step_counts_a_natedev_pass_of_the_same_selection(self) -> None:
+        sent_key = "a" * 64
+        self.write(
+            self.mac_call("sent-mac-failure", "failed", command="test hana --filter one"),
+            self.mac_call("same-selection-pass", "declined", "local_flag", local_reason="retry",
+                          command="test hana --filter one"),
+            step("same-selection-step", started_at=START, call_id="same-selection-pass",
+                 step="nextest", status=0, tree_key=sent_key),
+        )
+        self.record_sent_mac_step("sent-mac-failure", sent_key)
+        output = self.report()
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded.", output)
+        self.assertNotIn("without a tree key", output)
+
+    def test_sent_key_on_recorded_mac_step_does_not_count_a_different_natedev_command(self) -> None:
+        sent_key = "a" * 64
+        self.write(
+            self.mac_call("sent-mac-failure", "failed", command="test hana --filter one"),
+            self.mac_call("different-selection-pass", "declined", "local_flag", local_reason="retry",
+                          command="test hana --filter two"),
+            step("different-selection-step", started_at=START, call_id="different-selection-pass",
+                 step="nextest", status=0, tree_key=sent_key),
+        )
+        self.record_sent_mac_step("sent-mac-failure", sent_key)
+        output = self.report()
+        self.assertIn("Mac failures with a natedev pass of the same tree: 0 recorded.", output)
+        self.assertNotIn("without a tree key", output)
 
     def test_mac_failures_require_the_same_test_selection_as_the_natedev_pass(self) -> None:
         self.write(
@@ -531,7 +589,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("Now: Mac blocked by hana for render since 2026-10-08 00:00 PDT", output)
         self.assertNotIn("Not recorded yet:", output)
 
-    def test_mac_report_cli_runs_under_two_seconds_at_the_log_size(self) -> None:
+    def test_mac_report_cli_work_grows_near_linearly_at_the_log_size(self) -> None:
         now = datetime.now(UTC)
         began = (now - timedelta(hours=20)).replace(minute=0, second=0, microsecond=0)
         with self.log.open("wb") as handle:
@@ -557,13 +615,26 @@ class MacReportTests(unittest.TestCase):
             for hold_row in hold_rows:
                 _ = handle.write(encode(hold_row))
         self.assertEqual(index.update(), 65_600 + len(hold_rows))
-        measured = time.perf_counter()
-        result = subprocess.run(
-            [sys.executable, str(CLI), "mac-report"], env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
-            capture_output=True, text=True, check=False, timeout=30,
-        )
-        elapsed = time.perf_counter() - measured
-        print(f"mac-report timed fixture: {elapsed:.3f} s")
+        full_rows = self.log.read_bytes().splitlines(keepends=True)
+        quarter_rows = full_rows[:29_138:4] + full_rows[29_138:65_600:4] + full_rows[65_600:]
+        environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}
+        runs: list[list[MeasuredCliRun]] = []
+        for rows in (quarter_rows, full_rows):
+            _ = self.log.write_bytes(b"".join(rows))
+            _ = index.reindex()
+            runs.append([measure_cli_work("mac-report", environment, len(rows)) for _ in range(3)])
+        for measured in [*runs[0], *runs[1]]:
+            self.assertEqual(measured.result.returncode, 0, measured.result.stderr)
+            self.assertEqual(measured.work["index_updates"], 1)
+            self.assertEqual(measured.work["launch_collections"], 0)
+            self.assertLessEqual(measured.work["statements"], 4)
+            self.assertEqual(measured.work["step_reads"], 1)
+        baseline = min(run.work["cpu_seconds"] for run in runs[0])
+        full = min(run.work["cpu_seconds"] for run in runs[1])
+        self.assertLessEqual(full, baseline * 8, f"CLI CPU grew from {baseline} to {full} for four times the rows")
+        baseline_instructions = min(run.work["instructions"] for run in runs[0])
+        self.assertLessEqual(min(run.work["instructions"] for run in runs[1]), baseline_instructions * 8)
+        result = runs[1][-1].result
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Usable share:", result.stdout)
         self.assertIn("Set aside as not usable: blocked, backoff, unreachable, battery, disk, off", result.stdout)
@@ -581,7 +652,7 @@ class MacReportTests(unittest.TestCase):
             duration = cell.removeprefix("at least ")
             hours, minutes = duration.split(":")
             self.assertGreater(int(hours) * 60 + int(minutes), 0, day_line)
-        self.assertLessEqual(elapsed, 2.0, result.stdout)
+
 
 
 if __name__ == "__main__":

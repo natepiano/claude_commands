@@ -12,7 +12,7 @@
 #                                 waiting on a summary
 #   env AGENT_BG_LEDGER=<file>    append `<id>\t<mesh_name>` to <file> once the
 #                                 session is registered, for the caller's
-#                                 cleanup -- delegate/remove_seats.py reads it
+#                                 cleanup -- delegate/remove_workers.py reads it
 #
 # Why this exists rather than agent_exec.sh: a delegate launched with
 # `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
@@ -33,8 +33,8 @@
 #
 # The session is deliberately LEFT ALIVE when its turn ends. A message resumes a
 # stopped-turn session from its transcript, so a finished implementer can still
-# answer the tester's question. The caller ends it: a delegate seat through the
-# AGENT_BG_LEDGER record and delegate/remove_seats.py, a friend through the id
+# answer the tester's question. The caller ends it: a delegate worker through the
+# AGENT_BG_LEDGER record and delegate/remove_workers.py, a friend through the id
 # in <id_file>.
 
 set -euo pipefail
@@ -93,7 +93,7 @@ fi
 
 if [[ "${ATTACH}" == "1" ]]; then
   BG_ID="$(cat "${ID_FILE}" 2>/dev/null || true)"
-  [[ -n "${BG_ID}" ]] || { echo "agent_bg.sh: missing seat id" >&2; exit 2; }
+  [[ -n "${BG_ID}" ]] || { echo "agent_bg.sh: missing worker id" >&2; exit 2; }
   transcript_count() {
     BG_ID="${BG_ID}" MESH_NAME="${MESH_NAME}" "$PY" - <<'PY'
 import json
@@ -147,16 +147,19 @@ PY
   # The transcript index identifies this turn even if it finishes before the
   # first poll. Keep it with the launcher's claim for killed-launch recovery.
   if [[ -n "${PLAN_DELEGATE_BOARD_DIR:-}" && -n "${PLAN_DELEGATE_TEAM_ROLE:-}" ]]; then
-    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - <<'PY'
+    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../delegate" <<'PY'
 import fcntl
 import json
 import os
 from pathlib import Path
 
+import sys
+sys.path.insert(0, sys.argv[1])
+from worker_state import worker_claim_lock
+
 root = Path(os.environ["PLAN_DELEGATE_BOARD_DIR"])
 slot = os.environ["PLAN_DELEGATE_TEAM_ROLE"]
-with (root / "impl_seat_claim.lock").open("a+") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
+with worker_claim_lock(root):
     path = root / f"impl_claim_{slot}.json"
     try:
         claim = json.loads(path.read_text())
@@ -194,25 +197,28 @@ else:
   done
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/claude_account.sh"
+claude_launch_environment || exit 1
+
 # `claude --bg` runs the session in a spare process of one long-lived per-user
 # daemon, so the session inherits the environment of whichever launch started
-# the daemon, not this one's: on 2026-10-05 every unit's seats took one unit's
-# cargo token and filed into its session. Hand the seat its delegate variables
+# the daemon, not this one's: on 2026-10-05 every unit's workers took one unit's
+# cargo token and filed into its session. Hand the worker its delegate variables
 # through settings, empty when unset (every reader treats empty as unset), and
 # keep them off the launch below so a daemon it starts carries none.
-SEAT_ENV_NAMES=(PLAN_DELEGATE_BOARD_DIR PLAN_DELEGATE_TEAM_ROLE AGENTS_CONFIG_FILE)
-seat_settings="$("$PY" -c '
+WORKER_ENV_NAMES=(PLAN_DELEGATE_BOARD_DIR PLAN_DELEGATE_TEAM_ROLE AGENTS_CONFIG_FILE)
+worker_settings="$("$PY" -c '
 import json
 import os
 import sys
 
 env = {name: os.environ.get(name, "") for name in sys.argv[1:]}
 print(json.dumps({"sandbox": {"enabled": False}, "env": env}))
-' "${SEAT_ENV_NAMES[@]}")"
+' "${WORKER_ENV_NAMES[@]}")"
 
 launch_args=(--bg --name "${MESH_NAME}"
              --dangerously-skip-permissions
-             --settings "${seat_settings}")
+             --settings "${worker_settings}")
 if [[ -n "${MODEL}" ]]; then
   launch_args+=(--model "${MODEL}")
 fi
@@ -230,7 +236,7 @@ banner="$(cd "${WORKING_DIR}" \
 # so match the id itself rather than splitting on them -- on that line alone. A
 # refused launch prints an error instead, and a path in it can carry an 8-hex
 # run: the caller's own session id sits in its scratchpad path, and taking that
-# as the seat's id hands the caller's session to whatever stops this seat.
+# as the worker's id hands the caller's session to whatever stops this worker.
 BG_ID="$(printf '%s\n' "${banner}" | grep 'backgrounded' | grep -oE '\b[0-9a-f]{8}\b' | head -1 || true)"
 if [[ -z "${BG_ID}" ]]; then
   printf '%s\n' "${banner}" > "${LOG_FILE}"
@@ -240,6 +246,16 @@ if [[ -z "${BG_ID}" ]]; then
 fi
 printf '%s\n' "${BG_ID}" > "${ID_FILE}"
 if [[ -n "${LEDGER}" ]]; then
+  LEDGER="$("$PY" - "$(dirname "${BASH_SOURCE[0]}")/../delegate" "${LEDGER}" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from worker_state import worker_ledger
+
+path = Path(sys.argv[2])
+print(worker_ledger(path.parent) if path.name in ("seats", "workers") else path)
+PY
+)"
   printf '%s\t%s\n' "${BG_ID}" "${MESH_NAME}" >> "${LEDGER}"
 fi
 "$PY" "$(dirname "${BASH_SOURCE[0]}")/../usage/agents_log.py" append --id "${BG_ID}" --role worker || true
@@ -263,7 +279,7 @@ for row in rows:
     if row.get("id") == wanted:
         # A background row now carries BOTH fields, and they disagree: `status`
         # speaks the busy/idle vocabulary the poll loop below matches on, while
-        # `state` speaks working/blocked/done and goes stale -- a seat whose turn
+        # `state` speaks working/blocked/done and goes stale -- a worker whose turn
         # ended half an hour ago has been observed still reading `working`.
         # Prefer `status`; fall back to `state` only when the row omits it, and
         # translate it, because an untranslated `done` matches no case arm and

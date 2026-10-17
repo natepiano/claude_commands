@@ -2,7 +2,7 @@
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
 # flags, config/lint.conf gating, and macOS sandbox-failure detection. This is the single bottom layer. The lint CLI in
 # this directory is the public entry point (shell aliases, validate_ci.sh,
-# the fix pipeline, pre_release_checks.sh, /clippy); delegate/verify.sh sources this
+# the fix pipeline and pre_release_checks.sh); delegate/verify.sh sources this
 # file directly and adds only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.
@@ -197,8 +197,36 @@ buildlog_finish_memory() {
     fi
 }
 
+# run() returns this when LINT_QUEUE_LEAVE_HOOK (memory_gate.sh) ended the
+# memory wait or natedev's hold wait: the step never started, holds no reservation, leaves no build
+# log row and takes back build_hold_step_started's mark, and BUILDLOG_MEM_WAIT_S
+# keeps the time it waited. run_nextest passes it through. 75 is EX_TEMPFAIL;
+# neither cargo nor nextest exits with it.
+LINT_LEFT_QUEUE_STATUS=75
+
+# Record both streams without putting stderr into a JSON consumer's stdout.
+run_json_stdout() (
+    local log=$1 stderr_dir stderr_pid status=0
+    shift
+    : > "$log" || return $?
+    stderr_dir="$(mktemp -d)" || return $?
+    trap 'rm -rf "$stderr_dir"' EXIT
+    mkfifo "$stderr_dir/stderr" || return $?
+    # An ordinary background process can be waited for on Bash 3.2 too.
+    tee -a "$log" < "$stderr_dir/stderr" >&2 &
+    stderr_pid=$!
+    "$@" 2> "$stderr_dir/stderr" | tee -a "$log" || status=${PIPESTATUS[0]}
+    # Drain stderr before callers inspect or remove the completed step's log.
+    wait "$stderr_pid" || true
+    return "$status"
+)
+
 run_once() {
-    printf '+ %s\n' "$*"
+    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
+        printf '+ %s\n' "$*" >&2
+    else
+        printf '+ %s\n' "$*"
+    fi
     if buildlog_step_compiles "$@"; then
         build_hold_wait_local || return $?
     fi
@@ -209,6 +237,12 @@ run_once() {
         while :; do
             buildlog_wait_for_memory "$@"
             memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+            if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+                buildlog_release_memory 0
+                [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
+                BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""
+                return "$LINT_LEFT_QUEUE_STATUS"
+            fi
             if build_hold_check_admission; then
                 break
             else
@@ -222,6 +256,10 @@ run_once() {
             build_hold_wait_local || {
                 status=$?
                 BUILDLOG_MEM_WAIT_S=$memory_wait
+                if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
+                    [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
+                    BUILDLOG_START="" BUILDLOG_TREE=""
+                fi
                 return "$status"
             }
         done
@@ -257,8 +295,13 @@ run_once() {
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
-    buildlog_exec "$@" 2>&1 | tee "$log"
-    status=${PIPESTATUS[0]}
+    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
+        run_json_stdout "$log" buildlog_exec "$@"
+        status=$?
+    else
+        buildlog_exec "$@" 2>&1 | tee "$log"
+        status=${PIPESTATUS[0]}
+    fi
     set -e
     buildlog_finish_memory "$status" "$sampler_pid"
     if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
@@ -299,6 +342,7 @@ run() {
 SWEEP_EVERY_S=300
 
 sweep_after_step() {
+    [[ "${LINT_SKIP_SWEEP:-}" == 1 ]] && return 0
     local arg now last=0 dir stamp
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 0
@@ -377,6 +421,33 @@ nextest_width_arm() {
     fi
 }
 
+# Local nextest runs share the machine's test threads: a run takes the mode's
+# width divided by the runs in flight, itself included, never below
+# nextest_budget.FLOOR (4). Each run holds an flock on its own marker through fd
+# 9 for as long as it runs, so a killed run stops counting with its shell. The
+# test processes do not inherit the fd. The trial mode stays unshared, since
+# width_trial.py names its arm by width. Any failure runs at the full width.
+LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
+
+run_nextest_shared() {
+    local width=$1 shared="" status=0 dir name
+    shift
+    dir="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/admission/nextest"
+    name="$$.$RANDOM$RANDOM"
+    if ! { mkdir -p "$dir" && : > "$dir/$name.new"; } 2>/dev/null; then
+        run cargo nextest run --test-threads "$width" "$@"
+        return
+    fi
+    {
+        shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "$dir" "$name" "$width" 9 2>/dev/null)" \
+            || shared=""
+        [[ "$shared" =~ ^[1-9][0-9]*$ ]] || shared=$width
+        run cargo nextest run --test-threads "$shared" "$@" 9>&- || status=$?
+    } 9>>"$dir/$name.new"
+    rm -f "$dir/$name.run" "$dir/$name.new"
+    return "$status"
+}
+
 run_nextest() {
     require_nextest
     build_hold_wait_local || return $?
@@ -415,7 +486,11 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            run cargo nextest run --test-threads "$width" "$@"
+            if [[ "$LINT_TEST_WIDTH" == trial ]]; then
+                run cargo nextest run --test-threads "$width" "$@"
+            else
+                run_nextest_shared "$width" "$@"
+            fi
             return
         fi
     fi
@@ -462,6 +537,13 @@ invoke_clippy() {
     done
     run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
         ${clippy_args[@]+"${clippy_args[@]}"}
+}
+
+# Replay the judging diagnostics as JSON; only apply_mul_add.py selects fixes.
+invoke_clippy_mul_add_json() {
+    lint_config_enabled clippy || return 0
+    local LINT_JSON_STDOUT=1
+    invoke_clippy "$@" --message-format=json
 }
 
 invoke_mend() {

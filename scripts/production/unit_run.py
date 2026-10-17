@@ -15,7 +15,7 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.usage import collect
-from add_unit import Refusal, cell_value, unit_table
+from production_units import Refusal, cell_value, unit_table
 
 
 @dataclass(frozen=True)

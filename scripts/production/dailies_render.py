@@ -4,7 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
-                         [--below <outstanding.json>]... [--reports-to <root slug>]
+                         [--below <outstanding.json>]... [--reports-to <root slug>] [--doc <production doc>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -48,6 +48,9 @@ production's own plumbing words (PLUMBING).
          footer.
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
          `reports to <root slug>`.
+--doc    With --footer, the production doc: the line after the header counts
+         its changes to review, proposals and projects (footer_counts.py). A
+         report reads the doc from its input's `doc`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -69,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
+import note_file
 from run_out import READINGS_LOG, Reading
 from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
@@ -123,10 +127,9 @@ DOT_RANGED = "●━"
 # The chart mode every showrunner's dailies use, kept in one file so no
 # session has to remember it (user, 2026-10-03). `--chart` sets it.
 CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
-AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
-# A unit under a /build_hold carries this marker on its timeline row; no
+# A unit under a /build:hold carries this marker on its timeline row; no
 # marker means not held (user, 2026-10-03: "Without that marker I will assume
 # it is not held"). The hold's start, purpose and release are stated once, in
 # the line after the timeline (user, 2026-10-04: "you do not need to repeat
@@ -259,10 +262,53 @@ class Topic:
 
 
 @dataclass(frozen=True)
-class Outstanding:
+class DueNow:
+    pass
+
+
+@dataclass(frozen=True)
+class DeferredUntil:
+    at: datetime
+
+
+OutstandingTiming = DueNow | DeferredUntil
+
+
+@dataclass(frozen=True)
+class OutstandingReminder:
     since: datetime
     text: str
-    after: datetime | None = None
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class OutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewedOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reviewed: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewUnavailableOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reason: str
+    timing: OutstandingTiming = DueNow()
+
+
+Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
+               | ReviewUnavailableOutstandingQuestion)
 
 
 @dataclass(frozen=True)
@@ -391,6 +437,8 @@ class Report:
     children: list[Child]
     # The root this production's showrunner is under; empty for a root.
     reports_to: str
+    # The production doc the footer's counts line reads; None for an input that names none.
+    doc: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -849,7 +897,7 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable"}, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
@@ -858,13 +906,33 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
         check_plumbing(text, f"{where}.text")
-        items.append(Outstanding(datetime.fromisoformat(since), text, datetime.fromisoformat(after) if after else None))
+        timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        since_at = datetime.fromisoformat(since)
+        question = fields.get("question")
+        reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
+        if "question" not in fields:
+            if "reviewed" in fields or "review_unavailable" in fields:
+                raise InputError(f"{where}: question required for a review result")
+            items.append(OutstandingReminder(since_at, text, timing))
+            continue
+        if not isinstance(question, str) or not question.strip():
+            raise InputError(f"{where}.question: expected non-empty full question")
+        if "reviewed" in fields:
+            if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
+                raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing))
+        elif "review_unavailable" in fields:
+            if not isinstance(unavailable, str):
+                raise InputError(f"{where}.review_unavailable: expected reason text")
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing))
+        else:
+            items.append(OutstandingQuestion(since_at, text, question, timing))
     return sorted(items, key=lambda item: item.since)
 
 
 def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
     """The items the user has not deferred past `now`, a local time in the report's zone."""
-    return [item for item in items if item.after is None or item.after <= now]
+    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
 
 
 def read_dailies_hold() -> HoldState:
@@ -875,7 +943,7 @@ def read_dailies_hold() -> HoldState:
             try:
                 check_plumbing(holder.purpose, f"build hold {holder.name!r} purpose")
             except InputError as error:
-                raise InputError(f"{error}; have {holder.name} run /build_hold hold again with other words") from None
+                raise InputError(f"{error}; have {holder.name} run /build:hold hold again with other words") from None
     return hold
 
 
@@ -891,7 +959,7 @@ def read_mac_block() -> MacBlockFooterState:
             check_plumbing(block.reason, f"Mac block {block.holder!r} reason")
         except InputError as error:
             raise InputError(
-                f"{error}; have {block.holder} run /mac_test block again with other words"
+                f"{error}; have {block.holder} run /build:mac block again with other words"
             ) from None
     return block
 
@@ -1068,7 +1136,7 @@ def parse_report(value: object, chart: str) -> Report:
     fields = as_map(value, "input")
     if "build_hold" in fields:
         raise InputError("input.build_hold: remove this field; holds are read from the holder files")
-    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts", "children", "reports_to"}, "input")
+    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts", "children", "reports_to", "doc"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
@@ -1098,8 +1166,9 @@ def parse_report(value: object, chart: str) -> Report:
     for child in children:
         if child.name in labels:
             raise InputError(f"children: {child.name} is also a unit's label; give that unit another label")
+    doc = optional_text(fields, "doc", "input")
     return Report(length, chart, zone, next_run, hold, mac_block, units, topics, counts, children,
-                  optional_text(fields, "reports_to", "input") or "")
+                  optional_text(fields, "reports_to", "input") or "", Path(doc) if doc else None)
 
 
 def parse_count(value: object, where: str) -> ProductionCount:
@@ -1410,24 +1479,6 @@ def agent_number(value: str | None) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def agent_fields(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return {}
-    if not lines or lines[0] != "---":
-        return {}
-    if "---" not in lines[1:]:
-        return {}
-    fields: dict[str, str] = {}
-    for line in lines[1:]:
-        if line == "---":
-            break
-        if (match := re.fullmatch(r"([A-Za-z_][\w-]*):\s*(.*?)\s*", line)) is not None:
-            fields[match.group(1)] = match.group(2).strip("\"'")
-    return fields
-
-
 def agent_refill(reset: datetime, now: datetime, zone: ZoneInfo) -> str:
     local = reset.astimezone(zone)
     return f"{local:%H:%M} today" if local.date() == now.date() else f"{local:%a %H:%M}"
@@ -1486,10 +1537,12 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
     if stamped is not None and stamped.tzinfo is None:
         stamped = stamped.replace(tzinfo=zone)
     minute_end = stamped.timestamp() + 60 if stamped is not None else None
-    for path in sorted(AGENTS_DIR.glob("*.md")):
-        fields = agent_fields(path)
-        if fields.get("state") == "active":
-            account_readings = readings.get(path.stem, [])
+    for note in note_file.read_notes():
+        fields = {key: value for key in ("limit_reset_count", "limit_reset", "resets",
+                                        "weekly_usage_checked_at", "weekly_remaining_usage")
+                  if (value := note.get(key)) is not None}
+        if note_file.in_use(note):
+            account_readings = readings.get(note.label, [])
             if minute_end is not None:
                 account_readings = [reading for reading in account_readings if reading.at.timestamp() < minute_end]
                 checked_at = agent_time(fields.get("weekly_usage_checked_at"))
@@ -1497,7 +1550,7 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
                     latest = account_readings[-1]
                     fields["weekly_usage_checked_at"] = latest.at.isoformat()
                     fields["weekly_remaining_usage"] = str(100 - latest.used_percent)
-            lines.append(agent_line(path.stem, fields, account_readings, now, zone))
+            lines.append(agent_line(note.label, fields, account_readings, now, zone))
     if len(lines) == 1:
         lines.append("- none active")
     lines.append("")
@@ -1507,12 +1560,14 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
 def footer(
     now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None,
     hold: HoldState, mac_block: MacBlockFooterState, outstanding: list[Outstanding], *,
-    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = ""
+    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = "",
+    counts: str | None = None
 ) -> list[str]:
     """The separated update footer shared by replies and dailies reports.
 
     `outstanding` already holds the lower productions' items for a root. `unreadable` names each
     lower production whose list could not be read, and `root` the root a lower showrunner is under.
+    `counts` is the counts line that follows the header, when anything is counted.
     """
     items: list[str] = []
     if isinstance(hold, ActiveHolders):
@@ -1539,8 +1594,15 @@ def footer(
     # A list that cannot be read may hold an item, so the footer never calls that quiet.
     quiet = nothing_needed and not outstanding and not unreadable
     items.append(f"{schedule}{' - nothing needed' if quiet else ''}")
-    return ["", "---", f"{now:%H:%M} {zone_name} update:", "",
+    return ["", "---", f"{now:%H:%M} {zone_name} update:", *([counts] if counts else []), "",
             *(f"{item[:2]}* {item[2:]}" if item.startswith("  ") else f"* {item}" for item in items)]
+
+
+def doc_counts(doc: Path | None) -> str | None:
+    """The counts line for a production doc; the Waiting on block carries the question count."""
+    import footer_counts
+
+    return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 
 
 def eta_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
@@ -1752,7 +1814,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at),
                         unreadable=[slug for child in report.children for slug in child.unreadable],
-                        root=report.reports_to))
+                        root=report.reports_to, counts=doc_counts(report.doc)))
     return lines
 
 
@@ -1802,7 +1864,7 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
 
 
 def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
-                nothing_needed: bool, below: Sequence[Path] = (), root: str = "") -> int:
+                nothing_needed: bool, below: Sequence[Path] = (), root: str = "", doc: Path | None = None) -> int:
     unreadable: list[str] = []
     try:
         if next_run is not None and not TIME.match(next_run):
@@ -1822,7 +1884,7 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
             unreadable.append(path.stem)
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, mac_block, outstanding,
                            nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at),
-                           unreadable=unreadable, root=root)))
+                           unreadable=unreadable, root=root, counts=doc_counts(doc))))
     return 0
 
 
@@ -1841,6 +1903,7 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--below", type=Path, action="append", default=[],
                             help="with --footer, once per lower production: its list, counted with --outstanding; one that cannot be read is named")
     _ = parser.add_argument("--reports-to", default="", help="with --footer: the root production a lower showrunner is under")
+    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, proposals and projects are counted")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
@@ -1853,15 +1916,16 @@ def main(arguments: list[str]) -> int:
     outstanding_path = cast(Path | None, options.outstanding)
     below = cast(list[Path], options.below)
     reports_to = cast(str, options.reports_to)
+    doc = cast(Path | None, options.doc)
     if cast(bool, options.footer):
         if input_path is not None or chart is not None or state_path is not None or log_path is not None:
             parser.error("--footer takes no input file, --chart, --state or --log")
         if zone is None:
             parser.error("--footer needs --zone")
         return footer_main(zone, next_run, at, outstanding_path, nothing_needed=nothing_needed,
-                           below=below, root=reports_to)
-    if zone is not None or next_run is not None or nothing_needed or below or reports_to:
-        parser.error("--zone, --next-run, --nothing-needed, --below and --reports-to go with --footer; "
+                           below=below, root=reports_to, doc=doc)
+    if zone is not None or next_run is not None or nothing_needed or below or reports_to or doc is not None:
+        parser.error("--zone, --next-run, --nothing-needed, --below, --reports-to and --doc go with --footer; "
                      + "a report takes them from its input")
     if chart is not None:
         write_chart(CHART_CONF, chart)

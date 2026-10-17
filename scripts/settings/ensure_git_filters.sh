@@ -67,14 +67,14 @@ done
 ensure_watcher() {
     command -v launchctl >/dev/null 2>&1 || return 0
 
-    # Only the live config directory gets a watcher. The label is a single
+    # Only the shared config home gets a watcher. The label is a single
     # system-wide name, so any other copy of this repo -- a clone, a backup, a
     # worktree -- would otherwise point the one watcher at itself and silently
     # stop refreshing the directory that is actually in use. Filters still work
     # in such a copy; only the `git status` cosmetics lag, which is the right
     # trade for a checkout nothing is reading config from.
     local live_dir
-    live_dir="$(cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" 2>/dev/null && pwd)" || return 0
+    live_dir="$(cd "$HOME/.claude" 2>/dev/null && pwd)" || return 0
     [[ "$REPO_ROOT" == "$live_dir" ]] || return 0
 
     # nix-darwin owns this watcher now (modules/darwin/claude-git-filters.nix

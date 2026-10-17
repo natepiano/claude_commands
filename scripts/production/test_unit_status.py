@@ -3,18 +3,22 @@
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import NamedTuple
 
 from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock, StillWaiting, UnitRow,
                            status_blocks)
 from unit_lookup import UnitState
+import fake_unit_host
+from fake_unit_host import HostedUnit
+from sessions import SessionRecord
 
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
@@ -24,18 +28,6 @@ SESSION_ID = "test-session"
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
-
-
-class RealTmux(NamedTuple):
-    """A real tmux binary and the private socket directory its test server lives in."""
-
-    binary: str
-    server_dir: Path
-
-    def environment(self, base: dict[str, str]) -> dict[str, str]:
-        environment = {**base, "TMUX_TMPDIR": str(self.server_dir)}
-        _ = environment.pop("TMUX", None)
-        return environment
 
 
 def _write_executable(path: Path, contents: str) -> None:
@@ -48,111 +40,83 @@ class UnitStatusTests(unittest.TestCase):
     def run_statuses(
         self, marker: str | None, health_text: str, health_exit: int, *,
         panes: tuple[dict[str, str], ...],
-        processes: str = "100 1 tmux pane\n200 100 zsh\n12345 200 claude --remote-control stalls\n",
         units: tuple[str, ...] = ("hook",),
         retired_units: tuple[str, ...] = (),
-        real_tmux: RealTmux | None = None,
+        stopped_units: tuple[str, ...] = (),
+        missing_units: tuple[str, ...] = (),
+        unreadable_units: tuple[str, ...] = (),
     ) -> tuple[tuple[str, ...], str | None, str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "scripts" / "production" / "unit_status.sh"
             script.parent.mkdir(parents=True)
             _ = shutil.copy2(SCRIPT, script)
-            _write_executable(
-                root / "scripts" / "lib" / "py",
-                '#!/bin/sh\nexec python3 "$@"\n',
-            )
-            _ = (root / "scripts" / "message").mkdir(parents=True)
-            # The lookup imports the record readers from this module; the script asks it for a session id.
-            real_sessions = SCRIPT.parent.parent / "message" / "sessions.py"
-            _ = (root / "scripts" / "message" / "sessions.py").write_text(
-                "import importlib.util\nimport sys\n"
-                + f"spec = importlib.util.spec_from_file_location('real_sessions', {str(real_sessions)!r})\n"
-                + "real = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(real)\n"
-                + "UnreadableSessionRecord, live_session, read_session = "
-                + "real.UnreadableSessionRecord, real.live_session, real.read_session\n"
-                + f'if __name__ == "__main__":\n    print("{SESSION_ID}" if sys.argv[-1] == "12345" else "")\n',
-                encoding="utf-8")
-            _write_executable(
-                root / "scripts" / "message" / "notifier.sh",
-                """print -r -- "$*" >> "$NOTIFIER_CALL_LOG"
+            _write_executable(root / "scripts" / "lib" / "py", '#!/bin/sh\nexec python3 "$@"\n')
+            message = root / "scripts" / "message"
+            message.mkdir()
+            _ = shutil.copy2(SCRIPT.parent.parent / "message" / "sessions.py", message / "sessions.py")
+            _write_executable(message / "notifier.sh", """print -r -- "$*" >> "$NOTIFIER_CALL_LOG"
 print -r -- "$NOTIFIER_HEALTH_TEXT"
 exit "$NOTIFIER_HEALTH_EXIT"
-""",
-            )
-            _ = (root / "scripts" / "hooks").mkdir(parents=True)
-            _ = (root / "scripts" / "hooks" / "delegate_run.py").write_text(
-                "raise SystemExit(1)\n", encoding="utf-8"
-            )
-            bin_dir = root / "bin"
-            process_file = root / "processes.txt"
-            _ = process_file.write_text(processes, encoding="utf-8")
-            _write_executable(
-                bin_dir / "tmux",
-                # Unit N of $TEST_UNITS has the tmux session $N with the one pane %N, marked as that unit.
-                """#!/bin/sh
-for target in "$@"; do :; done
-i=0
-case "$1" in
-  list-panes) for unit in $TEST_UNITS; do i=$((i+1)); printf '$%s\\t%%%s\\tlabel-of-%s\\n' "$i" "$i" "$unit"; done ;;
-  show-environment)
-    for unit in $TEST_UNITS; do
-      i=$((i+1))
-      [ "\\$$i" = "$target" ] && printf 'SHOWRUNNER_UNIT=example\\nSHOWRUNNER_UNIT_ID=%s\\n' "$unit"
-    done ;;
-  display-message) printf '100\\n' ;;
-  capture-pane)
-    for unit in $TEST_UNITS; do
-      i=$((i+1))
-      [ "%$i" = "$target" ] && cat "$TEST_PANE_DIR/$unit"
-    done ;;
-  *) exit 2 ;;
-esac
-exit 0
-""" if real_tmux is None else f'#!/bin/sh\nexec {real_tmux.binary} "$@"\n',
-            )
-            _write_executable(bin_dir / "ps", '#!/bin/sh\ncat "$TEST_PROCESS_FILE"\n')
-            _write_executable(bin_dir / "pgrep", "#!/bin/sh\nexit 2\n")
-            pane_dir = root / "panes"
-            pane_dir.mkdir()
+""")
+            hooks = root / "scripts" / "hooks"
+            hooks.mkdir()
+            _ = (hooks / "delegate_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+            for source_name in ("add_unit.py", "production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_pane.py"):
+                _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
+            (root / "scripts" / "herdr").mkdir()
+            _ = shutil.copy2(SCRIPT.parent.parent / "herdr" / "herdr.py", root / "scripts" / "herdr" / "herdr.py")
+            for source_name in ("user_zone.py", "probe_session.py"):
+                _ = shutil.copy2(SCRIPT.parent.parent / "lib" / source_name, script.parent.parent / "lib" / source_name)
             active_dir = root / "active"
             active_dir.mkdir()
-            if marker is not None:
-                _ = (active_dir / SESSION_ID).write_text(marker, encoding="utf-8")
             call_log = root / "notifier_calls"
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "HOME": str(root),
-                    "PATH": f"{bin_dir}:{environment.get('PATH', '')}",
-                    "PLAN_DELEGATE_ACTIVE_DIR": str(active_dir),
-                    "NOTIFIER_STATE_DIR": str(root / "notifier"),
-                    "NOTIFIER_NOW_EPOCH": "20100",
-                    "NOTIFIER_CALL_LOG": str(call_log),
-                    "NOTIFIER_HEALTH_TEXT": health_text,
-                    "NOTIFIER_HEALTH_EXIT": str(health_exit),
-                    "TEST_PROCESS_FILE": str(process_file),
-                    "TEST_PANE_DIR": str(pane_dir),
-                    "TEST_UNITS": " ".join(units),
-                    "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
-                }
-            )
-            if real_tmux is not None:
-                environment = real_tmux.environment(environment)
-            for source_name in ("add_unit.py", "live_units.py", "showrunners.py", "unit_lookup.py"):
-                _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
-            # The copied scripts read the user's zone setting through the helper beside them.
-            _ = shutil.copy2(SCRIPT.parent.parent / "lib" / "user_zone.py", script.parent.parent / "lib" / "user_zone.py")
-            (root / "sessions").mkdir()
+            records = root / "sessions"
+            records.mkdir()
+            responses_file = root / "herdr-responses.json"
+            environment = {
+                **os.environ,
+                "HOME": str(root),
+                "PLAN_DELEGATE_ACTIVE_DIR": str(active_dir),
+                "PLAN_DELEGATE_HISTORY_DIR": str(root / "history"),
+                "NOTIFIER_STATE_DIR": str(root / "notifier"),
+                "NOTIFIER_NOW_EPOCH": "20100",
+                "NOTIFIER_CALL_LOG": str(call_log),
+                "NOTIFIER_HEALTH_TEXT": health_text,
+                "NOTIFIER_HEALTH_EXIT": str(health_exit),
+                "NOTIFIER_SESSIONS_DIR": str(records),
+                "HERDR_BIN": str(SCRIPT.parent.parent / "herdr" / "fake_herdr.py"),
+                "HERDR_PROC": str(root / "proc"),
+                "FAKE_HERDR_LOG": str(root / "herdr.jsonl"),
+                "FAKE_HERDR_RESPONSES": str(responses_file),
+            }
+            pids: dict[str, int] = {}
+            _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
             rows: list[str] = []
             for unit in units:
-                # A worktree of its own, so a unit whose session is gone keeps its row.
                 worktree = root / "worktrees" / unit
                 worktree.mkdir(parents=True)
                 _ = (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
                 plan = "(retired by the user)" if unit in retired_units else "docs/plan.md"
                 rows.append(f"| {unit} | {plan} | {worktree} | {unit} | — | — |")
-            _ = (root / "example-production.md").write_text("\n".join((
+                if unit in missing_units:
+                    continue
+                if unit not in stopped_units:
+                    address = root / f"{unit}.sock"
+                    held = socket.socket(socket.AF_UNIX)
+                    held.bind(str(address))
+                    self.addCleanup(held.close)
+                    session_id = f"{SESSION_ID}-{unit}"
+                    if marker is not None:
+                        _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
+                    pids[unit] = fake_unit_host.live_pid(self)
+                    record = SessionRecord(pid=pids[unit], sessionId=session_id, name=f"claude-{unit}",
+                        messagingSocketPath=str(address), updatedAt=1,
+                        tmux="", formerNames=[])
+                    _ = (records / f"{unit}.json").write_text(
+                        "{" if unit in unreadable_units else json.dumps(record))
+            production_doc = root / "example-production.md"
+            _ = production_doc.write_text("\n".join((
                 "# Production", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                 "| --- | --- | --- | --- | --- | --- |", *rows)), encoding="utf-8")
             zsh = shutil.which("zsh")
@@ -160,18 +124,19 @@ exit 0
                 raise RuntimeError("zsh is required for unit status tests")
             outputs: list[str] = []
             for pane_by_unit in panes:
-                for unit in units:
-                    _ = (pane_dir / unit).write_text(
-                        pane_by_unit.get(unit, "— holding: waiting on x\n"), encoding="utf-8"
-                    )
+                hosted = [
+                    HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit},
+                               pane_by_unit.get(unit, "— holding: waiting on x\n"))
+                    for index, unit in enumerate(units, start=1) if unit not in missing_units]
+                fake_unit_host.write(environment, hosted)
+                for unit in hosted:
+                    if unit.session in pids:
+                        fake_unit_host.place_process(environment, pids[unit.session], unit.pane)
                 result = subprocess.run(
-                    [zsh, str(script), str(root / "status"), "America/Los_Angeles",
-                     "--production", str(root / "example-production.md")],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=environment,
+                    [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
+                    check=True, capture_output=True, text=True, env=environment,
                 )
+                self.assertEqual(result.stderr, "")
                 outputs.append(result.stdout)
             calls = call_log.read_text(encoding="utf-8") if call_log.exists() else None
             seen_path = root / "status" / "decisions_seen"
@@ -180,12 +145,11 @@ exit 0
 
     def run_status(
         self, marker: str | None, health_text: str, health_exit: int, *,
-        processes: str = "100 1 tmux pane\n200 100 zsh\n12345 200 claude --remote-control stalls\n",
+        stopped_units: tuple[str, ...] = (),
     ) -> tuple[str, str | None]:
         outputs, calls, _ = self.run_statuses(
             marker, health_text, health_exit,
-            panes=({"hook": "— holding: waiting on x\n"},),
-            processes=processes,
+            panes=({"hook": "— holding: waiting on x\n"},), stopped_units=stopped_units,
         )
         return outputs[0], calls
 
@@ -219,12 +183,12 @@ exit 0
     def test_idle_run_reports_failed_tick_health(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "failing: no instance", 1)
         self.assertIn("TICKS FAILING (no instance)", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_healthy_run_has_no_tick_warning(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
         self.assertNotIn("TICKS FAILING", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_missing_active_marker_skips_health(self) -> None:
         output, calls = self.run_status(None, "failing: no instance", 1)
@@ -236,15 +200,24 @@ exit 0
         self.assertNotIn("TICKS FAILING", output)
         self.assertIsNone(calls)
 
-    def test_claude_is_found_under_the_pane_even_with_a_different_remote_name(self) -> None:
+    def test_claude_session_id_comes_from_lookup_even_with_a_different_name(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
         self.assertNotIn("CLAUDE NOT RUNNING", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
-    def test_no_claude_descendant_reports_not_running(self) -> None:
-        processes = "100 1 tmux pane\n200 100 zsh\n12345 1 claude --remote-control stalls\n"
-        output, calls = self.run_status("/tmp/test-run\n", "ok", 0, processes=processes)
+    def test_no_live_claude_record_reports_not_running(self) -> None:
+        output, calls = self.run_status("/tmp/test-run\n", "ok", 0, stopped_units=("hook",))
         self.assertIn("CLAUDE NOT RUNNING", output)
+        self.assertNotIn("CLAUDE STATE UNKNOWN", output)
+        self.assertIsNone(calls)
+
+    def test_unreadable_claude_records_report_unknown_instead_of_not_running(self) -> None:
+        outputs, calls, _ = self.run_statuses(
+            "/tmp/test-run\n", "ok", 0, panes=({"hook": "— holding: waiting on x\n"},),
+            unreadable_units=("hook",),
+        )
+        self.assertIn("CLAUDE STATE UNKNOWN", outputs[0].splitlines())
+        self.assertNotIn("CLAUDE NOT RUNNING", outputs[0])
         self.assertIsNone(calls)
 
     def test_gate_first_sight_prints_decision_and_records_seen_key(self) -> None:
@@ -380,20 +353,27 @@ exit 0
         self.assertTrue(any("gate: peer" in line.text for line in peer_routed.activity))
 
     def test_a_unit_with_no_marked_session_reads_gone_while_a_marked_one_lives(self) -> None:
-        binary = shutil.which("tmux")
-        if binary is None:
-            self.skipTest("tmux is required to check its session matching")
-        with tempfile.TemporaryDirectory() as server_dir:
-            server = RealTmux(binary, Path(server_dir))
-            _ = subprocess.run([binary, "-f", "/dev/null", "new-session", "-d", "-s", "any-name",
-                                "-e", "SHOWRUNNER_UNIT=example", "-e", "SHOWRUNNER_UNIT_ID=hookworm", "sleep 60"],
-                               env=server.environment(dict(os.environ)), check=True)
-            try:
-                outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
-                                                  real_tmux=server)
-            finally:
-                _ = subprocess.run([binary, "kill-server"], env=server.environment(dict(os.environ)), capture_output=True,
-                                   check=False)
+        outputs, _, _ = self.run_statuses(None, "ok", 0, panes=({},), units=("hook", "hookworm"),
+                                          missing_units=("hook",), stopped_units=("hookworm",))
         gone, live = self.parse_status(outputs[0], ("hook", "hookworm"))
         self.assertIsInstance(gone.state, SessionGone, outputs[0])
         self.assertIsInstance(live.state, ClaudeNotRunning, outputs[0])
+
+    def test_herdr_units_report_activity_and_tick_health(self) -> None:
+        outputs, calls, seen = self.run_statuses(
+            "/tmp/native-run\n", "failing: no instance", 1,
+            units=("hook", "native"),
+            panes=({"hook": "● Check hook progress\nPhase ETA: 12:00 EDT\n— holding: running\n",
+                    "native": "● Check herdr progress\nPhase ETA: 13:00 EDT\n— gate: approve release\n"},),
+        )
+        output = outputs[0]
+        self.assertIn("== hook", output)
+        self.assertIn("● Check hook progress", output)
+        self.assertIn("== native", output)
+        self.assertIn("● Check herdr progress", output)
+        self.assertIn("Phase ETA: 13:00 EDT", output)
+        self.assertIn("=== DECISION for you from native ===", output)
+        self.assertNotIn("CLAUDE NOT RUNNING", output)
+        self.assertNotIn("SESSION GONE", output)
+        self.assertEqual(calls, "health unit-native-run\n" * 2)
+        self.assertEqual(seen, "native|— gate: approve release\n")

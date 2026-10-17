@@ -11,16 +11,17 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-import fake_tmux
+import fake_unit_host
 import unit_effort
 import unit_lookup
-from fake_tmux import FakeSession
+import herdr
+from fake_herdr import CommandResponse
+from fake_unit_host import HostedUnit
 from unit_effort import Ready, Skipped
 
-FAKE = str(Path(__file__).with_name("fake_tmux.py"))
 RULE_TOP = "──── review-pool ──────────"
 RULE = "───────────────────────────"
-STATUS = "  natedev | claude 3 | review-pool | 189,709 | Opus 5.5 xhigh"
+STATUS = "  natedev | claude3 | review-pool | 189,709 | Opus 5.5 xhigh"
 EMPTY = f"{RULE_TOP}\n\x1b[39m❯ \n{RULE}\n{STATUS}"
 
 
@@ -58,46 +59,43 @@ class VerdictTests(unittest.TestCase):
 
 class UnitEffortTests(unittest.TestCase):
     root: Path = Path()
-    state: Path = Path()
     records: Path = Path()
     registry: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.state = self.root / "tmux.json"
         self.records = self.root / "sessions"
         self.records.mkdir()
         self.registry = self.root / "agents.conf"
         _ = self.registry.write_text(
             "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
             + "[claude.agents]\nopus=low,medium,high,xhigh,max\n", encoding="utf-8")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
         synced = self.root / "catalog-sync-success"
         synced.touch()
         self.enterContext(mock.patch.dict(os.environ, {
-            "FAKE_TMUX_STATE": str(self.state), "UNIT_LOOKUP_TMUX": FAKE,
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
+            "HERDR_PROC": str(self.root / "proc"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.records), "AGENTS_CONFIG_FILE": str(self.registry),
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
-        sessions = {
-            "$1": self.unit("review-pool", "%1", "build-followups", "review-pool-unit", EMPTY),
-            "$2": self.unit("widget", "%2", "tool-based-ui", "widget-unit", screen("❯ my draft")),
-            "$3": self.unit("trunk", "%3", "tool-based-ui", "trunk-unit", screen("❯ \x1b[2mtry this\x1b[22m")),
-            "$4": FakeSession(label="notes", panes=["%4"], env={}, screens={"%4": EMPTY}),
-        }
-        fake_tmux.write(self.state, sessions)
-        for pane, name in (("%1", "review-pool"), ("%2", "widget"), ("%3", "trunk"), ("%4", "notes")):
-            _ = (self.records / f"{name}.json").write_text(json.dumps({
-                "pid": os.getpid(), "sessionId": f"id-{name}", "name": name,
-                "messagingSocketPath": str(self.root / f"{name}.sock"), "updatedAt": 1,
-                "tmux": f"{name}:@1.{pane}"}), encoding="utf-8")
-
-    @staticmethod
-    def unit(label: str, pane: str, slug: str, unit: str, shown: str) -> FakeSession:
-        return FakeSession(label=label, panes=[pane], env={"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit},
-                           screens={pane: shown})
+        units = [
+            HostedUnit("review-pool", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-pool-unit"}, EMPTY),
+            HostedUnit("widget", "w2:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "widget-unit"}, screen("❯ my draft")),
+            HostedUnit("trunk", "w3:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "trunk-unit"}, screen("❯ \x1b[2mtry this\x1b[22m")),
+            HostedUnit("notes", "w4:p1", {}, EMPTY),
+        ]
+        fake_unit_host.write(os.environ, units)
+        for index, unit in enumerate(units):
+            _ = (self.records / f"{unit.session}.json").write_text(json.dumps({
+                "pid": 991001 + index * 2, "sessionId": f"id-{unit.session}", "name": unit.session,
+                "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
+                "tmux": ""}), encoding="utf-8")
 
     def run_main(self, *arguments: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -106,7 +104,7 @@ class UnitEffortTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def sent(self) -> list[list[str]]:
-        return [keys for session in fake_tmux.read(self.state).values() for keys in session.get("sent", [])]
+        return [call for call in fake_unit_host.calls(os.environ) if call[2:4] == ["agent", "prompt"]]
 
     def director_row(self) -> str:
         return next(line for line in self.registry.read_text(encoding="utf-8").splitlines()
@@ -129,8 +127,8 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.splitlines()[-1], "registry: production.director is now opus:high (was opus:xhigh)")
         self.assertIn("widget: skipped — a draft is in its input line", out)
-        self.assertEqual(self.sent(), [["%1", "-l", "/effort high"], ["%1", "Enter"],
-                                       ["%3", "-l", "/effort high"], ["%3", "Enter"]])
+        self.assertEqual(self.sent(), [["--session", "review-pool", "agent", "prompt", "w1:p1", "/effort high"],
+                                       ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
         self.assertEqual(self.director_row(), "director=opus:high")
 
     def test_a_level_the_model_does_not_take_is_refused_before_anything_happens(self) -> None:
@@ -140,6 +138,36 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.director_row(), "director=opus:xhigh")
         self.assertEqual(self.run_main("--check")[0], 2)
+
+    def test_a_herdr_director_reads_ansi_and_receives_effort_once(self) -> None:
+        place = herdr.HerdrPlace("native", "w1:p1")
+        marked = unit_lookup.MarkedUnit("native-unit", unit_lookup.LiveClaude("native", "id", "/sock", 1), place)
+        responses = self.root / "herdr-responses.json"
+        replies: dict[str, CommandResponse] = {
+            "--session native pane read w1:p1 --source recent --lines 60 --format ansi": {
+                "code": 0, "stdout": screen("❯ \x1b[2mtry this\x1b[22m")},
+            "default": {"code": 0, "stdout": ""},
+        }
+        _ = responses.write_text(json.dumps(replies))
+        with mock.patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions(
+                {"show": {"native-unit": marked}}, {})):
+            code, out, err = self.run_main("high")
+        self.assertEqual(code, 0, err)
+        self.assertIn("native: sent", out)
+        self.assertEqual((self.root / "herdr.log").read_text().splitlines(), [
+            json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60",
+                        "--format", "ansi"]),
+            json.dumps(["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]),
+        ])
+        self.assertEqual(self.sent(), [["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]])
+
+    def test_a_herdr_prompt_refusal_sends_no_enter(self) -> None:
+        refusal: herdr.HerdrRefusal = {"error": {"code": "agent_blocked", "message": "blocked at a prompt"}}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {
+            "code": 1, "stdout": json.dumps(refusal)}}))
+        problem = unit_effort.send(herdr.HerdrPlace("native", "w1:p1"), "high")
+        self.assertIn("agent_blocked", problem)
+        self.assertEqual(len((self.root / "herdr.log").read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":

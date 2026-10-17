@@ -33,16 +33,19 @@ What it does:
 1. **Checks**, and refuses with the cause, stopping nothing:
    - the unit has no live session under your production;
    - it is mid-turn, or its pane shows a form, prompt or draft;
-   - it has a `/unit:delegate` run open, which keeps its seats, so the run finishes first;
+   - it has a `/unit:delegate` run open, which keeps its workers, so the run finishes first;
    - it has uncommitted work, so it checkpoints first;
    - the doc is missing, uncommitted or not a production doc;
-   - the new production already has a showrunner.
+   - the new production already has a showrunner;
+   - Claude is not trusted in the unit's worktree on the showrunner account,
+     where the session resumes (`/showrunner:add_showrunner` names what
+     counts as trusted).
 2. **Stops** the unit: it types `/exit` into the unit's pane and waits until its
-   Claude is gone, then ends its tmux session. Two processes on one session
+   Claude is gone, then ends its session on its host, herdr. Two processes on one session
    corrupt it, so nothing restarts while the old one runs.
 3. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
-   same session in the unit's worktree: in tmux under the new production's
-   name, with no unit mark, on the showrunner account, attached to your production.
+   same session in the unit's worktree: in its own herdr session named for the
+   new production, with no unit mark, on the unit's own account, attached to your production.
 4. **Retires** the unit's Units row in your doc, `(retired <date>: promoted to
    showrunner of <slug>)`, and commits it in your checkout. Its branch stays as
    it is; the new production merges to the branch its own doc names.

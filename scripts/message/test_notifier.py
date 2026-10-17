@@ -86,7 +86,7 @@ class NotifierTests(unittest.TestCase):
                 "FAKE_SEND_RC": str(send_rc),
                 "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
             },
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
@@ -305,15 +305,15 @@ class NotifierTests(unittest.TestCase):
         self.assertFalse((self.state_dir / "example").exists())
         self.assertIn("removed example (check exit 2)", (self.state_dir / "notifier.log").read_text())
 
-    def test_check_timeout_skips_send_and_releases_tick_promptly(self) -> None:
+    def test_check_timeout_skips_send_and_releases_tick(self) -> None:
         check = self.root / "slow-check"
-        _ = check.write_text("#!/bin/sh\nexec sleep 4\n")
+        blocked = self.root / "check-blocked"
+        os.mkfifo(blocked)
+        _ = check.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
         check.chmod(0o755)
         _ = self.new("--check", str(check), "--timeout", "1")
-        started = time.monotonic()
         result = self.run_cli("tick", now=MINUTE + 120)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(time.monotonic() - started, 3)
         self.assertIn(" | skip check timeout", self.lines()[-1], result.stderr)
         self.assertFalse(self.send_args.exists())
 
@@ -441,12 +441,12 @@ class NotifierTests(unittest.TestCase):
         self.assertTrue(any("exit 7" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
         slow = self.root / "slow-run"
-        _ = slow.write_text("#!/bin/sh\nexec sleep 4\n")
+        blocked = self.root / "run-blocked"
+        os.mkfifo(blocked)
+        _ = slow.write_text(f"#!/bin/sh\nexec /bin/cat < {blocked}\n")
         slow.chmod(0o755)
         _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "1")
-        started = time.monotonic()
         _ = self.successful("tick", now=MINUTE + 120)
-        self.assertLess(time.monotonic() - started, 3)
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
         self.assertTrue(any("timeout" in line for line in self.lines()))
         self.assertFalse(self.send_args.exists())
@@ -485,10 +485,12 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
 
-    def test_mac_run_only_job_removes_label_after_fire_log_and_runs_once(self) -> None:
+    def fake_launchctl(self) -> Path:
+        """Install a fake launchctl that, like macOS 27, starts a submitted job only on kickstart."""
         launcher = self.launcher_dir / "launchctl"
         _ = launcher.write_text(
             """#!/usr/bin/env python3
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -500,13 +502,22 @@ action = sys.argv[1]
 if action == "submit":
     label = sys.argv[sys.argv.index("-l") + 1]
     (state / "submitted").write_text(label)
-    command = sys.argv[sys.argv.index("--") + 1:]
+    (state / f"{label}.command").write_text(json.dumps(sys.argv[sys.argv.index("--") + 1:]))
+elif action == "kickstart":
+    target = sys.argv[2]
+    (state / "kickstarted").write_text(target)
+    kickstart_rc = int(os.environ["FAKE_LAUNCHCTL_KICKSTART_RC"])
+    if kickstart_rc:
+        sys.exit(kickstart_rc)
+    label = target.split("/", 2)[2]
+    command = json.loads((state / f"{label}.command").read_text())
     job = subprocess.Popen(
         [sys.executable, __file__, "loop", label, *command],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, start_new_session=True,
     )
-    (state / "pid").write_text(str(job.pid))
+    (state / "pid.tmp").write_text(str(job.pid))
+    os.replace(state / "pid.tmp", state / "pid")
 elif action == "loop":
     label = sys.argv[2]
     removed = state / f"{label}.removed"
@@ -533,40 +544,69 @@ elif action == "remove":
                     pass
 
         self.addCleanup(stop_fake_job)
-        runs = self.root / "mac-runs"
+        return launch_state
+
+    def tick_mac_run_only(self, launch_state: Path, runs: Path, kickstart_rc: int = 0) -> Path:
         fire_log = self.state_dir / "example" / "fire.log"
         with mock.patch.dict(os.environ, {
             "NOTIFIER_PLATFORM": "darwin",
             "FAKE_LAUNCHCTL_STATE": str(launch_state),
             "FAKE_LAUNCHCTL_FIRE": str(fire_log),
+            "FAKE_LAUNCHCTL_KICKSTART_RC": str(kickstart_rc),
         }):
             _ = self.successful(
                 "new", "example", "--every", "1", "--run",
                 f"/bin/sh -c 'printf run >> {runs}; exit 7'",
             )
             _ = self.successful("tick", now=MINUTE + 60)
+        return fire_log
+
+    def test_mac_run_only_job_removes_label_after_fire_log_and_runs_once(self) -> None:
+        launch_state = self.fake_launchctl()
+        runs = self.root / "mac-runs"
+        fire_log = self.tick_mac_run_only(launch_state, runs)
         self.assertEqual(self.wait_for_text(fire_log, "run exit 7").count("run exit 7"), 1)
         self.assertEqual(self.wait_for_text(runs, "run"), "run")
         label = (launch_state / "submitted").read_text()
+        self.assertEqual((launch_state / "kickstarted").read_text(), f"gui/{os.getuid()}/{label}")
         removed = launch_state / f"{label}.removed"
         self.assertEqual(self.wait_for_text(removed, "after-fire"), "after-fire")
         self.assertEqual(runs.read_text(), "run")
+
+    def test_mac_run_only_failed_kickstart_removes_label_and_runs_after_tick(self) -> None:
+        launch_state = self.fake_launchctl()
+        runs = self.root / "mac-runs"
+        fire_log = self.tick_mac_run_only(launch_state, runs, kickstart_rc=1)
+        label = (launch_state / "submitted").read_text()
+        self.assertEqual((launch_state / f"{label}.removed").read_text(), "before-fire")
+        self.assertIn(
+            "run launcher unavailable: example; waiting after tick",
+            (self.state_dir / "notifier.log").read_text(),
+        )
+        self.assertEqual(fire_log.read_text().count("run exit 7"), 1)
+        self.assertEqual(runs.read_text(), "run")
+        self.assertFalse((launch_state / "pid").exists())
 
     def test_run_only_long_run_does_not_hold_tick_or_other_due_instance(self) -> None:
         started_file = self.root / "started"
         finished_file = self.root / "finished"
         slow = self.root / "slow-run"
-        _ = slow.write_text(f"#!/bin/sh\nprintf started > {started_file}\nsleep 3\nprintf finished > {finished_file}\n")
+        release_file = self.root / "release-run"
+        _ = slow.write_text(
+            f"#!/bin/sh\nprintf started > {started_file}\n"
+            + f"while [ ! -e {release_file} ]; do sleep 0.01; done\n"
+            + f"printf finished > {finished_file}\nexit 7\n"
+        )
         slow.chmod(0o755)
-        _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "2")
+        _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "30")
         _ = self.successful("new", "other", "--to", "session:sid-1", "--every", "1", "--command", "due")
-        started = time.monotonic()
         _ = self.successful("tick", now=MINUTE + 60)
-        self.assertLess(time.monotonic() - started, 1.5)
         _ = self.wait_for_text(started_file, "started")
         self.assertFalse(finished_file.exists())
         self.assertTrue(self.send_args.exists())
-        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
+        _ = release_file.write_text("release")
+        _ = self.wait_for_text(finished_file, "finished")
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
 
     def test_run_only_run_log_captures_stderr_and_replaces_previous_run(self) -> None:
         run_log = self.state_dir / "example" / "run.log"

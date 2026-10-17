@@ -35,7 +35,7 @@ path arguments. Set `${CLOSEOUT_DIR}` only when closeout was supplied; reject a
 missing directory, multiple phase ids, or closeout without `--phases`.
 
 `/unit:direct` runs closeout mode after the code commit, beside the next
-phase's seats, then makes a plan-doc-only shrink commit. Standalone mode remains
+phase's workers, then makes a plan-doc-only shrink commit. Standalone mode remains
 for legacy accumulated plans and immediately before `/plan:to_as_built`.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
@@ -61,7 +61,8 @@ This command does not change code and does not commit.
 
 <ArchiveOnly>
 **Shrinking touches `done` phases and nothing else.** Not the title, not the
-status line, not the `As-built disposition` line, not `## Delegation Context`
+status line, not the `As-built disposition`, `Production` or `Issues` lines,
+not `## Delegation Context`
 (including `Project started`, which `/unit:direct`'s recorder treats as
 authoritative),
 not `## Gates` or any other doc-level section, and above all not a single byte of
@@ -101,7 +102,8 @@ start; read that record.
 1. **The argument**, when one is given.
 
 2. **The `/unit:direct` run active in this session.** `/unit:direct` writes
-   `/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}` containing the run's
+   `/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}` (under `delegate/` for a run
+   started before the folder rename) containing the run's
    session directory, whose basename is the run id:
 
    The marker is keyed by Claude session id, so a hit means *this* session's run —
@@ -120,7 +122,8 @@ start; read that record.
    ```python
    import json, os, pathlib
    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-   marker = pathlib.Path(f"/tmp/claude/delegate/active/{sid}")
+   markers = [pathlib.Path(f"/tmp/claude/{name}/active/{sid}") for name in ("unit", "delegate")]
+   marker = next((path for path in markers if path.is_file()), markers[0])
    runs = pathlib.Path.home() / ".local/state/plan-delegate/runs"
    active = runs / f"{pathlib.Path(marker.read_text().strip()).name}.jsonl" \
        if sid and marker.is_file() else None
@@ -163,7 +166,7 @@ delegate-ready and this command does not apply to it — say so and stop.
 **Running mid-run is fine** — shrinking only touches `done` phases, and the
 phase `/unit:direct` is working is `todo`. Under `/unit:direct`, the code
 checkpoint is already committed; closeout shrink runs beside the next phase's
-seats and receives its own plan-doc-only commit. State in one line that any copy
+workers and receives its own plan-doc-only commit. State in one line that any copy
 of the doc already in the orchestrator's context is stale (a later `Edit`
 against pre-shrink text will fail loudly, not silently).
 </ResolvePlan>

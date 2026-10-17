@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import showrunners
+import tidy_wrapped
 import unit_lookup
-from add_unit import Production, Refusal, cell_value, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               PromoteTo, Stop,
@@ -107,6 +109,9 @@ def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
         row = {heading: cell_value(cell) for heading, cell in cells.items()}
         if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
             raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
+        # A permanent unit outlives the production: wrap neither waits on it nor retires it.
+        if row["Plan"] == "permanent":
+            continue
         plan = Path(row["Plan"]).expanduser()
         parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
                               Path(row["Worktree"]).expanduser(), row["Branch"]))
@@ -159,7 +164,7 @@ def load(production: Production, lines: list[str], resume: bool) -> None:
                   else "no code checkpoint")
         report("last-merged", "ok", f"{unit.name}: {detail}")
         found = marked.get(unit.name)
-        report("session", "ok", f"{unit.name}: " + (f"{found.label} live" if found is not None else "gone"))
+        report("session", "ok", f"{unit.name}: " + (f"{found.place.session} live" if found is not None else "gone"))
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
@@ -300,6 +305,14 @@ def close_out_items(lines: list[str]) -> tuple[str, ...]:
     return tuple(line[2:].strip() for line in lines[start:end] if line.startswith("- "))
 
 
+def archived_doc(production: Production) -> Path | None:
+    """Where a wrapped doc kept in a productions/ folder goes: archive/<repository>/<slug>/ beside it."""
+    if production.doc.parent.name != "productions":
+        return None
+    common = Path(checked(production.checkout, "wrap", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    return production.doc.parent.parent / "archive" / common.parent.name / production.slug / production.doc.name
+
+
 def retire_reservations(worktree: Path) -> None:
     board = subprocess.run(["cargo-berth", "board", "--json"], capture_output=True,
                            text=True, check=False)
@@ -354,6 +367,18 @@ def release_edges(slug: str) -> None:
     above = f"detached from {released.parent}" if released.parent else ""
     below = f"{', '.join(released.orphans)} now root{'' if len(released.orphans) == 1 else 's'}" if released.orphans else ""
     report("tree", "ok", "; ".join(part for part in (above, below, *told) if part))
+
+
+def tidy_state(slug: str) -> None:
+    """Delete the production's own footer, pause, open-question and state files; a failure keeps them for the sweep."""
+    try:
+        removed = tidy_wrapped.tidy(slug)
+    except (tidy_wrapped.TidyRefused, OSError) as error:
+        report("tidy", "kept", f"{error}; tidy_wrapped.py removes them once the doc says wrapped")
+        return
+    names = ", ".join(str(path.relative_to(tidy_wrapped.STATE_DIR)) + ("/" if path.parent == tidy_wrapped.STATE_DIR else "")
+                      for path in removed)
+    report("tidy", "ok", f"removed {names}" if removed else "no state files")
 
 
 def wrap(production: Production, lines: list[str], no_ci: bool,
@@ -423,6 +448,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
         release_edges(production.slug)
+        tidy_state(production.slug)
         archived = command(
             "phase-notes",
             production.checkout,
@@ -443,11 +469,17 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    doc_path = doc_path_in_checkout(production, production.doc)
-    if git(production.checkout, "diff", "--quiet", "HEAD", "--", doc_path).returncode == 1:
-        _ = checked(production.checkout, "wrap", "add", "--", doc_path)
+    doc_paths = [doc_path_in_checkout(production, production.doc)]
+    archive = archived_doc(production)
+    if archive is not None:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        doc_paths.append(doc_path_in_checkout(production, archive))
+        _ = checked(production.checkout, "wrap", "mv", "--", *doc_paths)
+        report("wrap", "ok", f"moved the doc out of productions/ to {doc_paths[1]}")
+    if git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
+        _ = checked(production.checkout, "wrap", "add", "--", doc_paths[-1])
         _ = checked(production.checkout, "wrap", "commit", "--only", "-m",
-                    f"production({production_name(lines)}): wrapped", "--", doc_path)
+                    f"production({production_name(lines)}): wrapped", "--", *doc_paths)
         report("wrap", "ok", "production doc committed")
     else:
         report("wrap", "ok", "production doc already committed")
@@ -479,7 +511,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     main_result = (f"promoted to {tip[:7]} ({commit_count} commits)" if isinstance(status, ProductionRunning)
                    else f"promoted to {tip[:7]} by the earlier run")
     print(f"| Main | {main_result} |")
-    print("| Next | close tmux sessions |")
+    print("| Next | close herdr sessions |")
 
 
 def main() -> int:

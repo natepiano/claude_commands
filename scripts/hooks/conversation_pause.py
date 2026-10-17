@@ -17,7 +17,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..lib import unit_runs
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import unit_runs
 
 
 QUIET_SECONDS = 900
@@ -26,7 +32,7 @@ UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
 SCHEDULED_PROMPT_RETENTION_SECONDS = 8 * 24 * 60 * 60
 WATCHER = "conversation-pause"
-JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
+JOB_SENDERS = frozenset({WATCHER, "stall-watch", "quota_alert", "mac-test",
                          "disk_floor", "shutdown"})
 QUESTION = (
     f"conversation-pause: the user has been quiet here for {QUIET_SECONDS // 60} minutes. "
@@ -370,10 +376,14 @@ def prompt_source(
     return PromptSource.TYPED
 
 
-def pauses(source: PromptSource, showrunner_session: bool) -> bool:
-    if source is PromptSource.TYPED:
-        return True
-    return source is PromptSource.PEER and not showrunner_session
+def pauses(source: PromptSource) -> bool:
+    """Only the user's own input pauses: a peer message, a tick or a relay never does.
+
+    Until 2026-10-13 a peer message paused a unit director too, so a review unit's hourly health
+    tick, relayed by another session, paused its timer and asked the user to return six times
+    while the user never typed in that pane.
+    """
+    return source is PromptSource.TYPED
 
 
 def is_showrunner_session(session_id: str) -> bool:
@@ -556,13 +566,10 @@ def user_words(instances: tuple[str, ...] | list[str],
         words.append("dailies")
     if footers:
         words.append("footer")
-    if any(name.startswith("delegate-") for name in instance_set):
+    if any(name.startswith(unit_runs.INSTANCE_PREFIXES) for name in instance_set):
         words.append("status reports")
-    if "report-builds" in instance_set:
-        words.append("build report")
     known = {name for name in instance_set
-             if name.startswith("showrunner-") or name.startswith("delegate-")
-             or name == "report-builds"}
+             if name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES))}
     words.extend(sorted(instance_set - known))
     return tuple(words)
 

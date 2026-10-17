@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
@@ -126,10 +127,27 @@ class MacOutcomeTests(unittest.TestCase):
             self.assertIn("calls_started", str(connection.execute("EXPLAIN QUERY PLAN " + statements[0]).fetchall()))
             self.assertNotIn("localtime", statements[0])
 
-    def test_python_and_sql_step_rules_identify_the_same_mac_caller(self) -> None:
+    def test_mac_step_rule_keeps_identifying_the_offload_caller(self) -> None:
         for caller in ("verify-mac", "verify", None, "agent"):
             self.assertEqual(outcome.is_mac_step(caller), caller == "verify-mac")
-        self.assertEqual(outcome.natedev_step_predicate("s"), "NOT (s.caller IS 'verify-mac')")
+
+    def test_natedev_step_predicate_selects_host_independently_of_caller(self) -> None:
+        self.assertEqual(outcome.natedev_step_predicate(), "steps.host = 'natedev'")
+        self.assertEqual(outcome.natedev_step_predicate("s"), "s.host = 'natedev'")
+        with closing(sqlite3.connect(":memory:")) as connection:
+            _ = connection.execute("CREATE TABLE steps (id INTEGER, host TEXT, caller TEXT)")
+            _ = connection.executemany("INSERT INTO steps VALUES (?, ?, ?)", [
+                (1, "natedev", "verify"), (2, "natedev", "verify-mac"),
+                (3, "natedev", None), (4, "Nates-MacBook-Pro-2023", "verify-mac"),
+                (5, "Nates-MacBook-Pro-2023", "unknown"), (6, "Mac", "agent"),
+                (7, "other-host", "verify"), (8, None, "verify"),
+            ])
+            for alias in ("steps", "s"):
+                with self.subTest(alias=alias):
+                    rows = connection.execute(
+                        f"SELECT id FROM steps AS {alias} WHERE {outcome.natedev_step_predicate(alias)} ORDER BY id"
+                    ).fetchall()
+                    self.assertEqual(rows, [(1,), (2,), (3,)])
 
 
 if __name__ == "__main__":

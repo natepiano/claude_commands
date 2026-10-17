@@ -125,15 +125,17 @@ class IsolatedTargetTest(unittest.TestCase):
         }
         _ = (self.mac_state / "block.json").write_text(json.dumps(record), encoding="utf-8")
 
-    def write_claim(self) -> None:
+    def write_claim(self, file_name: str = "run.json", what: str = "nextest hana", since: datetime = SINCE) -> None:
         record: ClaimRecord = {
             "pid": 12345,
             "proc_start": "test-run-start",
-            "what": "nextest hana",
+            "what": what,
             "worktree": str(self.root / "hana"),
-            "since": SINCE.isoformat(),
+            "since": since.isoformat(),
         }
-        _ = (self.mac_state / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        path = self.mac_state / file_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(record), encoding="utf-8")
 
 
 class ConfigurationTests(IsolatedTargetTest):
@@ -304,9 +306,16 @@ class TargetStateTests(IsolatedTargetTest):
         args.what = "nextest hana"
         args.worktree = str(self.root)
         output = io.StringIO()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+             mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))
+        if code == 0:
+            watcher.assert_called_once()
+            paths = cast(mac_test.StatePaths, watcher.call_args.args[0])
+            self.assertEqual(paths.directory, self.mac_state)
+        else:
+            watcher.assert_not_called()
         return code, output.getvalue()
 
     def test_retained_expired_block_is_held_and_refuses_claim(self) -> None:
@@ -352,7 +361,47 @@ class TargetStateTests(IsolatedTargetTest):
     def test_live_claim_is_running(self) -> None:
         self.write_claim()
         with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
-            self.assertEqual(targets.target_state(self.mac()), targets.Running("nextest hana", SINCE))
+            self.assertEqual(
+                targets.target_state(self.mac()),
+                targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
+            )
+
+    def test_each_live_repository_claim_is_a_running_job_oldest_first(self) -> None:
+        later = SINCE + timedelta(minutes=10)
+        self.write_claim("claims/cargo-liner.json", "nextest cargo-liner", later)
+        liner = self.mac_state / "claims" / "cargo-liner.json"
+        record = cast(dict[str, object], json.loads(liner.read_text(encoding="utf-8")))
+        record["idle_since"] = END.isoformat()
+        _ = liner.write_text(json.dumps(record), encoding="utf-8")
+        self.write_claim("claims/hana.json")
+        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+            self.assertEqual(targets.target_state(self.mac()), targets.Running((
+                targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),
+                targets.RunningJob("nextest cargo-liner", later, targets.IdleSince(END)),
+            )))
+
+    def test_ended_repository_claim_leaves_only_live_jobs(self) -> None:
+        record: ClaimRecord = {
+            "pid": 12345,
+            "proc_start": "ended-run-start",
+            "what": "nextest cargo-liner",
+            "worktree": str(self.root / "cargo-liner"),
+            "since": SINCE.isoformat(),
+        }
+        (self.mac_state / "claims").mkdir()
+        _ = (self.mac_state / "claims" / "cargo-liner.json").write_text(json.dumps(record), encoding="utf-8")
+        self.write_claim("claims/hana.json")
+        with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
+            self.assertEqual(
+                targets.target_state(self.mac()),
+                targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
+            )
+
+    def test_invalid_repository_claim_is_a_state_read_failure(self) -> None:
+        claim = self.mac_state / "claims" / "hana.json"
+        claim.parent.mkdir()
+        _ = claim.write_text("{}", encoding="utf-8")
+        self.assertEqual(targets.target_state(self.mac()), targets.StateUnreadable(f"{claim} has an invalid run record"))
 
     def test_claim_with_gone_run_is_free(self) -> None:
         self.write_claim()
@@ -476,7 +525,7 @@ class TargetStateTests(IsolatedTargetTest):
         self.assertEqual(targets.target_state(self.mac()), targets.StateUnreadable(f"{claim} has an invalid since"))
 
     def test_unrelated_value_error_is_not_reported_as_state_failure(self) -> None:
-        with mock.patch.object(mac_test, "read_run", side_effect=ValueError("unrelated failure")):
+        with mock.patch.object(mac_test, "read_claims", side_effect=ValueError("unrelated failure")):
             with self.assertRaisesRegex(ValueError, "unrelated failure"):
                 _ = targets.target_state(self.mac())
 
@@ -493,7 +542,10 @@ class ValueTests(unittest.TestCase):
             targets.LocalTarget("natedev", "linux"),
             targets.SshTarget("mac", "macos", Path("mac_test.conf")),
             targets.Free(),
-            targets.Running("nextest hana", SINCE),
+            targets.RunningJob("nextest hana", SINCE, targets.IdleSince(END)),
+            targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),)),
+            targets.IdleSince(END),
+            targets.NOT_SEEN_IDLE,
             targets.Held("hana", "render checks", SINCE, targets.UntilReleased()),
             targets.Unreachable("connection timed out"),
             targets.StateUnreadable("holder access denied"),

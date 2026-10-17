@@ -10,6 +10,26 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/herdr",
+      "extraPaths": [
+        ".",
+        "scripts/herdr",
+        "scripts/message",
+        "scripts/production",
+        "scripts/lib"
+      ]
+    },
+    {
+      "root": "scripts/delegate",
+      "extraPaths": [
+        ".",
+        "scripts/production",
+        "scripts/message",
+        "scripts/herdr",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
@@ -35,6 +55,7 @@
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
+        "scripts/delegate",
         "scripts/message",
         "scripts/notify",
         "scripts/production",
@@ -45,6 +66,16 @@
       "root": "scripts/fix",
       "extraPaths": [
         "scripts/fix",
+        "scripts/style",
+        "scripts/lib"
+      ]
+    },
+    {
+      "root": "scripts/style",
+      "extraPaths": [
+        ".",
+        "scripts/style",
+        "scripts/production",
         "scripts/lib"
       ]
     },
@@ -63,6 +94,7 @@
       "extraPaths": [
         ".",
         "scripts/nightly_review",
+        "scripts/herdr",
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/lib"
@@ -76,7 +108,8 @@
         "scripts/delegate",
         "scripts/notify",
         "scripts/shutdown",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
@@ -101,6 +134,7 @@
       "root": "scripts/mac_test",
       "extraPaths": [
         "scripts/mac_test",
+        "scripts/buildlog",
         "scripts/build_hold",
         "scripts/lint",
         "scripts/lib"
@@ -143,13 +177,17 @@
         "scripts/notify",
         "scripts/shutdown",
         "scripts/whoami",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr",
+        "scripts/make_a_worktree"
       ]
     },
     {
       "root": "scripts/build_hold",
       "extraPaths": [
         "scripts/build_hold",
+        "scripts/build_targets",
+        "scripts/lint",
         "scripts/message",
         "scripts/notify",
         "scripts/lib"
@@ -158,13 +196,15 @@
     {
       "root": "scripts/shutdown",
       "extraPaths": [
+        ".",
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/message",
         "scripts/notify",
         "scripts/production",
         "scripts/hooks",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
