@@ -42,21 +42,16 @@
       "time": "2026-10-14T04:27:02.640947-04:00"
     }
   },
-  "quota.claude": {
-    "exhausted": {
+  "quota.claude_next_move": {
+    "uncovered_empty": {
       "reviewer": "opus",
-      "sha256": "6b0887a34c590125a16f1efc9fd4cbfc20534fbc6752642092dfa5d0c0029d4a",
-      "time": "2026-10-14T17:16:07.558043-04:00"
+      "sha256": "2a7621904fa25e78aad26f1d722ab1771c161194723dc0c1db90ac57a9a5763a",
+      "time": "2026-10-16T21:23:39.016211-04:00"
     },
-    "long_target": {
+    "uncovered_low": {
       "reviewer": "opus",
-      "sha256": "6b0887a34c590125a16f1efc9fd4cbfc20534fbc6752642092dfa5d0c0029d4a",
-      "time": "2026-10-14T17:16:22.604143-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "6b0887a34c590125a16f1efc9fd4cbfc20534fbc6752642092dfa5d0c0029d4a",
-      "time": "2026-10-14T17:15:53.416495-04:00"
+      "sha256": "2a7621904fa25e78aad26f1d722ab1771c161194723dc0c1db90ac57a9a5763a",
+      "time": "2026-10-16T21:23:28.135801-04:00"
     }
   },
   "quota.codex_credits_forecast": {

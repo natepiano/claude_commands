@@ -1126,39 +1126,9 @@ each in your session.
 </PauseForMove>
 
 <QuotaAlert>
-Unit directors' workers run on accounts with a weekly usage limit. The notices about
-them, how to tell the three kinds apart, and what a receiver does are in
-`~/.claude/docs/quota_alerts.md`. Read it at <StartUpdates/> and follow it; this
-section adds only what the showrunner role needs.
+Read `~/.claude/docs/quota_alerts.md` at <StartUpdates/>. Relay only Codex notices through `python3 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR --notice "<full notice>"`.
 
-This session is on the quota alert list because <StartUpdates/> adds it.
-
-**Unit directors act through you.** They are not on the list, so each notice
-reaches them only as your relay (<Throughout/>). Run `python3
-~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
---state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
-to every unit director and prints one `send <unit>:` receipt each. With more
-than one Claude account in use, a Claude `Quota alert:` names its account and
-roles (`claude3 (unit directors) at …`). It reaches only the unit directors
-running on that account, prints `skip <unit>: it runs on <other account>` for
-the rest, and reports a unit whose account cannot be read as not told:
-- `Quota alert:` — the command picks the instruction from the notice. A Codex
-  notice that says nothing was switched: unit directors keep delegating on Codex,
-  whose account may keep working on its credits, and tell you at once if Codex
-  refuses work for quota; bring a refusal to the user. A notice that says every
-  function moved: delegation continues on Claude. A Claude notice, or a Codex one
-  whose switch failed: start no new delegate work on that tool; running workers
-  finish and the unit director does the rest itself. Hold the alert as one
-  line per account, led by `quota: ` and listed first in every Waiting on block
-  after the open-questions count, with the percent left and the reset time,
-  until it is acknowledged or restored. It is a status, not a question: keep it
-  out of `open_for_user`.
-- `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
-- `Quota restored:` — tell every unit director that delegation on that tool,
-  or work on that Claude account, can resume, and drop the held item.
-
-What to do about the quota itself is the user's call; relay their decision to
-every unit director.
+Codex notices that say nothing switched keep delegation on Codex; report a quota refusal at once. A move to Claude continues delegation there. Held Codex alerts are listed first in every Waiting on block, led by `quota: `, until restored; restoration resumes delegation and drops them. Claude has no session quota relay: `/next_moves` controls its one-shot group moves, and an uncovered low account gets one phone reminder.
 </QuotaAlert>
 
 ---
