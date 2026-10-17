@@ -11,7 +11,7 @@ the repository's local rule directories. This document holds the procedure.
 | A | A full clippy, mend and rustfmt lint record per synced tip; a merge's quick gate is insufficient. |
 | B | A worker judges every listed generator site or `pre_filter` hit; a partial generator also needs the uncovered read as C. |
 | C | A worker reads each included Rust file against the rule. |
-| D | One check per crate, including its listed sites and uncovered read. |
+| D | One check per file in reach and listed site path; manifest rules check each crate. |
 | E | Governs how fixes are made; never swept or counted as coverage. |
 
 ## Families
@@ -35,13 +35,20 @@ Every partial B rule also has a C read in its own family.
 One ticket per phase:
 
 - **Read:** one family, about 5,000 lines in one module subtree, 10–25 files.
+  The Work Order lists each file's line windows (at most 300 lines, test module
+  apart); judge and hold window by window, module docs first.
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
-- **Structure:** one crate, judged file by file, every distinct defect held as its own finding.
+- **Structure:** a small batch from one crate, at most 6 files and 3,000 lines,
+  keeping directories together when they fit. Judge and record each file against
+  every rule; the gate refuses the ticket while a file lacks a verdict.
+  Structure tickets opened before this change keep their crate cells until
+  they merge.
 
 Run tier D first. Structure crates are taken in order of the other-family
-pending cells they block, most first. A repair phase always precedes a new ticket.
+pending cells they block inside a unit's pilot scope, most first, so a crate
+blocking a pilot unit comes first. A repair phase always precedes a new ticket.
 After an interruption, resume the assigned or checkpointed ticket from
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`; never take a second
 one. A checkpointed ticket waits for its merge into the style branch before
@@ -85,8 +92,11 @@ Refill only the unit worktree's own plan copy:
 ```
 
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
-reporting `repair first`; 3 means `waiting for sync` (an unclassified catalog
-also says `pull nate_style`); 4 means `board unavailable: <reason>`; 5 means
+reporting `repair first`; 3 means `waiting for sync`, or
+`waiting for structure: <crates>` when pending structure cells in those in-scope
+crates hold the unit back until the modules unit's structure tickets merge
+(an unclassified catalog also says `pull nate_style`); 4 means
+`board unavailable: <reason>`; 5 means
 `waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
 availability stops selection without recording work. `queue` is a read-only
 preview and also returns 4 when the board is unavailable.
@@ -144,7 +154,8 @@ no cells or tickets; show their count with the action **pull nate_style**.
 The Rust cell universe contains tracked, included non-vendor `.rs` files.
 Listed rules also gain cells for tracked non-Rust files holding their sites;
 those cells use file fingerprints regardless of the rule's input scope.
-Tier D has crate cells. Sources outside workspace members belong to crate `.`.
+Tier D has file cells; manifest-scope D rules keep crate cells. Sources outside
+workspace members belong to crate `.`.
 
 | Cell state | Meaning |
 | --- | --- |
@@ -172,7 +183,7 @@ A partial B rule has listed file cells and `<rule id>#uncovered` C cells for
 every included Rust file in reach. Both components must be current to finish
 the parent rule; pseudo-rules never increase the rule count. Zero listed sites
 complete only the listed component. A whole B rule or a `pre_filter`-only rule
-has no uncovered component. A partial D rule's crate cell covers both reads.
+has no uncovered component. A partial D rule's file cell covers both reads.
 
 `set-tip` fills listed sites from committed files. Coverage and site reads
 refresh sites when the rule blob changes, even at the same tip; zero-site

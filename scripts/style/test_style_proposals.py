@@ -121,7 +121,7 @@ class StyleProposalsTests(unittest.TestCase):
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         finding = ledger.hold(rule, f"{crate}/src/lib.rs", line, f"site {line}", kind, "value", "count", blob, ticket)
         if record:
-            ledger.record(rule, crate if rule == self.structure else finding.path, self.tip, blob, "held", ticket=ticket, worker="test")
+            ledger.record(rule, finding.path, self.tip, blob, "held", ticket=ticket, worker="test")
         return finding
 
     def file(self, ledger: style_ledger.Ledger) -> tuple[Path, ...]:
@@ -373,15 +373,15 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(len(ledger.held_findings(style_ledger.HeldFindingsInState("waived"))), 2)
             self.assertEqual(next(cell.state for cell in ledger.cells(self.rename)), "current")
 
-    def test_decline_structure_resolves_the_crate_cell(self) -> None:
+    def test_decline_structure_resolves_the_file_cell(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger, rule=self.structure)
             result = ledger.decline_held(finding.finding_id, "Keep structure")
             self.assertIsInstance(result, style_ledger.CellWaived)
             if isinstance(result, style_ledger.CellWaived):
-                self.assertEqual(result.judgment.path, "alpha")
+                self.assertEqual(result.judgment.path, "alpha/src/lib.rs")
             with closing(sqlite3.connect(ledger.database)) as connection:
-                self.assertEqual(connection.execute("SELECT path,verdict FROM judgments").fetchall(), [("alpha", "waived")])
+                self.assertEqual(connection.execute("SELECT path,verdict FROM judgments").fetchall(), [("alpha/src/lib.rs", "waived")])
 
     def test_decline_changed_input_and_missing_judgment_do_not_record_waived_cells(self) -> None:
         with self.ledger() as ledger:

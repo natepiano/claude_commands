@@ -1514,7 +1514,7 @@ never take a second ticket while one is open.
 
 | Exit | Unit status and next action |
 | --- | --- |
-| 3 | `waiting for sync`; report once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
+| 3 | `waiting for sync` or `waiting for structure: <crates>`; report the printed line once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
 | 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
 | 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
 | Other nonzero | Report the error and retain the ticket; repair it before refill. |

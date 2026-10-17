@@ -63,8 +63,8 @@ against the union of one-rule findings using the same model.
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
 | modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
-| names | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by names-unit |
-| types | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by types-unit |
+| names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
+| types | FAIL | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
 
 Per-rule recall and candidate file-local rules: pending.
 
@@ -92,8 +92,11 @@ product merge between checkpoint and integration.
 The other 16 merged tickets record checkpoint `d1ced22c`, already on main before
 the first ticket: they changed no code and carried nothing to hand off. From the
 `style/main` aggregate commit `8d6e25d1` to main took 0.04 h. The ledger's
-`handoffs` row still read `sent` after git showed the merge, and so does the
-`f091ed48` row, with no merge commit recorded.
+`handoffs` row still read `sent` after git showed the merge, and so did the
+`f091ed48` row, with no merge commit recorded. cargo-liner's style showrunner
+recorded both at 16:45:17Z; a read-only ledger check on 2026-10-17 shows
+both rows `merged`, `8d6e25d1` with merge commit `28db0785` and `f091ed48`
+with `ac95d94d`. Fix K makes the parent's merge record this itself.
 
 The showrunner counts this as a fail and changes nothing until two more
 hand-offs are measured. For each, record whether a product merge landed between
@@ -284,6 +287,84 @@ Pending: parent's saved style child summary and rendered style line.
   acknowledgment is now a notice only. A ledger failure prints one `hand-off
   ledger:` line, and the merge and acknowledgment still go through.
 
+- **Fix L — modules tickets own small file batches, each file with its own verdict cell** (commit `23fd3edf`):
+  the modules recall sample above found 21 of 36 defects, and 7 of the misses
+  sat on files where the unit held nothing: a modules ticket owned a whole
+  crate, and the ledger asked for one crate verdict per rule, so nothing made
+  the worker judge every file. Modules rules now have one verdict cell per
+  file (the workspace-dependencies rules keep one per crate). A new modules
+  ticket owns a batch of at most 6 files and 3000 lines, directories kept
+  together, and its gate refuses the ticket while any file lacks a verdict.
+  The Work Order lists the batch, the cells it owns and the findings already
+  held on its files. A ticket opened before this change records crate
+  verdicts, which cover none of the new file cells, so its crate's files
+  are judged again in batches; each batch lists the findings it already
+  holds. Every crate's modules files start unjudged, so the
+  other families wait on each crate's batches; fix M orders the pilot crates
+  first.
+
+- **Fix M — modules takes first the crates that block a pilot unit** (commit `22fe6550`):
+  the types unit (pilot scope cargo-port) and the names unit (cargo-handler)
+  both waited on those crates' structure cells while refill handed modules
+  tui_pane, which sits in neither scope but held the most pending cells of
+  other families. A pending cell now counts toward a crate's place in the
+  structure order only when its family has a unit whose pilot scope holds
+  that crate, and a family with no unit counts nothing. Each unit's scope is
+  read from its own plan copy. `queue` shows the same order refill uses.
+
+- **Fix N — refill names the crates whose structure cells hold a unit back** (commit `425c27e2`):
+  while modules worked through the pilot crates, the types and names units
+  reported a bare `waiting for sync`, which reads as a missing sync and not
+  as work queued behind modules. A unit other than modules with nothing to
+  take now prints `waiting for structure: <crates>`, listing each in-scope
+  crate that holds both a pending structure cell and a pending cell of its
+  own family. It still exits 3 and still registers its sync wait, so a
+  modules merge wakes it as before.
+
+- **Windowed names recall sample:** the same 20 cargo-handler files were
+  judged again by two blind family judges, all seven names rules at once,
+  as a names ticket does, with one change: each file was read in windows of
+  at most about 300 lines, and each window's findings were written down
+  before the next window opened. Recall rose from 37/117 (31.62%) to 100/117
+  (85.47%). comments-name-code-constructs rose from 18 to 38 of 43, and
+  prefer-type-named-fields-and-bindings from 18 to 61 of 66. The misses in
+  long files and test files are gone. name-bindings-to-match-parameters
+  stayed at 0 of 6 and spell-out-names at 0 of 1: windows fix how deep a
+  judge reads, not whether it traces a binding into the parameter it feeds.
+  Three of the five comment misses left are module docs at lines 1–3. Fix O
+  makes windows the read-ticket procedure; a dedicated name-bindings pass
+  follows it.
+
+- **Fix O — read tickets judge each file in line windows** (commit `41cb588e`):
+  the windowed names sample showed depth within a file was the gap, so a
+  read ticket's Work Order now lists each file's line windows, computed
+  from the file at the ticket's base: at most 300 lines each, balanced,
+  with the file's test module in windows of its own. The Spec tells the
+  worker to judge window by window, every rule, line by line, starting a
+  file with its module docs, to hold each window's findings before opening
+  the next, and to record a file's verdicts after its last window. The
+  test module is found past any attributes or visibility between
+  `#[cfg(test)]` and `mod`, which about half the workspace's test modules
+  carry. Structure, listed and proposal tickets are unchanged.
+
+- **Types recall sample:** seven blind one-rule judges, one per types rule,
+  read 20 cargo-port files the types unit had judged, whole files, no
+  windows. The unit held 50 of their 71 findings (70.4%). Owned booleans
+  hold up (39 of 43), and the unit found sites the judges passed over.
+  If/else chains are the weak rule (7 of 13): half the misses are one
+  decision taken again at several points in a file, the rest short chains
+  over an unnamed set of states. Public failures turns on scope: cargo-port
+  is a binary crate, so none of its `pub` functions is reachable from
+  outside it, and the rule exempts functions not public outside the crate.
+  The judges read `pub` as public and flagged ten send-and-discard sites;
+  the unit read the exemption and held one. Read the binary-crate way,
+  recall is 50 of 61 (82.0%). The showrunner settled that reading: the
+  rule's own words exempt the ten, so 50 of 61 is the score, and fix P
+  states a binary crate's scope in its Work Order. The misses are not deep in
+  long files, but these findings came from read tickets, so the sample is
+  re-judged once fix O's windows land.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
-fix I as `89f24e01`, fix J as `9b71ca5b`.
+fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
+`a8ae4d2a`, fix N as `5f63b4cf`.
 Live verification of the fixes and subsequent measurements remain pending.
