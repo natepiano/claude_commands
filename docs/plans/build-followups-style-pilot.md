@@ -377,8 +377,20 @@ Pending: parent's saved style child summary and rendered style line.
   3 of 4 (75%). The third is a real miss: a binding passed through a `From`
   conversion takes the outer parameter's name, as the rule's own example
   passes through `map_or`, but the judge stopped at the conversion's own
-  parameter name. Either reading fails the 95% bar; the reading and any
-  rule-text change go to the showrunner.
+  parameter name. The showrunner settled the first reading: a binding
+  that fills differently named parameters is out of scope, so the score is
+  3 of 4. Four findings are too few to call pass or fail; the rule text is
+  right and only the judges miss the conversion case, so a names ticket's
+  Work Order states it, and the pass runs again on a sample holding at
+  least 20 in-scope findings.
+
+- **Fix P — a binary crate's Work Order says its `pub` items are not
+  public** (commit `d6818851`): the types sample showed judges reading
+  `pub` as public in a crate with no library target. The planner now reads
+  the crate's manifest and `src/lib.rs` at the ticket's base, and a ticket
+  for a package with no library target states that none of its items is
+  public outside the crate. A crate with a library, and a workspace root
+  with no package of its own, get no line.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
