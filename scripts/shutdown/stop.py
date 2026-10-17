@@ -24,7 +24,7 @@ for dependency in ("message", "production", "herdr", "lib"):
 import sessions
 import herdr
 import relaunch
-from inventory import Inventory, Session, terminal_kind, live_supervisor
+from inventory import Inventory, Session, terminal_kind, live_supervisor, codex_seats
 from record import (
     CLAIM_STALE_SECONDS,
     NoLiveRecord,
@@ -32,6 +32,7 @@ from record import (
     ReadinessCheck,
     SessionProgress,
     SessionShutdown,
+    PausedSeat,
     SessionStopIssue,
     find_session,
     update_session,
@@ -304,15 +305,33 @@ def _run_directories(session: Session) -> list[str]:
     )
 
 
-def _end_busy_codex_workers(
-    session: Session, codex_mesh: CommandRunner, claim: StopClaim
-) -> None:
-    for server in session["codex_servers"]:
-        for worker in server["busy_workers"]:
-            claim.check()
-            _ = codex_mesh(
-                ["end", "--session-dir", server["run_dir"], "--to", worker]
-            )
+RESUME_PROMPT = (
+    "You were paused when your unit director stopped for an account move or restart. "
+    "Continue the task you were on from where you stopped; your earlier instructions still hold."
+)
+
+
+def _capture_codex_seats(session: Session) -> list[PausedSeat]:
+    seats = codex_seats([Path(directory) for directory in _run_directories(session)])
+    for seat in seats:
+        if seat["turn_live"]:
+            _ = (Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md").write_text(RESUME_PROMPT + "\n", encoding="utf-8")
+    return seats
+
+
+def _save_codex_seats(session: Session, claim: StopClaim) -> None:
+    claim.check()
+    seats = _capture_codex_seats(session)
+    def save(current: SessionShutdown) -> None:
+        claim.require(current)
+        # Retried cleanup must retain the argv read before the launcher exited.
+        previous = {(seat["run_dir"], seat["seat"]): seat for seat in current.get("codex_seats", [])}
+        for seat in seats:
+            key = seat["run_dir"], seat["seat"]
+            if key not in previous:
+                previous[key] = seat
+        current["codex_seats"] = list(previous.values())
+    _ = update_session(claim.login, claim.session_id, save)
 
 
 def _stop_codex_servers(
@@ -327,7 +346,7 @@ def _stop_codex_servers(
     for run_dir in _run_directories(session):
         server_pids = _mesh_server_pids(run_dir)
         claim.check()
-        status = codex_mesh(["stop", "--session-dir", run_dir])
+        status = codex_mesh(["stop", "--pause", "--session-dir", run_dir])
         if status != 0 or any(is_alive(pid) for pid in server_pids):
             issues.append(
                 {
@@ -521,6 +540,7 @@ def _retry_owner_cleanup(
         if issue["kind"] == "codex server left running"
     ]
     session["codex_servers"] = []
+    _save_codex_seats(session, claim)
     issues.extend(_stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     ))
@@ -579,6 +599,7 @@ def _stop_owner(
         )
         return
     if match["kind"] == "session absent":
+        _save_codex_seats(stored, claim)
         try:
             retain_window = _hold_supervised_window(entry, claim)
         except OSError as error:
@@ -625,8 +646,7 @@ def _stop_owner(
 
         _ = update_session(claim.login, claim.session_id, wait_until_ready)
         return
-    if force_now:
-        _end_busy_codex_workers(current, codex_mesh, claim)
+    _save_codex_seats(current, claim)
     try:
         retain_window = _hold_supervised_window(entry, claim)
     except OSError as error:
