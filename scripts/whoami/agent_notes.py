@@ -6,7 +6,7 @@ that quota window expires; unknown or expired usage is YAML null. Never infer
 100% remaining from a reset. weekly_usage_checked_at records the observation in
 UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
-hands the notes to quota_alert.py, which messages sessions when an account runs
+hands the notes to quota_alert.py, which records routing when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 (/quota_refresh) is the run after the user reports a usage reset. `blocked` is
 codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
@@ -42,7 +42,8 @@ from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Repor
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
-                         codex_alert_pass, RefusedAt, RefusalTimeUnknown)
+                         codex_alert_pass, RefusedAt, RefusalTimeUnknown,
+                         StoppedWorkerCommand, StoppedCommandUnknown)
 from run_out import READINGS_LOG
 import usage_store
 from user_zone import user_zone
@@ -451,6 +452,7 @@ class RefusalCommandLine(argparse.Namespace):
     identity: list[str] = []
     window: str = "unknown"
     refused_at: str = ""
+    stopped: list[str] | None = None
 
 
 @role_map_command
@@ -460,6 +462,7 @@ def main() -> None:
         _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
         _ = parser.add_argument("--window", choices=("weekly", "five_hour", "unknown"), default="unknown")
         _ = parser.add_argument("--refused-at", default="", metavar="AWARE_ISO_TIME")
+        _ = parser.add_argument("--stopped", nargs=3, metavar=("SESSION_ID", "WORKER", "COMMAND"))
         parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
         arguments = parsed.identity
         if len(arguments) == 3:
@@ -482,7 +485,9 @@ def main() -> None:
             refused_at = RefusedAt(parsed_time)
         window = (refusals.KnownWindow("weekly") if parsed.window == "weekly" else
                   refusals.KnownWindow("five_hour") if parsed.window == "five_hour" else refusals.UnknownWindow())
-        for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at):
+        stopped = (StoppedWorkerCommand(*parsed.stopped) if parsed.stopped is not None
+                   else StoppedCommandUnknown())
+        for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at, stopped=stopped):
             print(line)
         return
     if sys.argv[1:] not in ([], ["refresh"]):

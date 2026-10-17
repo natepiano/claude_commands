@@ -37,6 +37,11 @@ _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
 _PLATFORM = sys.platform
 
 
+def _platform() -> str:
+    """The platform herdr reads processes as: HERDR_PLATFORM names the one a test's fake process tree was built for."""
+    return os.environ.get("HERDR_PLATFORM", _PLATFORM)
+
+
 class HerdrFailure(Exception):
     """An external command failure or malformed herdr response."""
 
@@ -132,7 +137,7 @@ class WindowServerCreated:
 
 def security_session() -> SecuritySession:
     """Read the command's security context once; a failed query grants no access."""
-    if _PLATFORM != "darwin":
+    if _platform() != "darwin":
         return NotMacSession()
     try:
         result = run_program([os.environ.get("LAUNCHCTL", "launchctl"), "managername"])
@@ -998,7 +1003,7 @@ def start_server(name: str, timeout_ms: int, *,
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _start_darwin_server(herdr, timeout_ms, exclusive=False,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
     deadline = time.monotonic() + timeout_ms / 1000
@@ -1031,7 +1036,7 @@ def start_new_server(name: str, timeout_ms: int, *,
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         _ = _start_darwin_server(herdr, timeout_ms, exclusive=True,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
         return
@@ -1069,14 +1074,14 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
     _validate_session_name(name)
     _timeout(timeout_ms)
-    if _PLATFORM != "darwin" or isinstance(session_kind, DesktopSession):
+    if _platform() != "darwin" or isinstance(session_kind, DesktopSession):
         if exclusive:
-            if _PLATFORM == "darwin":
+            if _platform() == "darwin":
                 start_new_server(name, timeout_ms, session_kind=session_kind)
             else:
                 start_new_server(name, timeout_ms)
             return ServerCreated()
-        if _PLATFORM == "darwin":
+        if _platform() == "darwin":
             return start_server(name, timeout_ms, session_kind=session_kind)
         return start_server(name, timeout_ms)
     client = Herdr(name)
@@ -1123,7 +1128,7 @@ def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | Wi
 def stop_session(name: str) -> None:
     _validate_session_name(name)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         require_success(run_program(herdr.argv("server", "stop")), f"stop herdr session {name}")
         return
     try:
@@ -1253,7 +1258,7 @@ def _herdr_command(arguments: list[str], default_session: str) -> tuple[str, lis
 
 
 def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
         processes = list(_proc_root().iterdir())
@@ -1382,7 +1387,7 @@ def server_environment(name: str) -> dict[str, str]:
     """Read the environment of the process holding this session's listener."""
     context = f"herdr session {name} server environment"
     socket_path = str(_session_socket(name))
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         try:
             holders = {listener.pid for listener in _darwin_bound_sockets() if str(listener.path) == socket_path}
             if len(holders) != 1:
@@ -1431,7 +1436,7 @@ def server_environment(name: str) -> dict[str, str]:
 
 
 def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
     try:
         environment = _process_environment(_proc_root() / str(pid))
@@ -1743,7 +1748,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
 
 
 def herdr_processes() -> list[HerdrProcess]:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:

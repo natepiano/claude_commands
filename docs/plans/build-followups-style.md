@@ -326,7 +326,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `cargo-berth check` during selection — it acquires reservations.
 - A test reading the footprint CLI from plan prose — a shrink rewrites that prose.
 
-### Phase 9 — Mechanical-fix filter: style_footprint.py  · status: todo
+### Phase 9 — Mechanical-fix filter: style_footprint.py  · status: done
 **Depends on:** Phase 7
 
 #### Work Order

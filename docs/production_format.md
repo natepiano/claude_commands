@@ -431,7 +431,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     positional arguments. The unit's reviewer is permanent: each review
     resumes its thread, and the pool forks a second one only while two reviews
     run at once. `<slug>` is the production doc's file name without
-    `-production.md`.
+    `-production.md`. Until `review-unit` primes the pool, the launcher
+    refuses with `no primed code template`: send that review to an idle
+    worker with `--to`, and tell the showrunner once.
 
 17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
     through `/issue` with tag `proposal`, `proposed_by` your unit's name, and

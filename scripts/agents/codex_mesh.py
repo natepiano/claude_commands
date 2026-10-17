@@ -157,8 +157,18 @@ class ServingRequestFailure(SystemExit):
         self.reported: bool = reported
 
 
+class WorkerQuotaRecoveryStopped(ServingRequestFailure):
+    """Quota recovery stopped on this thread, which may replace the original."""
+
+    def __init__(self, detail: str, serving: CodexServingState, port: int, thread_id: str) -> None:
+        super().__init__(detail, serving, True)
+        self.port: int = port
+        self.thread_id: str = thread_id
+
+
 def _serving_request(
     client: Client, method: str, params: dict[str, object], *, submits_work: bool = False,
+    stopped_in: str = "",
 ) -> dict[str, object]:
     opened = time.time()
     try:
@@ -170,7 +180,7 @@ def _serving_request(
             serving.started_here or time.time() - opened > RETRY_FAST_FAILURE_SECS)
         if proven:
             _owe_quota_continuation(client, _as_str(params.get("threadId")))
-            _report_quota_refusal(client.name, serving, detail)
+            _report_quota_refusal(client.name, serving, detail, stopped_in=stopped_in)
         raise ServingRequestFailure(detail, serving, proven) from error
 
 SERVER_FILE = "mesh_server.json"
@@ -1958,6 +1968,37 @@ class FailedBeforeThread:
 
 
 @dataclass(frozen=True)
+class PendingQuotaRefusal:
+    """A reported refusal whose interrupted command has not completed."""
+
+    serving: CodexServingState
+    detail: str
+
+
+@dataclass(frozen=True)
+class NoPendingQuotaRefusal:
+    """This command has no reported quota refusal to hand back on exit."""
+
+
+@dataclass(frozen=True)
+class KnownWorkerDirector:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class UnknownWorkerDirector:
+    """The command's director could not be uniquely identified."""
+
+
+@dataclass(frozen=True)
+class ResolveWorkerDirector:
+    """Resolve the director while the command's launcher evidence is intact."""
+
+
+RESOLVE_WORKER_DIRECTOR = ResolveWorkerDirector()
+
+
+@dataclass(frozen=True)
 class FailedWithThread:
     """The thread exists; its original prompt must never be submitted again."""
 
@@ -1967,6 +2008,8 @@ class FailedWithThread:
     serving: CodexServingState = field(default_factory=NotBoundCodexServer)
     refusal_reported: bool = False
     refusal_checked: bool = False
+    pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(default_factory=NoPendingQuotaRefusal, kw_only=True)
+    director: KnownWorkerDirector | UnknownWorkerDirector = field(default_factory=UnknownWorkerDirector, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1976,6 +2019,8 @@ class CapacityRetriesExhausted:
     thread_id: str
     retries: int
     minutes: int
+    pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(default_factory=NoPendingQuotaRefusal, kw_only=True)
+    director: KnownWorkerDirector | UnknownWorkerDirector = field(default_factory=UnknownWorkerDirector, kw_only=True)
 
     def message(self, name: str) -> str:
         return (
@@ -2129,16 +2174,36 @@ def _owe_quota_continuation(client: Client, thread_id: str) -> None:
             RosterOnThread(thread_id))
 
 
-def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "") -> None:
+def _worker_director(folder: Path) -> KnownWorkerDirector | UnknownWorkerDirector:
+    try:
+        holders = tuple(_marker_sessions(SWEEP_ROOTS, folder)) or _launcher_sessions(folder)
+    except OSError:
+        return UnknownWorkerDirector()
+    return KnownWorkerDirector(holders[0]) if len(holders) == 1 else UnknownWorkerDirector()
+
+
+def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "", *, stopped_in: str = "",
+                         stopped_thread_id: str = "",
+                         director: KnownWorkerDirector | UnknownWorkerDirector | ResolveWorkerDirector = RESOLVE_WORKER_DIRECTOR) -> None:
     """Hand the serving identity, named limit and refusal time to the account mover."""
     try:
         account = serving.account
         identity = ([str(account.home), account.login, account.label]
                     if isinstance(account, KnownCodexAccount)
                     else [str(account.home), account.reason])
+        stopped: list[str] = []
+        if stopped_in:
+            if isinstance(director, ResolveWorkerDirector):
+                director = _worker_director(Path(stopped_in))
+            if isinstance(director, KnownWorkerDirector):
+                stopped = ["--stopped", director.session_id, name, shlex.join(sys.argv)]
+            if stopped_thread_id:
+                _ = _update_roster_if_expected(stopped_in, name,
+                    {"thread_id": stopped_thread_id, "status": "failed", "continuation_owed": False},
+                                               RosterOnThread(stopped_thread_id))
         done = subprocess.run(
             [sys.executable, str(QUOTA_REPORT), "blocked", *identity,
-             "--window", _quota_window(detail), "--refused-at", datetime.now(timezone.utc).isoformat()],
+             "--window", _quota_window(detail), "--refused-at", datetime.now(timezone.utc).isoformat(), *stopped],
             capture_output=True, text=True, timeout=QUOTA_REPORT_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2217,10 +2282,19 @@ def command_start(args: argparse.Namespace) -> int:
         print(f"codex_mesh: {name}: {note}; retrying on a new one", file=sys.stderr)
         outcome = _run_delegate(args, port, started_here=_fresh)
         tested = True
+    if (isinstance(outcome, (FailedWithThread, CapacityRetriesExhausted))
+            and isinstance(outcome.pending_refusal, PendingQuotaRefusal)):
+        refusal = outcome.pending_refusal
+        _report_quota_refusal(name, refusal.serving, refusal.detail, stopped_in=session_dir,
+                             stopped_thread_id=outcome.thread_id, director=outcome.director)
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
         print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
         if not outcome.refusal_reported and not (isinstance(outcome, FailedWithThread) and outcome.refusal_checked) and _quota_refused(outcome, tested, resident):
-            _report_quota_refusal(name, outcome.serving, outcome.failure)
+            if isinstance(outcome, FailedWithThread):
+                _report_quota_refusal(name, outcome.serving, outcome.failure, stopped_in=session_dir,
+                                     stopped_thread_id=outcome.thread_id, director=outcome.director)
+            else:
+                _report_quota_refusal(name, outcome.serving, outcome.failure, stopped_in=session_dir)
         return 1
     if isinstance(outcome, CapacityRetriesExhausted):
         print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
@@ -2609,7 +2683,8 @@ def _attach_and_run(
 
     client = Client(port, name)
     _ = _bind_serving_server(client, session_dir, started_here=started_here)
-    started = _serving_request(client, "thread/start", _thread_start_params(args), submits_work=True)
+    started = _serving_request(client, "thread/start", _thread_start_params(args),
+                               submits_work=True, stopped_in=session_dir)
     thread_id = _as_str(_as_dict(started.get("thread")).get("id"))
     if not thread_id:
         raise SystemExit("codex_mesh: thread/start returned no thread id")
@@ -2708,7 +2783,8 @@ def _stream_turn(
     retry_waited = False
     waiting_for_progress_after_overflow = False
     run_outcome: RunOutcome = RunCompleted()
-    refusal_reported = False
+    pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = NoPendingQuotaRefusal()
+    director = UnknownWorkerDirector() if follow else _worker_director(Path(session_dir))
     failure_serving = client.serving
     reported_turns: set[tuple[CodexServingState, str, str]] = set()
     changed: bool
@@ -2784,6 +2860,8 @@ def _stream_turn(
                                     and not end_marker.exists()):
                                 continue
                             moved = _move_resident(args, session_dir, name, thread_id, client)
+                            if isinstance(moved, WorkerAwaitingQuotaRecovery):
+                                pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
                             if isinstance(moved, WorkerThreadStateUnknown):
                                 if isinstance(moved.cleanup, WorkerTurnCleanup):
                                     raise WorkerMoveUncertain(thread_id, moved)
@@ -2822,6 +2900,8 @@ def _stream_turn(
                                 and not _continuation_is_owed(session_dir, name)):
                             continue
                         moved = _move_resident(args, session_dir, name, thread_id, client)
+                        if isinstance(moved, WorkerAwaitingQuotaRecovery):
+                            pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
                         if isinstance(moved, WorkerThreadStateUnknown):
                             if isinstance(moved.cleanup, WorkerTurnCleanup):
                                 raise WorkerMoveUncertain(thread_id, moved)
@@ -2906,7 +2986,7 @@ def _stream_turn(
                             if _quota_refused(failed, serving.started_here, False):
                                 _owe_quota_continuation(client, thread_id)
                                 _report_quota_refusal(name, serving, turn_outcome.detail)
-                                refusal_reported = True
+                                pending_refusal = PendingQuotaRefusal(serving, turn_outcome.detail)
                         if not followed_failure:
                             failure_serving = serving
                     if isinstance(turn_outcome, TurnContextWindowExceeded):
@@ -2968,7 +3048,8 @@ def _stream_turn(
                                 reason = "ended" if end_marker.exists() else "replaced"
                                 _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
                                 log.flush()
-                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
+                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened,
+                                    pending_refusal=pending_refusal, director=director)
                         live = _read_live_turn(client, thread_id)
                         if isinstance(live, ThreadStateUnknown):
                             raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
@@ -3021,7 +3102,8 @@ def _stream_turn(
                                     reason = "ended" if end_marker.exists() else "replaced"
                                     _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
                                     log.flush()
-                                    return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
+                                    return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened,
+                                        pending_refusal=pending_refusal, director=director)
                                 if turn_id:
                                     _ = _update_roster_if_expected(
                                         session_dir,
@@ -3050,7 +3132,8 @@ def _stream_turn(
                                 reason = "ended" if end_marker.exists() else "replaced"
                                 _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
                                 log.flush()
-                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened)
+                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened,
+                                    pending_refusal=pending_refusal, director=director)
                         started = _start_workers_turn(
                             args, session_dir, name, thread_id, client,
                             "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
@@ -3077,6 +3160,8 @@ def _stream_turn(
                     if resident or held_messages or owed:
                         thread_id = _as_str(cast(object, thread_id))
                         moved = _move_resident(args, session_dir, name, thread_id, client)
+                        if isinstance(moved, WorkerAwaitingQuotaRecovery):
+                            pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
                         if isinstance(moved, WorkerThreadStateUnknown):
                             if isinstance(moved.cleanup, WorkerTurnCleanup):
                                 raise WorkerMoveUncertain(thread_id, moved)
@@ -3106,6 +3191,8 @@ def _stream_turn(
                         if _waiting_on_detached_run(session_dir, name, thread_id):
                             continue
                         moved = _move_resident(args, session_dir, name, thread_id, client)
+                        if isinstance(moved, WorkerAwaitingQuotaRecovery):
+                            pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
                         if isinstance(moved, WorkerThreadStateUnknown):
                             if isinstance(moved.cleanup, WorkerTurnCleanup):
                                 raise WorkerMoveUncertain(thread_id, moved)
@@ -3128,6 +3215,8 @@ def _stream_turn(
                         break
             else:
                 failure = f"no turn/completed within {timeout:.0f}s"
+        if not failure and isinstance(pending_refusal, PendingQuotaRefusal) and _continuation_is_owed(session_dir, name):
+            failure = pending_refusal.detail
         # A queued peer message can open a turn after the last completion
         # notification. Check once more before this launcher stops watching.
         if not resident or failure or end_marker.exists():
@@ -3142,13 +3231,16 @@ def _stream_turn(
                 RosterOnThread(thread_id),
             )
         if isinstance(run_outcome, CapacityRetriesExhausted):
-            return run_outcome
+            return replace(run_outcome, pending_refusal=pending_refusal, director=director)
         return FailedWithThread(thread_id, failure, time.time() - opened, failure_serving,
-                                refusal_reported, True) if failure else RunCompleted()
+                                isinstance(pending_refusal, PendingQuotaRefusal), True,
+                                pending_refusal=pending_refusal, director=director) if failure else RunCompleted()
     except (ConnectionError, OSError, SystemExit) as exc:
         # Once thread/start returned, even a disconnected turn/start may have
         # begun work. Keep its id and never resubmit the original prompt.
-        if isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
+        if isinstance(exc, WorkerQuotaRecoveryStopped):
+            port, thread_id = exc.port, exc.thread_id
+        elif isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
             port = exc.cleanup.port
             thread_id = exc.cleanup.thread_id
         _ = _end_unwatched_turn(port, thread_id, log_path)
@@ -3161,8 +3253,11 @@ def _stream_turn(
         )
         serving = exc.serving if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else client.serving
         reported = exc.reported if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else False
+        if reported:
+            pending_refusal = PendingQuotaRefusal(serving, failure)
         return FailedWithThread(thread_id, failure, time.time() - opened, serving,
-                                refusal_reported or reported, True)
+                                isinstance(pending_refusal, PendingQuotaRefusal), True,
+                                pending_refusal=pending_refusal, director=director)
     finally:
         if not end_marker.exists():
             with _pending_file(session_dir, name) as handle:
@@ -3191,6 +3286,13 @@ class WorkerWaitingOnLiveTurn:
 @dataclass(frozen=True)
 class WorkerAwaitingQuotaRecovery(MovedWorker):
     """The thread resumed, but the destination refused its owed continuation."""
+
+    refusal: ServingRequestFailure = field(kw_only=True)
+
+
+@dataclass(frozen=True)
+class NoSubmissionQuotaRefusal:
+    """No refused submission needs recovery during this attempt."""
 
 
 @dataclass(frozen=True)
@@ -3557,7 +3659,7 @@ def _move_idle_worker(
         return MovedWorker(moved, port, turn_id, thread_id, replaced, moved.serving)
     except (ConnectionError, OSError, SystemExit) as error:
         if isinstance(error, ServingRequestFailure) and error.reported:
-            return WorkerAwaitingQuotaRecovery(moved, moved.port, "", thread_id, replaced, moved.serving)
+            return WorkerAwaitingQuotaRecovery(moved, moved.port, "", thread_id, replaced, moved.serving, refusal=error)
         _record_worker_move_failure(request, str(error) or type(error).__name__)
         if isinstance(cleanup, NoWorkerTurnToCleanUp):
             raise
@@ -3573,6 +3675,7 @@ def _start_workers_turn(
     client: Client, message: str,
 ) -> MovedWorker:
     initial_client = client
+    quota_recovery: WorkerAwaitingQuotaRecovery | NoSubmissionQuotaRefusal = NoSubmissionQuotaRefusal()
     try:
         deadline = time.monotonic() + _as_float(_attr(args, "timeout"), 86400.0)
         while time.monotonic() < deadline:
@@ -3582,6 +3685,7 @@ def _start_workers_turn(
             if isinstance(result, MovedWorker) and not isinstance(result, WorkerAwaitingQuotaRecovery):
                 return result
             if isinstance(result, WorkerAwaitingQuotaRecovery):
+                quota_recovery = result
                 client, thread_id = result.client, result.thread_id
             if _continuation_is_owed(session_dir, name):
                 # A rejected submission's prompt was already handed to Codex; only the continuation is owed.
@@ -3591,9 +3695,16 @@ def _start_workers_turn(
             time.sleep(RESIDENT_POLL_SECS)
         raise SystemExit(f"thread {thread_id}: still live at the timeout; no new turn started")
 
-    except (ConnectionError, OSError, SystemExit):
+    except (ConnectionError, OSError, SystemExit) as error:
         if client is not initial_client:
             client.close()
+        if isinstance(quota_recovery, WorkerAwaitingQuotaRecovery):
+            refusal = quota_recovery.refusal
+            detail = f"{refusal}; recovery stopped: {error}"
+            if isinstance(error, WorkerMoveUncertain):
+                raise WorkerMoveUncertain(thread_id, WorkerThreadStateUnknown(
+                    detail, error.cleanup, refusal.serving, True)) from error
+            raise WorkerQuotaRecoveryStopped(detail, refusal.serving, client.port, thread_id) from error
         raise
 
 

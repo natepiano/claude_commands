@@ -227,10 +227,11 @@ from pathlib import Path
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
-identity_file = root / f"impl_worker_{slot}.json"
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
-from worker_state import worker_claim_lock, worker_ledger
+from worker_state import worker_claim_lock, worker_ledger, worker_record_path
+
+identity_file = worker_record_path(root, name, slot)
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)

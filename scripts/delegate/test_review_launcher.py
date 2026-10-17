@@ -753,7 +753,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertIn("[pool_code1] register:", board)
         self.assertIn("compacted code1", board)
         self.assertFalse((Path(environment["STUB_POOL_MESH_DIR"]) / "board.log").exists())
-        self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract.log").read_text())
+        self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract-pool.log").read_text())
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
         self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
         events = [event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]
@@ -830,7 +830,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
-        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract.log").read_text())
+        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract-pool.log").read_text())
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
         self.assertEqual(list(session.glob("review_message_*")), [])
 
@@ -1491,6 +1491,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
         )
+        # The seat's log is its own, so a second seat on pass 1 cannot truncate it.
+        self.assertTrue((session_dir / "review_agent_1-review2.log").is_file())
+        self.assertEqual(os.readlink(session_dir / "review_agent.log"), "review_agent_1-review2.log")
         reviews = [
             event for event in self.pass_events("new-worker")
             if event.get("pass_kind") == "review"

@@ -186,7 +186,29 @@ An uncertain result goes to review. Every tier D finding and every
 `mode: propose` rule is held. Remove non-mechanical findings and all dependent
 edits from the applied diff; merge the remainder after its gate passes.
 Record each held finding with `style_ledger.py held add` and its cell with
-`record --verdict held`. The mechanical-check phase supplies the gate command.
+`record --verdict held`.
+
+Run from the unit worktree, using the ticket's recorded start commit:
+
+```bash
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base <commit id> --head HEAD
+```
+
+Exit 0 means every finding is `mechanical`; exit 1 prints `review: <reasons>`
+for anything the filter cannot clear. Without `--finding-map`, the whole diff
+is one finding. An optional JSON map assigns finding ids to file lists, or to
+objects with `files` and `hunks` lists. A hunk is identified by its `path`,
+`old_start` and `new_start` from a zero-context diff; every changed hunk must
+have one owner. The gate folds merged-in parents into the comparison base so
+their changes are not judged as ticket work. A conflicting fold requires review.
+Each finding must preserve behavior using only its own edits; another finding's
+call-site changes cannot complete its rename. Changed documented usage, including
+block documentation, requires review. Glob imports prevent proving a rename's
+identity, and public glob re-exports prevent establishing module privacy.
+Generic signature brackets and attributes on unrelated items alone do not
+require review. Derive changes count as trait implementation changes.
+Changes inside macro invocations require review even when only spacing changes;
+type-shape checks include unions and their derives.
 
 File held changes as issues tagged `proposal` and `style` under the production's
 required `**Proposals:**` folder: one issue per rule and crate for renames or

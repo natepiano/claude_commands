@@ -183,7 +183,7 @@ class ProductionRenameTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home"
         self.checkout = self.root / "checkout"
         self.origin = self.root / "origin.git"
@@ -212,6 +212,7 @@ class ProductionRenameTests(unittest.TestCase):
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC",
