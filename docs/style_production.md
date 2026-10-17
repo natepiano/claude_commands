@@ -356,7 +356,9 @@ after every ticket checkpoint with held cells and every no-change ticket notice
 with a positive held count. Read the folder from the current production doc's
 `**Proposals:**` line and the parent from `showrunners.py parent <style slug>`
 each time. Filing recovers issues created before a crash and skips findings
-judged against an older rule blob.
+judged against an older rule blob. Findings held by assigned or checkpointed
+tickets stay unfiled until those tickets close; filing reports their counts per
+open ticket.
 
 Record approval with `proposal_issue.py approve <issue> --showrunner <parent>
 --unit <unit> --plan <plan phase>`. Refill selects the oldest approved style issue
