@@ -7,8 +7,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -130,7 +132,7 @@ def folded_base(repo: Path, base: str, head: str) -> str:
             # Subsequent folds need ancestry, not merely the intermediate tree.
             environment = dict(os.environ, GIT_AUTHOR_NAME="Style footprint", GIT_AUTHOR_EMAIL="style@example.invalid",
                                GIT_COMMITTER_NAME="Style footprint", GIT_COMMITTER_EMAIL="style@example.invalid")
-            commit = subprocess.run(["git", "-C", str(repo), "commit-tree", tree, "-p", current, "-p", parent],
+            commit = subprocess.run(["git", "-C", str(repo), "commit-tree", "--no-gpg-sign", tree, "-p", current, "-p", parent],
                                     input="Fold merged-in work for style comparison\n", capture_output=True,
                                     text=True, env=environment, check=False)
             if commit.returncode:
@@ -736,20 +738,50 @@ def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
     return Review(tuple(dict.fromkeys(reasons))) if reasons else Mechanical()
 
 
+def worktree_commit(repo: Path) -> str:
+    """Snapshot tracked and non-ignored work through a disposable index."""
+    head = git(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()
+    index = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    with tempfile.TemporaryDirectory(prefix="style-footprint-") as directory:
+        temporary_index = Path(directory) / "index"
+        if index.exists():
+            # Git uses the index timestamp to recheck files whose stat data may
+            # still match after a same-size edit. Preserve that timestamp.
+            _ = shutil.copy2(index, temporary_index)
+        environment = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
+
+        def snapshot_git(*arguments: str) -> str:
+            result = subprocess.run(["git", "-C", str(repo), *arguments], env=environment,
+                                    capture_output=True, text=True, check=False)
+            if result.returncode:
+                raise FootprintError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+            return result.stdout.strip()
+
+        _ = snapshot_git("add", "-A", "--", ":/")
+        tree = snapshot_git("write-tree")
+        if tree == git(repo, "rev-parse", f"{head}^{{tree}}").strip():
+            return head
+        return snapshot_git("commit-tree", "--no-gpg-sign", tree, "-p", head, "-m", "style-footprint")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check")
     _ = check.add_argument("--repo", type=Path, required=True)
     _ = check.add_argument("--base", required=True)
-    _ = check.add_argument("--head", required=True)
+    after = check.add_mutually_exclusive_group(required=True)
+    _ = after.add_argument("--head")
+    _ = after.add_argument("--worktree", action="store_true")
     _ = check.add_argument("--finding-map", type=Path)
     arguments = parser.parse_args(argv)
     repo = cast(Path, arguments.repo)
-    base, head = cast(str, arguments.base), cast(str, arguments.head)
+    base = cast(str, arguments.base)
     finding_map = cast(Path | None, arguments.finding_map)
     try:
-        head = git(repo, "rev-parse", "--verify", f"{head}^{{commit}}").strip()
+        head = worktree_commit(repo) if cast(bool, arguments.worktree) else git(
+            repo, "rev-parse", "--verify", f"{cast(str, arguments.head)}^{{commit}}",
+        ).strip()
         base = folded_base(repo, base, head)
         changes = changes_between(repo, base, head)
         findings = (Finding(WholeDiff(), changes),) if finding_map is None else finding_groups(finding_map, changes)

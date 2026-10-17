@@ -102,6 +102,10 @@
 #                                          rustdoc on the members that differ
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
+#   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
+#                                          emits style-lint tool boundaries for records
+#                                          --check reports mend findings and checks
+#                                          formatting without applying fixes
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
 #                                          it. For lint, the list reaches mend and
@@ -1654,9 +1658,61 @@ case "$CMD" in
     lint)
         PKG="${1:?verify.sh lint <package>}"
         shift
+        CHECK_LINT=0
+        if [[ "${1:-}" == --check ]]; then
+            if [[ "$PKG" != --workspace ]]; then
+                echo 'verify.sh: lint --check requires --workspace' >&2
+                exit 2
+            fi
+            CHECK_LINT=1
+            shift
+        fi
         take_features "$@"
-        require_member "$PKG"
+        if [[ "$PKG" != --workspace ]]; then
+            require_member "$PKG"
+        fi
         require_taplo
+        if (( CHECK_LINT )); then
+            # Judge all three tools even when an earlier one reports findings.
+            # Report mode never enters the rewrite paths of the package gate.
+            lint_status=0
+            if lint_config_enabled mend; then
+                echo 'style-lint: mend start'
+                if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
+                    echo 'style-lint: mend passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
+            fi
+            if lint_config_enabled fmt; then
+                echo 'style-lint: rustfmt start'
+                if fmt_cargo --all --check; then
+                    echo 'style-lint: rustfmt passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
+            fi
+            WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+            if ! (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
+                lint_status=1
+            fi
+            if lint_config_enabled clippy; then
+                echo 'style-lint: clippy start'
+                if invoke_clippy --workspace --all-targets --all-features; then
+                    echo 'style-lint: clippy passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
+            fi
+            exit "$lint_status"
+        fi
         # Order: mend rewrites first, fmt formats what mend wrote, then taplo
         # checks TOML before clippy and rustdoc read the settled tree.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
@@ -1666,6 +1722,7 @@ case "$CMD" in
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
             MEND_LOG="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
@@ -1686,6 +1743,7 @@ case "$CMD" in
                 exit 1
             fi
             rm -f "$MEND_LOG"
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
         else
             lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
         fi
@@ -1693,15 +1751,25 @@ case "$CMD" in
         # package and every member that differs from HEAD once mend has run.
         # Covering them all is what lets one lint record answer for each
         # package (tree_key).
-        FMT_SCOPE=(-p "$PKG")
-        FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+        if [[ "$PKG" == --workspace ]]; then
+            FMT_SCOPE=(--all)
+        else
+            FMT_SCOPE=(-p "$PKG")
+            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
             | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
-        while IFS= read -r member; do
-            if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                FMT_SCOPE+=(-p "$member")
-            fi
-        done <<< "$FMT_MEMBERS"
+            while IFS= read -r member; do
+                if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                    FMT_SCOPE+=(-p "$member")
+                fi
+            done <<< "$FMT_MEMBERS"
+        fi
+        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt start'
+        fi
         fmt_cargo "${FMT_SCOPE[@]}"
+        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt passed'
+        fi
         # Record the tree the first judgment reads; a clippy rewrite rekeys it.
         if [[ -n "${RUN_LOG}" ]]; then
             VERDICT_KEY="$(tree_key)"
@@ -1725,6 +1793,7 @@ case "$CMD" in
             exit "$taplo_status"
         fi
         if lint_config_enabled clippy; then
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
             CLIPPY_LOG="$(mktemp)"
             # pipefail preserves clippy's status while tee captures diagnostics.
             if invoke_clippy --workspace --all-targets --all-features 2>&1 | tee "$CLIPPY_LOG"; then
@@ -1772,6 +1841,7 @@ case "$CMD" in
                 fi
                 invoke_clippy --workspace --all-targets --all-features
             fi
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else
             invoke_clippy --workspace --all-targets --all-features
         fi

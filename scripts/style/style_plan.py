@@ -22,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
+from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
 from add_unit import read_production
@@ -95,9 +96,10 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def style_document(repo: Path) -> Path:
-    main = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent
-    slug = main.name + "-style"
-    return main.parent / slug / "docs" / f"{slug}-production.md"
+    standing = standing_style_production(repo)
+    if isinstance(standing, StandingStyleProduction):
+        return standing.doc
+    raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
 
 
 def unit_worktrees(doc: Path) -> tuple[UnitWorktree, ...]:
@@ -271,7 +273,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
         "`bash ~/.claude/scripts/delegate/verify.sh test <package>`",
         "`bash ~/.claude/scripts/delegate/verify.sh lint <package>`",
-        f"`~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base {ticket['base']} --head HEAD`",
+        f"`~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base {ticket['base']} --worktree`",
         "Every ticket cell has a recorded verdict.", "",
     ])
 

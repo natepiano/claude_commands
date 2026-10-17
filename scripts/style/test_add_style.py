@@ -174,6 +174,24 @@ class AddStyleTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / "ledger/sample/ledger.sqlite")) as connection:
             return cast(tuple[str, str, str], connection.execute("SELECT tip,style_branch,synced_at FROM sync").fetchone())
 
+    def test_lookup_from_main_and_linked_worktree_finds_the_same_standing_production(self) -> None:
+        _ = self.run_bootstrap()
+        main = add_style.standing_style_production(self.repo)
+        linked = add_style.standing_style_production(self.checkout)
+        self.assertEqual(main, linked)
+        self.assertIsInstance(main, add_style.StandingStyleProduction)
+        if isinstance(main, add_style.StandingStyleProduction):
+            self.assertEqual((main.repository, main.slug, main.checkout, main.doc, main.branch_point),
+                             (self.repo, "sample-style", self.checkout, self.doc, "main"))
+
+    def test_lookup_without_a_production_leaves_directories_branches_and_excludes_unchanged(self) -> None:
+        before = (sorted(self.root.iterdir()), self.git("branch", "--list"),
+                  (self.repo / ".git/info/exclude").read_bytes())
+        self.assertEqual(add_style.standing_style_production(self.repo),
+                         add_style.NoStyleProduction(self.repo, "sample-style"))
+        self.assertEqual((sorted(self.root.iterdir()), self.git("branch", "--list"),
+                          (self.repo / ".git/info/exclude").read_bytes()), before)
+
     def test_bootstrap_creates_excluded_production_plans_and_pins_style_branch(self) -> None:
         _ = self.run_bootstrap()
 

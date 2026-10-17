@@ -22,6 +22,9 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
+At startup or restart, a header `**Standing:** style_plan.py` runs
+<StandingPlanRefill/> before choosing a phase; repeat after compaction.
+
 State:
 
 - `SESSION_DIR`: last path printed by `prepare_session.sh`.
@@ -1391,6 +1394,9 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
+Standing plans skip this tag entirely: their excluded plan and pinned files
+are never staged, and no shrink commit or notice is sent.
+
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -1464,7 +1470,9 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, choose the next phase or close the plan. If no
+At <PhaseEnd/>'s next boundary, a plan whose header carries
+`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
+the next phase or close the plan. If no
 todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
@@ -1481,6 +1489,51 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
+
+<StandingPlanRefill>
+Run at standing-plan startup, after compaction or restart, and at every
+<NextPhase/> boundary, before deciding that the plan is exhausted.
+Before `next-phase`, read every
+`${SESSION_DIR}/phases/*/delegated_phase_reservation_state.json`. For any record
+in `checkpoint_committed_awaiting_release_confirmation`, resume
+<CheckpointCommit/> at step 7 through release confirmation, then push and merge
+request as that procedure requires, before refilling; a new ticket must not
+overtake an unconfirmed release. An unsuccessful recovery stops refill.
+
+Then run:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <unit-worktree>
+```
+
+Use the unit worktree's own plan: `add_unit.py` copies the showrunner template
+only at first launch. Exit 0 continues with the todo phase; a todo repair
+always runs first. The ledger resumes assigned work, rebuilds a missing phase,
+recovers interrupted assignment, and discards merged or dropped ticket phases;
+never take a second ticket while one is open.
+
+| Exit | Unit status and next action |
+| --- | --- |
+| 3 | `waiting for sync`; report once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message. |
+| 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
+| 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
+| Other nonzero | Report the error and retain the ticket; repair it before refill. |
+
+A standing plan never closes its run: skip FinalGate, RunAsBuilt, the final
+PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,
+`docs/style-production/` or its pinned rule files. Workers judge only the pinned
+`docs/style-production/rules/<blob>.md` files named in the ticket Work Order;
+`record --ticket` keeps that pinned blob even after a live rule edit, which
+leaves the new rule's cell stale until a later ticket.
+
+The ticket gate is `style_footprint.py check --repo . --base <tickets.base>
+--worktree`, from the unit worktree. It checks the uncommitted checkpoint tree;
+run it again at <CheckpointCommit/> step 6 before staging. Exit 1, including
+errors, retains the reservation and returns the phase to repair. Exit 0 permits
+committing exactly that tree, then `style_ledger.py ticket checkpoint --id
+<ticket> --commit <code commit>` before marking the phase done. Proposal tickets
+use Phase 14's approved-file gate when available.
+</StandingPlanRefill>
 
 <FinalGate>
 Loop/verbose only after plan exhaustion:

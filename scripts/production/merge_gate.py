@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -456,6 +457,23 @@ def rollback_merge(repo: Path, baseline: str) -> None:
         raise GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or result.stderr.strip()}; {result.stderr.strip()}")
 
 
+def notify_style(repo: Path, branch: str, tip: str) -> None:
+    try:
+        script = (os.environ.get("MERGE_GATE_STYLE_SYNC") or shutil.which("style_sync.py")
+                  or str(Path(__file__).resolve().parents[1] / "style/style_sync.py"))
+        python = shutil.which("python3") or sys.executable
+        _ = sys.stdout.flush()
+        result = subprocess.run(
+            [python, script, "notify", "--repo-dir", str(repo), "--branch", branch, "--tip", tip],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode or result.stdout.strip() or result.stderr.strip():
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            print("style sync: " + detail.replace("\n", "; "), flush=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("style sync: " + str(error).replace("\n", "; "), flush=True)
+
+
 def merge_checkpoint(args: GateArguments) -> int:
     repo = Path(str(args.repo)).resolve()
     # Untracked files (each showrunner's LOG) never block; a merge that would
@@ -500,6 +518,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         rollback_merge(repo, baseline)
         raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
+    notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
     if review_list is not None:
         record_changes(repo, review_list, Path(str(args.production)).expanduser(), commits, str(args.merge_branch))

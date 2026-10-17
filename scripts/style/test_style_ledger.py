@@ -379,6 +379,37 @@ class StyleLedgerTests(unittest.TestCase):
                 self.assertEqual(refusal.returncode, 2)
                 self.assertIn(component, refusal.stderr)
 
+    def test_seen_tip_refreshes_listed_sites_after_rule_edit_without_another_sync(self) -> None:
+        rule_id = self.rule(
+            "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: first_marker\n  surface: whole\n",
+        )
+        self.write(self.sources[0], "pub fn first_marker() {}\n")
+        self.write(self.sources[2], "pub fn second_marker() {}\n")
+        tip = self.commit("Candidate markers")
+        self.set_tip(tip)
+        _ = self.cli("tip", "done", "--tip", tip)
+        self.assertEqual(self.cli("tip", "seen", "--tip", tip).stdout.strip(), "seen")
+        self.assertEqual({site.path for site in self.ledger().listed_sites(rule_id)}, {self.sources[0]})
+        path = self.rule_dir / "listed.md"
+        _ = path.write_text(path.read_text().replace("first_marker", "second_marker"))
+        self.assertEqual(self.cli("tip", "seen", "--tip", tip).stdout.strip(), "seen")
+        self.assertEqual({site.path for site in self.ledger().listed_sites(rule_id)}, {self.sources[2]})
+        self.assertEqual({cell.path for cell in self.ledger().cells(rule_id)}, {self.sources[2]})
+
+    def test_sync_without_style_branch_keeps_unmerged_judgments_awaiting_merge(self) -> None:
+        rule_id = self.rule("read")
+        _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "style/main")
+        _ = self.git("checkout", "-qb", "style/main")
+        self.write(self.sources[0], "pub fn corrected() {}\n")
+        checked = self.commit("Correct style source")
+        self.record(rule_id, self.sources[0], checked, "fixed")
+        _ = self.git("checkout", "main")
+        self.write("README.md", "Unrelated parent change\n")
+        synced = self.commit("Advance parent")
+        self.set_tip(synced)
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "awaiting merge")
+
     def test_status_refreshes_changed_generator_at_the_same_tip(self) -> None:
         rule_id = self.rule(
             "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"

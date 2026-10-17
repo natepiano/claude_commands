@@ -866,6 +866,23 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
            else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
 
 
+def notify_style(checkout: Path, branch: str, tip: str) -> None:
+    try:
+        script = tool("style_sync.py", Path(__file__).resolve().parents[1] / "style/style_sync.py",
+                      "MERGE_CHECKPOINT_STYLE_SYNC")
+        python = shutil.which("python3") or sys.executable
+        _ = sys.stdout.flush()
+        result = subprocess.run(
+            [python, script, "notify", "--repo-dir", str(checkout), "--branch", branch, "--tip", tip],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode or result.stdout.strip() or result.stderr.strip():
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            print("style sync: " + detail.replace("\n", "; "), flush=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("style sync: " + str(error).replace("\n", "; "), flush=True)
+
+
 def run(request: MergeRequest) -> int:
     try:
         already = ancestry(request)
@@ -902,6 +919,7 @@ def run(request: MergeRequest) -> int:
             tip = push_git(request, not already)
         else:
             tip = push_validate(request, not already)
+        notify_style(request.production.checkout, request.production.merge_branch, tip)
         if isinstance(pushed, NotYetPushed):
             record_changes(request, commits, merge_head)
         into(request.production.checkout, request.production.merge_branch,
