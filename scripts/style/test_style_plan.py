@@ -491,6 +491,108 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.count_tickets(), 0)
         self.assertFalse((self.plan.parent.parent / "rules").exists())
 
+    def sync_wait_rows(self) -> list[tuple[str, str]]:
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            return cast(list[tuple[str, str]], connection.execute(
+                "SELECT unit,since FROM sync_waits ORDER BY since,unit",
+            ).fetchall())
+
+    def seed_sync_wait(self) -> None:
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
+            connection.commit()
+
+    def test_sync_wait_is_recorded_until_structure_finishes_and_refill_writes_a_phase(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
+        self.sync()
+        with mock.patch.object(style_ledger, "_now", return_value="2026-01-02T03:04:05+00:00"):
+            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.sync_wait_rows(), [("names-unit", "2026-01-02T03:04:05+00:00")])
+        with mock.patch.object(style_ledger, "_now", return_value="2026-01-03T03:04:05+00:00"):
+            self.assertEqual(self.run_next()[0], 3)
+        self.assertEqual(self.sync_wait_rows(), [("names-unit", "2026-01-02T03:04:05+00:00")])
+        self.record(structure, "crates/alpha", self.tip)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["crate"], "crates/alpha")
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_refill_rechecks_after_registering_a_wait_and_finds_the_just_merged_crate(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
+        self.sync()
+        reads = 0
+
+        def board_after_merge(repo: Path) -> berth_board.Board:
+            nonlocal reads
+            self.assertEqual(repo, self.repo)
+            reads += 1
+            if reads == 2:
+                self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+                self.record(structure, "crates/alpha", self.tip)
+            return self.board()
+
+        with mock.patch.object(berth_board, "read_board", side_effect=board_after_merge):
+            self.assertEqual(style_plan.next_phase("names-unit", self.plan, self.repo),
+                             style_plan.PhaseWritten("names-unit-1"))
+        self.assertEqual(reads, 2)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["crate"], "crates/alpha")
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_refill_checks_twice_before_sleeping_and_drops_a_busy_ticket_only_once(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        read = self.rule("read")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [read])
+        output = io.StringIO()
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])) as board, redirect_stdout(output):
+            result = style_plan.next_phase("names-unit", self.plan, self.repo)
+        self.assertEqual(result, style_plan.WaitingForSync(0))
+        self.assertEqual(board.call_count, 2)
+        self.assertEqual(output.getvalue(), "dropped names-unit-1: files busy\n")
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        self.assertEqual(ledger.queued_tickets("names-unit"), ())
+
+    def test_board_failure_after_registering_a_wait_preserves_it_for_a_later_wake(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
+        self.sync()
+        unavailable = berth_board.BoardUnavailable("second read failed")
+        with mock.patch.object(berth_board, "read_board", side_effect=[self.board(), unavailable]):
+            self.assertEqual(style_plan.next_phase("names-unit", self.plan, self.repo), unavailable)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        self.assertEqual(self.ledger().ticket_open("names-unit"), ())
+
+    def test_resuming_an_assigned_ticket_clears_a_persisted_sync_wait(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next()[0], 0)
+        self.seed_sync_wait()
+        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_repair_board_and_merge_waits_leave_the_sync_wait_unchanged(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.seed_sync_wait()
+        expected = [("names-unit", "2026-01-01T00:00:00+00:00")]
+        original = self.plan.read_text()
+        _ = self.plan.write_text(original + "\n### Phase 3 — repair round 1 · status: todo\nRepair.\n")
+        self.assertEqual(self.run_next(), (0, "repair first\n", ""))
+        self.assertEqual(self.sync_wait_rows(), expected)
+        _ = self.plan.write_text(original)
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.BoardUnavailable("unreadable")):
+            self.assertEqual(self.run_next()[0], 4)
+        self.assertEqual(self.sync_wait_rows(), expected)
+        self.assertEqual(self.run_next()[0], 0)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.ledger().ticket_checkpoint(ticket["id"], self.tip)
+        self.seed_sync_wait()
+        self.assertEqual(self.run_next()[0], 5)
+        self.assertEqual(self.sync_wait_rows(), expected)
+
     def test_legacy_only_waits_with_action_and_mixed_catalog_selects_only_classified_rules(self) -> None:
         _ = self.rule("legacy", "")
         self.sync()
@@ -737,7 +839,7 @@ class StylePlanTests(unittest.TestCase):
             self.assertEqual(self.count_tickets(), 0)
             self.assertEqual(frontmatter(issue)["stage"], ["backlog"])
             start.assert_not_called()
-            coverage.assert_called_once()
+            self.assertEqual(coverage.call_count, 2)
         def start_issue(*args: str) -> None:
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(proposal_issue.main(list(args)), 0)

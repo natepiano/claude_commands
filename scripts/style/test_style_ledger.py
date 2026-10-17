@@ -671,7 +671,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(6,)])
+        self.assertEqual(versions, [(7,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -1599,7 +1599,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(6,)])
+        self.assertEqual(versions, [(7,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -1835,7 +1835,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(6,)])
+        self.assertEqual(versions, [(7,)])
 
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
@@ -1865,6 +1865,42 @@ class StyleLedgerTests(unittest.TestCase):
         unknown = self.cli("handoff", "reroute", "--checkpoint", "HEAD", "--to", "third", success=False)
         self.assertEqual(unknown.returncode, 2)
         self.assertIn("unknown", unknown.stderr.lower())
+
+    def test_sync_waits_survive_reopen_keep_first_time_and_clear_only_the_named_unit(self) -> None:
+        ledger = self.ledger()
+        with mock.patch.object(style_ledger, "_now", return_value="2026-01-02T00:00:00+00:00"):
+            ledger.wait_for_sync("types-unit")
+            ledger.wait_for_sync("names-unit")
+        first_wait = next(wait for wait in ledger.sync_waits() if wait.unit == "names-unit")
+        with mock.patch.object(style_ledger, "_now", return_value="2026-01-03T00:00:00+00:00"):
+            ledger.wait_for_sync("names-unit")
+            ledger.wait_for_sync("modules-unit")
+        with style_ledger.open_ledger(self.repo) as reopened:
+            repeated_wait = next(wait for wait in reopened.sync_waits() if wait.unit == "names-unit")
+            self.assertEqual(repeated_wait.token, first_wait.token)
+            self.assertEqual([(wait.unit, wait.since) for wait in reopened.sync_waits()], [
+                ("names-unit", "2026-01-02T00:00:00+00:00"),
+                ("types-unit", "2026-01-02T00:00:00+00:00"),
+                ("modules-unit", "2026-01-03T00:00:00+00:00"),
+            ])
+            reopened.clear_sync_wait("types-unit")
+            reopened.clear_sync_wait("types-unit")
+        self.assertEqual([wait.unit for wait in ledger.sync_waits()], ["names-unit", "modules-unit"])
+
+    def test_existing_ledger_migrates_sync_waits_without_losing_tickets(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        self.add_ticket("read-1", [rule])
+        database = self.ledger().database
+        with closing(sqlite3.connect(database)) as connection:
+            _ = connection.execute("DROP TABLE IF EXISTS sync_waits")
+            _ = connection.execute("UPDATE schema_version SET version=6")
+            connection.commit()
+        with style_ledger.open_ledger(self.repo) as migrated:
+            migrated.wait_for_sync("names-unit")
+            self.assertEqual([wait.unit for wait in migrated.sync_waits()], ["names-unit"])
+            self.assertEqual(migrated.queued_tickets("read")[0]["id"], "read-1")
+            self.assertEqual(migrated.summary().synced_tip, self.initial_tip)
 
     def test_ticket_merge_requires_checkpoint_on_the_stored_style_branch(self) -> None:
         rule = self.rule("read")
