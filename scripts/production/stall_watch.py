@@ -11,7 +11,8 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from datetime import time as clock
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -36,6 +37,8 @@ PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
 TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*$", re.MULTILINE)
+# A time a holding line names: a date is optional, and UTC or GMT marks a time not in the production's zone.
+HOLD_TIME = re.compile(r"\b(?:(?P<date>\d{4}-\d{2}-\d{2})[ T])?(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 
 
@@ -213,6 +216,32 @@ def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     return None
 
 
+def stated_hold_end(line: str, now: float, zone: ZoneInfo) -> float | None:
+    """The latest time a holding line names, so a hold that states when it ends is not bumped before then.
+
+    A time without a date is the occurrence nearest now: "until 01:00" read at 23:00 is tomorrow, and
+    "since 23:50" read at 00:10 is yesterday.
+    """
+    instants: list[float] = []
+    for match in HOLD_TIME.finditer(line):
+        hour, minute = int(match["hour"]), int(match["minute"])
+        if hour > 23 or minute > 59:
+            continue
+        place = ZoneInfo("UTC") if match["utc"] else zone
+        if match["date"]:
+            try:
+                day = date.fromisoformat(match["date"])
+            except ValueError:
+                continue
+            instants.append(datetime.combine(day, clock(hour, minute), place).timestamp())
+            continue
+        today = datetime.fromtimestamp(now, place).date()
+        nearest = min((datetime.combine(today + timedelta(days=offset), clock(hour, minute), place).timestamp()
+                       for offset in (-1, 0, 1)), key=lambda instant: abs(instant - now))
+        instants.append(nearest)
+    return max(instants, default=None)
+
+
 def stretch_path(slug: str, unit: str) -> Path:
     name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
     return STATE_DIR / f"{name}.json"
@@ -325,7 +354,10 @@ def tick(now: float) -> None:
             turns = list(TURN_END.finditer(pane))
             turn = turns[-1] if turns else transcript_turn_end(session_id)
             last = turn.group(0).strip() if turn else "none on screen"
-            if turn and turn.group("kind") in WAITING_KINDS:
+            # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
+            held_until = (stated_hold_end(turn.group(0), now, zone)
+                          if turn and turn.group("kind") == HOLDING_KIND else None)
+            if turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now)):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
