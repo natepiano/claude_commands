@@ -57,22 +57,40 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `watch` is the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`) when it exists, so an open pane notices a production started later.
 - The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/delegate/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
 - `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase {id, of, title}` or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
-- `stage`: the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`, else the open activity label (`units_table.open_step`), else `Run done`, `Waiting on G<k>` or `Standing by`.
+- `stage`, in order:
+  - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
+  - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
+  - the open activity label (`units_table.open_step`);
+  - `Phase <id> running` while a phase is open;
+  - otherwise `Run done`, `Waiting on G<k>` or `Standing by`.
+
+  `Standing by` therefore means no phase is open.
 - `state` comes from `unit_run.local_run`, which reads each run file only up to its `run_started` line (every run file holds one, on line 1) and skips lines without `"run_started"` before parsing.
-- The record is `build_plan(plan)`; when that has no phases, `build_run(plan, events)` from the found run's events.
-- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the agent's newest `board.log` line as `doing`, less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
+- The record is built from the found run's own plan (`project_plan_doc`, else `plan_doc` resolved against the worktree), falling back to the Plan cell's plan.
+  - It is `build_plan` on that plan; when that has no phases, `build_run(plan, events)` from the run's events.
+  - A run on another plan than its production row (tool-based-ui `demo`) shows its real phase.
+  - `plan` is the Plan cell, and is empty when that file no longer exists.
+- `workers` come from the run's session dir: `mesh_roster.json` (role, status; `done` shows as `idle`, `ended` stays), `impl_worker_<slot>.json` (slot, family/model) and the slot's newest `board.log` line as `doing`.
+  - Slots drop the worktree's mesh prefix.
+  - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
+  - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
 - `eta.at`/`first`/`trail` are stated promises only; `schedule_end` is the chain's end and never a trail entry.
 - `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
 
 ### The mod
 
-`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. The user installs it per machine with `/plugin marketplace add ~/.claude/mods` and `/plugin install unit-board`.
+`mods/unit-board/` is a Claude Code mod (TypeScript, JSX with `h`, no DOM, no Node; every engine call goes through `$`). [`hooks/hooks.json`](../../mods/unit-board/hooks/hooks.json) loads [`register.tsx`](../../mods/unit-board/hooks/register.tsx); [`mods/.claude-plugin/marketplace.json`](../../mods/.claude-plugin/marketplace.json) (`nate-local`) lists it beside `postmaster`. Without an install, a session loads it only with `--plugin-dir ~/.claude/mods/unit-board`. To make it available in every session on a machine, run `claude plugin marketplace add ~/.claude/mods` and then `claude plugin install unit-board@nate-local`. Together these add `nate-local` to `extraKnownMarketplaces` and `unit-board@nate-local` to `enabledPlugins` in `~/.claude/settings.json`.
 
 | File | Role |
 | --- | --- |
 | `hooks/register.tsx` | Every direct engine call: commands, pane lifecycle, timers, state, render hooks. |
 | `hooks/data.ts` | `refreshIfChanged`, `snapshotPaths`, `loadBoard`, `loadAccounts`, `resolveUserZone` and their narrow service interfaces (`BoardLoader`, `AccountsLoader`, `UserZoneSettings`, `RefreshFiles`). |
-| `hooks/geometry.ts` | Pure layout: `stripCells`, `rulerCells`, `labelRuns`, `runsOf`, `clockText`, `signedMinutes`, `duration`. |
+| `hooks/geometry.ts` | Pure layout: `stripCells`, `rulerCells`, `labelRuns`, `runsOf`, `clockText`, `signedMinutes`, `duration`, plus the text fitters:
+
+- `cellWidth` counts terminal cells: wide and emoji characters 2, combining marks 0.
+- `fitText` flattens line breaks and tabs to one space, then cuts with `…`.
+- `doneText(keys, width, label)` gives `<label>: a, b, +N more`.
+- `overdueText` gives ` · overdue Nm|Nh Mm|Nd Mh`. |
 | `hooks/board.tsx` | `BoardView`, `RulerView` and the shared text helpers `etaText`, `gateText`, `finishText`, `workersText`. |
 | `hooks/unit.tsx` | `UnitView`: one unit's detail. |
 | `hooks/accounts.tsx` | `AccountsView`, `accountDisplay` and the display types. |
@@ -108,9 +126,37 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 
 **Views.** Views draw the `as_of` snapshot and never recompute an ETA. Colours are theme keys only (`success`, `error`, `warning`, `suggestion`, `inactive`, `subtle`).
 
-- Board: per production a heading with unit count and `as of`. Units sort running, then standing by, then run done. A finished unit is one line: state dot, key, `Run done` and its finish, and the `open` button. Any other unit has a header line (state dot, key, phase `id/of` and title, or the stage when no phase is running, and `open`), then the phase strip (`█` done, `▓` open, `░` todo, `▒` gated) with the stage when a phase is running, the ETA line (`ETA HH:MM  first … · moved N× · +H:MM late · fix rounds N + 1 running`, or `on its first ETA`), the gate line, `done by`/`after G<k>`, the ruler and a workers line grouped by role and state. The finish shows only while a phase is running or a todo or gated phase remains. The workers line is left out when every worker has ended, and `workersText` skips empty parts.
+- Board, per production:
+  - A heading with the unit count and `as of`.
+  - Then each unit that is running, or waiting on a gate. It gets a header line: state dot, key, then the phase `id/of` and title, or the stage when no phase is running, then `open`.
+  - Under the header, for a running phase:
+    - the strip (`█` done, `▓` open, `░` todo, `▒` gated) with the stage;
+    - the ETA line, with `· overdue …` once it has passed;
+    - the gate line;
+    - `done by`/`after G<k>`;
+    - the ruler;
+    - a workers line, grouped by role (else slot) and state, and left out when every worker has ended.
+  - With no phase running, the stage shows once, in the header, and the line under it is the strip alone, when the strip has cells.
+  - Run-done units fold into `Done: …`, and plain standing-by units into `Standing by: …`. Both lines come last and end `+N more` when they pass the width.
+- `BoardView(elements, columns, bodyRows, …)` never draws past `bodyRows`.
+  - The fold lines are reserved first.
+  - Running blocks then go compact from the last one up. A compact block is the header, then a line with stage, ETA and overdue first and the strip last.
+  - Then the gaps between blocks drop.
+  - Then one `+N more running: …` line takes the rest.
 - Ruler (`rulerCells`): from the start of the open row with the current phase id to `max(promise, now, start + 1s)` plus 10 %; `○` for each trail entry, `●` for `eta.at`, `│` for now; labels via `labelRuns`, where a later mark displaces whole earlier labels.
-- Unit: heading with stage, title, summary, ETA, gate, finish, ruler, the trail as `HH:MM said HH:MM → …`, the strip, `This phase` steps, one row per worker with slot, role and state padded to the widest entry, and a newest-first phase record (took, fix marks `●`/`○`, `+H:MM late, said HH:MM`), which reads `no phases recorded` when empty. A block with nothing in it is not drawn.
+- `UnitView(elements, columns, bodyRows, …)` draws:
+  - the heading (`Phase N of M · <stage>`, or the stage alone), the title, the plan path when it exists, the summary;
+  - ETA with overdue, gate and finish, then the ruler;
+  - the trail as `HH:MM said HH:MM → …`, then the strip;
+  - `This phase` steps, each label fitted to one row with two spaces before its time;
+  - one row per worker, with slot, role and state padded to the widest entry;
+  - the phase record, newest first.
+
+  It keeps within `bodyRows`:
+  - The phase record keeps the open row and the newest rows, with id, timing, fix-mark and ETA columns each one width.
+  - Older done rows fold into `+N earlier: <ids>`, and todo rows past the next three into `+N later`.
+  - Older steps fold into `+N earlier steps`.
+  - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
 - Accounts: `units: <labels>, showrunners: <labels>` from `roles` (units match `units` and `unit directors`; none reads `unassigned`), then Label, Login, Roles, Weekly left, Weekly resets, On credits, Credits left, Read, then Problems. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`), so a null reading shows `unavailable`, never 0. Dates format with `Intl.DateTimeFormat` in the resolved zone.
 - `resolveUserZone(calls, isActive): Promise<ZoneLookup>` follows [`scripts/lib/user_zone.py`](../../scripts/lib/user_zone.py): `USER_ZONE`, then the `zone=` line of `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`, validated through `Intl.DateTimeFormat`; it returns `{kind: 'cancelled'}` once the lifecycle moves on.
 
