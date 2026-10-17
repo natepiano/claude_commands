@@ -1704,39 +1704,41 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
-def _resume_worker_command(seat: PausedSeat) -> str:
-    """Rebuild a launcher invocation without changing its task or role arguments."""
+def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
+    """Build a complete launcher invocation that continues this seat's thread."""
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
-    fallback = shlex.join([str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"]])
-    command = seat["launcher_command"]
-    if not seat["turn_live"] or not command:
-        return fallback + " (supply your usual arguments)"
-    command = list(command)
+    prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
+    resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
+    if resumed is not None:
+        return resumed
+    start = [str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
+    if launcher == "review.sh":
+        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
+    kind = seat["role"] if seat["role"] in {"impl", "test", "fix"} else "impl"
+    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", seat["role"]])
+
+
+def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:
+    """Keep the recorded task arguments, following the seat with its resume prompt; None when incomplete."""
     index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
-        return fallback + " (supply your usual arguments)"
+        return None
     # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
     position = index + 1
     options: list[str] = []
     while position < len(command) and command[position].startswith("--"):
-        option = command[position]
         if position + 1 >= len(command):
-            return fallback + " (supply your usual arguments)"
-        value = command[position + 1]
+            return None
+        option, value = command[position], command[position + 1]
         if option not in {"--slot", "--pool", "--lease", "--to"}:
             options.extend((option, value))
         position += 2
     arguments = command[position:]
-    if not arguments:
-        return fallback + " (supply your usual arguments)"
-    if len(arguments) < 2:
-        arguments.append(".")
-    prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
-    if len(arguments) < 3:
-        arguments.append(prompt)
-    else:
-        arguments[2] = prompt
-    return shlex.join([*command[:index + 1], *options, "--to", seat["seat"], *arguments])
+    # implement.sh requires its team role as the ninth argument; review.sh has defaults after three.
+    if len(arguments) < (9 if Path(command[index]).name == "implement.sh" else 3):
+        return None
+    arguments[2] = prompt
+    return shlex.join([*command[:index + 1], *options, "--to", seat, *arguments])
 
 
 def _send_worker_resume(record: SessionShutdown) -> None:
@@ -1744,10 +1746,10 @@ def _send_worker_resume(record: SessionShutdown) -> None:
     if not seats:
         return
     lines = ["Resume your Codex workers; do not open new ones."]
-    cwd = shlex.quote(record["session"]["cwd"])
+    cwd = record["session"]["cwd"]
     for seat in seats:
         state = "was working" if seat["turn_live"] else "idle"
-        lines.append(f"{seat['seat']} ({seat['role']}, {state}): {_resume_worker_command(seat)}, run from {cwd}.")
+        lines.append(f"{seat['seat']} ({seat['role']}, {state}): {_resume_worker_command(seat, cwd)}")
     lines.append("Each seat continues its own thread; after resuming, send later work with --to as usual.")
     identity = record["session"]["session_id"]
     try:
