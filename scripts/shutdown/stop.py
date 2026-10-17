@@ -150,10 +150,6 @@ def run_systemctl(arguments: list[str]) -> int | None:
     return _run(["systemctl", *arguments])
 
 
-def run_launchctl(arguments: list[str]) -> int | None:
-    return _run(["launchctl", *arguments])
-
-
 def _run(command: list[str]) -> int | None:
     try:
         completed = subprocess.run(
