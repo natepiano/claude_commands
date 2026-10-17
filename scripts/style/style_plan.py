@@ -452,6 +452,12 @@ class CrateTargets(Enum):
     BINARY_ONLY = "binary-only"
 
 
+def _is_two_judge_ticket(ticket: style_ledger.TicketRecord,
+                         texts: tuple[style_ledger.PinnedRuleText, ...]) -> bool:
+    return (ticket["kind"] == "read" and ticket["family"] == "names"
+            and not any(_is_name_bindings_rule(pinned.rule_id) for pinned in texts))
+
+
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
@@ -464,8 +470,12 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                  for pinned in texts
                  if ticket["kind"] == "structure" or pinned.rule_id.endswith("#uncovered")
                  for match in re.finditer(r"(?m)^\s+uncovered:\s*(.+)$", pinned.text.decode())]
-    workers = "2 writers; split files by subtree." if len(ticket["files"]) > 12 else (
-        "1 writer + 1 tester; the tester opens as impl and re-reads the diff against the pinned rules."
+    two_judges = _is_two_judge_ticket(ticket, texts)
+    workers = ("2 judges, blind to each other; each judges every window of every file, "
+               + "then the first judge applies the mechanical fixes.") if two_judges else (
+        "2 writers; split files by subtree." if len(ticket["files"]) > 12 else (
+            "1 writer + 1 tester; the tester opens as impl and re-reads the diff against the pinned rules."
+        )
     )
     per_file_structure = ticket["kind"] == "structure" and bool(ticket["cells"])
     manifest_rules = [rule for rule, path in ticket["cells"] if path == ticket["crate"]]
@@ -542,12 +552,28 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             + "line by line, giving its last line the same attention as its first.",
             "Start a file's first window with its module docs (the `//!` block and any comment before the first item); "
             + "judge them against every rule before any code.",
-            "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
-            + "never stop at a window's first finding.",
+            *([
+                "Two judges read this ticket, blind to each other: each judges every window of every file against every rule, "
+                + "and neither reads the other's findings, board posts or edits until both have finished. Neither judge edits code while judging.",
+                "Note each window's findings before opening the next window, each distinct defect as its own finding "
+                + "(rule, path, line, text, kind, before and after); never stop at a window's first finding. "
+                + "A judge holds no finding and records no cell: it lists its findings in its summary.",
+            ] if two_judges else [
+                "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
+                + "never stop at a window's first finding.",
+            ]),
             "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
             + "even when one change fixes both: each rule's cell records its own verdict.",
-            "Record a file's verdict for every rule only after its last window has been judged, "
-            + "with `record --rule <rule> --path <file>` for each rule/file cell.",
+            *([
+                "The unit director holds the union of both judges' findings, one finding per defect: a defect both judges hold is held once, "
+                + "and a site that breaks more than one rule is held under each rule it breaks.",
+                "A cell is recorded only after both judges have judged it: held when either judge holds a finding in it, "
+                + "clean only when both judges call it clean.",
+                "Once both judges have finished, the first judge applies the union's mechanical fixes.",
+            ] if two_judges else [
+                "Record a file's verdict for every rule only after its last window has been judged, "
+                + "with `record --rule <rule> --path <file>` for each rule/file cell.",
+            ]),
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
