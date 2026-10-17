@@ -63,8 +63,8 @@ against the union of one-rule findings using the same model.
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
 | modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
-| names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 63 of 117, 53.8%, below the 100 of 117 a windowed pass reached before fixes P to X; type-named bindings 30/66 and comments 29/43 fell as the name-bindings paragraph drew the judges (`resample_names_table.md`). | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
-| types | FAIL | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 55 of 61, 90.2%; owned bools 43/43, if-else 8/13, From 3/4, public failures 1/1, and none of the ten out-of-scope `pub` sites flagged (`resample_types_table.md`). | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
+| names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 63 of 117, 53.8%, below the 100 of 117 a windowed pass reached before fixes P to X; type-named bindings 30/66 and comments 29/43 fell as the name-bindings paragraph drew the judges (`resample_names_table.md`). Rerun 7, after fixes Y and Z, on the six rules left in the names ticket (111 findings; name-bindings moved to its own ticket and met its own bar, 36 of 37): runs of 104, 99 and 104, a median of 104 of 111, 93.7%; comments 36 to 40 of 43, type-named 62 to 64 of 66 (`rerun7_names_table.md`). | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
+| types | PASS | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 55 of 61, 90.2%; owned bools 43/43, if-else 8/13, From 3/4, public failures 1/1, and none of the ten out-of-scope `pub` sites flagged (`resample_types_table.md`). Rerun 7, after fixes Y and Z: 59 of 61, 96.7%, which meets the bar; if-else 12/13, From 3/4 (`rerun7_types_table.md`). | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
 
 Per-rule recall and candidate file-local rules: pending.
 
@@ -566,6 +566,37 @@ Pending: parent's saved style child summary and rendered style line.
   type-named bindings fell to 30 of 66 and comments to 29 of 43: the long
   name-bindings paragraph draws the pass to one rule of seven. Some lost
   type-named sites were recorded under name-bindings instead.
+- **Fix Y — a read ticket holds a site under every rule it breaks**
+  (commit `781ff3ef`): the re-sample's judges held a defect that breaks two
+  pinned rules under one of them only, so the other rule's cell was
+  recorded clean. The read-ticket procedure now says a site that breaks
+  more than one rule is held under each rule it breaks, once per rule, even
+  when one change fixes both. Structure tickets keep their own rule: a
+  defect several rules name is held once, under the rule it breaks most
+  directly.
+- **Fix Z — name-bindings gets its own read ticket** (commit `c79c21be`):
+  the name-bindings rule needs a long paragraph of its own, and inside the
+  names ticket it drew the pass away from the other six rules. The planner
+  now splits a file's read work so the name-bindings rule goes to a read
+  ticket of its own and the family's other rules stay together. From here
+  the names family is scored on its other six rules (111 one-rule
+  findings; the re-sample caught 60 of them), and name-bindings keeps its
+  own bar of 36 of 37.
+- **Rerun 7 — types and name-bindings pass, names falls short**: both
+  families' samples judged again through the ticket text after fixes Y and
+  Z, by fresh blind judges on the same halves. Types: 59 of 61 (96.7%, bar
+  95%). The two defects held under one rule only are now held under both,
+  owned bools stay complete at 43 of 43, and `identity.rs:169` is again
+  kept under the const exception (`rerun7_types_table.md`). Name-bindings
+  in its own ticket: 36 of 37, the bar, so fix Z does not undo rerun 6
+  (`rerun7_bindings_table.md`). Names, six rules: run 1 caught 104 of 111
+  (93.7%), with misses that share no cause, so the ticket ran twice more;
+  runs 2 and 3 caught 99 and 104, a median of 104 (93.7%, bar 106). Fixes
+  Y and Z lifted names from 60 to 104: type-named bindings are back to 62
+  to 64 of 66 and comments to 36 to 40 of 43. Only two sites are missed in
+  every run (`render.rs:132`, `constants.rs:8`); every other miss is
+  caught by another run. Combining two runs' findings passes in every
+  pairing, 108 to 109 of 111 (`rerun7_names_table.md`).
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
