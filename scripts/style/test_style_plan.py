@@ -228,6 +228,33 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
         self.assertEqual(self.plan.read_text(), text)
 
+    def test_written_read_phase_holds_a_site_under_each_broken_rule_before_recording_verdicts(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("another-read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Hold that window's findings before opening the next window. "
+            + "Hold each distinct defect as its own finding; never stop at a window's first finding.\n"
+            + "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
+            + "even when one change fixes both: each rule's cell records its own verdict.\n"
+            + "Record a file's verdict for every rule only after its last window has been judged, ",
+            self.plan.read_text())
+
+    def test_written_structure_phase_holds_a_multi_rule_defect_once_without_read_holding_guidance(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [rule], cells=tuple((rule, path) for path in self.sources[:2]))
+        ticket = ledger.queued_tickets("modules-unit")[0]
+        text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket["id"]), self.plan,
+                                     style_plan.delegation_context(self.plan.read_text()))
+        self.assertNotIn("A site that breaks more than one rule above", text)
+        self.assertIn(
+            "A defect several rules name is held once, under the rule it breaks most directly, "
+            + "naming the others in its text.", text)
+
     def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
@@ -1119,6 +1146,42 @@ class StylePlanTests(unittest.TestCase):
         _ = self.git("commit", "-qm", "Later edit", cwd=self.style)
         self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
         self.assertEqual(next(cell.state for cell in self.ledger().cells() if cell.path == path), "stale")
+
+    def test_read_tickets_separate_name_bindings_from_other_names_rules_on_each_pending_file(self) -> None:
+        bindings = self.rule("name-bindings-to-match-parameters")
+        other = self.rule("other-names")
+        self.sync()
+        self.record(bindings, self.sources[2], self.tip)
+        self.record(other, self.sources[3], self.tip)
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (bindings,)),
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (other,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", (self.sources[3],), (bindings,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", (self.sources[2],), (other,)),
+        ))
+
+    def test_read_tickets_separate_uncovered_name_bindings_from_other_names_rules(self) -> None:
+        bindings = self.rule("name-bindings-to-match-parameters", "tier: B\nfamily: names\ncandidates:\n"
+                             + "  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read every binding.\n")
+        other = self.rule("other-names")
+        self.sync()
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (bindings + "#uncovered",)),
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (other,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", self.sources[2:], (bindings + "#uncovered",)),
+            style_plan.TicketSelection("read", "names", "crates/beta", self.sources[2:], (other,)),
+        ))
+
+    def test_read_tickets_without_name_bindings_keep_rules_grouped_on_their_pending_files(self) -> None:
+        first = self.rule("first-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        second = self.rule("second-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        self.record(second, self.sources[0], self.tip)
+        self.assertEqual(self.candidates("types"), (
+            style_plan.TicketSelection("read", "types", "crates/alpha", (self.sources[0],), (first,)),
+            style_plan.TicketSelection("read", "types", "crates/alpha", (self.sources[1],), (first, second)),
+            style_plan.TicketSelection("read", "types", "crates/beta", self.sources[2:], (first, second)),
+        ))
 
     def test_partial_b_reads_uncovered_and_zero_sites_has_no_listed_ticket(self) -> None:
         rule = self.rule("partial", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read everything else.\n")

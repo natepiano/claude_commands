@@ -299,6 +299,10 @@ def blocked_by_structure(cell: style_ledger.Cell, structure: tuple[style_ledger.
                for blocker in structure)
 
 
+def _is_name_bindings_rule(rule_id: str) -> bool:
+    return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "name-bindings-to-match-parameters.md"
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -369,7 +373,11 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                 read_rules[cell.path].add(cell.rule)
         by_rules: dict[tuple[str, ...], list[str]] = defaultdict(list)
         for path, rule_ids in sorted(read_rules.items()):
-            by_rules[tuple(sorted(rule_ids))].append(path)
+            name_bindings = tuple(sorted(rule_id for rule_id in rule_ids if _is_name_bindings_rule(rule_id)))
+            other_rules = tuple(sorted(rule_id for rule_id in rule_ids if not _is_name_bindings_rule(rule_id)))
+            for group in (name_bindings, other_rules):
+                if group:
+                    by_rules[group].append(path)
         for rule_ids, paths in sorted(by_rules.items()):
             for files in read_slices(repo, tip, tuple(paths)):
                 result.append(TicketSelection("read", family, crate, files, rule_ids))
@@ -512,8 +520,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
            + "The rule renames a binding that already exists: report no finding whose fix only adds a binding, "
            + "whether it names an inline expression, literal, array or field projection, "
            + "or adds a scoped alias that keeps the old name."]
-          if any(PurePosixPath(pinned.rule_id.removesuffix("#uncovered")).name
-                 == "name-bindings-to-match-parameters.md" for pinned in texts) else []),
+          if any(_is_name_bindings_rule(pinned.rule_id) for pinned in texts) else []),
         *([
             "Judge file by file: take each file under **Files** in turn and judge it against every rule above, with that rule's listed sites "
             + "in it and its uncovered surface; read the uncovered instructions in the pinned text.",
@@ -537,6 +544,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             + "judge them against every rule before any code.",
             "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
             + "never stop at a window's first finding.",
+            "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
+            + "even when one change fixes both: each rule's cell records its own verdict.",
             "Record a file's verdict for every rule only after its last window has been judged, "
             + "with `record --rule <rule> --path <file>` for each rule/file cell.",
         ] if ticket["kind"] == "read" else []),
