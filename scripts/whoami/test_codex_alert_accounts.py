@@ -13,7 +13,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -592,6 +592,65 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
         self.assertEqual(moves.read_journal(), [])
 
+    def assert_queued_workers_wait_for_known_reset(self, window: Literal["five_hour", "weekly"]) -> None:
+        source, target = self.account(1), self.account(2)
+        reset = self.now + timedelta(hours=3)
+        report = self.report(source, 80)
+        if window == "five_hour":
+            report.five_hour = Quota("5-hour", 100, reset)
+        else:
+            report.quotas = [Quota("Weekly", 20, reset)]
+        readings = self.readings(source, report, self.report(target, 80))
+        head = next_moves.add_next_move("workers", 1, "codex2")
+        with (patch.object(accounts, "pick", side_effect=AssertionError("queued reset wait picked an account")),
+              patch.object(accounts, "swap", side_effect=AssertionError("queued reset wait moved workers"))):
+            lines = quota_alert.blocked([self.note(1, "active", 80)], source, self.now,
+                codex_readings=readings, window=refusals.KnownWindow(window))
+            _ = quota_alert.blocked([self.note(1, "active", 80)], source, self.now + timedelta(minutes=2),
+                codex_readings=readings, window=refusals.KnownWindow(window))
+            waits = moves.read_moves()
+            self.assertEqual([row["kind"] for row in waits], ["waited"])
+            waited = waits[0]
+            assert waited["kind"] == "waited"
+            self.assertEqual((waited["window"], waited["reset"], waited["subject"]),
+                             (window, reset.isoformat(), "workers"))
+            window_text = "5-hour" if window == "five_hour" else "weekly"
+            self.assertTrue(any(f"workers wait for codex1's {window_text} reset at " in line for line in lines), lines)
+            renewed = self.readings(source, self.report(source, 80), self.report(target, 80))
+            for at in (reset - timedelta(seconds=1), reset, reset + timedelta(minutes=2)):
+                _ = quota_alert.alert([self.note(1, "active", 80)], at, codex_readings=renewed)
+                ends = [row for row in moves.read_moves() if row["kind"] == "wait ended"]
+                self.assertEqual(len(ends), int(at >= reset))
+            self.assertEqual(ends[0]["move_id"], waited["move_id"])
+        self.assertEqual(agent_accounts.workers_home(), source.home)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual([row["kind"] for row in moves.read_moves()], ["waited", "wait ended"])
+        self.assertEqual(self.pushes, [])
+
+    def test_queued_workers_head_waits_for_a_five_hour_reset_three_hours_away(self) -> None:
+        self.assert_queued_workers_wait_for_known_reset("five_hour")
+
+    def test_queued_workers_head_waits_for_a_known_weekly_reset(self) -> None:
+        self.assert_queued_workers_wait_for_known_reset("weekly")
+
+    def test_no_workers_entry_keeps_long_reset_refusals_moving_immediately(self) -> None:
+        source, target = self.account(1), self.account(2)
+        for window in ("five_hour", "weekly"):
+            with self.subTest(window=window):
+                accounts.set_role("workers", "codex1")
+                report = self.report(source, 80)
+                reset = self.now + timedelta(hours=3)
+                report.five_hour = Quota("5-hour", 100 if window == "five_hour" else 20, reset)
+                report.quotas = [Quota("Weekly", 100 if window == "weekly" else 20, reset)]
+                readings = self.readings(source, report, self.report(target, 80))
+                with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
+                    _ = quota_alert.blocked([self.note(1, "active", 80)], source, self.now,
+                        codex_readings=readings, window=refusals.KnownWindow(window))
+                swap.assert_called_once()
+                self.assertEqual(agent_accounts.workers_home(), target.home)
+        self.assertFalse(any(row["kind"] == "waited" for row in moves.read_moves()))
+
     def test_no_entry_default_refusal_picks_soonest_reset_not_the_most_allowance(self) -> None:
         source, soon, ample = self.account(1), self.account(2), self.account(3)
         early = self.report(soon, 20)
@@ -1075,6 +1134,17 @@ class CodexAccountAlertTests(unittest.TestCase):
                         self.assertIn("use_credits: off", rendered.action.text)
                         self.assertIn(example.values["file"], rendered.action.text)
                         self.assertIn(example.values.get("machine", "natedev"), rendered.action.text)
+                        if example.name == "queued":
+                            label = example.values["file"].removesuffix(".md")
+                            self.assertEqual(example.values["turn_off"],
+                                f"Turn off: paid spending stops. Workers stay on {label} and wait for the account move you queued.")
+                            self.assertEqual(example.values["leave_on"],
+                                f"Leave on: workers spend {label}'s credits until that move runs or the credits run out, then wait.")
+                            for key in ("turn_off", "leave_on"):
+                                self.assertIn("wait", example.values[key])
+                                self.assertNotIn("codex2", example.values[key])
+                                self.assertNotIn("Claude", example.values[key])
+                            continue
                         if entry.id == "quota.codex_on_credits":
                             self.assertIn("paid credits", text)
                             self.assertRegex(rendered.body, r"(?i)\b(?:within|in) (?:(?:a few|two|2) )?minutes\b")
