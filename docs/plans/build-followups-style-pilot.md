@@ -262,6 +262,16 @@ Pending: parent's saved style child summary and rendered style line.
   checkpointed ticket unfiled, prints `held for open ticket <id>: <count>
   findings` for each such ticket, and files them on the first run after the
   ticket closes.
+- **Fix J — the ticket gate measures from the style branch the ticket absorbed** (commit `fb08135a`):
+  modules-unit-8 was assigned at `d1ced22c` and fast-forwarded to style/main
+  `8d6e25d1` with no edit of its own. Its gate still exited 1 with `non-Rust
+  change requires review`: the four docs commits pushed straight to main sit on
+  the first-parent chain, and the footprint fold removes only merged-in side
+  parents. The coverage gate now measures from the unit's merge-base with the
+  style merge branch when the recorded start is its ancestor, and from the
+  recorded start otherwise (no style branch, unresolvable, or unrelated
+  history). The ledger's recorded base is unchanged, and the ticket's own edits
+  are still judged.
 
-Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
+Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`.
 Live verification of the fixes and subsequent measurements remain pending.
