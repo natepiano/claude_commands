@@ -281,16 +281,25 @@ with worker_claim_lock(root):
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
+        stale_claim = False
         if isinstance(pid, int) and pid > 0:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                status_path.write_text("error\n")
+                stale_claim = True
                 claim_file.unlink(missing_ok=True)
             else:
                 fail(f"{name} is claimed by launcher {pid}")
-        if status_path.exists() and status_path.read_text().strip() == "implementing":
-            fail(f"{name} is already implementing")
+        if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
+            launcher = entry.get("launcher_pid", 0) if isinstance(entry, dict) else 0
+            if isinstance(launcher, int) and launcher > 0:
+                try:
+                    os.kill(launcher, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    fail(f"{name} is already implementing")
+            status_path.write_text("error\n")
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
