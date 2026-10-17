@@ -990,7 +990,8 @@ def run(args: argparse.Namespace) -> int:
         topics_out.append({"title": "Merge branch", "update": "; ".join(details),
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
-    result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
+                       "doc": str(production.doc)}
     root = showrunners.place_of(production.slug).root
     if root:
         result["reports_to"] = root

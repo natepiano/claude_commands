@@ -20,6 +20,7 @@ from user_zone import user_zone_name  # noqa: E402
 
 if TYPE_CHECKING:
     from showrunners import Place
+    from turn_input import TurnInput
 
 
 STAMP_WINDOW = timedelta(minutes=5)
@@ -46,6 +47,10 @@ QUOTA_LEAD = "quota: "
 # User, 2026-10-12: "your messages should just say 'there are {n} open questions for you' - that's it".
 ASK_ONCE = ("A question for the user is asked once, in full, when it first comes up. After that the Waiting on "
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
+
+
+# A turn the user did not start passes with exactly this reply when nothing needs the user.
+NOTHING_FOR_USER = "nothing needs the user: reply with -"
 
 
 # The switch file's content when a conversation pause turned the footer off. A switch turned off
@@ -212,6 +217,43 @@ def outstanding_path(slug: str) -> Path:
     return state_root() / "outstanding" / f"{slug}.json"
 
 
+class ReportItem(TypedDict):
+    """Something the user asked to be told about, such as "tell me when hanadocs is back"."""
+    text: str
+    until: str
+
+
+def reports_path(slug: str) -> Path:
+    return state_root() / "reports" / f"{slug}.json"
+
+
+def live_reports(slug: str, now: datetime) -> list[ReportItem]:
+    """The production's reports whose `until` has not passed; a naive `until` is in the user's zone."""
+    try:
+        raw = cast(object, json.loads(reports_path(slug).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        raise FooterError(f"{slug}: reports unreadable: {error}") from error
+    if not isinstance(raw, list):
+        raise FooterError(f"{slug}: expected a reports list")
+    live: list[ReportItem] = []
+    for entry in cast(list[object], raw):
+        fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+        text, until = fields.get("text"), fields.get("until")
+        if not isinstance(text, str) or not isinstance(until, str):
+            raise FooterError(f"{slug}: a report needs text and until")
+        try:
+            ends = datetime.fromisoformat(until)
+        except ValueError as error:
+            raise FooterError(f"{slug}: report until {until!r} is not ISO") from error
+        if ends.tzinfo is None:
+            ends = ends.replace(tzinfo=ZoneInfo(user_zone_name()))
+        if ends > now:
+            live.append(ReportItem(text=text, until=until))
+    return live
+
+
 def state_root() -> Path:
     return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 
@@ -349,7 +391,7 @@ def place_of(slug: str) -> Place:
 def render_footer(production: Production, minute: datetime, at: datetime | None, place: Place, *,
                   nothing_needed: bool) -> list[str]:
     command = [sys.executable, str(DAILIES), "--footer", "--zone", production.zone,
-               "--outstanding", str(outstanding_path(production.slug))]
+               "--outstanding", str(outstanding_path(production.slug)), "--doc", str(production.doc)]
     for slug in place.below:
         command.extend(["--below", str(outstanding_path(slug))])
     if place.root:
@@ -483,6 +525,45 @@ def pending_question_text(item: PendingQuestion) -> str:
     return item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
 
 
+def instance_slugs(instance_dirs: list[str]) -> set[str]:
+    return {Path(instance).name.removeprefix("showrunner-") for instance in instance_dirs}
+
+
+def with_below(slugs: set[str]) -> set[str]:
+    """These productions and every one below them, as a root's count covers them."""
+    return slugs.union(*(place_of(slug).below for slug in slugs))
+
+
+def outstanding_texts(slugs: set[str]) -> list[str]:
+    """Every text, question and reviewed question in these productions' open_for_user lists."""
+    texts: list[str] = []
+    for slug in sorted(slugs):
+        try:
+            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            continue
+        if not isinstance(raw, list):
+            raise FooterError(f"{slug}: expected outstanding list")
+        for entry in cast(list[object], raw):
+            if isinstance(entry, dict):
+                fields = cast(dict[str, object], entry)
+                texts.extend(value for key in ("text", "question", "reviewed")
+                             if isinstance(value := fields.get(key), str))
+    return texts
+
+
+def carries_registered(instance_dirs: list[str], reply: str) -> bool:
+    """Whether the reply names an item registered for the user: an open item or a report."""
+    slugs = with_below(instance_slugs(instance_dirs))
+    now = datetime.now(ZoneInfo(user_zone_name()))
+    texts = [*(pending_question_text(item) for instance in instance_dirs
+               for item in read_pending_reviewed(Path(instance))),
+             *outstanding_texts(slugs),
+             *(report["text"] for slug in sorted(slugs) for report in live_reports(slug, now))]
+    compared = normalised(reply)
+    return any(text.strip() and normalised(text) in compared for text in texts)
+
+
 def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyReady | QuestionReplyBlocked:
     accepted: list[str] = []
     slugs: set[str] = set()
@@ -503,20 +584,7 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
     asks = reply_asks.user_reply_questions(reply)
     if not asks.sentences and not asks.has_choices:
         return QuestionReplyReady()
-    for slug in tuple(slugs):
-        slugs.update(place_of(slug).below)
-    for slug in slugs:
-        try:
-            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            continue
-        if not isinstance(raw, list):
-            raise FooterError(f"{slug}: expected outstanding list")
-        for entry in cast(list[object], raw):
-            if isinstance(entry, dict):
-                fields = cast(dict[str, object], entry)
-                accepted.extend(value for key in ("text", "question", "reviewed")
-                                if isinstance(value := fields.get(key), str))
+    accepted.extend(outstanding_texts(with_below(slugs)))
     registered = [reply_asks.question_prose(choice_comparison_text(question)) for question in accepted]
     for sentence in (*asks.sentences, *asks.choice_lines):
         compared = reply_asks.question_prose(choice_comparison_text(sentence))
@@ -528,12 +596,20 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
 
 
 def block_reason(instance_dirs: list[str], reply: str,
-                 states: dict[str, FooterState], *, skip_footer: bool = False) -> str | None:
+                 states: dict[str, FooterState], *, skip_footer: bool = False,
+                 turn: TurnInput | None = None) -> str | None:
     if not instance_dirs:
         return None
     checked = check_reviewed_text(instance_dirs, reply)
     if isinstance(checked, QuestionReplyBlocked):
         return checked.reason
+    # A turn the user did not start reaches the user only with an auto-mode denial or a registered
+    # item; otherwise the reply is exactly "-", which carries no footer.
+    if turn is not None and turn.machine_only:
+        if reply.strip() == "-":
+            return None
+        if not turn.denied and not carries_registered(instance_dirs, reply):
+            return NOTHING_FOR_USER
     reason = footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
     if reason is None:
         for instance in instance_dirs:
@@ -541,13 +617,47 @@ def block_reason(instance_dirs: list[str], reply: str,
     return reason
 
 
+def counts_line(productions: list[Production], questions: int) -> str | None:
+    """The counts line a footers-off reply ends with: each production's counts and the open questions."""
+    production_scripts = str(DAILIES.parent)
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
+    # The counts read the production scripts, which import this module, so this one imports late.
+    import footer_counts
+
+    counts = footer_counts.total([footer_counts.read_counts(production.doc) for production in productions])
+    return footer_counts.counts_line(counts._replace(questions=questions))
+
+
+def counts_block_reason(productions: list[Production], reply: str) -> str | None:
+    """With footers off, the reply's last line is the counts line, and none when nothing is counted."""
+    if reply.strip() == "-":
+        return None
+    counted = open_questions(productions, {production.slug: place_of(production.slug).below
+                                           for production in productions})
+    # A list that cannot be read leaves the question count unknown, so the line is not checked.
+    if counted is None:
+        return None
+    expected = counts_line(productions, counted)
+    import footer_counts
+
+    lines = [line for line in reply_lines(reply) if line.strip()]
+    last = lines[-1] if lines else ""
+    if expected is None:
+        return (f"Footers are off and nothing waits on the user: remove the last line `{last}`."
+                if last.startswith(footer_counts.COUNTS_HEAD) else None)
+    return None if last == expected else f"Footers are off: end the reply with this line, on its own:\n\n{expected}"
+
+
 def footer_block_reason(instance_dirs: list[str], reply: str,
                        states: dict[str, FooterState], *, skip_footer: bool) -> str | None:
     if skip_footer:
         return None
     productions = [production for path in instance_dirs if (production := read_production(Path(path))) is not None]
-    if not productions or all(states[production.slug] is FooterState.OFF for production in productions):
+    if not productions:
         return None
+    if all(states[production.slug] is FooterState.OFF for production in productions):
+        return counts_block_reason(productions, reply)
     lines = reply_lines(reply)
     waiting = waiting_bullets(lines)
     footer_lines, bullets = waiting if waiting is not None else ([], [])

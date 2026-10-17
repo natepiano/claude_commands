@@ -149,6 +149,13 @@ session name now. `<slug>` is this doc's file name without `-production.md`; a f
 slug from the Formerly line also works, and a mark set before a rename is found under
 the current slug.
 
+To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
+between phases. Never edit the Unit, Worktree or Branch cell by hand. The rename stops the unit,
+moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
+the merge branch. Merge history follows that commit, so the unit's past merges still count under
+the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
+`review-unit` and `nightly-review-unit` keep their names.
+
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
 The status script, the dailies, the waits and the stall watch then skip it. The word

@@ -593,6 +593,12 @@ def restart_note(
     record: SessionShutdown, restarted_at: str
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
+    note = _stop_note(record, restarted_at)
+    # A unit renamed while it was stopped learns its new names before anything else it reads.
+    return f"{record['renamed']} {note}" if "renamed" in record else note
+
+
+def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
     if "target" in record and record["requested_by"]["kind"] != "snapshot":
         note = account_move_note(record["session"], record["target"],
                                  record.get("source_label", record["label"]), record.get("why", ""),
@@ -1033,7 +1039,9 @@ def _herdr_launch(
             herdr.stop_created_server(name, server)
             raise
         if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
-            _focus_restored_pane(client, pane, session["name"])
+            focused = _focus_restored_pane(client, pane, session["name"])
+            if focused and isinstance(server, herdr.WindowServerCreated):
+                _close_startup_workspaces(client, pane)
         if isinstance(parts.conversation, StartFreshConversation):
             print(f"{session['name']}: no conversation to resume; started a new one")
         return server
@@ -1045,11 +1053,20 @@ def _herdr_launch(
         raise OSError(str(error)) from error
 
 
-def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> None:
+def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> bool:
     try:
         client.focus_workspace(pane.split(":", 1)[0])
+        return True
     except herdr.HerdrFailure as error:
         print(f"{name} restart issue: restored workspace not focused: {error}")
+        return False
+
+
+def _close_startup_workspaces(client: herdr.Herdr, pane: str) -> None:
+    try:
+        client.close_startup_workspaces(pane.split(":", 1)[0])
+    except herdr.HerdrFailure as error:
+        print(f"{client.session} restart issue: startup workspace left open: {error}")
 
 
 def launches_window(host: Host) -> bool:
@@ -1741,7 +1758,7 @@ def _resume_worker_command(seat: PausedSeat) -> str:
 
 def _send_worker_resume(record: SessionShutdown) -> None:
     seats = record.get("codex_seats", [])
-    if record["session"]["kind"] != "unit" or not seats:
+    if not seats:
         return
     lines = ["Resume your Codex workers; do not open new ones."]
     cwd = shlex.quote(record["session"]["cwd"])
@@ -2115,7 +2132,9 @@ def _launch_codex_snapshot(
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
         herdr.stop_created_server(name, server)
         raise
-    _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
+    focused = _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
+    if focused and isinstance(server, herdr.WindowServerCreated):
+        _close_startup_workspaces(herdr.Herdr(name), pane)
     _acknowledge_restored_snapshots(owner["session_id"])
     if isinstance(server, herdr.WindowServerCreated):
         return

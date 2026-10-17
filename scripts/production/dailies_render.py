@@ -4,7 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
-                         [--below <outstanding.json>]... [--reports-to <root slug>]
+                         [--below <outstanding.json>]... [--reports-to <root slug>] [--doc <production doc>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -48,6 +48,9 @@ production's own plumbing words (PLUMBING).
          footer.
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
          `reports to <root slug>`.
+--doc    With --footer, the production doc: the line after the header counts
+         its changes to review, proposals and projects (footer_counts.py). A
+         report reads the doc from its input's `doc`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
@@ -434,6 +437,8 @@ class Report:
     children: list[Child]
     # The root this production's showrunner is under; empty for a root.
     reports_to: str
+    # The production doc the footer's counts line reads; None for an input that names none.
+    doc: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1131,7 +1136,7 @@ def parse_report(value: object, chart: str) -> Report:
     fields = as_map(value, "input")
     if "build_hold" in fields:
         raise InputError("input.build_hold: remove this field; holds are read from the holder files")
-    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts", "children", "reports_to"}, "input")
+    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts", "children", "reports_to", "doc"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
@@ -1161,8 +1166,9 @@ def parse_report(value: object, chart: str) -> Report:
     for child in children:
         if child.name in labels:
             raise InputError(f"children: {child.name} is also a unit's label; give that unit another label")
+    doc = optional_text(fields, "doc", "input")
     return Report(length, chart, zone, next_run, hold, mac_block, units, topics, counts, children,
-                  optional_text(fields, "reports_to", "input") or "")
+                  optional_text(fields, "reports_to", "input") or "", Path(doc) if doc else None)
 
 
 def parse_count(value: object, where: str) -> ProductionCount:
@@ -1554,12 +1560,14 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
 def footer(
     now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None,
     hold: HoldState, mac_block: MacBlockFooterState, outstanding: list[Outstanding], *,
-    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = ""
+    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = "",
+    counts: str | None = None
 ) -> list[str]:
     """The separated update footer shared by replies and dailies reports.
 
     `outstanding` already holds the lower productions' items for a root. `unreadable` names each
     lower production whose list could not be read, and `root` the root a lower showrunner is under.
+    `counts` is the counts line that follows the header, when anything is counted.
     """
     items: list[str] = []
     if isinstance(hold, ActiveHolders):
@@ -1586,8 +1594,15 @@ def footer(
     # A list that cannot be read may hold an item, so the footer never calls that quiet.
     quiet = nothing_needed and not outstanding and not unreadable
     items.append(f"{schedule}{' - nothing needed' if quiet else ''}")
-    return ["", "---", f"{now:%H:%M} {zone_name} update:", "",
+    return ["", "---", f"{now:%H:%M} {zone_name} update:", *([counts] if counts else []), "",
             *(f"{item[:2]}* {item[2:]}" if item.startswith("  ") else f"* {item}" for item in items)]
+
+
+def doc_counts(doc: Path | None) -> str | None:
+    """The counts line for a production doc; the Waiting on block carries the question count."""
+    import footer_counts
+
+    return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 
 
 def eta_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
@@ -1799,7 +1814,7 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at),
                         unreadable=[slug for child in report.children for slug in child.unreadable],
-                        root=report.reports_to))
+                        root=report.reports_to, counts=doc_counts(report.doc)))
     return lines
 
 
@@ -1849,7 +1864,7 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
 
 
 def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
-                nothing_needed: bool, below: Sequence[Path] = (), root: str = "") -> int:
+                nothing_needed: bool, below: Sequence[Path] = (), root: str = "", doc: Path | None = None) -> int:
     unreadable: list[str] = []
     try:
         if next_run is not None and not TIME.match(next_run):
@@ -1869,7 +1884,7 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
             unreadable.append(path.stem)
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, mac_block, outstanding,
                            nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at),
-                           unreadable=unreadable, root=root)))
+                           unreadable=unreadable, root=root, counts=doc_counts(doc))))
     return 0
 
 
@@ -1888,6 +1903,7 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--below", type=Path, action="append", default=[],
                             help="with --footer, once per lower production: its list, counted with --outstanding; one that cannot be read is named")
     _ = parser.add_argument("--reports-to", default="", help="with --footer: the root production a lower showrunner is under")
+    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, proposals and projects are counted")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
@@ -1900,15 +1916,16 @@ def main(arguments: list[str]) -> int:
     outstanding_path = cast(Path | None, options.outstanding)
     below = cast(list[Path], options.below)
     reports_to = cast(str, options.reports_to)
+    doc = cast(Path | None, options.doc)
     if cast(bool, options.footer):
         if input_path is not None or chart is not None or state_path is not None or log_path is not None:
             parser.error("--footer takes no input file, --chart, --state or --log")
         if zone is None:
             parser.error("--footer needs --zone")
         return footer_main(zone, next_run, at, outstanding_path, nothing_needed=nothing_needed,
-                           below=below, root=reports_to)
-    if zone is not None or next_run is not None or nothing_needed or below or reports_to:
-        parser.error("--zone, --next-run, --nothing-needed, --below and --reports-to go with --footer; "
+                           below=below, root=reports_to, doc=doc)
+    if zone is not None or next_run is not None or nothing_needed or below or reports_to or doc is not None:
+        parser.error("--zone, --next-run, --nothing-needed, --below, --reports-to and --doc go with --footer; "
                      + "a report takes them from its input")
     if chart is not None:
         write_chart(CHART_CONF, chart)
