@@ -18,8 +18,8 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 import showrunners
 from add_showrunner import herdr_session_running
-from add_unit import Production, production_field, read_production
-from production_units import Refusal
+from add_unit import Production, read_production
+from production_units import Refusal, production_field
 
 import rules
 import style_ledger

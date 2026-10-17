@@ -489,7 +489,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(4,)])
+        self.assertEqual(versions, [(5,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -1344,7 +1344,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(4,)])
+        self.assertEqual(versions, [(5,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -1406,6 +1406,178 @@ class StyleLedgerTests(unittest.TestCase):
                 self.assertEqual(refused.returncode, 2)
                 self.assertIn(invalid, refused.stderr)
         self.assertEqual(len(self.ledger().held_findings()), 1)
+
+
+    def test_pinned_rule_bytes_survive_edits_reopen_and_pseudo_rules_share_the_parent(self) -> None:
+        partial = self.rule(
+            "partial", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: value\n"
+            + "  surface: partial\n  uncovered: other names\n",
+        )
+        path = self.rule_dir / "partial.md"
+        original = path.read_bytes() + b"Exact bytes: \xc3\xa9\r\n"
+        _ = path.write_bytes(original)
+        blob = self.blob(partial)
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                              list(self.sources[:2]), [partial, partial + "#uncovered"])
+        _ = path.write_text(path.read_text() + "Changed after ticket creation\n")
+
+        with style_ledger.open_ledger(self.repo) as ledger:
+            # A repeated add must preserve the old ticket, including its pinned bytes.
+            ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                              list(self.sources[:2]), [partial, partial + "#uncovered"])
+            texts = ledger.pinned_rule_texts("names-unit-1")
+
+        self.assertEqual(texts, (
+            style_ledger.PinnedRuleText(partial, blob, original),
+            style_ledger.PinnedRuleText(partial + "#uncovered", blob, original),
+        ))
+        with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
+            stored = cast(list[tuple[str, bytes]], connection.execute("SELECT blob,text FROM rule_texts").fetchall())
+        self.assertEqual(stored, [(blob, original)])
+
+    def test_rule_edit_during_pinning_rolls_back_ticket_and_all_its_texts(self) -> None:
+        first = self.rule("first")
+        second = self.rule("second")
+        ledger = self.ledger()
+        catalog = rules.load_rules(self.repo)
+
+        def catalog_then_edit(repo: Path) -> tuple[rules.Rule, ...]:
+            self.assertEqual(repo, self.repo)
+            path = self.rule_dir / "second.md"
+            _ = path.write_text(path.read_text() + "Concurrent edit\n")
+            return catalog
+
+        with mock.patch.object(rules, "load_rules", side_effect=catalog_then_edit):
+            with self.assertRaisesRegex(style_ledger.LedgerError, second + ": rule changed while pinning; rerun"):
+                ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [first, second])
+        self.assertEqual(ledger.queued_tickets("read"), ())
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            texts = cast(list[tuple[str]], connection.execute("SELECT blob FROM rule_texts").fetchall())
+        self.assertEqual(texts, [])
+
+    def test_ticket_start_is_recorded_once_and_survives_reopening_and_branch_deletion(self) -> None:
+        rule = self.rule("read")
+        _ = self.git("branch", "demo-style-names")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                              list(self.sources[:2]), [rule])
+            with self.assertRaisesRegex(style_ledger.LedgerError, "cannot record start commit in state queued"):
+                _ = ledger.ticket_base("names-unit-1")
+            ledger.ticket_assign("names-unit-1", "demo-style-names")
+            self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
+
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        advanced = self.commit("Advance unit branch")
+        _ = self.git("branch", "-f", "demo-style-names", advanced)
+        with style_ledger.open_ledger(self.repo) as ledger:
+            self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
+            self.assertEqual(ledger.ticket_open("names-unit")[0]["base"], self.initial_tip)
+            ledger.ticket_drop("names-unit-1")
+        _ = self.git("branch", "-D", "demo-style-names")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
+        self.assertEqual(self.git("for-each-ref", "refs/style-tickets"), "")
+
+    def test_next_ticket_id_never_reuses_merged_or_dropped_numbers(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        self.assertEqual(ledger.next_ticket_id("names-unit"), "names-unit-1")
+        for number in (9, 11):
+            ledger.ticket_add(f"names-unit-{number}", "names-unit", "read", "names", "crates/alpha",
+                              list(self.sources[:2]), [rule])
+        ledger.ticket_drop("names-unit-9")
+        ledger.ticket_assign("names-unit-11", "main")
+        ledger.ticket_checkpoint("names-unit-11", self.initial_tip)
+        ledger.ticket_merge("names-unit-11")
+        self.assertEqual(ledger.next_ticket_id("names-unit"), "names-unit-12")
+        ledger.ticket_add("names-unit-12", "names-unit", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        self.assertEqual(self.ledger().next_ticket_id("names-unit"), "names-unit-13")
+
+    def test_queued_tickets_are_only_the_units_unassigned_work_in_creation_order(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        with mock.patch.object(style_ledger, "_now", side_effect=[
+            "2026-10-16T10:00:00+00:00", "2026-10-16T10:00:01+00:00", "2026-10-16T10:00:02+00:00",
+        ]):
+            for number in (2, 1, 3):
+                ledger.ticket_add(f"read-{number}", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        ledger.ticket_assign("read-3", "main")
+        ledger.ticket_add("other-1", "other", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("read")], ["read-2", "read-1"])
+        ledger.ticket_drop("read-2")
+        self.assertEqual([ticket["id"] for ticket in self.ledger().queued_tickets("read")], ["read-1"])
+
+    def test_structure_ticket_keeps_sites_and_pins_their_rule_text(self) -> None:
+        rule = self.rule(
+            "structure", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n  pattern: value\n"
+            + "  surface: partial\n  uncovered: crate structure\n",
+        )
+        sites: list[dict[str, object]] = [{"rule": rule, "path": self.sources[0], "line": 1, "text": "pub fn value() {}"}]
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [rule], sites=sites)
+        ticket, = ledger.queued_tickets("modules-unit")
+        self.assertEqual((ticket["sites"], ticket["rule"]), (sites, ""))
+        pinned, = ledger.pinned_rule_texts(ticket["id"])
+        self.assertEqual((pinned.rule_id, pinned.text), (rule, (self.rule_dir / "structure.md").read_bytes()))
+
+    def test_rust_files_exposes_the_synced_universe_even_with_only_crate_rules(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.write("crates/alpha/src/ignored/hidden.rs", "pub fn ignored() {}\n")
+        self.write("rustfmt.toml", 'ignore = ["crates/alpha/src/ignored"]\n')
+        self.write("tools/root.rs", "pub fn root() {}\n")
+        tip = self.commit("Add ignored and root Rust files")
+        self.set_tip(tip)
+        self.write("crates/alpha/src/untracked.rs", "pub fn untracked() {}\n")
+        self.write("rustfmt.toml", 'ignore = ["crates/beta"]\n')
+        ledger = self.ledger()
+
+        self.assertEqual(ledger.rust_files("crates/alpha"), self.sources[:2])
+        self.assertEqual(ledger.rust_files("crates/beta"), self.sources[2:])
+        self.assertEqual(ledger.rust_files("."), ("tools/root.rs",))
+        self.assertEqual(ledger.rust_files("missing"), ())
+
+    def test_version_four_migration_preserves_work_and_reports_missing_historical_pin_text(self) -> None:
+        rule = self.rule("read")
+        blob = self.blob(rule)
+        database = self.root / "state/sample/ledger.sqlite"
+        database.parent.mkdir(parents=True)
+        now = "2026-10-16T10:00:00+00:00"
+        with closing(sqlite3.connect(database)) as connection:
+            for version in (1, 2, 3, 4):
+                _ = connection.executescript(style_ledger.MIGRATIONS[version])
+            _ = connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (4)")
+            _ = connection.execute("INSERT INTO sync VALUES (1,?,?,?)", (self.initial_tip, "refs/heads/main", now))
+            _ = connection.execute(
+                "INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?)",
+                ("read-1", "read", "read", "names", "", "crates/alpha", json.dumps(list(self.sources[:2])), "[]",
+                 json.dumps([rule]), json.dumps({rule: blob}), now, now),
+            )
+            _ = connection.execute("INSERT INTO handoffs VALUES (?,'sent','','parent',?,?)", (self.initial_tip, now, now))
+            _ = connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (rule, blob, "file", self.git("rev-parse", f"{self.initial_tip}:{self.sources[0]}"), self.sources[0],
+                 self.initial_tip, "clean", "", "read-1", "worker", now),
+            )
+            connection.commit()
+
+        ledger = self.ledger()
+
+        self.assertEqual([ticket["id"] for ticket in ledger.queued_tickets("read")], ["read-1"])
+        self.assertEqual(ledger.queued_tickets("read")[0]["base"], "")
+        self.assertEqual(ledger.next_ticket_id("read"), "read-2")
+        self.assertEqual([(handoff["checkpoint"], handoff["state"]) for handoff in ledger.pending_handoffs()], [(self.initial_tip, "sent")])
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"read-1: no pinned text for {blob}"):
+            _ = ledger.pinned_rule_texts("read-1")
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
+        with closing(sqlite3.connect(database)) as connection:
+            versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
+        self.assertEqual(versions, [(5,)])
 
 
 if __name__ == "__main__":

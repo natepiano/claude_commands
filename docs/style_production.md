@@ -53,6 +53,33 @@ instructions and plans out of `docs/style/` and `docs/<member>/style/`, which
 `add_unit.py` launches a standing plan from the showrunner checkout and copies
 it into the unit worktree, where the unit's copy is its own.
 
+Refill only the unit worktree's own plan copy:
+
+```bash
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <checkout>
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py queue --repo <checkout> [--unit <unit>]
+```
+
+`next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
+reporting `repair first`; 3 means `waiting for sync` (an unclassified catalog
+also says `pull nate_style`); 4 means `board unavailable: <reason>`; 5 means
+`waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
+availability stops selection without recording work. `queue` is a read-only
+preview and also returns 4 when the board is unavailable.
+
+The ticket stores its rule text. Workers read the pinned files under the unit
+worktree's `docs/style-production/rules/`, including after an interruption;
+later rule edits cannot change an assigned ticket's Work Order. A queued ticket
+is recovered under the same id if its files remain free; otherwise it is dropped
+before selecting fresh work. Merged and dropped ticket phases are discarded on
+refill; a checkpointed ticket waits for the style showrunner to merge it.
+Refill writes plans and pinned texts atomically. Resume checks every pin's blob
+and rebuilds a damaged ticket phase from its recorded instructions. Before
+publishing a phase, it records the unit branch's starting commit once in the
+ledger ticket's `base` field. The footprint gate uses that literal commit id as
+`--base` and `--head HEAD`, including after an interruption. No private Git ref
+keeps a dropped ticket's abandoned commits reachable.
+
 ## Ledger
 
 One style production and one synced branch point per repository. The ledger is

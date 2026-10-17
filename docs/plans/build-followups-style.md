@@ -289,7 +289,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - Picking the pilot types crate from `style_plan.py queue` before bootstrap — its busy-file lookup needs `**Parent production:**`.
 - A manual launch hold for the pilot — `produce.md` launches every Units row, so only rows absent at launch stay unlaunched.
 
-### Phase 8 — Ticket selection: the berth board reader and style_plan.py  · status: todo
+### Phase 8 — Ticket selection: the berth board reader and style_plan.py  · status: done
 **Depends on:** Phase 2, Phase 5, Phase 6, Phase 7
 
 #### Work Order

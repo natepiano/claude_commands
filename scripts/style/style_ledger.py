@@ -159,9 +159,17 @@ class TicketRecord(TypedDict):
     rule_blobs: dict[str, str]
     state: TicketState
     branch: str
+    base: str
     checkpoint: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class PinnedRuleText:
+    rule_id: str
+    blob: str
+    text: bytes
 
 
 def _now() -> str:
@@ -384,6 +392,10 @@ MIGRATIONS = {
         );
         CREATE TABLE reconciliation (id INTEGER PRIMARY KEY CHECK(id=1), branch_point TEXT NOT NULL);
     """,
+    5: """
+        CREATE TABLE rule_texts (blob TEXT PRIMARY KEY, text BLOB NOT NULL);
+        ALTER TABLE tickets ADD COLUMN base TEXT NOT NULL DEFAULT '';
+    """,
 }
 
 
@@ -474,8 +486,8 @@ class Ledger:
         return datetime.fromisoformat(rows[0][0])
 
     def _ticket(self, ticket_id: str) -> TicketRecord:
-        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str]],
-                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at FROM tickets WHERE id=?", (ticket_id,)).fetchall())
+        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str]],
+                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base FROM tickets WHERE id=?", (ticket_id,)).fetchall())
         if not rows:
             raise LedgerError(f"unknown ticket {ticket_id}")
         row = rows[0]
@@ -484,6 +496,7 @@ class Ledger:
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
             "rules": cast(list[str], json.loads(row[8])), "rule_blobs": cast(dict[str, str], json.loads(row[9])),
             "state": row[10], "branch": row[11], "checkpoint": row[12], "created_at": row[13], "updated_at": row[14],
+            "base": row[15],
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -507,12 +520,12 @@ class Ledger:
             raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
-        if kind != "listed" and (rule or sites):
-            raise LedgerError(f"{id}: rule and sites are for listed tickets only")
+        if kind != "listed" and rule:
+            raise LedgerError(f"{id}: rule is for listed tickets only")
+        if kind == "read" and sites:
+            raise LedgerError(f"{id}: sites are for listed or structure tickets only")
         if not rules:
             raise LedgerError(f"{id}: ticket must cover at least one rule")
-        self._catalog = rule_catalog.load_rules(self.repo)
-        pins = {rule_id: self._component_rule(rule_id).blob for rule_id in rules}
         files = [self._path(path) for path in files]
         crate = self._path(crate)
         with self._connection:
@@ -523,12 +536,53 @@ class Ledger:
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"]) != (unit, kind, family, crate, files, rules, rule, sites or []):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return
+            self._catalog = rule_catalog.load_rules(self.repo)
+            definitions = {rule_id: self._component_rule(rule_id) for rule_id in rules}
+            pins = {rule_id: definition.blob for rule_id, definition in definitions.items()}
+            for rule_id, definition in definitions.items():
+                text = definition.path.read_bytes()
+                hashed = subprocess.run(
+                    ["git", "-C", str(self.repo), "hash-object", "--stdin"],
+                    input=text, capture_output=True, check=True,
+                ).stdout.decode().strip()
+                if hashed != pins[rule_id]:
+                    raise LedgerError(f"{rule_id}: rule changed while pinning; rerun")
+                _ = self._connection.execute(
+                    "INSERT INTO rule_texts VALUES (?,?) ON CONFLICT(blob) DO NOTHING", (hashed, text),
+                )
             now = _now()
             _ = self._connection.execute(
-                "INSERT INTO tickets VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?)",
+                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?)",
                 (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
                  json.dumps(rules), json.dumps(pins, sort_keys=True), now, now),
             )
+
+    def pinned_rule_texts(self, ticket_id: str) -> tuple[PinnedRuleText, ...]:
+        ticket = self._ticket(ticket_id)
+        texts: list[PinnedRuleText] = []
+        for rule_id in ticket["rules"]:
+            blob = ticket["rule_blobs"][rule_id]
+            rows = cast(list[tuple[bytes]], self._connection.execute(
+                "SELECT text FROM rule_texts WHERE blob=?", (blob,),
+            ).fetchall())
+            if not rows:
+                raise LedgerError(f"{ticket_id}: no pinned text for {blob}")
+            texts.append(PinnedRuleText(rule_id, blob, rows[0][0]))
+        return tuple(texts)
+
+    def queued_tickets(self, unit: str) -> tuple[TicketRecord, ...]:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE unit=? AND state='queued' ORDER BY created_at,id", (unit,),
+        ).fetchall())
+        return tuple(self._ticket(row[0]) for row in rows)
+
+    def next_ticket_id(self, unit: str) -> str:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE unit=?", (unit,),
+        ).fetchall())
+        highest = max((int(row[0].removeprefix(unit + "-")) for row in rows), default=0)
+        return f"{unit}-{highest + 1}"
 
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> None:
         with self._connection:
@@ -558,6 +612,19 @@ class Ledger:
         branch = "refs/heads/" + branch.removeprefix("refs/heads/")
         _ = _git(self.repo, "check-ref-format", branch)
         self._ticket_transition(id, "assigned", branch=branch)
+
+    def ticket_base(self, id: str) -> str:
+        """Remember the assigned branch's start before publishing its first phase."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["base"]:
+                return ticket["base"]
+            if ticket["state"] != "assigned":
+                raise LedgerError(f"{id}: cannot record start commit in state {ticket['state']}")
+            base = _git(self.repo, "rev-parse", "--verify", f"{ticket['branch']}^{{commit}}")
+            _ = self._connection.execute("UPDATE tickets SET base=?,updated_at=? WHERE id=?", (base, _now(), id))
+            return base
 
     def ticket_checkpoint(self, id: str, commit: str) -> None:
         self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
@@ -821,6 +888,10 @@ class Ledger:
             (rule, tip.commit),
         ).fetchall())
         return tuple(ListedSite(rule, path, tip.crate(path), line, text) for path, line, text in rows)
+
+    def rust_files(self, crate: str) -> tuple[str, ...]:
+        tip = self._synced_tip()
+        return tuple(path for path in tip.rust_files if tip.crate(path) == crate)
 
     def listed_sites(self, rule: str, crate: str | None = None) -> tuple[ListedSite, ...]:
         self._catalog = rule_catalog.load_rules(self.repo)
