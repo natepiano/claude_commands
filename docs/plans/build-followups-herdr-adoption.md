@@ -643,32 +643,14 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 24 — Startup shell check reads herdr's real pane list  · status: done
 
-**Depends on:** Phase 23
+#### As-built
 
-**User sees:** before — a Mac restart's window still shows the empty `~` shell beside the restored agent; after — only the agent.
-
-#### Work Order
-
-**Goal:** the untouched-startup-shell check reads the scroll offset where herdr 0.9.0 puts it, so the Phase 23 cleanup closes the shell.
-
-**Spec:**
-
-1. Measured (2026-10-16 19:47 EDT, Mac, herdr 0.9.0, Phase 23 live check after `restart --here --no-alert`): both restored windows still list the `~` workspace. Its `pane list` entry, verbatim:
-   `{"agent_status":"unknown","cwd":"/Users/natemccoy","focused":false,"foreground_cwd":"/Users/natemccoy","pane_id":"wG:p1","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":61},"tab_id":"wG:t1","terminal_id":"term_65dfdc73afbe63","workspace_id":"wG"}`
-   and its `workspace list` entry:
-   `{"active_tab_id":"wG:t1","agent_status":"unknown","focused":false,"label":"~","number":1,"pane_count":1,"tab_count":1,"workspace_id":"wG"}`.
-   `_pane_startup_state` (`herdr.py` ~877) reads `pane.get("max_offset_from_bottom")` at the top level, gets `None`, and keeps the shell.
-2. Read the offset from the `scroll` object. A missing or non-object `scroll`, or a missing or non-int offset, still keeps the workspace.
-3. Every fake pane in `test_herdr.py` and `test_restart.py` that feeds the startup check uses the measured shape above, built from one shared captured entry per file rather than hand-written keyword fields, so a fake cannot drift from herdr again.
-4. Live, on the Mac (desktop unlocked): repeat the Phase 23 check (Codex probe pane, one prompt, snapshot, `server stop`, `restart --here --no-alert` over ssh); each restored window lists one workspace, the agent's.
-5. Showrunner add-on (2026-10-16, a wrong result): `shutdown.py tmux-free` on natedev exited 1 with `inventory incomplete: shared observations: herdr clients showrunner-fixer: [Errno 3] No such process`; a rerun passed. `attached_clients` (`herdr.py` ~1250) skips only `FileNotFoundError`; a process that exits between the `/proc` listing and reading its `environ` raises `ProcessLookupError`, which reaches the `OSError` branch and returns `ClientsUnreadable`. A client that vanishes mid-read counts as gone, on Linux and in the Darwin reader alike; any other read error still returns `ClientsUnreadable`.
+- `_pane_startup_state` reads the scroll offset from herdr's nested `scroll` object (`scroll.max_offset_from_bottom`); a missing or non-object `scroll`, or a missing or non-int offset, keeps the workspace. Every startup-check fixture in `test_herdr.py` and `test_restart.py` derives from one captured herdr 0.9.0 pane-list entry and workspace entry. Live on the Mac, a restart's windows each show one workspace, the restored agent.
+- A herdr client that exits mid-read counts as gone. Linux `attached_clients` skips `ProcessLookupError` as well as `FileNotFoundError`. On Darwin, `_require_darwin_process_read` raises `_DarwinProcessGone` (a private `HerdrFailure`) only when `ps` exits nonzero with empty stdout and stderr and `os.kill(pid, 0)` raises `ProcessLookupError`. `darwin_process_environment` uses it for all three reads, and `_darwin_processes` uses it to drop a pid missing from the argument scan. Any other failure stays `ClientsUnreadable`.
 
 **Files:**
-- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`
-- `scripts/shutdown/test_restart.py`
+- `scripts/herdr/herdr.py` — nested scroll read; confirmed-gone client reads.
+- `scripts/herdr/test_herdr.py` — captured-shape fixtures; Linux and fake-`ps` Darwin disappearance regressions.
+- `scripts/shutdown/test_restart.py` — captured-shape fixtures.
 
-**Workers:** 1 writer, `test` (as impl).
-
-**Constraints from prior phases:** Work Orders and fakes that describe herdr JSON quote captured output verbatim. Missing evidence keeps the workspace (Phase 23). Every herdr command names `--session`; never probe the default herdr server.
-
-**Acceptance gate:** a test that fails before the fix: the measured pane and workspace entries above make the startup workspace close; a nested offset of 1, a missing `scroll`, and a non-int offset each keep it; a client process that raises `ProcessLookupError` mid-read is skipped while a permission error still reads as unreadable (Spec 5). `merge_gate.py --tests-only` green; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; Mac `scripts/herdr` and `scripts/shutdown` suites green; Spec 4 passes on the Mac.
+**Gotchas:** herdr 0.9.0 and 0.9.5 both nest the offset under `scroll`, and 0.9.5 omits `scroll` when unset. macOS `ps -p <gone pid>` exits 1 with no output.
