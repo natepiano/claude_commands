@@ -151,6 +151,110 @@ class StylePlanTests(unittest.TestCase):
             rows = cast(list[tuple[int]], connection.execute("SELECT COUNT(*) FROM tickets").fetchall())
         return rows[0][0]
 
+    def test_long_read_windows_balance_each_part_and_cover_the_test_module_separately(self) -> None:
+        text = "//! Module docs\n" + "// production\n" * 759 + "#[cfg(test)]\nmod tests {\n" + "// test\n" * 599 + "}\n"
+        windows = style_plan.read_windows(text)
+        self.assertEqual(windows, (
+            style_plan.ReadWindow(1, 254), style_plan.ReadWindow(255, 507), style_plan.ReadWindow(508, 760),
+            style_plan.ReadWindow(761, 961), style_plan.ReadWindow(962, 1162), style_plan.ReadWindow(1163, 1362),
+        ))
+        self.assertEqual([line for window in windows for line in range(window.start, window.end + 1)],
+                         list(range(1, len(text.splitlines()) + 1)))
+        self.assertTrue(all(window.end - window.start + 1 <= 300 for window in windows))
+
+    def test_short_read_windows_keep_tests_apart_and_leave_files_without_tests_whole(self) -> None:
+        cases = (
+            ("//! Docs\nfn value() {}\n#[cfg(test)]\nmod tests {}\n",
+             (style_plan.ReadWindow(1, 2), style_plan.ReadWindow(3, 4))),
+            ("//! Docs\nfn value() {}", (style_plan.ReadWindow(1, 2),)),
+            ("#[cfg(test)]\nmod tests {}\n", (style_plan.ReadWindow(1, 2),)),
+            ("", ()),
+            ("fn value() {\n#[cfg(test)]\nmod nested {}\n}\n", (style_plan.ReadWindow(1, 4),)),
+            ("/*\n#[cfg(test)]\nmod example {}\n*/\nfn value() {}\n", (style_plan.ReadWindow(1, 5),)),
+            ('const TEXT: &str = r#"\n#[cfg(test)]\nmod example {}\n"#;\n', (style_plan.ReadWindow(1, 4),)),
+            ("#[cfg(test)]\nfn helper() {}\n#[cfg(test)]\nmod tests {}\n",
+             (style_plan.ReadWindow(1, 2), style_plan.ReadWindow(3, 4))),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(style_plan.read_windows(text), expected)
+
+    def test_read_windows_find_test_modules_past_outer_attributes_and_visibility(self) -> None:
+        items = (
+            ("#[allow(\n    clippy::expect_used,\n    clippy::unwrap_used\n)]\nmod tests {}", True),
+            ('#[expect(clippy::panic, reason = "tests may panic")]\nmod tests {}', True),
+            ("pub(crate) mod tests {}", True),
+            ("pub mod tests {}", True),
+            ("pub(super) mod tests {}", True),
+            ("pub(in crate::helpers) mod tests {}", True),
+            ('#[allow(dead_code)]\n#[example([nested], reason = "]")]\npub(crate) mod tests {}', True),
+            ("#[allow(dead_code)]\nfn helper() {}", False),
+            ("#![allow(dead_code)]\nmod tests {}", False),
+        )
+        for item, is_module in items:
+            with self.subTest(item=item):
+                text = "//! Docs\nfn value() {}\n#[cfg(test)]\n" + item + "\n"
+                end = len(text.splitlines())
+                expected = ((style_plan.ReadWindow(1, 2), style_plan.ReadWindow(3, end))
+                            if is_module else (style_plan.ReadWindow(1, end),))
+                self.assertEqual(style_plan.read_windows(text), expected)
+
+    def test_written_read_phase_lists_base_commit_windows_and_requires_module_docs_before_code(self) -> None:
+        _ = self.rule("read")
+        self.write(self.sources[0], "//! Module docs\n" + "// production\n" * 599
+                   + "#[cfg(test)]\nmod tests {\n" + "// tests\n" * 298 + "}\n")
+        self.tip = self.commit()
+        for checkout in (self.style, self.unit):
+            _ = self.git("merge", "--ff-only", "main", cwd=checkout)
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn(f"- `{self.sources[0]}` — lines 1-300, 301-600, 601-751, 752-901\n", text)
+        self.assertIn(f"- `{self.sources[1]}` — lines 1-1\n", text)
+        instructions = (
+            "Judge window by window: take the files under **Files** in order, and each file's windows in order.",
+            "read exactly that line range in full", "against every rule above, line by line",
+            "giving its last line the same attention as its first",
+            "module docs (the `//!` block and any comment before the first item)",
+            "judge them against every rule before any code",
+            "Hold that window's findings before opening the next window.",
+            "Hold each distinct defect as its own finding; never stop at a window's first finding.",
+            "Record a file's verdict for every rule only after its last window has been judged",
+            "`record --rule <rule> --path <file>` for each rule/file cell.",
+        )
+        for instruction in instructions:
+            self.assertIn(instruction, text)
+        _ = (self.unit / self.sources[0]).write_text("// Working tree now differs from the ticket base.\n")
+        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.plan.read_text(), text)
+
+    def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("modules-unit-1"))
+        text = plan.read_text()
+        self.assertEqual(text.split("**Files:**\n", 1)[1].split("\n**Workers:**", 1)[0],
+                         "\n".join(f"- `{path}`" for path in self.sources[:2]) + "\n")
+        self.assertEqual(text.split("Read only these pinned rule texts.", 1)[1].split("\nProduct work wins.", 1)[0],
+                         " A #uncovered rule is the parent rule's uncovered read.\n"
+                         + "Judge file by file: take each file under **Files** in turn and judge it against every rule above, "
+                         + "with that rule's listed sites in it and its uncovered surface; read the uncovered instructions in the pinned text.\n"
+                         + "Before judging a file, read its sibling files in the same module and its direct callers "
+                         + "(search the crate for its types and functions), so placement and ownership are judged against the code around it.\n"
+                         + "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
+                         + "and never stop at a file's first finding.\n"
+                         + "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
+                         + "under the rule it breaks most directly, naming the others in its text.\n"
+                         + "Record each file's verdict for every rule above as soon as that file has been judged against it, "
+                         + "with `record --path <file>`; the gate refuses this ticket while any file lacks one.")
+        self.assertNotIn("window", text)
+        self.assertEqual(self.ledger().ticket_open("modules-unit")[0]["rules"], [rule])
+
 
     def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -670,7 +774,8 @@ class StylePlanTests(unittest.TestCase):
                                   proposal=str(issue) if kind == "proposal" else "")
                 ticket = ledger.queued_tickets("names-unit")[-1]
                 phase = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan,
-                                              style_plan.delegation_context(self.plan.read_text()))
+                                              style_plan.delegation_context(self.plan.read_text()),
+                                              file_windows={self.sources[0]: (style_plan.ReadWindow(1, 1),)})
                 self.assertIn("Read only these pinned rule texts.", phase)
                 self.assertIn("#uncovered rule is the parent rule's uncovered read.", phase)
                 self.assertNotIn("For a structure ticket, judge", phase)

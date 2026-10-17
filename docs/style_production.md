@@ -35,6 +35,8 @@ Every partial B rule also has a C read in its own family.
 One ticket per phase:
 
 - **Read:** one family, about 5,000 lines in one module subtree, 10–25 files.
+  The Work Order lists each file's line windows (at most 300 lines, test module
+  apart); judge and hold window by window, module docs first.
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
