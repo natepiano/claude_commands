@@ -473,8 +473,11 @@ class StylePlanTests(unittest.TestCase):
     def test_structure_batches_own_only_pending_pairs_and_manifest_only_work_is_selectable(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        nested = "crates/alpha/src/nested/inner.rs"
+        self.write(nested, "pub fn inner() {}\n")
+        self.tip = self.commit()
         self.sync()
-        for path in self.sources[:2]:
+        for path in (*self.sources[:2], nested):
             self.record(structure, path, self.tip)
         batches = [ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha"]
         self.assertEqual([(ticket.files, ticket.rules, ticket.cells) for ticket in batches], [
@@ -488,7 +491,10 @@ class StylePlanTests(unittest.TestCase):
         self.sync()
         batch = next(ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha")
         self.assertEqual((batch.files, batch.rules, batch.cells),
-                         ((self.sources[0],), (structure,), ((structure, self.sources[0]),)))
+                         (tuple(self.sources[:2]), (structure,),
+                          tuple((structure, path) for path in self.sources[:2])))
+        self.assertNotIn(nested, batch.files)
+        self.assertNotIn((structure, nested), batch.cells)
 
     def test_structure_work_order_shows_existing_holds_on_the_batch_files_only(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")

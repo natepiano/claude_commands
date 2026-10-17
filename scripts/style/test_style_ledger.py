@@ -170,6 +170,126 @@ class StyleLedgerTests(unittest.TestCase):
             "--after", "new_name", "--rule-blob", rule_blob or self.blob(rule), "--ticket", ticket,
         ).stdout.strip()
 
+    def structure_module(self) -> tuple[str, str, str, str]:
+        path = "crates/alpha/src/theme/colors.rs"
+        sibling = "crates/alpha/src/theme/mod.rs"
+        parent = "crates/alpha/src/theme.rs"
+        for source in (path, sibling, parent, "crates/alpha/src/unrelated/item.rs"):
+            self.write(source, "pub fn value() {}\n")
+        return path, sibling, parent, self.commit("Add module inputs")
+
+    def insert_legacy_structure_judgment(self, rule: str, path: str, commit: str, verdict: str = "clean") -> None:
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (rule, self.blob(rule), "crate", self.git("rev-parse", f"{commit}:crates/alpha"),
+                 path, commit, verdict, "", "outside", "legacy-worker", "2026-10-16T00:00:00+00:00"),
+            )
+            connection.commit()
+
+    def test_structure_module_cell_ignores_other_directories_but_tracks_siblings_and_parent(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, sibling, parent, base = self.structure_module()
+        self.set_tip(base)
+        self.record(rule, path, base)
+        self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated() {}\n")
+        self.set_tip(self.commit("Change another module"))
+        self.assertEqual(self.states(rule)[path], "current")
+        for changed in (sibling, parent, path):
+            with self.subTest(changed=changed):
+                self.write(changed, "pub fn changed() {}\n")
+                tip = self.commit("Change a module input")
+                self.set_tip(tip)
+                self.assertEqual(self.states(rule)[path], "stale")
+                self.record(rule, path, tip)
+                self.assertEqual(self.states(rule)[path], "current")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            scopes = cast(list[tuple[str]], connection.execute("SELECT DISTINCT input_scope FROM judgments").fetchall())
+        self.assertEqual(scopes, [("module",)])
+
+    def test_legacy_structure_crate_key_carries_over_without_rewriting_the_row(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, sibling, _, base = self.structure_module()
+        self.set_tip(base)
+        self.insert_legacy_structure_judgment(rule, path, base)
+        self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated() {}\n")
+        self.set_tip(self.commit("Change outside the judged module"))
+        self.assertEqual(self.states(rule)[path], "current")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            stored = cast(list[tuple[str, str, str]], connection.execute(
+                'SELECT input_scope,input_fingerprint,"commit" FROM judgments').fetchall())
+        self.assertEqual(stored, [("crate", self.git("rev-parse", f"{base}:crates/alpha"), base)])
+        self.write(sibling, "pub fn sibling_changed() {}\n")
+        self.set_tip(self.commit("Change a sibling after legacy judgment"))
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_legacy_structure_module_key_carries_over_on_the_style_branch(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, sibling, _, base = self.structure_module()
+        _ = self.cli("set-tip", "--tip", base, "--style-branch", "style/main")
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(path, "pub fn fixed() {}\n")
+        checked = self.commit("Fix module on style branch")
+        self.insert_legacy_structure_judgment(rule, path, checked, "fixed")
+        self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated() {}\n")
+        _ = self.commit("Change another module on style branch")
+        self.assertEqual(self.states(rule)[path], "awaiting merge")
+        self.write(sibling, "pub fn changed() {}\n")
+        _ = self.commit("Change judged module on style branch")
+        self.assertEqual(self.states(rule)[path], "stale")
+        self.record(rule, path, self.git("rev-parse", "HEAD"), "fixed")
+        self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated_again() {}\n")
+        _ = self.commit("Change another module after new judgment")
+        self.assertEqual(self.states(rule)[path], "awaiting merge")
+
+    def test_legacy_structure_held_judgment_carries_over_for_decline(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        ledger = self.ledger()
+        finding = ledger.hold(rule, path, 1, "Split module", "restructure", "before", "after", self.blob(rule), "outside")
+        self.insert_legacy_structure_judgment(rule, path, base, "held")
+        self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated() {}\n")
+        self.set_tip(self.commit("Change outside held module"))
+        self.assertIsInstance(ledger.decline_held(finding.finding_id, "declined"), style_ledger.CellWaived)
+        self.assertEqual(self.states(rule)[path], "current")
+
+    def test_structure_row_with_an_unresolvable_commit_counts_as_changed(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        ledger = self.ledger()
+        finding = ledger.hold(rule, path, 1, "Split module", "restructure", "before", "after", self.blob(rule), "outside")
+        self.insert_legacy_structure_judgment(rule, path, base, "held")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute('UPDATE judgments SET "commit"=?', ("0" * 40,))
+            connection.commit()
+        self.assertEqual(self.states(rule)[path], "stale")
+        self.assertIsInstance(ledger.decline_held(finding.finding_id, "declined"), style_ledger.InputChangedSinceJudged)
+
+    def test_structure_crate_and_manifest_cells_retain_their_original_keys(self) -> None:
+        crate_rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        manifest_rule = self.rule("manifests", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.set_tip(self.initial_tip)
+        self.record(crate_rule, "crates/alpha", self.initial_tip, "held")
+        self.record(manifest_rule, "crates/alpha", self.initial_tip)
+        ledger = self.ledger()
+        finding = ledger.hold(crate_rule, "crates/alpha", 1, "Split crate", "restructure",
+                              "before", "after", self.blob(crate_rule), "outside")
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.set_tip(self.commit("Change crate source"))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            stored = cast(list[tuple[str, str, str]], connection.execute(
+                "SELECT rule,input_scope,input_fingerprint FROM judgments ORDER BY id").fetchall())
+        self.assertEqual(stored[0], (crate_rule, "crate", self.git("rev-parse", f"{self.initial_tip}:crates/alpha")))
+        self.assertEqual(stored[1][1], "manifest")
+        self.assertEqual(self.states(manifest_rule)["crates/alpha"], "current")
+        self.assertIsInstance(ledger.decline_held(finding.finding_id, "declined"), style_ledger.InputChangedSinceJudged)
+        self.write("crates/alpha/Cargo.toml", (self.repo / "crates/alpha/Cargo.toml").read_text() + "\n[features]\nextra = []\n")
+        self.set_tip(self.commit("Change workspace manifest"))
+        self.assertEqual(self.states(manifest_rule)["crates/alpha"], "stale")
 
     def test_celled_structure_record_refuses_rule_path_pairs_outside_ticket_ownership(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -207,7 +327,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(migrated.ticket_open("modules")[0]["state"], "checkpointed")
         self.assertEqual(self.states(rule), dict.fromkeys(self.sources, "open"))
 
-    def test_structure_file_cells_keep_crate_fingerprints_and_decline_only_the_matching_file(self) -> None:
+    def test_structure_file_cells_track_module_inputs_and_decline_only_the_matching_file(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: crate\n")
         self.set_tip(self.initial_tip)
         ledger = self.ledger()
@@ -223,7 +343,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.states(rule), {**dict.fromkeys(self.sources[:2], "stale"), **dict.fromkeys(self.sources[2:], "open")})
 
 
-    def test_structure_file_scope_includes_listed_non_rust_sites_and_preserves_file_fingerprints(self) -> None:
+    def test_structure_file_scope_keys_rust_modules_and_preserves_non_rust_site_fingerprints(self) -> None:
         rule = self.rule("structure-sites", "tier: D\nfamily: modules\ninput_scope: file\ncandidates:\n"
                          + "  kind: regex\n  pattern: PLACEHOLDER\n  globs: [README.md]\n  surface: partial\n"
                          + "  uncovered: Read module ownership.\n")
@@ -239,7 +359,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.set_tip(self.commit("Change another file"))
         self.assertEqual(self.states(rule), {**dict.fromkeys(self.sources, "open"),
-                                           self.sources[0]: "current", "README.md": "current"})
+                                           self.sources[0]: "stale", "README.md": "current"})
 
     def test_initial_universe_has_file_cells_but_no_vendor_or_process_cells(self) -> None:
         file_rule = self.rule("read")
