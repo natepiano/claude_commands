@@ -310,6 +310,30 @@ Pending: parent's saved style child summary and rendered style line.
   that crate, and a family with no unit counts nothing. Each unit's scope is
   read from its own plan copy. `queue` shows the same order refill uses.
 
+- **Fix N — refill names the crates whose structure cells hold a unit back** (commit `425c27e2`):
+  while modules worked through the pilot crates, the types and names units
+  reported a bare `waiting for sync`, which reads as a missing sync and not
+  as work queued behind modules. A unit other than modules with nothing to
+  take now prints `waiting for structure: <crates>`, listing each in-scope
+  crate that holds both a pending structure cell and a pending cell of its
+  own family. It still exits 3 and still registers its sync wait, so a
+  modules merge wakes it as before.
+
+- **Windowed names recall sample:** the same 20 cargo-handler files were
+  judged again by two blind family judges, all seven names rules at once,
+  as a names ticket does, with one change: each file was read in windows of
+  at most about 300 lines, and each window's findings were written down
+  before the next window opened. Recall rose from 37/117 (31.62%) to 100/117
+  (85.47%). comments-name-code-constructs rose from 18 to 38 of 43, and
+  prefer-type-named-fields-and-bindings from 18 to 61 of 66. The misses in
+  long files and test files are gone. name-bindings-to-match-parameters
+  stayed at 0 of 6 and spell-out-names at 0 of 1: windows fix how deep a
+  judge reads, not whether it traces a binding into the parameter it feeds.
+  Three of the five comment misses left are module docs at lines 1–3. Fix O
+  makes windows the read-ticket procedure; a dedicated name-bindings pass
+  follows it.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
-fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`.
+fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
+`a8ae4d2a`.
 Live verification of the fixes and subsequent measurements remain pending.
