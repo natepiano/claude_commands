@@ -593,6 +593,12 @@ def restart_note(
     record: SessionShutdown, restarted_at: str
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
+    note = _stop_note(record, restarted_at)
+    # A unit renamed while it was stopped learns its new names before anything else it reads.
+    return f"{record['renamed']} {note}" if "renamed" in record else note
+
+
+def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
     if "target" in record and record["requested_by"]["kind"] != "snapshot":
         note = account_move_note(record["session"], record["target"],
                                  record.get("source_label", record["label"]), record.get("why", ""),

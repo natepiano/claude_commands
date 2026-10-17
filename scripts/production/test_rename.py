@@ -126,7 +126,7 @@ def refusing_run(command, *args, **kwargs):
     operation = os.environ["RENAME_TEST_REFUSE"]
     arguments = command[3:] if command[:1] == ["git"] else []
     blocked = ((operation == "repair" and arguments[:2] == ["worktree", "repair"])
-               or (operation == "finish-delete" and arguments == ["branch", "-D", "--", "old"])
+               or (operation == "finish-delete" and arguments[:3] == ["update-ref", "-d", "refs/heads/old"])
                or (operation == "unit-push" and "push" in arguments
                    and "new-alpha-unit:refs/heads/new-alpha-unit" in arguments)
                or (operation == "unit-doc" and arguments == ["diff", "--name-only", "-z", "HEAD"])

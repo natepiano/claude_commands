@@ -2846,6 +2846,13 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(len(lines), 1, "\n".join(result["lines"]))
         self.assertIn(restart.resume_command(saved["session"], "claude3", LABEL), lines[0])
 
+    def test_a_renamed_unit_hears_its_new_names_first(self) -> None:
+        saved = entry(unit("unit"))
+        saved["renamed"] = "While you were stopped the showrunner renamed you: you are now gamma-unit."
+        note = restart.restart_note(saved, RESTARTED)
+        self.assertTrue(note.startswith(saved["renamed"] + " Restarted after /shutdown"), note)
+        self.assertNotIn("renamed you", restart.restart_note(entry(unit("unit")), RESTARTED))
+
     def test_move_restart_note_names_source_target_reason_and_continuation_for_every_session_kind(self) -> None:
         for owner in (top_level("top"), unit("unit"), showrunner("runner")):
             with self.subTest(kind=owner["kind"]):

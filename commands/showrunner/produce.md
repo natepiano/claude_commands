@@ -45,10 +45,15 @@ State:
 - `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
-  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply carries the printed `reviewed question` text.
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
+  `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
+  the user asked to be told about, such as "tell me when hanadocs is back";
+  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply carries the printed `reviewed question` text.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
+  `report_to_user` is kept the same way in
+  `~/.local/state/showrunner/reports/<slug>.json`.
 - `LOG` backups — `~/.local/state/showrunner/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`,
   one copy per update tick, the newest 48 kept (`log_backup.py`). To restore
   `LOG`, copy the wanted file back over it.
@@ -257,10 +262,22 @@ State:
   When the user-facing open list changes, set `open_for_user` in
   `SHOWRUNNER_STATE` to the complete new list, starting from `OUTSTANDING`'s
   current items; `[]` clears it.
+  The line after the footer's `HH:MM <zone> update:` header counts what waits
+  on the user, read when the footer is rendered and never stored, zero counts
+  left out and no line when all are zero: `For you: 2 changes to review, 1
+  proposal, 3 projects`. Changes are the rows still to review on the list the
+  doc's Change review line names; proposals are the open `proposal` issues in
+  its Proposals folder; projects, only for a doc with an `- **Improvement
+  queue:** <ledger>` line, are its ledger lines still `proposed`, or
+  `accepted` without `assigned`, `applied`, `built` or `declined` (write
+  `assigned <unit>` on a line when you hand the project out). The Waiting on
+  block carries the question count, so this line leaves it out.
   When the footer switch is off, the command says `footers off`; omit both the
   footer and the Waiting on block. It still stores `open_for_user`, so the
-  dailies count it, and with questions open the reply ends with the count line
-  alone (**Open questions** above). The command reads the switch, the notifier's
+  dailies count it. It prints the counts line with the open questions added
+  (`For you: 1 change to review, 2 questions`) when anything is counted; the
+  reply ends with that line alone, and the footer hook blocks a reply that
+  does not. A `-` reply carries no line. The command reads the switch, the notifier's
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
   item complete enough to stand alone when the user asks for the list: what
   is asked, where, why and the choices. Remove
@@ -273,8 +290,17 @@ State:
   targeted by `UPDATES`. When footers are on, a missing or outdated footer or
   Waiting on block blocks the reply with the exact footer lines and the Waiting on
   block's form. A block that restates a user item, or whose count differs from the
-  `OUTSTANDING` items now due, blocks it with the count line to write. End the reply with those lines and the Waiting on block. The hook
-  passes a reply after any Stop-hook block and passes on errors.
+  `OUTSTANDING` items now due, blocks it with the count line to write. End the reply with those lines and the Waiting on block. The footer
+  check passes a reply after any Stop-hook block, and the hook passes on errors.
+
+  A turn the user did not start (only cross-session messages, the update tick
+  among them, or task notifications) gets exactly `-` as its reply when nothing
+  needs the user; `-` carries no footer. Such a turn reaches the user only when
+  a tool call in it was refused by auto mode (surface it) or when the reply
+  names a registered item: an `OUTSTANDING` item, or a `report_to_user` item
+  whose `until` has not passed. A fault the user would see is registered first.
+  Any other reply is blocked with `nothing needs the user: reply with -`, the
+  retry included.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
   footer for this showrunner. A new production starts with it off. Run them when the user says "footers off" or
