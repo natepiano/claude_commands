@@ -266,38 +266,23 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 **Depends on:** Phase 8
 
-#### Work Order
+#### As-built
 
-**Goal:** one lint call clears every multiply-add clippy can rewrite automatically, including the inner term of a chained sum and the crates downstream of the first crate that failed.
-
-**Spec:**
-
-The showrunner, 2026-10-17, after Phase 8 measured both limits failing: "Add Phase 9 (current): (1) for chained sums, the rewrite applies clippy's mul_add suggestions again until none is left (to a fixed point), so the inner a*x + b*y is rewritten too; (2) the first lint does not stop at the first failing crate, so the rewrite sees the downstream crates. Leave macro bodies alone (MaybeIncorrect)."
-
-Phase 8's evidence: of five failed final verdicts, two kept the inner term of a chained sum the applier had skipped as overlapping (count lines "1 skipped: overlapping", "3 skipped: overlapping"), and one failed in `hana` after the first and replay runs stopped at `hana_conduit`, so the replay never reported `hana`'s warnings.
-
-In `verify.sh lint`'s rewrite branch (`scripts/delegate/verify.sh`, after the judging clippy fails with `#suboptimal_flops`):
-1. Replace the single replay and apply with rounds: each round replays clippy as JSON (`invoke_clippy_mul_add_json`, same arguments) and runs `apply_mul_add.py` on it. Stop when the applier exits 3 (`NOTHING_APPLIED`), when the replay exits other than 0 or 101, when the applier exits 1, or after **5** rounds; then format `FMT_SCOPE` once, recompute `VERDICT_KEY`, and judge once more, as today. A later round sees the file the earlier round wrote, so a skipped inner term and a crate the earlier run never reached both come up again. Edits a round already wrote stay when a later round fails; the final verdict judges them.
-2. When no round applied anything, keep today's "changed nothing" line and the first verdict. When the first round applied and a later one failed, print the failure line and still format and judge.
-3. Print the count line of each round that rewrote, unchanged in form; save every round's count line, one per line in order, in `<call_id>.log`. When the cap stops the rounds, print `verify.sh: stopped the multiply-add rewrite after 5 rounds`.
-4. Every lint clippy run in this branch (the judging run, the replays and the final judgment) passes Cargo's `--keep-going`, so a failing crate no longer hides crates that do not depend on it.
-Macro-body suggestions stay untouched: the applier's `MachineApplicable` rule already excludes them.
+- `verify.sh lint`'s multiply-add rewrite runs a first judgment, then up to five rounds of JSON replay plus `apply_mul_add.py`, then one format, cache rekey and final judgment. Every clippy step carries `--keep-going`, so crates that do not depend on the failing one are judged too; crates that do are reached in the next round once the upstream rewrite lands.
+- A round that applies nothing, a replay status other than 0 or 101, or an applier failure ends the loop; edits from earlier rounds stay and are formatted and judged. With no applied round, the first verdict stands and `changed nothing` prints.
+- Each applied round prints its own count line, and every line is saved in order to `~/.local/state/mul-add-hook/lint-rewrite/<call_id>.log`. Five applied rounds print `verify.sh: stopped the multiply-add rewrite after 5 rounds`.
+- Macro-body suggestions (`MaybeIncorrect`) are left alone.
 
 **Files:**
-- `scripts/delegate/verify.sh` — the lint rewrite branch
-- `scripts/lint/invoke.sh` — only when `--keep-going` belongs in `invoke_clippy` rather than at the call sites
-- `scripts/delegate/test_verify_lint_scope.py` — lint-step tests with fake Cargo
+- `scripts/delegate/verify.sh` — the rewrite rounds in the `lint` verb
+- `scripts/delegate/test_verify_lint_scope.py` — fake cargo with per-round diagnostic streams; chained sum, downstream crate, five-round cap, later-round failure and macro body
+- `scripts/style/test_style_sync.py` — its clippy argv expectation carries `--keep-going`
 
-**Workers:** 1 writer; the tests live beside the change.
-- `impl` — rounds, `--keep-going`, tests
+**Binds later work:** a call's fixes are the sum of its count lines (`watch.py`'s `rewrite_count` sums them); a cap stop shows as five saved count lines, since the cap message is only in lint output.
 
-**Constraints from prior phases:**
-- Phase 5: the replay step is marked by `--message-format=json` in its argv and shares the call's `call_id`; under `-D warnings` a useful replay exits 101. `apply_mul_add.py` exits 0 rewrote, 3 nothing, 1 incomplete stream or I/O failure, and requires Cargo's `build-finished` record. The count line is `verify.sh: rewrote <n> multiply-add(s) in <m> file(s)` with an optional `(<k> skipped: overlapping)`.
-- Phase 7: `run_json_stdout` returns only once its log holds every line; keep bash 3.2 constructs (no `{fd}>`) and every step returning its command's own status.
-- `~/.local/state/mul-add-hook/lint-rewrite/watch.py` reads count lines with a multi-line pattern; Phase 10 sums every line of a log.
-- A rewrite lands uncommitted in the calling worktree.
+**Gotchas:** `--keep-going` sits at the lint call sites, not in `scripts/lint/invoke.sh`, so examples and other consumers keep their argv. A round-one replay failure prints both its failure line and `changed nothing`.
 
-**Acceptance gate:** fake-Cargo tests show: a chained sum whose inner term comes up in round 2 ends with a passing final verdict and two saved count lines; a downstream crate's suggestion that first appears in round 2 is rewritten; the cap stops at 5 rounds with its line; a later round's failure still formats and judges; `--keep-going` is on every clippy argv in the branch. `merge_gate.py --tests-only` passes.
+**Ruled out:** rewriting inside macro bodies, whose suggestions clippy marks `MaybeIncorrect`.
 
 ### Phase 10 — Re-measure the rewrite rounds  · status: todo
 
@@ -318,22 +303,29 @@ and removes it on the wake.
 
 Method: copy Phase 8's `measure.py`, `commits.py` and `audit.py` from `~/.local/state/mul-add-hook/lint-rewrite/` into `~/.local/state/mul-add-hook/lint-rounds/` and run the copies with the window T_rounds ≤ start < T_rounds + 24 h, by Phase 8's per-call verdict rule. Report what Phase 8 reported, plus rounds per call (each saved count line is one round; sum the fixes of every line) and how many calls the 5-round cap stopped. Rank what remains by failed verdicts, as Phase 8 did. `audit.py` re-derives the counts independently and must PASS.
 
+The copies change where Phase 8's scripts assume one replay per call:
+- **Cohort.** A call belongs to the window when its first judgment starts inside it. Read each call's complete step sequence, even past the window's end, before picking its final judgment; never let an initial judgment stand as the verdict because the final one started after the window closed.
+- **Counts per call.** `measure.py` (around lines 181–185) refuses repeated call ids and more than one count line, and `audit.py` expects one count line: read each call's count log once, sum every line, and sum replay durations separately from the judgments. `audit.py` re-derives both totals on its own.
+- **Rounds and cap stops.** A round is one saved count line, and a replay that applied nothing or failed adds none. The cap message lives only in lint output, which is not always kept, so a cap stop is a call with five saved count lines. A call with four lines followed by a failed fifth replay is not a cap stop. Where a call's count log is missing, report its rounds as unknown, never as zero.
+- **Replay history.** `commits.py` keys replay evidence by call id alone (around lines 109 and 142), which would keep only the last round. Keep every round's replay in order per call, so a call that rewrote in round one and then failed stays apart from one that never rewrote anything.
+
 If both limits PASS, the as-built proposes retiring the edit hook; the proposal goes to the showrunner, and nothing is removed in this phase. If either FAILs, the as-built names the largest remaining cause by failed verdicts.
 
 **Files:**
 - `docs/as-built/build-followups-mul-add.md` — "Rewrite rounds, re-measure" under "Measured outcome", with the bounded SQL
 - `~/.local/state/mul-add-hook/lint-rounds/` — outside the repository: the copied scripts and their JSON
 
-**Workers:** 1 writer + 1 adversary review; nothing to test.
-- `impl` — the scripts' copies, the run, the as-built section
+**Workers:** 1 writer + 1 adversary review.
+- `impl` — the scripts' copies, their synthetic checks, the run, the as-built section
 
 **Constraints from prior phases:**
 - Phase 4's limits: 1.979 per 100 and 0.100 seat-hours a day. Phase 8's result (4.032 and 0.448, per call) is the baseline row.
 - Phase 8: the verdict is the last judging clippy step per `call_id`; JSON replay steps (`--message-format=json` in argv) are never verdicts. Warning counts include repeated diagnostics, so causes are ranked by failed verdicts.
-- Count logs stay in `~/.local/state/mul-add-hook/lint-rewrite/<call_id>.log` (Phase 9 writes one line per round there).
+- Count logs stay in `~/.local/state/mul-add-hook/lint-rewrite/<call_id>.log` (Phase 9 writes one line per round there). `watch.py`'s `rewrite_count` already sums every round's line.
+- Phase 9: a rewrite call now runs one first judgment, up to five JSON replays and one final judgment, all with `--keep-going`; the verdict rule above still picks the final judgment. A call the cap stopped prints `verify.sh: stopped the multiply-add rewrite after 5 rounds` in its lint output. A replay or applier failure in a later round keeps the earlier rounds' edits and still formats and judges.
 - The build log index is UTC; state times in EDT with UTC beside them. Never write `~/.local/state/buildlog`, the block log or the hana tree.
 
-**Acceptance gate:** `audit.py` PASS; both verdicts stated with their arithmetic; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
+**Acceptance gate:** synthetic checks run against the copied scripts and pass: two applied rounds then an empty replay (2 rounds, fixes summed once); five applied rounds (one cap stop); four applied rounds then a failed fifth replay (not a cap stop); a round-one rewrite followed by a failed replay (kept apart from a call that never rewrote); a call whose first judgment is inside the window and whose final judgment is after it (verdict taken from the final judgment). `audit.py` PASS; both verdicts stated with their arithmetic; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
 
 ## Out of scope
 
