@@ -6,12 +6,15 @@ import io
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rules
 import style_ledger
@@ -113,16 +116,70 @@ class StyleProposalsTests(unittest.TestCase):
             raise style_ledger.LedgerError("stubbed issue command failed")
 
     def hold(self, ledger: style_ledger.Ledger, *, rule: str = "global:rust/names.md", crate: str = "alpha",
-             line: int = 1, kind: style_ledger.FindingKind = "rename", record: bool = True) -> style_ledger.HeldFinding:
+             line: int = 1, kind: style_ledger.FindingKind = "rename", record: bool = True,
+             ticket: str = "outside") -> style_ledger.HeldFinding:
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        finding = ledger.hold(rule, f"{crate}/src/lib.rs", line, f"site {line}", kind, "value", "count", blob, "outside")
+        finding = ledger.hold(rule, f"{crate}/src/lib.rs", line, f"site {line}", kind, "value", "count", blob, ticket)
         if record:
-            ledger.record(rule, crate if rule == self.structure else finding.path, self.tip, blob, "held", ticket="outside", worker="test")
+            ledger.record(rule, crate if rule == self.structure else finding.path, self.tip, blob, "held", ticket=ticket, worker="test")
         return finding
 
     def file(self, ledger: style_ledger.Ledger) -> tuple[Path, ...]:
         with redirect_stdout(io.StringIO()):
             return style_proposals.file_proposals(ledger, self.proposals, "parent")
+
+    def assign_ticket(self, ledger: style_ledger.Ledger, unit: str) -> str:
+        ticket = f"{unit}-1"
+        ledger.ticket_add(ticket, unit, "read", "names", "alpha", ["alpha/src/lib.rs"], [self.rename])
+        ledger.ticket_assign(ticket, "main")
+        return ticket
+
+    def test_assigned_ticket_findings_wait_while_closed_ticket_findings_are_filed(self) -> None:
+        with self.ledger() as ledger:
+            assigned = self.assign_ticket(ledger, "assigned")
+            waiting = (self.hold(ledger, ticket=assigned), self.hold(ledger, ticket=assigned, line=2))
+            merged = self.assign_ticket(ledger, "merged")
+            ready = self.hold(ledger, ticket=merged, line=3)
+            ledger.ticket_checkpoint(merged, self.tip)
+            ledger.ticket_merge(merged)
+            dropped = self.assign_ticket(ledger, "dropped")
+            dropped_finding = self.hold(ledger, ticket=dropped, line=4)
+            ledger.ticket_drop(dropped)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                paths = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(set(frontmatter(paths[0])["style_findings"]), {ready.finding_id, dropped_finding.finding_id})
+            self.assertEqual({item.finding_id for item in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))},
+                             {item.finding_id for item in waiting})
+            self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith("held for open ticket")],
+                             [f"held for open ticket {assigned}: 2 findings"])
+
+    def test_filing_retries_held_findings_after_the_holding_ticket_merges(self) -> None:
+        with self.ledger() as ledger:
+            ticket = self.assign_ticket(ledger, "names")
+            finding = self.hold(ledger, ticket=ticket)
+            self.assertEqual(self.file(ledger), ())
+            self.assertEqual(self.calls, [])
+            ledger.ticket_checkpoint(ticket, self.tip)
+            ledger.ticket_merge(ticket)
+            paths = self.file(ledger)
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(frontmatter(paths[0])["style_findings"], [finding.finding_id])
+            self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Filed)
+
+    def test_checkpointed_ticket_findings_remain_unfiled_with_a_wait_notice(self) -> None:
+        with self.ledger() as ledger:
+            ticket = self.assign_ticket(ledger, "names")
+            finding = self.hold(ledger, ticket=ticket)
+            ledger.ticket_checkpoint(ticket, self.tip)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                paths = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertEqual(paths, ())
+            self.assertEqual(output.getvalue(), f"held for open ticket {ticket}: 1 findings\n")
+            self.assertEqual(self.calls, [])
+            self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")), (finding,))
 
     def test_batches_by_kind_and_crate_include_every_site_and_issue_fields(self) -> None:
         with self.ledger() as ledger:

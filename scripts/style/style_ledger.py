@@ -136,6 +136,11 @@ class HeldFindingsInState:
 
 
 @dataclass(frozen=True)
+class UnfiledFindingsFromOpenTickets:
+    """Findings still subject to revision by an assigned or checkpointed ticket."""
+
+
+@dataclass(frozen=True)
 class ApprovedProposal:
     issue: Path
     unit: str
@@ -997,8 +1002,14 @@ class Ledger:
         state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Built() if row[10] == "built" else Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state)
 
-    def held_findings(self, selection: AllHeldFindings | HeldFindingsInState) -> tuple[HeldFinding, ...]:
-        if isinstance(selection, HeldFindingsInState):
+    def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
+        if isinstance(selection, UnfiledFindingsFromOpenTickets):
+            query = self._connection.execute(
+                "SELECT h.finding_id FROM held_findings h JOIN tickets t ON t.id=h.ticket "
+                + "WHERE h.state='unfiled' AND t.state IN ('assigned','checkpointed') "
+                + "ORDER BY h.created_at,h.finding_id",
+            )
+        elif isinstance(selection, HeldFindingsInState):
             query = self._connection.execute(
                 "SELECT finding_id FROM held_findings WHERE state=? ORDER BY created_at,finding_id", (selection.state,),
             )
