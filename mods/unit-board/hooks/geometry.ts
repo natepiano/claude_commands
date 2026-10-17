@@ -51,7 +51,7 @@ export function labelRuns(marks: readonly { column: number; text: string }[], wi
 
 export function rulerCells(unit: BoardUnit, now: number, width: number, utcOffsetMinutes = 0): Ruler {
   width = Math.max(1, Math.floor(width));
-  const phase = unit.phases.find(row => row.id === unit.phase?.id);
+  const phase = unit.phases.find(row => row.id === unit.phase?.id && row.status === 'open');
   const from = phase?.start?.at ?? now;
   const promise = unit.eta?.at;
   const end = Math.max(promise?.at ?? now, now, from + 1);
