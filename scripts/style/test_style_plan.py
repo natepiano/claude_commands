@@ -631,6 +631,55 @@ class StylePlanTests(unittest.TestCase):
         for directory in ("one", "two"):
             self.assertEqual(sum(any(f"/{directory}/" in path for path in ticket.files) for ticket in batches), 1)
 
+    def test_structure_batches_read_each_rules_listed_sites_once_per_crate_without_changing_tickets(self) -> None:
+        first = self.rule("first", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n  pattern: first\n"
+                          + "  surface: partial\n  uncovered: Read the module.\n")
+        second = self.rule("second", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n  pattern: second\n"
+                           + "  surface: partial\n  uncovered: Read the module.\n")
+        self.write(self.sources[0], "pub fn first() {}\npub fn second() {}\n")
+        for name in ("a", "b", "c", "d", "e", "f"):
+            self.write(f"crates/alpha/src/nested/{name}.rs", "pub fn value() {}\n")
+        self.write("crates/alpha/src/nested/a.rs", "pub fn second() {}\npub fn first() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        ledger = self.ledger()
+        with mock.patch.object(ledger, "listed_sites", wraps=ledger.listed_sites) as listed_sites:
+            tickets = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
+                                                   "modules")
+        self.assertEqual(tickets, (
+            style_plan.TicketSelection("structure", "modules", "crates/alpha",
+                ("crates/alpha/src/lib.rs", "crates/alpha/src/other.rs"), (first, second), sites=(
+                    style_ledger.ListedSite(first, "crates/alpha/src/lib.rs", "crates/alpha", 1, "pub fn first() {}"),
+                    style_ledger.ListedSite(second, "crates/alpha/src/lib.rs", "crates/alpha", 2, "pub fn second() {}"),
+                ), cells=(
+                    (first, "crates/alpha/src/lib.rs"), (first, "crates/alpha/src/other.rs"),
+                    (second, "crates/alpha/src/lib.rs"), (second, "crates/alpha/src/other.rs"),
+                )),
+            style_plan.TicketSelection("structure", "modules", "crates/alpha", (
+                "crates/alpha/src/nested/a.rs", "crates/alpha/src/nested/b.rs", "crates/alpha/src/nested/c.rs",
+                "crates/alpha/src/nested/d.rs", "crates/alpha/src/nested/e.rs", "crates/alpha/src/nested/f.rs",
+            ), (first, second), sites=(
+                style_ledger.ListedSite(first, "crates/alpha/src/nested/a.rs", "crates/alpha", 2, "pub fn first() {}"),
+                style_ledger.ListedSite(second, "crates/alpha/src/nested/a.rs", "crates/alpha", 1, "pub fn second() {}"),
+            ), cells=(
+                (first, "crates/alpha/src/nested/a.rs"), (first, "crates/alpha/src/nested/b.rs"),
+                (first, "crates/alpha/src/nested/c.rs"), (first, "crates/alpha/src/nested/d.rs"),
+                (first, "crates/alpha/src/nested/e.rs"), (first, "crates/alpha/src/nested/f.rs"),
+                (second, "crates/alpha/src/nested/a.rs"), (second, "crates/alpha/src/nested/b.rs"),
+                (second, "crates/alpha/src/nested/c.rs"), (second, "crates/alpha/src/nested/d.rs"),
+                (second, "crates/alpha/src/nested/e.rs"), (second, "crates/alpha/src/nested/f.rs"),
+            )),
+            style_plan.TicketSelection("structure", "modules", "crates/beta",
+                ("crates/beta/src/lib.rs", "crates/beta/src/other.rs"), (first, second), cells=(
+                    (first, "crates/beta/src/lib.rs"), (first, "crates/beta/src/other.rs"),
+                    (second, "crates/beta/src/lib.rs"), (second, "crates/beta/src/other.rs"),
+                )),
+        ))
+        self.assertEqual(listed_sites.call_args_list, [
+            mock.call(first, "crates/alpha"), mock.call(second, "crates/alpha"),
+            mock.call(first, "crates/beta"), mock.call(second, "crates/beta"),
+        ])
+
     def test_structure_manifest_cell_joins_first_batch_and_requires_its_crate_verdict(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
         manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")

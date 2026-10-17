@@ -338,12 +338,14 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                 available = {cell.path for cell in file_cells}
                 if manifest_cells and not busy.contains(manifest):
                     available.add(manifest)
+                sites_by_rule = {rule_id: ledger.listed_sites(rule_id, crate)
+                                 for rule_id in sorted({cell.rule for cell in structure})}
                 for files in sorted(read_slices(repo, tip, tuple(sorted(available)), _STRUCTURE_LIMITS)):
                     batch_cells = tuple(cell for cell in file_cells if cell.path in files)
                     if manifest in files:
                         batch_cells += manifest_cells
                     rule_ids = tuple(sorted({cell.rule for cell in batch_cells}))
-                    sites = tuple(site for rule_id in rule_ids for site in ledger.listed_sites(rule_id, crate)
+                    sites = tuple(site for rule_id in rule_ids for site in sites_by_rule[rule_id]
                                   if site.path in files)
                     result.append(TicketSelection("structure", family, crate, files, rule_ids, sites=sites,
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
