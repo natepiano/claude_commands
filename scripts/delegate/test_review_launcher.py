@@ -935,6 +935,16 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertTrue(list(phase_dir.glob("review_status*")))
         self.assertEqual(sorted(path.name for path in session.glob("review_*")), [])
 
+    def test_a_pool_review_names_the_director_in_the_unit_run_folder(self) -> None:
+        session = self.start_implementation("director")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
+        result = subprocess.run(self.pool_command(session), env=environment, capture_output=True, text=True,
+                                check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "director").read_text(encoding="utf-8"), "sid-director\n")
+
     def test_a_phase_id_with_a_space_names_a_directory_without_it(self) -> None:
         session = self.start_implementation("phase-directory-name")
         self.finish_implementation(session)

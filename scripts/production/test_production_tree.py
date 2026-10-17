@@ -61,11 +61,17 @@ class ProductionTreeTests(unittest.TestCase):
         ):
             _ = self.enterContext(patch)
 
-    def run_folder(self, root: str, director: str, roster: dict[str, dict[str, object]], server: bool = True) -> Path:
-        run = self.root / root / f"run-{director}"
-        (self.root / root / "active").mkdir(parents=True, exist_ok=True)
-        run.mkdir()
-        _ = (self.root / root / "active" / director).write_text(f"{run}\n")
+    def run_folder(self, root: str, director: str, roster: dict[str, dict[str, object]], server: bool = True,
+                   name: str = "") -> Path:
+        """A run `start-run` opened for `director`: its state names a history whose first event says so."""
+        run = self.root / root / (name or f"run-{director}")
+        run.mkdir(parents=True)
+        history = self.root / "history" / f"{run.name}.jsonl"
+        history.parent.mkdir(exist_ok=True)
+        started = {"event_type": "run_started", "main_agent": {"family": "claude", "session_id": director}}
+        _ = history.write_text(json.dumps(started) + "\n" + json.dumps({"event_type": "phase_started"}) + "\n")
+        _ = (run / "progress_history_state.json").write_text(json.dumps(
+            {"history_file": str(history), "main_agent": {"family": "claude", "session_id": director}}))
         _ = (run / "mesh_roster.json").write_text(json.dumps(roster))
         if server:
             _ = (run / "mesh_server.json").write_text(json.dumps({"pid": 1}))
@@ -156,11 +162,64 @@ class ProductionTreeTests(unittest.TestCase):
         _ = (run / "board.log").write_text("2026-10-16T09:00:00-0400 [fix] register: fix launcher up; role=fix\n")
         _ = (run / "impl_worker_fix.json").write_text(json.dumps(
             {"name": "proj-fix", "slot": "fix", "family": "claude", "model": "m", "worker_id": "sid-claude-fix"}))
+        _ = (run / "workers").write_text("sid-clau\tproj-fix\n")
         edges = self.tree({DIRECTOR, "sid-claude-fix"}, {})
         self.assertEqual(edges, [
             {"manager": DIRECTOR, "member": "thread-impl", "role": "impl"},
             {"manager": DIRECTOR, "member": "sid-claude-fix", "role": "fix"},
         ])
+
+    def test_a_run_without_a_worker_ledger_has_no_claude_workers(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {}, server=False)
+        _ = (run / "board.log").write_text("2026-10-16T09:00:00-0400 [impl] register: impl launcher up; role=impl\n")
+        _ = (run / "impl_worker_impl.json").write_text(json.dumps(
+            {"name": "proj-impl", "slot": "impl", "family": "claude", "model": "m", "worker_id": "sid-claude-impl"}))
+        self.assertEqual(self.tree({DIRECTOR, "sid-claude-impl"}, {}), [])
+
+    def test_runs_side_by_side_under_one_director_each_list_their_workers(self) -> None:
+        # A director's marker names one run; the phase it runs beside that one has its own folder.
+        main = self.run_folder("delegate", DIRECTOR, {"p1-impl": {"thread_id": "thread-p1", "role": "impl", "status": "running"}},
+                               name="run-phase-1")
+        _ = self.run_folder("delegate", DIRECTOR, {"p2-fix": {"thread_id": "thread-p2", "role": "fix", "status": "running"}},
+                            name="run-phase-2")
+        (self.root / "delegate" / "active").mkdir()
+        _ = (self.root / "delegate" / "active" / DIRECTOR).write_text(f"{main}\n")
+        edges = self.tree({DIRECTOR}, {})
+        self.assertEqual(edges, [
+            {"manager": DIRECTOR, "member": "thread-p1", "role": "impl"},
+            {"manager": DIRECTOR, "member": "thread-p2", "role": "fix"},
+        ])
+
+    def test_the_director_is_the_session_that_started_the_run(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}})
+        # A pass opened inside the worker rewrote the state's identity with the worker's own thread.
+        _ = (run / "progress_history_state.json").write_text(json.dumps({
+            "history_file": str(self.root / "history" / f"{run.name}.jsonl"),
+            "main_agent": {"family": "codex", "session_id": "thread-impl"},
+        }))
+        edges = self.tree({DIRECTOR, "thread-impl"}, {})
+        self.assertEqual(edges, [{"manager": DIRECTOR, "member": "thread-impl", "role": "impl"}])
+
+    def test_the_recorded_director_names_a_run_opened_without_start_run(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-a", "role": "impl", "status": "running"}},
+                              name="run-by-hand")
+        (run / "progress_history_state.json").unlink()
+        self.assertEqual(self.tree({DIRECTOR}, {}), [])
+        unit_runs.record_director(run, DIRECTOR)
+        self.assertEqual(self.tree({DIRECTOR}, {}), [{"manager": DIRECTOR, "member": "thread-a", "role": "impl"}])
+
+    def test_a_run_without_a_started_history_has_no_director(self) -> None:
+        no_state = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-a", "role": "impl", "status": "running"}},
+                                   name="run-no-state")
+        (no_state / "progress_history_state.json").unlink()
+        gone = self.run_folder("unit", DIRECTOR, {"b-impl": {"thread_id": "thread-b", "role": "impl", "status": "running"}},
+                               name="run-history-gone")
+        (self.root / "history" / f"{gone.name}.jsonl").unlink()
+        unstarted = self.run_folder("unit", DIRECTOR, {"c-impl": {"thread_id": "thread-c", "role": "impl", "status": "running"}},
+                                    name="run-unstarted")
+        _ = (self.root / "history" / f"{unstarted.name}.jsonl").write_text(json.dumps({"event_type": "phase_started"}) + "\n")
+        _ = (self.root / "unit" / "stray-file").write_text("not a run\n")
+        self.assertEqual(self.tree({DIRECTOR}, {}), [])
 
     def test_a_large_tree_answers_well_under_a_second(self) -> None:
         directors = [f"sid-director-{number}" for number in range(40)]

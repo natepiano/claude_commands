@@ -434,6 +434,20 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertNotIn("3-impl", board)
 
+    def test_a_dispatch_names_its_director_in_the_run_folder(self) -> None:
+        # The production tree reads the director here: its one marker names only one of the runs
+        # it has open side by side, and a run opened by hand has none.
+        session_dir = self.start_phase("director")
+        environment = self.environment()
+        environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
+        result = subprocess.run(
+            ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
+             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "director").read_text(encoding="utf-8"), "sid-director\n")
+
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()
         environment["PLAN_DELEGATE_CODEX_MESH"] = "1"
