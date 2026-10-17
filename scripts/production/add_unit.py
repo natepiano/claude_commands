@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "hooks"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
+import autocompact
 import rename_state
 import unit_lookup
 import unit_names
@@ -712,6 +713,7 @@ def launch_session(
     *,
     target: str = "",
     model: str = "",
+    autocompact_window: str = "",
 ) -> None:
     """Start Claude in its own herdr session carrying this unit's marks."""
     import herdr
@@ -736,6 +738,8 @@ def launch_session(
         arguments.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
         arguments.extend(["--resume", request.session.session_id])
+    if autocompact_window:
+        arguments.extend(["--autocompact", autocompact_window])
     session_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
     profile = request.profile
@@ -900,6 +904,21 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
     return transcript_model(request.session.session_id) if isinstance(launched_unit(request), MarkedUnitFound) else ""
 
 
+def autocompact_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
+    """The session's recorded auto-compact window, with --autocompact as the value to record."""
+    if isinstance(request.session, NewSession):
+        if explicit:
+            raise Refusal("--autocompact requires --resume")
+        return ""
+    try:
+        if explicit:
+            value = autocompact.checked(explicit)
+            return "" if value == autocompact.AUTO else value
+        return autocompact.recorded(request.session.session_id)
+    except (autocompact.BadAutocompact, OSError, UnicodeError) as error:
+        raise Refusal(f"auto-compact record: {error}") from error
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
@@ -914,6 +933,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--account", default="")
     _ = parser.add_argument("--model", default="")
+    _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
@@ -935,6 +955,7 @@ def main(argv: list[str]) -> int:
                 f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
             )
         resume_model = model_for_resume(request, cast(str, args.model))
+        resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
         # Read the shutdown launch barrier only when a unit is launched.
         import launch_permission
 
@@ -973,6 +994,8 @@ def main(argv: list[str]) -> int:
             request = ready.launch
             if cast(bool, args.check):
                 return 0
+            if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
+                autocompact.record(request.session.session_id, cast(str, args.autocompact))
             marked_unit = launched_unit(request)
             if (
                 isinstance(request.session, ResumedSession)
@@ -1012,7 +1035,8 @@ def main(argv: list[str]) -> int:
                         request.launch_kind.session_id, prompt
                     )
                 launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
-                               if isinstance(request.session, ResumedSession) else "", model=resume_model)
+                               if isinstance(request.session, ResumedSession) else "", model=resume_model,
+                               autocompact_window=resume_autocompact)
         finally:
             _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):

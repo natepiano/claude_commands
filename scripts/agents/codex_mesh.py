@@ -81,6 +81,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Te
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
+from scripts.delegate import plan_history
 from scripts.lib import unit_runs
 from scripts.message import sessions, process_table
 from scripts.whoami import account
@@ -4044,10 +4045,28 @@ def command_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _finished_run(session_dir: str) -> str:
+    """Name how this run finished, or "" while it has not.
+
+    `progress_history.py finish-run` stamps the run's progress state with its
+    final status and `finished_at`, and no later command makes it active again.
+    """
+    state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
+    status = _as_str(state.get("status"))
+    if not status or status == "active" or "finished_at" not in state:
+        return ""
+    return status
+
+
 def command_reopen(args: argparse.Namespace) -> int:
     """Recover an ended or abandoned seat without creating a new thread."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
+    finished = _finished_run(session_dir)
+    if finished:
+        # A finished run's seats stay ended, so no later run takes them for live ones.
+        print(f"skipped {Path(session_dir).name}: run finished ({finished}); {name} stays ended")
+        return 0
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
