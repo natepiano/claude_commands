@@ -15,6 +15,7 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 
 import style_sync
+import style_ledger
 import showrunners
 from scripts.delegate import test_verify_lint_scope as verify_fixture
 
@@ -252,6 +253,196 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             rows = cast(list[tuple[int]], connection.execute("SELECT passed FROM lint_runs").fetchall())
         self.assertEqual(rows, [(0,), (0,), (0,)])
         self.assertEqual((self.repo / "src/lib.rs").read_text(), "fn value() {}\n")
+
+    def handoff_checkpoint(self) -> str:
+        _ = self.git("switch", "-qc", "style/main")
+        _ = (self.repo / "src/lib.rs").write_text("fn corrected() {}\n")
+        _ = self.git("commit", "-qam", "Style checkpoint")
+        checkpoint = self.git("rev-parse", "HEAD")
+        _ = self.git("switch", "-q", "main")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip, "style/main")
+        _ = (self.root / "address.py").write_text(
+            "import sys\nprint('parent' if sys.argv[1] == 'parent' else 'session:fake-parent')\n",
+        )
+        _ = (self.root / "send.py").write_text(
+            "import json,sys\nfrom pathlib import Path\n"
+            + f"with Path({str(self.root / 'notices.jsonl')!r}).open('a') as out:\n"
+            + " out.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        )
+        return checkpoint
+
+    def handoff_rows(self) -> list[tuple[str, str, str, str, str]]:
+        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            return cast(list[tuple[str, str, str, str, str]], connection.execute(
+                "SELECT checkpoint,state,sent_to,created_at,updated_at FROM handoffs ORDER BY created_at,checkpoint",
+            ).fetchall())
+
+    def handoff_notices(self) -> list[list[str]]:
+        path = self.root / "notices.jsonl"
+        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def resume_handoffs(self) -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_sync.main(["resume", "--repo", str(self.repo), "--slug", "sample-style",
+                                    "--branch-point", "main", "--style-branch", "style/main"])
+        return code, output.getvalue()
+
+    def test_resume_reconciles_before_notice_and_sends_pending_handoff(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+            # This second row gives reconcile a visible transition before the notice.
+            ledger.handoff_add(self.tip)
+        output = io.StringIO()
+        real_run = subprocess.run
+        def observe_send(arguments: list[str], **options: object) -> object:
+            if str(self.root / "send.py") in arguments:
+                self.assertIn(f"hand-off {self.tip}: pending -> merged", output.getvalue())
+                with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
+                    self.assertEqual(connection.execute("SELECT branch_point FROM reconciliation").fetchone(), ("main",))
+            self.assertTrue(options.get("capture_output"))
+            return cast(object, mock.DEFAULT)
+        with mock.patch("style_sync.subprocess.run", wraps=real_run, side_effect=observe_send), redirect_stdout(output):
+            code = style_sync.main(["resume", "--repo", str(self.repo), "--slug", "sample-style",
+                                    "--branch-point", "main", "--style-branch", "style/main"])
+        self.assertEqual(code, 0)
+        rows = {row[0]: row for row in self.handoff_rows()}
+        self.assertEqual(rows[checkpoint][1:3], ("sent", "parent"))
+        notices = self.handoff_notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn("session:fake-parent", notices[0])
+
+    def test_resume_replays_same_parent_without_touching_the_row(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+            ledger.handoff_send(checkpoint, "parent")
+        before = self.handoff_rows()
+        self.assertEqual(self.resume_handoffs()[0], 0)
+        self.assertEqual(self.handoff_rows(), before)
+        self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_resume_reroutes_departed_parent_and_keeps_pending_age(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+            ledger.handoff_send(checkpoint, "departed")
+        before = self.handoff_rows()[0]
+        self.assertEqual(self.resume_handoffs()[0], 0)
+        after = self.handoff_rows()[0]
+        self.assertEqual(after[:4], (checkpoint, "sent", "parent", before[3]))
+        self.assertNotEqual(after[4], before[4])
+        self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_resume_as_root_leaves_pending_until_branch_point_contains_it(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        _ = (self.root / "address.py").write_text("print('')\n")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+        code, output = self.resume_handoffs()
+        self.assertEqual(code, 0)
+        self.assertIn(f"root: merge {checkpoint[:7]} with --root-self", output)
+        self.assertEqual(self.handoff_rows()[0][1], "pending")
+        self.assertEqual(self.handoff_notices(), [])
+        _ = self.git("merge", "--no-ff", "-qm", "Integrate root handoff", "style/main")
+        code, output = self.resume_handoffs()
+        self.assertEqual(code, 0)
+        self.assertIn(f"hand-off {checkpoint}: pending -> merged", output)
+        self.assertEqual(self.handoff_rows()[0][1], "merged")
+        self.assertEqual(self.handoff_notices(), [])
+
+    def test_failed_resume_notice_leaves_pending_and_sent_destinations_unchanged(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+        _ = (self.root / "send.py").write_text("print('FAILED: unavailable')\nraise SystemExit(3)\n")
+        for destination in ("", "departed"):
+            if destination:
+                with style_ledger.open_ledger(self.repo) as ledger:
+                    ledger.handoff_send(checkpoint, destination)
+            before = self.handoff_rows()
+            code, output = self.resume_handoffs()
+            self.assertEqual(code, 1)
+            self.assertEqual(len(output.splitlines()), 1)
+            self.assertIn("FAILED: unavailable", output)
+            self.assertEqual(self.handoff_rows(), before)
+
+    def test_acknowledgment_requires_resume_to_establish_branch_point(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+            ledger.handoff_send(checkpoint, "parent")
+        _ = self.git("merge", "--no-ff", "-qm", "Integrate handoff", "style/main")
+        merge = self.git("rev-parse", "HEAD")
+        def acknowledge() -> subprocess.CompletedProcess[str]:
+            return subprocess.run([str(style_sync.PYTHON), str(style_sync.LEDGER), "handoff", "merged",
+                                   "--repo", str(self.repo), "--checkpoint", checkpoint, "--merge-commit", merge],
+                                  capture_output=True, text=True, check=False)
+        refused = acknowledge()
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("reconcile", refused.stderr)
+        self.assertEqual(self.resume_handoffs()[0], 0)
+        accepted = acknowledge()
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(self.handoff_rows()[0][1], "merged")
+
+    def test_send_handoff_sends_one_notice_and_records_the_current_parent(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+                                    "--checkpoint", checkpoint])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
+        notices = self.handoff_notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("session:fake-parent", notices[0])
+        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+
+    def test_send_handoff_as_root_sends_nothing_and_leaves_the_row_pending(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        _ = (self.root / "address.py").write_text("print('')\n")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+                                    "--checkpoint", checkpoint])
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue().strip(), f"root: merge {checkpoint[:7]} with --root-self")
+        self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
+        self.assertEqual(self.handoff_notices(), [])
+
+    def test_send_handoff_interrupted_after_notice_is_replayed_on_resume(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with mock.patch.object(style_ledger.Ledger, "handoff_send", side_effect=RuntimeError("interruption")):
+            with self.assertRaisesRegex(RuntimeError, "interruption"):
+                _ = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+                                     "--checkpoint", checkpoint])
+        self.assertEqual(len(self.handoff_notices()), 1)
+        self.assertEqual(self.handoff_rows()[0][1], "pending")
+        self.assertEqual(self.resume_handoffs()[0], 0)
+        self.assertEqual(len(self.handoff_notices()), 2)
+        self.assertEqual(self.handoff_notices()[0], self.handoff_notices()[1])
+        self.assertEqual(self.handoff_rows()[0][1:3], ("sent", "parent"))
+
+    def test_resume_sends_multiple_pending_handoffs_oldest_first(self) -> None:
+        first = self.handoff_checkpoint()
+        _ = self.git("switch", "-q", "style/main")
+        _ = (self.repo / "src/lib.rs").write_text("fn another_correction() {}\n")
+        _ = self.git("commit", "-qam", "Next style checkpoint")
+        second = self.git("rev-parse", "HEAD")
+        _ = self.git("switch", "-q", "main")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            with mock.patch.object(style_ledger, "_now", return_value="2026-01-02T00:00:00+00:00"):
+                ledger.handoff_add(second)
+            with mock.patch.object(style_ledger, "_now", return_value="2026-01-01T00:00:00+00:00"):
+                ledger.handoff_add(first)
+        self.assertEqual(self.resume_handoffs()[0], 0)
+        texts = [notice[notice.index("--text") + 1] for notice in self.handoff_notices()]
+        self.assertEqual(texts, [f"From the showrunner of sample-style: hand-off {checkpoint}" for checkpoint in (first, second)])
+        self.assertEqual({row[1:3] for row in self.handoff_rows()}, {("sent", "parent")})
 
 
 if __name__ == "__main__":

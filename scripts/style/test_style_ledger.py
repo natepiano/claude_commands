@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -952,7 +953,7 @@ class StyleLedgerTests(unittest.TestCase):
 
     def test_ticket_resume_transitions_repeats_and_rejected_skips(self) -> None:
         rule_id = self.rule("read")
-        self.set_tip(self.initial_tip)
+        _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "main")
         self.add_ticket("read-1", [rule_id], unit="read")
         self.add_ticket("read-1", [rule_id], unit="read")
         self.assertEqual(self.cli("ticket", "open", "--unit", "read").stdout.strip(), "")
@@ -1513,6 +1514,7 @@ class StyleLedgerTests(unittest.TestCase):
     def test_next_ticket_id_never_reuses_merged_or_dropped_numbers(self) -> None:
         rule = self.rule("read")
         ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
         self.assertEqual(ledger.next_ticket_id("names-unit"), "names-unit-1")
         for number in (9, 11):
             ledger.ticket_add(f"names-unit-{number}", "names-unit", "read", "names", "crates/alpha",
@@ -1609,6 +1611,91 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
         self.assertEqual(versions, [(5,)])
+
+
+    def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
+        ledger = self.ledger()
+        ledger.handoff_add(self.initial_tip)
+        pending = ledger.pending_handoffs()[0]
+        refused = self.cli("handoff", "reroute", "--checkpoint", self.initial_tip, "--to", "new", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertTrue(refused.stderr.strip().endswith("; use handoff send"), refused.stderr)
+        ledger.handoff_send(self.initial_tip, "old")
+        sent = ledger.pending_handoffs()[0]
+        with mock.patch.object(style_ledger, "_now", return_value="2099-01-01T00:00:00+00:00"):
+            ledger.handoff_reroute(self.initial_tip, "new")
+        rerouted = ledger.pending_handoffs()[0]
+        self.assertEqual((rerouted["checkpoint"], rerouted["state"], rerouted["sent_to"], rerouted["created_at"]),
+                         (self.initial_tip, "sent", "new", pending["created_at"]))
+        self.assertNotEqual(rerouted["updated_at"], sent["updated_at"])
+        _ = self.cli("handoff", "reroute", "--checkpoint", self.initial_tip, "--to", "new")
+        self.assertEqual(ledger.pending_handoffs()[0], rerouted)
+        resend = self.cli("handoff", "send", "--checkpoint", self.initial_tip, "--to", "third", success=False)
+        self.assertEqual(resend.returncode, 2)
+        _ = self.cli("reconcile", "--branch-point", "main", "--style-branch", "main")
+        merged = self.cli("handoff", "reroute", "--checkpoint", self.initial_tip, "--to", "third", success=False)
+        self.assertEqual(merged.returncode, 2)
+        self.assertIn("merged", merged.stderr)
+        _ = self.git("commit", "--allow-empty", "-qm", "Unknown handoff")
+        unknown = self.cli("handoff", "reroute", "--checkpoint", "HEAD", "--to", "third", success=False)
+        self.assertEqual(unknown.returncode, 2)
+        self.assertIn("unknown", unknown.stderr.lower())
+
+    def test_ticket_merge_requires_checkpoint_on_the_stored_style_branch(self) -> None:
+        rule = self.rule("read")
+        _ = self.git("branch", "style/main")
+        _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "style/main")
+        self.add_ticket("read-1", [rule])
+        _ = self.cli("ticket", "assign", "--id", "read-1", "--branch", "main")
+        self.write(self.sources[0], "pub fn fixed() {}\n")
+        checkpoint = self.commit("Unit checkpoint")
+        _ = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", checkpoint)
+        ledger = self.ledger()
+        with self.assertRaisesRegex(style_ledger.LedgerError,
+                                    f"read-1: checkpoint {checkpoint[:7]} is not on refs/heads/style/main"):
+            ledger.ticket_merge("read-1")
+        self.assertEqual(ledger.ticket_open("read")[0]["state"], "checkpointed")
+        _ = self.git("branch", "-f", "style/main", checkpoint)
+        ledger.ticket_merge("read-1")
+        self.assertEqual(ledger.ticket_open("read"), ())
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='read-1'").fetchone(), ("merged",))
+
+    def test_assigned_ticket_merge_reports_the_state_before_resolving_style_branch(self) -> None:
+        rule = self.rule("read")
+        self.add_ticket("read-1", [rule])
+        _ = self.cli("ticket", "assign", "--id", "read-1", "--branch", "main")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            _ = connection.execute("UPDATE sync SET style_branch='refs/heads/missing'")
+            connection.commit()
+        refused = self.cli("ticket", "merge", "--id", "read-1", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused.stderr.strip(), "style_ledger: read-1: cannot become merged from assigned")
+        self.assertEqual(self.ledger().ticket_open("read")[0]["state"], "assigned")
+
+    def test_ticket_pin_git_failure_is_a_cli_error_and_rolls_back_the_ticket(self) -> None:
+        rule = self.rule("read")
+        binary = self.root / "bin"
+        binary.mkdir()
+        git = binary / "git"
+        real_git = shutil.which("git")
+        if real_git is None:
+            self.fail("git is required for the ledger fixture")
+        _ = git.write_text(
+            "#!/bin/sh\nif [ \"$*\" = \"-C " + str(self.repo) + " hash-object --stdin\" ]; then\n"
+            + "  echo 'pin hash unavailable' >&2; exit 17\nfi\nexec " + real_git + ' "$@"\n',
+        )
+        git.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")}):
+            result = self.cli("ticket", "add", "--id", "read-1", "--unit", "read", "--kind", "read",
+                              "--family", "names", "--crate", "crates/alpha", "--files", json.dumps([self.sources[0]]),
+                              "--rules", json.dumps([rule]), success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "style_ledger: pin hash unavailable")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.ledger().queued_tickets("read"), ())
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM rule_texts").fetchone(), (0,))
 
 
 if __name__ == "__main__":

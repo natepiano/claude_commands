@@ -143,6 +143,78 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             shutil.rmtree(directory)
 
 
+def runner_value(action: str, slug: str) -> str:
+    result = subprocess.run(
+        [str(PYTHON), str(SHOWRUNNERS), action, slug],
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    if result.returncode:
+        raise Refusal(result.stderr.strip() or f"showrunners.py {action} exited {result.returncode}")
+    return result.stdout.strip()
+
+
+def handoff_notice(slug: str, parent: str, checkpoint: str) -> None:
+    address = runner_value("address", parent)
+    if not address:
+        raise Refusal(f"no address for {parent}")
+    result = subprocess.run([
+        str(PYTHON), str(SEND), "--to", address, "--from", slug,
+        "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
+        "--timeout", "10",
+    ], capture_output=True, text=True, check=False, timeout=15)
+    if result.returncode:
+        raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+
+
+def replay_handoffs(ledger: style_ledger.Ledger, slug: str, parent: str) -> int:
+    failed = False
+    for row in ledger.pending_handoffs():
+        checkpoint = row["checkpoint"]
+        if not parent:
+            print(f"root: merge {checkpoint[:7]} with --root-self")
+            continue
+        try:
+            handoff_notice(slug, parent, checkpoint)
+        except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            print("style_sync: hand-off: " + " ".join(str(error).splitlines()))
+            failed = True
+            continue
+        if row["state"] == "pending":
+            ledger.handoff_send(checkpoint, parent)
+        elif row["sent_to"] != parent:
+            ledger.handoff_reroute(checkpoint, parent)
+    return int(failed)
+
+
+def resume(repo: Path, slug: str, branch_point: str, style_branch: str) -> int:
+    with style_ledger.open_ledger(repo) as ledger:
+        for change in ledger.reconcile(branch_point, style_branch):
+            print(change, flush=True)
+        return replay_handoffs(ledger, slug, runner_value("parent", slug))
+
+
+def send_handoff(repo: Path, slug: str, checkpoint: str) -> int:
+    with style_ledger.open_ledger(repo) as ledger:
+        checkpoint = git(repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
+        ledger.handoff_add(checkpoint)
+        parent = runner_value("parent", slug)
+        if not parent:
+            print(f"root: merge {checkpoint[:7]} with --root-self")
+            return 0
+        try:
+            handoff_notice(slug, parent, checkpoint)
+        except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            print("style_sync: hand-off: " + " ".join(str(error).splitlines()))
+            return 1
+        row = next((row for row in ledger.pending_handoffs() if row["checkpoint"] == checkpoint), None)
+        if row is not None:
+            if row["state"] == "pending":
+                ledger.handoff_send(checkpoint, parent)
+            elif row["sent_to"] != parent:
+                ledger.handoff_reroute(checkpoint, parent)
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -154,13 +226,26 @@ def main(argv: list[str] | None = None) -> int:
     _ = run_lint.add_argument("--repo", type=Path, required=True)
     _ = run_lint.add_argument("--checkout", type=Path, required=True)
     _ = run_lint.add_argument("--tip", required=True)
+    replay = commands.add_parser("resume")
+    handoff = commands.add_parser("send-handoff")
+    for command in (replay, handoff):
+        _ = command.add_argument("--repo", type=Path, required=True)
+        _ = command.add_argument("--slug", required=True)
+    _ = replay.add_argument("--branch-point", required=True)
+    _ = replay.add_argument("--style-branch", required=True)
+    _ = handoff.add_argument("--checkpoint", required=True)
     args = parser.parse_args(argv)
     if cast(str, args.command) == "notify":
         notify(cast(Path, args.repo_dir), cast(str, args.branch), cast(str, args.tip))
         return 0
     try:
+        if cast(str, args.command) == "resume":
+            return resume(cast(Path, args.repo), cast(str, args.slug),
+                          cast(str, args.branch_point), cast(str, args.style_branch))
+        if cast(str, args.command) == "send-handoff":
+            return send_handoff(cast(Path, args.repo), cast(str, args.slug), cast(str, args.checkpoint))
         return lint(cast(Path, args.repo), cast(Path, args.checkout), cast(str, args.tip))
-    except (Refusal, OSError, ValueError) as error:
+    except (Refusal, style_ledger.LedgerError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style_sync: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 2
 

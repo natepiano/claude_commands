@@ -196,10 +196,67 @@ remaining finding touches, rerun the gate and leave dropped cells stale.
 ## Merging back
 
 Merge each unit checkpoint into the style merge branch as soon as it arrives;
-that clears its berth protection. Then send the style branch checkpoint as a
-hand-off to the parent. Style work does not wait for a sync to go home.
-The child hand-off phase supplies the merge and acknowledgment contract;
-the ledger marks a hand-off merged only when the branch point contains it.
+that clears its berth protection. Use the ordinary
+`merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`
+with one `--also <path>` for each entry of the unit's open ticket's `files`
+(`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Its Owns is
+`none — takes what the board leaves free`; paths outside that ticket stay refused.
+
+After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
+and send the unit director
+`From the showrunner of <style slug>: ticket <id> merged; refill.`
+The ledger accepts only a checkpoint contained by its stored style merge branch.
+Then run
+`style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
+It adds the hand-off, sends
+`From the showrunner of <style slug>: hand-off <hash>` to the current parent's
+`showrunners.py address <parent>`, then records `handoff send`.
+Style work never waits for a sync to go home.
+
+The parent correctness-reviews the hand-off's diff against the branch point
+as for a unit checkpoint, then runs
+`merge_checkpoint.py --from-child <style slug> --checkpoint <hash> --production <parent doc> --started <time>`.
+The child must be attached, the checkpoint on its merge branch and descended
+from its last merged hand-off. The subject is
+`Merge <style slug> hand-off (<hash7>) into <branch point>`.
+After pushing, notifying sync and promoting, the attached receiver sends
+`From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
+On acknowledgment run
+`style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
+ancestry on the branch point is the evidence. The receiver decides delivery
+state once. A local merge missing from origin is pushed, notified and promoted
+before acknowledgment, without merging again. A checkpoint already on origin
+merges, pushes, notifies and promotes nothing: it prints
+`hand-off <hash7> already merged as <merge7>` and acknowledges again.
+A failed first push undoes the unpushed merge; no acknowledgment precedes a
+successful push. Hand-offs run the same package and Merge tests and test log
+as unit checkpoints.
+
+At startup, first run
+`style_sync.py resume --repo <checkout> --slug <style slug> --branch-point <branch point> --style-branch <style merge branch>`
+and append its reconcile change lines to **Log**. Reconcile stores the branch
+point before any acknowledgment and marks merged hand-offs by ancestry.
+Replay proceeds oldest first: pending notices are sent then recorded; sent
+notices are sent again; a notice sent to another parent is sent to the current
+parent then rerouted. Failed sends leave the row unchanged.
+`style_ledger.py handoff reroute --repo <checkout> --checkpoint <hash> --to <parent>`
+accepts only sent rows, preserving their checkpoint and creation time; the
+same parent is a no-op. `handoff send` still refuses a second parent.
+Reattaching runs this resume after updating Parent production and Proposals.
+
+While root, resume prints `root: merge <hash7> with --root-self` and sends nothing.
+Correctness-review and merge each own hand-off with
+`merge_checkpoint.py --from-child <own slug> --checkpoint <hash> --root-self --production <doc in Parent production> --started <time>`.
+No other production writes that branch then. The root receives no
+acknowledgment; the receiver prints
+`root: run style_ledger.py reconcile to mark <hash7> merged`.
+Run `reconcile` afterward: a root's unsent row stays pending until ancestry
+marks it merged.
+This also clears hand-offs a departing parent had not merged.
+
+On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
+nothing and send neither a hand-off nor a refill message: the unit refills
+itself. When `<n>` is positive, run proposal filing (Phase 14).
 
 ## Yielding
 

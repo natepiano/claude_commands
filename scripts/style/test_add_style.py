@@ -37,10 +37,15 @@ name = Path(sys.argv[0]).name
 with Path(os.environ["TEST_EVENTS"]).open("a") as events:
     events.write(json.dumps({"command": name, "arguments": arguments}) + "\\n")
 state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
-if name == "launch.py":
+if name == "style_sync.py":
+    raise SystemExit(0)
+elif name == "launch.py":
+    doc = Path(arguments[arguments.index("--production") + 1])
+    destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Parent production:**"))
+    with Path(os.environ["TEST_LAUNCH_DESTINATIONS"]).open("a") as destinations:
+        destinations.write(destination + "\\n")
     if os.environ.get("TEST_FAIL_LAUNCH") == "1":
         raise SystemExit(2)
-    doc = Path(arguments[arguments.index("--production") + 1])
     slug = doc.name.removesuffix("-production.md")
     if os.environ.get("TEST_OPEN_SESSION_EXIT"):
         (Path(os.environ["TEST_LIVE_SESSIONS"]) / slug).touch()
@@ -68,8 +73,16 @@ from unittest import mock
 sys.path.insert(0, str(Path(sys.argv[1]).parent))
 import add_style
 
-with mock.patch.object(add_style, "herdr_session_running", side_effect=lambda name:
-                       (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).exists()):
+real_run_script = add_style._run_script
+def run_script(script, *arguments):
+    if script.name == "style_sync.py":
+        script = Path(os.environ["TEST_STYLE_SYNC"])
+    return real_run_script(script, *arguments)
+
+with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.patch.object(
+    add_style, "herdr_session_running", side_effect=lambda name:
+    (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).exists()
+):
     raise SystemExit(add_style.main(sys.argv[2:]))
 '''
 
@@ -114,7 +127,7 @@ class AddStyleTests(unittest.TestCase):
             _ = (rule_root / "rust" / f"{family}.md").write_text(
                 f"---\ntier: C\nfamily: {family}\ninput_scope: file\n---\n# {family}\n",
             )
-        for name in ("launch.py", "showrunners.py"):
+        for name in ("launch.py", "showrunners.py", "style_sync.py"):
             _ = (self.root / name).write_text(STUB)
         (self.root / "live-sessions").mkdir()
         self.env = {
@@ -126,8 +139,10 @@ class AddStyleTests(unittest.TestCase):
             "ADD_STYLE_LAUNCHER": str(self.root / "launch.py"),
             "ADD_STYLE_SHOWRUNNERS": str(self.root / "showrunners.py"),
             "TEST_EVENTS": str(self.root / "events.jsonl"),
+            "TEST_LAUNCH_DESTINATIONS": str(self.root / "launch-destinations.txt"),
             "TEST_PARENT_SLUG": "parent",
             "TEST_LIVE_SESSIONS": str(self.root / "live-sessions"),
+            "TEST_STYLE_SYNC": str(self.root / "style_sync.py"),
         }
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
@@ -169,6 +184,12 @@ class AddStyleTests(unittest.TestCase):
     def calls(self) -> list[ScriptCall]:
         path = self.root / "events.jsonl"
         return [cast(ScriptCall, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def resume_call(self) -> ScriptCall:
+        return {"command": "style_sync.py", "arguments": [
+            "resume", "--repo", str(self.checkout), "--slug", "sample-style",
+            "--branch-point", "main", "--style-branch", "style/main",
+        ]}
 
     def sync(self) -> tuple[str, str, str]:
         with closing(sqlite3.connect(self.root / "ledger/sample/ledger.sqlite")) as connection:
@@ -259,9 +280,9 @@ class AddStyleTests(unittest.TestCase):
 
         self.assertEqual({path: (path.read_text(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual(self.sync(), sync)
-        self.assertEqual(self.calls(), calls)
+        self.assertEqual(self.calls(), [*calls, self.resume_call()])
 
-    def test_existing_production_reattaches_updates_destination_and_prints_every_handoff(self) -> None:
+    def test_existing_production_reattaches_updates_destination_and_runs_resume(self) -> None:
         _ = self.run_bootstrap()
         with style_ledger.open_ledger(self.checkout) as ledger:
             ledger.handoff_add(self.initial_tip)
@@ -276,15 +297,18 @@ class AddStyleTests(unittest.TestCase):
 
         result = self.run_bootstrap(parent=caller)
 
-        printed = [cast(dict[str, str], json.loads(line)) for line in result.stdout.splitlines()]
-        self.assertEqual({row["checkpoint"] for row in printed}, {self.initial_tip, second})
-        self.assertEqual({row["state"] for row in printed}, {"pending", "sent"})
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.calls()[-1], self.resume_call())
+        with style_ledger.open_ledger(self.checkout) as ledger:
+            self.assertEqual({row["checkpoint"]: row["state"] for row in ledger.pending_handoffs()},
+                             {self.initial_tip: "pending", second: "sent"})
         fields = self.doc.read_text().splitlines()
         self.assertEqual(production_field(fields, "Parent production"), str(caller))
         self.assertEqual(production_field(fields, "Proposals"), str(self.root / "next-issues"))
         self.assertEqual(self.calls()[1:], [
             {"command": "showrunners.py", "arguments": ["detach", "sample-style"]},
             {"command": "showrunners.py", "arguments": ["attach", "sample-style", "next"]},
+            self.resume_call(),
         ])
         self.assertEqual((self.root / "showrunners/sample-style/parent").read_text().strip(), "next")
         self.assertEqual(self.sync(), original_sync)
@@ -334,7 +358,7 @@ class AddStyleTests(unittest.TestCase):
             f"1. read {caller}; repository {self.repo}; Proposals {self.root / 'next-issues'}",
             "2. attach standing sample-style under next; branch point main",
             *(f"{number}. skipped: sample-style already exists" for number in range(3, 7)),
-            "7. update Parent production and Proposals, print pending hand-offs; synced tip unchanged",
+            "7. update Parent production and Proposals, run style_sync.py resume; synced tip unchanged",
         ])
         self.assertEqual({path: (path.read_text(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.git("show-ref"), self.git("worktree", "list", "--porcelain"), self.sync(), self.calls()),
@@ -369,7 +393,7 @@ class AddStyleTests(unittest.TestCase):
 
         self.assertEqual(self.calls(), [*calls, {
             "command": "showrunners.py", "arguments": ["attach", "sample-style", "parent"],
-        }])
+        }, self.resume_call()])
         self.assertEqual((self.root / "showrunners/sample-style/parent").read_text().strip(), "parent")
         self.assertEqual(self.sync(), sync)
 
@@ -461,3 +485,41 @@ class AddStyleTests(unittest.TestCase):
         self.assertEqual(len(tuple((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
         self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))
         self.assertEqual(len(self.calls()), 1)
+
+    def test_interrupted_bootstrap_rewrites_destination_for_the_next_parent_only(self) -> None:
+        self.env["TEST_FAIL_LAUNCH"] = "1"
+        failed = self.run_bootstrap(success=False)
+        self.assertEqual(failed.returncode, 2)
+        plans = {path: path.read_bytes() for path in (self.checkout / add_style.PLAN_DIRECTORY).glob("*.md")}
+        sync, excludes = self.sync(), (self.repo / ".git/info/exclude").read_bytes()
+        caller = self.parent_doc("next")
+        self.env["TEST_FAIL_LAUNCH"] = "0"
+        self.env["TEST_PARENT_SLUG"] = "next"
+        _ = self.run_bootstrap(parent=caller)
+        fields = self.doc.read_text().splitlines()
+        self.assertEqual(production_field(fields, "Parent production"), str(caller))
+        self.assertEqual(production_field(fields, "Proposals"), str(self.root / "next-issues"))
+        self.assertEqual({path: path.read_bytes() for path in plans}, plans)
+        self.assertEqual((self.sync(), (self.repo / ".git/info/exclude").read_bytes()), (sync, excludes))
+        launches = [call for call in self.calls() if call["command"] == "launch.py"]
+        self.assertEqual(len(launches), 2)
+        self.assertIn(str(self.doc), launches[-1]["arguments"])
+        destinations = (self.root / "launch-destinations.txt").read_text().splitlines()
+        self.assertEqual(len(destinations), 2)
+        self.assertEqual(production_field([destinations[0]], "Parent production"), str(self.parent))
+        self.assertEqual(production_field([destinations[1]], "Parent production"), str(caller))
+        self.assertNotIn(self.resume_call(), self.calls())
+
+    def test_check_interrupted_bootstrap_describes_destination_repair_without_writes(self) -> None:
+        self.env["TEST_FAIL_LAUNCH"] = "1"
+        self.assertEqual(self.run_bootstrap(success=False).returncode, 2)
+        caller = self.parent_doc("next")
+        paths = (self.doc, self.repo / ".git/info/exclude", *(self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        calls, sync = self.calls(), self.sync()
+        result = self.run_bootstrap("--check", parent=caller)
+        self.assertEqual(result.stdout.splitlines()[3],
+                         f"4. set Parent production and Proposals in existing production doc {self.doc}")
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+        self.assertEqual((self.calls(), self.sync()), (calls, sync))
+        self.assertEqual(production_field(self.doc.read_text().splitlines(), "Parent production"), str(self.parent))

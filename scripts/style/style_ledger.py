@@ -541,10 +541,13 @@ class Ledger:
             pins = {rule_id: definition.blob for rule_id, definition in definitions.items()}
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                hashed = subprocess.run(
+                result = subprocess.run(
                     ["git", "-C", str(self.repo), "hash-object", "--stdin"],
-                    input=text, capture_output=True, check=True,
-                ).stdout.decode().strip()
+                    input=text, capture_output=True, check=False,
+                )
+                if result.returncode:
+                    raise LedgerError(result.stderr.decode(errors="replace").strip() or "git hash-object failed")
+                hashed = result.stdout.decode().strip()
                 if hashed != pins[rule_id]:
                     raise LedgerError(f"{rule_id}: rule changed while pinning; rerun")
                 _ = self._connection.execute(
@@ -630,6 +633,16 @@ class Ledger:
         self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
 
     def ticket_merge(self, id: str) -> None:
+        ticket = self._ticket(id)
+        if ticket["state"] == "merged":
+            return
+        if ticket["state"] != "checkpointed":
+            raise LedgerError(f"{id}: cannot become merged from {ticket['state']}")
+        rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+        branch = rows[0][0] if rows else ""
+        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
+        if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
+            raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         self._ticket_transition(id, "merged")
 
     def ticket_drop(self, id: str) -> None:
@@ -662,6 +675,26 @@ class Ledger:
             if not to:
                 raise LedgerError("hand-off send requires --to")
             _ = self._connection.execute("UPDATE handoffs SET state='sent',sent_to=?,updated_at=? WHERE checkpoint=?", (to, _now(), checkpoint))
+
+    def handoff_reroute(self, checkpoint: str, to: str) -> None:
+        checkpoint = _git(self.repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
+        if not to:
+            raise LedgerError("hand-off reroute requires --to")
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            rows = cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT state,sent_to FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchall())
+            if not rows:
+                raise LedgerError(f"unknown hand-off {checkpoint}")
+            state, sent_to = rows[0]
+            if state != "sent":
+                hint = "; use handoff send" if state == "pending" else ""
+                raise LedgerError(f"{checkpoint}: cannot reroute hand-off in state {state}{hint}")
+            if sent_to != to:
+                _ = self._connection.execute(
+                    "UPDATE handoffs SET sent_to=?,updated_at=? WHERE checkpoint=?", (to, _now(), checkpoint),
+                )
 
     def _first_merge(self, checkpoint: str, branch_point: str) -> str:
         for commit in _git(self.repo, "rev-list", "--first-parent", "--reverse", "--merges", branch_point).splitlines():
@@ -1219,7 +1252,7 @@ def main() -> None:
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
         ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open")),
-        ("handoff", ("add", "send", "merged", "pending")),
+        ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "file", "waive", "list")),
     ):
@@ -1247,7 +1280,7 @@ def main() -> None:
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
-                if action == "send":
+                if action in ("send", "reroute"):
                     _ = command.add_argument("--to", required=True)
                 elif action == "merged":
                     _ = command.add_argument("--merge-commit", default="")
@@ -1312,6 +1345,8 @@ def main() -> None:
                     ledger.handoff_add(args.checkpoint)
                 elif args.action == "send":
                     ledger.handoff_send(args.checkpoint, args.to)
+                elif args.action == "reroute":
+                    ledger.handoff_reroute(args.checkpoint, args.to)
                 elif args.action == "merged":
                     ledger.handoff_merged(args.checkpoint, args.merge_commit)
                 else:

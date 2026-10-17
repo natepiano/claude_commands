@@ -1305,6 +1305,20 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.report()["next_run"], "00:30+1")
 
+    def test_newest_child_handoff_labels_the_merge_topic_without_a_unit_phase(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (aaaaaaa) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 shrink (bbbbbbb) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit alpha-unit to renamed-unit")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (ccccccc) into production")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        merge_topics = [topic for topic in topics if topic["title"] == "Merge branch"]
+        self.assertEqual(len(merge_topics), 1)
+        self.assertIn("last merge: alpha-unit style hand-off (ccccccc)", str(merge_topics[0]["update"]))
+        self.assertNotIn("alpha-unit phase", str(merge_topics[0]["update"]))
+        self.assertNotIn("renamed-unit", str(merge_topics[0]["update"]))
+
     def test_unpushed_merge_appears_as_merge_branch_topic_until_pushed(self) -> None:
         _ = self.git("checkout", "-b", "alpha")
         _ = (self.checkout / "alpha.txt").write_text("panel change\n", encoding="utf-8")

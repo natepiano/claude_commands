@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sqlite3
 import subprocess
@@ -221,6 +220,13 @@ def _attach(style: StyleProduction) -> None:
         if current_parent:
             _run_script(SHOWRUNNERS, "detach", style.slug)
         _run_script(SHOWRUNNERS, "attach", style.slug, style.parent.slug)
+    _update_destination(style)
+    _run_script(SCRIPTS / "style/style_sync.py", "resume", "--repo", str(style.checkout),
+                "--slug", style.slug, "--branch-point", style.branch_point,
+                "--style-branch", style.merge_branch)
+
+
+def _update_destination(style: StyleProduction) -> None:
     previous = style.doc.read_text()
     replacements = {"Parent production": str(style.parent.doc), "Proposals": style.proposals}
     lines = previous.splitlines()
@@ -235,9 +241,6 @@ def _attach(style: StyleProduction) -> None:
     updated = "\n".join(lines) + "\n"
     if updated != previous:
         _ = style.doc.write_text(updated)
-    with style_ledger.open_ledger(style.checkout) as ledger:
-        for handoff in ledger.pending_handoffs():
-            print(json.dumps(handoff, sort_keys=True))
 
 
 def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
@@ -246,13 +249,14 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
             f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
             f"attach standing {style.slug} under {style.parent.slug}; branch point {style.branch_point}",
             *((f"skipped: {style.slug} already exists",) * 4),
-            "update Parent production and Proposals, print pending hand-offs; synced tip unchanged",
+            "update Parent production and Proposals, run style_sync.py resume; synced tip unchanged",
         )
     return (
         f"read {style.parent.doc}; repository {style.repository}; Proposals {style.proposals}",
         f"find standing {style.slug} under {style.parent.slug}; branch point {style.branch_point}",
         f"ensure {style.merge_branch} from {style.branch_tip} and worktree {style.checkout}",
-        f"write missing production doc {style.doc}",
+        (f"set Parent production and Proposals in existing production doc {style.doc}"
+         if style.doc.exists() else f"write missing production doc {style.doc}"),
         f"write four missing standing plans under {style.checkout / PLAN_DIRECTORY}",
         f"exclude docs/style-production/, {style.doc.relative_to(style.checkout)} and {style.log} in shared info/exclude",
         f"initialize ledger at {style.branch_tip} with {style.merge_branch}; launch via add_showrunner.py",
@@ -290,6 +294,7 @@ def main(argv: list[str]) -> int:
                 raise Refusal(present.stderr.strip())
             _ = _git(style.repository, "worktree", "add", str(style.checkout), style.merge_branch)
         _write_missing(style.doc, _production_text(style))
+        _update_destination(style)
         for family in FAMILIES:
             _write_missing(style.checkout / PLAN_DIRECTORY / f"{family}-unit.md", _plan_text(style, family, catalog))
         _exclude(style)
@@ -297,10 +302,7 @@ def main(argv: list[str]) -> int:
             try:
                 _ = ledger.synced_at()
             except style_ledger.LedgerError:
-                tip = style.branch_tip
-            else:
-                tip = ledger.summary().synced_tip
-            ledger.set_tip(tip, style.merge_branch)
+                ledger.set_tip(style.branch_tip, style.merge_branch)
         result = subprocess.run([
             str(SCRIPTS / "lib/py"), str(LAUNCHER), "--production", str(style.doc),
             "--model", cast(str, args.model), "--effort", cast(str, args.effort),

@@ -23,7 +23,7 @@ from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, 
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
                             parse_style_summary, read_outstanding)
-from merge_checkpoint import NoMerge, git, merge_branch_history
+from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
 from update_registration import RegistrationFailure, UpdatesOnDemand, outstanding_file, update_schedule
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
@@ -1008,7 +1008,9 @@ def run(args: argparse.Namespace) -> int:
     merge = as_map(judgment.get("merge", {}), f"{judgment_path}.merge")
     held, testing = merge.get("held"), merge.get("testing")
     if held or testing or not pushed:
-        latest = "no checkpoint merged" if isinstance(last, NoMerge) else f"{last.unit} phase {last.phase} ({last.short})"
+        latest = ("no checkpoint merged" if isinstance(last, NoMerge) else
+                  f"{last.child} style hand-off ({last.short})" if isinstance(last, ChildHandoffEntry) else
+                  f"{last.unit} phase {last.phase} ({last.short})")
         details = [f"last merge: {latest}", "pushed" if pushed else "not pushed"]
         if held:
             details.append(f"held: {held}")
