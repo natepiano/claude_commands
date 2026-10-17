@@ -749,13 +749,19 @@ def launch_session(
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
     name = host_session_name(request)
     timeout_ms = int(request.timeout * 1000)
-    herdr.start_new_server(name, timeout_ms)
-    pane = herdr.open_pane(name, name, str(request.session_cwd), environment)
+    host = herdr.shared_session()
+    if host:
+        _ = herdr.start_server(host, timeout_ms)
+        pane = herdr.open_tab(host, request.production.slug, name, str(request.session_cwd), environment)
+    else:
+        host = name
+        herdr.start_new_server(host, timeout_ms)
+        pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
     try:
-        herdr.start_agent(name, pane, kind="claude", agent_arguments=arguments,
+        herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
                           opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
     except herdr.AgentExited:
-        herdr.stop_session(name)
+        herdr.close_agent(host, pane)
         raise
 
 
@@ -1033,14 +1039,15 @@ def main(argv: list[str]) -> int:
                     )
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
                     try:
-                        herdr.stop_session(unit.place.session)
+                        herdr.close_agent(unit.place.session, unit.place.pane)
                     except herdr.HerdrFailure as error:
                         raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
                     marked_unit = NoMarkedUnit()
             name = host_session_name(request)
             if isinstance(marked_unit, NoMarkedUnit):
                 try:
-                    running = any(entry["name"] == name for entry in herdr.live_sessions())
+                    running = not herdr.shared_session() and any(
+                        entry["name"] == name for entry in herdr.live_sessions())
                 except herdr.HerdrFailure as error:
                     raise Refusal(str(error)) from error
                 if running:
