@@ -236,27 +236,16 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ### Phase 10 — Unit view fits, and no doubled stage  · status: done
 
-**Goal:** These are the five small defects from the live check of phase 9 (captures `/tmp/claude/ub9-live-trunk.txt`, `/tmp/claude/ub9-live-unit.txt`). The board opens as a side pane about 76 columns wide at a 170x50 terminal, and every fix must hold at that width.
+#### As-built
 
-1. **No doubled stage.**
-   - On the board, a unit with no phase running shows its stage once, in the header.
-   - The line under it then shows only the strip, and is not drawn when the strip is empty. Today it reads `● mul_add  Waiting on G3` and then `Waiting on G3  ███████▒`.
-2. **Worker slots are short.**
-   - `board_json.workers` gives a roster entry named with the full mesh name (`claude-build-followups-style-impl`) its slot, with the worktree's mesh prefix removed (`impl`).
-   - Two entries that become the same slot merge into one row, the newer state winning.
-3. **Step rows keep their columns.**
-   - In the unit view's `This phase`, each step label is cut with `fitText` to its column, so at least two spaces stay before the time.
-   - A step row never wraps.
-4. **The unit view fits the pane.**
-   - `UnitView` takes `bodyRows` the way `BoardView` does.
-   - When the content passes the pane, the phase record keeps the open row and the newest rows.
-   - Older done rows fold into one line, `+N earlier: 1–7` (ids in record order).
-   - Todo rows beyond the next three fold into `+N later`.
-   - `This phase` keeps its newest steps and folds older ones into `+N earlier steps`.
-   - Nothing is drawn past `bodyRows`.
-5. **Long overdue reads in hours.**
-   - `overdueText` reads `overdue 50m` under an hour, `overdue 5h 20m` from an hour, and `overdue 2d 3h` from a day.
-
-**Files:** `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`, `mods/unit-board/hooks/geometry.ts`, `mods/unit-board/hooks/register.tsx`, `scripts/delegate/board_json.py`. Tests: `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/geometry.test.ts`, `scripts/delegate/test_board_json.py`.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, basedpyright 0/0, the full merge gate. After promotion, a live capture of both panes at 170x50.
+- Board: a unit with no phase running shows its stage once, in its header. The line under it is the strip alone, drawn only when the strip has cells.
+- `board_json.workers(session, sources, mesh_prefix)`:
+  - Slots drop the worktree's mesh prefix, also learned from `impl_worker_*.json` names.
+  - Roster entries that become one slot merge into the entry that slot's `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters and are never compared.
+- `geometry.ts`:
+  - `fitText` collapses whitespace runs, newlines included, to one space before fitting.
+  - `overdueText` reads `Nm`, `Nh Mm` or `Nd Mh`.
+- `UnitView(elements, columns, bodyRows, …)` keeps within `bodyRows`:
+  - The phase record keeps the open row and the newest rows. Older done rows fold into `+N earlier: <ids>`, and todo rows past the next three fold into `+N later`.
+  - `This phase` keeps its newest steps and folds the rest into `+N earlier steps`.
+  - Step labels are fitted to their column on one row.
