@@ -400,6 +400,15 @@ Pending: parent's saved style child summary and rendered style line.
   the parameter the converted value fills. Tickets without that rule are
   unchanged.
 
+- **Fix Q — a file opens to other families once its own structure cells
+  are judged** (commit `0710fb55`): a pending structure cell closed its
+  whole crate to the names and types units, so they waited on the modules
+  unit's slowest file. Now only the files with a pending structure cell
+  stay closed, and a pending crate-wide structure cell still closes the
+  crate. The other families refill from the crate's open files, and wait
+  for structure only when every cell they have left is on a closed file.
+  The modules unit's own selection is unchanged.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`.
