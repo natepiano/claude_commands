@@ -56,13 +56,20 @@ def open_project(line: str) -> bool:
     return status.startswith("proposed") or (status.startswith("accepted") and SETTLED.search(status) is None)
 
 
-def projects(doc: Path) -> int:
+def ledger(doc: Path) -> Path | None:
+    """The ledger the doc's Improvement queue line names, or None when it names none."""
     try:
-        ledger = Path(production_field(doc.read_text(encoding="utf-8").splitlines(), IMPROVEMENT_QUEUE_FIELD))
+        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), IMPROVEMENT_QUEUE_FIELD)).expanduser()
     except Refusal:
+        return None
+
+
+def projects(doc: Path) -> int:
+    path = ledger(doc)
+    if path is None:
         return 0
     try:
-        lines = ledger.expanduser().read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return 0
     return sum(open_project(line) for line in lines)
@@ -74,6 +81,30 @@ def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
         return FooterCounts(changes(doc), proposals(doc), projects(doc), questions)
     except OSError:
         return FooterCounts(questions=questions)
+
+
+def sources(doc: Path) -> list[Path]:
+    """The files the counts read, so a copy of them can tell when it is out of date.
+
+    A proposal closes in place, so each open one is named beside its folder, which a new one
+    changes.
+    """
+    try:
+        listed = change_review.list_path(doc)
+    except (change_review.ChangeReviewError, OSError):
+        listed = None
+    folder = proposals_folder.issues_folder(doc)
+    try:
+        queue = ledger(doc)
+    except OSError:
+        queue = None
+    found = [doc, *(path for path in (listed, folder, queue) if path is not None)]
+    if folder is not None:
+        try:
+            found.extend(issue.path for issue in issues.open_issues(folder, proposals_folder.PROPOSAL_TAG))
+        except OSError:
+            pass
+    return found
 
 
 def plural(count: int, word: str) -> str:

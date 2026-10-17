@@ -30,7 +30,6 @@ AGENT_LINE = "* claude1: week's usage unknown; refill time unknown; resets unkno
 WAITING_BLOCK = "\n\n\nWaiting on:\n\n* no ETA measured - x"
 ONE_OPEN = "There is 1 open question for you."
 TWO_OPEN = "There are 2 open questions for you."
-QUOTA_LINE = "quota: codex at 12% for the week, resets Tue 14:00"
 
 
 # The counts line a footers-off reply ends with while one question is open.
@@ -353,7 +352,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertEqual(saved["items"][1]["kind"], "review unavailable")
         self.assertNotIn("reviewed", saved["items"][1])
 
-    def test_pending_questions_block_with_footers_off_until_the_whole_reply_contains_both(self) -> None:
+    def test_each_pending_question_is_needed_with_footers_off_until_one_reply_carries_it(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
         first = showrunner_footer.PendingReviewedQuestion("merge", "Merge now (recommended), or wait?")
         second = showrunner_footer.PendingReviewUnavailableQuestion(
@@ -361,9 +360,9 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         showrunner_footer.add_pending_reviewed(self.instance, [first])
         showrunner_footer.add_pending_reviewed(self.instance, [second])
         self.assertIn("merge", self.reason("Done."))
-        self.assertIn("path", self.reason(first.reviewed))
-        self.assertTrue(showrunner_footer.pending_reviewed_path(self.instance).exists())
-        self.assert_passes(self.run_hook("Merge now  (recommended),\n or wait?\n" + second.question))
+        self.assertIn("path", self.reason("Merge now  (recommended),\n or wait?"))
+        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [second])
+        self.assert_passes(self.run_hook(second.question))
         self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
         self.assert_passes(self.run_hook("Later reply with no repeated questions."))
 
@@ -379,14 +378,13 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assert_passes(self.run_hook(item.reviewed, session_id="replacement", stop_hook_active=True))
         self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
 
-    def test_unrelated_footer_rejection_preserves_pending_text_until_a_valid_reply(self) -> None:
+    def test_a_footer_rejection_after_the_question_was_shown_never_asks_for_it_again(self) -> None:
         item = showrunner_footer.PendingReviewedQuestion("path", "Which path should we use?")
         showrunner_footer.add_pending_reviewed(self.instance, [item])
         self.assertIn("footer", self.reason(item.reviewed))
-        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [item])
-        self.assertIn("path", self.reason("A later turn.\n" + self.footer() + WAITING_BLOCK))
-        self.assert_passes(self.run_hook(item.reviewed + "\n" + self.footer() + WAITING_BLOCK))
         self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+        self.assert_passes(self.run_hook("A later turn.\n" + self.footer() + WAITING_BLOCK, stop_hook_active=True))
+        self.assert_passes(self.run_hook("-", transcript_path=self.transcript(tick())))
 
     def test_unregistered_choices_are_blocked_but_code_and_quotes_are_not(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -471,18 +469,16 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = self.outstanding.write_text(json.dumps([stranger]))
         self.assert_passes(self.run_hook(question + ONE_QUESTION))
 
-    def test_new_ask_preserves_pending_text_until_the_entire_reply_is_registered(self) -> None:
+    def test_a_new_ask_beside_a_shown_question_is_registered_without_repeating_the_question(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
         pending = showrunner_footer.PendingReviewedQuestion("route", "Which path should we use?")
         showrunner_footer.add_pending_reviewed(self.instance, [pending])
         request = "Say go and I'll run the diagnostic."
-        reply = pending.reviewed + "\n" + request
-        self.assertIn(request, self.reason(reply, stop_hook_active=True))
-        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [pending])
+        self.assertIn(request, self.reason(pending.reviewed + "\n" + request, stop_hook_active=True))
+        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
         item: OutstandingUserQuestion = {"since": "2026-10-16T08:00", "text": "diagnostics", "question": request}
         _ = self.outstanding.write_text(json.dumps([item]))
-        self.assert_passes(self.run_hook(reply, stop_hook_active=True))
-        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+        self.assert_passes(self.run_hook(request, stop_hook_active=True))
 
     def test_relayed_peer_question_and_attributed_unit_choice_pass_unregistered(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -514,15 +510,17 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertEqual(self.run_switch("off").returncode, 0)
         question = "Run now (recommended), or wait?"
         item = showrunner_footer.PendingReviewedQuestion("run", question)
+        # Registration stores the question in OUTSTANDING beside the pending copy the hook checks.
+        _ = self.outstanding.write_text(json.dumps([{
+            "since": "2026-10-06T08:00", "text": "run", "question": question, "reviewed": question}]))
         for marker in ("-", "*", "+", "1.", "1)"):
             with self.subTest(marker=marker):
                 showrunner_footer.add_pending_reviewed(self.instance, [item])
                 reply = f"{marker} Run  now (recommended), or wait?"
                 self.assertIn("record the item", self.reason(
                     reply + f"\n{marker} Delete the work (recommended), or keep it?"))
-                self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [item])
-                self.assert_passes(self.run_hook(reply))
                 self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+                self.assert_passes(self.run_hook(reply + ONE_QUESTION))
 
     def test_recorded_list_choices_can_be_recalled_without_their_markers(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -781,7 +779,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
         tomorrow = (datetime.now(ZoneInfo(ZONE)) + timedelta(days=1)).strftime("%a")
         valid = [
-            "* " + QUOTA_LINE, "* 19:45 (18:20–23:55) - startup Phase 16",
+            "* 19:45 (18:20–23:55) - startup Phase 16",
             "* 23:30 - later", "* 00:15+1 - overnight",
             f"* {tomorrow} 09:00 - tomorrow", "* no ETA measured - awaiting estimate",
         ]
@@ -793,7 +791,6 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             (["* startup 19:45 (18:20–23:55)"], "ETA"),
             (["* 19:45 PDT - startup"], "zone"),
             (["* 21:00 - later", "* 19:45 - earlier"], "order"),
-            (["* 19:45 - startup", "* " + QUOTA_LINE], "order"),
             (["* no ETA measured - one", "* 19:45 - two"], "order"),
             (["* 23:30 - today", "* 00:15 - earlier today"], "order"),
         ]
@@ -817,7 +814,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         merge = {"since": "2026-10-06T09:00", "text": "merge the branch today?"}
         footer = self.write_open(path)
         self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN)))
-        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN, QUOTA_LINE, "19:45 - startup Phase 16")))
+        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN, "19:45 - startup Phase 16")))
         footer = self.write_open(path, merge)
         self.assert_passes(self.run_hook(self.waiting(footer, TWO_OPEN, "no ETA measured - startup")))
         refused = [
@@ -826,7 +823,6 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             ("the wrong count", ["There are 3 open questions for you."]),
             ("the count for one", [ONE_OPEN]),
             ("the count twice", [TWO_OPEN, TWO_OPEN]),
-            ("the count after a quota line", [QUOTA_LINE, TWO_OPEN]),
             ("no count", ["19:45 - startup Phase 16"]),
         ]
         for name, bullets in refused:
@@ -847,12 +843,11 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
 
     def test_with_nothing_open_the_block_takes_no_line_for_the_user(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
-        self.assert_passes(self.run_hook(self.waiting(footer, QUOTA_LINE, "no ETA measured - startup")))
+        self.assert_passes(self.run_hook(self.waiting(footer, "no ETA measured - startup")))
         for bullet in (ONE_OPEN, "you: choose the path"):
             with self.subTest(bullet=bullet):
                 reason = self.reason(self.waiting(footer, bullet, "no ETA measured - startup"))
                 self.assertIn(f"remove `* {bullet}`", reason)
-                self.assertIn("begins `quota: `", reason)
 
     def test_missing_footer_reason_shows_the_count_line(self) -> None:
         reason = self.assert_blocked_with_current_footer("Done.")
@@ -946,8 +941,14 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn(f"`{showrunner_footer.count_sentence(1)}`", produce)
         self.assertIn("`There are {n} open questions for you.`", produce)
         self.assertEqual(showrunner_footer.count_sentence(7), "There are 7 open questions for you.")
-        self.assertIn(f"led by `{showrunner_footer.QUOTA_LEAD}`", produce)
+        self.assertNotIn("led by `quota: `", produce)
         self.assertNotIn("The user's items come first", produce)
+
+    def test_old_quota_hold_bullet_has_no_footer_exemption(self) -> None:
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        bullet = "quota: Codex usage is exhausted"
+        reason = self.reason(self.waiting(footer, bullet))
+        self.assertIn(f"remove `* {bullet}`", reason)
 
     def test_no_eta_items_and_malformed_leading_eta_cannot_hide_times(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))

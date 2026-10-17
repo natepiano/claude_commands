@@ -1171,6 +1171,19 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    def test_a_repair_pass_leaves_the_impl_worker_followable(self) -> None:
+        session_dir = self.start_phase("repair-keeps-impl")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        impl = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
+        repair = self.mesh_launch(session_dir, kind="fix")
+        self.assertEqual(repair.returncode, 0, repair.stderr)
+        self.assertEqual(json.loads((session_dir / "impl_worker_impl.json").read_text()), impl)
+        fix = cast("dict[str, object]", json.loads((session_dir / "impl_worker_fix.json").read_text()))
+        self.assertTrue(str(fix["name"]).endswith("-fix"))
+        result = self.mesh_launch(session_dir, to=str(impl["name"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_follow_up_reads_an_old_identity_and_leaves_only_worker_names(self) -> None:
         session_dir = self.start_phase("old-run-follow")
         first = self.mesh_launch(session_dir)

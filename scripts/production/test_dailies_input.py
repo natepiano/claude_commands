@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import dailies_input
+import fake_unit_host
 import dailies_render
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import os
@@ -158,7 +159,7 @@ class DailiesInputTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
         self.origin = self.root / "origin.git"
@@ -200,9 +201,7 @@ class DailiesInputTests(unittest.TestCase):
                     "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
-                    # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
-                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.sh")),
-                    "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
+                    **fake_unit_host.environment(self.root),
                     "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
         (self.root / "sessions").mkdir()
         self.production_doc()

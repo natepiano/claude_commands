@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
+import fake_showrunner
+import fake_unit_host
+
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
 
@@ -72,10 +75,9 @@ class UnitRenameTests(unittest.TestCase):
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
-            "UNIT_LOOKUP_TMUX": str(SCRIPT.with_name("fake_tmux.py")),
-            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "PLAN_DELEGATE_SYNC_WRITES": "0",
@@ -364,6 +366,55 @@ class UnitRenameTests(unittest.TestCase):
             with self.subTest(old=old, new=new):
                 self.assert_refused(self.rename("apply", old, new), text)
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
+
+    def mark_live(self, unit: str, session_id: str) -> None:
+        """A live Claude in a herdr session marked as `unit` of this production."""
+        held = fake_showrunner.write_session(self.root / "state/sessions", unit.removesuffix("-unit"), session_id)
+        self.addCleanup(held.close)
+        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
+            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit})])
+        fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
+
+    def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
+        log = self.seed_record()
+        (self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json").unlink()
+        self.mark_live("alpha-unit", "sid-alpha")
+        planned = self.rename("plan")
+        self.assert_ok(planned)
+        self.assertIn("1. stop alpha-unit through the shutdown path", planned.stdout)
+        applied = self.rename("apply")
+        self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
+        self.assertIn("alpha-unit is stopping; rerun apply once it has stopped", applied.stderr)
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["down", "--only", "sid-alpha", "--here"]])
+        self.assertEqual(self.journal()["step"], 0)
+
+    def test_a_running_new_id_is_refused(self) -> None:
+        self.mark_live("gamma-unit", "sid-gamma")
+        self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
+
+    def test_an_older_run_keeps_the_old_path_as_history(self) -> None:
+        old = self.rust / "claude-demo-alpha"
+        older = self.root / "history/runs/run-0.jsonl"
+        self.write(older, json.dumps({"event_type": "run_started", "run_started_at": 0, "working_dir": str(old)})
+                   + "\n" + json.dumps({"event_type": "run_finished"}) + "\n")
+        self.assert_ok(self.rename("apply"))
+        self.assertIn(str(old), older.read_text())
+        newest = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
+        self.assertEqual(newest["working_dir"], str(self.rust / "claude-demo-gamma"))
+        self.assert_ok(self.rename("verify"))
+
+    def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
+        for name in ("demo-log.md", "demo-log-recovered.md"):
+            self.write(self.checkout / "docs/plans" / name, "alpha-unit merged phase 2\n")
+        self.write(self.doc, self.doc.read_text() + "a tracked edit\n")
+        self.assert_refused(self.rename("apply"), "showrunner checkout must be clean")
+        _ = self.git("checkout", "--", str(self.doc))
+        self.assert_ok(self.rename("apply"))
+        self.assertEqual(self.git("ls-files", "--others", "--exclude-standard").split(),
+                         ["docs/plans/demo-log-recovered.md", "docs/plans/demo-log.md"])
+        self.assertNotIn("demo-log", self.git("show", "--name-only", "--format=", "HEAD"))
+        self.assertEqual((self.checkout / "docs/plans/demo-log.md").read_text(), "alpha-unit merged phase 2\n")
 
     def test_refuses_an_unmerged_checkpoint(self) -> None:
         worktree = self.rust / "claude-demo-alpha"

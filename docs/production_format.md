@@ -141,7 +141,7 @@ one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr or tmux session carries the production's
+a session at any time. The unit's herdr session carries the production's
 slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
@@ -431,7 +431,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     positional arguments. The unit's reviewer is permanent: each review
     resumes its thread, and the pool forks a second one only while two reviews
     run at once. `<slug>` is the production doc's file name without
-    `-production.md`.
+    `-production.md`. Until `review-unit` primes the pool, the launcher
+    refuses with `no primed code template`: send that review to an idle
+    worker with `--to`, and tell the showrunner once.
 
 17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
     through `/issue` with tag `proposal`, `proposed_by` your unit's name, and

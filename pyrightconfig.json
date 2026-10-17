@@ -222,6 +222,19 @@
       ]
     },
     {
+      "root": "scripts/statusline",
+      "extraPaths": [
+        ".",
+        "scripts/statusline",
+        "scripts/hooks",
+        "scripts/delegate",
+        "scripts/message",
+        "scripts/notify",
+        "scripts/production",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "."
     }
   ]

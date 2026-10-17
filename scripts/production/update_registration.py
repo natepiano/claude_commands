@@ -18,14 +18,14 @@ from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
     from ..hooks.showrunner_footer import (FooterState, footer_state, set_footer_state,
-        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
-        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
+        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
+        read_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
         NoDailiesSchedule, Production as FooterProduction)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import (FooterState, footer_state, set_footer_state,
-        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
-        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
+        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
+        read_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
         NoDailiesSchedule, Production as FooterProduction)
 import showrunners
 from dailies_render import (UNREADABLE_LIST, InputError, footer_main, read_outstanding,
@@ -215,10 +215,9 @@ def register(production: Production) -> None:
     if new_production:
         set_footer_state(production.slug, FooterState.OFF)
         report("footer", "ok", "off — new production; /showrunner:footer on turns it on")
-    for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
-        if isinstance(instance(name), InstanceAbsent):
-            run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
-            _ = notifier(["new", name, "--every", "1", "--run", run])
+    if isinstance(instance("stall-watch"), InstanceAbsent):
+        run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
+        _ = notifier(["new", "stall-watch", "--every", "1", "--run", run])
     if isinstance(schedule, UpdatesOnDemand):
         report("register", "ok", f"{updates} on demand: no scheduled dailies")
         return
@@ -538,8 +537,7 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             existing_pending = read_pending_reviewed(instance_dir)
             retained_pending = [item for item in existing_pending if item.text in items_by_text]
             if retained_pending != existing_pending or pending:
-                delete_pending_reviewed(instance_dir)
-                add_pending_reviewed(instance_dir, retained_pending + pending)
+                write_pending_reviewed(instance_dir, retained_pending + pending)
         record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
         for item in pending:

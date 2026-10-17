@@ -19,13 +19,12 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase, linux_process_fixture
-from test_restart import entry, pane_display, top_level
+from test_restart import entry, top_level
 import record
 import inventory
 import conversation_pause
 import unit_runs
 import account
-import fake_tmux
 import herdr
 import sessions
 import showrunners
@@ -33,7 +32,6 @@ import unit_lookup
 import restart
 import shutdown
 import stop
-from fake_tmux import FakeSession
 from fake_herdr import CommandResponse, herdr_listener
 
 
@@ -53,7 +51,6 @@ UNKNOWN_PID = 41_006
 DIRECTOR_SHELL_PID = 51_001
 DESKTOP_SHELL_PID = 51_004
 CURRENT_PROCESS_START = "current-process-start"
-FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
 class TranscriptReadCounter(io.BufferedReader):
@@ -362,7 +359,6 @@ class InventoryTests(ShutdownTestCase):
         self.checkout = Path()
         self.origin = Path()
         self.bin = Path()
-        self.tmux_state = Path()
         self.proc = Path()
         self.herdr_log = Path()
         self.target_config = Path()
@@ -385,7 +381,6 @@ class InventoryTests(ShutdownTestCase):
         self.checkout = self.root / "checkout"
         self.origin = self.root / "origin.git"
         self.bin = self.root / "bin"
-        self.tmux_state = self.root / "tmux.json"
         self.proc = self.root / "proc"
         self.herdr_log = self.root / "herdr.jsonl"
         responses = self.root / "herdr-responses.json"
@@ -415,8 +410,6 @@ class InventoryTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.history),
             "SHUTDOWN_DELEGATE_ROOT": str(self.delegate),
-            "UNIT_LOOKUP_TMUX": str(FAKE_TMUX),
-            "FAKE_TMUX_STATE": str(self.tmux_state),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
             "HERDR_PROC": str(self.proc),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
@@ -501,12 +494,13 @@ class InventoryTests(ShutdownTestCase):
 
     def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
         process = self.proc / str(pid)
-        process.mkdir()
+        process.mkdir(exist_ok=True)
         _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
         _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         _ = (process / "environ").write_bytes(
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
         )
+        (process / "cwd").unlink(missing_ok=True)
         (process / "cwd").symlink_to(self.checkout)
         if arguments and Path(arguments[0]).name == "herdr" and arguments[-1] == "server":
             name = arguments[arguments.index("--session") + 1] if "--session" in arguments else "default"
@@ -699,19 +693,12 @@ elif "comm=" in joined:
         other_timer.mkdir()
         _ = (other_timer / "conf").write_text(f"TARGET=session:{OTHER_ID}\n", encoding="utf-8")
 
-        fake_tmux.write(
-            self.tmux_state,
-            {
-                "$1": FakeSession(
-                    label="unit-renamed",
-                    panes=["%4"],
-                    env={
-                        "SHOWRUNNER_UNIT": "build-followups",
-                        "SHOWRUNNER_UNIT_ID": "shutdown-unit",
-                    },
-                )
-            },
-        )
+        self.herdr_sessions(["unit-renamed"])
+        self.herdr_process(72_001, 1, ["/fixture/herdr", "--session", "unit-renamed", "server"], {})
+        self.herdr_process(UNIT_PID, 72_001, ["/bin/claude"], {
+            "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
+            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+        })
         for name, started_at, plan in (
             ("newer", 20, "docs/shutdown-plan.md"),
             ("older", 10, "docs/old-plan.md"),
@@ -850,7 +837,7 @@ elif "comm=" in joined:
                 "doc": str(self.root / "build-followups-production.md"),
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
                 "session_name": "unit-renamed",
-                "session_host": "tmux",
+                "session_host": "herdr",
             },
         )
         self.assertEqual(
@@ -898,21 +885,7 @@ elif "comm=" in joined:
             {"kind": "named", "name": "Production"},
         )
 
-    def test_unit_host_carries_live_tmux_session_name(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
 
-        self.assertEqual(unit["host"].get("session_name"), "unit-renamed")
-        self.assertEqual(unit["host"].get("session_host"), "tmux")
-        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit")  # pyright: ignore[reportPrivateUsage]
-
-    def test_empty_herdr_unit_name_does_not_fall_back_to_a_tmux_record(self) -> None:
-        session = inventory.SessionFile(sessionId="unit", tmux="unrelated:0.0")
-        for host in ("tmux", "herdr"):
-            marks = inventory.UnitMarks(production="build", unit="one", doc="/tmp/build.md",
-                                        session_name="", session_host=host)
-            recorded = inventory._host(session, marks, {}, {})  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(recorded.get("session_name"), "unrelated" if host == "tmux" else "")
 
     def test_herdr_host_comes_from_the_process_server_ancestor(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
@@ -957,7 +930,6 @@ elif "comm=" in joined:
 
     def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
         self.herdr_sessions(["unit-herdr"])
-        fake_tmux.write(self.tmux_state, {})
         path = self.records / f"{UNIT_PID}.json"
         record = cast(dict[str, object], json.loads(path.read_text()))
         record["tmux"] = ""
@@ -981,145 +953,23 @@ elif "comm=" in joined:
             item for item in inventory.inventory(TARGET_LOGIN)["sessions"] if item["session_id"] == DESKTOP_ID
         ))
         session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")
-        with patch.object(stop, "_stop_unit_tmux") as tmux_cleanup, patch.object(stop, "_close_ghostty_window"):
+        with patch.object(stop, "_stop_unit_session") as cleanup, patch.object(stop, "_close_ghostty_window"):
             issues = stop._stop_owner_resources(  # pyright: ignore[reportPrivateUsage]
                 session, kill=lambda _pid, _signal: self.fail("unexpected kill"), is_alive=lambda _pid: False,
                 codex_mesh=lambda _argv: self.fail("unexpected Codex stop"),
-                tmux=lambda _argv: self.fail("unexpected tmux call"), clock=datetime.now,
+                clock=datetime.now,
                 claim=stop.StopClaim(TARGET_LOGIN, DESKTOP_ID, "fixture", "fixture"),
             )
         self.assertEqual(issues, [])
-        tmux_cleanup.assert_not_called()
+        cleanup.assert_not_called()
 
-    def test_tmux_host_takes_precedence_over_inherited_herdr_environment(self) -> None:
+    def test_user_tmux_is_unknown_despite_inherited_herdr_environment(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9"}), patch(
-            "inventory._tmux_session", return_value=(
-                "inner", inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
-                inventory.TmuxServerNotRecorded(kind="not recorded"), inventory.PaneNotRecorded(kind="not recorded"),
-            ),
-        ):
+        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
             found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"]["kind"], "tmux")
-        self.assertEqual(desktop["host"].get("tmux_session"), "inner")
-
-    def test_tmux_hosts_record_the_pane_or_an_explicit_absence(self) -> None:
-        def process_environment(pid: int) -> dict[str, str]:
-            if pid == self.director_pid:
-                return {"TMUX_PANE": "%8"}
-            if pid == DESKTOP_PID:
-                return {"TMUX_PANE": "%9"}
-            return {}
-
-        def tmux_details(
-            pane: str,
-        ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded, inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
-            if pane == "%8":
-                return "production work", inventory.TmuxSessionId(kind="session id", session_id="$8"), inventory.TmuxServer(kind="server", pid=34500, started_at=1700000000), {
-                    "kind": "pane",
-                    "pane_id": "%8",
-                    "pane_pid": 62_008,
-                }
-            if pane == "%9":
-                return "writing", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
-            return "", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
-
-        with (
-            patch("inventory._process_environment", side_effect=process_environment),
-            patch("inventory._tmux_session", side_effect=tmux_details),
-        ):
-            found = inventory.inventory(TARGET_LOGIN)
-
-        by_id = {session["session_id"]: session for session in found["sessions"]}
-        self.assertEqual(
-            by_id[DIRECTOR_ID]["host"],
-            {
-                "kind": "tmux",
-                "tmux_session": "production work",
-                "session_ref": {"kind": "session id", "session_id": "$8"},
-                "server": {"kind": "server", "pid": 34500, "started_at": 1700000000},
-                "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
-            },
-        )
-        self.assertEqual(
-            by_id[DESKTOP_ID]["host"],
-            {
-                "kind": "tmux",
-                "tmux_session": "writing",
-                "session_ref": {"kind": "not recorded"},
-                "server": {"kind": "not recorded"},
-                "pane": {"kind": "not recorded"},
-            },
-        )
-
-    def discover_tmux(
-        self, name: str, session_id: str, pid: str, started_at: str = "1700000000",
-        *, include_start: bool = True, server_pid: str = "34500", include_pid: bool = True,
-    ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded,
-               inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
-        calls: list[tuple[str, ...]] = []
-        def probe(argv: tuple[str, ...], *, capture_output: bool, text: bool, timeout: int, check: bool) -> subprocess.CompletedProcess[str]:
-            del capture_output, text, timeout, check
-            calls.append(argv)
-            self.assertEqual(argv[:5], ("/test/tmux", "display", "-p", "-t", "%8"))
-            self.assertCountEqual(argv[-1].split("\t"), ["#{session_name}", "#{session_id}", "#{pane_pid}", "#{start_time}", "#{pid}"])
-            format_text = argv[-1]
-            if not include_start:
-                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{start_time}")
-            if not include_pid:
-                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{pid}")
-            return subprocess.CompletedProcess(argv, 0,
-                pane_display(format_text, name, session_id, pid, "", started_at, server_pid), "")
-        with patch.object(unit_lookup, "installed_tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
-            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(len(calls), 1)
-        return found
-
-    def test_tmux_host_observation_never_builds_when_its_binary_is_gone(self) -> None:
-        with (patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
-              patch.object(shutil, "which", return_value=None),
-              patch.object(subprocess, "run", side_effect=FileNotFoundError("no executable")) as run):
-            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(found, ("", {"kind": "not recorded"}, {"kind": "not recorded"}, {"kind": "not recorded"}))
-        run.assert_not_called()
-
-    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
-        self.assertEqual(self.discover_tmux("production work", "$8", "62008"),
-            ("production work", {"kind": "session id", "session_id": "$8"},
-             {"kind": "server", "pid": 34500, "started_at": 1700000000},
-             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
-
-    def test_tmux_discovery_preserves_spaces_in_session_name(self) -> None:
-        self.assertEqual(self.discover_tmux(" work ", "$8", "62008"),
-            (" work ", {"kind": "session id", "session_id": "$8"},
-             {"kind": "server", "pid": 34500, "started_at": 1700000000},
-             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
-
-    def test_tmux_discovery_keeps_session_when_pane_pid_is_unusable(self) -> None:
-        self.assertEqual(self.discover_tmux("writing", "$9", "not-a-pid"),
-            ("writing", {"kind": "session id", "session_id": "$9"},
-             {"kind": "server", "pid": 34500, "started_at": 1700000000}, {"kind": "not recorded"}))
-
-    def test_tmux_discovery_records_missing_session_id_without_losing_pane(self) -> None:
-        self.assertEqual(self.discover_tmux("writing", "", "62009"),
-            ("writing", {"kind": "not recorded"}, {"kind": "server", "pid": 34500, "started_at": 1700000000},
-             {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
-
-    def test_tmux_discovery_records_missing_or_invalid_server_without_losing_ids(self) -> None:
-        for started_at, include_start in (("1700000000", False), ("", True), ("not-an-integer", True)):
-            with self.subTest(started_at=started_at, include_start=include_start):
-                self.assertEqual(self.discover_tmux("writing", "$9", "62009", started_at, include_start=include_start),
-                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
-                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
-
-    def test_tmux_discovery_records_missing_or_invalid_server_pid_without_losing_ids(self) -> None:
-        for server_pid, include_pid in (("34500", False), ("", True), ("not-an-integer", True)):
-            with self.subTest(server_pid=server_pid, include_pid=include_pid):
-                self.assertEqual(self.discover_tmux("writing", "$9", "62009", server_pid=server_pid, include_pid=include_pid),
-                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
-                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
+        self.assertEqual(desktop["host"], {"kind": "unknown"})
 
     def test_ghostty_host_carries_window_shell_between_terminal_and_claude(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -1325,6 +1175,7 @@ elif "comm=" in joined:
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
         worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
+        assert unit["host"]["kind"] == "unit"
         self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
         self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
         self.assertEqual(worker["owner"], {"kind": "no director"})
@@ -1453,7 +1304,7 @@ elif "comm=" in joined:
 
         self.assertEqual(decoded, found)
 
-    def test_parse_inventory_treats_a_legacy_tmux_host_as_pane_not_recorded(self) -> None:
+    def test_parse_inventory_normalizes_a_legacy_tmux_host_to_manual_recovery(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
         session_values = cast(list[object], document["sessions"])
@@ -1471,55 +1322,7 @@ elif "comm=" in joined:
             if session["session_id"] == DESKTOP_ID
         )
 
-        self.assertEqual(
-            parsed["host"],
-            {
-                "kind": "tmux",
-                "tmux_session": "legacy",
-                "session_ref": {"kind": "not recorded"},
-                "server": {"kind": "not recorded"},
-                "pane": {"kind": "not recorded"},
-            },
-        )
-
-    def test_parse_inventory_restores_session_reference_and_preserves_legacy_pane(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        owner = cast(dict[str, object], session_values[0])
-        host: dict[str, object] = {"kind": "tmux", "tmux_session": "old name",
-            "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 700},
-            "session_ref": {"kind": "session id", "session_id": "$4"},
-            "server": {"kind": "server", "pid": 34500, "started_at": 1700000000}}
-        owner["host"] = host
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, host)
-        host["server"] = {"kind": "server", "started_at": 1700000000}
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
-        del host["server"]
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
-        del host["session_ref"]
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, {**host, "session_ref": {"kind": "not recorded"}, "server": {"kind": "not recorded"}})
-
-    def test_parse_inventory_validates_a_recorded_tmux_pane(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        first = cast(dict[str, object], session_values[0])
-        first["host"] = {
-            "kind": "tmux",
-            "tmux_session": "work",
-            "pane": {"kind": "pane", "pane_id": "%2", "pane_pid": "invalid"},
-        }
-
-        with self.assertRaisesRegex(
-            inventory.InvalidInventory,
-            r"inventory\.sessions\[0\]\.host\.pane\.pane_pid must be an integer",
-        ):
-            _ = inventory.parse_inventory(json.dumps(document))
+        self.assertEqual(parsed["host"], {"kind": "legacy tmux", "session_name": "legacy"})
 
     def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -1650,15 +1453,12 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = (self.proc / "stat").write_text("btime 1792065600\n")  # 2026-10-15 12:00 UTC
         fake_responses = self.root / "herdr-responses.json"
         _ = fake_responses.write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions":[]}'}}))
-        fake_state = self.root / "tmux.json"
-        fake_tmux.write(fake_state, {})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "HERDR_PROC": str(self.proc), "NOTIFIER_SESSIONS_DIR": str(self.registry),
             "NOTIFIER_STATE_DIR": str(self.notifier), "AGENT_NOTES_DIR": str(self.root / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_DELEGATE_ROOT": str(self.root / "runs"),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pauses"),
-            "UNIT_LOOKUP_TMUX": str(FAKE_TMUX), "FAKE_TMUX_STATE": str(fake_state),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "FAKE_HERDR_RESPONSES": str(fake_responses), "FAKE_HERDR_LOG": str(self.root / "herdr-log"),
         })))
@@ -1781,10 +1581,9 @@ class RecoveryInventoryTests(unittest.TestCase):
         self.assertIn(["-n", "kern.bootsessionuuid"], calls)
         self.assertFalse(any("server" in call and "stop" in call for call in calls))
 
-    def test_darwin_without_installed_tmux_still_observes_native_sessions(self) -> None:
+    def test_darwin_without_path_binaries_still_observes_native_sessions(self) -> None:
         _ = self.darwin_snapshot()
-        with (patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": ""}),
-              patch.object(shutil, "which", return_value=None)):
+        with patch.object(shutil, "which", return_value=None):
             found = inventory.snapshot_inventory()
         assert isinstance(found, inventory.CompleteInventory), found
         self.assertEqual(set(found.sessions), {TARGET_LOGIN, "codex-.codex"})
@@ -1941,6 +1740,14 @@ class RecoveryInventoryTests(unittest.TestCase):
         desktops.assert_called_once_with(refresh=False)
         self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["cwd"], str(self.root))
 
+    def test_user_tmux_with_inherited_herdr_is_unknown_in_a_complete_snapshot(self) -> None:
+        self.claude()
+        _ = (self.proc / "1001/environ").write_bytes(
+            (f"CLAUDE_CONFIG_DIR={self.config}\0TMUX_PANE=%9\0HERDR_PANE_ID=w1:p1\0").encode())
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["host"], {"kind": "unknown"})
+
     def test_snapshot_without_account_setting_keeps_home_identity_only_until_cutover(self) -> None:
         self.claude()
         self.claude(1002, identity="second-owner")
@@ -1985,11 +1792,11 @@ class RecoveryInventoryTests(unittest.TestCase):
         self.assertIsInstance(found, inventory.PartialInventory)
         assert isinstance(found, inventory.PartialInventory)
         self.assertIn("duplicate unit marks", "; ".join(found.failures))
-        marks.assert_called_once_with(every_host=True)
+        marks.assert_called_once_with()
 
     def test_each_required_shared_source_failure_refuses_a_complete_snapshot(self) -> None:
         self.claude()
-        for source in ("_snapshot_timers", "_snapshot_units", "_snapshot_tmux_hosts", "_snapshot_native_hosts"):
+        for source in ("_snapshot_timers", "_snapshot_units", "_snapshot_native_hosts"):
             with self.subTest(source=source), patch.object(inventory, source, side_effect=OSError(source + " denied")):
                 found = inventory.snapshot_inventory()
                 self.assertIsInstance(found, inventory.PartialInventory)
@@ -2214,7 +2021,7 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     def test_live_marked_unit_without_a_messaging_socket_is_not_a_standalone(self) -> None:
         self.claude()
-        row = unit_lookup.MarkedUnit("unit", "unit-host", unit_lookup.ClaudeNotRunning(),
+        row = unit_lookup.MarkedUnit("unit", unit_lookup.ClaudeNotRunning(),
                                    herdr.HerdrPlace("unit-host", "w1:p1"))
         with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({"show": {"unit": row}}, {})):
             observed = inventory.snapshot_inventory()
@@ -2259,7 +2066,7 @@ class RecoveryInventoryTests(unittest.TestCase):
     def test_lost_herdr_server_retains_a_missing_owner_with_host_loss_evidence(self) -> None:
         self.claude()
         with patch.object(inventory, "_terminal_host", return_value=inventory.HerdrHost(
-                kind="herdr", herdr_session="writing", pane_id="w1:p1")):
+                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
             first = inventory.snapshot_inventory()
         assert isinstance(first, inventory.CompleteInventory), first
         _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
@@ -2303,33 +2110,13 @@ class RecoveryInventoryTests(unittest.TestCase):
         environments = [cast(dict[str, str], call.kwargs["env"]) for call in run.call_args_list]
         self.assertEqual({env.get("GIT_OPTIONAL_LOCKS") for env in environments}, {"0"})
 
-    def test_tmux_pane_exit_is_clean_but_server_loss_retains_recovery(self) -> None:
-        self.claude()
-        server = self.process(3001, command="tmux")
-        host = inventory.TmuxHost(kind="tmux", tmux_session="writing",
-            session_ref=inventory.TmuxSessionId(kind="session id", session_id="$1"),
-            server=inventory.TmuxServer(kind="server", pid=3001, started_at=1700000000),
-            pane=inventory.TmuxPane(kind="pane", pane_id="%1", pane_pid=4001))
-        with patch.object(inventory, "_terminal_host", return_value=host):
-            first = inventory.snapshot_inventory()
-        assert isinstance(first, inventory.CompleteInventory), first
-        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
-        shutil.rmtree(self.proc / "1001")
-        clean = inventory.snapshot_inventory()
-        assert isinstance(clean, inventory.CompleteInventory), clean
-        self.assertEqual(clean.gone_hosts, frozenset())
-        shutil.rmtree(server)
-        lost = inventory.snapshot_inventory()
-        assert isinstance(lost, inventory.CompleteInventory), lost
-        restored = record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")[0]
-        self.assertEqual(restored["sessions"][0].get("crash"), "host gone")
 
     def test_same_name_herdr_replacement_cannot_hide_the_original_server_loss(self) -> None:
         self.claude()
         old = self.process(3001, command="herdr", arguments=["herdr", "server"])
         herdr_listener(self.proc, 3001, "writing", {"HOME": str(self.root)})
         with patch.object(inventory, "_terminal_host", return_value=inventory.HerdrHost(
-                kind="herdr", herdr_session="writing", pane_id="w1:p1")):
+                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
             first = inventory.snapshot_inventory()
         assert isinstance(first, inventory.CompleteInventory), first
         saved = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")[0]

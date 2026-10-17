@@ -601,13 +601,13 @@ def command_end_lease(_args: PoolArguments) -> int:
 
 def running_units(slug: str) -> set[str]:
     """Units of the production whose unit director runs, plus those whose state is unknown."""
-    # unit_lookup imports its siblings by bare name, and it reads tmux and herdr, so only migrate loads it.
+    # unit_lookup imports its siblings by bare name, and it reads herdr, so only migrate loads it.
     production_scripts = str(Path(__file__).resolve().parents[1] / "production")
     if production_scripts not in sys.path:
         sys.path.insert(0, production_scripts)
     import unit_lookup
 
-    return {unit for unit, marked in unit_lookup.marked_units(slug, every_host=True).items()
+    return {unit for unit, marked in unit_lookup.marked_units(slug).items()
             if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)}
 
 

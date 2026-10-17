@@ -28,7 +28,7 @@ from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusals, role_map
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -2711,6 +2711,87 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(second, first)
         self.codex_reads.assert_awaited_once_with(self.home / ".codex")
 
+    def test_next_add_list_and_remove_print_the_stored_plan(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+        self.assertFalse(next_moves.next_moves_file().exists())
+        code, output, error = self.run_cli("next", "add", "units", "1", "claude2", "--hold-minutes", "5")
+        self.assertEqual((code, error), (0, ""))
+        entries = next_moves.read_next_moves()
+        self.assertEqual(len(entries), 1)
+        self.assertIsInstance(entries[0], next_moves.ClaudeGroupMove)
+        assert isinstance(entries[0], next_moves.ClaudeGroupMove)
+        self.assertEqual((entries[0].group, entries[0].at_percent, entries[0].hold_minutes, entries[0].to),
+                         ("units", 1, 5, "claude2"))
+        self.assertIn(entries[0].id, output)
+        self.assertIn("when units reach 1% → claude2", output)
+        code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(listed, output)
+        code, _, error = self.run_cli("next", "remove", entries[0].id)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(next_moves.read_next_moves(), ())
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+
+    def test_next_refuses_unknown_accounts_groups_and_invalid_percent_without_storing_an_entry(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        with redirect_stderr(io.StringIO()) as parser_error:
+            with self.assertRaises(SystemExit) as refused:
+                _ = accounts.main(["next", "add", "unknown-group", "1", "claude2"])
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("unknown-group", parser_error.getvalue())
+        self.assertEqual(next_moves.read_next_moves(), ())
+        for arguments in (("units", "1", "claude99"),
+                          ("units", "-1", "claude2"), ("units", "101", "claude2"),
+                          ("units", "nan", "claude2")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", "add", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                self.assertTrue(error)
+                self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_workers_next_cli_validates_codex_targets_and_lists_and_removes_both_destinations(self) -> None:
+        self.write_note("codex2", "target@example.invalid")
+        self.codex_login("target@example.invalid", self.home / ".codex2")
+        with patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check:
+            code, output, error = self.run_cli("next", "add", "workers", "1", "codex2")
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(check.called)
+        self.assertIs(cast(object, check.call_args.kwargs["repair"]), False)
+        self.assertIn("when workers reach 1% → codex2", output)
+        with patch.object(accounts, "check_codex_target", side_effect=AssertionError("Claude is not a Codex login")):
+            code, output, error = self.run_cli("next", "add", "workers", "0", "claude")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("when workers reach 0% → claude", output)
+        entries = next_moves.read_next_moves()
+        code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("when workers reach 1% → codex2", listed)
+        self.assertIn("when workers reach 0% → claude", listed)
+        for entry in entries:
+            self.assertEqual(self.run_cli("next", "remove", entry.id)[0], 0)
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_workers_next_cli_rejects_hold_unknown_account_and_remote_invalid_entry(self) -> None:
+        for arguments in (("workers", "1", "claude", "--hold-minutes", "5"),
+                          ("workers", "1", "codex99"), ("workers", "1", "claude2")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", "add", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                self.assertTrue(error)
+                self.assertEqual(next_moves.read_next_moves(), ())
+        entry = next_moves.WorkersMove("remote-invalid", 1, next_moves.CodexWorkersTarget("codex99"),
+                                      datetime.now(timezone.utc))
+        code, output, error = self.run_cli("next-write", next_moves.encode_next_moves((entry,)))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertTrue(error)
+        self.assertEqual(next_moves.read_next_moves(), ())
+
     def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
         self.login_directory("claude2", "shared@example.invalid")
         groups = accounts.groups_file()
@@ -3366,6 +3447,15 @@ class AccountsTests(unittest.TestCase):
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"workers": "codex2"}\n')
         return default, target
+
+    def test_workers_swap_records_the_callers_auto_reason_and_cause(self) -> None:
+        _ = self.workers_fixture()
+        with patch.object(accounts, "_retire_workers_servers", return_value=[]):
+            _ = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto")
+        rows = [cast(dict[str, object], json.loads(line))
+                for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual((rows[-1]["role"], rows[-1]["cause"], rows[-1]["why"]),
+                         ("workers", "auto", "auto: workers-entry"))
 
     def test_unset_workers_role_refuses_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
@@ -4274,7 +4364,7 @@ class PickerTests(unittest.TestCase):
         moves.append_move(request)
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", cause="credits off", moved=["delegate", "fix"]))
+            fallback_at=stamp, owner="codex1", cause="credits off", why="credits off", moved=["delegate", "fix"]))
         with patch.object(accounts, "datetime", PickerTime):
             text = accounts.status_report(detail=True)
         self.assertIn("by hand", text)
@@ -4289,7 +4379,7 @@ class PickerTests(unittest.TestCase):
             fallback_at=stamp, owner="codex1", restored=["delegate"], kept=["fix"]))
         failed_at = (self.now + timedelta(minutes=1)).isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=failed_at, tool="codex",
-            fallback_at=failed_at, owner="unknown", cause="refusal", moved=["delegate"]))
+            fallback_at=failed_at, owner="unknown", cause="refusal", why="Codex refused work for quota", moved=["delegate"]))
         moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=failed_at, tool="codex",
             fallback_at=failed_at, owner="unknown", outcome="failed", restored=[], kept=[], failed=["delegate (unreadable)"]))
         with patch.object(accounts, "datetime", PickerTime):
@@ -4300,6 +4390,19 @@ class PickerTests(unittest.TestCase):
         self.assertIn("delegate (unreadable)", routing)
         self.assertIn("owner unknown", routing)
         self.assertNotIn("— open", routing)
+
+    def test_status_detail_shows_scheduled_claude_routing_as_auto(self) -> None:
+        self.codex("default", "worker@example.invalid")
+        stamp = self.now.isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", cause="auto", why="auto: workers-once", moved=["delegate"]))
+        with patch.object(accounts, "datetime", PickerTime):
+            text = accounts.status_report(detail=True)
+        routing = text.split("Codex work routing:", 1)[1]
+        self.assertIn("auto", routing)
+        self.assertIn("routed to claude", routing)
+        self.assertIn("delegate", routing)
+        self.assertIn("— open", routing)
 
     def test_default_input_is_refused_before_any_session_or_home_matcher(self) -> None:
         self.codex("default", "worker@example.invalid")

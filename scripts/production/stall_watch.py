@@ -22,6 +22,8 @@ import showrunners
 import unit_lookup
 from session_pane import HerdrFailure, read_place
 
+import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -102,11 +104,18 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
 
 def unit_marks(pid: int) -> tuple[str, str] | None:
     """The production and unit a process's environment marks it with, inherited from its unit's session."""
-    try:
-        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return None
-    values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+    if sys.platform == "darwin":
+        # The Mac has no /proc; herdr reads the environment from ps.
+        try:
+            values = herdr.darwin_process_environment(pid)
+        except (HerdrFailure, subprocess.SubprocessError, OSError):
+            return None
+    else:
+        try:
+            environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            return None
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
     slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
     return (slug, unit) if slug and unit else None
 
@@ -276,7 +285,7 @@ def tick(now: float) -> None:
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
-        # The units are the doc's live rows; each is found by the mark on its tmux session.
+        # The units are the doc's live rows; each is found by the mark on its herdr pane.
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()

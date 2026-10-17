@@ -169,7 +169,7 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
 def _check_stopped(rename: UnitRename) -> None:
     """The unit runs no Claude under either id, and nothing works inside its worktree."""
     try:
-        marked = unit_lookup.marked_units(rename.slug, every_host=True)
+        marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     for unit in (rename.old, rename.new):
@@ -183,9 +183,31 @@ def _check_stopped(rename: UnitRename) -> None:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
 
+def _check_stoppable(rename: UnitRename) -> None:
+    """What the stop step cannot settle: the new id running, a Claude it cannot read, or processes
+    in the worktree of a unit with no Claude to stop. A live old unit is the stop step's to stop."""
+    try:
+        marked = unit_lookup.marked_units(rename.slug)
+    except OSError as error:
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
+    old, new = marked.get(rename.old), marked.get(rename.new)
+    if new and not isinstance(new.claude, unit_lookup.ClaudeNotRunning):
+        raise RenameRefused(f"{rename.new} already runs in session {new.place.session}")
+    if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
+    if old and isinstance(old.claude, unit_lookup.LiveClaude):
+        return
+    pids = unit_move.processes_inside(rename.worktree())
+    if pids:
+        raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
+
+
 def _check_checkout(rename: UnitRename) -> None:
+    # Untracked files are left alone: the doc commit stages only tracked changes, and the checkout
+    # keeps untracked files of its own, such as the production log, which `!docs/**` keeps visible.
     checkout = Path(rename.checkout)
-    if git(checkout, "branch", "--show-current") != rename.merge_branch or git(checkout, "status", "--porcelain"):
+    if (git(checkout, "branch", "--show-current") != rename.merge_branch
+            or git(checkout, "status", "--porcelain", "--untracked-files=no")):
         raise RenameRefused(f"showrunner checkout must be clean and on {rename.merge_branch}")
 
 
@@ -207,7 +229,7 @@ def _preflight(rename: UnitRename) -> None:
     phase = unit_move.open_phase(run) if run else ""
     if phase:
         raise RenameRefused(f"{rename.old} is in phase {phase}; rename between phases")
-    _check_stopped(rename)
+    _check_stoppable(rename)
 
 
 def _token(old: str, new: str, text: str) -> str:
@@ -304,7 +326,7 @@ def _commit_doc(rename: UnitRename, save: Callable[[], None]) -> None:
                     write_text(path, updated)
             changed = set(git(checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
             allowed = {str(path.relative_to(checkout)) for path in (doc, *plans)}
-            if changed - allowed or git(checkout, "ls-files", "--others", "--exclude-standard"):
+            if changed - allowed:
                 raise RenameRefused("unrelated checkout changes during unit rename")
             _ = git(checkout, "add", "--", *sorted(changed))
             _ = git(checkout, "commit", "-m", rename.message)
@@ -409,7 +431,7 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
         rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
         return
     try:
-        found = unit_lookup.marked_units(rename.slug, every_host=True).get(rename.old)
+        found = unit_lookup.marked_units(rename.slug).get(rename.old)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
@@ -526,7 +548,8 @@ def _state_failures(rename: UnitRename) -> list[str]:
                 if (directory / "projects" / unit_move.project_folder(str(old))).exists()]
     if stall_watch.stretch_path(rename.slug, rename.old).exists():
         failures.append(f"stall-watch: the stretch is still under {rename.old}")
-    if unit_move.newest_run(old) is not None:
+    # Step 7 moves the newest run, the one run_state reads; older runs under the old path are history.
+    if unit_move.newest_run(old) is not None and unit_move.newest_run(new) is None:
         failures.append(f"run records: the newest run still names {old}")
     failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
     failures.extend(f"{note}: phase note still names {rename.old}"
@@ -545,7 +568,7 @@ def _session_failures(rename: UnitRename) -> list[str]:
     saved = shutdown_record.find_session(rename.account, rename.session_id)
     if saved is not None and saved["session"]["host"]["kind"] == "unit" and saved["session"]["host"]["unit"] != rename.new:
         failures.append(f"shutdown record {rename.session_id} does not name {rename.new}")
-    marked = unit_lookup.marked_units(rename.slug, every_host=True)
+    marked = unit_lookup.marked_units(rename.slug)
     found = marked.get(rename.new)
     if found is None or not isinstance(found.claude, unit_lookup.LiveClaude):
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")

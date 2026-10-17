@@ -59,6 +59,17 @@ class RoleMapTests(unittest.TestCase):
             code = accounts.main(list(arguments))
         return code, output.getvalue(), error.getvalue()
 
+    def test_role_history_append_is_one_whole_line_write(self) -> None:
+        self.seed(self.home, groups={"units": "claude1"})
+        with (patch.object(socket, "gethostname", return_value="natedev"),
+              patch.object(os, "write", wraps=os.write) as write):
+            _ = accounts.set_group_account("units", "claude2", why="auto: line-write", origin=accounts.AutoOrigin())
+        write.assert_called_once()
+        line = cast(bytes, write.call_args.args[1])
+        self.assertTrue(line.endswith(b"\n"))
+        self.assertEqual(json.loads(line)["why"], "auto: line-write")
+        self.assertEqual(accounts.roles_history_file().read_bytes(), line)
+
     def remote(self, arguments: tuple[str, ...]) -> str:
         """Run the real remote CLI against a second scratch home, never a shell or ssh."""
         with (patch.dict(os.environ, {"HOME": str(self.server_home),

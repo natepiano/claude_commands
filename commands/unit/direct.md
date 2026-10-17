@@ -102,7 +102,9 @@ mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 When the production doc names a review pool, send code reviews with
 `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
-review resumes the unit's own reviewer, which is never reset.
+review resumes the unit's own reviewer, which is never reset. A refusal ending
+`no primed code template` means `review-unit` has not primed the pool yet: send
+that review to an idle worker with `--to`, and tell the showrunner once.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
@@ -899,8 +901,9 @@ An answer is `cargo-berth claim <paths> --reservation <id> --<choice> <holder>
 one step and exits 0. `before` and `after` widen only that phase's reservation,
 with the ordering edge; `defer` records the answer and takes no paths, so the
 phase holds its dispatch on them. An id the ledger does not know is refused.
-A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
-recorded: the answer stands, so do not repeat it. When several holders
+A claim behind a holder you already sequenced against reuses that edge and
+adds the paths; only `cargo-berth sequence` still refuses a duplicate edge
+(exit 2). When several holders
 conflict, name every one in the same claim, one flag each: `--before`,
 `--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
 claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.

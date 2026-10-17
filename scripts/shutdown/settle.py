@@ -36,8 +36,8 @@ import record as store
 from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunner_footer
-import sessions
 import showrunners
+import sessions
 import stop as stop_work
 from user_zone import user_zone
 from scripts.accounts.accounts import HAND_ORIGIN
@@ -137,7 +137,7 @@ class ScreenText:
 
 @dataclass(frozen=True)
 class ScreenUnreadable:
-    reason: Literal["no pane host", "no pane id", "capture failed"]
+    reason: Literal["no pane host", "no pane id", "capture failed", "session registry identity changed"]
 
 
 @dataclass(frozen=True)
@@ -485,37 +485,25 @@ def blocker(session: Session) -> ReadinessCheck:
     return {"kind": "clear"}
 
 def _screen(session: Session) -> ScreenText | ScreenUnreadable:
+    from session_pane import read_place
+    from herdr import HerdrFailure, HerdrPlace
+
     host = session["host"]
     if host["kind"] == "herdr":
-        from session_pane import read_place
-        from herdr import HerdrFailure, HerdrPlace
-
-        try:
-            return ScreenText(read_place(HerdrPlace(host["herdr_session"], host["pane_id"]), 60))
-        except HerdrFailure:
-            return ScreenUnreadable("capture failed")
-    if host["kind"] != "tmux" and host["kind"] != "unit":
+        place = HerdrPlace(host["herdr_session"], host["pane_id"])
+    elif host["kind"] == "unit":
+        registered = sessions.read_session(sessions.sessions_dir() / f"{session['pid']}.json")
+        if isinstance(registered, sessions.UnreadableSessionRecord) or registered["sessionId"] != session["session_id"]:
+            return ScreenUnreadable("session registry identity changed")
+        place = herdr.herdr_place_of(session["pid"])
+        if not isinstance(place, HerdrPlace):
+            return ScreenUnreadable("no pane id")
+    else:
         return ScreenUnreadable("no pane host")
-    entry = sessions.read_session(sessions.sessions_dir() / f"{session['pid']}.json")
-    if isinstance(entry, sessions.UnreadableSessionRecord) or entry["sessionId"] != session["session_id"]:
-        return ScreenUnreadable("no pane id")
-    pane_id = entry["tmux"].rsplit(".", 1)[-1]
-    if re.fullmatch(r"%[0-9]+", pane_id) is None or "." not in entry["tmux"]:
-        return ScreenUnreadable("no pane id")
-    tmux = os.environ.get("SHUTDOWN_TMUX", "tmux")
     try:
-        result = subprocess.run(
-            [tmux, "capture-pane", "-p", "-t", pane_id],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        return ScreenText(read_place(place, 60))
+    except HerdrFailure:
         return ScreenUnreadable("capture failed")
-    if result.returncode != 0:
-        return ScreenUnreadable("capture failed")
-    return ScreenText(result.stdout)
 
 
 def _showing_form(session: Session) -> bool:
@@ -730,6 +718,9 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
     else:
         message = ""
     lines = [f"  {record['session']['name']}: {progress}{message}"]
+    if record["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(record):
+        from restart import legacy_resume_command
+        lines.append(f"    manual restart: {legacy_resume_command(record)}")
     for step in record.get("trail", []):
         at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
         lines.append(f"    {at} {step['kind']} {located_detail(record, step['detail'])}".rstrip())
@@ -1003,6 +994,9 @@ def stop_issue_text(issue: SessionStopIssue) -> str:
             return "not stopped: account unreadable"
         case "codex server left running":
             return f"Codex server {issue['run_dir']} left running: {issue['cause']}"
+        case "legacy tmux session left running":
+            command = shlex.join(["tmux", "kill-session", "-t", "=" + issue["session_name"]])
+            return f"legacy tmux session {issue['session_name']} left running: {issue['cause']}; {command}"
         case "unit session left running":
             return f"{issue['host']} session {issue['session_name']} left running: {issue['cause']}"
 
@@ -1126,7 +1120,17 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     for saved in records:
         if ids and saved["session"]["session_id"] not in ids:
             continue
-        if not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"} and not store.stop_incomplete(saved):
+        if (not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"}
+                and not store.stop_incomplete(saved)
+                and saved["session"]["host"]["kind"] not in {"legacy tmux", "legacy tmux unit"}
+                and not store.legacy_tmux_leftovers(saved)):
+            continue
+        if saved["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(saved):
+            from restart import legacy_resume_command
+            print(f"manual restart {saved['session']['name']}: {legacy_resume_command(saved)}")
+            for issue in store.legacy_tmux_leftovers(saved):
+                print(f"  {stop_issue_text(issue)}")
+            refused = True
             continue
         forced = False
         def force(current: SessionShutdown) -> None:
@@ -1381,7 +1385,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
     stop_due = [saved for saved in failed if saved["hold"] == "account" and saved["alerts"] == "user"]
     unpushed = [saved for saved in restore_failed
                 if saved["progress"]["kind"] != "timers pending" and saved["alerts"] == "user"
-                and saved.get("restore_alerted") != _not_back_text(saved)]
+                and saved.get("restore_alerted") != not_back_text(saved)]
     try:
         due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
         text_id = "shutdown.stop_failed" if stop_due else "shutdown.restart_failed"
@@ -1391,12 +1395,12 @@ def report_stop(records: list[SessionShutdown]) -> None:
                               stopped=stopped_sessions_text(len(items))), machine=route)
             if not stop_due:
                 for saved in items:
-                    _mark_not_back_pushed(saved)
+                    mark_not_back_pushed(saved)
         if not stop_due:
             for saved in unpushed:
                 if saved["progress"]["kind"] == "manual restart":
                     alert_user(render("shutdown.manual_restart", session=saved["session"]["name"], machine=saved["machine"]), machine=route)
-                    _mark_not_back_pushed(saved)
+                    mark_not_back_pushed(saved)
     finally:
         if not origins:
             print(text)
@@ -1404,7 +1408,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
             _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-result-{first['login']}")
 
 
-def _not_back_text(saved: SessionShutdown) -> str:
+def not_back_text(saved: SessionShutdown) -> str:
     """What a not-back push says about this record; an unchanged one is not pushed again."""
     progress = saved["progress"]
     if progress["kind"] == "restart failed":
@@ -1474,7 +1478,7 @@ def tell_showrunners_outcome(records: list[SessionShutdown]) -> None:
             summary = f"{name} is back on {saved.get('target') or saved['label']}"
             text = summary
         elif progress["kind"] in {"restart failed", "manual restart"}:
-            told = _not_back_text(saved)
+            told = not_back_text(saved)
             reason = progress["reason"] if progress["kind"] == "restart failed" else "it needs a manual restart"
             summary = f"{name} did not come back: {reason}"
             command = shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
@@ -1489,10 +1493,10 @@ def tell_showrunners_outcome(records: list[SessionShutdown]) -> None:
             _ = send_message(showrunner, summary, text, key=f"shutdown-unit-{saved['session']['session_id']}")
 
 
-def _mark_not_back_pushed(saved: SessionShutdown) -> None:
+def mark_not_back_pushed(saved: SessionShutdown) -> None:
     def mark(current: SessionShutdown) -> None:
         if current["request_id"] == saved["request_id"] and current["progress"] == saved["progress"]:
-            current["restore_alerted"] = _not_back_text(saved)
+            current["restore_alerted"] = not_back_text(saved)
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], mark)
     except store.NoLiveRecord:
@@ -1565,9 +1569,8 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
 
 def _holdout_host(saved: SessionShutdown) -> str:
     host = saved["session"]["host"]
-    if host["kind"] == "tmux":
-        pane = host["pane"]
-        return f"tmux {host['tmux_session']}" + (f" pane {pane['pane_id']}" if pane["kind"] == "pane" else " pane")
+    if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
+        return f"legacy host {host['session_name']}; manual recovery required"
     if host["kind"] == "unit":
         return f"unit {host['production']}/{host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":

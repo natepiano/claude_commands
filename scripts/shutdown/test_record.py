@@ -389,8 +389,8 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.parse_session_records(json.dumps([first, second])), [first, second])
         self.assertFalse((self.directory / "record.json").exists())
 
-    def test_unit_session_leftover_issues_round_trip_for_both_hosts(self) -> None:
-        for host in ("tmux", "herdr"):
+    def test_herdr_unit_session_leftover_issues_round_trip(self) -> None:
+        for host in ("herdr",):
             with self.subTest(host=host):
                 saved = session_shutdown()
                 saved["stop_issues"] = [record.UnitSessionLeftRunning(
@@ -470,8 +470,8 @@ class SessionRecordTests(ShutdownTestCase):
 
     def test_old_tmux_leftover_issue_is_normalized_on_read_and_written_canonically(self) -> None:
         saved = session_shutdown()
-        saved["stop_issues"] = [record.UnitSessionLeftRunning(
-            kind="unit session left running", at=NOW, host="tmux",
+        saved["stop_issues"] = [record.LegacyTmuxSessionLeftRunning(
+            kind="legacy tmux session left running", at=NOW,
             session_name="old-unit", cause="owner identity lost")]
         wire = cast(dict[str, object], json.loads(json.dumps(saved)))
         wire["stop_issues"] = [{"kind": "unit tmux session left running", "at": NOW,
@@ -505,27 +505,56 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
 
-    def test_unit_host_without_transport_defaults_to_tmux_with_either_name_key(self) -> None:
+    def test_legacy_unit_wire_forms_normalize_in_records_and_snapshots(self) -> None:
+        for transport in (None, "tmux"):
+            for key in ("session_name", "tmux_session"):
+                with self.subTest(transport=transport, key=key):
+                    host: dict[str, object] = {"kind": "unit", "production": "build", "unit": "one",
+                        "doc": "/tmp/build.md", key: "unit-session"}
+                    if transport is not None:
+                        host["session_host"] = transport
+                    saved = session_shutdown()
+                    document = cast(dict[str, object], json.loads(json.dumps(saved)))
+                    wire_session = cast(dict[str, object], document["session"])
+                    wire_session.update(kind="unit", host=host)
+                    expected = {"kind": "legacy tmux unit", "production": "build", "unit": "one",
+                        "doc": "/tmp/build.md", "session_name": "unit-session"}
+                    parsed = record.parse_session_records(json.dumps([document]))[0]
+                    self.assertEqual(parsed["session"]["host"], expected)
+                    snapshot = record.parse_snapshot(dict[str, object]({"machine": "natedev", "login": saved["login"],
+                        "label": saved["label"], "taken_at": NOW, "sessions": [
+                            {"agent": "claude", "session": wire_session, "workers": list[object](), "timers": list[object](),
+                             "last_seen": NOW, "state": "unresolved", "crash": "host gone"}]}))
+                    self.assertEqual(snapshot["sessions"][0]["session"]["host"], expected)
+                    path = self.directory / "sessions/session-1.json"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    _ = path.write_text(json.dumps(document))
+                    self.assertEqual(record.find_session(saved["login"], "session-1"), parsed)
+
+    def test_old_tmux_hosts_normalize_in_records_and_snapshots(self) -> None:
         saved = session_shutdown()
-        unit = cast(inventory.UnitSession, cast(object, {
-            **session(), "kind": "unit",
-            "host": inventory.UnitHost(kind="unit", production="build", unit="one", doc="/tmp/build.md",
-                                       session_name="unit-session", session_host="tmux", plan=inventory.NoRunRecord(kind="no run record")),
-        }))
-        saved["session"] = unit
-        for key in ("session_name", "tmux_session"):
-            with self.subTest(key=key):
-                document = cast(dict[str, object], json.loads(json.dumps(saved)))
-                wire_session = cast(dict[str, object], document["session"])
-                host = cast(dict[str, object], wire_session["host"])
-                del host["session_host"]
-                del host["session_name"]
-                host[key] = "unit-session"
-                self.assertEqual(record.parse_session_records(json.dumps([document])), [saved])
-                path = self.directory / "sessions" / "session-1.json"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                _ = path.write_text(json.dumps(document))
-                self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        owner = cast(dict[str, object], document["session"])
+        owner["host"] = {"kind": "tmux", "tmux_session": "old:name", "pane": {"kind": "not recorded"}}
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed["session"]["host"], {"kind": "legacy tmux", "session_name": "old:name"})
+        snapshot = record.parse_snapshot(dict[str, object]({"machine": "natedev", "login": saved["login"], "label": saved["label"],
+            "taken_at": NOW, "sessions": [{"agent": "claude", "session": owner, "workers": list[object](), "timers": list[object](),
+                "last_seen": NOW, "state": "unresolved", "crash": "host gone"}]}))
+        self.assertEqual(snapshot["sessions"][0]["session"], parsed["session"])
+
+    def test_both_legacy_leftover_forms_require_time_and_normalize(self) -> None:
+        expected = {"kind": "legacy tmux session left running", "at": NOW,
+            "session_name": "old-unit", "cause": "stop not confirmed"}
+        for old in ({"kind": "unit tmux session left running", "tmux_session": "old-unit"},
+                    {"kind": "unit session left running", "host": "tmux", "session_name": "old-unit"}):
+            document = cast(dict[str, object], json.loads(json.dumps(session_shutdown())))
+            issue = {**old, "at": NOW, "cause": "stop not confirmed"}
+            document["stop_issues"] = [issue]
+            self.assertEqual(record.parse_session_records(json.dumps([document]))[0]["stop_issues"], [expected])
+            del issue["at"]
+            with self.assertRaises(record.InvalidRecord):
+                _ = record.parse_session_records(json.dumps([document]))
 
     def test_herdr_unit_transport_round_trips_through_the_record_store(self) -> None:
         saved = session_shutdown()
@@ -1305,7 +1334,7 @@ class SessionRecordTests(ShutdownTestCase):
                     if issues:
                         saved["stop_issues"] = [record.UnitSessionLeftRunning(
                             kind="unit session left running", at=NOW,
-                            host="tmux", session_name="unit", cause="stop not confirmed")]
+                            host="herdr", session_name="unit", cause="stop not confirmed")]
                     self.assertEqual(record.stop_incomplete(saved), kind == "stop failed" or (
                         issues and kind in {"stopped", "already gone", "process identity lost"}))
 

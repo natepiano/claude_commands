@@ -19,7 +19,8 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the worker held before), and appends the role and lens to the role log `agents.jsonl` (`docs/as-built/usage-ledger.md`). |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores `previous_role`, or removes `role` if the worker had none, returns the worker to its previous status, and appends the restored role to `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
 | `end` | `--session-dir --to` | Clears the worker's pending queue, writes its end marker and sets the worker's roster `status` to `"ended"`. |
-| `stop` | `--session-dir` | Sets every roster worker to `"ended"` and stops the current server and every retired one. |
+| `stop` | `--session-dir [--pause]` | Sets every roster worker to `"ended"` and stops the current server and every retired one. With `--pause` (a shutdown stop, `docs/as-built/shutdown-and-restart.md`) it instead sets every non-ended worker to the followable `"paused"`, with `paused_from` and `paused_turn`, after dropping its queued messages and interrupting a live turn. |
+| `reopen` | `--session-dir --to` | Returns an `ended` worker, or a `running`/`starting` one whose launcher is dead and whose server is gone, to `"paused"` on its recorded thread. Exits 2 with one stderr line when the thread id is missing or a launcher or server is alive. |
 | `sweep` | `[--root] [--stop]` | Gives a verdict on every app-server listening on `ws://` (see Cleanup). |
 | `idle-stop` | `--session-dir --pid --port` | The server's own watcher calls this. It stops the server, or touches its record if something still uses it. |
 | `list` | `--session-dir` | Prints the roster. |
@@ -29,7 +30,7 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 **Roster fields (`mesh_roster.json`).** Each entry has:
 
 - `thread_id`.
-- `status`: `starting`, `running`, `done`, `failed`, `waiting_capacity`, `capacity_exhausted`, or the terminal `ended`.
+- `status`: `starting`, `running`, `done`, `failed`, `paused`, `waiting_capacity`, `capacity_exhausted`, or the terminal `ended`. `done`, `failed` and `paused` are followable (`FOLLOWABLE_STATES`); a follow clears `paused_from` and `paused_turn`.
 - `role`: `impl`, `test`, `fix` or `review`, or absent for a roleless thread.
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`, or `"not_measured_since_compaction"` after a compaction turn that reported 0, until the worker's next turn reports a size.
 - `revision`: raised by one on every write inside the roster lock; an entry without one reads as 0. `_update_roster_if_expected` writes only when the entry still matches what the writer expects (still on its thread, absent, ended on its thread, or at an unchanged revision), so a command still at work for an earlier thread, or a compaction that ends late, cannot replace a newer record (`docs/as-built/usage-ledger.md`, Worker roster guards).
@@ -52,8 +53,8 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`.
-  2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`) or whose status is `implementing`.
+  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`.
+  2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On any other failure it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
 - On exit, it releases the claim.
@@ -63,7 +64,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 **`scripts/delegate/review.sh [--to <worker> | --slot <new-slot> | --pool code|ui --lease <slug>/<unit>/<phase>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
 
-`lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Artifacts are keyed by pass and lens, never by worker: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`, `review_agent_<N>[_<lens>].log`.
+`lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Findings and status are keyed by pass and lens, never by worker: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`. The agent log adds the seat, `review_agent_<N>[_<lens>]-<slot>.log` for a worker and `-pool` for a pool reviewer, so a second seat on the same pass cannot truncate the first one's log.
 
 - **`--pool code|ui --lease …`**: reviews on a pooled reviewer of the production, on a read-only turn. `docs/as-built/review-pool.md` describes this path.
 - **`--to <worker>`**: reviews on an open worker.
@@ -94,7 +95,7 @@ After the turn it compares the first four. Any difference makes the review statu
 
 The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegate/dual_review.md` (`<TeamReview/>` and `<ReviewPromptContract/>`), `docs/delegate/run_phase_review.md`, `docs/delegate/write_prompt_contract.md` (`<RoleReassignment/>`) and `commands/plan/phase_review.md`:
 
-- Each lens gets a different open worker, preferring one that did not write the files under review. If the other workers are busy, the writer may take the `adversary` lens on its own work.
+- Each lens gets a different open worker, and an idle open worker, a writer included, takes a lens before a new worker opens. Idle workers that did not write the files under review go first; then a writer takes one, arguing against its own choices on the `adversary` lens.
 - Roles move between workers; slots do not. Any open worker may take any role, including in the middle of a phase. Before dispatching, post a board `handoff` that names the slot, the role it leaves and the role it takes. The new prompt has the worker run `board.sh role` before its first tool call.
 - If every open worker is busy, open an extra worker named for its role with `--slot` (`review`, then `review2`; `fix2` for repair) and keep it until `end_session.sh`. Never name an extra worker with a bare number.
 - Only the adversary lens starts early, and the director records its worker in `EARLY_REVIEW_SLOT`. The closure review and the phase-review architect go to an open worker with `--to`.

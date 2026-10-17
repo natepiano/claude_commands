@@ -274,10 +274,10 @@ export const register: Register = on => {
     if (state.kind === 'unit') {
       const data = state.data.boards.find(board => board.production === state.production);
       const unit = data?.units.find(unit => unit.key === state.unit);
-      if (data && unit) return UnitView(elements, e.props.bodyColumns, data, unit, state.now,
+      if (data && unit) return UnitView(elements, e.props.bodyColumns, e.props.scroll.bodyRows, data, unit, state.now,
         () => { void select($, opened, PANE, { kind: 'board' }); });
     }
-    return BoardView(elements, e.props.bodyColumns, state.data, state.now,
+    return BoardView(elements, e.props.bodyColumns, e.props.scroll.bodyRows, state.data, state.now,
       (production, unit) => { void select($, opened, PANE, { kind: 'unit', production, unit }); });
   });
 };

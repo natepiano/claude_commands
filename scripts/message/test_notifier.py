@@ -485,10 +485,12 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
         _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
 
-    def test_mac_run_only_job_removes_label_after_fire_log_and_runs_once(self) -> None:
+    def fake_launchctl(self) -> Path:
+        """Install a fake launchctl that, like macOS 27, starts a submitted job only on kickstart."""
         launcher = self.launcher_dir / "launchctl"
         _ = launcher.write_text(
             """#!/usr/bin/env python3
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -500,7 +502,15 @@ action = sys.argv[1]
 if action == "submit":
     label = sys.argv[sys.argv.index("-l") + 1]
     (state / "submitted").write_text(label)
-    command = sys.argv[sys.argv.index("--") + 1:]
+    (state / f"{label}.command").write_text(json.dumps(sys.argv[sys.argv.index("--") + 1:]))
+elif action == "kickstart":
+    target = sys.argv[2]
+    (state / "kickstarted").write_text(target)
+    kickstart_rc = int(os.environ["FAKE_LAUNCHCTL_KICKSTART_RC"])
+    if kickstart_rc:
+        sys.exit(kickstart_rc)
+    label = target.split("/", 2)[2]
+    command = json.loads((state / f"{label}.command").read_text())
     job = subprocess.Popen(
         [sys.executable, __file__, "loop", label, *command],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -534,24 +544,48 @@ elif action == "remove":
                     pass
 
         self.addCleanup(stop_fake_job)
-        runs = self.root / "mac-runs"
+        return launch_state
+
+    def tick_mac_run_only(self, launch_state: Path, runs: Path, kickstart_rc: int = 0) -> Path:
         fire_log = self.state_dir / "example" / "fire.log"
         with mock.patch.dict(os.environ, {
             "NOTIFIER_PLATFORM": "darwin",
             "FAKE_LAUNCHCTL_STATE": str(launch_state),
             "FAKE_LAUNCHCTL_FIRE": str(fire_log),
+            "FAKE_LAUNCHCTL_KICKSTART_RC": str(kickstart_rc),
         }):
             _ = self.successful(
                 "new", "example", "--every", "1", "--run",
                 f"/bin/sh -c 'printf run >> {runs}; exit 7'",
             )
             _ = self.successful("tick", now=MINUTE + 60)
+        return fire_log
+
+    def test_mac_run_only_job_removes_label_after_fire_log_and_runs_once(self) -> None:
+        launch_state = self.fake_launchctl()
+        runs = self.root / "mac-runs"
+        fire_log = self.tick_mac_run_only(launch_state, runs)
         self.assertEqual(self.wait_for_text(fire_log, "run exit 7").count("run exit 7"), 1)
         self.assertEqual(self.wait_for_text(runs, "run"), "run")
         label = (launch_state / "submitted").read_text()
+        self.assertEqual((launch_state / "kickstarted").read_text(), f"gui/{os.getuid()}/{label}")
         removed = launch_state / f"{label}.removed"
         self.assertEqual(self.wait_for_text(removed, "after-fire"), "after-fire")
         self.assertEqual(runs.read_text(), "run")
+
+    def test_mac_run_only_failed_kickstart_removes_label_and_runs_after_tick(self) -> None:
+        launch_state = self.fake_launchctl()
+        runs = self.root / "mac-runs"
+        fire_log = self.tick_mac_run_only(launch_state, runs, kickstart_rc=1)
+        label = (launch_state / "submitted").read_text()
+        self.assertEqual((launch_state / f"{label}.removed").read_text(), "before-fire")
+        self.assertIn(
+            "run launcher unavailable: example; waiting after tick",
+            (self.state_dir / "notifier.log").read_text(),
+        )
+        self.assertEqual(fire_log.read_text().count("run exit 7"), 1)
+        self.assertEqual(runs.read_text(), "run")
+        self.assertFalse((launch_state / "pid").exists())
 
     def test_run_only_long_run_does_not_hold_tick_or_other_due_instance(self) -> None:
         started_file = self.root / "started"

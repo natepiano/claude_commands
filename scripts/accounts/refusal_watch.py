@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
-from scripts.accounts import accounts, moves, refusals, role_map
+from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 import account
 import agent_accounts
 from note_file import canonical_label
@@ -118,13 +118,7 @@ class WatchedSession(TypedDict):
 class WatchState(TypedDict):
     sessions: dict[str, WatchedSession]
     notices: dict[str, str]
-    auto_moves: NotRequired[dict[str, AutoResetObservation]]
     auto_move_holds: NotRequired[dict[str, HoldStarted]]
-
-
-class AutoResetObservationDocument(TypedDict):
-    observed_reset: str
-    acted_reset: str
 
 
 class HoldStartedDocument(TypedDict):
@@ -137,7 +131,6 @@ class HoldStartedDocument(TypedDict):
 class WatchStateDocument(TypedDict):
     sessions: dict[str, WatchedSession]
     notices: dict[str, str]
-    auto_moves: NotRequired[dict[str, AutoResetObservationDocument]]
     auto_move_holds: NotRequired[dict[str, HoldStartedDocument]]
 
 
@@ -154,110 +147,31 @@ class HoldStarted:
 
 
 @dataclass(frozen=True)
-class NeverActedOnReset:
-    """This rule has not acted on an observed reset."""
-
-
-@dataclass(frozen=True)
-class ActedOnReset:
-    at: datetime
-
-    def __post_init__(self) -> None:
-        if self.at.utcoffset() is None:
-            raise ValueError("acted reset needs a zone")
-
-
-@dataclass(frozen=True)
-class AutoResetObservation:
-    observed_reset: datetime
-    acted_reset: NeverActedOnReset | ActedOnReset
-
-    def __post_init__(self) -> None:
-        if self.observed_reset.utcoffset() is None:
-            raise ValueError("observed reset needs a zone")
-
-
-@dataclass(frozen=True)
 class LeftAtMost:
     percent: float
     hold_minutes: float = 0
 
 
 @dataclass(frozen=True)
-class AfterReset:
-    """Return to the target after an observed weekly window ends."""
-
-
-@dataclass(frozen=True)
 class AutoMoveRule:
-    name: str
+    entry_id: str
     group: accounts.ClaudeGroup
     to: str
-    when: LeftAtMost | AfterReset
+    when: LeftAtMost
 
 
 @dataclass(frozen=True)
-class MalformedAutoMoveRule:
+class UnreadableNextMoveLog:
     reason: str
 
 
-def read_auto_move_rules() -> tuple[AutoMoveRule | MalformedAutoMoveRule, ...]:
+def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
     try:
-        config = accounts._read_json_object(accounts.accounts_config_file())  # pyright: ignore[reportPrivateUsage]
-    except FileNotFoundError:
-        return ()
-    except (OSError, ValueError) as error:
-        return (MalformedAutoMoveRule(f"auto_moves: {error}"),)
-    raw = config.get("auto_moves", [])
-    if not isinstance(raw, list):
-        return (MalformedAutoMoveRule("auto_moves: expected a list"),)
-    result: list[AutoMoveRule | MalformedAutoMoveRule] = []
-    names: set[str] = set()
-    for index, entry in enumerate(cast(list[object], raw), 1):
-        name = f"#{index}"
-        try:
-            if not isinstance(entry, dict):
-                raise ValueError("expected an object")
-            fields = cast(dict[str, object], entry)
-            configured_name = fields.get("name")
-            if not isinstance(configured_name, str) or not configured_name.strip():
-                raise ValueError("name must be nonempty")
-            name = configured_name
-            if name in names:
-                raise ValueError("duplicate rule name")
-            group, target, when = fields.get("group"), fields.get("to"), fields.get("when")
-            if group not in accounts.CLAUDE_GROUPS or not isinstance(target, str) or not isinstance(when, dict):
-                raise ValueError("expected a Claude group, target label and when object")
-            label = accounts.numbered_account_label(target, "claude").label
-            condition = cast(dict[str, object], when)
-            trigger: LeftAtMost | AfterReset
-            if "left_at_most" in condition and set(condition) <= {"left_at_most", "hold_minutes"}:
-                percent = condition["left_at_most"]
-                if (not isinstance(percent, (int, float)) or isinstance(percent, bool)
-                        or not 0 <= percent <= 100 or not math.isfinite(percent)):
-                    raise ValueError("left_at_most must be a percent from 0 to 100")
-                hold_minutes = condition.get("hold_minutes", 0)
-                if (not isinstance(hold_minutes, (int, float)) or isinstance(hold_minutes, bool)
-                        or hold_minutes < 0):
-                    raise ValueError("hold_minutes must be a finite nonnegative number")
-                try:
-                    hold_minutes = float(hold_minutes)
-                except OverflowError as error:
-                    raise ValueError("hold_minutes must be a finite nonnegative number") from error
-                if not math.isfinite(hold_minutes):
-                    raise ValueError("hold_minutes must be a finite nonnegative number")
-                trigger = LeftAtMost(float(percent), hold_minutes)
-            elif condition == {"after_reset": True}:
-                if condition["after_reset"] is not True:
-                    raise ValueError("after_reset must be true")
-                trigger = AfterReset()
-            else:
-                raise ValueError("when must contain left_at_most or after_reset: true")
-            result.append(AutoMoveRule(name, group, label, trigger))
-            names.add(name)
-        except (ValueError, TypeError) as error:
-            result.append(MalformedAutoMoveRule(f"auto_moves {name}: {error}"))
-    return tuple(result)
+        return tuple(AutoMoveRule(entry.id, entry.group, entry.to,
+                                  LeftAtMost(entry.at_percent, entry.hold_minutes))
+                     for entry in next_moves.read_next_moves() if isinstance(entry, next_moves.ClaudeGroupMove))
+    except next_moves.NextMoveError as error:
+        return (UnreadableNextMoveLog(str(error)),)
 
 
 def state_root() -> Path:
@@ -303,21 +217,6 @@ def _load_state() -> WatchState:
     raw_notices = held.get("notices")
     if isinstance(raw_notices, dict):
         result["notices"] = {key: value for key, value in cast(dict[str, object], raw_notices).items() if isinstance(value, str)}
-    raw_auto = held.get("auto_moves")
-    if isinstance(raw_auto, dict):
-        observations: dict[str, AutoResetObservation] = {}
-        for name, raw in cast(dict[str, object], raw_auto).items():
-            if isinstance(raw, dict):
-                fields = cast(dict[str, object], raw)
-                observed, acted = fields.get("observed_reset"), fields.get("acted_reset")
-                if isinstance(observed, str) and isinstance(acted, str):
-                    try:
-                        progress = ActedOnReset(datetime.fromisoformat(acted)) if acted else NeverActedOnReset()
-                        observations[name] = AutoResetObservation(datetime.fromisoformat(observed), progress)
-                    except ValueError:
-                        # An invalid observation is first sight on the next fresh reading.
-                        continue
-        result["auto_moves"] = observations
     raw_holds = held.get("auto_move_holds")
     if isinstance(raw_holds, dict):
         holds: dict[str, HoldStarted] = {}
@@ -341,14 +240,6 @@ def _load_state() -> WatchState:
 
 def _state_document(state: WatchState) -> WatchStateDocument:
     document = WatchStateDocument(sessions=state["sessions"], notices=state["notices"])
-    if "auto_moves" in state:
-        document["auto_moves"] = {
-            name: AutoResetObservationDocument(
-                observed_reset=observation.observed_reset.isoformat(),
-                acted_reset=observation.acted_reset.at.isoformat()
-                if isinstance(observation.acted_reset, ActedOnReset) else "")
-            for name, observation in state["auto_moves"].items()
-        }
     if "auto_move_holds" in state:
         document["auto_move_holds"] = {
             name: HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
@@ -371,6 +262,18 @@ def _watch_lock() -> Generator[None]:
     with lock.open("a") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
+
+
+@contextmanager
+def removing_next_move(entry_id: str) -> Generator[None]:
+    """Hold the watcher lock before the log lock, then discard the removed hold."""
+    with _watch_lock():
+        yield
+        state = _load_state()
+        holds = state.get("auto_move_holds", {})
+        if entry_id in holds:
+            del holds[entry_id]
+            _save_state(state)
 
 
 class TranscriptEntry(TypedDict, total=False):
@@ -898,21 +801,48 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     return lines
 
 
-def run_auto_moves(now: datetime, *, dry_run: bool = False,
+# Preserve the watcher API while sharing replay evidence with quota_alert.
+RecordedAutoMoves = role_map.RecordedAutoMoves
+UnreadableAutoMoveHistory = role_map.UnreadableAutoMoveHistory
+
+
+def recorded_auto_moves() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    return role_map.recorded_auto_moves(accounts.roles_history_file())
+
+
+def _recorded_auto_move_ids() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    return recorded_auto_moves()
+
+
+def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                    moved_groups: frozenset[accounts.ClaudeGroup] = NO_MOVED_GROUPS) -> list[str]:
-    """Apply configured rules after the refusal pass, under its watch lock."""
+    """Apply log entries after the refusal pass while holding the log lock."""
     if socket.gethostname().split(".", 1)[0] != role_map.ROLE_MAP_HOST:
         return []
     configured = read_auto_move_rules()
     rules = [rule for rule in configured if isinstance(rule, AutoMoveRule)]
-    lines = [rule.reason for rule in configured if isinstance(rule, MalformedAutoMoveRule)]
+    lines = [rule.reason for rule in configured if isinstance(rule, UnreadableNextMoveLog)]
     if not rules:
+        return lines
+    recorded = _recorded_auto_move_ids()
+    if isinstance(recorded, UnreadableAutoMoveHistory):
         return lines
     state = _load_state()
     original = deepcopy(state)
-    observations = state.setdefault("auto_moves", {})
     holds = state.get("auto_move_holds", {})
-    threshold = max((rule.when.percent for rule in rules if isinstance(rule.when, LeftAtMost)), default=0)
+    consumed = recorded.entry_ids & {rule.entry_id for rule in rules}
+    if consumed:
+        rules = [rule for rule in rules if rule.entry_id not in consumed]
+        for entry_id in consumed:
+            _ = holds.pop(entry_id, None)
+        if not dry_run:
+            next_moves.write_next_moves(tuple(entry for entry in next_moves.read_next_moves()
+                                              if entry.id not in consumed))
+            if state != original:
+                _save_state(state)
+    if not rules:
+        return lines
+    threshold = max((rule.when.percent for rule in rules), default=0)
     selected = accounts.group_accounts()
     members = accounts.live_group_members()
     shutdown_progress = cast(ShutdownProgressReader, cast(object, import_module("settle")))
@@ -924,11 +854,11 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         source_label = accounts.group_label(selected, rule.group)
         transition = accounts.group_transition(rule.group)
         selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
-        hold = holds.get(rule.name)
+        hold = holds.get(rule.entry_id)
         if hold is not None and (hold.account != source_label or hold.move_id != selection_id
-                                 or not isinstance(rule.when, LeftAtMost) or hold.percent != rule.when.percent):
-            del holds[rule.name]
-        if isinstance(rule.when, LeftAtMost) and rule.when.hold_minutes > 0:
+                                 or hold.percent != rule.when.percent):
+            del holds[rule.entry_id]
+        if rule.when.hold_minutes > 0:
             if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
                     or rule.group in moved):
                 continue
@@ -942,41 +872,24 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
             if not isinstance(source, refusals.FreshReading):
                 continue
             if source.weekly.left > rule.when.percent:
-                _ = holds.pop(rule.name, None)
+                _ = holds.pop(rule.entry_id, None)
                 continue
-            if rule.name not in holds:
-                holds[rule.name] = HoldStarted(source_label, now, selection_id, rule.when.percent)
+            if rule.entry_id not in holds:
+                holds[rule.entry_id] = HoldStarted(source_label, now, selection_id, rule.when.percent)
                 state["auto_move_holds"] = holds
-            if (now - holds[rule.name].at).total_seconds() / 60 < rule.when.hold_minutes:
+            if (now - holds[rule.entry_id].at).total_seconds() / 60 < rule.when.hold_minutes:
                 continue
         try:
             target_identity = accounts.account_identity(accounts.claude_account_dir(rule.to))
         except accounts.AccountsError as error:
-            lines.append(f"auto: {rule.name}: target {rule.to} unavailable: {error}")
+            lines.append(f"auto: {rule.entry_id}: target {rule.to} unavailable: {error}")
             continue
         if not isinstance(target_identity, agent_accounts.NumberedAccount):
-            lines.append(f"auto: {rule.name}: target {rule.to} is not logged in")
+            lines.append(f"auto: {rule.entry_id}: target {rule.to} is not logged in")
             continue
         target = refusals.stored_reading("claude", target_identity.login, now)
         if not isinstance(target, refusals.FreshReading):
             continue
-        progress: NeverActedOnReset | ActedOnReset = NeverActedOnReset()
-        if isinstance(rule.when, AfterReset):
-            if not isinstance(target.weekly.reset, refusals.KnownReset):
-                continue
-            current_reset = target.weekly.reset.at
-            previous = observations.get(rule.name)
-            if previous is None:
-                observations[rule.name] = AutoResetObservation(current_reset, NeverActedOnReset())
-                continue
-            if isinstance(previous.acted_reset, ActedOnReset) and previous.acted_reset.at == previous.observed_reset:
-                if current_reset != previous.observed_reset:
-                    observations[rule.name] = AutoResetObservation(
-                        observed_reset=current_reset, acted_reset=previous.acted_reset)
-                continue
-            if previous.observed_reset > now:
-                continue
-            progress = ActedOnReset(previous.observed_reset)
         if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
                 or rule.group in moved or rule.group in in_flight):
             continue
@@ -985,7 +898,7 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         held = held_refusals.get(refusals.key("claude", target_identity.login))
         if held is not None and not refusals.resolved(held, target, now):
             continue
-        if isinstance(rule.when, LeftAtMost) and rule.when.hold_minutes == 0:
+        if rule.when.hold_minutes == 0:
             source_identity = accounts.account_identity(accounts.claude_account_dir(source_label))
             if not isinstance(source_identity, agent_accounts.NumberedAccount):
                 continue
@@ -995,9 +908,9 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         prepared = (accounts.prepared_account_preview(rule.to, resume=True) if dry_run
                     else accounts.prepared_account(rule.to, resume=True))
         if isinstance(prepared, accounts.AccountRefused):
-            lines.append(f"auto: {rule.name}: move refused: {prepared.reason}")
+            lines.append(f"auto: {rule.entry_id}: move refused: {prepared.reason}")
             continue
-        why = f"auto: {rule.name}"
+        why = f"auto: {rule.entry_id}"
         lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {source_label} to {rule.to}")
         moved.add(rule.group)
         if dry_run:
@@ -1006,12 +919,10 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         selected[rule.group] = rule.to
         for group_rule in rules:
             if group_rule.group == rule.group:
-                _ = holds.pop(group_rule.name, None)
-        if isinstance(rule.when, AfterReset):
-            assert isinstance(target.weekly.reset, refusals.KnownReset)
-            observations[rule.name] = AutoResetObservation(
-                observed_reset=target.weekly.reset.at, acted_reset=progress)
-        # Commit the once-per-reset decision before starting detached session moves.
+                _ = holds.pop(group_rule.entry_id, None)
+        # Consume only after the group selection and its reason are recorded.
+        next_moves.write_next_moves(tuple(entry for entry in next_moves.read_next_moves()
+                                          if entry.id != rule.entry_id))
         _save_state(state)
         ids = tuple(member.session_id for member in members[rule.group]
                     if not accounts.session_on_account(member, rule.to))
@@ -1022,6 +933,17 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
     if not dry_run and state != original:
         _save_state(state)
     return lines
+
+
+def run_auto_moves(now: datetime, *, dry_run: bool = False,
+                   moved_groups: frozenset[accounts.ClaudeGroup] = NO_MOVED_GROUPS) -> list[str]:
+    """Read and consume one-shot entries under the same lock as log edits."""
+    if socket.gethostname().split(".", 1)[0] != role_map.ROLE_MAP_HOST:
+        return []
+    if dry_run:
+        return _run_auto_moves_locked(now, dry_run=True, moved_groups=moved_groups)
+    with next_moves.next_moves_lock():
+        return _run_auto_moves_locked(now, moved_groups=moved_groups)
 
 
 @role_map.role_map_command
