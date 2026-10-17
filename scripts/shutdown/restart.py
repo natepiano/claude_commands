@@ -1097,6 +1097,23 @@ def _herdr_launch(
         raise OSError(str(error)) from error
 
 
+def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
+    """Close the pane a session left behind when it moved into the shared session; stop the server it emptied."""
+    client = herdr.Herdr(recorded)
+    try:
+        rows = client.panes()
+        left = [row for row in rows if row["pane_id"] == pane]
+        if left and not isinstance(client.pane_activity(pane), herdr.PaneAtShell):
+            print(f"{name} restart issue: herdr {recorded}:{pane} still runs a program; left open")
+            return
+        if len(rows) == len(left):
+            herdr.stop_session(recorded)
+        elif left:
+            client.close_pane(pane)
+    except herdr.HerdrFailure as error:
+        print(f"{name} restart issue: herdr session {recorded} left open: {error}")
+
+
 def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> bool:
     try:
         client.focus_workspace(pane.split(":", 1)[0])
@@ -1202,9 +1219,13 @@ def _launch_session(
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
                           at=record["requested_at"], probe=record.get("probe", False))
     if host["kind"] == "herdr":
-        server = _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
-                      session, dry_run=dry_run, session_kind=desktop_state.session_kind)
-        name = host["herdr_session"]
+        shared = herdr.shared_session()
+        moving = bool(shared) and host["herdr_session"] != shared
+        destination = SharedHerdrTab(shared) if moving else RecordedHerdrPane(host["herdr_session"], host["pane_id"])
+        server = _herdr_launch(parts, destination, session, dry_run=dry_run, session_kind=desktop_state.session_kind)
+        if moving and not dry_run:
+            _leave_recorded_session(session["name"], host["herdr_session"], host["pane_id"])
+        name = destination.name
         if isinstance(server, herdr.WindowServerCreated):
             return SessionLaunched()
         if herdr_presentation(host) == "attached window":
