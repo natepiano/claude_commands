@@ -49,6 +49,10 @@ class HerdrMissing(HerdrFailure):
     """No herdr binary is available."""
 
 
+class _DarwinProcessGone(HerdrFailure):
+    """An empty failed ps read was confirmed by the pid no longer existing."""
+
+
 class SessionTaken(HerdrFailure):
     """A new session cannot own a server or systemd unit already in use."""
 
@@ -877,7 +881,9 @@ def _workspace_startup_state(value: object) -> _WorkspaceStartupState:
 def _pane_startup_state(value: object) -> _PaneStartupState:
     pane = json_object(value, "herdr pane")
     pane_id = json_text(pane.get("pane_id"), "herdr pane id")
-    revision, scrollback = pane.get("revision"), pane.get("max_offset_from_bottom")
+    revision, scroll = pane.get("revision"), pane.get("scroll")
+    scrollback = (json_object(cast(object, scroll), "herdr pane scroll").get("max_offset_from_bottom")
+                  if isinstance(scroll, dict) else None)
     untouched = (pane.get("agent") is None and pane.get("agent_status") == "unknown"
                  and pane.get("cwd") == str(Path.home()) and pane.get("foreground_cwd") == str(Path.home())
                  and type(revision) is int and revision == 0 and type(scrollback) is int and scrollback == 0)
@@ -1265,7 +1271,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
             if session and not command:
                 environment = _process_environment(process)
                 session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError as error:
             return ClientsUnreadable(str(error))
@@ -1306,18 +1312,29 @@ def darwin_open_files(pid: int) -> list[Path]:
     return [Path(field[1:]) for field in result.stdout.splitlines() if field.startswith("n/")]
 
 
+def _require_darwin_process_read(result: subprocess.CompletedProcess[str], pid: int, context: str) -> None:
+    if result.returncode != 0 and not result.stdout and not result.stderr:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError as error:
+            raise _DarwinProcessGone(f"process {pid}: exited") from error
+        except OSError:
+            pass
+    require_success(result, context)
+
+
 def darwin_process_environment(pid: int) -> dict[str, str]:
     """Read only the environment following a stable, separately read argv."""
     ps = os.environ.get("HERDR_PS", "ps")
     command = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(command, f"process {pid} command")
+    _require_darwin_process_read(command, pid, f"process {pid} command")
     arguments = command.stdout.rstrip("\r\n").lstrip()
     if arguments.startswith("(") and arguments.endswith(")"):
         raise HerdrFailure(f"process {pid}: arguments are unreadable")
     expanded = run_program([ps, "eww", "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(expanded, f"process {pid} environment")
+    _require_darwin_process_read(expanded, pid, f"process {pid} environment")
     confirmed = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(confirmed, f"process {pid} command confirmation")
+    _require_darwin_process_read(confirmed, pid, f"process {pid} command confirmation")
     text = expanded.stdout.rstrip("\r\n").lstrip()
     if not arguments or confirmed.stdout != command.stdout or not text.startswith(arguments):
         raise HerdrFailure(f"process {pid}: environment does not follow stable command")
@@ -1613,6 +1630,14 @@ def _darwin_processes() -> list[_UserProcess]:
         if uid != os.getuid() or pid <= 0:
             continue
         executable = fields[3].rstrip()
+        if pid not in commands:
+            try:
+                current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)], timeout=5)
+                _require_darwin_process_read(current, pid, f"process {pid} command")
+            except _DarwinProcessGone:
+                continue
+            except (HerdrFailure, subprocess.TimeoutExpired):
+                pass
         command = commands.get(pid, "")
         arguments: ReadProcessArguments | UnreadableProcessArguments = UnreadableProcessArguments(
             f"process {pid}: arguments are unreadable or changed")
@@ -1628,7 +1653,7 @@ def _darwin_processes() -> list[_UserProcess]:
 def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     try:
         processes = _darwin_processes()
-    except (HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
@@ -1641,7 +1666,9 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
         if session and not command:
             try:
                 environment = darwin_process_environment(process.pid)
-            except (HerdrFailure, subprocess.TimeoutExpired) as error:
+            except _DarwinProcessGone:
+                continue
+            except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
                 return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
         if (session == name and not command) or command == ["session", "attach", name]:

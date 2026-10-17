@@ -641,7 +641,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Gotchas:** herdr's attach client makes the `~` workspace after the server answers, so `_clear_restored_workspaces` never sees it. Fakes of herdr JSON must come from captured output: the flat-shape fakes passed while the real run failed.
 
-### Phase 24 — Startup shell check reads herdr's real pane list  · status: todo
+### Phase 24 — Startup shell check reads herdr's real pane list  · status: done
 
 **Depends on:** Phase 23
 
@@ -661,6 +661,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 2. Read the offset from the `scroll` object. A missing or non-object `scroll`, or a missing or non-int offset, still keeps the workspace.
 3. Every fake pane in `test_herdr.py` and `test_restart.py` that feeds the startup check uses the measured shape above, built from one shared captured entry per file rather than hand-written keyword fields, so a fake cannot drift from herdr again.
 4. Live, on the Mac (desktop unlocked): repeat the Phase 23 check (Codex probe pane, one prompt, snapshot, `server stop`, `restart --here --no-alert` over ssh); each restored window lists one workspace, the agent's.
+5. Showrunner add-on (2026-10-16, a wrong result): `shutdown.py tmux-free` on natedev exited 1 with `inventory incomplete: shared observations: herdr clients showrunner-fixer: [Errno 3] No such process`; a rerun passed. `attached_clients` (`herdr.py` ~1250) skips only `FileNotFoundError`; a process that exits between the `/proc` listing and reading its `environ` raises `ProcessLookupError`, which reaches the `OSError` branch and returns `ClientsUnreadable`. A client that vanishes mid-read counts as gone, on Linux and in the Darwin reader alike; any other read error still returns `ClientsUnreadable`.
 
 **Files:**
 - `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`
@@ -670,4 +671,4 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Constraints from prior phases:** Work Orders and fakes that describe herdr JSON quote captured output verbatim. Missing evidence keeps the workspace (Phase 23). Every herdr command names `--session`; never probe the default herdr server.
 
-**Acceptance gate:** a test that fails before the fix: the measured pane and workspace entries above make the startup workspace close; a nested offset of 1, a missing `scroll`, and a non-int offset each keep it. `merge_gate.py --tests-only` green; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; Mac `scripts/herdr` and `scripts/shutdown` suites green; Spec 4 passes on the Mac.
+**Acceptance gate:** a test that fails before the fix: the measured pane and workspace entries above make the startup workspace close; a nested offset of 1, a missing `scroll`, and a non-int offset each keep it; a client process that raises `ProcessLookupError` mid-read is skipped while a permission error still reads as unreadable (Spec 5). `merge_gate.py --tests-only` green; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; Mac `scripts/herdr` and `scripts/shutdown` suites green; Spec 4 passes on the Mac.

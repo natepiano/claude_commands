@@ -56,6 +56,21 @@ RESTARTED = "2026-10-10T01:02:03+00:00"
 EMPTY_SESSION_IDS: frozenset[str] = frozenset()
 
 
+# herdr 0.9.0, Mac, 2026-10-16 19:47 EDT: verbatim startup-shell list entries.
+STARTUP_PANE_JSON = '{"agent_status":"unknown","cwd":"/Users/natemccoy","focused":false,"foreground_cwd":"/Users/natemccoy","pane_id":"wG:p1","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":61},"tab_id":"wG:t1","terminal_id":"term_65dfdc73afbe63","workspace_id":"wG"}'
+STARTUP_WORKSPACE_JSON = '{"active_tab_id":"wG:t1","agent_status":"unknown","focused":false,"label":"~","number":1,"pane_count":1,"tab_count":1,"workspace_id":"wG"}'
+
+
+def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    """Adapt the captured shell's identity and home directory for this fixture."""
+    workspace = herdr.decode_object(STARTUP_WORKSPACE_JSON, "captured startup workspace")
+    pane = herdr.decode_object(STARTUP_PANE_JSON, "captured startup pane")
+    workspace.update(workspace_id=workspace_id, active_tab_id=workspace_id + ":t1")
+    pane.update(workspace_id=workspace_id, pane_id=workspace_id + ":p1", tab_id=workspace_id + ":t1",
+                cwd=str(Path.home()), foreground_cwd=str(Path.home()))
+    return workspace, pane
+
+
 class RestartAttemptTime(datetime):
     @classmethod
     @override
@@ -1026,15 +1041,13 @@ class RestartTests(ShutdownTestCase):
 
     def configure_startup_shell(self, responses: Path, name: str) -> None:
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+        workspace, pane = startup_shell("w9")
         replies[f"--session {name} workspace list"] = [
             {"stdout": json.dumps({"result": {"workspaces": []}}), "code": 0},
             {"stdout": json.dumps({"result": {"workspaces": [
-                dict(workspace_id="w9", label="~", tab_count=1,
-                    pane_count=1, agent_status="unknown"),
+                workspace,
                 dict(workspace_id="w2", label=name)]}}), "code": 0}]
-        replies[f"--session {name} pane list"] = {"stdout": json.dumps({"result": {"panes": [
-            dict(pane_id="w9:p1", agent_status="unknown", cwd=str(Path.home()), foreground_cwd=str(Path.home()),
-                revision=0, max_offset_from_bottom=0)]}}), "code": 0}
+        replies[f"--session {name} pane list"] = {"stdout": json.dumps({"result": {"panes": [pane]}}), "code": 0}
         _ = responses.write_text(json.dumps(replies))
 
     def test_window_restore_survives_startup_workspace_read_or_close_failure_with_one_session_issue(self) -> None:

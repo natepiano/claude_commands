@@ -29,6 +29,21 @@ from fake_herdr import CommandResponse
 GIT_BINARY = shutil.which("git") or "git"
 
 
+# herdr 0.9.0, Mac, 2026-10-16 19:47 EDT: verbatim startup-shell list entries.
+STARTUP_PANE_JSON = '{"agent_status":"unknown","cwd":"/Users/natemccoy","focused":false,"foreground_cwd":"/Users/natemccoy","pane_id":"wG:p1","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":61},"tab_id":"wG:t1","terminal_id":"term_65dfdc73afbe63","workspace_id":"wG"}'
+STARTUP_WORKSPACE_JSON = '{"active_tab_id":"wG:t1","agent_status":"unknown","focused":false,"label":"~","number":1,"pane_count":1,"tab_count":1,"workspace_id":"wG"}'
+
+
+def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    """Adapt the captured shell's identity and home directory for this fixture."""
+    workspace = herdr.decode_object(STARTUP_WORKSPACE_JSON, "captured startup workspace")
+    pane = herdr.decode_object(STARTUP_PANE_JSON, "captured startup pane")
+    workspace.update(workspace_id=workspace_id, active_tab_id=workspace_id + ":t1")
+    pane.update(workspace_id=workspace_id, pane_id=workspace_id + ":p1", tab_id=workspace_id + ":t1",
+                cwd=str(Path.home()), foreground_cwd=str(Path.home()))
+    return workspace, pane
+
+
 class StartupClock:
     elapsed: float = 0.0
 
@@ -738,6 +753,71 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="], code=1, stderr="cannot read processes")
         self.assertIsInstance(herdr.attached_clients("writing"), herdr.ClientsUnreadable)
 
+    def test_darwin_attached_clients_skip_clients_confirmed_gone_during_environment_reads(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        for stage in ("command", "environment", "confirmation"):
+            with self.subTest(stage=stage):
+                self.log.unlink(missing_ok=True)
+                self.darwin_process_table(f"81 1 {uid} herdr\n82 1 {uid} herdr session attach writing\n")
+                self.darwin_environment(81, "herdr", "HERDR_SESSION=writing")
+                if stage == "environment":
+                    self.configure(["eww", "-o", "command=", "-p", "81"], code=1)
+                elif stage == "confirmation":
+                    self.responses["-o command= -p 81"] = [
+                        {"stdout": "herdr\n", "code": 0}, {"stdout": "", "code": 1}]
+                    _ = self.responses_path.write_text(json.dumps(self.responses))
+                else:
+                    self.configure(["-o", "command=", "-p", "81"], code=1)
+                with patch.object(os, "kill", side_effect=ProcessLookupError("no such process")) as probe:
+                    self.assertEqual(herdr.attached_clients("writing"), herdr.ClientsAttached(1))
+                probe.assert_called_once_with(81, 0)
+                self.assertIn(["-o", "command=", "-p", "81"], self.commands())
+
+    def test_darwin_attached_clients_skip_clients_confirmed_gone_between_process_scans(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(f"81 1 {uid} herdr\n82 1 {uid} herdr session attach writing\n")
+        self.configure(["-U", str(uid), "-o", "pid=,command="], "82 herdr session attach writing\n")
+        self.configure(["-o", "command=", "-p", "81"], code=1)
+        with patch.object(os, "kill", side_effect=ProcessLookupError("no such process")) as probe:
+            self.assertEqual(herdr.attached_clients("writing"), herdr.ClientsAttached(1))
+        probe.assert_called_once_with(81, 0)
+        self.assertEqual(self.commands(), [
+            ["-U", str(uid), "-o", "pid=,ppid=,uid=,comm="],
+            ["-U", str(uid), "-o", "pid=,command="],
+            ["-o", "command=", "-p", "81"]])
+
+    def test_darwin_attached_clients_preserve_unconfirmed_process_read_failures(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        failures: list[tuple[str, CommandResponse, OSError | None]] = [
+            ("pid still exists", {"stdout": "", "code": 1}, None),
+            ("pid probe denied", {"stdout": "", "code": 1}, PermissionError("not permitted")),
+            ("pid probe failed", {"stdout": "", "code": 1}, OSError("probe failed")),
+            ("ps permission denied", {"stdout": "", "stderr": "permission denied", "code": 1},
+             ProcessLookupError("no such process")),
+            ("ps partial output", {"stdout": "herdr\n", "code": 1}, ProcessLookupError("no such process")),
+            ("ps malformed output", {"stdout": "(herdr)\n", "code": 0}, ProcessLookupError("no such process")),
+            ("ps empty success", {"stdout": "", "code": 0}, ProcessLookupError("no such process")),
+        ]
+        for stage in ("environment read", "argument scan"):
+            for reason, response, probe_error in failures:
+                with self.subTest(stage=stage, reason=reason):
+                    self.log.unlink(missing_ok=True)
+                    self.darwin_process_table(f"81 1 {uid} herdr\n82 1 {uid} herdr session attach writing\n")
+                    self.darwin_environment(81, "herdr", "HERDR_SESSION=writing")
+                    if stage == "argument scan":
+                        self.configure(["-U", str(uid), "-o", "pid=,command="], "82 herdr session attach writing\n")
+                    self.responses["-o command= -p 81"] = response
+                    _ = self.responses_path.write_text(json.dumps(self.responses))
+                    with patch.object(os, "kill", side_effect=probe_error, return_value=None) as probe:
+                        self.assertIsInstance(herdr.attached_clients("writing"), herdr.ClientsUnreadable)
+                    if reason in {"pid still exists", "pid probe denied", "pid probe failed"}:
+                        probe.assert_called_once_with(81, 0)
+                    else:
+                        probe.assert_not_called()
+
     def test_darwin_handoff_finds_reparented_pane_shells_and_their_agents(self) -> None:
         self.darwin()
         uid = os.getuid()
@@ -958,10 +1038,9 @@ class HerdrTests(unittest.TestCase):
             self.herdr.focus_workspace("w3")
 
     def test_startup_cleanup_closes_only_the_untouched_home_shell_and_preserves_the_restored_workspace(self) -> None:
-        workspaces = [dict(workspace_id=name, label="~", tab_count=1,
-            pane_count=1, agent_status="unknown") for name in ("w1", "w2", "w3")]
-        panes = [dict(pane_id=name + ":p1", agent_status="unknown", cwd=str(Path.home()),
-            foreground_cwd=str(Path.home()), revision=0, max_offset_from_bottom=0) for name in ("w1", "w2", "w3")]
+        shells = [startup_shell(name) for name in ("w1", "w2", "w3")]
+        workspaces = [workspace for workspace, _ in shells]
+        panes = [pane for _, pane in shells]
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": workspaces}}))
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
         self.herdr.close_startup_workspaces("w2")
@@ -974,15 +1053,23 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "pane", "list"],
             ["--session", "fixture", "workspace", "close", "w3"]])
 
+    def test_startup_cleanup_closes_the_shell_from_the_captured_mac_list_entries(self) -> None:
+        workspace = herdr.decode_object(STARTUP_WORKSPACE_JSON, "captured startup workspace")
+        pane = herdr.decode_object(STARTUP_PANE_JSON, "captured startup pane")
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [workspace]}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [pane]}}))
+        with (patch.object(herdr, "run_program", side_effect=self.run_fake),
+              patch.object(Path, "home", return_value=Path("/Users/natemccoy"))):
+            self.herdr.close_startup_workspaces("w2")
+        self.assertEqual(self.commands()[-1], ["--session", "fixture", "workspace", "close", "wG"])
+
     def test_startup_cleanup_preserves_workspace_changed_while_another_workspace_closes(self) -> None:
         for change in ("typed input", "renamed workspace", "removed workspace"):
             with self.subTest(change=change):
                 self.log.unlink(missing_ok=True)
-                workspaces = [dict(workspace_id=name, label="~", tab_count=1,
-                    pane_count=1, agent_status="unknown") for name in ("w1", "w2", "w3")]
-                panes = [dict(pane_id=name + ":p1", agent_status="unknown", cwd=str(Path.home()),
-                    foreground_cwd=str(Path.home()), revision=0, max_offset_from_bottom=0)
-                    for name in ("w1", "w2", "w3")]
+                shells = [startup_shell(name) for name in ("w1", "w2", "w3")]
+                workspaces = [workspace for workspace, _ in shells]
+                panes = [pane for _, pane in shells]
                 self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": workspaces}}))
                 self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
                 def close_then_change(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
@@ -1005,12 +1092,10 @@ class HerdrTests(unittest.TestCase):
 
     def test_startup_cleanup_preserves_workspaces_with_activity_or_incomplete_evidence(self) -> None:
         _ = self.enterContext(patch.object(herdr, "run_program", side_effect=self.run_fake))
-        workspace: dict[str, object] = dict(workspace_id="w1", label="~", tab_count=1,
-            pane_count=1, agent_status="unknown")
-        pane: dict[str, object] = dict(pane_id="w1:p1", agent_status="unknown", cwd=str(Path.home()),
-            foreground_cwd=str(Path.home()), revision=0, max_offset_from_bottom=0)
+        workspace, pane = startup_shell("w1")
+        scroll = herdr.json_object(pane["scroll"], "captured startup scroll")
         changed: list[tuple[str, dict[str, object], list[dict[str, object]]]] = [
-            ("scrollback", {**workspace}, [{**pane, "max_offset_from_bottom": 1}]),
+            ("scrollback", {**workspace}, [{**pane, "scroll": {**scroll, "max_offset_from_bottom": 1}}]),
             ("typed input", {**workspace}, [{**pane, "revision": 1}]),
             ("second pane", {**workspace}, [{**pane}, {**pane, "pane_id": "w1:p2"}]),
             ("missing pane", {**workspace}, []),
@@ -1022,10 +1107,13 @@ class HerdrTests(unittest.TestCase):
             ("cwd", {**workspace}, [{**pane, "cwd": str(self.root / "work")}]),
             ("foreground cwd", {**workspace}, [{**pane, "foreground_cwd": str(self.root / "work")}]),
             ("renamed", {**workspace, "label": "my shell"}, [{**pane}]),
-            ("missing screen state", {**workspace}, [{"pane_id": "w1:p1", "cwd": str(Path.home()),
-                "foreground_cwd": str(Path.home())}]),
+            ("non-object scroll", {**workspace}, [{**pane, "scroll": []}]),
+            ("null scroll", {**workspace}, [{**pane, "scroll": None}]),
+            ("missing scroll offset", {**workspace}, [{**pane, "scroll": {
+                key: value for key, value in scroll.items() if key != "max_offset_from_bottom"}}]),
+            ("text scroll offset", {**workspace}, [{**pane, "scroll": {**scroll, "max_offset_from_bottom": "0"}}]),
             ("boolean revision", {**workspace}, [{**pane, "revision": False}]),
-            ("boolean scrollback", {**workspace}, [{**pane, "max_offset_from_bottom": False}]),
+            ("boolean scrollback", {**workspace}, [{**pane, "scroll": {**scroll, "max_offset_from_bottom": False}}]),
             ("boolean tab count", {**workspace, "tab_count": True}, [{**pane}]),
             ("boolean pane count", {**workspace, "pane_count": True}, [{**pane}]),
         ]
@@ -1033,7 +1121,7 @@ class HerdrTests(unittest.TestCase):
                         [{**pane}]) for field in ("label", "tab_count", "pane_count", "agent_status"))
         changed.extend((f"missing pane {field}", {**workspace},
                         [{key: value for key, value in pane.items() if key != field}])
-                       for field in ("agent_status", "cwd", "foreground_cwd", "revision", "max_offset_from_bottom"))
+                       for field in ("agent_status", "cwd", "foreground_cwd", "revision", "scroll"))
         for reason, candidate, members in changed:
             with self.subTest(reason=reason):
                 self.log.unlink(missing_ok=True)
@@ -1121,6 +1209,25 @@ class HerdrTests(unittest.TestCase):
             self.assertIsInstance(herdr.attached_clients("default"), herdr.ClientsUnreadable)
         vanished.joinpath("cmdline").mkdir()
         self.assertIsInstance(herdr.attached_clients("default"), herdr.ClientsUnreadable)
+
+    def test_attached_clients_skip_vanished_clients_but_report_permission_errors(self) -> None:
+        disappearing = self.process(10, 1, ["herdr"], {"HERDR_SESSION": "writing"})
+        _ = self.process(11, 1, ["herdr"], {"HERDR_SESSION": "writing"})
+        original = Path.read_bytes
+        for field in ("cmdline", "environ"):
+            for failure in (FileNotFoundError, ProcessLookupError, PermissionError):
+                with self.subTest(field=field, failure=failure.__name__):
+                    def read(path: Path) -> bytes:
+                        if path == disappearing / field:
+                            raise failure("client process read")
+                        return original(path)
+
+                    with patch.object(Path, "read_bytes", read):
+                        result = herdr.attached_clients("writing")
+                    if failure is PermissionError:
+                        self.assertEqual(result, herdr.ClientsUnreadable("client process read"))
+                    else:
+                        self.assertEqual(result, herdr.ClientsAttached(1))
 
     def test_bare_client_uses_environment_session_but_explicit_argv_wins(self) -> None:
         _ = self.process(10, 1, ["herdr"], {"HERDR_SESSION": "writing"})
