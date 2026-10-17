@@ -263,11 +263,6 @@ live units holding those files, and a recommended answer. Show the count in
 reports; present proposals only when asked through `/showrunner:proposals` or
 `/adhoc_review`. The proposal phase supplies filing and approval commands.
 
-## Report
-
-Use `/showrunner:style_report` for coverage, held changes and pending hand-offs.
-The report phase supplies the command and its output contract.
-
 ## Lifetime
 
 The production and its unit plans are standing. An empty queue leaves a unit
@@ -276,3 +271,17 @@ style production. While a root, it merges its own hand-offs into the branch
 point using `**Parent production:**` as the merge context. Pending hand-offs
 survive detachment; the hand-off and proposal phases supply the root merge and
 detach procedures.
+
+## Report
+
+Run `/showrunner:style_report [rule|crate]` from the style showrunner or any
+showrunner above it. It prints coverage at the synced tip, held changes, pending
+hand-offs and changes since the last report. Rule views include open tickets;
+crate views include the oldest open ticket. Proposals are shown only when asked.
+
+The script is `scripts/style/coverage_report.py --repo <style checkout>
+[--rule <id or unique stem> | --crate <directory or package name>]`. It reads
+`style_ledger.Ledger`; its header uses `summary()`. Unclassified rules are listed
+as a count with `pull nate_style`, and awaiting-merge cells count separately
+from current coverage. The comparison snapshot is `last_report.json` beside
+the ledger, including under `STYLE_LEDGER_STATE_DIR`.
