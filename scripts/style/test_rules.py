@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import rules
 import style_rules
 from candidate_generators import CandidatesSpecError, read_candidates_spec
@@ -262,6 +264,45 @@ class RuleTests(unittest.TestCase):
         loaded = rules.load_rules(None)
         self.assertEqual([rule.name for rule in loaded], ["clippy", "mend", "rustfmt"])
         self.assertEqual([rule.tier for rule in loaded], ["A", "A", "A"])
+
+    def test_global_tier_d_rule_rejects_the_types_family(self) -> None:
+        path = self.write_rule("structure", "tier: D\nfamily: types\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(None)
+
+        self.assertEqual(str(raised.exception), f"{path}: tier D requires the modules family")
+
+    def test_local_tier_d_rule_rejects_the_types_family(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "structure.md"
+        _ = path.write_text("---\ntier: D\nfamily: types\n---\n# Structure rule\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+
+        self.assertEqual(str(raised.exception), f"{path}: tier D requires the modules family")
+
+    def test_modules_family_loads_for_tiers_b_c_and_d_from_both_origins(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        for tier in ("B", "C", "D"):
+            metadata = f"tier: {tier}\nfamily: modules\n"
+            if tier == "B":
+                metadata += "pre_filter: item\n"
+            _ = self.write_rule(f"modules-{tier}", metadata)
+            _ = (local_dir / f"modules-{tier}.md").write_text(f"---\n{metadata}---\n# Modules rule\n")
+
+        loaded = rules.load_rules(repo)
+
+        self.assertEqual(
+            {(rule.origin, rule.tier, rule.family) for rule in loaded},
+            {(origin, tier, "modules") for origin in ("global", "local") for tier in ("B", "C", "D")},
+        )
+        self.assertEqual(len(loaded), 6)
 
     def test_discovers_root_and_member_rules_without_filtering_tool_or_bevy_rules(self) -> None:
         global_path = self.write_rule("same-name", "tier: A\nmechanism: mend\ntags:\n  - bevy\nmode: auto\n")
