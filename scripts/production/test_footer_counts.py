@@ -69,6 +69,18 @@ class FooterCountsTests(unittest.TestCase):
                        f"- **Improvement queue:** {ledger}")
         self.assertEqual(footer_counts.read_counts(doc, questions=1), FooterCounts(2, 1, 2, 1))
 
+    def test_sources_name_each_file_a_count_reads_and_each_open_proposal(self) -> None:
+        listing = self.root / "change-review.md"
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue(folder, "wanted", "open", "proposal")
+        issue(folder, "closed", "closed", "proposal")
+        ledger = self.root / "ledger.md"
+        doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
+                       f"- **Improvement queue:** {ledger}")
+        self.assertEqual(footer_counts.sources(doc), [doc, listing, folder, ledger, folder / "wanted.md"])
+        self.assertEqual(footer_counts.sources(self.doc()), [self.root / "production.md"])
+
     def test_a_doc_without_the_lines_counts_nothing(self) -> None:
         self.assertEqual(footer_counts.read_counts(self.doc()), FooterCounts())
         missing = self.doc(f"- **Change review:** `{self.root / 'absent.md'}`",
