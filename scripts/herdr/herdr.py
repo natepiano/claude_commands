@@ -35,7 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
 _PLATFORM = sys.platform
-MARK_KEYS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+# The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
+# server started from inside a unit, drops them so that the unit's lookup never finds a second session.
+UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
 
 
 class HerdrFailure(Exception):
@@ -447,10 +449,16 @@ def json_items(value: object, context: str) -> list[object]:
     return cast(list[object], value)
 
 
+def unmarked_environment() -> dict[str, str]:
+    """This process's environment without a unit's marks, so that no server it starts carries them."""
+    return {key: value for key, value in os.environ.items() if key not in UNIT_MARKS}
+
+
 def run_program(argv: list[str], timeout: float = 10.0, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout, env=environment)
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
+                              env=unmarked_environment() if environment is None else environment)
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
 
@@ -978,7 +986,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 
 
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
-    from detached import DiscardOutput, InheritEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
+    from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
     try:
@@ -1013,7 +1021,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
 
     try:
         pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic(),
-                             output=DiscardOutput(), environment=InheritEnvironment())
+                             output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
     except DetachedChildExited as error:
         if holders and holders != {error.pid}:
             if exclusive:
@@ -1803,7 +1811,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
             pane = environment.get("HERDR_PANE_ID", "")
             if environment.get("TMUX_PANE") or not pane:
                 continue
-            marks = {key: environment[key] for key in MARK_KEYS if key in environment}
+            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -1833,7 +1841,7 @@ def herdr_processes() -> list[HerdrProcess]:
             if not arguments:
                 continue
             cwd = str(process.joinpath("cwd").resolve(strict=True))
-            marks = {key: environment[key] for key in MARK_KEYS if key in environment}
+            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue

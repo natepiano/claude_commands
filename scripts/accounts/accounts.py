@@ -1258,7 +1258,11 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
     if probe:
+        from scripts.herdr.herdr import UNIT_MARKS
+
         environment[PROBE_ENV] = "1"
+        for name in UNIT_MARKS:
+            _ = environment.pop(name, None)
     try:
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),

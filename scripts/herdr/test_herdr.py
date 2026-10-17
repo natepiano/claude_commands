@@ -360,7 +360,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertIsInstance(outcome, herdr.ServerCreated)
                 spawn.assert_called_once_with([str(self.fake), "--session", "fixture", "server"],
                     start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, close_fds=True, env=None)
+                    stderr=subprocess.DEVNULL, close_fds=True, env=herdr.unmarked_environment())
                 self.assertEqual(self.commands(), [
                     ["--session", "fixture", "status", "server"],
                     ["--session", "fixture", "status", "server"],
@@ -1048,6 +1048,17 @@ class HerdrTests(unittest.TestCase):
         folder = self.root / "config/herdr"
         folder.mkdir(parents=True, exist_ok=True)
         _ = (folder / "shared-session").write_text("fixture\n")
+
+    def test_programs_and_servers_never_inherit_a_units_marks(self) -> None:
+        with patch.dict(os.environ, SHOWRUNNER_UNIT="show/demo-unit", SHOWRUNNER_UNIT_ID="id-demo", KEPT="yes"), \
+                patch.object(subprocess, "run") as run:
+            _ = herdr.run_program(["true"])
+            given = cast(dict[str, str], run.call_args.kwargs["env"])
+            self.assertEqual(given["KEPT"], "yes")
+            self.assertNotIn("SHOWRUNNER_UNIT", given)
+            self.assertNotIn("SHOWRUNNER_UNIT_ID", given)
+            _ = herdr.run_program(["true"], environment={"SHOWRUNNER_UNIT": "explicit"})
+            self.assertEqual(run.call_args.kwargs["env"], {"SHOWRUNNER_UNIT": "explicit"})
 
     def test_shared_session_is_empty_until_named(self) -> None:
         self.assertEqual(herdr.shared_session(), "")
