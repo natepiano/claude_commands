@@ -375,6 +375,17 @@ def _stop_unit_session(
         "cause": "stop not confirmed",
     }
     claim.check()
+    if name == herdr.shared_session():
+        # The shared session holds every production: close only this unit's tab, named for its session.
+        client = herdr.Herdr(name)
+        try:
+            client.close_tab_labelled(session["name"])
+            left = session["name"] in client.tab_labels()
+        except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+            left = True
+        finally:
+            claim.check()
+        return [issue] if left else []
     try:
         herdr.stop_session(name)
     except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):

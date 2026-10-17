@@ -125,9 +125,15 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
     environment = {"ENABLE_TOOL_SEARCH": "true"}
     environment.update(named_account_environment(selected.dir))
-    herdr.start_new_server(child.slug, 90_000)
-    pane = herdr.open_pane(child.slug, child.slug, str(cwd), environment)
-    herdr.start_agent(child.slug, pane, kind="claude", agent_arguments=arguments,
+    host = herdr.shared_session()
+    if host:
+        _ = herdr.start_server(host, 90_000)
+        pane = herdr.open_tab(host, child.slug, child.slug, str(cwd), environment)
+    else:
+        host = child.slug
+        herdr.start_new_server(host, 90_000)
+        pane = herdr.open_pane(host, child.slug, str(cwd), environment)
+    herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
                       opening=herdr.OpeningPrompt(prompt), timeout_ms=90_000)
 
 
