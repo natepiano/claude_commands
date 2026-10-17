@@ -1634,30 +1634,23 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 56
 
-#### Work Order
+#### As-built
 
-**Goal:** `accounts.py status` shows why an account went unread after its weekly reset, instead of a bare `unavailable`. An idle Claude account's login token is renewed only by a Claude session on it. Once the token is stale, the 2-minute pass skips the read (`Weekly quota: not read (stale token; …)`), and after the recorded reset the stored weekly reading is no longer current. Showrunner decision 2026-10-17: display only. The pass never wakes the token and never infers 100% from a reset.
-
-**Constraints from prior phases:**
-- `_status_row` (`scripts/accounts/accounts.py` ~:3680) sets weekly and resets to `StatusUnavailable("unavailable")` when the stored weekly window is not current. `read_at` comes from `_read_at(usage)`.
-- `claude_live` (`scripts/whoami/agent_accounts.py` ~:698) returns `quota_problem` "Weekly quota: not read (stale token; a Claude session on this account refreshes it)" when the stored token has expired.
-- `agent_notes.apply` writes `weekly_remaining_usage: null` for an account whose recorded reset has passed. Never infer 100% remaining from a reset.
-- Tests never touch live directories, run ssh, or read a real keychain, process or credential file.
-
-**Spec:**
-1. When the stored weekly window has expired (its reset has passed), the weekly cell reads `not read since <HH:MM>` in the user's zone. The time comes from the last stored reading of the account (`read_at`). When the account's last read was skipped for a stale token, the cell continues `: no session to refresh its login`. Example: `not read since 05:29: no session to refresh its login`. Keep the reason typed; never match the problem text. With no stored reading at all, keep `unavailable`.
-2. The stale-token skip is recorded with the stored usage, or carried another typed way, so `status` can tell it apart from other unread causes.
-3. Regression tests: a past reset with a stale-token skip shows the reason; a past reset with another cause shows only `not read since <HH:MM>`; a current window is unchanged.
+- After an account's weekly reset passes with no new reading, `accounts.py status`'s weekly cell reads `not read since HH:MM` (user zone) from the last stored reading (`read_at`) instead of `unavailable`. When the latest read attempt was skipped because the login token is stale (only a Claude session refreshes it), the cell adds `: no session to refresh its login`, e.g. `not read since 05:29: no session to refresh its login`. With no stored reading the cell stays `unavailable`; a current window is unchanged. Display only: no new read, token refresh or Claude call, and a passed reset never implies 100% remaining.
+- `scripts/whoami/agent_accounts.py`: `StaleTokenSkip`, `NoWeeklyReadSkip`; `Report.weekly_read_skip: StaleTokenSkip | NoWeeklyReadSkip` (default `NoWeeklyReadSkip`), set to `StaleTokenSkip` on `claude_live`'s expired-token branch beside its `quota_problem`.
+- `scripts/whoami/usage_store.py`: `StoredUsage.weekly_read_skip: Literal["stale_token"]` with `weekly_read_skip_directory: str` (the skip's `ClaudeDirectorySource.directory`), decoded by `weekly_read_skip(usage) -> StaleTokenSkip | NoWeeklyReadSkip`. `merge` sets both on a stale skip; any later attempt for that login, or any later Claude attempt from that directory (a failed one with no login, or one for another login), clears them. Last good numbers and their timestamps are kept. `agent_notes.py`'s existing report save carries the reason unchanged.
+- `scripts/accounts/accounts.py`: `WeeklyNotReadSince(read_at, reason)`, a `StatusRow.weekly_left_percent` variant set in `_status_row` when the stored window's reset is at or before now and rendered in `_status_row_cells`; `render_status_json` writes `weekly_left_percent: null` for it, as before.
 
 **Files:**
-- `scripts/accounts/accounts.py`
-- `scripts/whoami/agent_accounts.py`
-- `scripts/whoami/agent_notes.py`
-- `scripts/whoami/usage_store.py`
-- `scripts/accounts/test_accounts.py`
-- `scripts/whoami/test_agent_notes.py`
-- `scripts/whoami/test_usage_store.py`
+- `scripts/accounts/accounts.py` — `WeeklyNotReadSince`, status row and cell.
+- `scripts/whoami/agent_accounts.py` — skip reason types, `Report.weekly_read_skip`.
+- `scripts/whoami/usage_store.py` — stored skip and directory, decoder, clearing in `merge`.
+- `scripts/accounts/test_accounts.py` — display cases; a real `claude_live` stale skip followed by an authentication failure clears the reason and keeps the last good reading.
+- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_usage_store.py` — the update pass stores the typed skip; persistence, decode and clearing.
 
-**Workers:** `1 writer + 1 tester`. `impl` owns the production files; `test` owns the test files.
+**Gotchas:**
+- An authentication-status failure yields a `Report` with no email; the recorded directory is what lets that attempt clear the stale reason.
+- A marker stored without a directory cannot be cleared by a loginless failure.
+- The reason is typed; nothing matches the `quota_problem` text.
 
-**Acceptance gate:** the cell reads as in Spec 1 for each case; no new read, token refresh or Claude call is added; basedpyright 0/0; phase suites and merge gate green on Linux and the Mac.
+**Ruled out:** waking or refreshing the token from the pass; inferring 100% remaining from a passed reset; detecting the skip from its problem text.
