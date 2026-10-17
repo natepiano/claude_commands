@@ -613,6 +613,15 @@ Pending: parent's saved style child summary and rendered style line.
   and records a cell only after both have judged it, clean only when both
   call it clean. Reading the names rules costs twice what it did. The
   name-bindings ticket keeps one judge, since it meets its bar alone.
+- **Fix AB — modules refill reads listed sites once per crate** (commit `6e2975f4`):
+  building the modules queue took 228 s, 220 s of it in 1318 reads of a
+  rule's listed sites: each read reloads the rule catalog, and the
+  structure branch read it once per rule for every batch. It now reads each
+  rule's sites once per crate and filters them per batch. The queue builds
+  in 25 s instead of 182 s with identical tickets, about a third of each
+  modules ticket's cycle. A test pins the read count and three exact
+  tickets; it fails before the fix. The unit director closed the review on
+  their own read of the change.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
