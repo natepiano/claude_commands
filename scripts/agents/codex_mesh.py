@@ -166,9 +166,49 @@ class WorkerQuotaRecoveryStopped(ServingRequestFailure):
         self.thread_id: str = thread_id
 
 
+@dataclass(frozen=True)
+class KnownWorkerDirector:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class UnknownWorkerDirector:
+    """The command's director could not be uniquely identified."""
+
+
+@dataclass(frozen=True)
+class ResolveWorkerDirector:
+    """Resolve the director while the command's launcher evidence is intact."""
+
+
+RESOLVE_WORKER_DIRECTOR = ResolveWorkerDirector()
+
+
+@dataclass(frozen=True)
+class RefusalWithoutCommandExit:
+    """Report routing while the command can still recover."""
+
+
+@dataclass(frozen=True)
+class CommandStoppedBeforeThread:
+    session_dir: str
+    director: KnownWorkerDirector | UnknownWorkerDirector | ResolveWorkerDirector = RESOLVE_WORKER_DIRECTOR
+
+
+@dataclass(frozen=True)
+class CommandStoppedOnThread:
+    session_dir: str
+    thread_id: str
+    director: KnownWorkerDirector | UnknownWorkerDirector | ResolveWorkerDirector = RESOLVE_WORKER_DIRECTOR
+
+
+RefusalCommandContext = RefusalWithoutCommandExit | CommandStoppedBeforeThread | CommandStoppedOnThread
+REFUSAL_WITHOUT_COMMAND_EXIT = RefusalWithoutCommandExit()
+
+
 def _serving_request(
     client: Client, method: str, params: dict[str, object], *, submits_work: bool = False,
-    stopped_in: str = "",
+    stopped: RefusalCommandContext = REFUSAL_WITHOUT_COMMAND_EXIT,
 ) -> dict[str, object]:
     opened = time.time()
     try:
@@ -180,7 +220,7 @@ def _serving_request(
             serving.started_here or time.time() - opened > RETRY_FAST_FAILURE_SECS)
         if proven:
             _owe_quota_continuation(client, _as_str(params.get("threadId")))
-            _report_quota_refusal(client.name, serving, detail, stopped_in=stopped_in)
+            _report_quota_refusal(client.name, serving, detail, stopped=stopped)
         raise ServingRequestFailure(detail, serving, proven) from error
 
 SERVER_FILE = "mesh_server.json"
@@ -1968,34 +2008,42 @@ class FailedBeforeThread:
 
 
 @dataclass(frozen=True)
+class AwaitingQuotaContinuation:
+    """No continuation submission has yet been accepted."""
+
+
+@dataclass(frozen=True)
+class SubmittedQuotaContinuation:
+    thread_id: str
+    turn_id: str
+
+
+@dataclass(frozen=True)
+class QuotaContinuationTurn:
+    """This submission resumes the work interrupted by the pending refusal."""
+
+
+@dataclass(frozen=True)
+class UnrelatedWorkerTurn:
+    """This submission cannot finish an earlier quota continuation."""
+
+
+UNRELATED_WORKER_TURN = UnrelatedWorkerTurn()
+
+
+@dataclass(frozen=True)
 class PendingQuotaRefusal:
-    """A reported refusal whose interrupted command has not completed."""
+    """A reported refusal whose owed continuation has not completed."""
 
     serving: CodexServingState
     detail: str
+    continuation: AwaitingQuotaContinuation | SubmittedQuotaContinuation = field(
+        default_factory=AwaitingQuotaContinuation, kw_only=True)
 
 
 @dataclass(frozen=True)
 class NoPendingQuotaRefusal:
     """This command has no reported quota refusal to hand back on exit."""
-
-
-@dataclass(frozen=True)
-class KnownWorkerDirector:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class UnknownWorkerDirector:
-    """The command's director could not be uniquely identified."""
-
-
-@dataclass(frozen=True)
-class ResolveWorkerDirector:
-    """Resolve the director while the command's launcher evidence is intact."""
-
-
-RESOLVE_WORKER_DIRECTOR = ResolveWorkerDirector()
 
 
 @dataclass(frozen=True)
@@ -2182,28 +2230,28 @@ def _worker_director(folder: Path) -> KnownWorkerDirector | UnknownWorkerDirecto
     return KnownWorkerDirector(holders[0]) if len(holders) == 1 else UnknownWorkerDirector()
 
 
-def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "", *, stopped_in: str = "",
-                         stopped_thread_id: str = "",
-                         director: KnownWorkerDirector | UnknownWorkerDirector | ResolveWorkerDirector = RESOLVE_WORKER_DIRECTOR) -> None:
+def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "", *,
+                         stopped: RefusalCommandContext = REFUSAL_WITHOUT_COMMAND_EXIT) -> None:
     """Hand the serving identity, named limit and refusal time to the account mover."""
     try:
         account = serving.account
         identity = ([str(account.home), account.login, account.label]
                     if isinstance(account, KnownCodexAccount)
                     else [str(account.home), account.reason])
-        stopped: list[str] = []
-        if stopped_in:
+        stopped_arguments: list[str] = []
+        if isinstance(stopped, (CommandStoppedBeforeThread, CommandStoppedOnThread)):
+            director = stopped.director
             if isinstance(director, ResolveWorkerDirector):
-                director = _worker_director(Path(stopped_in))
+                director = _worker_director(Path(stopped.session_dir))
             if isinstance(director, KnownWorkerDirector):
-                stopped = ["--stopped", director.session_id, name, shlex.join(sys.argv)]
-            if stopped_thread_id:
-                _ = _update_roster_if_expected(stopped_in, name,
-                    {"thread_id": stopped_thread_id, "status": "failed", "continuation_owed": False},
-                                               RosterOnThread(stopped_thread_id))
+                stopped_arguments = ["--stopped", director.session_id, name, shlex.join(sys.argv)]
+            if isinstance(stopped, CommandStoppedOnThread):
+                _ = _update_roster_if_expected(stopped.session_dir, name,
+                    {"thread_id": stopped.thread_id, "status": "failed", "continuation_owed": False},
+                                               RosterOnThread(stopped.thread_id))
         done = subprocess.run(
             [sys.executable, str(QUOTA_REPORT), "blocked", *identity,
-             "--window", _quota_window(detail), "--refused-at", datetime.now(timezone.utc).isoformat(), *stopped],
+             "--window", _quota_window(detail), "--refused-at", datetime.now(timezone.utc).isoformat(), *stopped_arguments],
             capture_output=True, text=True, timeout=QUOTA_REPORT_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2285,16 +2333,17 @@ def command_start(args: argparse.Namespace) -> int:
     if (isinstance(outcome, (FailedWithThread, CapacityRetriesExhausted))
             and isinstance(outcome.pending_refusal, PendingQuotaRefusal)):
         refusal = outcome.pending_refusal
-        _report_quota_refusal(name, refusal.serving, refusal.detail, stopped_in=session_dir,
-                             stopped_thread_id=outcome.thread_id, director=outcome.director)
+        _report_quota_refusal(name, refusal.serving, refusal.detail,
+                             stopped=CommandStoppedOnThread(session_dir, outcome.thread_id, outcome.director))
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
         print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
         if not outcome.refusal_reported and not (isinstance(outcome, FailedWithThread) and outcome.refusal_checked) and _quota_refused(outcome, tested, resident):
             if isinstance(outcome, FailedWithThread):
-                _report_quota_refusal(name, outcome.serving, outcome.failure, stopped_in=session_dir,
-                                     stopped_thread_id=outcome.thread_id, director=outcome.director)
+                _report_quota_refusal(name, outcome.serving, outcome.failure,
+                                     stopped=CommandStoppedOnThread(session_dir, outcome.thread_id, outcome.director))
             else:
-                _report_quota_refusal(name, outcome.serving, outcome.failure, stopped_in=session_dir)
+                _report_quota_refusal(name, outcome.serving, outcome.failure,
+                                     stopped=CommandStoppedBeforeThread(session_dir))
         return 1
     if isinstance(outcome, CapacityRetriesExhausted):
         print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
@@ -2684,7 +2733,7 @@ def _attach_and_run(
     client = Client(port, name)
     _ = _bind_serving_server(client, session_dir, started_here=started_here)
     started = _serving_request(client, "thread/start", _thread_start_params(args),
-                               submits_work=True, stopped_in=session_dir)
+                               submits_work=True, stopped=CommandStoppedBeforeThread(session_dir))
     thread_id = _as_str(_as_dict(started.get("thread")).get("id"))
     if not thread_id:
         raise SystemExit("codex_mesh: thread/start returned no thread id")
@@ -2726,11 +2775,12 @@ def _resume_account_move(
     thread_id: str,
     client: Client,
     marker: AccountMoveMarker,
+    *, submission: QuotaContinuationTurn | UnrelatedWorkerTurn = UNRELATED_WORKER_TURN,
 ) -> MovedWorker:
     """Resume the marked worker and acknowledge its accepted continuation."""
     try:
         resumed = _start_workers_turn(
-            args, session_dir, name, thread_id, client, ACCOUNT_MOVE_CONTINUATION)
+            args, session_dir, name, thread_id, client, ACCOUNT_MOVE_CONTINUATION, submission=submission)
         if not resumed.turn_id:
             raise SystemExit("account move continuation returned no turn id")
         _ = _update_roster_if_expected(
@@ -2778,6 +2828,8 @@ class TurnStream:
     capacity_waited: float = 0.0
     capacity_retries: int = 0
     resume_owed: bool = False
+    # Whether the owed capacity resume continues an earlier quota continuation.
+    capacity_submission: QuotaContinuationTurn | UnrelatedWorkerTurn = UNRELATED_WORKER_TURN
     waiting_for_progress_after_overflow: bool = False
     run_outcome: RunOutcome = field(default_factory=RunCompleted)
     pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(default_factory=NoPendingQuotaRefusal)
@@ -2789,6 +2841,54 @@ class StreamStep(Enum):
 
     NEXT_FRAME = "next_frame"
     FINISH = "finish"
+
+
+def _quota_retry_submission(
+    pending: PendingQuotaRefusal | NoPendingQuotaRefusal, thread_id: str, turn_id: str,
+) -> QuotaContinuationTurn | UnrelatedWorkerTurn:
+    if (isinstance(pending, PendingQuotaRefusal)
+            and isinstance(pending.continuation, SubmittedQuotaContinuation)
+            and pending.continuation.thread_id == thread_id and pending.continuation.turn_id == turn_id):
+        return QuotaContinuationTurn()
+    return UNRELATED_WORKER_TURN
+
+
+def _pending_after_worker_start(
+    pending: PendingQuotaRefusal | NoPendingQuotaRefusal, started: MovedWorker,
+) -> PendingQuotaRefusal | NoPendingQuotaRefusal:
+    if isinstance(started.pending_refusal, PendingQuotaRefusal):
+        pending = started.pending_refusal
+    if (isinstance(pending, PendingQuotaRefusal) and started.turn_id
+            and isinstance(started.submission, QuotaContinuationTurn)):
+        return replace(pending, continuation=SubmittedQuotaContinuation(started.thread_id, started.turn_id))
+    return pending
+
+
+def _quota_continuation_finished(client: Client, thread_id: str, turn_id: str) -> bool:
+    """An idle read-back must confirm this continuation completed successfully."""
+    try:
+        reply = client.call("thread/read", {"threadId": thread_id, "includeTurns": True}, UNSEEN_END_CALL_SECS)
+    except (ConnectionError, OSError, SystemExit):
+        return False
+    if reply.get("error"):
+        return False
+    thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
+    if _as_str(_as_dict(thread.get("status")).get("type")) != "idle":
+        return False
+    turns = thread.get("turns")
+    return isinstance(turns, list) and any(
+        (record := _as_dict(turn)).get("id") == turn_id and record.get("status") == "completed"
+        for turn in cast("list[object]", turns))
+
+
+def _pending_after_completion_readback(
+    pending: PendingQuotaRefusal | NoPendingQuotaRefusal, client: Client,
+) -> PendingQuotaRefusal | NoPendingQuotaRefusal:
+    if (isinstance(pending, PendingQuotaRefusal)
+            and isinstance(pending.continuation, SubmittedQuotaContinuation)
+            and _quota_continuation_finished(client, pending.continuation.thread_id, pending.continuation.turn_id)):
+        return NoPendingQuotaRefusal()
+    return pending
 
 
 def _stream_turn(
@@ -2897,6 +2997,7 @@ def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
     """Watch the server, thread and turn a submission landed on."""
     stream.client, stream.port = started.client, started.port
     stream.thread_id, stream.turn_id = started.thread_id, started.turn_id
+    stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, started)
     if stream.follow:
         stream.followed_turn = stream.turn_id
 
@@ -2904,6 +3005,7 @@ def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
 def _adopt_moved_worker(stream: TurnStream, moved: MovedWorker) -> bool:
     """Watch the server a move landed on; true when it left a turn or a continuation to watch."""
     stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
+    stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
     if not (moved.turn_id or _continuation_is_owed(stream.session_dir, stream.name)):
         return False
     stream.turn_id = moved.turn_id or stream.turn_id
@@ -2928,7 +3030,8 @@ def _move_worker(stream: TurnStream) -> WorkerMoveResult:
 def _resume_marked_account_move(stream: TurnStream, marker: AccountMoveMarker) -> None:
     """Open the marked move's continuation and forget the answer of the turn it replaced."""
     _adopt_started_turn(stream, _resume_account_move(
-        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, marker))
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, marker,
+        submission=_quota_retry_submission(stream.pending_refusal, stream.thread_id, marker.turn_id)))
     stream.failure = stream.followed_failure = stream.final_answer = ""
 
 
@@ -2947,6 +3050,8 @@ def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str)
 
 def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep:
     """No frame arrived within one poll: catch a move, an unseen end or a resident off its server."""
+    if not stream.resume_owed:
+        stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
     account_move = _read_account_move(stream.session_dir, stream.name, stream.thread_id)
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and _ended_unseen(stream.client, stream.thread_id)):
@@ -3010,6 +3115,7 @@ def _keep_resident_on_selected_server(stream: TurnStream, log: TextIO) -> None:
     elif isinstance(moved, MovedWorker):
         changed = moved.port != stream.port or moved.thread_id != stream.thread_id
         stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
+        stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
         stream.turn_id = moved.turn_id or stream.turn_id
         if changed:
             _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} moved to the workers app-server on port {stream.port}\n")
@@ -3090,6 +3196,7 @@ def _on_turn_end(
     if stream.follow:
         stream.followed_turn = ""
     turn_outcome = _turn_outcome(method, params)
+    _settle_quota_continuation(stream, notice_turn, turn_outcome)
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and (not notice_turn or notice_turn == account_move.turn_id)):
         _resume_marked_account_move(stream, account_move)
@@ -3099,15 +3206,29 @@ def _on_turn_end(
     if isinstance(turn_outcome, TurnFailed):
         _record_turn_failure(stream, notice_turn, turn_outcome)
     if isinstance(turn_outcome, TurnContextWindowExceeded):
-        return _continue_after_context_overflow(stream, log)
+        return _continue_after_context_overflow(stream, log, notice_turn)
     if isinstance(turn_outcome, TurnRefusedForCapacity):
-        return _on_capacity_refusal(stream, log)
+        return _on_capacity_refusal(stream, log, notice_turn)
     stream.capacity_waited = 0.0
     stream.capacity_retries = 0
     stream.waiting_for_progress_after_overflow = False
     if stream.resume_owed:
         return _resume_owed_turn(stream, log, refused_for_capacity=False)
     return _after_turn_end(stream, log, turn_outcome)
+
+
+def _settle_quota_continuation(stream: TurnStream, notice_turn: str, turn_outcome: TurnOutcome) -> None:
+    """Clear the pending refusal once its submitted continuation completes."""
+    pending = stream.pending_refusal
+    if (isinstance(pending, PendingQuotaRefusal)
+            and isinstance(pending.continuation, SubmittedQuotaContinuation)
+            and isinstance(turn_outcome, TurnCompleted) and not stream.resume_owed
+            and pending.continuation.thread_id == stream.thread_id
+            and (notice_turn or stream.turn_id) == pending.continuation.turn_id
+            and not _continuation_is_owed(stream.session_dir, stream.name)):
+        stream.pending_refusal = NoPendingQuotaRefusal()
+    elif not stream.resume_owed:
+        stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
 
 
 def _record_turn_failure(stream: TurnStream, notice_turn: str, turn_outcome: TurnFailed) -> None:
@@ -3126,7 +3247,7 @@ def _record_turn_failure(stream: TurnStream, notice_turn: str, turn_outcome: Tur
         stream.failure_serving = serving
 
 
-def _continue_after_context_overflow(stream: TurnStream, log: TextIO) -> StreamStep:
+def _continue_after_context_overflow(stream: TurnStream, log: TextIO, notice_turn: str) -> StreamStep:
     """Start one continuation turn, or finish when the last one made no progress."""
     if stream.waiting_for_progress_after_overflow:
         stream.failure = (
@@ -3147,7 +3268,8 @@ def _continue_after_context_overflow(stream: TurnStream, log: TextIO) -> StreamS
     )
     log.flush()
     _adopt_started_turn(stream, _start_workers_turn(
-        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, continuation))
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, continuation,
+        submission=_quota_retry_submission(stream.pending_refusal, stream.thread_id, notice_turn or stream.turn_id)))
     _ = _update_roster_if_expected(
         stream.session_dir,
         stream.name,
@@ -3158,8 +3280,11 @@ def _continue_after_context_overflow(stream: TurnStream, log: TextIO) -> StreamS
     return StreamStep.NEXT_FRAME
 
 
-def _on_capacity_refusal(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithThread:
+def _on_capacity_refusal(stream: TurnStream, log: TextIO, notice_turn: str) -> StreamStep | FailedWithThread:
     """Park queued messages and owe the task a resume turn, or stop once the budget is spent."""
+    if not stream.resume_owed:
+        stream.capacity_submission = _quota_retry_submission(
+            stream.pending_refusal, stream.thread_id, notice_turn or stream.turn_id)
     stream.resume_owed = True
     thread_id = stream.thread_id
     _move_queue_to_pending(
@@ -3225,6 +3350,7 @@ def _resume_owed_turn(stream: TurnStream, log: TextIO, *, refused_for_capacity: 
     _adopt_started_turn(stream, _start_workers_turn(
         stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client,
         "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
+        submission=stream.capacity_submission,
     ))
     stream.resume_owed = False
     return StreamStep.NEXT_FRAME
@@ -3357,6 +3483,8 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
 
 def _finish_stream(stream: TurnStream) -> RunOutcome:
     """End the watch: close an unwatched turn, write the summary and settle the roster."""
+    if not stream.resume_owed:
+        stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
     if (not stream.failure and isinstance(stream.pending_refusal, PendingQuotaRefusal)
             and _continuation_is_owed(stream.session_dir, stream.name)):
         stream.failure = stream.pending_refusal.detail
@@ -3389,6 +3517,8 @@ def _fail_stream(stream: TurnStream, exc: ConnectionError | OSError | SystemExit
     elif isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
         stream.port = exc.cleanup.port
         stream.thread_id = exc.cleanup.thread_id
+    if not stream.resume_owed:
+        stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
     _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
     failure = str(exc) or exc.__class__.__name__
     _ = _update_roster_if_expected(
@@ -3415,6 +3545,10 @@ class MovedWorker:
     thread_id: str
     thread_replaced: bool
     serving: CodexServingState = field(default_factory=NotBoundCodexServer)
+    pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(
+        default_factory=NoPendingQuotaRefusal, kw_only=True)
+    submission: QuotaContinuationTurn | UnrelatedWorkerTurn = field(
+        default_factory=UnrelatedWorkerTurn, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -3797,7 +3931,8 @@ def _move_idle_worker(
                 "thread_id": thread_id, "turn_id": turn_id or prior_turn, "status": "running", "port": port,
                 "continuation_owed": False
             })
-        return MovedWorker(moved, port, turn_id, thread_id, replaced, moved.serving)
+        return MovedWorker(moved, port, turn_id, thread_id, replaced, moved.serving,
+            submission=QuotaContinuationTurn() if owes_continuation and turn_id else UNRELATED_WORKER_TURN)
     except (ConnectionError, OSError, SystemExit) as error:
         if isinstance(error, ServingRequestFailure) and error.reported:
             return WorkerAwaitingQuotaRecovery(moved, moved.port, "", thread_id, replaced, moved.serving, refusal=error)
@@ -3814,6 +3949,7 @@ def _move_idle_worker(
 def _start_workers_turn(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str,
     client: Client, message: str,
+    *, submission: QuotaContinuationTurn | UnrelatedWorkerTurn = UNRELATED_WORKER_TURN,
 ) -> MovedWorker:
     initial_client = client
     quota_recovery: WorkerAwaitingQuotaRecovery | NoSubmissionQuotaRefusal = NoSubmissionQuotaRefusal()
@@ -3824,6 +3960,11 @@ def _start_workers_turn(
             if isinstance(result, WorkerThreadStateUnknown):
                 raise WorkerMoveUncertain(thread_id, result)
             if isinstance(result, MovedWorker) and not isinstance(result, WorkerAwaitingQuotaRecovery):
+                if isinstance(submission, QuotaContinuationTurn):
+                    result = replace(result, submission=submission)
+                if isinstance(quota_recovery, WorkerAwaitingQuotaRecovery):
+                    refusal = quota_recovery.refusal
+                    return replace(result, pending_refusal=PendingQuotaRefusal(refusal.serving, str(refusal)))
                 return result
             if isinstance(result, WorkerAwaitingQuotaRecovery):
                 quota_recovery = result
