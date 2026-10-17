@@ -1,4 +1,5 @@
 import type { ProcessRunResult } from 'claude-code';
+import type { StoredAccountsStatus } from '../types/accounts';
 import type { BoardData, BoardResult } from '../types/board';
 import type { BoardSnapshot } from '../types';
 
@@ -82,4 +83,79 @@ export async function loadBoard(
   }
   ensureOpen();
   return { files: response.files, boards, focus: response.focus, watch: response.watch, loadedAt };
+}
+
+export interface AccountsLoader {
+  home(): Promise<string | undefined>;
+  now(): Promise<number>;
+  run(argv: readonly string[]): Promise<ProcessRunResult>;
+  stat(path: string): Promise<{ mtimeMs: number }>;
+}
+
+export interface UserZoneSettings {
+  override(): Promise<string | undefined>;
+  config(): Promise<string | undefined>;
+  home(): Promise<string | undefined>;
+  read(path: string): Promise<string>;
+}
+export type ZoneLookup = { kind: 'resolved'; name: string } | { kind: 'cancelled' };
+
+/** Matches scripts/lib/user_zone.py, including its configurable settings path. */
+export async function resolveUserZone(calls: UserZoneSettings, isActive: () => boolean): Promise<ZoneLookup> {
+  if (!isActive()) return { kind: 'cancelled' };
+  let name = await calls.override();
+  if (!isActive()) return { kind: 'cancelled' };
+  if (!name) {
+    const configured = await calls.config();
+    if (!isActive()) return { kind: 'cancelled' };
+    const home = configured ? '' : await calls.home();
+    if (!isActive()) return { kind: 'cancelled' };
+    let contents = '';
+    try { contents = await calls.read(configured || `${home}/.claude/config/user_zone.conf`); }
+    catch { /* An absent setting uses the repository's default. */ }
+    if (!isActive()) return { kind: 'cancelled' };
+    name = contents.split(/\r?\n/).find(line => line.startsWith('zone='))?.split('=').slice(1).join('=').trim();
+  }
+  name ||= 'America/New_York';
+  // Validate before storing the zone, as the Python resolver does.
+  new Intl.DateTimeFormat('en-US', { timeZone: name });
+  return { kind: 'resolved', name };
+}
+
+/** Only stored-status inputs and their existing discovery directories are inspected. */
+export async function loadAccounts(
+  calls: AccountsLoader, isOpen: () => boolean, watch: (paths: RefreshPaths[]) => void,
+): Promise<StoredAccountsStatus> {
+  const ensureOpen = () => { if (!isOpen()) throw new Error('Pane closed.'); };
+  ensureOpen();
+  const home = await calls.home();
+  if (!home) throw new Error('Home directory is unavailable.');
+  const loadedAt = await calls.now();
+  const sources = new Set<string>();
+  const inputs = [`${home}/.local/state/agent-notes/usage.json`, `${home}/.local/state/accounts/groups.json`,
+    `${home}/.claude/config/accounts.json`, `${home}/.local/state/accounts/role_map_cache.json`];
+  for (const input of inputs) {
+    let path = input;
+    while (path) {
+      ensureOpen();
+      try {
+        await calls.stat(path);
+        sources.add(path);
+        break;
+      } catch { /* A missing input is discovered through its closest existing parent. */ }
+      path = path.slice(0, path.lastIndexOf('/')) || (path === '/' ? '' : '/');
+    }
+    watch([{ kind: 'discovery', sources: [...sources], loadedAt }]);
+  }
+  ensureOpen();
+  const result = await calls.run([`${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/accounts/accounts.py`,
+    'status', '--json', '--stored', '--with-login']);
+  ensureOpen();
+  // Process output can contain logins; failure details never leave the pane loader.
+  if (result.exitCode !== 0) throw new Error('Stored accounts status could not be read.');
+  try {
+    const status = JSON.parse(result.stdout) as StoredAccountsStatus;
+    if (!Array.isArray(status.accounts) || !Array.isArray(status.problems)) throw new Error();
+    return status;
+  } catch { throw new Error('Stored accounts status is invalid.'); }
 }

@@ -169,7 +169,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 **Acceptance gate:** the Test and Lint lines of Delegation Context green.
 
-### Phase 6 — Accounts view  · status: todo
+### Phase 6 — Accounts view  · status: done
 **Depends on:** 4
 
 #### Work Order

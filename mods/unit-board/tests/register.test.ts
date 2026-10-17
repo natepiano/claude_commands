@@ -179,12 +179,13 @@ describe("unit board commands and lifetime", () => {
 
   test("unchanged ticks move now past the promise while keeping the snapshot and promise", async ($, on) => {
     const fake = engineFiles(on);
+    await fake.clock.advance(29 * 60_000);
     await $.session.start(start);
     await $.command.run(command());
     const ui = await mount($, "terminal");
     const before = drawnText(await ui.drawn());
     fake.clear();
-    await fake.clock.advance(31 * 60_000);
+    await fake.clock.advance(2 * 60_000);
     const after = drawnText(await ui.drawn());
     expect(after).not.toBe(before);
     expect(after).toContain("14:31");

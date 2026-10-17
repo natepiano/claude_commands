@@ -13,10 +13,15 @@ export type PaneState<Production> =
   | { kind: 'unit'; data: BoardSnapshot<Production>; production: string; unit: string; now: number }
   | { kind: 'failed'; reason: string };
 
+export type AccountsPaneState<Status> =
+  | { kind: 'loading' }
+  | { kind: 'accounts'; data: Status; zone: string }
+  | { kind: 'failed'; reason: string };
+
 /** The engine contract keeps snapshots opaque; hooks bind Production to BoardData. */
 /** Missing keys are closed panes. Timers belong to the module, never persisted. */
 declare module 'claude-code' {
   interface PluginState {
-    'unit-board': { panes: Record<string, PaneState<unknown>> };
+    'unit-board': { panes: Record<string, PaneState<unknown>>; accountsPanes: Record<string, AccountsPaneState<unknown>> };
   }
 }

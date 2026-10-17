@@ -1,12 +1,17 @@
 import type { BoardData } from '../types/board';
 import type { EngineInterface, Register, Timer } from 'claude-code';
-import type { BoardSnapshot, PaneState } from '../types';
-import { loadBoard, refreshIfChanged, snapshotPaths } from './data';
-import type { BoardLoader, RefreshPaths } from './data';
+import type { AccountsPaneState, BoardSnapshot, PaneState } from '../types';
+import { loadAccounts, loadBoard, refreshIfChanged, resolveUserZone, snapshotPaths } from './data';
+import type { AccountsLoader, BoardLoader, RefreshPaths, UserZoneSettings } from './data';
 import { BoardView } from './board';
 import { UnitView } from './unit';
+import { AccountsView } from './accounts';
+import type { StoredAccountsStatus } from '../types/accounts';
 
 const PANE = 'unit-board';
+const ACCOUNTS = 'accounts-board';
+const ACCOUNT_PANES = { plugin: 'unit-board', key: 'accountsPanes' } as const;
+type OpenAccountsPane = { timer: Timer; busy: boolean; paths: RefreshPaths[]; zone: string };
 const PANES = { plugin: 'unit-board', key: 'panes' } as const;
 
 type Selection = { kind: 'board' } | { kind: 'unit'; production: string; unit: string };
@@ -101,12 +106,73 @@ const select = async ($: EngineInterface, opened: Map<string, OpenPane>, id: str
   await put($, id, viewState(current.data, selection, current.now), () => opened.get(id) === active);
 };
 
+const putAccounts = async ($: EngineInterface, state: AccountsPaneState<StoredAccountsStatus>, isOpen: () => boolean) => {
+  if (!isOpen()) return;
+  const previous = (await $.state.get(ACCOUNT_PANES)).value ?? {};
+  if (isOpen()) await $.state.set(ACCOUNT_PANES, { ...previous, [ACCOUNTS]: state });
+};
+function accountsCalls($: EngineInterface): AccountsLoader {
+  return {
+    home: () => $.env.get('HOME'), now: () => $.clock.now(),
+    stat: path => $.fs.stat(path), run: argv => $.process.run(argv),
+  };
+}
+function zoneSettings($: EngineInterface): UserZoneSettings {
+  return {
+    override: () => $.env.get('USER_ZONE'), config: () => $.env.get('USER_ZONE_CONF'),
+    home: () => $.env.get('HOME'), read: path => $.fs.read(path),
+  };
+}
+const readAccounts = async ($: EngineInterface, opened: Map<string, OpenAccountsPane>, active: OpenAccountsPane) => {
+  const isOpen = () => opened.get(ACCOUNTS) === active;
+  try {
+    const data = await loadAccounts(accountsCalls($), isOpen, paths => { if (isOpen()) active.paths = paths; });
+    await putAccounts($, { kind: 'accounts', data, zone: active.zone }, isOpen);
+  } catch {
+    // Never include process output or a login in an error or command result.
+    await putAccounts($, { kind: 'failed', reason: 'Stored accounts status could not be read.' }, isOpen);
+  }
+};
+const tickAccounts = async ($: EngineInterface, opened: Map<string, OpenAccountsPane>) => {
+  const active = opened.get(ACCOUNTS);
+  if (!active || active.busy) return;
+  const isOpen = () => opened.get(ACCOUNTS) === active;
+  active.busy = true;
+  try {
+    await refreshIfChanged({ stat: path => $.fs.stat(path) }, active.paths,
+      () => loadAccounts(accountsCalls($), isOpen, paths => { if (isOpen()) active.paths = paths; }),
+      data => putAccounts($, { kind: 'accounts', data, zone: active.zone }, isOpen), isOpen);
+  } catch {
+    await putAccounts($, { kind: 'failed', reason: 'Stored accounts status could not be read.' }, isOpen);
+  } finally { active.busy = false; }
+};
+const startAccounts = ($: EngineInterface, opened: Map<string, OpenAccountsPane>, zone: string) => {
+  const previous = opened.get(ACCOUNTS);
+  previous?.timer.cancel();
+  const active: OpenAccountsPane = { busy: false, paths: previous?.paths ?? [], zone,
+    timer: $.clock.every(10_000, () => { void tickAccounts($, opened); }) };
+  opened.set(ACCOUNTS, active);
+  return active;
+};
+const stopAccounts = async ($: EngineInterface, opened: Map<string, OpenAccountsPane>) => {
+  opened.get(ACCOUNTS)?.timer.cancel();
+  opened.delete(ACCOUNTS);
+  const panes = { ...(await $.state.get(ACCOUNT_PANES)).value };
+  delete panes[ACCOUNTS];
+  await $.state.set(ACCOUNT_PANES, panes);
+};
+
 export const register: Register = on => {
   const opened = new Map<string, OpenPane>();
+  const accounts = new Map<string, OpenAccountsPane>();
+  let accountsLifecycle = 0;
 
   on('session.start', async ($, e, next) => {
+    const lifecycle = ++accountsLifecycle;
     await $.command.register({ name: PANE, description: 'Show the production board pane' });
-    if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
+    await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
+    const panes = await $.ui.panes();
+    if (panes.some(pane => pane.id === PANE)) {
       startTimer($, opened, PANE, e.cwd);
       const active = opened.get(PANE)!;
       const state = await readPane($, PANE);
@@ -115,6 +181,17 @@ export const register: Register = on => {
         active.selection = state.kind === 'unit' ? { kind: 'unit', production: state.production, unit: state.unit } : { kind: 'board' };
       }
       await tick($, opened, PANE);
+    }
+    if (panes.some(pane => pane.id === ACCOUNTS)) {
+      const zone = await resolveUserZone(zoneSettings($), () => accountsLifecycle === lifecycle);
+      if (zone.kind === 'resolved' && accountsLifecycle === lifecycle) {
+        const active = startAccounts($, accounts, zone.name);
+        if (active.paths.length) await tickAccounts($, accounts);
+        else {
+          active.busy = true;
+          try { await readAccounts($, accounts, active); } finally { active.busy = false; }
+        }
+      }
     }
     return next(e);
   });
@@ -146,6 +223,27 @@ export const register: Register = on => {
     } finally { active.busy = false; }
     return { text: 'Unit board opened.' };
   });
+  on('command.run', { command: ACCOUNTS }, async ($, e) => {
+    if (e.args.trim() === 'close') {
+      await $.ui.close({ id: ACCOUNTS });
+      return { text: 'Accounts closed.' };
+    }
+    const lifecycle = ++accountsLifecycle;
+    accounts.get(ACCOUNTS)?.timer.cancel();
+    accounts.delete(ACCOUNTS);
+    const zone = await resolveUserZone(zoneSettings($), () => accountsLifecycle === lifecycle);
+    if (zone.kind === 'cancelled' || accountsLifecycle !== lifecycle) return { text: 'Accounts closed.' };
+    await $.ui.open({ id: ACCOUNTS, title: 'Accounts', closeOnEscape: true });
+    if (accountsLifecycle !== lifecycle) return { text: 'Accounts closed.' };
+    const active = startAccounts($, accounts, zone.name);
+    const isOpen = () => accounts.get(ACCOUNTS) === active;
+    active.busy = true;
+    try {
+      await putAccounts($, { kind: 'loading' }, isOpen);
+      await readAccounts($, accounts, active);
+    } finally { active.busy = false; }
+    return { text: 'Accounts opened.' };
+  });
   on('turn.complete', async ($, e, next) => {
     if (opened.size === 0) return next(e);
     for (const id of opened.keys()) await tick($, opened, id);
@@ -153,7 +251,19 @@ export const register: Register = on => {
   });
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) await stop($, opened, e.id);
+    if (e.id === ACCOUNTS) {
+      accountsLifecycle++;
+      await stopAccounts($, accounts);
+    }
     return next(e);
+  });
+  on('ui.render', { component: 'Pane', requestId: ACCOUNTS }, async ($, e) => {
+    const state = (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined;
+    const elements = $.ui.resolve(e);
+    const { Text } = elements;
+    if (!state || state.kind === 'loading') return <Text color="subtle">Loading accounts…</Text>;
+    if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
+    return AccountsView(elements, state.data, state.zone);
   });
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const state = await readPane($, PANE);

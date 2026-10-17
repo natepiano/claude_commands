@@ -134,9 +134,12 @@ export function drawnText(value: unknown): string {
 export function lifecycleHarness() {
   type LifecycleHook = (services: EngineInterface, event: unknown,
     next: (event: unknown) => Promise<unknown>) => unknown;
-  const hooks = new Map<string, LifecycleHook>();
+  const hooks = new Map<string, { filter: Record<string, unknown>; hook: LifecycleHook }[]>();
   const collect = (pattern: string, ...arguments_: unknown[]) => {
-    hooks.set(pattern, arguments_.at(-1) as LifecycleHook);
+    const filter = arguments_.length > 1 ? arguments_[0] as Record<string, unknown> : {};
+    const chain = hooks.get(pattern) ?? [];
+    chain.push({ filter, hook: arguments_.at(-1) as LifecycleHook });
+    hooks.set(pattern, chain);
     return { catch: () => {} };
   };
   register(collect as On, {});
@@ -189,12 +192,21 @@ export function lifecycleHarness() {
     calls, panes: () => panes, cancelledTimers: () => cancelled,
     forwardedCloses: () => forwarded, clearCalls: () => { calls.length = 0; },
     dispatch: async (event: string, input: unknown) => {
-      const hook = hooks.get(event);
-      if (!hook) throw new Error(`No registered ${event} hook`);
-      return hook(engine, input, async value => {
-        if (event === "ui.close") forwarded++;
-        return value;
-      });
+      const chain = hooks.get(event);
+      if (!chain) throw new Error(`No registered ${event} hook`);
+      const dispatchAt = async (index: number, value: unknown): Promise<unknown> => {
+        const entry = chain[index];
+        if (!entry) {
+          if (event === "ui.close") forwarded++;
+          return value;
+        }
+        const fields = value as Record<string, unknown>;
+        if (!Object.entries(entry.filter).every(([key, expected]) => fields[key] === expected)) {
+          return dispatchAt(index + 1, value);
+        }
+        return entry.hook(engine, value, nextValue => dispatchAt(index + 1, nextValue));
+      };
+      return dispatchAt(0, input);
     },
     advanceMinute: async () => {
       for (let tick = 0; tick < 6; tick++) {
