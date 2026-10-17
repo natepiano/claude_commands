@@ -1492,43 +1492,31 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 51
 
-#### Work Order
+#### As-built
 
-**Goal:** the user's rule (2026-10-16): a "what happens next" log on natedev holds entries like "when units reach X% switch to claude2". An entry that covers a group replaces the alert; an entry runs once and is removed when its move happens, so the log empties out. With no entry, the user's phone is told once at 2% that what happens next needs setting up. The Claude session alert, its 30-minute repeat, its showrunner relay and `/quota_ack` go away.
-
-**Constraints from prior phases:** Phase 49's `run_auto_moves` (refusal_watch.py) runs on natedev after the refusal pass, under the watch lock, from rules in `~/.claude/config/accounts.json` `auto_moves`; moves record cause `auto`, reason `auto: <name>`, `alerts="none"`, and use the guards documented in `docs/accounts.md` (fresh readings, target room, no in-flight transition, not the current account, not moved this run). Phase 50 typed the reasons and reset progress. The role map lives on natedev; Mac reads go through `read_role_map()`. Phase 51 added holds: `refusal_watch.json` `auto_move_holds`, keyed by rule name, each tied to the account, the selection `move_id` and the percent; a recorded group move clears every hold for that group; when the first target is unavailable or lacks room, the next rule in order moves the group. Codex alerting is unchanged in this phase (Phase 53). Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
-
-**Spec:**
-1. **The log.** A new module `scripts/accounts/next_moves.py` stores entries in `~/.local/state/accounts/next_moves.json` on natedev: `{id, group: units|showrunners, at_percent, hold_minutes, to, added_at}` as typed values in code, JSON only at the file boundary, atomic writes under a lock. Reads on the Mac go through natedev the way the role map does.
-2. **CLI.** `accounts.py next add <units|showrunners> <percent> <account>`, `accounts.py next list`, `accounts.py next remove <id>`. `add` refuses an unknown account or group and prints the stored entry; `list` prints one line per entry in the user's words ("when units reach 1% → claude2") or "nothing set up".
-3. **Skill.** `commands/next_moves.md` (`/next_moves`): turns plain words ("when showrunners get to 1% switch to claude2", "what's set up", "drop the units one") into those commands and prints the list after every change.
-4. **Engine.** `run_auto_moves` takes its rules from the log instead of the config key; a rule is a `left_at_most` entry with Phase 51's hold, and log order is chain order. When an entry's group move is recorded, the entry is removed in the same locked pass; a skipped or refused move keeps it. Remove `after_reset`, the `auto_moves` config key and the reset-progress state (`auto_moves` in `refusal_watch.json` is ignored on load and dropped on the next write). Cause `auto` and reason `auto: <id>` stay. Holds are keyed by entry id; removing an entry drops its hold.
-5. **Claude alert.** In `scripts/whoami/quota_alert.py`, for Claude accounts: no session message, no repeat, no `Quota restored:` notice, and no "start no new Claude work" line. When an in-use account reads ≤ the threshold (2%) and some group on it has no log entry, send one phone push per episode: "<account> is at N% weekly. Set up what happens next: tell natedev, for example, when units reach 1% switch to claude2." When log entries cover every group on that account, send nothing. Remove `/quota_ack` (`commands/quota_ack.md`, the `ack` verb and acknowledgement state); `/quota_refresh` stays.
-6. **Showrunner relay.** Remove the Claude quota relay from `scripts/production/waiting.py quota` and `commands/showrunner/produce.md`; the Codex relay stays for Phase 53.
-7. **Docs.** `docs/quota_alerts.md`, `docs/accounts.md` and `commands/showrunner/accounts.md` describe the log, the one phone alert and the removed pieces; `commands/message.md` drops `/quota_ack`.
+- `scripts/accounts/next_moves.py` keeps the "what happens next" log in `~/.local/state/accounts/next_moves.json` on natedev: an ordered JSON list of `NextMove(id, group: Literal["units", "showrunners"], at_percent, hold_minutes, to, added_at)`, frozen and checked in `__post_init__` (percent 0–100, finite nonnegative hold, `to` a numbered Claude label, aware `added_at`). `encode_next_moves` / `decode_next_moves` are the only JSON boundary; a bad log or duplicate id raises `NextMoveError`. Ids are `uuid4().hex`. `write_next_moves` replaces the file atomically under `next_moves_lock()`, and both refuse off natedev; the Mac reads through `role_map.ssh_role_map(("next-read",))`, adds through `next-write <one encoded entry>` and removes through `next remove <id>`.
+- `accounts.py next add <units|showrunners> <percent> <account> [--hold-minutes N]`, `next list`, `next remove <id>`. `add` refuses an unknown group or account (`claude_account_dir` on natedev) and prints the stored entry; `list` prints `<id>: when units reach 1% → claude2 (hold 30 minutes)` per entry, or `nothing set up`. `/next_moves` (`commands/next_moves.md`) turns ordinary words into these commands and prints the list after every change.
+- `refusal_watch.read_auto_move_rules()` returns `AutoMoveRule(entry.id, group, to, LeftAtMost(at_percent, hold_minutes))` per entry in log order, or one `MalformedAutoMoveRule` for an unreadable log. `run_auto_moves` takes `next_moves_lock()` inside the watch lock (a dry run takes neither) and keeps Phase 51's guards, holds and chain, with holds keyed by entry id. Once `set_group_account` records the choice, the entry leaves the log before members are dispatched; a skipped or refused move keeps it. Each pass first drops any entry, and its hold, whose `auto: <id>` already stands as a cause-`auto` Claude-group line in `roles.jsonl` (`_recorded_auto_move_ids`), so an interrupted log write never replays a recorded move. `next remove` runs inside `refusal_watch.removing_next_move(id)`, which holds the watch lock and then drops that entry's hold.
+- `after_reset`, its reset-progress types and the `auto_moves` config key are gone; `auto_moves` in `refusal_watch.json` is ignored on load and dropped on the next write. Moves keep cause `auto` and why `auto: <entry id>`.
+- Claude low quota (`scripts/whoami/quota_alert.py`): no session alert, repeat, `Quota restored:` notice or stop-work line. An episode opens at ≤ 2% on an in-use account; `claude_next_move_push` sends push `quota.claude_next_move` once when a group on that account has no log entry, and returns a status note, leaving the push due, when every group is covered, no group uses the account, or the log cannot be read. A Claude episode closes silently on recovery or once its stored `weekly_reset` has passed. `/quota_ack`, `acknowledge()` and the `ack` verb are gone for both tools, and a saved `acknowledged` field is dropped on load, so a Codex low alert repeats every `repeat_minutes` until recovery. `/quota_refresh` stays.
+- `quota.claude_next_move` (`scripts/notify/push_catalog.py`, approved in `push_texts_reviewed.json`, replacing `quota.claude`): title `Claude work on {account} may stop`; body `{account} has {remaining} of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.`; action `In the natedev session, type /next_moves and the move you want, for example: when units reach 1% switch to claude2.`
+- `waiting.py quota` relays only Codex notices: a Claude account line, or a notice that does not name Codex, prints `Claude quota notices no longer relay`. `drop_claude_quota_waits` removes saved Claude waits from `quota_seen.json` on every read and quota call. `commands/showrunner/produce.md` keeps only the Codex relay.
 
 **Files:**
-- `scripts/accounts/next_moves.py`
-- `scripts/accounts/accounts.py`
-- `scripts/accounts/refusal_watch.py`
-- `scripts/whoami/quota_alert.py`
-- `scripts/production/waiting.py`
-- `commands/next_moves.md`
-- `commands/quota_ack.md`
-- `commands/showrunner/produce.md`
-- `commands/showrunner/accounts.md`
-- `commands/message.md`
-- `docs/quota_alerts.md`
-- `docs/accounts.md`
-- `scripts/accounts/test_next_moves.py`
-- `scripts/accounts/test_accounts.py`
-- `scripts/accounts/test_refusal_watch.py`
-- `scripts/whoami/test_quota_alert.py`
-- `scripts/production/test_waiting.py`
+- `scripts/accounts/next_moves.py` — `NextMove`, the JSON boundary, lock, atomic write, add/remove, rendering, Mac transport.
+- `scripts/accounts/accounts.py` — `next add|list|remove` and the natedev-only `next-read` / `next-write` verbs.
+- `scripts/accounts/refusal_watch.py` — rules from the log, `removing_next_move`, `_recorded_auto_move_ids`, consumption under the log lock.
+- `scripts/whoami/quota_alert.py` — `claude_next_move_push`, the Claude episode path, Claude recovery by passed reset, acknowledgement removed.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — `quota.claude_next_move` and its approvals.
+- `scripts/production/waiting.py` — Codex-only relay, `drop_claude_quota_waits`.
+- `commands/next_moves.md` — `/next_moves`; `commands/quota_ack.md` deleted; `commands/showrunner/produce.md`, `commands/showrunner/accounts.md`, `commands/message.md`, `docs/quota_alerts.md`, `docs/accounts.md` — the log, the one phone reminder, the removed pieces.
+- `scripts/accounts/test_next_moves.py`, `test_accounts.py`, `test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`, `test_codex_alert_accounts.py`, `scripts/production/test_waiting.py` — add/list/remove and refusals, one-shot consumption, skipped moves keeping entries, replay after an interrupted write, legacy `auto_moves` and rule-name holds, one push per episode, covered and ungrouped-only accounts silent, Codex repeats without acknowledgement, legacy Claude waits dropped.
 
-**Workers:** `impl` owns the production, command and doc files; `test` owns the five test files.
+**Binds later work:** the log is the one store for what happens next: writes only on natedev under `next_moves_lock()`, lock order watch lock then log lock. `NextMove` accepts only `units` or `showrunners` and a numbered Claude target; the CLI group uses `CLAUDE_GROUPS`; `read_auto_move_rules` turns every entry into a Claude group rule; `claude_next_move_push` counts coverage from every entry's group. A new or reworded push needs `review.py texts --id <id> --approve` recorded in `push_texts_reviewed.json`, or the notify suite fails. Codex low alerts, their repeat and the Codex relay in `waiting.py quota` remain.
 
-**Acceptance gate:** tests cover add/list/remove and refusals, an entry firing once and being removed, a skipped move keeping its entry, a legacy `refusal_watch.json` with `auto_moves`, or with `auto_move_holds` keyed by a config rule name, loading, one phone push per Claude episode with no session send and no repeat, no push when entries cover every group on the account, and the waiting.py relay no longer forwarding a Claude alert. Account, whoami and production suites pass on natedev and the Mac; the merge gate is green. After install the director moves the two live config rules into the log and removes the config key.
+**Gotchas:** an entry whose target is the low account itself counts as cover in `claude_next_move_push`, while the engine skips it as already on target, so that account gets no reminder and the entry never runs. An unreadable or undecodable `roles.jsonl` makes `_recorded_auto_move_ids` raise `NextMoveError`, which ends the watcher run with exit 1 before the group completion pass. A Claude episode whose reminder resolves to a status note stays due and writes a `quota status <account>: …` log line every pass. `message()`, `instruction()` and `unit_swap_line()` keep Claude branches, though `message()` is reached only for Codex notes. The live `auto_moves` config key is ignored without a warning; live rules move by `next add`. `scripts.notify.test_push_catalog` does not exist.
+
+**Ruled out:** consuming an entry only through the log write (an interrupted write replayed a recorded move once the group came back); a reminder for an account used only by ungrouped sessions (no entry could silence it).
 
 ### Phase 53 — What happens next for Codex workers  · status: todo
 
