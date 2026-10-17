@@ -1448,24 +1448,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 49
 
-#### Work Order
+#### As-built
 
-**Goal:** the two empty-string markers Phase 49 shipped become named states, with no change in behavior: a group transition's reason is either recorded or unavailable, and an auto rule's reset progress is either never acted on or acted on at a known reset.
-
-**Constraints from prior phases:** Phase 49 added `GroupTransition.why` (default `""`; `group_transition` decodes a stored selection without `why` to `""`) and `StoredGroupSelection.why` (optional in role-map JSON). The refusal-watch completion pass reuses the transition's why so an auto retry journals `auto: <rule>`. `refusal_watch.json` holds `auto_moves[rule] = {observed_reset, acted_reset}` as strings, where `acted_reset == ""` means never acted; `run_auto_moves` compares these strings to fire `after_reset` once per reset. Older role-map selections and older `refusal_watch.json` files must still load. Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
-
-**Spec:**
-1. **Transition reason.** `GroupTransition` carries a typed reason: a recorded reason (its text) or an unavailable reason (a stored selection without `why`, a historical one). `group_transition` decodes the absent field to the unavailable state and recorded text to the recorded state; optional fields stay at the JSON boundary in `role_map.py`. A new auto transition always carries a recorded `auto: <rule name>` reason, and the completion pass journals it on every retry; a refusal or by-hand transition keeps its current reason text.
-2. **Reset progress.** `AutoResetObservation` becomes a typed value: `observed_reset` an aware reset time, and acted progress `NeverActedOnReset | ActedOnReset(time)`, converted only where `refusal_watch.json` is read and written. Existing state files (including `acted_reset: ""`) still load; a malformed time is treated as a first sight, as today. First sight, once per reset, a reset that passes while the target lacks room, and read-only dry runs behave exactly as in Phase 49.
+- `role_map.TransitionReason = RecordedTransitionReason(text) | UnavailableTransitionReason`, re-exported by `accounts`. `role_map.selection_reason(selection)` decodes a stored `groups.json` selection: an absent `why` (written before Phase 49) is unavailable; any present text, `""` included, is recorded.
+- `accounts.GroupTransition.why: TransitionReason` (default `UnavailableTransitionReason()`): `group_transition` decodes through `selection_reason`, `set_group_account` returns a recorded reason, and the refusal pass records its refusal why. The refusal-watch completion pass journals an auto transition's recorded `auto: <rule>` on every retry (`""` for an unavailable one); other origins journal `complete <group> move to <label>`.
+- `refusal_watch.AutoResetObservation` is a frozen dataclass: `observed_reset` an aware `datetime`, `acted_reset: NeverActedOnReset | ActedOnReset(at)`, zones checked in `__post_init__`. `AutoResetObservationDocument` and `WatchStateDocument` are the JSON forms: `_load_state` decodes, and every `refusal_watch.json` write goes through `_save_state` (`_state_document`), keeping the two strings and `acted_reset: ""` for never acted.
+- `run_auto_moves` fires `after_reset` once per reset by comparing datetimes; first sight, a reset passing while the target lacks room, and `--dry-run` writing nothing behave as in Phase 49. Journal and state-file bytes are unchanged.
 
 **Files:**
-- `scripts/accounts/accounts.py`
-- `scripts/accounts/role_map.py`
-- `scripts/accounts/refusal_watch.py`
-- `scripts/accounts/test_accounts.py`
-- `scripts/accounts/test_role_map.py`
-- `scripts/accounts/test_refusal_watch.py`
+- `scripts/accounts/role_map.py` — `TransitionReason` and its two states, `selection_reason`.
+- `scripts/accounts/accounts.py` — typed `GroupTransition.why`, the re-exports.
+- `scripts/accounts/refusal_watch.py` — reset-progress states, document types, `_save_state`, the typed completion reason.
+- `scripts/accounts/test_accounts.py`, `test_role_map.py`, `test_refusal_watch.py` — a historical selection's unavailable reason, the auto reason through a round trip and a completion retry, legacy never-acted and acted state, malformed and naive times, successive resets, dry runs.
 
-**Workers:** `impl` owns the three production files; `test` owns the three test files.
+**Binds later work:** an auto transition's `GroupTransition.why` is `RecordedTransitionReason("auto: <rule name>")`, and the journalled why text is the same as before.
 
-**Acceptance gate:** tests cover a legacy selection without `why` decoding to the unavailable reason, an auto reason surviving a role-map round trip and a completion retry's journal, a legacy `refusal_watch.json` with `acted_reset: ""`, an acted state, a malformed time, and successive resets firing once each. The account suites pass on natedev and the Mac; the merge gate is green.
+**Gotchas:** an unparsable or naive `observed_reset` or `acted_reset` drops that observation at load, so the next fresh reading is a first sight; the bad entry stays on disk until another state change rewrites the file. Observations compare by instant, so a reset reported under another UTC offset is the same reset. State changes are detected by comparing a `deepcopy` of the loaded state by value.
