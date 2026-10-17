@@ -1885,15 +1885,19 @@ def prune(production_doc: Path) -> None:
         _ = _archive_note(candidate, vault_root, production.slug)
 
 
+def owned_notes(production: str, unit: str) -> list[Path]:
+    """The generated phase notes that name `unit` of `production` as their owner."""
+    owner = NoteOwnership(production=production, unit=unit)
+    return [candidate for candidate in sorted(_vault_root().glob("*/*.md")) if _note_ownership(candidate) == owner]
+
+
 def rename_unit(production: str, old: str, new: str) -> list[Path]:
     """Point a renamed unit's generated phase notes at its new id, so prune keeps them.
 
     Only the `unit:` key changes; the unit's next refresh rewrites the rest of each note.
     """
     renamed: list[Path] = []
-    for candidate in sorted(_vault_root().glob("*/*.md")):
-        if _note_ownership(candidate) != NoteOwnership(production=production, unit=old):
-            continue
+    for candidate in owned_notes(production, old):
         try:
             lines = candidate.read_text(encoding="utf-8").splitlines(keepends=True)
         except (OSError, UnicodeError) as error:

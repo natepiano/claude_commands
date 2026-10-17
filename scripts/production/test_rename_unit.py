@@ -244,6 +244,88 @@ class UnitRenameTests(unittest.TestCase):
                       + "other = claude-demo-alphabet", conf)
         self.assertIs(self.journal()["done"], True)
 
+    def seed_record(self, progress: str = "stopped", name: str = "alpha") -> Path:
+        """A stopped unit's shutdown record, as `shutdown.py down` leaves it."""
+        old = self.rust / "claude-demo-alpha"
+        session: dict[str, object] = {
+            "session_id": "sid-alpha", "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
+            "name": name, "cwd": f"{old}/sub", "status": "idle", "updated_at": 0, "probe": False,
+            "model": {"kind": "no reply yet"},
+            "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "demo-alpha"},
+                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
+            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
+            "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit", "doc": str(self.doc),
+                     "session_name": "demo-alpha", "session_host": "herdr",
+                     "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha.md"}}}
+        saved: dict[str, object] = {
+            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
+            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
+            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
+            "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
+            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
+            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": []}
+        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
+                  + "assert record.create_session(json.loads(sys.stdin.read()))")
+        created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
+                                 input=json.dumps(saved), env=self.env, capture_output=True, text=True,
+                                 check=False, timeout=60)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        log = self.root / "shutdown-calls.jsonl"
+        stub = self.root / "fake_shutdown.py"
+        self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
+                   + "    _ = log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+        self.env["RENAME_UNIT_SHUTDOWN"] = str(stub)
+        self.env["RENAME_UNIT_SHUTDOWN_LOG"] = str(log)
+        return log
+
+    def record(self) -> dict[str, object]:
+        directory = self.home / ".local/state/shutdown/owner@example.com/sessions"
+        return cast(dict[str, object], json.loads((directory / "sid-alpha.json").read_text()))
+
+    def test_a_stopped_unit_relaunches_from_its_rewritten_record(self) -> None:
+        log = self.seed_record()
+        result = self.rename("apply")
+        # The fake restart starts nothing, so verify finds the unit not running and holds the journal open.
+        self.assert_refused(result, "gamma-unit is not running")
+        self.assertEqual((self.journal()["step"], self.journal()["claimed"]), (10, False))
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["restart", "--only", "sid-alpha", "--here"]])
+        saved = self.record()
+        session = cast(dict[str, object], saved["session"])
+        host = cast(dict[str, object], session["host"])
+        new = self.rust / "claude-demo-gamma"
+        self.assertEqual((host["unit"], host["session_name"], session["name"], session["cwd"]),
+                         ("gamma-unit", "demo-gamma", "gamma", f"{new}/sub"))
+        self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha.md")
+        self.assertIn(f"you are now gamma-unit, in worktree {new} on branch demo-gamma, and your plan is at "
+                      + f"{new}/docs/plans/alpha.md", cast(str, saved["renamed"]))
+
+    def test_a_chosen_session_name_stays(self) -> None:
+        _ = self.seed_record(name="showrunner-fixer")
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assertEqual(cast(dict[str, object], self.record()["session"])["name"], "showrunner-fixer")
+
+    def test_apply_waits_while_the_unit_is_stopping(self) -> None:
+        _ = self.seed_record(progress="waiting")
+        result = self.rename("apply")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("alpha-unit is stopping (waiting); rerun apply once it has stopped", result.stderr)
+        self.assertEqual(self.journal()["step"], 0)
+
+    def test_verify_fails_on_an_unclassified_stale_reference(self) -> None:
+        self.assert_ok(self.rename("apply"))
+        self.write(self.root / "state/nightly-review/2026-10-16/report.md", "alpha-unit reviewed\n")
+        self.write(self.root / "state/other/names.json", '{"unit": "claude-demo-alphabet"}\n')
+        self.assert_ok(self.rename("verify"))
+        stale = self.root / "state/other/cache.json"
+        self.write(stale, '{"unit": "alpha-unit"}\n')
+        self.write(self.root / "scratch/showrunner_state.json", '{"units": {"alpha-unit": {}}}\n')
+        result = self.rename("verify")
+        self.assert_refused(result, f"unclassified: {stale} still holds an old name")
+        self.assertIn(f"unclassified: {self.root / 'scratch/showrunner_state.json'} still holds", result.stderr)
+        self.assertNotIn("nightly-review", result.stderr)
+        self.assertNotIn("names.json", result.stderr)
+
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
         self.assert_ok(self.rename("apply", "mul_add-unit", "fma"))
         self.assertIn(f"| fma-unit | docs/plans/mul-add.md | `{self.rust / 'claude-demo-fma'}` | demo-fma |",
@@ -252,7 +334,7 @@ class UnitRenameTests(unittest.TestCase):
     def test_resume_after_an_interrupted_merge_branch_push(self) -> None:
         self.assert_refused(self.rename("apply", refuse="push origin demo:refs/heads/demo"), "simulated failure")
         journal = self.journal()
-        self.assertEqual((journal["step"], journal["done"]), (3, False))
+        self.assertEqual((journal["step"], journal["done"]), (4, False))
         self.assertEqual(journal["doc_commit"], self.git("rev-parse", "demo"))
         refused = self.rename("apply", "alpha", "delta")
         self.assert_refused(refused, "the unfinished rename is alpha-unit to gamma-unit")

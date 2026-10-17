@@ -51,11 +51,17 @@ def unit_journal(slug: str) -> Path:
 
 
 def rename_claim(slug: str) -> frozenset[str]:
-    """Both ids of a unit whose rename is unfinished: only the rename may launch it."""
+    """Both ids of a unit whose rename is unfinished: only the rename may launch it.
+
+    The claim ends once the unit's shutdown record names the new id, so the rename's own relaunch
+    goes through.
+    """
     path = unit_journal(slug)
     if not unfinished(path):
         return frozenset()
     fields = _fields(path)
+    if fields.get("claimed") is False:
+        return frozenset()
     return frozenset(value for value in (fields.get("old"), fields.get("new")) if isinstance(value, str) and value)
 
 
@@ -176,6 +182,11 @@ def _rename_blocks_open(path: Path, old: str, new: str) -> bool:
         output = [new_prefix + line[len(old_prefix):] if line.startswith(old_prefix) else line for line in lines]
     write_text(path, "".join(output))
     return True
+
+
+# The showrunner scratch files _rename_scratch rewrites; verify reads them for a stale unit id.
+SCRATCH_FILES = ("dailies_input_state/eta_seen.json", "unit_status/decisions_seen", "unit_status/blocks_open",
+                 "showrunner_state.json", "dailies_judgment.json", "dailies_state.json")
 
 
 def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
