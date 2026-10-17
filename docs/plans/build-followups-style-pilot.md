@@ -545,6 +545,12 @@ Pending: parent's saved style child summary and rendered style line.
   is measured on both bars. From rerun 6 on, a failed rerun whose misses
   share no cause the ticket leaves uncovered runs the same ticket twice
   more, and the median is judged against the bar.
+- **Name-bindings rerun 6 — both bars met**: 36 of the 37 settled findings
+  caught (97.3%), the bar. Only `overview.rs:72` is lost, as expected; the
+  three sites rerun 5 lost to the conversion-parameter mistake are all
+  caught again. The pass raised 321 findings; 47 sit where rerun 2 had
+  none. Three blind judges called none of the 47 false (bar 10%), and none
+  of a random 30 of the 274 older findings. The name-bindings pass is done.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
