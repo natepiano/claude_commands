@@ -31,6 +31,7 @@ import agent_notes
 import session_table
 import note_file
 import account
+import usage_store
 from agent_notes import local_reset
 from note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
@@ -588,16 +589,21 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(len(self.noted), 2)
         self.assertEqual(self.sent, [])
 
-    def test_workers_self_target_does_not_cover_the_low_account_or_repeat_the_reminder(self) -> None:
+    def test_workers_self_target_keeps_the_low_reminder_due_without_pushing_a_fallback(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
         _ = quota_alert.CONFIG.write_text(json.dumps(config))
         entry = next_moves.add_next_move("workers", 1, "codex1")
+        note = self.note("codex1.md", "active", "2")
         for minute in (0, 2, 32):
-            _ = self.alert([self.note("codex1.md", "active", "2")], self.now + timedelta(minutes=minute))
-        self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
+            _ = self.alert([note], self.now + timedelta(minutes=minute))
+        self.assertEqual(quota_alert.codex_next_move_push(note, now=self.now),
+                         quota_alert.QuotaStatusNote("codex1", "the queued next entry targets the current account"))
+        self.assertEqual(self.noted, [])
         self.assertEqual(self.sent, [])
         self.assertEqual(next_moves.read_next_moves(), (entry,))
+        with quota_alert.state_file() as state:
+            self.assertEqual(state["episodes"]["codex1"].get("push"), "due")
 
     def test_runnable_workers_entry_keeps_the_reminder_due_until_removed(self) -> None:
         config = quota_alert.load_config()
@@ -1279,6 +1285,120 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         for text in self.relayed_texts():
             self.assertNotIn("default", text.lower())
         return lines
+
+    def stale_workers_target_readings(self, now: datetime) -> quota_alert.CodexAlertPassReadings:
+        fresh = self.readings(now, left=0)
+        checked = tuple(quota_alert.CodexHomeReading(home.home, home.report,
+            self.now - timedelta(minutes=11) if home.home == self.root / ".codex3" else now)
+            for home in fresh.checked_homes)
+        stale = next(home for home in checked if home.home == self.root / ".codex3")
+        usage_store.save([stale.report], stale.observed_at)
+        return quota_alert.CodexAlertPassReadings(fresh.workers, fresh.selected_account, checked)
+
+    def test_stale_workers_head_blocks_a_fresh_later_entry_and_notifies_once(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        later = next_moves.add_next_move("workers", 1, "codex2")
+        with (mock.patch.object(quota_alert, "recipients", return_value=["director"]),
+              mock.patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check,
+              redirect_stdout(io.StringIO()) as output):
+            for minute in (0, 2):
+                now = self.now + timedelta(minutes=minute)
+                returned = quota_alert.run_workers_next_moves(self.stale_workers_target_readings(now), now)
+                self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex1", self.root / ".codex1"))
+        self.swap.assert_not_called()
+        self.assertEqual([call.args[0] for call in check.call_args_list], ["codex3", "codex3"])
+        self.assertEqual(next_moves.read_next_moves(), (head, later))
+        self.assertEqual(moves.read_moves(), [])
+        self.relay.assert_called_once()
+        recipient, text, _ = cast(tuple[str, str, str | None], self.relay.call_args.args)
+        self.assertEqual(recipient, "director")
+        for detail in ("workers", "codex3", head.id, "due", "no fresh reading",
+                       (self.now - timedelta(minutes=11)).strftime("%H:%M")):
+            self.assertIn(detail, text)
+        self.assertIn(text, output.getvalue())
+        self.phone.assert_not_called()
+
+    def test_queued_workers_head_blocks_a_provider_refusal_fallback_swap(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        readings = self.readings(self.now, left=80)
+        identity = readings.selected_account
+        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+        with mock.patch.object(accounts, "pick", wraps=accounts.pick) as pick:
+            _ = quota_alert.blocked([self.note(1, left=80)], identity, self.now,
+                codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        pick.assert_not_called()
+        self.swap.assert_not_called()
+        self.assertEqual(accounts.role_account("workers").label, "codex1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertEqual(moves.read_moves(), [])
+        self.assertIn(refusals.key("codex", identity.login), refusals.load())
+
+    def test_queued_workers_head_blocks_a_credits_off_fallback_swap(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        notes = [self.note(1, "off"), self.note(2), self.note(3)]
+        with (mock.patch.object(quota_alert, "recipients", return_value=["director"]),
+              redirect_stdout(io.StringIO())):
+            _ = quota_alert.alert(notes, self.now,
+                selection=ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(
+                    self.root / ".claude", "fixture identity unavailable"), False, (), frozenset()),
+                codex_readings=self.stale_workers_target_readings(self.now))
+        self.swap.assert_not_called()
+        self.assertEqual(accounts.role_account("workers").label, "codex1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertEqual(moves.read_moves(), [])
+
+    def test_removing_a_queued_head_releases_the_still_zero_credits_off_fallback_once(self) -> None:
+        _ = self.note(1, "off")
+        head = next_moves.add_next_move("workers", 1, "codex1")
+        _ = self.alert()
+        self.swap.assert_not_called()
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        next_moves.remove_next_move(head.id)
+        _ = self.alert(self.now + timedelta(minutes=2))
+        _ = self.alert(self.now + timedelta(minutes=4))
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.assertEqual(len([row for row in moves.read_moves() if row["kind"] == "requested"]), 1)
+
+    def test_workers_target_allowance_changes_below_the_same_threshold_send_one_notice(self) -> None:
+        head = next_moves.add_next_move("workers", 20, "codex3")
+        with mock.patch.object(quota_alert, "recipients", return_value=["director"]):
+            for minute, left in ((0, 10), (2, 9)):
+                now = self.now + timedelta(minutes=minute)
+                readings = self.readings(now, left=1, spare_accounts=((3, left, "0"),))
+                _ = quota_alert.run_workers_next_moves(readings, now)
+        self.relay.assert_called_once()
+        text = cast(str, self.relay.call_args.args[1])
+        self.assertIn("10% left, at or below 20%", text)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.swap.assert_not_called()
+        self.phone.assert_not_called()
+
+    def test_workers_successor_becomes_eligible_only_after_its_head_is_consumed(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        later = next_moves.add_next_move("workers", 80, "codex2")
+        readings = self.readings(self.now, left=1,
+            spare_accounts=((3, 50, "0"), (2, 90, "0")))
+        with mock.patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check:
+            returned = quota_alert.run_workers_next_moves(readings, self.now)
+            self.swap.assert_called_once_with("workers", "codex3", why=f"auto: {head.id}", cause="auto")
+            self.assertEqual(next_moves.read_next_moves(), (later,))
+            self.assertEqual([call.args[0] for call in check.call_args_list], ["codex3"])
+            self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex3", self.root / ".codex3"))
+            self.swap.reset_mock()
+            check.reset_mock()
+            now = self.now + timedelta(minutes=2)
+            readings = self.readings(now, selected=3, left=50,
+                spare_accounts=((2, 90, "0"),))
+            returned = quota_alert.run_workers_next_moves(readings, now)
+        self.swap.assert_called_once_with("workers", "codex2", why=f"auto: {later.id}", cause="auto")
+        self.assertEqual([call.args[0] for call in check.call_args_list], ["codex2"])
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex2", self.root / ".codex"))
+        self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"],
+                         [f"auto: {head.id}", f"auto: {later.id}"])
+        self.relay.assert_not_called()
 
     def test_pending_phone_retry_normalizes_the_saved_note_filename_without_reopening_or_relaying(self) -> None:
         _ = self.alert()

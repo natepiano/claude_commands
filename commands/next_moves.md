@@ -12,4 +12,4 @@ Translate $ARGUMENTS into `python3 ~/.claude/scripts/accounts/accounts.py next`:
 
 Workers entries cannot have a minute hold. A workers move to Claude holds there until the source account’s weekly reset.
 
-Print the list after every change. Entries run once, in list order; a recorded move removes its entry. Reads and changes on the Mac go to natedev. See `docs/accounts.md`.
+Print the list after every change. For units, showrunners and workers, only the first entry per group can run; queued entries block fallback moves, and a recorded move removes its entry so the next becomes eligible on a later pass (starting its hold for Claude groups). A due head whose target is already current or blocked by login, reading, allowance, refusal or preparation stays queued and tells showrunners once per changed reason; shutdown waits silently, and completing members onto the selected account still runs. Queued Claude groups wait for any known refusal reset and continue on the current account afterward (unknown resets wait for the head); queued workers keep their brief reset wait. Reads and changes on the Mac go to natedev. See `docs/accounts.md`.
