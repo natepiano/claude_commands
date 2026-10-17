@@ -4,6 +4,8 @@
 
 `scripts/production/merge_gate.py` is the committed command that merges a checkpoint into a `~/.claude` production's merge branch and tests the result. It refuses unsafe starting states, merges the checkpoint `--no-ff`, then runs every test module of the 22 `~/.claude` Python suites plus basedpyright in parallel under a sampled-memory cap. On green it pushes, and with `--promote` it fast-forwards `~/.claude` main and the Mac. On red it undoes the merge and prints each red suite's failures. Run sequentially, the suites took about 30 minutes; in parallel they take 75–195 s depending on machine load. A set of test rules keeps them at that speed and keeps load from turning them red: no live state, no wall-clock thresholds, no fixed waits in the code under test, few process launches, no trivial tests.
 
+## How it works
+
 ### The gate: `scripts/production/merge_gate.py`
 
 **Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--memory-cap-mib 4096]`. The six merge flags are required unless `--tests-only` is given. `--type-dirs` (alias `--type-dir`) defaults to `scripts`. Any failure prints `REFUSED: <reason>` to stderr and exits 1. Typed boundary: `GateArguments(argparse.Namespace)`; each failure raises `GateRefused`.
@@ -55,13 +57,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 - `ImmutableGitSeed.create(root, branch, author, email, files)` builds one checkout plus a bare origin per test class, with `GIT_CONFIG_GLOBAL=/dev/null`. `copy_to(checkout, origin)` copies both trees and repoints the remote, so each case has private refs, config, index and origin without re-running git setup.
 - Converted test modules keep one `subprocess_cli=True` case per script, covering parsing, exit status and the launch contract. `mac_test/test_offload.py` imports `cli_fixture` through a `sys.path` insertion.
 
-- Verbs: `list-panes -a -F`, `show-environment -t`, `set-environment -t`, `capture-pane -p -e -t`, `send-keys -t`.
-
-- Exit 2: a malformed or unexpected call. Exit 1: a missing session or pane (jq `halt_error(1)` prints a diagnostic naming the target and leaves the state unchanged) or a missing state file.
-
-- Writes go through a temp file and `mv`.
-
-- Used by `test_waiting.py` and `test_dailies_input.py`. The `ci_points` fake `gh` is likewise a shell + jq stub.
+**Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes marked unit panes, their pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` and `test_dailies_input.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
 
 **`scripts/delegate/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
@@ -103,6 +99,11 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 `PLAN_DELEGATE_ACTIVE_DIR` is on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when it, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
 
 ## Invariants
+
+- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, a real herdr server, the real `codex app-server`, and phone sends. Test discovery never starts a real session host or builds a missing host binary.
+  - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `observe_workers_home` raises on any fallback to a live Codex home.
+  - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
+  - No test writes into the repo.
 
 - **No wall-clock thresholds.** A timing claim is a work count (launches in flight, subshells traced with a DEBUG trap, barrier arrivals), a controlled clock (token clock file, injected durations), or a comparison calibrated in the same run (buildlog report: CLI CPU at full and quarter log size, three runs each). Fixture deadlines are 300 s hang guards, never pass/fail limits.
 
@@ -182,9 +183,3 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 - **Event waits over polls.** inotify and pidfd waits wake on the change itself, so tests are both faster and immune to load, where a fixed poll or deadline gives only one of those.
 - **The phone-send guards are kept.** They look like tests of a mock, but they pin the patch that stops a fixture from sending real phone messages.
 - **Trivial tests were rare.** The audit of 5,713 tests deleted five and moved no gate time; the criteria live in the worker prompt contract so new ones are not written.
-
-## Host fixtures
-
-Production, message and shutdown tests use fake herdr responses and process
-fixtures. Test discovery never starts a real session host or builds a missing
-host binary.

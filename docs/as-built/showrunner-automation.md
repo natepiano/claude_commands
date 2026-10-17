@@ -24,7 +24,7 @@ The problem it solves is the number of manual steps a showrunner has to carry. E
 
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
 
-`add_unit.py --production <doc> <name> (--plan <path> | --brief <words> | --standby) [--port N] [--owns <paths>] [--resume <sessionId> --cwd <dir> [--restart-note <file> --session-name <name> --host-session <name> [--probe]]] [--timeout S] [--check]`, run through `scripts/lib/py`.
+`add_unit.py --production <doc> <name> (--plan <path> | --brief <words> | --standby) [--permanent] [--account <label>] [--model <model>] [--port N] [--owns <paths>] [--resume <sessionId> --cwd <dir> [--restart-note <file> --session-name <name> --host-session <name> [--probe]]] [--timeout S] [--check]`, run through `scripts/lib/py`.
 
 - **Request.** `launch_request` builds `RequestedUnitLaunch`, whose request-only fields are `requested_name` and `unit = <name>-unit`. A name that already ends in `-unit` (or `_unit`) loses that ending first, so `feature-log-unit` launches exactly as `feature-log` does, not as `feature-log-unit-unit`. The shared `UnitLaunchConfiguration` carries `production`, `branch`, `worktree`, `plan: PlanGiven | BriefGiven | Standby`, `port`/`owns: OmittedCell | SuppliedCell`, `session: NewSession | ResumedSession`, and `timeout`. Exactly one of the three launch states is required; `--resume` also needs `--cwd` and `--plan`. `launch_kind` is `UnitRestoreLaunch(session_id, note, session_name, host_session, probe)` when `--restart-note`, `--session-name` and `--host-session` are all given with `--resume` (only `/shutdown restart` passes them), else `NewWorkLaunch`; any other mix is refused. The hidden `--probe` is accepted only with `--restart-note`; shutdown passes it for a probe session's record.
 
