@@ -24,7 +24,7 @@ export function cellWidth(text: string): number {
 
 /** Keep the following column's space even when a title fills its entire cell. */
 export function fitText(text: string, width: number): string {
-  text = text.replace(/\s+/gu, ' ');
+  text = text.replace(/[ \t]*[\r\n\t][\s]*/gu, ' ');
   width = Math.max(0, Math.floor(width));
   if (cellWidth(text) <= width) return text;
   if (!width) return '';

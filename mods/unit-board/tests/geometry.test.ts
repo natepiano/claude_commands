@@ -18,6 +18,8 @@ describe("board geometry", () => {
     expect(fitText("e\u0301xy", 2)).toBe("e\u0301…");
     expect(fitText("界", 2)).toBe("界");
     expect(fitText("界", 1)).toBe("…");
+    expect(fitText("  Phase 9/17  Title", 40)).toBe("  Phase 9/17  Title");
+    expect(fitText("one\ntwo  three\n", 40)).toBe("one two  three ");
   });
 
   test("fold and more-running lines reserve terminal cells for whole keys and overflow counts", () => {

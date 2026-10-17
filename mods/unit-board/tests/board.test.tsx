@@ -209,7 +209,7 @@ describe("board layout", () => {
       }
       expect(occupiedRows(tree)).toBeLessThanOrEqual(50);
       expect(rows.some(row => /\bopen\b.*Record 10$/.test(row))).toBe(true);
-      expect(fitText("  one\n\t two\r\nthree  ", 30)).toBe(" one two three ");
+      expect(fitText("  one\n\t two\r\nthree  ", 30)).toBe("  one two three  ");
     });
 
     for (const bodyRows of [0, 1, 12, 30]) {
@@ -250,7 +250,7 @@ describe("board layout", () => {
       expect(occupiedRows(tree)).toBeLessThanOrEqual(3);
       const compact = lines(tree).find(row => row.includes("ETA 17:48"))!;
       const visible = fitText(compact, 40);
-      expect(visible).toContain("Build ETA 17:48 · overdue 12m");
+      expect(visible).toContain("Build  ETA 17:48 · overdue 12m");
       expect(visible.indexOf("Build")).toBeLessThan(visible.indexOf("ETA"));
       expect(compact.indexOf("overdue 12m")).toBeLessThan(compact.indexOf("█"));
       expect(cellWidth(visible)).toBeLessThanOrEqual(40);
