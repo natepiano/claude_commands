@@ -39,11 +39,9 @@ ETA_LEAD = re.compile(
 )
 MIDLINE_ETA = re.compile(rf"\bETA\s*:?[ ]*{TIME}\b|{TIME} \({TIME}–{TIME}\)", re.IGNORECASE)
 LEADING_TIME = re.compile(rf"^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?{TIME}(?:\s|$)")
-WAITING_EXAMPLE = ("Waiting on items: the open-questions count first while any is open, then `quota: ` lines, "
+WAITING_EXAMPLE = ("Waiting on items: the open-questions count first while any is open, "
                    + "then ETA items soonest first, then no-ETA items. Use `19:45 (18:20–23:55) - startup Phase 16` "
                    + "or `no ETA measured - <item>`; omit the zone.")
-# A held quota alert is a status, not a question, so it keeps a line of its own.
-QUOTA_LEAD = "quota: "
 # User, 2026-10-12: "your messages should just say 'there are {n} open questions for you' - that's it".
 ASK_ONCE = ("A question for the user is asked once, in full, when it first comes up. After that the Waiting on "
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
@@ -501,15 +499,13 @@ def open_questions_error(bullets: list[str], expected: int | None) -> str | None
     if expected is None:
         return None
     user_lines = [bullet for bullet in bullets
-                  if ETA_LEAD.match(bullet) is None and not bullet.startswith(("no ETA measured - ", QUOTA_LEAD))]
+                  if ETA_LEAD.match(bullet) is None and not bullet.startswith("no ETA measured - ")]
     wanted = [count_sentence(expected)] if expected else []
     if user_lines == wanted and (not wanted or bullets[0] == wanted[0]):
         return None
     if not wanted:
-        return (ASK_ONCE + f"Nothing waits on the user now, so remove `* {user_lines[0]}`. "
-                + f"A held quota alert begins `{QUOTA_LEAD}`.")
-    return (ASK_ONCE + f"Write exactly `* {wanted[0]}` as the first bullet, once, and no other line for the user. "
-            + f"A held quota alert begins `{QUOTA_LEAD}`.")
+        return ASK_ONCE + f"Nothing waits on the user now, so remove `* {user_lines[0]}`."
+    return ASK_ONCE + f"Write exactly `* {wanted[0]}` as the first bullet, once, and no other line for the user."
 
 
 def waiting_format_error(bullets: list[str], now: datetime) -> str | None:
@@ -540,7 +536,7 @@ def waiting_format_error(bullets: list[str], now: datetime) -> str | None:
                     return "ETA items are out of time order. " + WAITING_EXAMPLE
                 last_eta = eta
         if kind < last_kind:
-            return "Waiting on kinds are out of order: the count and `quota: ` lines first. " + WAITING_EXAMPLE
+            return "Waiting on kinds are out of order: the open-questions count first. " + WAITING_EXAMPLE
         last_kind = kind
     return None
 

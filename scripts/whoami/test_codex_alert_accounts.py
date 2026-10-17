@@ -67,7 +67,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "alerts.json"))
         _ = self.enterContext(patch.object(quota_alert, "REGISTRY", registry))
         _ = self.enterContext(patch.object(quota_alert, "recipients", return_value=["director"]))
-        _ = self.enterContext(patch.object(quota_alert, "not_live", return_value=[]))
         _ = self.enterContext(patch.object(quota_alert, "relay", side_effect=self.relay))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", side_effect=self.push))
         _ = self.enterContext(patch.object(accounts, "_retire_workers_servers", return_value=[]))
@@ -524,6 +523,31 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertEqual(agent_accounts.workers_home(), soon.home)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
 
+    def test_each_exited_refusal_tells_only_its_director_even_with_an_open_fallback(self) -> None:
+        source = self.account(1)
+        readings = self.readings(source, self.report(source, 0))
+        note = self.note(1, "active", 0)
+        commands = (("director-a", "impl", "codex_mesh start --prompt 'first task'"),
+                    ("director-b", "test", "codex_mesh follow --to test --prompt 'second task'"))
+        with patch.object(quota_alert, "relay", return_value=None) as relay:
+            for director, worker, command in commands:
+                log = quota_alert.blocked([note], source, self.now, codex_readings=readings,
+                    stopped=quota_alert.StoppedWorkerCommand(director, worker, command))
+                self.assertTrue(any(f"quota rerun {worker} -> {director}: sent" in line for line in log))
+                with quota_alert.state_file() as state:
+                    self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(relay.call_count, 2)
+            for call, (director, worker, command) in zip(relay.call_args_list, commands):
+                recipient, text, key = cast(tuple[str, str, str | None], call.args)
+                self.assertEqual(recipient, f"session:{director}")
+                self.assertIn(worker, text)
+                self.assertIn(command, text)
+                self.assertIn("Rerun this command on Claude", text)
+                self.assertIsNone(key)
+            _ = quota_alert.blocked([note], source, self.now, codex_readings=readings,
+                                    stopped=quota_alert.StoppedCommandUnknown())
+            self.assertEqual(relay.call_count, 2)
+
     def account(self, number: int, *, default: bool = False) -> agent_accounts.KnownCodexAccount:
         home = self.root / (".codex" if default else f".codex{number}")
         home.mkdir(exist_ok=True)
@@ -679,10 +703,10 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target))
         with patch.object(accounts, "swap", side_effect=accounts.AccountsError("destination unavailable")):
-            _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now, codex_readings=readings)
+            log = quota_alert.blocked([self.note(1, "active", 0)], old, self.now, codex_readings=readings)
         self.assertEqual(agent_accounts.workers_home(), old.home)
         self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
-        self.assertTrue(any("workers could not move" in text and "destination unavailable" in text for text in self.sent))
+        self.assertTrue(any("workers could not move" in text and "destination unavailable" in text for text in log))
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
         self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
@@ -694,7 +718,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
         with (patch.object(quota_alert, "switch_to_claude") as fallback,
               patch.object(accounts, "swap", wraps=accounts.swap) as swap):
-            _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
+            log = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
         fallback.assert_not_called()
         swap.assert_called_once()
@@ -702,7 +726,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertEqual(agent_accounts.workers_home(), target.home)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
         self.assertEqual(sum(text.startswith("workers moved from codex1 to codex2:")
-                             for text in self.sent), 1)
+                             for text in log), 1)
         held = refusals.load()[refusals.key("codex", old.login)]
         self.assertEqual(held.window, refusals.KnownWindow("weekly"))
         entries = moves.read_moves()
@@ -740,13 +764,14 @@ class CodexAccountAlertTests(unittest.TestCase):
         reset = self.now + timedelta(minutes=19)
         report.five_hour = Quota("5-hour", 100, reset)
         readings = self.readings(old, report, self.report(target, 1))
+        log: list[str] = []
         for _attempt in range(2):
-            _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
+            log += quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
                 codex_readings=readings, window=refusals.KnownWindow("five_hour"))
         self.assertEqual(agent_accounts.workers_home(), old.home)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
         self.assertEqual(sum(text.startswith("workers wait for codex1's 5-hour reset at ")
-                             for text in self.sent), 1)
+                             for text in log), 1)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["waited"])
         renewed = self.report(old, 80)
         later_readings = quota_alert.CodexAlertPassReadings(readings.workers, old,
@@ -825,7 +850,8 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
             codex_readings=readings, window=refusals.KnownWindow("weekly"))
         self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
-        self.assertTrue(any("earliest reset" in text for text in self.sent), self.sent)
+        self.assertEqual(self.relayed, [])
+        self.assertTrue(any(row["kind"] == "routed to claude" for row in moves.read_journal()))
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["no room"])
         later = self.now + timedelta(minutes=1)
         same_reset = quota_alert.CodexAlertPassReadings(readings.workers, old,
@@ -1117,12 +1143,12 @@ class CodexAccountAlertTests(unittest.TestCase):
         async def live(home: Path) -> Report:
             return self.report(a if home == a.home else b, 0 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live), patch.object(quota_alert, "tell_user", wraps=self.push) as push:
-            _ = quota_alert.blocked([self.note(1, "active", 0)], a)
-        self.assertIn("workers moved from codex1 to codex2", "\n".join(self.sent))
+            log = quota_alert.blocked([self.note(1, "active", 0)], a)
+        self.assertIn("workers moved from codex1 to codex2", "\n".join(log))
         self.assertEqual(agent_accounts.workers_home(), b.home)
         push.assert_not_called()
 
-    def test_standalone_alert_message_and_refresh_accept_their_new_readings(self) -> None:
+    def test_standalone_alert_and_refresh_accept_their_new_readings(self) -> None:
         a, b = self.account(1), self.account(2)
         _ = self.readings(a)
         note = self.note(1, "active", 1)
@@ -1132,8 +1158,6 @@ class CodexAccountAlertTests(unittest.TestCase):
             _ = quota_alert.alert([note])
             self.assertEqual([push.title for push in self.pushes], ["codex1 Codex workers will use paid credits"])
             self.assertEqual(self.relayed, [])
-            text = quota_alert.message(note, [note], quota_alert.load_config())
-            self.assertIn("workers move to codex2 when Codex refuses work", text)
             quota_alert.STATE.unlink(missing_ok=True)
             self.sent.clear()
             _ = quota_alert.refresh([note], None)
@@ -1201,21 +1225,18 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
             self.assertEqual(state.get("unseen"), unseen)
 
-    def test_unknown_refusal_is_sent_once_until_a_known_account_is_reported(self) -> None:
+    def test_unknown_refusal_logs_without_telling_any_session(self) -> None:
         a = self.account(1)
         readings = self.readings(a, self.report(a, 90))
         unknown = agent_accounts.UnknownCodexAccount(a.home, "sign-in unreadable")
+        log = quota_alert.blocked([], unknown, self.now, codex_readings=readings)
+        self.assertTrue(any("refusing account unknown" in line for line in log), log)
         _ = quota_alert.blocked([], unknown, self.now, codex_readings=readings)
-        sent = len(self.sent)
-        _ = quota_alert.blocked([], unknown, self.now, codex_readings=readings)
-        self.assertEqual(len(self.sent), sent)
-        _ = quota_alert.blocked([self.note(1, "active", 90)], a, self.now, codex_readings=readings)
-        _ = quota_alert.blocked([], unknown, self.now, codex_readings=readings)
-        self.assertGreater(len(self.sent), sent)
+        self.assertEqual(self.relayed, [])
         with quota_alert.state_file() as state:
             self.assertEqual(state["episodes"], {})
 
-    def test_refusal_after_credit_recovery_relays_the_new_move_without_a_phone_push(self) -> None:
+    def test_refusal_after_credit_recovery_keeps_the_new_move_without_session_or_phone_delivery(self) -> None:
         a = self.account(1)
         note = self.note(1, "active", 0)
         low = self.readings(a, self.report(a, 0))
@@ -1232,11 +1253,10 @@ class CodexAccountAlertTests(unittest.TestCase):
         with patch.object(quota_alert, "relay", wraps=self.relay) as relay, patch.object(
                 quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([note], a, self.now, codex_readings=low)
-            relay.assert_called_once()
+            relay.assert_not_called()
             push.assert_not_called()
-            self.assertIn("moved", cast(str, relay.call_args.args[1]))
             _ = quota_alert.blocked([note], a, self.now, codex_readings=low)
-            relay.assert_called_once()
+            relay.assert_not_called()
             push.assert_not_called()
         self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
 
@@ -1254,14 +1274,12 @@ class CodexAccountAlertTests(unittest.TestCase):
         with patch.object(quota_alert, "relay", wraps=self.relay) as relay, patch.object(
                 quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([note], a, self.now, codex_readings=selected)
-            relay.assert_called_once()
+            relay.assert_not_called()
             push.assert_not_called()
-            self.assertIn("moved", cast(str, relay.call_args.args[1]))
-            self.assertIn("workers moved", cast(str, relay.call_args.args[1]))
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
         self.assertEqual(agent_accounts.workers_home(), b.home)
 
-    def test_switch_failure_messages_repeat_only_when_the_failure_changes(self) -> None:
+    def test_switch_failure_phone_pushes_repeat_only_for_a_new_failure(self) -> None:
         a = self.account(1)
         readings = self.readings(a, self.report(a, 0))
         note = self.note(1, "active", 0)
@@ -1269,16 +1287,16 @@ class CodexAccountAlertTests(unittest.TestCase):
                 "editor unavailable", "editor unavailable", "registry is read only",
                 "registry is read only", "editor unavailable"]), patch.object(quota_alert, "relay", wraps=self.relay) as relay, patch.object(
                 quota_alert, "tell_user", wraps=self.push) as push:
-            for count, sent_failure in ((1, "editor unavailable"), (1, "editor unavailable"),
+            for count, attempted_failure in ((1, "editor unavailable"), (1, "editor unavailable"),
                                         (2, "registry is read only"), (2, "registry is read only"),
-                                        (2, "registry is read only")):
-                _ = quota_alert.blocked([note], a, self.now, codex_readings=readings)
-                self.assertEqual(relay.call_count, count)
+                                        (2, "editor unavailable")):
+                log = quota_alert.blocked([note], a, self.now, codex_readings=readings)
+                relay.assert_not_called()
                 self.assertEqual(push.call_count, count)
                 self.assertEqual(cast(RenderedPush, push.call_args.args[0]).id, "quota.codex_refused")
                 self.assertIn("the work is paused", cast(RenderedPush, push.call_args.args[0]).body)
-                self.assertNotIn(sent_failure, cast(RenderedPush, push.call_args.args[0]).body)
-                self.assertIn(sent_failure, cast(str, relay.call_args.args[1]))
+                self.assertNotIn(attempted_failure, cast(RenderedPush, push.call_args.args[0]).body)
+                self.assertTrue(any(attempted_failure in line for line in log), log)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
 
     def test_account_import_forms_share_module_and_identity_class(self) -> None:

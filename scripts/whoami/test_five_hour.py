@@ -1,4 +1,4 @@
-"""Tests for session warnings, repeat suppression and old-hold cleanup."""
+"""Claude session warnings, Codex log markers and legacy notice cleanup."""
 from __future__ import annotations
 
 import tempfile
@@ -16,7 +16,7 @@ import agent_accounts
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 import five_hour
 from agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
-from scripts.accounts import accounts
+from scripts.accounts import accounts, role_map
 
 import escalate  # five_hour puts scripts/message on the path
 import quota_alert
@@ -93,6 +93,23 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.watch([report("Claude", 90)]), [])
         self.assertEqual(len(self.sent), 2)
 
+    def test_codex_low_spell_logs_once_without_relay_then_rearms_after_recovery(self) -> None:
+        first = self.watch([report("Codex", 95)])
+        self.assertEqual(len(first), 1)
+        self.assertIn("5-hour limit:", first[0])
+        self.assertIn("codex1", first[0])
+        self.assertIn("5%", first[0])
+        markers = list(five_hour.STATE.glob("five-hour-codex-*.notice"))
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0].read_text(), "codex1")
+        self.assertEqual(self.watch([report("Codex", 99)]), [])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.watch([report("Codex", 3)]), ["5-hour limit: codex1 is back above 20%"])
+        self.assertFalse(markers[0].exists())
+        self.assertEqual(self.watch([report("Codex", 3)]), [])
+        self.assertEqual(len(self.watch([report("Codex", 80)])), 1)
+        self.assertEqual(self.sent, [])
+
     def test_old_phone_hold_closes_once_on_recovery(self) -> None:
         _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "Usage low", NoActionRequired(), "note"))
         self.assertEqual(self.watch([report("Claude", 3)]), ["5-hour limit: Claude is back above 20%"])
@@ -105,7 +122,8 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.watch([report("Codex", 3)]), ["5-hour limit: codex1 is back above 20%"])
         self.assertIsInstance(escalate.read(escalate.held_path("five-hour-codex")), escalate.NoHeld)
         self.assertEqual(self.watch([report("Codex", 3)]), [])
-        self.assertEqual(len(self.watch([report("Codex", 80)])), 2)
+        self.assertEqual(len(self.watch([report("Codex", 80)])), 1)
+        self.assertEqual(self.sent, [])
 
     def test_no_reading_changes_nothing(self) -> None:
         _ = self.watch([report("Claude", 99)])
@@ -124,6 +142,8 @@ class AccountHoldTests(unittest.TestCase):
         self.sent = []
         self.now = datetime.now(timezone.utc)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)})))
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
+        _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
         _ = self.enterContext(patch.object(escalate, "STATE", self.root / "holds"))
         _ = self.enterContext(patch.object(five_hour, "STATE", self.root / "notices"))
         _ = self.enterContext(patch.object(escalate, "schedule"))
@@ -165,19 +185,19 @@ class AccountHoldTests(unittest.TestCase):
         current = [entry for entry in held if isinstance(entry, escalate.HeldMessage)]
         self.assertEqual([entry.summary for entry in current], ["Claude"])
         low_b = self.readings(2)
-        _ = five_hour.watch([low_b.checked_homes[0].report], codex_readings=low_b)
-        self.assertTrue(self.sent)
-        self.assertTrue(all("codex2" in text for text in self.sent))
+        lines = five_hour.watch([low_b.checked_homes[0].report], codex_readings=low_b)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("codex2", lines[0])
+        self.assertEqual(self.sent, [])
 
     def test_known_swap_retires_an_offline_relay_even_without_a_usage_reading(self) -> None:
         with (patch.object(send, "STATE", self.root / "messages"),
               patch.object(sessions, "live_sessions", return_value=[])):
-            def queue(recipient: str, text: str, key: str | None) -> str:
-                send.enqueue(send.Message(recipient, "quota_alert", "", text, key), "offline", self.now)
-                return "offline"
             a = self.readings(1)
-            with patch.object(five_hour, "relay", side_effect=queue):
-                _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
+            _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
+            # This queued relay predates log-only Codex notices; new watches never enqueue it.
+            send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1"),
+                         "offline", self.now)
             self.assertTrue(send.read_queue(send.queue_path("hana")))
             chosen = self.readings(2, None)
             b = quota_alert.CodexAlertPassReadings(chosen.workers, chosen.selected_account, ())
