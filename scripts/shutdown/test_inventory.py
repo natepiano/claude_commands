@@ -512,6 +512,10 @@ class InventoryTests(ShutdownTestCase):
             )
             _ = self.git("add", f"ahead-{number}.txt")
             _ = self.git("commit", "-m", f"ahead {number}")
+        # A snapshot commit is pushed by its own job, so the ahead count leaves it out.
+        _ = (self.checkout / "snapshot.md").write_text("sessions\n", encoding="utf-8")
+        _ = self.git("add", "snapshot.md")
+        _ = self.git("commit", "-m", "agent-sessions-snapshot: update agent sessions")
         _ = (self.checkout / "dirty.txt").write_text("changed\n", encoding="utf-8")
         self.head = self.git("rev-parse", "HEAD")
 

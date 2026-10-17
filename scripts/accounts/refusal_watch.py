@@ -6,7 +6,9 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,6 +44,10 @@ else:
 @dataclass(frozen=True)
 class NoSessionRefusal:
     """The session has no current transcript or assumed quota refusal."""
+
+
+class ShutdownProgressReader(Protocol):
+    def shutdown_in_progress(self, saved: record.SessionShutdown) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,84 @@ class WatchedSession(TypedDict):
 class WatchState(TypedDict):
     sessions: dict[str, WatchedSession]
     notices: dict[str, str]
+    auto_moves: NotRequired[dict[str, AutoResetObservation]]
+
+
+class AutoResetObservation(TypedDict):
+    observed_reset: str
+    acted_reset: str
+
+
+@dataclass(frozen=True)
+class LeftAtMost:
+    percent: float
+
+
+@dataclass(frozen=True)
+class AfterReset:
+    """Return to the target after an observed weekly window ends."""
+
+
+@dataclass(frozen=True)
+class AutoMoveRule:
+    name: str
+    group: accounts.ClaudeGroup
+    to: str
+    when: LeftAtMost | AfterReset
+
+
+@dataclass(frozen=True)
+class MalformedAutoMoveRule:
+    reason: str
+
+
+def read_auto_move_rules() -> tuple[AutoMoveRule | MalformedAutoMoveRule, ...]:
+    try:
+        config = accounts._read_json_object(accounts.accounts_config_file())  # pyright: ignore[reportPrivateUsage]
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError) as error:
+        return (MalformedAutoMoveRule(f"auto_moves: {error}"),)
+    raw = config.get("auto_moves", [])
+    if not isinstance(raw, list):
+        return (MalformedAutoMoveRule("auto_moves: expected a list"),)
+    result: list[AutoMoveRule | MalformedAutoMoveRule] = []
+    names: set[str] = set()
+    for index, entry in enumerate(cast(list[object], raw), 1):
+        name = f"#{index}"
+        try:
+            if not isinstance(entry, dict):
+                raise ValueError("expected an object")
+            fields = cast(dict[str, object], entry)
+            configured_name = fields.get("name")
+            if not isinstance(configured_name, str) or not configured_name.strip():
+                raise ValueError("name must be nonempty")
+            name = configured_name
+            if name in names:
+                raise ValueError("duplicate rule name")
+            group, target, when = fields.get("group"), fields.get("to"), fields.get("when")
+            if group not in accounts.CLAUDE_GROUPS or not isinstance(target, str) or not isinstance(when, dict):
+                raise ValueError("expected a Claude group, target label and when object")
+            label = accounts.numbered_account_label(target, "claude").label
+            condition = cast(dict[str, object], when)
+            trigger: LeftAtMost | AfterReset
+            if set(condition) == {"left_at_most"}:
+                percent = condition["left_at_most"]
+                if (not isinstance(percent, (int, float)) or isinstance(percent, bool)
+                        or not math.isfinite(percent) or not 0 <= percent <= 100):
+                    raise ValueError("left_at_most must be a percent from 0 to 100")
+                trigger = LeftAtMost(float(percent))
+            elif condition == {"after_reset": True}:
+                if condition["after_reset"] is not True:
+                    raise ValueError("after_reset must be true")
+                trigger = AfterReset()
+            else:
+                raise ValueError("when must contain left_at_most or after_reset: true")
+            result.append(AutoMoveRule(name, group, label, trigger))
+            names.add(name)
+        except (ValueError, TypeError) as error:
+            result.append(MalformedAutoMoveRule(f"auto_moves {name}: {error}"))
+    return tuple(result)
 
 
 def state_root() -> Path:
@@ -156,6 +240,16 @@ def _load_state() -> WatchState:
     raw_notices = held.get("notices")
     if isinstance(raw_notices, dict):
         result["notices"] = {key: value for key, value in cast(dict[str, object], raw_notices).items() if isinstance(value, str)}
+    raw_auto = held.get("auto_moves")
+    if isinstance(raw_auto, dict):
+        observations: dict[str, AutoResetObservation] = {}
+        for name, raw in cast(dict[str, object], raw_auto).items():
+            if isinstance(raw, dict):
+                fields = cast(dict[str, object], raw)
+                observed, acted = fields.get("observed_reset"), fields.get("acted_reset")
+                if isinstance(observed, str) and isinstance(acted, str):
+                    observations[name] = AutoResetObservation(observed_reset=observed, acted_reset=acted)
+        result["auto_moves"] = observations
     return result
 
 
@@ -321,6 +415,7 @@ def cancelled(session_id: str) -> None:
 
 
 NO_SESSION_FILTER: frozenset[str] = frozenset()
+NO_MOVED_GROUPS: frozenset[accounts.ClaudeGroup] = frozenset()
 
 
 def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_module.Session]:
@@ -637,6 +732,17 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 outcome.move_id if isinstance(outcome, accounts.SessionMoveRequested) else "")
             if isinstance(outcome, accounts.SessionMoveRefused):
                 lines.append(f"{outcome.session_id}: move refused: {outcome.reason}")
+    if not proof_group:
+        if not dry_run and json.dumps(state, sort_keys=True) != original_state:
+            _atomic_json(state_root() / "refusal_watch.json", state)
+        before_rules = dict(selected_groups)
+        lines.extend(run_auto_moves(now, dry_run=dry_run, moved_groups=frozenset(moved_groups)))
+        if not dry_run:
+            selected_groups = accounts.group_accounts()
+            moved_groups.update(group for group in accounts.CLAUDE_GROUPS
+                                if selected_groups.get(group) != before_rules.get(group))
+            state = _load_state()
+            original_state = json.dumps(state, sort_keys=True)
     # A committed group choice is stable. Complete its off-target members without choosing again.
     if not proof_group and selected_groups:
         for group_name in accounts.CLAUDE_GROUPS:
@@ -671,9 +777,113 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 transition = accounts.group_transition(group_name)
                 if isinstance(transition, accounts.NoGroupTransition):
                     transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
+                why = transition.why if isinstance(transition.origin, accounts.AutoOrigin) else f"complete {group_name} move to {target}"
                 _ = accounts.move_sessions(tuple(session.session_id for session in members), target,
-                    why=f"complete {group_name} move to {target}", origin=transition.origin, move_id=transition.move_id)
+                    why=why, origin=transition.origin, move_id=transition.move_id,
+                    alerts="none" if isinstance(transition.origin, accounts.AutoOrigin) else "user")
     if not dry_run and json.dumps(state, sort_keys=True) != original_state:
+        _atomic_json(state_root() / "refusal_watch.json", state)
+    return lines
+
+
+def run_auto_moves(now: datetime, *, dry_run: bool = False,
+                   moved_groups: frozenset[accounts.ClaudeGroup] = NO_MOVED_GROUPS) -> list[str]:
+    """Apply configured rules after the refusal pass, under its watch lock."""
+    if socket.gethostname().split(".", 1)[0] != role_map.ROLE_MAP_HOST:
+        return []
+    configured = read_auto_move_rules()
+    rules = [rule for rule in configured if isinstance(rule, AutoMoveRule)]
+    lines = [rule.reason for rule in configured if isinstance(rule, MalformedAutoMoveRule)]
+    if not rules:
+        return lines
+    state = _load_state()
+    original = json.dumps(state, sort_keys=True)
+    observations = state.setdefault("auto_moves", {})
+    threshold = max((rule.when.percent for rule in rules if isinstance(rule.when, LeftAtMost)), default=0)
+    selected = accounts.group_accounts()
+    members = accounts.live_group_members()
+    shutdown_progress = cast(ShutdownProgressReader, cast(object, import_module("settle")))
+    in_flight = {accounts.session_group(saved["session"]) for saved in record.all_session_records()
+                 if shutdown_progress.shutdown_in_progress(saved)}
+    moved = set(moved_groups)
+    held_refusals = refusals.load()
+    for rule in rules:
+        try:
+            target_identity = accounts.account_identity(accounts.claude_account_dir(rule.to))
+        except accounts.AccountsError as error:
+            lines.append(f"auto: {rule.name}: target {rule.to} unavailable: {error}")
+            continue
+        if not isinstance(target_identity, agent_accounts.NumberedAccount):
+            lines.append(f"auto: {rule.name}: target {rule.to} is not logged in")
+            continue
+        target = refusals.stored_reading("claude", target_identity.login, now)
+        if not isinstance(target, refusals.FreshReading):
+            continue
+        passed_reset = ""
+        if isinstance(rule.when, AfterReset):
+            if not isinstance(target.weekly.reset, refusals.KnownReset):
+                continue
+            current_reset = target.weekly.reset.at.isoformat()
+            previous = observations.get(rule.name)
+            if previous is None:
+                observations[rule.name] = AutoResetObservation(observed_reset=current_reset, acted_reset="")
+                continue
+            try:
+                observed_reset = datetime.fromisoformat(previous["observed_reset"])
+                if observed_reset.tzinfo is None:
+                    raise ValueError("reset needs a zone")
+            except ValueError:
+                observations[rule.name] = AutoResetObservation(observed_reset=current_reset, acted_reset="")
+                continue
+            if previous["acted_reset"] == previous["observed_reset"]:
+                if current_reset != previous["observed_reset"]:
+                    observations[rule.name] = AutoResetObservation(
+                        observed_reset=current_reset, acted_reset=previous["acted_reset"])
+                continue
+            if observed_reset > now:
+                continue
+            passed_reset = previous["observed_reset"]
+        source_label = accounts.group_label(selected, rule.group)
+        if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
+                or rule.group in moved or rule.group in in_flight):
+            continue
+        if target.weekly.left <= threshold:
+            continue
+        held = held_refusals.get(refusals.key("claude", target_identity.login))
+        if held is not None and not refusals.resolved(held, target, now):
+            continue
+        if isinstance(rule.when, LeftAtMost):
+            source_identity = accounts.account_identity(accounts.claude_account_dir(source_label))
+            if not isinstance(source_identity, agent_accounts.NumberedAccount):
+                continue
+            source = refusals.stored_reading("claude", source_identity.login, now)
+            if not isinstance(source, refusals.FreshReading) or source.weekly.left > rule.when.percent:
+                continue
+        prepared = (accounts.prepared_account_preview(rule.to, resume=True) if dry_run
+                    else accounts.prepared_account(rule.to, resume=True))
+        if isinstance(prepared, accounts.AccountRefused):
+            lines.append(f"auto: {rule.name}: move refused: {prepared.reason}")
+            continue
+        why = f"auto: {rule.name}"
+        lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {source_label} to {rule.to}")
+        moved.add(rule.group)
+        if dry_run:
+            continue
+        transition = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
+        selected[rule.group] = rule.to
+        if isinstance(rule.when, AfterReset):
+            assert isinstance(target.weekly.reset, refusals.KnownReset)
+            observations[rule.name] = AutoResetObservation(
+                observed_reset=target.weekly.reset.at.isoformat(), acted_reset=passed_reset)
+        # Commit the once-per-reset decision before starting detached session moves.
+        _atomic_json(state_root() / "refusal_watch.json", state)
+        ids = tuple(member.session_id for member in members[rule.group]
+                    if not accounts.session_on_account(member, rule.to))
+        outcomes = accounts.move_sessions(ids, rule.to, why=why, origin=transition.origin,
+                                         move_id=transition.move_id, alerts="none") if ids else ()
+        lines.extend(f"{outcome.session_id}: move refused: {outcome.reason}" for outcome in outcomes
+                     if isinstance(outcome, accounts.SessionMoveRefused))
+    if not dry_run and json.dumps(state, sort_keys=True) != original:
         _atomic_json(state_root() / "refusal_watch.json", state)
     return lines
 
