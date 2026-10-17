@@ -363,7 +363,8 @@ class MeshCommandTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.session_dir = Path(self.temporary.name) / "run"
+        # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
+        self.session_dir = Path(self.temporary.name).resolve() / "run"
         self.session_dir.mkdir()
         _ = (self.session_dir / "prompt.txt").write_text("Original delegate task", encoding="utf-8")
         self.outcomes = []
@@ -983,9 +984,11 @@ class MeshCommandTests(unittest.TestCase):
             if request.get("method") == "thread/compact/start":
                 armed[0] = True
             return frames
+        path = self.session_dir / codex_mesh.ROSTER_FILE
         def acquire(descriptor: int, operation: int) -> None:
-            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
-            if armed[0] and operation == fcntl.LOCK_EX and path.name == codex_mesh.ROSTER_FILE:
+            # Matched by inode, not /proc/self/fd, which macOS lacks.
+            locks_roster = path.exists() and os.path.samestat(os.fstat(descriptor), path.stat())
+            if armed[0] and operation == fcntl.LOCK_EX and locks_roster:
                 armed[0] = False
                 with path.open("r+") as other:
                     flock(other.fileno(), fcntl.LOCK_EX)
