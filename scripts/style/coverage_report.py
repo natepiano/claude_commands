@@ -142,7 +142,7 @@ def counted(count: int, noun: str) -> str:
 def table_row(name: str, progress: style_ledger.RuleCounts, counts: style_ledger.RuleCounts) -> str:
     current = (f"{counts.current:,} of {counts.total:,} crates" if progress.tier == "D"
                else f"{counts.current:,} ({percent(counts.current, counts.total)}%)")
-    if progress.complete:
+    if counts.complete:
         done = f"yes, {counts.held:,} held" if counts.held else "yes"
     else:
         done = f"no: {counts.stale:,} stale" if counts.stale else "no"
@@ -227,7 +227,7 @@ def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") 
         else:
             lines.extend(["", "Oldest open ticket: " + (ticket_line(tickets[0]) if tickets else "none")])
     gained = lost = lost_to_new_files = 0
-    current_proposals = {str(finding.state.proposal) for finding in ledger.held_findings("filed")
+    current_proposals = {str(finding.state.proposal) for finding in ledger.held_findings(style_ledger.HeldFindingsInState("filed"))
                          if isinstance(finding.state, style_ledger.Filed)}
     proposals = summary.proposals
     if isinstance(previous, PreviousReport):

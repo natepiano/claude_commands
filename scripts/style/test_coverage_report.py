@@ -378,7 +378,7 @@ class CoverageReportTests(unittest.TestCase):
                 ledger.ticket_assign(unit + "-1", "main")
         output = self.report("--crate", "crates/alpha").stdout
         row = self.rows(output)["read"]
-        self.assertEqual((row.current, row.open, row.done), ("2 (100%)", "0", "no"))
+        self.assertEqual((row.current, row.open, row.done), ("2 (100%)", "0", "yes"))
         oldest_line = next(line for line in output.splitlines() if "oldest" in line.lower())
         self.assertIn("oldest-1", oldest_line)
         self.assertNotIn("elsewhere-1", output)
@@ -401,7 +401,7 @@ class CoverageReportTests(unittest.TestCase):
                         self.assertEqual(coverage.call_count, passes)
                     row = self.rows(output)["read"]
                     self.assertEqual(row.current, "2 (100%)" if crate else "2 (50%)")
-                    self.assertEqual(row.done, "no")
+                    self.assertEqual(row.done, "yes" if crate else "no")
                     self.assertIn("Rules done: 0 of 2", output)
 
     def test_awaiting_merge_is_neither_current_nor_done_until_sync_after_merge(self) -> None:

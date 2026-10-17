@@ -90,7 +90,7 @@ Loop/verbose only:
    or `CARGO_BERTH_RUN`. Exit `6` has already spent the engine's single
    ten-second deadline: invoke no retry.
 6. **Standing plans:** rerun the ticket's
-   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base <tickets.base> --worktree`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket <id>`
    before staging. Exit 1 (a review or error) retains the reservation and
    returns to repair. On exit 0, stage only this phase's code paths from
    `git status --porcelain`, handling renamed paths as pairs; never name the
