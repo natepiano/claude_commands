@@ -465,6 +465,32 @@ Pending: parent's saved style child summary and rendered style line.
   findings are new at their place and 26 earlier ones dropped out. A blind
   check of the 57 against the rule decides whether the new ones hold, under
   the same 10% bar.
+- **Rerun 3 false-positive check — fails the 10% bar**: three blind judges,
+  reading only the rule, called 16 of the 57 new findings false (28%); one
+  judge rejected every finding whose change adds a binding, and the other
+  two accepted 8 of that shape, so read consistently 24 of 57 are false
+  (42%). Twenty-two of them propose adding a binding instead of renaming
+  one: naming an inline expression (a literal path, a slice, an array, a
+  setting's `.get()`) or opening a scoped alias that keeps the old name.
+  The rule only renames a binding that already feeds the parameter. Part
+  of that shape came from the measurement itself: since the first run the
+  pilot's traced procedure told judges to count an inline expression the
+  change would bind first, a sentence production tickets never carried.
+  Two more are single cases: fix T's shadowing sentence let a rename hide
+  an inner binding that the loop compares with the renamed one
+  (`local_use.rs:96`), and fix S's accessor clause let a lookup of another
+  value pass as a conversion (`provenance.rs:98`).
+- **Fix V — a name-bindings ticket asks only for renames, and narrows
+  accessors and shadowing** (commit `a1af8705`): the ticket line now says
+  the rule renames a binding that already exists and a finding whose change
+  only adds a binding is none, that a method taking arguments or looking up
+  another value is no accessor, and that a later inner binding is no
+  collision only when that inner block does not also read the renamed
+  binding. All 37 settled findings rename an existing binding, so the
+  change costs no recall by construction. Rerun 4 drops the traced
+  procedure's inline sentence and is measured on recall, on a blind check
+  of its new findings, and on a blind check of 30 findings rerun 2 already
+  had, each against its bar.
 - **Fix U — structure file cells are keyed by their module, not their
   crate** (commit `07d86ebe`): a structure verdict on a file inside a crate
   was keyed by the whole crate, so an edit anywhere in it made every such
@@ -477,9 +503,57 @@ Pending: parent's saved style child summary and rendered style line.
   structure verdict that depends on a caller outside the module's own
   directory no longer goes stale when that caller changes. Ticket 19 in the
   modules pass waits on it.
+- **Name-bindings rerun 4 — recall holds, new findings fail the 10% bar**:
+  36 of the 37 settled findings caught (97.3%). The pair that moved cancel:
+  `actions.rs:835` is caught for the first time, and `overview.rs:72` is
+  lost because its judge read `lines.join("\n")` under fix V's accessor
+  sentence as a method that takes arguments. The pass raised 331 findings;
+  52 sit where rerun 2 had none. Three blind judges called none of a random
+  30 of the 279 older findings false (0%), so fix V removed the shape that
+  may have predated fix S. Of the 52 new ones they called 8 false (15%):
+  four rename `column` and `row` after `Position::new(x, y)`, whose
+  parameters are single letters that give no name to match; two name one
+  element of an array literal (`&[item]`, `[path.as_path()]`) after the
+  collection parameter it sits in; one renames `key` after
+  `CFString::from_static_str(string)`; one binding fills two parameters
+  with different names.
+- **Fix W — a name-bindings ticket skips single-letter parameters and
+  array elements** (commit `45438d3d`): the ticket line now says a
+  parameter with a single-letter name gives no name to match, and a binding
+  placed as one element of an array or slice literal does not fill the
+  collection parameter. Fix V's accessor sentence stays word for word, so
+  `overview.rs:72` stays lost; the bar is 36 of 37.
+- **Name-bindings rerun 5 — new findings pass, recall fails**: 33 of the
+  37 settled findings caught (89.2%). Besides `overview.rs:72`, three
+  findings rerun 4 caught were lost to one judge mistake, reading a
+  conversion's own parameter as the target or as a second target:
+  `usize::from(saved_width)` into `push_display_padded(width)` was read as
+  a derived value, `ThemeId::new(name)` into `find(id)` was judged to match
+  at `new(name)`, and `WorktreeRootDisplay::from(item)` beside `Some(item)`
+  was counted as a second target, although `from` takes the generic
+  `value`. None of the four involves fix W's sentences. The pass raised 311
+  findings; 47 sit where rerun 2 had none. Three blind judges called 1 of
+  the 47 false, and that one (`actions.rs:835`) is a settled finding, so
+  none are false after the hand-check (bar 10%). Of a random 30 of the 264
+  older findings they called 1 false (3.3%), a binding that keeps a
+  type-named prefix.
+- **Fix X — a name-bindings ticket never targets a conversion's own
+  parameter** (commit `8cd73ea4`): the ticket line now says a conversion's
+  own parameter, such as the `value` of `From::from` or the `name` of a
+  newtype constructor, is never the target and never a second target, and
+  the judge follows the converted value to the parameter it fills. Rerun 6
+  is measured on both bars. From rerun 6 on, a failed rerun whose misses
+  share no cause the ticket leaves uncovered runs the same ticket twice
+  more, and the median is judged against the bar.
+- **Name-bindings rerun 6 — both bars met**: 36 of the 37 settled findings
+  caught (97.3%), the bar. Only `overview.rs:72` is lost, as expected; the
+  three sites rerun 5 lost to the conversion-parameter mistake are all
+  caught again. The pass raised 321 findings; 47 sit where rerun 2 had
+  none. Three blind judges called none of the 47 false (bar 10%), and none
+  of a random 30 of the 274 older findings. The name-bindings pass is done.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`.
 Live verification of the fixes and subsequent measurements remain pending.
