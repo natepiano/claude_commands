@@ -75,7 +75,10 @@ Clear means cargo-berth `edit_blocking_status` Clear, rather than release.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Sample size, median and maximum pending | cargo-berth board/journal history: claim time to first Clear |
+| pass | 4 style reservations, 0 still open: median 1.06 h, maximum 1.41 h (modules-unit), none over 6 h | Read-only replay of the cargo-berth journal `claim`, `checkpoint` and `holder_merge_extent_observed` entries, 12:00Z to 15:09Z; Clear is Outstanding with an empty merge extent (`reservation/record.rs:423-430`) |
+
+All four reservations were Clear before their release. Reservation-to-ticket links
+are time correlations: the ledger has no reservation column on a ticket.
 
 ## Quiet-branch hand-off
 
@@ -84,7 +87,23 @@ product merge between checkpoint and integration.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Checkpoint, integration commit and elapsed time pending | `git log main` and ledger hand-off timestamps |
+| fail | One hand-off, `28db0785` (Merge cargo-liner-style hand-off (8d6e25d) into main) at 15:09:24Z. It carried one new ticket checkpoint, names-unit-6's `c2a3160a` from 14:40:46Z: 0.48 h, under four hours, but tile-fixes-unit phase 21 merged to main at 14:55:35Z (`d2a10b35`) in between | `git log --first-parent --merges` on cargo-liner main; `git rev-list 28db0785^1..28db0785^2` |
+
+The other 16 merged tickets record checkpoint `d1ced22c`, already on main before
+the first ticket: they changed no code and carried nothing to hand off. From the
+`style/main` aggregate commit `8d6e25d1` to main took 0.04 h. The ledger's
+`handoffs` row still read `sent` after git showed the merge.
+
+The showrunner counts this as a fail and changes nothing until two more
+hand-offs are measured. For each, record whether a product merge landed between
+checkpoint and hand-off, and whether `style/main` took it in cleanly; the
+criterion is then judged from three points.
+
+| Hand-off | Ticket checkpoint | Elapsed | Product merge between | `style/main` took it in cleanly |
+| --- | --- | --- | --- | --- |
+| `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
+| second | pending | pending | pending | pending |
+| third | pending | pending | pending | pending |
 
 ## Restart
 
@@ -101,9 +120,26 @@ Pass criterion: no product unit waits on a style reservation.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Observed product waits and pilot interval pending | cargo-berth board history and product units' reports |
+| partial | 12:00Z to 15:09Z: 0 recorded overlap answers naming a style holder, 0 recorded incursions naming a style blocker, 0 `ticket_yields` rows | Read-only scan of the 3,033 journal entries in the interval |
 
-Tickets per hour per unit: pending.
+A refused check or claim is not journaled (`verb/check.rs:226-232`,
+`verb/claim/mod.rs:1473-1477`, `ledger/handle.rs:748-765`), so a product unit
+that waited and retried leaves no record. Zero recorded overlaps passes for what
+is recorded; the criterion itself cannot be shown from records.
+
+Open item the criterion waits on: cargo-berth journaling each refused check or
+claim (requester, paths, holder), placed as cargo-liner berth-parallel-unit's
+Phase 10, after its Phase 9. The yielding criterion can be measured once that
+phase merges.
+
+Tickets per hour per unit, merged tickets over first ticket created to last
+merged: modules 7 in 2.41 h (2.90/h), names 6 in 1.88 h (3.19/h), types 4 in
+0.98 h (4.08/h). At 15:09Z each unit held one assigned ticket (modules-unit-8,
+names-unit-7, types-unit-5) and none waited in any other state.
+
+16 of the 17 merged tickets carried no edit: their checkpoint is `d1ced22c`,
+already on main, and only names-unit-6 changed code. The retirement call weighs
+how many tickets changed code, not only how many merged.
 
 ## Ticket-gate evidence
 
@@ -141,7 +177,8 @@ Waiting to merge back: none
 
 Source: saved `pilot/coverage.txt`. The old sync tip is the defect described in
 Fix A below. The slash-command invocation itself, later held proposals and
-nonzero hand-off counts remain pending.
+nonzero hand-off counts remain pending; the first hand-off, `28db0785`, merged at
+15:09Z.
 
 ## --from-child trace
 
@@ -201,13 +238,23 @@ Pending: parent's saved style child summary and rendered style line.
   whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules (`1385595f`),
   after cargo-liner re-tiered trait-tutorial-format as E (`a351f6be`) and moved
   readme-diagnostic-section to the modules family (`707bb4c6`).
-- **Fix F — structure tickets list every finding** (commit `pending`):
+- **Fix F — structure tickets list every finding** (commit `2c5e4d5f`, merged as `f71d71ae`):
   the crate pass held 2/12 known defects (16.7%); the file-by-file rerun held
   10/12 (83.3%) on the same four cargo-berth files, six pinned rules and commit.
   The cause was crate-level summarizing, not rule sharing. Structure Work Orders
   now judge file by file after reading each file's siblings and direct callers,
   hold every distinct defect separately and a cross-file defect once, and record
   crate verdicts only after every file is judged.
+- **Fix G — refill waits for sync when the branch point is not in the synced tip** (commit `67ed4f25`):
+  two docs commits pushed straight to cargo-liner `main` bypassed
+  `merge_checkpoint`, so no sync notice went out and `next-phase` kept handing
+  out tickets against a base the style branch had not absorbed. Settled with the
+  showrunner: no git hook. Before selecting a new ticket, refill checks that the
+  branch point's tip is an ancestor of the ledger's synced tip (ancestry, since a
+  good sync merges the branch point and the tips then differ). When it is not,
+  refill records a sync wait and exits 3 with `waiting for sync: <branch point>
+  <tip7> is not in the synced tip <synced7>`. An assigned or checkpointed ticket
+  still resumes or waits for merge.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
 Live verification of the fixes and subsequent measurements remain pending.
