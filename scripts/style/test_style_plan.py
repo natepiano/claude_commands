@@ -228,6 +228,33 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
         self.assertEqual(self.plan.read_text(), text)
 
+    def test_written_read_phase_holds_a_site_under_each_broken_rule_before_recording_verdicts(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("another-read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Hold that window's findings before opening the next window. "
+            + "Hold each distinct defect as its own finding; never stop at a window's first finding.\n"
+            + "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
+            + "even when one change fixes both: each rule's cell records its own verdict.\n"
+            + "Record a file's verdict for every rule only after its last window has been judged, ",
+            self.plan.read_text())
+
+    def test_written_structure_phase_holds_a_multi_rule_defect_once_without_read_holding_guidance(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [rule], cells=tuple((rule, path) for path in self.sources[:2]))
+        ticket = ledger.queued_tickets("modules-unit")[0]
+        text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket["id"]), self.plan,
+                                     style_plan.delegation_context(self.plan.read_text()))
+        self.assertNotIn("A site that breaks more than one rule above", text)
+        self.assertIn(
+            "A defect several rules name is held once, under the rule it breaks most directly, "
+            + "naming the others in its text.", text)
+
     def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()

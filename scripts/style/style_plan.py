@@ -537,6 +537,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             + "judge them against every rule before any code.",
             "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
             + "never stop at a window's first finding.",
+            "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
+            + "even when one change fixes both: each rule's cell records its own verdict.",
             "Record a file's verdict for every rule only after its last window has been judged, "
             + "with `record --rule <rule> --path <file>` for each rule/file cell.",
         ] if ticket["kind"] == "read" else []),
