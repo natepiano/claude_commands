@@ -142,7 +142,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 **Ruled out:** a scratch HOME for the live check (refused as credential exploration); a watcher process or timer outside the mod.
 
-### Phase 5 — Shorter terminal report  · status: todo
+### Phase 5 — Shorter terminal report  · status: done
 **Depends on:** 4
 
 #### Work Order
