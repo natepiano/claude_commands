@@ -490,8 +490,12 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]
           if crate_targets is CrateTargets.BINARY_ONLY else []),
-        *(["A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
-           + "name the binding after the parameter the converted value fills."]
+        *(["A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
+           + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
+           + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+           + "A binding fills several parameters only when that same value fills them: "
+           + "a value derived from it (`dir.join(\"config\")`) is another value, "
+           + "and a later binding of the same name, as in a second loop, is another binding."]
           if any(PurePosixPath(pinned.rule_id.removesuffix("#uncovered")).name
                  == "name-bindings-to-match-parameters.md" for pinned in texts) else []),
         *([
