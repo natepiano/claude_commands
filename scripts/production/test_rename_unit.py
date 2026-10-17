@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 
 import fake_showrunner
+import fake_unit_host
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
@@ -74,8 +75,6 @@ class UnitRenameTests(unittest.TestCase):
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
-            "UNIT_LOOKUP_TMUX": str(SCRIPT.with_name("fake_tmux.py")),
-            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
@@ -368,13 +367,12 @@ class UnitRenameTests(unittest.TestCase):
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
 
     def mark_live(self, unit: str, session_id: str) -> None:
-        """A live Claude in a tmux session marked as `unit` of this production."""
+        """A live Claude in a herdr session marked as `unit` of this production."""
         held = fake_showrunner.write_session(self.root / "state/sessions", unit.removesuffix("-unit"), session_id)
         self.addCleanup(held.close)
-        record = self.root / "state/sessions" / f"{os.getpid()}.json"
-        _ = record.write_text(json.dumps({**json.loads(record.read_text()), "tmux": f"demo-{unit}:@1.%1"}))
-        self.write(self.root / "tmux.json", json.dumps({"$1": {"label": f"demo-{unit}", "panes": ["%1"], "env": {
-            "SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}}}))
+        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
+            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit})])
+        fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
 
     def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
         log = self.seed_record()

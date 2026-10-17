@@ -19,6 +19,9 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 - the production doc;
 - what each unit director does (<ProductionUnit/>).
 
+When `PRODUCTION_DOC` carries `**Kind:** style`, read
+`~/.claude/docs/style_production.md` and follow it wherever it differs from this file.
+
 State:
 
 - `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
@@ -367,7 +370,7 @@ State:
 Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 --production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
 the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
-last code checkpoint from first-parent merge history, and checks its herdr or tmux
+last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
 again and retargets the instance. A reboot needs nothing.
 
@@ -439,7 +442,7 @@ This session's name is written nowhere: the update timer is addressed to its
 Claude session id, and every tool looks the name up from that when it needs it.
 The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
-stall-watch and tmux-names only when absent, and prints `next_due`. Use the
+stall-watch only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 When the doc's Updates line reads `on demand`, or there is none, it makes
 `UPDATES` at the default 15 minutes and stops it, prints `on demand: no
@@ -1152,39 +1155,9 @@ each in your session.
 </PauseForMove>
 
 <QuotaAlert>
-Unit directors' workers run on accounts with a weekly usage limit. The notices about
-them, how to tell the three kinds apart, and what a receiver does are in
-`~/.claude/docs/quota_alerts.md`. Read it at <StartUpdates/> and follow it; this
-section adds only what the showrunner role needs.
+Read `~/.claude/docs/quota_alerts.md` at <StartUpdates/>. Relay only Codex notices through `python3 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR --notice "<full notice>"`.
 
-This session is on the quota alert list because <StartUpdates/> adds it.
-
-**Unit directors act through you.** They are not on the list, so each notice
-reaches them only as your relay (<Throughout/>). Run `python3
-~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
---state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
-to every unit director and prints one `send <unit>:` receipt each. With more
-than one Claude account in use, a Claude `Quota alert:` names its account and
-roles (`claude3 (unit directors) at …`). It reaches only the unit directors
-running on that account, prints `skip <unit>: it runs on <other account>` for
-the rest, and reports a unit whose account cannot be read as not told:
-- `Quota alert:` — the command picks the instruction from the notice. A Codex
-  notice that says nothing was switched: unit directors keep delegating on Codex,
-  whose account may keep working on its credits, and tell you at once if Codex
-  refuses work for quota; bring a refusal to the user. A notice that says every
-  function moved: delegation continues on Claude. A Claude notice, or a Codex one
-  whose switch failed: start no new delegate work on that tool; running workers
-  finish and the unit director does the rest itself. Hold the alert as one
-  line per account, led by `quota: ` and listed first in every Waiting on block
-  after the open-questions count, with the percent left and the reset time,
-  until it is acknowledged or restored. It is a status, not a question: keep it
-  out of `open_for_user`.
-- `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
-- `Quota restored:` — tell every unit director that delegation on that tool,
-  or work on that Claude account, can resume, and drop the held item.
-
-What to do about the quota itself is the user's call; relay their decision to
-every unit director.
+Codex notices that say nothing switched keep delegation on Codex; report a quota refusal at once. A move to Claude continues delegation there. Held Codex alerts are listed first in every Waiting on block, led by `quota: `, until restored; restoration resumes delegation and drops them. Claude has no session quota relay: `/next_moves` controls its one-shot group moves, and an uncovered low account gets one phone reminder.
 </QuotaAlert>
 
 ---
@@ -1222,7 +1195,7 @@ outside it too: wrap neither waits on it nor retires its worktree or branch.
    production's links in the showrunner tree, deletes its own footer, pause,
    open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
-   Leave herdr and tmux sessions for the user to close.
+   Leave herdr sessions for the user to close.
 </Wrap>
 
 ---

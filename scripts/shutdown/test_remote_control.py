@@ -22,7 +22,7 @@ import session_pane
 import settle
 import detached
 from push_texts import RenderedPush
-from unit_lookup import TmuxPlace
+from herdr import HerdrPlace
 from herdr import AgentBlocked
 
 
@@ -68,7 +68,7 @@ class RemoteControlTests(ShutdownTestCase):
         self.root = Path()
         self.registry = Path()
         self.clock = FakeClock()
-        self.place = TmuxPlace("%7")
+        self.place = HerdrPlace("owner", "w1:p7")
         self.typed: list[tuple[float, str]] = []
         self.screen = ""
         self.fields: RegistryFixture = {
@@ -101,16 +101,16 @@ class RemoteControlTests(ShutdownTestCase):
     def write(self) -> None:
         _ = (self.registry / "321.json").write_text(json.dumps(self.fields), encoding="utf-8")
 
-    def find_place(self, saved: sessions.SessionRecord) -> TmuxPlace:
+    def find_place(self, saved: sessions.SessionRecord) -> HerdrPlace:
         self.assertEqual(saved["sessionId"], "owner")
         self.assertEqual(saved["pid"], 321, "fixer must resolve the confirmed process's own pane")
         self.assertEqual(saved.get("procStart"), "original")
         return self.place
 
-    def read_screen(self, _place: TmuxPlace) -> str:
+    def read_screen(self, _place: HerdrPlace) -> str:
         return self.screen
 
-    def type_command(self, place: TmuxPlace, text: str) -> None:
+    def type_command(self, place: HerdrPlace, text: str) -> None:
         self.assertEqual(place, self.place)
         current = cast(dict[str, object], json.loads((self.registry / "321.json").read_text()))
         self.assertEqual(current["status"], "idle", "busy registry must never authorize input")
@@ -238,7 +238,7 @@ class RemoteControlTests(ShutdownTestCase):
                 self.assertEqual(pushes, [])
 
     def test_identity_changed_while_resolving_pane_is_rechecked_before_typing(self) -> None:
-        def replace_before_input(saved: sessions.SessionRecord) -> TmuxPlace:
+        def replace_before_input(saved: sessions.SessionRecord) -> HerdrPlace:
             place = self.find_place(saved)
             self.fields["sessionId"] = "different-session"
             self.write()
@@ -255,11 +255,9 @@ class RemoteControlTests(ShutdownTestCase):
             "updatedAt": 2, "status": "busy", "tmux": "newer:@2.%99"}
         _ = (self.registry / "999.json").write_text(json.dumps(newer))
         resolved: list[int] = []
-        def pane_for_record(saved: sessions.SessionRecord) -> TmuxPlace:
+        def pane_for_record(saved: sessions.SessionRecord) -> HerdrPlace:
             resolved.append(saved["pid"])
-            return TmuxPlace("%7" if saved["pid"] == 321 else "%99")
-        def environment(pid: int) -> dict[str, str]:
-            return {"TMUX_PANE": "%7" if pid == 321 else "%99"}
+            return HerdrPlace("owner", "w1:p7" if saved["pid"] == 321 else "w1:p99")
         def activate(at: float) -> None:
             if self.typed and at > self.typed[0][0]:
                 self.fields["bridgeSessionId"] = "bridge"
@@ -267,7 +265,6 @@ class RemoteControlTests(ShutdownTestCase):
         self.clock.tick = activate
         with (patch.object(sys, "platform", "linux"),
               patch.object(session_pane, "live_session", return_value=True),
-              patch.object(session_pane, "_session_environment", side_effect=environment),
               patch.object(session_pane, "record_place", side_effect=pane_for_record)):
             outcome, _text, pushes = self.run_fix()
         self.assertIsInstance(outcome, remote_control.TurnedOn)
@@ -283,7 +280,7 @@ class RemoteControlTests(ShutdownTestCase):
                 self.typed.clear()
                 self.fields["bridgeSessionId"] = ""
                 self.write()
-                def disappearing_pane(saved: sessions.SessionRecord) -> TmuxPlace:
+                def disappearing_pane(saved: sessions.SessionRecord) -> HerdrPlace:
                     if already_typed and not self.typed:
                         return self.find_place(saved)
                     self.fields["bridgeSessionId"] = "bridge"
@@ -303,7 +300,7 @@ class RemoteControlTests(ShutdownTestCase):
                 self.fields["bridgeSessionId"] = ""
                 self.write()
                 attempted: list[float] = []
-                def input_with_failure(place: TmuxPlace, text: str) -> None:
+                def input_with_failure(place: HerdrPlace, text: str) -> None:
                     attempted.append(self.clock.at)
                     if not recover or len(attempted) == 1:
                         raise OSError("temporary pane transport failure")

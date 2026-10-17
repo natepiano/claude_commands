@@ -13,7 +13,7 @@ from production_units import Refusal, cell_value, live_unit_table
 
 class LiveUnit(NamedTuple):
     unit: str
-    # None when no tmux session carries the unit's mark.
+    # None when no herdr session carries the unit's mark.
     session: unit_lookup.MarkedUnit | None
 
     @property
@@ -26,7 +26,7 @@ class LiveUnit(NamedTuple):
 def production_units(doc: Path) -> list[LiveUnit]:
     """Every unit the doc's Units table lists and has not retired, found by its mark.
 
-    Raises OSError when the doc cannot be read or tmux cannot say which sessions exist.
+    Raises OSError when the doc cannot be read or herdr cannot say which sessions exist.
     """
     slug, units = _listed(doc)
     return _joined(slug, units, unit_lookup.every_marked_unit())
@@ -67,7 +67,7 @@ def units_of(runner: showrunners.Showrunner) -> list[LiveUnit]:
 def live_unit_names(runner: showrunners.Showrunner) -> list[str]:
     """The session names, as they are now, of the showrunner's units that have a live Claude.
 
-    A tmux that cannot say which sessions exist leaves the list empty and says why.
+    A herdr that cannot say which sessions exist leaves the list empty and says why.
     """
     try:
         return [unit.name for unit in units_of(runner) if unit.name]

@@ -215,10 +215,9 @@ def register(production: Production) -> None:
     if new_production:
         set_footer_state(production.slug, FooterState.OFF)
         report("footer", "ok", "off — new production; /showrunner:footer on turns it on")
-    for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
-        if isinstance(instance(name), InstanceAbsent):
-            run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
-            _ = notifier(["new", name, "--every", "1", "--run", run])
+    if isinstance(instance("stall-watch"), InstanceAbsent):
+        run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
+        _ = notifier(["new", "stall-watch", "--every", "1", "--run", run])
     if isinstance(schedule, UpdatesOnDemand):
         report("register", "ok", f"{updates} on demand: no scheduled dailies")
         return

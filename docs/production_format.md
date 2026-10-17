@@ -88,6 +88,12 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
+- **Kind:** style — optional; absent means a product production. A style production
+  reads `~/.claude/docs/style_production.md`
+- **Branch point:** `<branch>` — style productions only: the parent's merge branch
+  to sync from and hand back to
+- **Parent production:** <path to parent production doc> — style productions only:
+  the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
@@ -113,7 +119,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <the issues folder the production files its proposals in, e.g.
   `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
-  `proposal`; omit when the production keeps none
+  `proposal`; required for a style production, which files held changes there;
+  otherwise omit when the production keeps none
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
@@ -134,7 +141,7 @@ one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr or tmux session carries the production's
+a session at any time. The unit's herdr session carries the production's
 slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its

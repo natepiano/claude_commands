@@ -164,7 +164,7 @@ def load(production: Production, lines: list[str], resume: bool) -> None:
                   else "no code checkpoint")
         report("last-merged", "ok", f"{unit.name}: {detail}")
         found = marked.get(unit.name)
-        report("session", "ok", f"{unit.name}: " + (f"{found.label} live" if found is not None else "gone"))
+        report("session", "ok", f"{unit.name}: " + (f"{found.place.session} live" if found is not None else "gone"))
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
@@ -511,7 +511,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     main_result = (f"promoted to {tip[:7]} ({commit_count} commits)" if isinstance(status, ProductionRunning)
                    else f"promoted to {tip[:7]} by the earlier run")
     print(f"| Main | {main_result} |")
-    print("| Next | close herdr or tmux sessions |")
+    print("| Next | close herdr sessions |")
 
 
 def main() -> int:

@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import cast, final, override
 
 
-
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("ci_points.py")
 LIFECYCLE = SCRIPT.with_name("production_lifecycle.py")
@@ -42,7 +41,7 @@ if name == "review_regime.py":
         print("| review | after |")
         print("| phases merged | 12 |")
         raise SystemExit(0)
-if name in ("send.py", "tmux", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
+if name in ("send.py", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
 '''
@@ -108,7 +107,7 @@ class CiPointsTests(unittest.TestCase):
         self.bin.mkdir()
         self.doc = self.root / "example-production.md"
         self.log = self.checkout / "production.log"
-        for name in ("review_regime.py", "gh", "tmux", "claude",
+        for name in ("review_regime.py", "gh", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
             self.stub(self.bin / name)
         for path in (self.bin / "validate_and_push.sh",

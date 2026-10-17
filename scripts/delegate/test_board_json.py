@@ -261,6 +261,7 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual(response["files"], [str(self.output / "show.json")])
         self.assertEqual(response["focus"], "alpha")
+        self.assertEqual(response["watch"], [str(self.notifier.resolve())])
         self.assertEqual(documents[0]["production"], fixture.slug)
         unit = object_fields(array_items(documents[0]["units"])[0])
         self.assertEqual(unit["key"], "alpha")
@@ -276,6 +277,31 @@ class BoardJsonTests(unittest.TestCase):
         self.assertIsNone(response["focus"])
         self.assertEqual([doc["production"] for doc in documents], [fixture.slug])
 
+    def test_deleted_plan_is_omitted_from_the_unit_path(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        fixture.plan.unlink()
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["plan"], "")
+
+    def test_production_as_built_path_replaces_the_deleted_run_plan(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        fixture.plan.unlink()
+        as_built = fixture.worktree / "as-built.md"
+        _ = as_built.write_text("# Delivered feature\n", encoding="utf-8")
+        _ = fixture.document.write_text(
+            fixture.document.read_text(encoding="utf-8").replace(str(fixture.plan), str(as_built)),
+            encoding="utf-8",
+        )
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["plan"], str(as_built))
+        self.assertNotEqual(unit["plan"], str(fixture.plan))
+
     def test_unrelated_cwd_lists_every_running_production(self) -> None:
         _ = self.production()
         _ = self.production("other")
@@ -289,7 +315,17 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_no_registered_production_resolves_without_output_files(self) -> None:
         response, documents = self.generate("--cwd", "/")
-        self.assertEqual(response, {"files": [], "focus": None})
+        self.assertEqual(response, {
+            "files": [], "focus": None, "watch": [str(self.notifier.resolve())],
+        })
+        self.assertEqual(documents, [])
+
+    def test_missing_registry_produces_no_discovery_watch_paths(self) -> None:
+        self.notifier.rmdir()
+
+        response, documents = self.generate("--cwd", "/")
+
+        self.assertEqual(response, {"files": [], "focus": None, "watch": []})
         self.assertEqual(documents, [])
 
     def test_output_directory_uses_xdg_then_home_when_no_override_is_set(self) -> None:
@@ -315,6 +351,61 @@ class BoardJsonTests(unittest.TestCase):
                 self.assertEqual(unit["state"], "running")
                 self.assertEqual(unit["phase"], {"id": "2", "of": 4, "title": "Current delivery"})
 
+    def test_dispatched_batches_name_the_repair_until_landed_in_the_current_instance(self) -> None:
+        fixture = self.production()
+        events = [
+            *self.delivery_events(),
+            self.event("finding_batch_dispatched", NOW - 400, instance="older", round=9),
+            self.event("finding_batch_dispatched", NOW - 300, round=1),
+            self.event("finding_batch_landed", NOW - 240, round=1),
+            self.event("finding_batch_dispatched", NOW - 120, round=8),
+            self.event("activity_started", NOW - 100, activity_instance_id="check",
+                       activity_label="Check delivery"),
+        ]
+        _ = self.write_run(fixture, events)
+        _, unit = self.unit(fixture)
+        self.assertEqual(unit["stage"], "Repair round 2")
+
+        events.append(self.event("pass_started", NOW - 90, pass_instance_id="review",
+                                 pass_kind="review"))
+        _ = self.write_run(fixture, events)
+        _, unit = self.unit(fixture)
+        self.assertEqual(unit["stage"], "Review")
+
+        events += [
+            self.event("pass_finished", NOW - 60, pass_instance_id="review"),
+            self.event("finding_batch_landed", NOW - 30, round=8),
+        ]
+        _ = self.write_run(fixture, events)
+        _, unit = self.unit(fixture)
+        self.assertEqual(unit["stage"], "Check delivery")
+
+    def test_run_plan_supplies_the_open_phase_while_display_keeps_the_plan_cell(self) -> None:
+        fixture = self.production()
+        self.plan(fixture, all_done=True)
+        active_plan = fixture.worktree / "active-plan.md"
+        _ = active_plan.write_text("### Phase 29 — Active work · status: todo\n", encoding="utf-8")
+        for project_path in (True, False):
+            with self.subTest(project_path=project_path):
+                run = self.write_run(fixture, [
+                    self.event("phase_started", NOW - 120, phase="29", instance="active",
+                               phase_title="Active work"),
+                    self.event("pass_started", NOW - 60, phase="29", instance="active",
+                               pass_instance_id="build", pass_kind="impl"),
+                ])
+                events = [object_fields(cast(object, json.loads(line)))
+                          for line in run.read_text(encoding="utf-8").splitlines()]
+                events[0]["plan_doc"] = "active-plan.md"
+                events[0]["project_plan_doc"] = str(active_plan) if project_path else ""
+                _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+                document, unit = self.unit(fixture)
+
+                self.assertEqual(object_fields(unit["phase"])["id"], "29")
+                self.assertEqual(unit["stage"], "Build")
+                self.assertEqual(unit["plan"], str(fixture.plan))
+                self.assertIn(str(active_plan), array_items(document["sources"]))
+
     def test_activity_stage_and_steps_are_scoped_to_the_open_instance(self) -> None:
         fixture = self.production()
         _ = self.write_run(fixture, [
@@ -339,6 +430,57 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual([step[3] for step in steps], [60, 120])
         self.assertNotEqual(steps[0][0], steps[1][0])
         self.assertEqual(object_fields(steps[0][2])["at"], NOW - 300)
+
+    def test_open_pass_wins_over_a_newer_step_with_live_workers(self) -> None:
+        fixture = self.production()
+        _ = self.session_files()
+        _ = self.write_run(fixture, [
+            *self.delivery_events(),
+            self.event("pass_started", NOW - 300, pass_instance_id="build",
+                       pass_kind="impl", pass_activity="building current delivery"),
+            self.event("activity_started", NOW - 120, activity_instance_id="check",
+                       activity_label="Check fixtures", activity_text="checking fixtures"),
+        ])
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["state"], "running")
+        self.assertEqual(object_fields(unit["phase"])["id"], "2")
+        self.assertEqual(unit["stage"], "Build")
+        self.assertTrue(any(object_fields(worker)["state"] == "running"
+                            for worker in array_items(unit["workers"])))
+
+    def test_launcher_phase_without_pass_events_names_the_running_phase(self) -> None:
+        fixture = self.production()
+        _ = self.session_files()
+        for finished_step in (False, True):
+            with self.subTest(finished_step=finished_step):
+                events = self.delivery_events()
+                if finished_step:
+                    events += [
+                        self.event("activity_started", NOW - 120, activity_instance_id="check",
+                                   activity_label="Check fixtures", activity_text="checking fixtures"),
+                        self.event("activity_finished", NOW - 60, activity_instance_id="check",
+                                   status="completed", activity_elapsed_seconds=60),
+                    ]
+                _ = self.write_run(fixture, events)
+
+                _, unit = self.unit(fixture)
+
+                self.assertEqual(unit["state"], "running")
+                self.assertEqual(object_fields(unit["phase"])["id"], "2")
+                self.assertEqual(unit["stage"], "Phase 2 running")
+
+    def test_working_workers_without_an_open_phase_stay_standing_by(self) -> None:
+        fixture = self.production()
+        _ = self.session_files()
+        _ = self.write_run(fixture, self.delivery_events(open_phase=False))
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["state"], "running")
+        self.assertIsNone(unit["phase"])
+        self.assertEqual(unit["stage"], "Standing by")
 
     def test_overdue_repeated_promise_stays_distinct_from_schedule_end(self) -> None:
         fixture = self.production()
@@ -583,6 +725,155 @@ class BoardJsonTests(unittest.TestCase):
         self.assertLessEqual(len(doing), 80)
         self.assertNotIn("obsolete", doing)
         self.assertEqual(workers["test"]["doing"], "checking the delivery")
+
+    def test_worker_states_distinguish_a_finished_turn_from_a_closed_thread(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory = self.session_files()
+        statuses = {"running": "running", "paused": "paused", "idle": "idle",
+                    "done": "idle", "ended": "ended", "connecting": "connecting"}
+        _ = (directory / "mesh_roster.json").write_text(json.dumps({
+            f"worker-{status}": {"slot": status, "role": "test", "status": status,
+                                 "thread_id": f"thread-{status}", "turn_id": ""}
+            for status in statuses
+        }), encoding="utf-8")
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual({str(worker["slot"]): worker["state"] for worker in
+                          (object_fields(row) for row in array_items(unit["workers"]))},
+                         statuses)
+
+    def test_worker_activity_removes_launcher_and_report_paths_from_latest_message(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory = self.session_files()
+        for message, expected in (
+            ("launcher: adversary review finished; summary at /tmp/review.md",
+             "adversary review finished"),
+            ("launcher: adversary review finished; findings in /tmp/findings.json",
+             "adversary review finished"),
+            ("adversary review finished; summary at /tmp/summary; findings in /tmp/findings",
+             "adversary review finished"),
+            ("launcher: tests passed; checking the next case", "tests passed; checking the next case"),
+        ):
+            with self.subTest(message=message):
+                _ = (directory / "board.log").write_text(
+                    "2026-10-16T17:00:00Z [alpha-impl] status: obsolete activity\n"
+                    + f"2026-10-16T17:01:00Z [alpha-impl] status: {message}\n"
+                    + "2026-10-16T17:02:00Z [alpha-test] status: another worker\n",
+                    encoding="utf-8",
+                )
+                _, unit = self.unit(fixture)
+                worker = next(object_fields(row) for row in array_items(unit["workers"])
+                              if object_fields(row)["slot"] == "1")
+                self.assertEqual(worker["doing"], expected)
+
+    def test_worker_activity_trims_whitespace_after_removing_report_paths(self) -> None:
+        directory = self.session_files()
+        for message in (
+            "launcher:  review finished  ; summary at /tmp/summary.md",
+            "launcher:  review finished  ; findings in /tmp/findings.json",
+            " review finished ",
+        ):
+            with self.subTest(message=message):
+                _ = (directory / "board.log").write_text(
+                    f"2026-10-16T17:01:00Z [alpha-impl] status: {message}\n",
+                    encoding="utf-8",
+                )
+
+                workers = board_json.workers(directory, set())
+
+                worker = next(row for row in workers if row["slot"] == "1")
+                self.assertEqual(worker["doing"], "review finished")
+
+    def test_run_events_supply_phase_records_when_the_plan_has_no_phase_headings(self) -> None:
+        fixture = self.production()
+        _ = fixture.plan.write_text("# As built\n\nDelivered feature overview.\n", encoding="utf-8")
+        # A different run must not contribute phase rows, findings or promises.
+        _ = self.write_run(fixture, [
+            self.event("phase_started", NOW - 19_000, phase="99", instance="unrelated",
+                       phase_title="Old run"),
+            self.event("phase_finished", NOW - 18_000, phase="99", instance="unrelated",
+                       phase_title="Old run", phase_elapsed_seconds=1_000),
+        ], name="older", started=NOW - 20_000)
+        _ = self.write_run(fixture, [
+            self.event("phase_started", NOW - 6_000, phase="7", instance="first",
+                       phase_title="Original delivery"),
+            self.event("pass_started", NOW - 5_900, phase="7", instance="first",
+                       pass_instance_id="repair-first", pass_kind="fix"),
+            self.event("pass_finished", NOW - 5_700, phase="7", instance="first",
+                       pass_instance_id="repair-first", pass_kind="fix", status="completed"),
+            self.event("finding_opened", NOW - 5_650, phase="7", instance="first", severity="blocker"),
+            self.event("eta_stated", NOW - 5_600, phase="7", instance="first",
+                       eta_phase_id="7", eta_at=NOW - 5_000),
+            self.event("eta_stated", NOW - 5_500, phase="7", instance="first",
+                       eta_phase_id="7", eta_at=NOW - 4_900),
+            self.event("phase_finished", NOW - 4_800, phase="7", instance="first",
+                       phase_title="Original delivery", phase_elapsed_seconds=1_200),
+            # Repeated ids are separate instances, not a single combined row.
+            self.event("phase_started", NOW - 4_000, phase="7", instance="retry",
+                       phase_title="Retried delivery"),
+            self.event("finding_opened", NOW - 3_900, phase="7", instance="retry", severity="minor"),
+            self.event("finding_opened", NOW - 3_800, phase="7", instance="retry", severity="nit"),
+            self.event("eta_stated", NOW - 3_700, phase="7", instance="retry",
+                       eta_phase_id="7", eta_at=NOW - 3_300),
+            self.event("phase_finished", NOW - 3_000, phase="7", instance="retry",
+                       phase_title="Retried delivery", phase_elapsed_seconds=1_000),
+            self.event("phase_started", NOW - 1_000, phase="8", instance="open",
+                       phase_title="Follow-up delivery"),
+            self.event("pass_started", NOW - 900, phase="8", instance="open",
+                       pass_instance_id="repair-open", pass_kind="fix"),
+            self.event("finding_opened", NOW - 800, phase="8", instance="open", severity="minor"),
+            # eta_phase_id identifies the target, even when the event's phase differs.
+            self.event("eta_stated", NOW - 700, phase="7", instance="open",
+                       eta_phase_id="8", eta_at=NOW + 600),
+        ])
+
+        _, unit = self.unit(fixture)
+
+        rows = [object_fields(row) for row in array_items(unit["phases"])]
+        self.assertEqual([(row["id"], row["title"], row["status"]) for row in rows],
+                         [("7", "Original delivery", "done"),
+                          ("7", "Retried delivery", "done"),
+                          ("8", "Follow-up delivery", "open")])
+        self.assertEqual([row["took"] for row in rows[:2]], [1_200, 1_000])
+        self.assertEqual(object_fields(unit["phase"]),
+                         {"id": "8", "of": 3, "title": "Follow-up delivery"})
+        self.assertEqual([(row["fix_done"], row["fix_running"], row["findings"]) for row in rows], [
+            (1, 0, {"blocker": 1, "minor": 0, "nit": 0}),
+            (0, 0, {"blocker": 0, "minor": 1, "nit": 1}),
+            (0, 1, {"blocker": 0, "minor": 1, "nit": 0}),
+        ])
+        first_eta = object_fields(rows[0]["eta"])
+        self.assertEqual(first_eta, {
+            "first": {"at": NOW - 5_000, "text": "16:36"},
+            "trail": [[{"at": NOW - 5_000, "text": "16:36"},
+                       {"at": NOW - 5_600, "text": "16:26"}],
+                      [{"at": NOW - 4_900, "text": "16:38"},
+                       {"at": NOW - 5_500, "text": "16:28"}]],
+            "finished": {"at": NOW - 4_800, "text": "16:40"},
+            "delta_minutes": 100 / 60,
+        })
+        retry_eta = object_fields(rows[1]["eta"])
+        self.assertEqual(object_fields(retry_eta["first"])["at"], NOW - 3_300)
+        self.assertEqual(len(array_items(retry_eta["trail"])), 1)
+        self.assertEqual(object_fields(retry_eta["finished"])["at"], NOW - 3_000)
+        self.assertEqual(retry_eta["delta_minutes"], 5)
+        open_eta = object_fields(rows[2]["eta"])
+        self.assertEqual(object_fields(open_eta["first"])["at"], NOW + 600)
+        self.assertIsNone(open_eta["finished"])
+        self.assertIsNone(open_eta["delta_minutes"])
+        for row in rows:
+            self.assertEqual(set(row), {"id", "title", "status", "took", "fix_done", "fix_running",
+                                        "findings", "eta", "start", "finish", "gate"})
+        with (self.history / "runs/current.jsonl").open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps(self.event(
+                "run_finished", NOW - 10, phase="", instance="", status="completed",
+            )) + "\n")
+        _, finished_unit = self.unit(fixture)
+        self.assertEqual(finished_unit["state"], "run-finished")
+        self.assertEqual(finished_unit["phases"], rows)
 
     def test_sources_include_history_workers_and_discovery_dirs_but_no_missing_paths(self) -> None:
         fixture = self.production()

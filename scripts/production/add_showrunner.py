@@ -30,8 +30,6 @@ import showrunners
 from add_unit import Production, read_production
 from production_units import Refusal
 import herdr
-# Promotion still imports this tmux-only helper until its launcher migrates.
-from add_unit import tmux_live as tmux_live
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
