@@ -373,13 +373,15 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex workers running: the mover ends them with this session.
+   Leave Codex workers running: the mover pauses them with this session.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.
 
 The session is resumed with that line, on the account the message names; continue
-from it. A forced stop without this message is a separate command the user gives.
+from it. Before any dispatch, run the resume commands in the shutdown message;
+never open a new seat for a role a paused seat holds. A forced stop without this
+message is a separate command the user gives.
 </PauseForMove>
 
 <CompactionContract>

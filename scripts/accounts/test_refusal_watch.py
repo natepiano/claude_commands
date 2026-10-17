@@ -250,6 +250,232 @@ class RefusalWatchTests(unittest.TestCase):
                  threshold: float = 1) -> dict[str, object]:
         return {"name": name, "group": group, "to": target, "when": {"left_at_most": threshold}}
 
+    def hold_rule(self, name: str = "units-low", *, target: str = "claude2",
+                  minutes: object = 10) -> dict[str, object]:
+        return {"name": name, "group": "units", "to": target,
+                "when": {"left_at_most": 1, "hold_minutes": minutes}}
+
+    def test_low_rule_persists_its_hold_and_moves_only_after_the_full_interval(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        document = cast(dict[str, object], json.loads(state_file.read_text()))
+        self.assertEqual(document["auto_move_holds"], {"units-low": {
+            "account": "claude1", "at": NOW.isoformat(), "move_id": "", "percent": 1}})
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_move_holds", {})["units-low"],
+                         refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1))
+        for elapsed in (timedelta(minutes=9, seconds=59), timedelta(minutes=10)):
+            WatchTime.at = NOW + elapsed
+            self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude1" if elapsed.total_seconds() < 600 else "claude2")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([(entry["cause"], entry["why"]) for entry in history], [("auto", "auto: units-low")])
+        self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_fresh_reading_above_the_threshold_restarts_the_hold_clock(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        for minute, left in ((5, 2), (6, 1), (15, 1), (16, 1)):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, left, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 16 else "claude1")
+            holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+            if minute == 5:
+                self.assertEqual(holds, {})
+            elif minute in (6, 15):
+                self.assertEqual(holds["units-low"].at, NOW + timedelta(minutes=6))
+
+    def test_stale_and_missing_readings_neither_start_nor_clear_a_hold(self) -> None:
+        for unavailable in ("stale", "missing"):
+            with self.subTest(reading=unavailable):
+                path = self.groups()
+                self.auto_rules(self.hold_rule())
+                WatchTime.at = NOW
+                self.reading(SOURCE_LOGIN, 1, at=NOW - timedelta(minutes=11))
+                if unavailable == "missing":
+                    saved = usage_store.load()
+                    del saved[usage_store.key("Claude", SOURCE_LOGIN)]
+                    usage_store.write(saved)
+                _ = self.cli()
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+                self.reading(SOURCE_LOGIN, 1)
+                _ = self.cli()
+                WatchTime.at = NOW + timedelta(minutes=12)
+                # Even a stale high reading must not clear the saved low episode.
+                self.reading(SOURCE_LOGIN, 80)
+                if unavailable == "missing":
+                    saved = usage_store.load()
+                    del saved[usage_store.key("Claude", SOURCE_LOGIN)]
+                    usage_store.write(saved)
+                self.reading("main@example.invalid", 80, at=WatchTime.at)
+                _ = self.cli()
+                self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {})["units-low"],  # pyright: ignore[reportPrivateUsage]
+                                 refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1))
+                self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+                _ = self.cli()
+                self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
+    def test_changing_the_group_account_requires_a_new_full_hold(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        transition = accounts.set_group_account("units", "claude3", why="operator move", now=NOW + timedelta(minutes=5))
+        for minute in (10, 19, 20):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(TARGET_LOGIN, 1, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 20 else "claude3")
+            if minute != 20:
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {})["units-low"],  # pyright: ignore[reportPrivateUsage]
+                                 refusal_watch.HoldStarted("claude3", NOW + timedelta(minutes=10), transition.move_id, 1))
+
+    def test_round_trip_group_moves_between_passes_require_a_new_full_hold(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        _ = accounts.set_group_account("units", "claude3", why="operator outward move",
+                                       now=NOW + timedelta(minutes=4))
+        returned = accounts.set_group_account("units", "claude1", why="operator return move",
+                                              now=NOW + timedelta(minutes=5))
+        for minute in (10, 19, 20):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 20 else "claude1")
+            if minute == 10:
+                holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(holds["units-low"], refusal_watch.HoldStarted(
+                    "claude1", WatchTime.at, returned.move_id, 1))
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["why"] for entry in history],
+                         ["operator outward move", "operator return move", "auto: units-low"])
+
+    def test_changing_the_rule_percent_requires_a_new_full_hold(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.auto_rules({"name": "units-low", "group": "units", "to": "claude2",
+                         "when": {"left_at_most": 0, "hold_minutes": 10}})
+        for minute in (10, 19, 20):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, 0, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 20 else "claude1")
+            if minute == 10:
+                holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(holds["units-low"], refusal_watch.HoldStarted(
+                    "claude1", WatchTime.at, accounts.NoGroupTransition(), 0))
+        history = accounts.roles_history_file().read_text().splitlines()
+        self.assertEqual(len(history), 1)
+
+    def test_oversized_hold_is_reported_without_blocking_a_later_valid_rule(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule("oversized", minutes=10 ** 400), self.low_rule("valid"))
+        self.reading(SOURCE_LOGIN, 1)
+        code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("auto_moves oversized: hold_minutes", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["why"] for entry in history], ["auto: valid"])
+
+    def test_chained_rules_choose_the_first_target_then_hold_again_on_that_account(self) -> None:
+        self.assertEqual(accounts.setup("claude4"), [])
+        _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "four@example.invalid"}}))
+        _ = (self.home / "notes" / note_name("claude4")).write_text("---\nlogin: four@example.invalid\n---\n")
+        path = self.groups()
+        self.auto_rules(self.hold_rule("first", target="claude4", minutes=5), self.hold_rule("second", minutes=5))
+        for minute, source_left, fourth_left, expected in ((0, 1, 80, "claude1"), (5, 1, 80, "claude4"),
+                                                          (6, 80, 1, "claude4"), (10, 80, 1, "claude4"),
+                                                          (11, 80, 1, "claude2")):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, source_left, at=WatchTime.at)
+            self.reading("four@example.invalid", fourth_left, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], expected)
+            if minute == 5:
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([(entry["label"], entry["why"]) for entry in history],
+                         [("claude4", "auto: first"), ("claude2", "auto: second")])
+
+    def test_zero_hold_moves_immediately_like_a_rule_without_a_hold(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule(minutes=0))
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
+    def test_malformed_hold_values_are_reported_without_blocking_a_later_valid_rule(self) -> None:
+        path = self.groups()
+        self.reading(SOURCE_LOGIN, 1)
+        self.auto_rules(*(self.hold_rule(f"bad-{index}", minutes=value)
+                          for index, value in enumerate((-1, True, "10", None, float("inf"), float("nan")))),
+                        self.low_rule("valid"))
+        code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        for index in range(6):
+            self.assertIn(f"bad-{index}", output)
+        self.assertIn("hold_minutes", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["why"] for entry in history], ["auto: valid"])
+
+    def test_hold_dry_runs_do_not_start_clear_or_consume_the_saved_episode(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        before = self.snapshot()
+        _ = self.cli("--dry-run")
+        self.assertEqual(self.snapshot(), before)
+        _ = self.cli()
+        for minute, left in ((5, 2), (10, 1)):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, left, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            before = self.snapshot()
+            code, output, error = self.cli("--dry-run")
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(self.snapshot(), before)
+            if minute == 10:
+                self.assertIn("would move from claude1 to claude2", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
     def test_automatic_low_rule_holds_at_two_percent_and_moves_at_one_with_one_transition(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
@@ -323,6 +549,9 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(record.all_session_records(), [])
         history = accounts.roles_history_file().read_bytes()
         transition = cast(dict[str, object], json.loads(path.read_text())["units"])
+        decoded = accounts.group_transition("units")
+        assert isinstance(decoded, accounts.GroupTransition)
+        self.assertEqual(decoded.why, accounts.RecordedTransitionReason("auto: units-low"))
         code, _, error = self.cli()
         self.assertEqual((code, error), (0, ""))
         requested = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
@@ -399,6 +628,9 @@ class RefusalWatchTests(unittest.TestCase):
         first_reset = NOW + timedelta(minutes=5)
         self.reading(SOURCE_LOGIN, 80)
         self.reading(TARGET_LOGIN, 90, reset=first_reset)
+        before = self.snapshot()
+        _ = self.cli("--dry-run")
+        self.assertEqual(self.snapshot(), before)
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude1")
         self.assertFalse(accounts.roles_history_file().exists())
@@ -423,6 +655,86 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude3")
         self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 2)
+
+    def test_legacy_never_acted_reset_loads_as_named_progress_and_dry_run_preserves_it(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        observed = NOW - timedelta(minutes=1)
+        current_reset = NOW + timedelta(days=7)
+        self.reading(TARGET_LOGIN, 90, reset=current_reset)
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+            "units-reset": {"observed_reset": observed.isoformat(), "acted_reset": ""}}}))
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(observed, refusal_watch.NeverActedOnReset()))
+        before = self.snapshot()
+        code, output, error = self.cli("--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("would move from claude1 to claude3", output)
+        self.assertEqual(self.snapshot(), before)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(current_reset, refusal_watch.ActedOnReset(observed)))
+        document = cast(dict[str, object], json.loads(state_file.read_text()))
+        observations = cast(dict[str, object], document["auto_moves"])
+        self.assertEqual(observations["units-reset"],
+                         {"observed_reset": current_reset.isoformat(), "acted_reset": observed.isoformat()})
+        self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 1)
+
+    def test_legacy_acted_reset_does_not_repeat_and_a_later_reset_can_fire(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        acted = NOW - timedelta(minutes=1)
+        next_reset = NOW + timedelta(minutes=5)
+        self.reading(TARGET_LOGIN, 90, reset=next_reset)
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+            "units-reset": {"observed_reset": acted.isoformat(), "acted_reset": acted.isoformat()}}}))
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(acted, refusal_watch.ActedOnReset(acted)))
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertFalse(accounts.roles_history_file().exists())
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(next_reset, refusal_watch.ActedOnReset(acted)))
+        WatchTime.at = next_reset + timedelta(seconds=1)
+        following_reset = WatchTime.at + timedelta(days=7)
+        self.reading(TARGET_LOGIN, 90, at=WatchTime.at, reset=following_reset)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                         refusal_watch.AutoResetObservation(following_reset, refusal_watch.ActedOnReset(next_reset)))
+        self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 1)
+
+    def test_malformed_observed_or_acted_reset_is_relearned_without_moving_on_first_sight(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        past = (NOW - timedelta(minutes=1)).isoformat()
+        current_reset = NOW + timedelta(days=7)
+        self.reading(TARGET_LOGIN, 90, reset=current_reset)
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        for observed, acted in (("invalid", ""), (past, "invalid"),
+                                ("2026-10-01T12:00:00", ""), (past, "2026-10-01T12:00:00")):
+            with self.subTest(observed=observed, acted=acted):
+                _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+                    "units-reset": {"observed_reset": observed, "acted_reset": acted}}}))
+                code, _, error = self.cli()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                self.assertFalse(accounts.roles_history_file().exists())
+                loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(loaded.get("auto_moves", {})["units-reset"],
+                                 refusal_watch.AutoResetObservation(current_reset, refusal_watch.NeverActedOnReset()))
+                document = cast(dict[str, object], json.loads(state_file.read_text()))
+                observations = cast(dict[str, object], document["auto_moves"])
+                self.assertEqual(observations["units-reset"],
+                                 {"observed_reset": current_reset.isoformat(), "acted_reset": ""})
 
     def test_automatic_rules_report_malformed_entries_and_still_apply_valid_configured_thresholds(self) -> None:
         path = self.groups()

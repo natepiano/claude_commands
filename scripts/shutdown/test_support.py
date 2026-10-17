@@ -25,6 +25,7 @@ class ShutdownSendLeaf(StrEnum):
     DELIVER_MESSAGE = "settle._deliver_message"
     RETIRE_SHUTDOWN_MESSAGES = "settle._retire_shutdown_messages"
     RESTART_RETIRE = "restart._retire"
+    RESUME_CODEX_WORKERS = "restart._send_worker_resume"
     RUN_REMOTE = "remote.run_remote"
     LAUNCH_CONDUCTOR = "settle._launch_conductor"
     LAUNCH_REMOTE_CONTROL_FIXER = "remote_control.launch_fixer"
@@ -41,6 +42,9 @@ _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object]
         (settle, "_retire_shutdown_messages", settle._retire_shutdown_messages),  # pyright: ignore[reportPrivateUsage]
     ),
     ShutdownSendLeaf.RESTART_RETIRE: ((restart, "_retire", _REAL_RESTART_RETIRE),),
+    ShutdownSendLeaf.RESUME_CODEX_WORKERS: (
+        (restart, "_send_worker_resume", restart._send_worker_resume),  # pyright: ignore[reportPrivateUsage]
+    ),
     ShutdownSendLeaf.RUN_REMOTE: (
         (remote, "run_remote", remote.run_remote),
         (settle, "run_remote", remote.run_remote),
@@ -86,6 +90,7 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.DELIVER_MESSAGE: self._block_deliver_message,
             ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES: self._block_retire_shutdown_messages,
             ShutdownSendLeaf.RESTART_RETIRE: self._block_restart_retire,
+            ShutdownSendLeaf.RESUME_CODEX_WORKERS: self._block_worker_resume,
             ShutdownSendLeaf.RUN_REMOTE: self._block_run_remote,
             ShutdownSendLeaf.LAUNCH_CONDUCTOR: self._block_launch_conductor,
             ShutdownSendLeaf.RUN_NOTIFIER: self._block_run_notifier,
@@ -149,6 +154,13 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.RUN_REMOTE,
             f"{remote.other_machine()}: shutdown.py {shlex.join(args)}",
         )
+
+    def _block_worker_resume(self, record: SessionShutdown) -> None:
+        if record["session"]["kind"] == "unit" and record.get("codex_seats"):
+            self._reached_send_leaf(
+                ShutdownSendLeaf.RESUME_CODEX_WORKERS,
+                f"session:{record['session']['session_id']}",
+            )
 
     def _block_launch_conductor(self, login: str, label: str, here: bool = True) -> Never:
         del label, here

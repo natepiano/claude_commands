@@ -330,6 +330,7 @@ class SendGuardTests(ShutdownTestCase):
                         "DELIVER_MESSAGE": "settle._deliver_message",
                         "RETIRE_SHUTDOWN_MESSAGES": "settle._retire_shutdown_messages",
                         "RESTART_RETIRE": "restart._retire",
+                        "RESUME_CODEX_WORKERS": "restart._send_worker_resume",
                         "RUN_REMOTE": "remote.run_remote",
                         "LAUNCH_CONDUCTOR": "settle._launch_conductor",
                         "LAUNCH_REMOTE_CONTROL_FIXER": "remote_control.launch_fixer",
