@@ -2277,6 +2277,48 @@ class AddUnitTests(ShutdownTestCase):
                 self.assertEqual(self.git("rev-parse", "HEAD"), head)
                 self.assertFalse(self.config.exists())
 
+    def test_excluded_standing_plan_launches_and_keeps_the_units_copy(self) -> None:
+        plan = Path("docs/style-production/units/alpha-unit.md")
+        source = self.checkout / plan
+        source.parent.mkdir(parents=True)
+        header = "# Standing plan\n\n> **Production: build-followups** — unit `alpha-unit`\n"
+        standing = header + "> **Standing:** style_plan.py\n"
+        _ = source.write_text(standing, encoding="utf-8")
+        initial = self.repository_state()
+        refusal = f"plan {plan} is missing on build-followups or lacks the Production header"
+
+        with self.subTest(plan="untracked but not excluded"):
+            result = self.cli("alpha", "--plan", plan.as_posix(), "--check")
+            self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+            self.assertIn(refusal, result.stderr)
+            self.assertEqual(self.repository_state(), initial)
+
+        exclude = self.checkout / ".git/info/exclude"
+        _ = exclude.write_text(exclude.read_text() + "\n/docs/style-production/\n", encoding="utf-8")
+        _ = source.write_text(header, encoding="utf-8")
+        with self.subTest(plan="excluded without Standing header"):
+            result = self.cli("alpha", "--plan", plan.as_posix(), "--check")
+            self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+            self.assertIn(refusal, result.stderr)
+            self.assertEqual(self.repository_state(), initial)
+
+        _ = source.write_text(standing, encoding="utf-8")
+        _ = self.successful("alpha", "--plan", plan.as_posix(), "--check")
+        self.assertEqual(self.repository_state(), initial)
+        _ = self.successful("alpha", "--plan", plan.as_posix())
+        worktree = self.root / "project-alpha"
+        copied = worktree / plan
+        self.assertEqual(copied.read_text(encoding="utf-8"), standing)
+        self.assertEqual(self.git("check-ignore", "--", plan.as_posix(), cwd=worktree), plan.as_posix())
+        self.assertEqual(self.git("ls-tree", "HEAD", "--", plan.as_posix()), "")
+        self.assertIn(f"/unit:direct {plan}", self.opening_prompt())
+
+        progress = standing + "\n### Phase 1 — ticket in progress\n"
+        _ = copied.write_text(progress, encoding="utf-8")
+        _ = source.write_text(standing + "\nShowrunner template changed\n", encoding="utf-8")
+        _ = self.successful("alpha", "--plan", plan.as_posix())
+        self.assertEqual(copied.read_text(encoding="utf-8"), progress)
+
     def test_refuses_plan_without_production_header(self) -> None:
         _ = self.plan.write_text("# No production header\n", encoding="utf-8")
         _ = self.git("add", "docs/plans/given.md")

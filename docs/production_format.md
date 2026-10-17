@@ -88,6 +88,12 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
+- **Kind:** style — optional; absent means a product production. A style production
+  reads `~/.claude/docs/style_production.md`
+- **Branch point:** `<branch>` — style productions only: the parent's merge branch
+  to sync from and hand back to
+- **Parent production:** <path to parent production doc> — style productions only:
+  the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
@@ -113,7 +119,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <the issues folder the production files its proposals in, e.g.
   `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
-  `proposal`; omit when the production keeps none
+  `proposal`; required for a style production, which files held changes there;
+  otherwise omit when the production keeps none
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py

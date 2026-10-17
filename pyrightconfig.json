@@ -75,6 +75,7 @@
       "extraPaths": [
         ".",
         "scripts/style",
+        "scripts/production",
         "scripts/lib"
       ]
     },
