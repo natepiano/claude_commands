@@ -436,6 +436,17 @@ Pending: parent's saved style child summary and rendered style line.
   without the name-bindings rule are unchanged. A second rerun of the traced
   pass on the same 120 files, under the same scope reading, measures it
   against the 95% bar.
+- **Name-bindings rerun 2 — fix S misses the bar**: 33 of the 38 settled
+  findings caught (87%), against 34 (89%) in the first rerun; the bar allows
+  one loss. Three earlier losses are now caught (`visit.rs:37`,
+  `target.rs:404`, `unused_pub.rs:5`), and four earlier catches are lost.
+  Two come from the traced pass's own exclusions: a call inside
+  `tracing::trace!` (`disk_usage.rs:153`) and a value wrapped in an enum
+  variant (`dispatch.rs:803`). One is a later binding inside a loop read as
+  a collision when it would only shadow (`refresh.rs:403`). One is the
+  several-targets drop, reached now that `.path()` passes through
+  (`presentation.rs:103`). The type-prefix drop at `actions.rs:835` holds as
+  in the first rerun.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
