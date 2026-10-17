@@ -318,10 +318,12 @@ accounts.py next add showrunners 1 claude2 --hold-minutes 30
 accounts.py next add workers 1 codex2
 accounts.py next add workers 1 claude
 accounts.py next list
-accounts.py next remove ID
+accounts.py next move showrunners 1 2
+accounts.py next remove units 2
+accounts.py next add units 1 claude3 --at 1
 ```
 
-Each line reads “when units reach 1% → claude4”, with its ID and hold. An empty log prints “nothing set up”. The Mac reads and edits the log through natedev. Writes are atomic under a lock. Removing an entry also drops its saved hold.
+The list has showrunners, units and workers sections in that order, numbered from 1 within each group: “units 1: at 1% → claude4, hold 30 min”. Position 1 runs next; an empty log prints “nothing set up”. `move GROUP N M` moves position N to M, `remove GROUP N` removes it, and `add … --at N` inserts at positions 1 through the group’s size plus 1 (omission appends). Edits preserve other groups’ order and internal entry identities; ids are never shown or accepted in these commands. The Mac forwards group positions to natedev, which resolves and edits them under the watch and log locks; install both machines together. A head change immediately clears the displaced head’s hold and notice keys, so the new head starts its own hold on a later pass; an unchanged head keeps its hold.
 
 For units, showrunners and workers, the two-minute notes timer considers only the first entry per group; later entries wait until the head is recorded and removed, then become eligible on a later pass. Later Claude entries keep no hold until then. A due head that cannot run stays queued and tells showrunners once per changed reason (target already current, unreadable login, stale or missing reading, low target, unresolved refusal or refused preparation); shutdown in progress waits silently. A head targeting the current account blocks later entries too. The example holds units at 1% for 30 minutes, moves them to claude4, then holds again when claude4 reads low before moving them to claude2. Both groups may share an account; the Role cell then reads `units, showrunners`.
 

@@ -1752,7 +1752,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** confirmation requires a submitted first prompt; a lost Enter is retried without duplicating text; an unsent prompt is reported as a failed restart; merge gate (`merge_gate --tests-only`) on natedev and the Mac suites pass.
 
-### Phase 61 — The next list is numbered per group  · status: todo
+### Phase 61 — The next list is numbered per group  · status: done
 
 **Depends on:** Phase 59 (independent of Phase 60's files; runs while Phase 60 waits on herdr-trial)
 
@@ -1776,7 +1776,8 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/accounts/accounts.py` — `next list|move|remove|add --at` CLI and the forwarded positional verbs.
 - `scripts/accounts/refusal_watch.py` — head-change clearing for an edit (generalize `removing_next_move` to the displaced head).
 - `scripts/whoami/quota_alert.py` — blocked-head notice without the id.
-- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py` — tests.
+- `scripts/accounts/role_map.py` — `RemoteCommandRefused` carries natedev's refusal line to the Mac.
+- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/accounts/test_role_map.py` — tests.
 - `commands/next_moves.md`, `docs/accounts.md` — the forms.
 
 **Workers:** 1 writer + 1 tester. impl owns `next_moves.py`, `accounts.py`, `refusal_watch.py`, `quota_alert.py` and the docs; test owns `test_next_moves.py`, `test_accounts.py`, `test_refusal_watch.py`, `test_quota_alert.py` and `test_codex_alert_accounts.py`.

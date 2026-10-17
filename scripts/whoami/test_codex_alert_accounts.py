@@ -493,7 +493,8 @@ class CodexAccountAlertTests(unittest.TestCase):
             notice.assert_called_once_with("workers", "codex1", same.id,
                                            quota_alert.TargetIsCurrentAccount(), self.now)
         self.assertEqual(len(self.relayed), 1)
-        for text in (same.id, "workers", "codex1", "due", "already the current account"):
+        self.assertNotIn(same.id, self.relayed[0])
+        for text in ("workers 1", "codex1", "due", "already the current account"):
             self.assertIn(text, self.relayed[0])
         self.assertEqual(self.pushes, [])
 
@@ -544,7 +545,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                     swap.assert_not_called()
                     self.assertEqual(next_moves.read_next_moves(), (head,))
                     self.assertIn("already the current account", self.relayed[-1])
-                    next_moves.remove_next_move(head.id)
+                    next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
 
     def test_due_codex_head_runs_with_an_unknown_source_weekly_reset(self) -> None:
         source, target = self.account(1), self.account(2)

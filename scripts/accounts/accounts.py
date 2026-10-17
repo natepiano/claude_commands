@@ -436,7 +436,9 @@ class CommandLine(argparse.Namespace):
     group: next_moves.NextMoveGroup = "units"
     percent: float = 0
     hold_minutes: float = 0
-    entry_id: str = ""
+    next_position: next_moves.GroupPosition = next_moves.GroupPosition(1)
+    next_destination: next_moves.GroupPosition = next_moves.GroupPosition(1)
+    insertion: next_moves.AppendToGroup | next_moves.InsertAt = next_moves.AppendToGroup()
     entries: str = ""
     action: str = ""
     label: str = ""
@@ -4016,6 +4018,9 @@ def _parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("next-read")
     next_writer = commands.add_parser("next-write")
     _ = next_writer.add_argument("entries")
+    def insertion(text: str) -> next_moves.InsertAt:
+        return next_moves.InsertAt(next_moves.GroupPosition(int(text)))
+    _ = next_writer.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
     next_command = commands.add_parser("next")
     next_verbs = next_command.add_subparsers(dest="next_action", required=True)
     next_add = next_verbs.add_parser("add")
@@ -4023,9 +4028,17 @@ def _parser() -> argparse.ArgumentParser:
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
     _ = next_add.add_argument("--hold-minutes", type=float, default=0)
+    _ = next_add.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
     _ = next_verbs.add_parser("list")
     next_remove = next_verbs.add_parser("remove")
-    _ = next_remove.add_argument("entry_id")
+    _ = next_remove.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    def position(text: str) -> next_moves.GroupPosition:
+        return next_moves.GroupPosition(int(text))
+    _ = next_remove.add_argument("next_position", type=position)
+    next_move = next_verbs.add_parser("move")
+    _ = next_move.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_move.add_argument("next_position", type=position)
+    _ = next_move.add_argument("next_destination", type=position)
     parser.set_defaults(action="status", as_json=False, stored=False, with_login=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
@@ -4103,11 +4116,7 @@ def main(argv: list[str]) -> int:
                     raise AccountsError("accounts: next-write requires one entry")
                 entry = entries[0]
                 validate_next_move_target(entry)
-                with next_moves.next_moves_lock():
-                    current = next_moves.read_next_moves()
-                    if any(saved.id == entry.id for saved in current):
-                        raise AccountsError(f"accounts: duplicate next entry {entry.id}")
-                    next_moves.write_next_moves((*current, entry))
+                next_moves.insert_next_move(entry, options.insertion)
                 print(next_moves.encode_next_moves(entries))
             return 0
         if options.action == "next":
@@ -4117,15 +4126,19 @@ def main(argv: list[str]) -> int:
                         at_percent=options.percent, hold_minutes=options.hold_minutes, to=options.label,
                         added_at=datetime.now(timezone.utc).isoformat())]))[0]
                     validate_next_move_target(candidate)
-                entry = next_moves.add_next_move(options.group, options.percent, options.label,
-                                                 options.hold_minutes)
-                print(next_moves.render_next_move(entry))
+                _ = next_moves.add_next_move(options.group, options.percent, options.label,
+                                             options.hold_minutes, insertion=options.insertion)
+                print(next_moves.render_next_moves(next_moves.read_next_moves()) if role_map.is_role_map_host()
+                      else f"added {options.group} next move")
             elif options.next_action == "remove":
-                next_moves.remove_next_move(options.entry_id)
-                print(f"removed {options.entry_id}")
+                next_moves.remove_next_move(options.group, options.next_position)
+                print(f"removed {options.group} {options.next_position.value}")
+            elif options.next_action == "move":
+                next_moves.move_next_move(options.group, options.next_position, options.next_destination)
+                print(f"moved {options.group} {options.next_position.value} to {options.next_destination.value}")
             else:
                 entries = next_moves.read_next_moves()
-                print("\n".join(next_moves.render_next_move(entry) for entry in entries) or "nothing set up")
+                print(next_moves.render_next_moves(entries))
             return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():

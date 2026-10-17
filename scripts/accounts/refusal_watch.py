@@ -279,20 +279,41 @@ def _watch_lock() -> Generator[None]:
         yield
 
 
+@dataclass(frozen=True)
+class LockedNextMoveEdit:
+    """An edit whose watch and log locks remain held through cleanup and commit."""
+
+    before: tuple[next_moves.NextMove, ...]
+
+    def commit(self, entries: tuple[next_moves.NextMove, ...]) -> None:
+        heads: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in self.before:
+            _ = heads.setdefault(entry.group, entry.id)
+        new_heads: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in entries:
+            _ = new_heads.setdefault(entry.group, entry.id)
+        discarded = {entry.id for entry in self.before} - {entry.id for entry in entries}
+        discarded.update(entry_id for group, entry_id in heads.items() if new_heads.get(group) != entry_id)
+        if discarded:
+            state = _load_state()
+            original = deepcopy(state)
+            for entry_id in discarded:
+                _ = state.get("auto_move_holds", {}).pop(entry_id, None)
+                _ = state.get("auto_move_notices", {}).pop(entry_id, None)
+            if state != original:
+                _save_state(state)
+            import quota_alert
+            with quota_alert.state_file() as quota_state:
+                for entry_id in discarded:
+                    _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
+        next_moves.write_next_moves(entries)
+
+
 @contextmanager
-def removing_next_move(entry_id: str) -> Generator[None]:
-    """Hold the watcher lock before the log lock, then discard the removed hold."""
-    with _watch_lock():
-        yield
-        state = _load_state()
-        holds = state.get("auto_move_holds", {})
-        removed_hold = holds.pop(entry_id, None)
-        removed_notice = state.get("auto_move_notices", {}).pop(entry_id, None)
-        if removed_hold is not None or removed_notice is not None:
-            _save_state(state)
-        import quota_alert
-        with quota_alert.state_file() as quota_state:
-            _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
+def editing_next_moves() -> Generator[LockedNextMoveEdit]:
+    """Resolve edits under watch then log locks; cleanup must precede the log write."""
+    with _watch_lock(), next_moves.next_moves_lock():
+        yield LockedNextMoveEdit(next_moves.read_next_moves())
 
 
 class TranscriptEntry(TypedDict, total=False):
