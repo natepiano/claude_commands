@@ -50,6 +50,7 @@ from scripts.accounts.refusals import (  # noqa: E402
     StaleReading as StaleReading, NoReading as NoReading,
 )
 
+from scripts.accounts import next_moves
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
@@ -431,6 +432,12 @@ class CodexStatus:
 
 
 class CommandLine(argparse.Namespace):
+    next_action: str = ""
+    group: ClaudeGroup = "units"
+    percent: float = 0
+    hold_minutes: float = 0
+    entry_id: str = ""
+    entries: str = ""
     action: str = ""
     label: str = ""
     role: str = ""
@@ -3986,6 +3993,19 @@ def _parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("role-map-read")
     writer = commands.add_parser("role-map-write")
     _ = writer.add_argument("change")
+    _ = commands.add_parser("next-read")
+    next_writer = commands.add_parser("next-write")
+    _ = next_writer.add_argument("entries")
+    next_command = commands.add_parser("next")
+    next_verbs = next_command.add_subparsers(dest="next_action", required=True)
+    next_add = next_verbs.add_parser("add")
+    _ = next_add.add_argument("group", choices=CLAUDE_GROUPS)
+    _ = next_add.add_argument("percent", type=float)
+    _ = next_add.add_argument("label")
+    _ = next_add.add_argument("--hold-minutes", type=float, default=0)
+    _ = next_verbs.add_parser("list")
+    next_remove = next_verbs.add_parser("remove")
+    _ = next_remove.add_argument("entry_id")
     parser.set_defaults(action="status", as_json=False, stored=False, with_login=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
@@ -4045,6 +4065,38 @@ def main(argv: list[str]) -> int:
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
+        if options.action in ("next-read", "next-write"):
+            if not role_map.is_role_map_host():
+                raise AccountsError("accounts: next moves belong on natedev")
+            if options.action == "next-read":
+                print(next_moves.encode_next_moves(next_moves.read_next_moves()))
+            else:
+                entries = next_moves.decode_next_moves(options.entries)
+                if len(entries) != 1:
+                    raise AccountsError("accounts: next-write requires one entry")
+                entry = entries[0]
+                _ = claude_account_dir(entry.to)
+                with next_moves.next_moves_lock():
+                    current = next_moves.read_next_moves()
+                    if any(saved.id == entry.id for saved in current):
+                        raise AccountsError(f"accounts: duplicate next entry {entry.id}")
+                    next_moves.write_next_moves((*current, entry))
+                print(next_moves.encode_next_moves(entries))
+            return 0
+        if options.action == "next":
+            if options.next_action == "add":
+                if role_map.is_role_map_host():
+                    _ = claude_account_dir(options.label)
+                entry = next_moves.add_next_move(options.group, options.percent, options.label,
+                                                 options.hold_minutes)
+                print(next_moves.render_next_move(entry))
+            elif options.next_action == "remove":
+                next_moves.remove_next_move(options.entry_id)
+                print(f"removed {options.entry_id}")
+            else:
+                entries = next_moves.read_next_moves()
+                print("\n".join(next_moves.render_next_move(entry) for entry in entries) or "nothing set up")
+            return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():
                 raise AccountsError(f"accounts: role map belongs on {role_map.ROLE_MAP_HOST}")
@@ -4163,7 +4215,7 @@ def main(argv: list[str]) -> int:
                 print("No paired quota readings in this window.")
             return 0
         raise AccountsError(f"accounts: unknown action {options.action}")
-    except (AccountsError, role_map.RoleMapUnavailable, role_map.RoleMapWriteRefused) as error:
+    except (AccountsError, next_moves.NextMoveError, role_map.RoleMapUnavailable, role_map.RoleMapWriteRefused) as error:
         print(error, file=sys.stderr)
         return 2 if options.action == "exec" else 1
 
