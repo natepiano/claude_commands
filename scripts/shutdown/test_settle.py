@@ -378,13 +378,13 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual({push.values["session"] for push in pushes}, set(identities))
         for push in pushes:
             self.assertEqual(push.id, "shutdown.holdout_unanswered")
-            self.assertIn(push.values["session"], push.title)
-            self.assertIn("is blocked", push.title)
+            self.assertIn(f"Session: {push.values['session']}\n", push.message)
+            self.assertIn("is stuck", push.title)
             self.assertIn(push.values["command"], push.body)
             combined = push.body + " " + cast(ActionRequired, push.action).text
-            self.assertIn("in a terminal on natedev:", combined.casefold())
+            self.assertIn("in a terminal on natedev,", combined.casefold())
             self.assertIn(f"now {LABEL} --here --only {identities[push.values['session']]}", combined)
-            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session has not paused for it and it can't proceed.\n\n"))
+            self.assertTrue(push.body.startswith(f"Your Claude {push.values['operation']} waits for each session to pause. The session {push.values['session']} has not paused, so the {push.values['operation']} is stuck.\n\n"))
             self.assertNotIn("form", push.title + "\n" + push.message)
             if identities[push.values["session"]] == "session-wait":
                 self.assertIn("restart", push.title)
@@ -3256,8 +3256,8 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual([push.id for push in pushes], ["shutdown.holdout", "shutdown.holdout_unanswered"])
         self.assertIn("claude session is showing a form and it can't proceed.", pushes[0].body)
         self.assertEqual(cast(ActionRequired, pushes[0].action).text, "answer the open form")
-        self.assertEqual(cast(ActionRequired, pushes[1].action).text, "in a terminal on natedev, stop Busy with the command below")
-        self.assertIn("claude session has not paused for it and it can't proceed.", pushes[1].body)
+        self.assertEqual(cast(ActionRequired, pushes[1].action).text, "In a terminal on natedev, stop Busy with the command below")
+        self.assertIn("The session Busy has not paused, so the shutdown is stuck.", pushes[1].body)
         self.assertNotIn("form", pushes[1].title + "\n" + pushes[1].message)
         self.assertIn("Busy", cast(str, sender.call_args.args[2]))
 
@@ -3296,7 +3296,7 @@ class SettleTests(ShutdownTestCase):
                 push = cast(RenderedPush, alert.call_args.args[0])
                 self.assertEqual(push.id, expected_id)
                 self.assertNotIn("@", push.title + "\n" + push.message)
-                self.assertEqual(push.title, "pm-move-ghostty restart is blocked")
+                self.assertEqual(push.title, "pm-move-ghostty restart is blocked" if expected_id == "shutdown.holdout" else "Your Claude restart is stuck")
                 self.assertIn("shutdown.py now claude4 --here --only held", push.body)
 
     def test_pending_scheduled_jobs_remain_in_session_reports_without_a_phone_alert(self) -> None:
@@ -3590,9 +3590,9 @@ class SettleTests(ShutdownTestCase):
                 alert.assert_called_once()
                 push = cast(RenderedPush, alert.call_args.args[0])
                 self.assertEqual(push.id, "shutdown.holdout_unanswered")
-                self.assertEqual(cast(ActionRequired, push.action).text, "in a terminal on natedev, stop Owner with the command below")
+                self.assertEqual(cast(ActionRequired, push.action).text, "In a terminal on natedev, stop Owner with the command below")
                 self.assertNotIn("form", push.title + "\n" + push.message)
-                self.assertTrue(push.body.startswith("Reason: shutdown is blocked because Owner's claude session has not paused for it and it can't proceed.\n\n"))
+                self.assertTrue(push.body.startswith("Your Claude shutdown waits for each session to pause. The session Owner has not paused, so the shutdown is stuck.\n\n"))
                 self.assertIn("Owner has not answered the pause", cast(str, sender.call_args.args[2]))
                 self.assertIn(f"now {LOGIN} --here --only owner", cast(str, sender.call_args.args[2]))
 

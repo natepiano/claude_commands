@@ -194,7 +194,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - `shutdown.holdout` when a form is shown.
   - `shutdown.holdout_unanswered` for any other hold.
 
-  Both use the user's four lines: title `{session} {operation} is blocked`, `Session: {session}`, the Action line and `Reason: …`. A stop command follows, which names the account label (`note_file.canonical_label`) with `--here` and never the login. No raw hold-detail list reaches the push; the requesting session's message keeps it.
+  `shutdown.holdout` uses the user's four lines: title `{session} {operation} is blocked`, `Session: {session}`, the Action line and `Reason: …`. `shutdown.holdout_unanswered` keeps the Session and Action lines, but its title is `Your Claude {operation} is stuck`. Its body says the session has not paused and that stopping it keeps its uncommitted work, then gives the bare command. The user's title and `Reason:` line failed the push review here (reader-starts-cold, title-names-the-stake, short-plain-sentences) and were sent anyway as a registry push, so the showrunner had the text rewritten on 2026-10-16. Both give a stop command, which names the account label (`note_file.canonical_label`) with `--here` and never the login. No raw hold-detail list reaches the push; the requesting session's message keeps it.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
   - `texts --approve` writes passing examples only.
