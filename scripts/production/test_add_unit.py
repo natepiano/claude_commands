@@ -798,7 +798,7 @@ class AddUnitTests(ShutdownTestCase):
 
     def test_restore_returns_zero_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+            "session-123", self.root / "restart-note", "recorded-name", "build-followups-recorded-tmux"
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -808,7 +808,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach recorded-tmux\n")
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach build-followups-recorded-tmux\n")
 
     def test_restore_already_running_returns_zero_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -899,8 +899,12 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(add_unit.host_session_name(hana), "hana-review")
         named = dataclasses.replace(request, identity=add_unit.UnitIdentity("review-unit", "build-followups-review"))
         self.assertEqual(add_unit.host_session_name(named), "build-followups-review")
-        restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "review")
-        self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)), "review")
+        restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
+        self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
+                         "build-followups-review")
+        # A record from before the slug led: its bare name may be another production's live session.
+        before = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "review")
+        self.assertEqual(add_unit.host_session_name(dataclasses.replace(hana, launch_kind=before)), "hana-review")
 
     def test_failed_unit_restore_stops_its_created_server_after_agent_exit(self) -> None:
         prior = self.root / "prior-session"
@@ -917,15 +921,15 @@ class AddUnitTests(ShutdownTestCase):
                 plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
                 port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
                 session=add_unit.ResumedSession("session-123", prior),
-                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "alpha"),
+                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "build-followups-alpha"),
                 timeout=90,
             )
             self.configure_herdr(request)
             with self.assertRaises(herdr.AgentExited):
                 add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                                         "Resume this unit.", accounts.role_account("unit"))
-        stopped.assert_called_once_with("alpha")
-        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-alpha.service"] for row in self.herdr_calls()))
+        stopped.assert_called_once_with("build-followups-alpha")
+        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-build-followups-alpha.service"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
@@ -1088,6 +1092,27 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
+    def test_restart_from_a_record_before_the_slug_led_skips_another_productions_live_session(self) -> None:
+        self.commit_prepared_row(self.unit_row("review"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        # hana's review-unit holds the bare name this record was written under.
+        self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
+            herdr.SessionListResult(sessions=[herdr.SessionEntry(name="review", running=True, default=False,
+                                                                 session_dir="/fixture", socket_path="/fixture/socket")])))
+
+        result = self.successful(
+            "review", "--plan", "docs/plans/given.md", "--resume", "session-review", "--cwd", str(prior),
+            "--restart-note", str(note), "--session-name", "review", "--host-session", "review",
+        )
+
+        self.assertIn("review-unit restore launched", result.stdout)
+        self.assertEqual(len(self.servers_started()), 1)
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual([row[1] for row in starts], ["build-followups-review"])
+
     def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
         self.env["CLAUDE_PROBE_SESSION"] = "1"
         prior = self.root / "prior-session"
@@ -1102,19 +1127,20 @@ class AddUnitTests(ShutdownTestCase):
                 result = self.successful(
                     name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
                     "--cwd", str(prior), "--restart-note", str(note),
-                    "--session-name", name, "--host-session", name,
+                    "--session-name", name, "--host-session", f"build-followups-{name}",
                     *(["--probe"] if probe else []),
                     *(["--account", target] if target else []),
                 )
                 self.assertIn(f"{name}-unit restore launched", result.stdout)
                 self.assertEqual(len(self.servers_started()), count)
-                opened = self.opened(name)
+                opened = self.opened(f"build-followups-{name}")
                 self.assertEqual(opened[opened.index("--cwd") + 1], str(prior))
-                starts = [row for row in self.herdr_calls() if row[:4] == ["--session", name, "agent", "start"]]
+                starts = [row for row in self.herdr_calls()
+                          if row[:4] == ["--session", f"build-followups-{name}", "agent", "start"]]
                 self.assertEqual(len(starts), 1)
                 arguments = starts[0][starts[0].index("--") + 1:]
                 self.assertEqual(arguments[arguments.index("--resume") + 1], f"session-{name}")
-                environment = self.pane_environment(name)
+                environment = self.pane_environment(f"build-followups-{name}")
                 self.assertEqual(environment.get("CLAUDE_PROBE_SESSION", ""), "1" if probe else "")
                 self.assertNotIn("CLAUDE_TEST_SECRET", environment)
 
@@ -2429,7 +2455,7 @@ class AddUnitTests(ShutdownTestCase):
         restart_note = "Restarted with spaces, 'quotes', and $() unchanged."
         _ = note.write_text(restart_note, encoding="utf-8")
         recorded_session = "restored 'session' $()"
-        recorded_tmux = "restore $()"
+        recorded_tmux = "build-followups restore $()"
         existing_prompt = "Keep this previously scheduled prompt."
         with patch.dict(os.environ, self.env):
             conversation_pause.record_scheduled_prompts(
@@ -2446,7 +2472,7 @@ class AddUnitTests(ShutdownTestCase):
             "--host-session", recorded_tmux,
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        self.assertEqual(self.opened()[1], "restore----")
+        self.assertEqual(self.opened()[1], "build-followups-restore----")
         self.assertEqual(self.opened()[7], str(prior))
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
@@ -2460,7 +2486,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(recorded, (existing_prompt, prompt))
         self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
                       conversation_pause.PromptSource.SCHEDULED)
-        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-restore----.service")
+        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-build-followups-restore----.service")
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
         self.commit_prepared_row(self.unit_row())
