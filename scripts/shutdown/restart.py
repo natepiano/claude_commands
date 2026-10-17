@@ -60,6 +60,7 @@ from record import (  # noqa: E402
     NoLiveRecord,
     PendingTimer,
     SessionShutdown,
+    PausedSeat,
     SessionRestoredTimersPending,
     SessionNeedsManualRestart,
     SessionProgress,
@@ -592,9 +593,16 @@ def restart_note(
     record: SessionShutdown, restarted_at: str
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
+    note = _stop_note(record, restarted_at)
+    # A unit renamed while it was stopped learns its new names before anything else it reads.
+    return f"{record['renamed']} {note}" if "renamed" in record else note
+
+
+def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
     if "target" in record and record["requested_by"]["kind"] != "snapshot":
         note = account_move_note(record["session"], record["target"],
-                                 record.get("source_label", record["label"]), record.get("why", ""))
+                                 record.get("source_label", record["label"]), record.get("why", ""),
+                                 codex_seats=record.get("codex_seats", []))
         where = record["where"]
         if where["kind"] == "said":
             punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
@@ -755,13 +763,16 @@ def _resume_command(session: Session, prompt: str, target: str = "", *, login: s
     return _resume_shell(_resume_parts(session, prompt, target, login=login, at=at, probe=probe))
 
 
-def account_move_note(session: Session, target: str, source_label: str, why: str = "") -> str:
+def account_move_note(session: Session, target: str, source_label: str, why: str = "", *,
+                      codex_seats: Sequence[PausedSeat] = ()) -> str:
     """One stable explanation for every moved conversation and host."""
     reason = why or f"{source_label} is out of usage"
     continuation = (" Continue your /unit:direct run." if session["kind"] == "unit" else "")
+    workers = (" Your Codex workers are paused, not ended; a message lists the command that resumes each."
+               if codex_seats else "")
     return (f"You were moved from {source_label} to {target} because {reason}. "
             + "This was an account move, not a stop. Continue where you stopped."
-            + continuation + " First run `~/.claude/scripts/lib/py "
+            + continuation + workers + " First run `~/.claude/scripts/lib/py "
             + "~/.claude/scripts/message/send.py pending` for messages kept while you "
             + "were down; if you were waiting on the user, keep waiting.")
 
@@ -776,6 +787,26 @@ def resume_command(session: Session, target: str, source_label: str = "", why: s
     note = account_move_note(session, target, source_label, why)
     prompt = f"{_showrunner_prompt(session)} {note}" if session["kind"] == "showrunner" else note
     return _resume_command(session, prompt, target)
+
+
+def legacy_resume_command(record: SessionShutdown) -> str:
+    """Keep obsolete host names out of destinations and preserve unresolved cleanup."""
+    session = record["session"]
+    prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else "Continue where you stopped."
+    resume = _resume_command(session, prompt, record.get("target", ""), login=record["login"],
+        at=record["requested_at"], probe=record.get("probe", False))
+    cleanup = [shlex.join(["tmux", "kill-session", "-t", "=" + issue["session_name"]])
+               for issue in recovery_store.legacy_tmux_leftovers(record)]
+    return " && ".join([*cleanup, resume])
+
+
+def legacy_codex_command(entry: SnapshotCodexSession) -> str:
+    launch = entry["codex"]
+    argv = ["codex", "resume"]
+    if launch["resume"]["kind"] == "session id":
+        argv.append(launch["resume"]["session_id"])
+    return (f"cd {shlex.quote(entry['session']['cwd'])} && "
+            f"CODEX_HOME={shlex.quote(launch['home'])} {shlex.join(argv)}")
 
 
 def _showrunner_prompt(session: Session) -> str:
@@ -1028,7 +1059,9 @@ def _herdr_launch(
             herdr.stop_created_server(name, server)
             raise
         if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
-            _focus_restored_pane(client, pane, session["name"])
+            focused = _focus_restored_pane(client, pane, session["name"])
+            if focused and isinstance(server, herdr.WindowServerCreated):
+                _close_startup_workspaces(client, pane)
         if isinstance(parts.conversation, StartFreshConversation):
             print(f"{session['name']}: no conversation to resume; started a new one")
         return server
@@ -1040,11 +1073,20 @@ def _herdr_launch(
         raise OSError(str(error)) from error
 
 
-def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> None:
+def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> bool:
     try:
         client.focus_workspace(pane.split(":", 1)[0])
+        return True
     except herdr.HerdrFailure as error:
         print(f"{name} restart issue: restored workspace not focused: {error}")
+        return False
+
+
+def _close_startup_workspaces(client: herdr.Herdr, pane: str) -> None:
+    try:
+        client.close_startup_workspaces(pane.split(":", 1)[0])
+    except herdr.HerdrFailure as error:
+        print(f"{client.session} restart issue: startup workspace left open: {error}")
 
 
 def launches_window(host: Host) -> bool:
@@ -1115,6 +1157,8 @@ def _launch_session(
         record = {**record, "target": resolved.label}
     session = record["session"]
     host = session["host"]
+    if host["kind"] in {"legacy tmux", "legacy tmux unit"}:
+        return ManualRestartRequired(legacy_resume_command(record))
     if session["kind"] == "unit":
         if host["kind"] != "unit":
             raise ValueError("unit session has no unit host")
@@ -1150,17 +1194,6 @@ def _launch_session(
                     pass
         else:
             print(shlex.join(["herdr", "session", "attach", name]))
-        return SessionLaunched()
-    if host["kind"] == "tmux":
-        suffix = 0
-        while True:
-            name = herdr.generated_session_name(host["tmux_session"], str(suffix) if suffix else "")
-            try:
-                _ = _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run,
-                    session_kind=desktop_state.session_kind)
-                break
-            except HerdrDestinationTaken:
-                suffix += 1
         return SessionLaunched()
     if host["kind"] == "ghostty" or host["kind"] == "zed" or (host["kind"] == "terminal" and sys.platform == "darwin"):
         name = herdr.generated_session_name(session["name"])
@@ -1419,7 +1452,9 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
     remaining: list[SessionShutdown] = []
     finished: list[SessionShutdown] = []
     for record in records:
-        if record["progress"]["kind"] not in NOT_BACK_PROGRESS or record["machine"].casefold() != settle.local_machine().casefold():
+        if (recovery_store.legacy_tmux_leftovers(record)
+                or record["progress"]["kind"] not in NOT_BACK_PROGRESS
+                or record["machine"].casefold() != settle.local_machine().casefold()):
             remaining.append(record)
             continue
         directory, target = _live_config_dir(record), _target_config_dir(record)
@@ -1594,6 +1629,12 @@ def launch_entry(
         return EntrySettled()
     session = record["session"]
     session_id = session["session_id"]
+    if session["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or recovery_store.legacy_tmux_leftovers(record):
+        command = legacy_resume_command(record)
+        print(f"manual restart {session['name']}: {command}")
+        if not dry_run:
+            _ = _set_entry_progress(record, SessionNeedsManualRestart(kind="manual restart", command=command))
+        return EntrySettled()
     relaunching_pending_timers = False
     if progress["kind"] == "timers pending":
         relaunching_pending_timers = True
@@ -1699,6 +1740,64 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
+def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
+    """Build a complete launcher invocation that continues this seat's thread."""
+    launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
+    prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
+    resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
+    if resumed is not None:
+        return resumed
+    start = [str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
+    if launcher == "review.sh":
+        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
+    kind = seat["role"] if seat["role"] in {"impl", "test", "fix"} else "impl"
+    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", seat["role"]])
+
+
+def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:
+    """Keep the recorded task arguments, following the seat with its resume prompt; None when incomplete."""
+    index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
+    if index < 0:
+        return None
+    # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
+    position = index + 1
+    options: list[str] = []
+    while position < len(command) and command[position].startswith("--"):
+        if position + 1 >= len(command):
+            return None
+        option, value = command[position], command[position + 1]
+        if option not in {"--slot", "--pool", "--lease", "--to"}:
+            options.extend((option, value))
+        position += 2
+    arguments = command[position:]
+    # implement.sh requires its team role as the ninth argument; review.sh has defaults after three.
+    if len(arguments) < (9 if Path(command[index]).name == "implement.sh" else 3):
+        return None
+    arguments[2] = prompt
+    return shlex.join([*command[:index + 1], *options, "--to", seat, *arguments])
+
+
+def _send_worker_resume(record: SessionShutdown) -> None:
+    seats = record.get("codex_seats", [])
+    if not seats:
+        return
+    lines = ["Resume your Codex workers; do not open new ones."]
+    cwd = record["session"]["cwd"]
+    for seat in seats:
+        state = "was working" if seat["turn_live"] else "idle"
+        lines.append(f"{seat['seat']} ({seat['role']}, {state}): {_resume_worker_command(seat, cwd)}")
+    lines.append("Each seat continues its own thread; after resuming, send later work with --to as usual.")
+    identity = record["session"]["session_id"]
+    try:
+        result = _run([*_send_command(), "--to", f"session:{identity}", "--from", "shutdown",
+                       "--key", f"resume-workers-{identity}", "--text", "\n".join(lines)],
+                      dry_run=False, check=False)
+        if result is not None and result.returncode != 0:
+            print(f"shutdown: worker resume message: {_first_line(result.stderr, 'send failed')}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"shutdown: worker resume message: {_error_reason(error)}", file=sys.stderr)
+
+
 def confirm_entry(
     record: SessionShutdown,
     restarted_at: str,
@@ -1728,6 +1827,7 @@ def confirm_entry(
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
             return
+    _send_worker_resume(current)
     timer_failures = _restore_timers(record["timers"], dry_run=False)
     _record_timer_restore_progress(record, timer_failures)
 
@@ -1847,7 +1947,7 @@ def relaunch_session(
     if dry_run:
         _ = launch_entry(record, settle.record_time(), desktop_state, dry_run=True)
         return record
-    if record["progress"]["kind"] != "restarting" and _unfinished_cleanup(record) and record["session"]["session_id"] not in _live_session_ids():
+    if record["progress"]["kind"] != "restarting" and _unfinished_cleanup(record) and not recovery_store.legacy_tmux_leftovers(record) and record["session"]["session_id"] not in _live_session_ids():
         try:
             cleaned = stop_work.stop_session(record)
         except Exception as error:
@@ -1897,7 +1997,7 @@ def relaunch_session(
 
 
 def _unfinished_cleanup(record: SessionShutdown) -> bool:
-    return any(
+    return bool(recovery_store.legacy_tmux_leftovers(record)) or any(
         (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
         and issue["cause"] == "stop not confirmed"
         for issue in record["stop_issues"]
@@ -2032,8 +2132,12 @@ def _restore_target(saved: SessionShutdown, decision: RestoreAccountChosen, *, d
 
 def _launch_codex_snapshot(
     snapshot: RecoverySnapshot, entry: SnapshotCodexSession, state: DesktopLaunchState, *, dry_run: bool,
-) -> None:
+) -> SessionLaunched | ManualRestartRequired:
     owner, launch = entry["session"], entry["codex"]
+    if owner["host"]["kind"] == "legacy tmux":
+        command = legacy_codex_command(entry)
+        print(f"manual restart {owner['name']}: {command}")
+        return ManualRestartRequired(command)
     suffix = hashlib.sha256(owner["session_id"].encode()).hexdigest()[:16]
     name = herdr.generated_session_name(Path(owner["cwd"]).name + "-codex", suffix)
     arguments = ["resume"]
@@ -2043,7 +2147,7 @@ def _launch_codex_snapshot(
         print(f"{owner['name']}: Codex resume picker opens")
     if dry_run:
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in {owner['cwd']}")
-        return
+        return SessionLaunched()
     server = herdr.restore_server(name, 90_000, session_kind=state.session_kind,
                                   exclusive=True)
     try:
@@ -2053,27 +2157,30 @@ def _launch_codex_snapshot(
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
         herdr.stop_created_server(name, server)
         raise
-    _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
+    focused = _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
+    if focused and isinstance(server, herdr.WindowServerCreated):
+        _close_startup_workspaces(herdr.Herdr(name), pane)
     _acknowledge_restored_snapshots(owner["session_id"])
     if isinstance(server, herdr.WindowServerCreated):
-        return
+        return SessionLaunched()
     attach = shlex.join(["herdr", "session", "attach", name])
     if launches_window(owner["host"]):
         clients = herdr.attached_clients(name)
         if isinstance(clients, herdr.ClientsAttached):
-            return
+            return SessionLaunched()
         if isinstance(clients, herdr.NoClientAttached):
             if sys.platform == "darwin":
                 _herdr_window(CodexWindowRestore(snapshot["machine"], owner["name"]), name,
                     owner["cwd"], DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)
-                return
+                return SessionLaunched()
             try:
                 _open_window(_herdr_attach_command(name, owner["cwd"]),
                     DesktopNotInSnapshot(kind="not in snapshot"), state, dry_run=False)
-                return
+                return SessionLaunched()
             except (OSError, subprocess.SubprocessError) as error:
                 print(f"{snapshot['machine']}: {owner['name']}: window not opened: {_error_reason(error)}")
     print(attach)
+    return SessionLaunched()
 
 
 @dataclass(frozen=True)
@@ -2288,20 +2395,28 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
     started_at = time.monotonic()
     attempted: list[SessionShutdown] = []
     codex_restarted = 0
+    manual_sessions: list[ManualSessionRestart] = []
     try:
         if dry_run:
             for record in sorted(eligible, key=_dry_run_entry_order):
                 if record["progress"]["kind"] != "restarted":
                     _ = relaunch_session(record, dry_run=True, desktop_state=state)
+                    if record["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or recovery_store.legacy_tmux_leftovers(record):
+                        manual_sessions.append(ManualSessionRestart(record["session"]["name"], legacy_resume_command(record)))
             for snapshot, entry in codex_entries:
-                _launch_codex_snapshot(snapshot, entry, state, dry_run=True)
-            return MachineRestartResult(machine, label, "partial" if recovery_failures else "done",
-                failed=len(recovery_failures), failed_sessions=tuple(recovery_failures),
+                launch = _launch_codex_snapshot(snapshot, entry, state, dry_run=True)
+                if isinstance(launch, ManualRestartRequired):
+                    manual_sessions.append(ManualSessionRestart(entry["session"]["name"], launch.command))
+            return MachineRestartResult(machine, label, "partial" if recovery_failures or manual_sessions else "done",
+                manual=len(manual_sessions), manual_sessions=tuple(manual_sessions), failed=len(recovery_failures), failed_sessions=tuple(recovery_failures),
                 refused=refused, local_session_ids=frozenset(local_ids))
         for snapshot, entry in codex_entries:
             try:
-                _launch_codex_snapshot(snapshot, entry, state, dry_run=False)
-                codex_restarted += 1
+                launch = _launch_codex_snapshot(snapshot, entry, state, dry_run=False)
+                if isinstance(launch, ManualRestartRequired):
+                    manual_sessions.append(ManualSessionRestart(entry["session"]["name"], launch.command))
+                else:
+                    codex_restarted += 1
             except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
                 recovery_failures.append(FailedSessionRestart(entry["session"]["name"], _error_reason(error)))
         previous_manual_ids = {record["session"]["session_id"] for record in eligible
@@ -2350,6 +2465,8 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 clear_finished_account_hold(login, request_ids=finished_requests)
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
         result = replace(result, restarted=result.restarted + codex_restarted)
+        if manual_sessions:
+            result = replace(result, status="partial", manual=result.manual + len(manual_sessions), manual_sessions=(*result.manual_sessions, *manual_sessions))
         if recovery_failures:
             result = replace(result, status="partial", failed=result.failed + len(recovery_failures),
                              failed_sessions=(*result.failed_sessions, *recovery_failures))

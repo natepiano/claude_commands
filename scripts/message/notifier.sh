@@ -440,13 +440,17 @@ launch_run() {
     linux*) systemd-run --user --collect --quiet --no-block --unit "$label" -- "${command[@]}" >/dev/null 2>&1 ;;
     darwin*)
       command[-2,-1]=(run-due-and-remove "$name" "$label")
-      launchctl submit -l "$label" -- "${command[@]}" >/dev/null 2>&1 ;;
+      launchctl submit -l "$label" -- "${command[@]}" >/dev/null 2>&1 || return 1
+      # macOS only registers a submitted job; kickstart starts it.
+      launchctl kickstart "gui/$UID/$label" >/dev/null 2>&1 && return 0
+      launchctl remove "$label" >/dev/null 2>&1
+      return 1 ;;
     *) return 1 ;;
   esac
 }
 
 cmd_tick() {
-  local tick_fd dir name
+  local tick_fd dir name fired
   local -a deferred_runs
   typeset -A state conf
   [[ -d $STATE_DIR ]] || mkdir -p -- "$STATE_DIR" || return 0
@@ -462,6 +466,7 @@ cmd_tick() {
     read_conf
     if [[ -n ${conf[RUN]:-} ]]; then
       if ! launch_run "$name"; then
+        fired=$(fired_stamp)
         log_error "run launcher unavailable: $name; waiting after tick"
         deferred_runs+=("$name")
       fi

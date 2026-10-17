@@ -328,6 +328,32 @@ def command_prime(args: PoolArguments) -> int:
     return 0
 
 
+def rename_unit(production: str, old: str, new: str) -> int:
+    """Carry a renamed unit's reviewers and memory to its new id; returns the leases moved.
+
+    Thread ids and ordinals stay, so the unit keeps the reviewers that already know it.
+    """
+    pool_dir = _production(production)
+    if not pool_dir.directory.exists():
+        return 0
+    moved = 0
+    with pool_dir.locked() as pool:
+        for reviewer in pool.reviewers.values():
+            lease = reviewer.lease
+            if isinstance(lease, UnitLease) and lease.unit == new:
+                raise PoolError(f"a reviewer is already leased to {new}")
+            if isinstance(lease, UnitLease) and lease.unit == old:
+                reviewer.lease = UnitLease(new, lease.ordinal)
+                moved += 1
+        memory = pool_dir.directory / "memory"
+        source, destination = memory / f"{old}.md", memory / f"{new}.md"
+        if source.exists():
+            if destination.exists():
+                raise PoolError(f"memory for {new} already exists")
+            _ = source.rename(destination)
+    return moved
+
+
 def command_unit_memory(args: PoolArguments) -> int:
     if not args.unit or Path(args.unit).name != args.unit or args.unit in (".", ".."):
         raise PoolError("unit must name one memory file")
@@ -575,13 +601,13 @@ def command_end_lease(_args: PoolArguments) -> int:
 
 def running_units(slug: str) -> set[str]:
     """Units of the production whose unit director runs, plus those whose state is unknown."""
-    # unit_lookup imports its siblings by bare name, and it reads tmux and herdr, so only migrate loads it.
+    # unit_lookup imports its siblings by bare name, and it reads herdr, so only migrate loads it.
     production_scripts = str(Path(__file__).resolve().parents[1] / "production")
     if production_scripts not in sys.path:
         sys.path.insert(0, production_scripts)
     import unit_lookup
 
-    return {unit for unit, marked in unit_lookup.marked_units(slug, every_host=True).items()
+    return {unit for unit, marked in unit_lookup.marked_units(slug).items()
             if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)}
 
 

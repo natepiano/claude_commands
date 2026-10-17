@@ -27,6 +27,19 @@ ROLE_MAP_HOST = "natedev"
 Role = Literal["showrunners", "units", "workers"]
 
 
+@dataclass(frozen=True)
+class RecordedTransitionReason:
+    text: str
+
+
+@dataclass(frozen=True)
+class UnavailableTransitionReason:
+    """A historical selection did not record its transition reason."""
+
+
+TransitionReason = RecordedTransitionReason | UnavailableTransitionReason
+
+
 class StoredGroupSelection(TypedDict):
     label: str
     move_id: str
@@ -34,6 +47,12 @@ class StoredGroupSelection(TypedDict):
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
     why: NotRequired[str]
+
+
+def selection_reason(selection: StoredGroupSelection) -> TransitionReason:
+    if "why" in selection:
+        return RecordedTransitionReason(selection["why"])
+    return UnavailableTransitionReason()
 
 
 class StoredGroupSelections(TypedDict, total=False):

@@ -54,10 +54,6 @@ class Promotion(NamedTuple):
     plan: str
 
 
-def _tmux(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([unit_lookup.tmux_binary(), *arguments], capture_output=True, text=True, check=False)
-
-
 def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(where), *arguments], capture_output=True, text=True, check=False)
 
@@ -137,7 +133,7 @@ def checked(name: str, child_doc: Path) -> Promotion:
     _committed(child.doc)
     # Only the unit's herdr session will end before the same-named destination starts.
     directory = showrunner_account_directory()
-    ending = marked.label if isinstance(marked.place, herdr.HerdrPlace) else ""
+    ending = marked.place.session
     _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 
@@ -167,15 +163,10 @@ def stop(promotion: Promotion) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(POLL_S)
-    if isinstance(place, unit_lookup.TmuxPlace):
-        ended = _tmux("kill-session", "-t", place.pane)
-        if ended.returncode:
-            raise Refusal(f"cannot end {promotion.unit}'s session: {ended.stderr.strip()}")
-    else:
-        try:
-            herdr.stop_session(promotion.marked.label)
-        except HerdrFailure as error:
-            raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
+    try:
+        herdr.stop_session(place.session)
+    except HerdrFailure as error:
+        raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
     return True
 
 
@@ -239,8 +230,7 @@ def main(argv: list[str]) -> int:
         return 2
     unit, slug = promotion.unit, promotion.child.slug
     if cast(bool, args.check):
-        host = "tmux" if isinstance(promotion.marked.place, unit_lookup.TmuxPlace) else "herdr"
-        print(f"check: ok — would stop {unit} ({host} {promotion.marked.label}), resume it as the showrunner of "
+        print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
               + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
         return 0
     try:

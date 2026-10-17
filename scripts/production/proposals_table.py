@@ -26,9 +26,9 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import showrunners
-from add_unit import production_field
 from production_units import Refusal
 from issues import Issue, open_issues
+from proposals_folder import PROPOSAL_TAG, issues_folder
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import phase_table
@@ -43,8 +43,6 @@ BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/s
 SESSION_ROOTS = unit_runs.run_roots()
 PENDING_NAME = "next_items_pending.md"
 # The Production Context line that names the issues folder a production files its proposals in.
-PROPOSALS_FIELD = "Proposals"
-PROPOSAL_TAG = "proposal"
 # A state says what the user can do, in their terms.
 REVIEW_STATE = "waiting for your review"
 # An add-on is the showrunner's to settle, not the user's (user, 2026-10-12).
@@ -124,15 +122,6 @@ def issue_rows(folder: Path) -> list[Row]:
     rows = [Row(issue.value("proposed_by") or NONE, issue.path.stem, issue.value("date_created") or NONE,
                 issue_state(issue)) for issue in open_issues(folder, PROPOSAL_TAG)]
     return sorted(rows, key=lambda row: (row.date, row.proposal))
-
-
-def issues_folder(doc: Path) -> Path | None:
-    """The folder the production doc's Proposals line names, or None when it names none."""
-    try:
-        folder = Path(production_field(read_lines(doc), PROPOSALS_FIELD)).expanduser()
-    except Refusal:
-        return None
-    return folder if folder.is_absolute() else worktree_of(doc) / folder
 
 
 def file_date(path: Path) -> str:

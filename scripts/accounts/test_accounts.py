@@ -28,7 +28,7 @@ from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusals, role_map
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -2711,6 +2711,46 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(second, first)
         self.codex_reads.assert_awaited_once_with(self.home / ".codex")
 
+    def test_next_add_list_and_remove_print_the_stored_plan(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+        self.assertFalse(next_moves.next_moves_file().exists())
+        code, output, error = self.run_cli("next", "add", "units", "1", "claude2", "--hold-minutes", "5")
+        self.assertEqual((code, error), (0, ""))
+        entries = next_moves.read_next_moves()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0].group, entries[0].at_percent, entries[0].hold_minutes, entries[0].to),
+                         ("units", 1, 5, "claude2"))
+        self.assertIn(entries[0].id, output)
+        self.assertIn("when units reach 1% → claude2", output)
+        code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(listed, output)
+        code, _, error = self.run_cli("next", "remove", entries[0].id)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(next_moves.read_next_moves(), ())
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+
+    def test_next_refuses_unknown_accounts_groups_and_invalid_percent_without_storing_an_entry(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        with redirect_stderr(io.StringIO()) as parser_error:
+            with self.assertRaises(SystemExit) as refused:
+                _ = accounts.main(["next", "add", "workers", "1", "claude2"])
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("workers", parser_error.getvalue())
+        self.assertEqual(next_moves.read_next_moves(), ())
+        for arguments in (("units", "1", "claude99"),
+                          ("units", "-1", "claude2"), ("units", "101", "claude2"),
+                          ("units", "nan", "claude2")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", "add", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                self.assertTrue(error)
+                self.assertEqual(next_moves.read_next_moves(), ())
+
     def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
         self.login_directory("claude2", "shared@example.invalid")
         groups = accounts.groups_file()
@@ -4204,6 +4244,7 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(accounts.group_transition("units"), accounts.NoGroupTransition)
         self.assertEqual(path.read_bytes(), original)
         transition = accounts.set_group_account("units", "claude2", why="operator choice", now=self.now)
+        self.assertEqual(transition.why, accounts.RecordedTransitionReason("operator choice"))
         stored = cast(dict[str, object], json.loads(path.read_text()))
         selection = cast(dict[str, object], stored["units"])
         self.assertEqual((selection["label"], selection["cause"], selection["window"]), ("claude2", "by hand", "unknown"))
@@ -4212,6 +4253,25 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(stored["showrunners"], "claude3")
         self.assertEqual(accounts.group_transition("units"), transition)
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+
+    def test_historical_transition_reason_is_unavailable_only_when_the_field_is_absent(self) -> None:
+        path = self.groups()
+        selection: dict[str, object] = {"label": "claude1", "move_id": "historical-transition",
+                                      "cause": "by hand", "window": "unknown"}
+        cases: tuple[tuple[dict[str, object], accounts.TransitionReason], ...] = (
+            (selection, accounts.UnavailableTransitionReason()),
+            ({**selection, "why": ""}, accounts.RecordedTransitionReason("")),
+            ({**selection, "why": "operator selection"}, accounts.RecordedTransitionReason("operator selection")),
+        )
+        for stored, expected in cases:
+            with self.subTest(selection=stored):
+                _ = path.write_text(json.dumps({"units": stored, "showrunners": "claude3"}))
+                before = path.read_bytes()
+                transition = accounts.group_transition("units")
+                assert isinstance(transition, accounts.GroupTransition)
+                self.assertEqual(transition.move_id, "historical-transition")
+                self.assertEqual(transition.why, expected)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_mixed_group_writes_keep_every_sibling_field_and_log_only_the_changed_group(self) -> None:
         transition = {"label": "claude1", "move_id": "original-transition", "cause": "refusal",

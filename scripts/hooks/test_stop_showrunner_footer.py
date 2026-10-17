@@ -17,6 +17,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import showrunner_footer
+import turn_input
 
 
 HOOK = Path(__file__).with_name("stop-showrunner-footer.py")
@@ -32,6 +33,9 @@ TWO_OPEN = "There are 2 open questions for you."
 QUOTA_LINE = "quota: codex at 12% for the week, resets Tue 14:00"
 
 
+# The counts line a footers-off reply ends with while one question is open.
+ONE_QUESTION = "\n\nFor you: 1 question"
+
 class OutstandingUserQuestion(TypedDict):
     since: str
     text: str
@@ -42,6 +46,31 @@ class OutstandingUserQuestion(TypedDict):
 class StopHookBlock(TypedDict):
     decision: Literal["block"]
     reason: str
+
+
+def human(text: str) -> dict[str, object]:
+    return {"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": text}}
+
+
+def peer(text: str, sender: str = "natedev") -> dict[str, object]:
+    return {"type": "user", "isMeta": True, "origin": {"kind": "peer", "name": sender},
+            "message": {"role": "user", "content": f'<cross-session-message from-name="{sender}">\n{text}\n</cross-session-message>'}}
+
+
+def tick() -> dict[str, object]:
+    """The update timer's tick reaches the session through send.py, as a cross-session message."""
+    return peer("Scheduled update (every 15 minutes, every unit checked).", "showrunner-demo")
+
+
+def notification() -> dict[str, object]:
+    return {"type": "user", "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content": "<task-notification>\n<status>completed</status>\n</task-notification>"}}
+
+
+def denial() -> dict[str, object]:
+    return {"type": "user", "message": {"role": "user", "content": [{
+        "type": "tool_result", "tool_use_id": "toolu_1", "is_error": True,
+        "content": "Permission for this action was denied by the Claude Code auto mode classifier. Reason: [x]."}]}}
 
 
 def setUpModule() -> None:
@@ -98,6 +127,23 @@ class FooterLibraryTests(unittest.TestCase):
             _ = doc.write_text("> **Status: PRODUCTION — wrapped.** demo\n- **User zone:** America/Los_Angeles — demo\n")
             _ = (instance / "conf").write_text(f"CHECK=zsh /x/production_check.sh {doc}\n")
             self.assertIsNone(showrunner_footer.read_production(instance))
+
+
+class TurnInputTests(unittest.TestCase):
+    def test_lines_read_backwards_across_chunk_boundaries_and_stop_at_the_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "transcript.jsonl"
+            long_result: dict[str, object] = {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x" * 300}]}}
+            empty: dict[str, object] = {"type": "assistant", "message": {"content": []}}
+            entries = [peer("old turn"), empty,
+                       notification(), long_result, denial(), empty]
+            _ = path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+            with patch.object(turn_input, "CHUNK_BYTES", 7):
+                lines = list(turn_input.lines_backwards(path))
+                turn = turn_input.read_turn(path)
+            self.assertEqual([json.loads(line) for line in reversed(lines)], entries)
+            self.assertEqual(turn, turn_input.TurnInput(frozenset({"task-notification"}), True))
+            self.assertIsNone(turn_input.read_turn(Path(scratch) / "missing.jsonl"))
 
 
 class ShowrunnerFooterHookTests(unittest.TestCase):
@@ -205,6 +251,90 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn("Waiting on:", reason)
         return reason
 
+    def transcript(self, *entries: dict[str, object]) -> str:
+        path = self.root / "transcript.jsonl"
+        earlier = [human("start"), {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}]
+        _ = path.write_text("".join(json.dumps(entry) + "\n" for entry in (*earlier, *entries)))
+        return str(path)
+
+    def footers_off(self) -> None:
+        switch = self.root / "showrunner-state/footers-off/demo"
+        switch.parent.mkdir(parents=True, exist_ok=True)
+        _ = switch.write_text("")
+
+    def test_a_turn_the_user_did_not_start_blocks_a_status_reply(self) -> None:
+        # Tonight's replies: each said nothing needed the user, then gave a status sentence.
+        replies = ("Nothing here needs you. stalls-unit Phase 6 merged at 19:12 and the merge branch is pushed.",
+                   "Nothing here needs you. The gate for enh-showrunner-unit is still running.")
+        for opening in (peer("From the showrunner: checkpoint merged."), tick(), notification()):
+            for footers in ("on", "off"):
+                if footers == "off":
+                    self.footers_off()
+                for reply in replies:
+                    with self.subTest(opening=opening["origin"], footers=footers, reply=reply):
+                        self.assertEqual(self.reason(reply, transcript_path=self.transcript(opening)),
+                                         showrunner_footer.NOTHING_FOR_USER)
+
+    def test_a_dash_answers_a_turn_the_user_did_not_start_with_footers_on_or_off(self) -> None:
+        path = self.transcript(peer("ack"), notification())
+        self.assert_passes(self.run_hook("-", transcript_path=path))
+        self.assert_passes(self.run_hook(" -\n", transcript_path=path, stop_hook_active=True))
+        self.footers_off()
+        self.assert_passes(self.run_hook("-", transcript_path=path))
+
+    def test_a_registered_item_or_an_auto_mode_denial_reaches_the_user(self) -> None:
+        self.footers_off()
+        _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-16T19:00", "text": "Vault promotion"}]))
+        reports = self.root / "showrunner-state/reports/demo.json"
+        reports.parent.mkdir(parents=True)
+        later = (datetime.now(ZoneInfo(ZONE)) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")
+        _ = reports.write_text(json.dumps([{"text": "hanadocs is back", "until": later},
+                                           {"text": "the Mac is free", "until": "2026-10-01T09:00"}]))
+        path = self.transcript(peer("hanadocs restarted"))
+        self.assert_passes(self.run_hook("Vault promotion still waits on your choice." + ONE_QUESTION, transcript_path=path))
+        self.assert_passes(self.run_hook("You asked to hear: hanadocs is back, at 19:52." + ONE_QUESTION, transcript_path=path))
+        # A report whose `until` has passed is no longer registered.
+        self.assertEqual(self.reason("You asked to hear: the Mac is free.", transcript_path=path),
+                         showrunner_footer.NOTHING_FOR_USER)
+        denied = self.transcript(notification(), denial())
+        self.assert_passes(self.run_hook("Auto mode refused the vault commit; it needs you." + ONE_QUESTION, transcript_path=denied))
+
+    def test_with_footers_off_the_reply_ends_with_the_counts_line(self) -> None:
+        self.footers_off()
+        self.assert_passes(self.run_hook("Done."))
+        blocked = self.reason("Done.\n\nFor you: 1 project")
+        self.assertIn("remove the last line `For you: 1 project`", blocked)
+        ledger = self.root / "ledger.md"
+        _ = ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n")
+        _ = self.doc.write_text(self.doc.read_text() + f"- **Improvement queue:** {ledger}\n")
+        _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-16T19:00", "text": "Vault promotion"}]))
+        expected = "For you: 1 project, 1 question"
+        self.assertIn(expected, self.reason("Vault promotion still waits on your choice."))
+        self.assert_passes(self.run_hook(f"Vault promotion still waits on your choice.\n\n{expected}"))
+        self.assert_passes(self.run_hook("-", transcript_path=self.transcript(peer("ack"))))
+
+    def test_a_registered_item_still_needs_the_footer(self) -> None:
+        _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-16T19:00", "text": "Vault promotion"}]))
+        reason = self.reason("Vault promotion still waits on you.", transcript_path=self.transcript(peer("ping")))
+        self.assertTrue(reason.startswith(showrunner_footer.REASON_HEAD), reason)
+
+    def test_the_retry_keeps_the_block_only_while_the_reply_still_matches_nothing(self) -> None:
+        path = self.transcript(tick())
+        self.assertEqual(self.reason("Nothing here needs you.", transcript_path=path, stop_hook_active=True),
+                         showrunner_footer.NOTHING_FOR_USER)
+        self.assert_passes(self.run_hook("-", transcript_path=path, stop_hook_active=True))
+
+    def test_the_rule_stands_aside_when_the_user_had_a_hand_in_the_turn(self) -> None:
+        self.footers_off()
+        status = "Nothing here needs you. The gate is still running."
+        queued: dict[str, object] = {"type": "attachment", "attachment": {
+            "type": "queued_command", "prompt": "and check the Mac", "origin": {"kind": "human"}}}
+        for path in (self.transcript(human("how is the gate?")), self.transcript(peer("ack"), queued),
+                     str(self.root / "missing.jsonl")):
+            with self.subTest(path=path):
+                self.assert_passes(self.run_hook(status, transcript_path=path))
+        self.assert_passes(self.run_hook(status))
+
     def test_matching_footer_passes_with_one_or_more_waiting_items(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
         for waiting in (WAITING_BLOCK, WAITING_BLOCK + "\n* no ETA measured - y"):
@@ -270,12 +400,12 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 self.assert_passes(self.run_hook(example))
         item = {"since": "2026-10-06T08:00", "text": "run", "question": choice, "reviewed": choice}
         _ = self.outstanding.write_text(json.dumps([item]))
-        self.assert_passes(self.run_hook(choice))
+        self.assert_passes(self.run_hook(choice + ONE_QUESTION))
         self.assertIn("record the item", self.reason(choice + "\nDelete the work (recommended), or keep it."))
         code_choice = "Run `check.py` (recommended), or wait?"
         showrunner_footer.add_pending_reviewed(self.instance, [
             showrunner_footer.PendingReviewedQuestion("check", code_choice)])
-        self.assert_passes(self.run_hook("Run `check.py` (recommended),\n or wait?"))
+        self.assert_passes(self.run_hook("Run `check.py` (recommended),\n or wait?" + ONE_QUESTION))
 
     def test_unregistered_requests_block_with_footers_off_and_on_hook_retries(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -312,10 +442,10 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         for field, record in records:
             with self.subTest(field=field):
                 _ = self.outstanding.write_text(json.dumps([record]))
-                self.assert_passes(self.run_hook("Say  go and I'll run `check.py`."))
+                self.assert_passes(self.run_hook("Say  go and I'll run `check.py`." + ONE_QUESTION))
         shorter: OutstandingUserQuestion = {"since": "2026-10-16T08:00", "text": "Say go and I'll run"}
         _ = self.outstanding.write_text(json.dumps([shorter]))
-        self.assert_passes(self.run_hook("Say go and I'll run the diagnostic."))
+        self.assert_passes(self.run_hook("Say go and I'll run the diagnostic." + ONE_QUESTION))
 
     def test_registered_question_does_not_authorise_another_ask_in_the_same_reply(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -328,7 +458,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn("update_registration.py footer --state", reason)
         item["reviewed"] = first + "\n" + second
         _ = self.outstanding.write_text(json.dumps([item]))
-        self.assert_passes(self.run_hook(first + " " + second))
+        self.assert_passes(self.run_hook(first + " " + second + ONE_QUESTION))
 
     def test_unrelated_production_and_code_only_text_do_not_register_a_user_ask(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -339,7 +469,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = self.outstanding.write_text(json.dumps([code_only]))
         self.assertIn(question, self.reason(question))
         _ = self.outstanding.write_text(json.dumps([stranger]))
-        self.assert_passes(self.run_hook(question))
+        self.assert_passes(self.run_hook(question + ONE_QUESTION))
 
     def test_new_ask_preserves_pending_text_until_the_entire_reply_is_registered(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -401,8 +531,8 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 question = f"{marker} Run now (recommended), or wait?"
                 _ = self.outstanding.write_text(json.dumps([{
                     "since": "2026-10-06T08:00", "text": "run", "question": question, "reviewed": question}]))
-                self.assert_passes(self.run_hook("Run  now (recommended), or wait?"))
-                self.assert_passes(self.run_hook("2) Run now (recommended), or wait?"))
+                self.assert_passes(self.run_hook("Run  now (recommended), or wait?" + ONE_QUESTION))
+                self.assert_passes(self.run_hook("2) Run now (recommended), or wait?" + ONE_QUESTION))
 
     def test_root_can_recall_a_lower_productions_recorded_choice(self) -> None:
         self.timer("kid")
@@ -411,7 +541,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = self.outstanding.with_name("kid.json").write_text(json.dumps([
             {"since": "2026-10-06T08:00", "text": "choose route", "question": question, "reviewed": question}]))
         self.assertEqual(self.run_switch("off").returncode, 0)
-        self.assert_passes(self.run_hook(question))
+        self.assert_passes(self.run_hook(question + ONE_QUESTION))
         self.assertIn("record the item", self.reason("Use the long route (recommended), or wait?"))
 
     def test_footer_stays_valid_when_a_reading_arrives_after_its_stamp(self) -> None:

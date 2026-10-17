@@ -42,6 +42,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.sent = []
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
+        _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "CODEX_CONFIG_FILE": str(self.root / "absent"),
@@ -448,24 +449,25 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertEqual(recovered_entries[0]["label"], "codex2")
         self.assertEqual(entries[0]["move_id"], recovered_entries[0]["move_id"])
 
-    def test_acknowledged_account_stays_quiet_after_swap_away_and_back(self) -> None:
+    def test_low_account_repeats_only_while_selected_after_swap_away_and_back(self) -> None:
         a, b = self.account(1), self.account(2)
         a_pass = self.readings(a, self.report(a), self.report(b, 70))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 70)],
                               self.now, codex_readings=a_pass)
-        _ = quota_alert.acknowledge("codex1", now=self.now)
         self.sent.clear()
         self.now += timedelta(hours=1)
         b_pass = self.readings(b, self.report(a), self.report(b, 70))
         _ = quota_alert.alert([self.note(1, "inactive", 1), self.note(2, "active", 70)],
                               self.now, codex_readings=b_pass)
+        self.assertEqual(self.sent, [])
         self.now += timedelta(hours=1)
         a_pass = self.readings(a, self.report(a), self.report(b, 70))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 70)],
                               self.now, codex_readings=a_pass)
-        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0].startswith("Quota alert: codex1"))
         with quota_alert.state_file() as state:
-            self.assertIn("acknowledged", state["episodes"]["codex1"])
+            self.assertNotIn("acknowledged", state["episodes"]["codex1"])
 
     def test_stale_active_spare_never_opens_an_episode_with_or_without_credits(self) -> None:
         a, b = self.account(1), self.account(2, default=True)
@@ -482,7 +484,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         a, b = self.account(1), self.account(2)
         selected_a = self.readings(a, self.report(a))
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=selected_a)
-        _ = quota_alert.acknowledge("codex1", now=self.now)
         selected_b = self.readings(b, self.report(a, 90), self.report(b, 90))
         _ = quota_alert.alert([self.note(1, "inactive", 90), self.note(2, "active", 90)],
                               self.now + timedelta(minutes=1), codex_readings=selected_b)
@@ -710,11 +711,10 @@ class CodexAccountAlertTests(unittest.TestCase):
                 if selected == b:
                     self.assertFalse(any(text.startswith("Quota restored:") for text in self.sent))
 
-    def test_spare_reset_closes_acknowledgement_before_the_new_low_week(self) -> None:
+    def test_spare_reset_closes_the_episode_before_the_new_low_week(self) -> None:
         a, b = self.account(1), self.account(2)
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now,
             codex_readings=self.readings(a, self.report(a), self.report(b, 80)))
-        _ = quota_alert.acknowledge("codex1", now=self.now)
         self.now += timedelta(days=3)
         _ = quota_alert.alert([self.note(1, "inactive", 1), self.note(2, "active", 80)], self.now,
             codex_readings=self.readings(b, self.report(a), self.report(b, 80)))

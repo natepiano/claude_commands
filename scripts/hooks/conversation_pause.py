@@ -32,7 +32,7 @@ UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
 SCHEDULED_PROMPT_RETENTION_SECONDS = 8 * 24 * 60 * 60
 WATCHER = "conversation-pause"
-JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
+JOB_SENDERS = frozenset({WATCHER, "stall-watch", "quota_alert", "mac-test",
                          "disk_floor", "shutdown"})
 QUESTION = (
     f"conversation-pause: the user has been quiet here for {QUIET_SECONDS // 60} minutes. "

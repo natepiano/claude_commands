@@ -18,7 +18,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import patch
 
-from scripts.accounts import accounts, moves, refusal_watch, refusals, role_map
+from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.production import showrunners
 import account
 import agent_accounts
@@ -154,14 +154,12 @@ class RefusalWatchTests(unittest.TestCase):
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
             owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=inventory.UnitHost(
-                kind="unit", production="fixture", unit=identity, doc=str(self.home / "fixture-production.md"), session_name=identity, session_host="tmux",
+                kind="unit", production="fixture", unit=identity, doc=str(self.home / "fixture-production.md"), session_name=identity, session_host="herdr",
                 plan=inventory.NoRunRecord(kind="no run record")))
-        elif host == "tmux":
+        elif host == "herdr":
             owner = inventory.ShowrunnerSession(**fields, kind="showrunner", production="fixture", doc="/fixture.md",
-                host=inventory.TmuxHost(kind="tmux", tmux_session=identity,
-                    server=inventory.TmuxServerNotRecorded(kind="not recorded"),
-                    session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
-                    pane=inventory.PaneNotRecorded(kind="not recorded")))
+                host=inventory.HerdrHost(kind="herdr", herdr_session=identity,
+                    pane_id="w1:p1", presentation="detached"))
         else:
             where: inventory.SessionHost = (inventory.TerminalHost(kind="terminal") if host == "terminal" else
                 inventory.WindowHost(kind="ghostty" if host == "ghostty" else "zed", window_shell=2000,
@@ -241,19 +239,417 @@ class RefusalWatchTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
         return path
 
-    def auto_rules(self, *rules: dict[str, object]) -> None:
-        path = accounts.accounts_config_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(json.dumps({"auto_moves": list(rules)}))
+    def next_entries(self, *entries: next_moves.NextMove) -> None:
+        with next_moves.next_moves_lock():
+            next_moves.write_next_moves(entries)
 
-    def low_rule(self, name: str = "units-low", *, group: str = "units", target: str = "claude2",
-                 threshold: float = 1) -> dict[str, object]:
-        return {"name": name, "group": group, "to": target, "when": {"left_at_most": threshold}}
+    def low_rule(self, name: str = "units-low", *, group: accounts.ClaudeGroup = "units",
+                 target: str = "claude2", threshold: float = 1) -> next_moves.NextMove:
+        return next_moves.NextMove(name, group, threshold, 0, target, NOW)
+
+    def hold_rule(self, name: str = "units-low", *, target: str = "claude2",
+                  minutes: float = 10) -> next_moves.NextMove:
+        return next_moves.NextMove(name, "units", 1, minutes, target, NOW)
+
+    def test_consumed_entry_does_not_move_a_group_again_after_an_operator_returns_it(self) -> None:
+        path = self.groups()
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["why"] for entry in history], ["auto: units-low", "operator return"])
+
+    def test_failed_consumption_cannot_replay_a_recorded_move_after_an_operator_returns_the_group(self) -> None:
+        path = self.groups()
+        entry = self.low_rule()
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(next_moves, "write_next_moves", side_effect=OSError("injected log replacement failure")) as write:
+            try:
+                _ = self.cli()
+            except OSError:
+                pass
+        write.assert_called_once()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        # Return before the watcher has a chance to reconcile the failed write.
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        _ = self.cli()
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([saved["why"] for saved in history], ["auto: units-low", "operator return"])
+
+    def test_failed_consumption_cannot_replay_a_recorded_move_when_role_history_becomes_malformed(self) -> None:
+        path = self.groups()
+        entry = self.low_rule()
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(next_moves, "write_next_moves", side_effect=OSError("injected log replacement failure")) as write:
+            try:
+                _ = self.cli()
+            except OSError:
+                pass
+        write.assert_called_once()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        history = accounts.roles_history_file()
+        recorded = history.read_text()
+        malformed = recorded + "not JSON\n"
+        _ = history.write_text(malformed)
+        for _ in range(2):
+            code, output, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(len([line for line in output.splitlines()
+                                  if "cannot read recorded auto moves" in line]), 1)
+            self.assertEqual(stored_group_labels(path)["units"], "claude1")
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+            self.assertEqual(history.read_text(), malformed)
+        rows = [cast(dict[str, object], json.loads(line)) for line in recorded.splitlines()]
+        self.assertEqual([row["why"] for row in rows], [f"auto: {entry.id}", "operator return"])
+        # Once the journal is readable, reconcile consumption without replaying the move.
+        _ = history.write_text(recorded)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(history.read_text(), recorded)
+
+    def test_unreadable_role_history_reports_once_and_leaves_all_log_entries_untouched(self) -> None:
+        read_text = Path.read_text
+        for problem in ("permission", "malformed", "encoding"):
+            with self.subTest(problem=problem):
+                path = self.groups()
+                entry = self.low_rule(f"units-{problem}")
+                skipped = self.low_rule(f"runner-{problem}", group="showrunners", target="claude3")
+                self.next_entries(entry, skipped)
+                self.reading(SOURCE_LOGIN, 1)
+                history = accounts.roles_history_file()
+                # A valid prefix is insufficient evidence when the rest cannot be decoded.
+                prefix = json.dumps({"cause": "auto", "group": "showrunners", "why": f"auto: {skipped.id}"}) + "\n"
+                original = prefix.encode() + (b"not JSON\n" if problem == "malformed" else
+                                              b"\xff\n" if problem == "encoding" else b"")
+                _ = history.write_bytes(original)
+
+                def read_with_failure(file: Path, encoding: str | None = None,
+                                      errors: str | None = None) -> str:
+                    if file == history and problem == "permission":
+                        raise PermissionError("fixture history unreadable")
+                    return read_text(file, encoding=encoding, errors=errors)
+
+                with patch.object(Path, "read_text", read_with_failure):
+                    code, output, error = self.cli()
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertEqual(len([line for line in output.splitlines()
+                                          if "cannot read recorded auto moves" in line]), 1)
+                    self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                    self.assertEqual(next_moves.read_next_moves(), (entry, skipped))
+                self.assertEqual(history.read_bytes(), original)
+
+    def test_legacy_reset_state_is_ignored_and_dropped_on_the_next_watch_write(self) -> None:
+        path = self.groups()
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_moves": {
+            "old-reset": {"observed_reset": "malformed", "acted_reset": ""}}}))
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        document = cast(dict[str, object], json.loads(state_file.read_text()))
+        self.assertNotIn("auto_moves", document)
+        self.assertIn("units-low", cast(dict[str, object], document["auto_move_holds"]))
+
+    def test_old_config_rules_do_not_move_a_group_without_a_log_entry(self) -> None:
+        path = self.groups()
+        config = accounts.accounts_config_file()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _ = config.write_text(json.dumps({"auto_moves": [{"name": "retired", "group": "units",
+            "to": "claude2", "when": {"left_at_most": 1}}]}))
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_removing_an_entry_drops_only_its_hold_without_needing_another_timer_pass(self) -> None:
+        _ = self.groups()
+        first, second = self.hold_rule("entry-one"), self.hold_rule("entry-two")
+        self.next_entries(first, second)
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        before = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(set(before.get("auto_move_holds", {})), {first.id, second.id})
+        next_moves.remove_next_move(first.id)
+        self.assertEqual(next_moves.read_next_moves(), (second,))
+        after = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(after.get("auto_move_holds", {}),
+                         {second.id: before.get("auto_move_holds", {})[second.id]})
+
+    def test_legacy_config_named_hold_loads_without_starting_a_new_entry_early(self) -> None:
+        path = self.groups()
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        _ = state_file.write_text(json.dumps({"sessions": {}, "notices": {}, "auto_move_holds": {
+            "units-low": {"account": "claude1", "at": (NOW - timedelta(hours=1)).isoformat(),
+                          "move_id": "", "percent": 1}}}))
+        self.next_entries(self.hold_rule("new-entry-id"))
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_move_holds", {})["new-entry-id"].at, NOW)
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_held_chain_uses_a_later_target_when_the_first_is_unavailable_or_low(self) -> None:
+        for target in ("claude99", "claude3"):
+            with self.subTest(first_target=target):
+                path = self.groups()
+                first = self.hold_rule(f"first-{target}", target=target)
+                second = self.hold_rule(f"second-{target}")
+                self.next_entries(first, second)
+                WatchTime.at = NOW
+                self.reading(SOURCE_LOGIN, 1)
+                _ = self.cli()
+                WatchTime.at = NOW + timedelta(minutes=10)
+                self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+                self.reading(TARGET_LOGIN, 1, at=WatchTime.at)
+                self.reading("main@example.invalid", 80, at=WatchTime.at)
+                code, _, error = self.cli()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(stored_group_labels(path)["units"], "claude2")
+                self.assertEqual(next_moves.read_next_moves(), (first,))
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_group_moved_by_a_refusal_keeps_its_later_next_entry(self) -> None:
+        path = self.groups()
+        _ = self.owner("refused-unit", host="unit")
+        _ = self.transcript("refused-unit", at=NOW)
+        entry = self.low_rule("later", target="claude3")
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 0)
+        self.reading("main@example.invalid", 1)
+        self.reading(TARGET_LOGIN, 90)
+        placed = accounts.GroupPlacement("units", "claude2", accounts.account_dir("claude2"), accounts.UnitsResetSoonest())
+        with patch.object(accounts, "placement", return_value=placed):
+            code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["cause"] for entry in history], ["refusal"])
+
+    def test_low_rule_persists_its_hold_and_moves_only_after_the_full_interval(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        state_file = self.home / ".local/state/accounts/refusal_watch.json"
+        document = cast(dict[str, object], json.loads(state_file.read_text()))
+        self.assertEqual(document["auto_move_holds"], {"units-low": {
+            "account": "claude1", "at": NOW.isoformat(), "move_id": "", "percent": 1}})
+        loaded = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(loaded.get("auto_move_holds", {})["units-low"],
+                         refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1))
+        for elapsed in (timedelta(minutes=9, seconds=59), timedelta(minutes=10)):
+            WatchTime.at = NOW + elapsed
+            self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude1" if elapsed.total_seconds() < 600 else "claude2")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([(entry["cause"], entry["why"]) for entry in history], [("auto", "auto: units-low")])
+        self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_fresh_reading_above_the_threshold_restarts_the_hold_clock(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        for minute, left in ((5, 2), (6, 1), (15, 1), (16, 1)):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, left, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 16 else "claude1")
+            holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+            if minute == 5:
+                self.assertEqual(holds, {})
+            elif minute in (6, 15):
+                self.assertEqual(holds["units-low"].at, NOW + timedelta(minutes=6))
+
+    def test_stale_and_missing_readings_neither_start_nor_clear_a_hold(self) -> None:
+        for unavailable in ("stale", "missing"):
+            with self.subTest(reading=unavailable):
+                path = self.groups()
+                entry = self.hold_rule(f"units-low-{unavailable}")
+                self.next_entries(entry)
+                WatchTime.at = NOW
+                self.reading(SOURCE_LOGIN, 1, at=NOW - timedelta(minutes=11))
+                if unavailable == "missing":
+                    saved = usage_store.load()
+                    del saved[usage_store.key("Claude", SOURCE_LOGIN)]
+                    usage_store.write(saved)
+                _ = self.cli()
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+                self.reading(SOURCE_LOGIN, 1)
+                _ = self.cli()
+                WatchTime.at = NOW + timedelta(minutes=12)
+                # Even a stale high reading must not clear the saved low episode.
+                self.reading(SOURCE_LOGIN, 80)
+                if unavailable == "missing":
+                    saved = usage_store.load()
+                    del saved[usage_store.key("Claude", SOURCE_LOGIN)]
+                    usage_store.write(saved)
+                self.reading("main@example.invalid", 80, at=WatchTime.at)
+                _ = self.cli()
+                self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {})[entry.id],  # pyright: ignore[reportPrivateUsage]
+                                 refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1))
+                self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+                _ = self.cli()
+                self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
+    def test_changing_the_group_account_requires_a_new_full_hold(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        transition = accounts.set_group_account("units", "claude3", why="operator move", now=NOW + timedelta(minutes=5))
+        for minute in (10, 19, 20):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(TARGET_LOGIN, 1, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 20 else "claude3")
+            if minute != 20:
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {})["units-low"],  # pyright: ignore[reportPrivateUsage]
+                                 refusal_watch.HoldStarted("claude3", NOW + timedelta(minutes=10), transition.move_id, 1))
+
+    def test_round_trip_group_moves_between_passes_require_a_new_full_hold(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        _ = accounts.set_group_account("units", "claude3", why="operator outward move",
+                                       now=NOW + timedelta(minutes=4))
+        returned = accounts.set_group_account("units", "claude1", why="operator return move",
+                                              now=NOW + timedelta(minutes=5))
+        for minute in (10, 19, 20):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 20 else "claude1")
+            if minute == 10:
+                holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(holds["units-low"], refusal_watch.HoldStarted(
+                    "claude1", WatchTime.at, returned.move_id, 1))
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["why"] for entry in history],
+                         ["operator outward move", "operator return move", "auto: units-low"])
+
+    def test_changing_the_rule_percent_requires_a_new_full_hold(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.next_entries(next_moves.NextMove("units-low", "units", 0, 10, "claude2", NOW))
+        for minute in (10, 19, 20):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, 0, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], "claude2" if minute == 20 else "claude1")
+            if minute == 10:
+                holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(holds["units-low"], refusal_watch.HoldStarted(
+                    "claude1", WatchTime.at, accounts.NoGroupTransition(), 0))
+        history = accounts.roles_history_file().read_text().splitlines()
+        self.assertEqual(len(history), 1)
+
+
+    def test_chained_rules_choose_the_first_target_then_hold_again_on_that_account(self) -> None:
+        self.assertEqual(accounts.setup("claude4"), [])
+        _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "four@example.invalid"}}))
+        _ = (self.home / "notes" / note_name("claude4")).write_text("---\nlogin: four@example.invalid\n---\n")
+        path = self.groups()
+        self.next_entries(self.hold_rule("first", target="claude4", minutes=5), self.hold_rule("second", minutes=5))
+        for minute, source_left, fourth_left, expected in ((0, 1, 80, "claude1"), (5, 1, 80, "claude4"),
+                                                          (6, 80, 1, "claude4"), (10, 80, 1, "claude4"),
+                                                          (11, 80, 1, "claude2")):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, source_left, at=WatchTime.at)
+            self.reading("four@example.invalid", fourth_left, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(stored_group_labels(path)["units"], expected)
+            if minute == 5:
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([(entry["label"], entry["why"]) for entry in history],
+                         [("claude4", "auto: first"), ("claude2", "auto: second")])
+
+    def test_zero_hold_moves_immediately_like_a_rule_without_a_hold(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule(minutes=0))
+        self.reading(SOURCE_LOGIN, 1)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
+
+    def test_hold_dry_runs_do_not_start_clear_or_consume_the_saved_episode(self) -> None:
+        path = self.groups()
+        self.next_entries(self.hold_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        before = self.snapshot()
+        _ = self.cli("--dry-run")
+        self.assertEqual(self.snapshot(), before)
+        _ = self.cli()
+        for minute, left in ((5, 2), (10, 1)):
+            WatchTime.at = NOW + timedelta(minutes=minute)
+            self.reading(SOURCE_LOGIN, left, at=WatchTime.at)
+            self.reading("main@example.invalid", 80, at=WatchTime.at)
+            before = self.snapshot()
+            code, output, error = self.cli("--dry-run")
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(self.snapshot(), before)
+            if minute == 10:
+                self.assertIn("would move from claude1 to claude2", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
 
     def test_automatic_low_rule_holds_at_two_percent_and_moves_at_one_with_one_transition(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         self.reading(SOURCE_LOGIN, 2)
         _ = self.cli()
         self.assertEqual(self.commands, [])
@@ -264,6 +660,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("units-low", output)
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
         self.assertEqual(len(self.commands), 1)
+        self.assertEqual(next_moves.read_next_moves(), ())
         self.assertIn("--no-alert", self.commands[0])
         history = [cast(dict[str, object], json.loads(line))
                    for line in accounts.roles_history_file().read_text().splitlines()]
@@ -282,7 +679,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_automatic_low_rule_requires_a_fresh_source_reading(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         self.reading(SOURCE_LOGIN, 1, at=NOW - timedelta(minutes=11))
         _ = self.cli()
         self.assertEqual(self.commands, [])
@@ -295,7 +692,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_retained_stopped_unit_record_does_not_block_an_automatic_low_rule(self) -> None:
         path = self.groups()
         _ = self.owner("old-unit", host="unit")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         _ = self.down(["/fake/shutdown.py", "--only", "old-unit", "--to", "claude3",
                        "--why", "older stop", "--move-id", "older-transition"],
                       env={"REFUSAL_WATCH_INVENTORY": "read existing"})
@@ -315,7 +712,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_automatic_completion_retry_preserves_the_rule_reason_and_transition_in_the_journal(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         with patch.object(accounts, "move_sessions", return_value=(
                 accounts.SessionMoveRefused("unit", "synthetic delivery refusal"),)):
             _ = self.cli()
@@ -323,6 +720,9 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(record.all_session_records(), [])
         history = accounts.roles_history_file().read_bytes()
         transition = cast(dict[str, object], json.loads(path.read_text())["units"])
+        decoded = accounts.group_transition("units")
+        assert isinstance(decoded, accounts.GroupTransition)
+        self.assertEqual(decoded.why, accounts.RecordedTransitionReason("auto: units-low"))
         code, _, error = self.cli()
         self.assertEqual((code, error), (0, ""))
         requested = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
@@ -335,7 +735,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_unavailable_automatic_target_is_reported_and_a_later_valid_rule_still_moves(self) -> None:
         path = self.groups()
-        self.auto_rules(self.low_rule("missing-target", target="claude99"), self.low_rule("valid-target"))
+        self.next_entries(self.low_rule("missing-target", target="claude99"), self.low_rule("valid-target"))
         code, output, error = self.cli()
         self.assertEqual((code, error), (0, ""))
         self.assertIn("missing-target", output)
@@ -349,7 +749,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_automatic_rule_refuses_low_stale_missing_and_unresolved_target_readings(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         for state in ("at threshold", "below threshold", "stale", "missing", "unresolved refusal"):
             with self.subTest(state=state):
                 self.reading("main@example.invalid", 1 if state == "at threshold" else 0 if state == "below threshold" else 80,
@@ -365,11 +765,12 @@ class RefusalWatchTests(unittest.TestCase):
                 self.assertEqual(self.commands, [])
                 self.assertEqual(stored_group_labels(path)["units"], "claude1")
                 self.assertFalse(accounts.roles_history_file().exists())
+                self.assertEqual(next_moves.read_next_moves(), (self.low_rule(),))
 
     def test_automatic_rule_does_not_prepare_or_reselect_the_current_account(self) -> None:
         path = self.groups(units="claude2")
         _ = self.owner("unit", host="unit", label="claude2")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         self.reading("main@example.invalid", 1)
         before = path.read_bytes()
         with patch.object(accounts, "prepared_account", side_effect=AssertionError("same-account rule prepared a move")):
@@ -381,10 +782,10 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups()
         _ = self.owner("unit", host="unit")
         _ = self.owner("arrived-unit", host="unit", label="claude2")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         self.reading(SOURCE_LOGIN, 1)
         self.reading(TARGET_LOGIN, 1)
-        self.auto_rules(self.low_rule(), self.low_rule("showrunners-low", group="showrunners"))
+        self.next_entries(self.low_rule(), self.low_rule("showrunners-low", group="showrunners"))
         _ = self.cli()
         self.assertEqual(stored_group_labels(path), {"units": "claude2", "showrunners": "claude2"})
         self.assertEqual({identity for command in self.commands
@@ -392,53 +793,10 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertTrue(all("--no-alert" in command for command in self.commands))
         self.assertEqual(self.notifications, [])
 
-    def test_automatic_reset_rule_observes_first_then_fires_once_for_each_passed_reset(self) -> None:
-        path = self.groups()
-        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}},
-                        self.low_rule(threshold=7))
-        first_reset = NOW + timedelta(minutes=5)
-        self.reading(SOURCE_LOGIN, 80)
-        self.reading(TARGET_LOGIN, 90, reset=first_reset)
-        _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude1")
-        self.assertFalse(accounts.roles_history_file().exists())
-        WatchTime.at = first_reset + timedelta(seconds=1)
-        next_reset = WatchTime.at + timedelta(days=7)
-        # Room must be above every configured low threshold, even a non-seed value.
-        self.reading(TARGET_LOGIN, 7, at=WatchTime.at, reset=next_reset)
-        self.reading(SOURCE_LOGIN, 80, at=WatchTime.at)
-        _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude1")
-        self.reading(TARGET_LOGIN, 8, at=WatchTime.at, reset=next_reset)
-        _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude3")
-        _ = self.groups()
-        _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude1")
-        history = accounts.roles_history_file().read_text().splitlines()
-        self.assertEqual(len(history), 1)
-        WatchTime.at = next_reset + timedelta(seconds=1)
-        self.reading(TARGET_LOGIN, 90, at=WatchTime.at, reset=WatchTime.at + timedelta(days=7))
-        self.reading(SOURCE_LOGIN, 80, at=WatchTime.at, reset=WatchTime.at + timedelta(days=7))
-        _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude3")
-        self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 2)
-
-    def test_automatic_rules_report_malformed_entries_and_still_apply_valid_configured_thresholds(self) -> None:
-        path = self.groups()
-        self.reading(SOURCE_LOGIN, 6)
-        self.reading(TARGET_LOGIN, 90)
-        self.auto_rules({"name": "bad-rule", "group": "other", "to": "claude2", "when": {"after_reset": True}},
-                        self.low_rule("custom-limit", threshold=6, target="claude3"))
-        _, output, error = self.cli()
-        self.assertEqual(error, "")
-        self.assertIn("bad-rule", output)
-        self.assertIn("custom-limit", output)
-        self.assertEqual(stored_group_labels(path)["units"], "claude3")
 
     def test_automatic_move_commits_while_the_refusal_watch_lock_is_held(self) -> None:
         _ = self.groups()
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         lock_held = False
         select = accounts.set_group_account
         @contextmanager
@@ -464,7 +822,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_automatic_rules_do_not_run_off_natedev(self) -> None:
         path = self.groups()
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         before = path.read_bytes()
         with patch.object(socket, "gethostname", return_value="macbook"):
             _ = self.cli()
@@ -473,11 +831,12 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_automatic_rule_keeps_selection_when_target_preparation_refuses(self) -> None:
         path = self.groups()
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("target clash")):
             _, output, error = self.cli()
         self.assertEqual(error, "")
         self.assertIn("target clash", output)
+        self.assertEqual(next_moves.read_next_moves(), (self.low_rule(),))
         self.assertEqual(stored_group_labels(path)["units"], "claude1")
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(self.commands, [])
@@ -488,38 +847,17 @@ class RefusalWatchTests(unittest.TestCase):
         _ = accounts.move_group("units", "claude3", why="pending hand move")
         self.assertEqual(len(record.all_session_records()), 1)
         history = accounts.roles_history_file().read_bytes()
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude3")
         self.assertEqual(accounts.roles_history_file().read_bytes(), history)
         self.assertEqual(len(self.commands), 1)
 
-    def test_reset_rule_does_not_override_a_group_moved_by_the_refusal_pass_this_tick(self) -> None:
-        path = self.groups()
-        reset = NOW + timedelta(minutes=1)
-        self.reading(SOURCE_LOGIN, 80)
-        self.reading(TARGET_LOGIN, 90, reset=reset)
-        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
-        _ = self.cli()
-        _ = self.owner("refused-unit", host="unit")
-        WatchTime.at = reset + timedelta(seconds=1)
-        _ = self.transcript("refused-unit", at=WatchTime.at)
-        self.reading(SOURCE_LOGIN, 0, at=WatchTime.at)
-        self.reading("main@example.invalid", 80, at=WatchTime.at)
-        self.reading(TARGET_LOGIN, 90, at=WatchTime.at, reset=WatchTime.at + timedelta(days=7))
-        placed = accounts.GroupPlacement("units", "claude2", accounts.account_dir("claude2"), accounts.UnitsResetSoonest())
-        with patch.object(accounts, "placement", return_value=placed):
-            _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude2")
-        history = [cast(dict[str, object], json.loads(line))
-                   for line in accounts.roles_history_file().read_text().splitlines()]
-        self.assertEqual([entry["cause"] for entry in history], ["refusal"])
-        self.assertEqual(len(self.commands), 1)
 
     def test_automatic_move_uses_the_refusal_showrunner_notice_without_a_phone_alert(self) -> None:
         _ = self.groups()
         _ = self.owner("unit", host="unit")
-        self.auto_rules(self.low_rule())
+        self.next_entries(self.low_rule())
         _ = self.cli()
         saved = record.all_session_records()
         self.assertEqual(len(saved), 1)
@@ -665,7 +1003,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_assumed_refusal_rejects_both_real_group_kinds_without_changing_selections(self) -> None:
         groups = self.groups()
-        for identity, host in (("unit", "unit"), ("runner", "tmux")):
+        for identity, host in (("unit", "unit"), ("runner", "herdr")):
             _ = self.owner(identity, host=host)
             before = self.snapshot()
             with self.subTest(host=host), redirect_stderr(io.StringIO()):
@@ -707,7 +1045,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("probe-one")
         _ = self.owner("probe-two", host="ghostty", label="claude3")
         _ = self.owner("unit", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         groups = self.groups()
         before = groups.read_bytes()
         with (patch.object(accounts, "group_accounts", side_effect=AssertionError("proof must not read real groups")),
@@ -820,7 +1158,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_units_group_preview_lists_exactly_off_target_members_without_writes(self) -> None:
         off = self.owner("off-target", host="unit")
         _ = self.owner("already-there", host="unit", label="claude3")
-        _ = self.owner("other-group", host="tmux")
+        _ = self.owner("other-group", host="herdr")
         before = self.snapshot()
         output, error = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(error):
@@ -894,7 +1232,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_example_groups_move_only_after_their_own_refusals(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        runner = self.owner("runner", host="tmux", label="claude3")
+        runner = self.owner("runner", host="herdr", label="claude3")
         self.reading("main@example.invalid", 0, reset=NOW + timedelta(days=2))
         self.reading(TARGET_LOGIN, 3, reset=NOW + timedelta(days=4))
         self.reading(SOURCE_LOGIN, 53, reset=NOW + timedelta(days=6))
@@ -930,8 +1268,8 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_manual_showrunner_group_command_needs_only_destination(self) -> None:
         path = self.groups(showrunners="claude1")
-        _ = self.owner("runner-one", host="tmux")
-        _ = self.owner("runner-two", host="tmux")
+        _ = self.owner("runner-one", host="herdr")
+        _ = self.owner("runner-two", host="herdr")
         _ = self.owner("unit", host="unit")
         output, error = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(error):
@@ -946,7 +1284,7 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups()
         _ = self.owner("refused-unit", host="unit")
         _ = self.owner("healthy-unit", host="unit")
-        _ = self.owner("healthy-showrunner", host="tmux", label="claude3")
+        _ = self.owner("healthy-showrunner", host="herdr", label="claude3")
         _ = self.transcript("refused-unit")
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
@@ -961,8 +1299,8 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_classified_showrunner_without_update_timer_moves_with_its_group(self) -> None:
         path = self.groups(showrunners="claude1")
-        refused = self.owner("refused-runner", host="tmux")
-        healthy = self.owner("runner-without-timer", host="tmux")
+        refused = self.owner("refused-runner", host="herdr")
+        healthy = self.owner("runner-without-timer", host="herdr")
         _ = self.owner("unit", host="unit")
         self.assertEqual(healthy["kind"], "showrunner")
         self.assertEqual(healthy["timers"], [])
@@ -979,7 +1317,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_healthy_groups_stay_on_their_accounts_despite_better_placement(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         before = path.read_bytes()
         _ = self.cli()
         self.assertEqual(self.commands, [])
@@ -1145,7 +1483,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_status_without_group_file_does_not_infer_live_members_accounts(self) -> None:
         """F004: read-only status reports missing configuration despite live members."""
         _ = self.owner("unit-one", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         before = self.snapshot()
         self.assertIn("units: not configured", accounts.status_report())
         self.assertIn("showrunners: not configured", accounts.status_report())
@@ -1153,7 +1491,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_refused_unconfigured_groups_report_setup_and_move_no_members(self) -> None:
         """F004: neither real nor preview ticks infer a missing group's account."""
-        for identity, host in (("unit-one", "unit"), ("unit-two", "unit"), ("runner", "tmux")):
+        for identity, host in (("unit-one", "unit"), ("unit-two", "unit"), ("runner", "herdr")):
             _ = self.owner(identity, host=host)
             _ = self.transcript(identity)
         for arguments in (("--dry-run",), ()):
@@ -1183,7 +1521,7 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups()
         _ = self.owner("scratch", host="terminal")
         _ = self.owner("unit", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         _ = self.transcript("scratch")
         before = path.read_bytes()
         _ = self.cli()
@@ -1231,7 +1569,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_dry_run_detects_refusal_on_each_host_and_changes_nothing(self) -> None:
         _ = self.groups(showrunners="claude1")
-        for host in ("tmux", "unit", "ghostty", "zed", "terminal"):
+        for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
             for window, text in (("weekly", "weekly limit"), ("five", "You've hit your session limit")):
                 identity = host + "-" + window
                 _ = self.owner(identity, host=host)
@@ -1240,7 +1578,7 @@ class RefusalWatchTests(unittest.TestCase):
         code, output, error = self.cli("--dry-run")
         self.assertIn(code, (0, None))
         self.assertEqual(error, "")
-        for host in ("tmux", "unit", "ghostty", "zed", "terminal"):
+        for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
             self.assertIn(host, output)
         self.assertIn("claude3", output)
         self.assertEqual(self.snapshot(), before)
@@ -1348,7 +1686,7 @@ class RefusalWatchTests(unittest.TestCase):
             self.assertIn("é" * 70_000, found.text)
 
     def test_healthy_live_owners_never_invoke_inventory_or_start_a_move(self) -> None:
-        for host in ("tmux", "unit", "ghostty", "zed", "terminal"):
+        for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
             _ = self.owner(host, host=host)
             _ = self.transcript(host, tail={"type": "assistant", "message": {"model": "opus-real", "content": "normal work"}})
         with patch.object(inventory, "inventory") as observe:
@@ -1380,7 +1718,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_refused_sessions_on_one_account_move_by_group_and_scratch_boundary(self) -> None:
         _ = self.groups(showrunners="claude1")
-        for identity, host in (("director", "unit"), ("showrunner", "tmux"), ("desktop", "ghostty")):
+        for identity, host in (("director", "unit"), ("showrunner", "herdr"), ("desktop", "ghostty")):
             _ = self.owner(identity, host=host)
             _ = self.transcript(identity)
         _ = self.cli()
@@ -1764,8 +2102,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
-        _ = self.owner("first", host="tmux")
-        _ = self.owner("second", host="tmux")
+        _ = self.owner("first", host="herdr")
+        _ = self.owner("second", host="herdr")
         _ = self.owner("unit", host="unit")
         requested = (accounts.SessionMoveRequested("first", "batch-id", "claude3", source_login=SOURCE_LOGIN),
                      accounts.SessionMoveRequested("second", "batch-id", "claude3", source_login=SOURCE_LOGIN))
