@@ -29,7 +29,7 @@
 
 ## Phases
 
-### Phase 1 — A moved unit director resumes its Codex workers  · status: pending
+### Phase 1 — A moved unit director resumes its Codex workers  · status: done
 
 #### Work Order
 
