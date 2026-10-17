@@ -72,8 +72,12 @@ def place_text(place: Place) -> str:
 class MarkedProductions(NamedTuple):
     # Each production's marked units, by production slug and then unit id.
     units: dict[str, dict[str, MarkedUnit]]
-    # Why a production's units were left out, by production slug: two sessions carry one unit's mark.
-    faults: dict[str, str]
+    # Why a unit was left out, by production slug and then unit id: two sessions carry its mark.
+    faults: dict[str, dict[str, str]]
+
+    def production_fault(self, slug: str) -> str:
+        """Every left-out unit of the production, in one line; empty when none was left out."""
+        return "; ".join(detail for _, detail in sorted(self.faults.get(slug, {}).items()))
 
 
 def runs_dir() -> Path:
@@ -196,29 +200,39 @@ def every_marked_unit() -> MarkedProductions:
         marked = list(_herdr_marked(claudes, evidence, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
-    units: dict[str, dict[str, MarkedUnit]] = {}
-    faults: dict[str, str] = {}
+    found: dict[str, dict[str, list[MarkedUnit]]] = {}
     current_slugs: dict[str, str] = {}
     for slug, unit in marked:
         if slug not in current_slugs:
             current_slugs[slug] = _lookup_slug(slug)
-        slug = current_slugs[slug]
-        production = units.setdefault(slug, {})
-        if unit.unit in production:
-            previous = production[unit.unit]
-            hosts = f"herdr sessions {previous.place.session} and {unit.place.session}"
-            _ = faults.setdefault(slug, f"{hosts} both carry the mark of {unit.unit}")
-        production[unit.unit] = unit
-    return MarkedProductions({slug: found for slug, found in units.items() if slug not in faults}, faults)
+        found.setdefault(current_slugs[slug], {}).setdefault(unit.unit, []).append(unit)
+    units: dict[str, dict[str, MarkedUnit]] = {}
+    faults: dict[str, dict[str, str]] = {}
+    for slug, production in found.items():
+        units[slug] = {name: places[0] for name, places in production.items() if len(places) == 1}
+        for name, places in production.items():
+            if len(places) > 1:
+                sessions = " and ".join(sorted(place.place.session for place in places))
+                faults.setdefault(slug, {})[name] = f"{name}: its mark is on herdr sessions {sessions}"
+    return MarkedProductions(units, faults)
 
 
 def marked_units(slug: str) -> dict[str, MarkedUnit]:
-    """The production's units. Unreadable herdr or duplicate marks raise OSError."""
+    """Every unit of the production. Unreadable herdr, or any unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
     found = every_marked_unit()
-    if slug in found.faults:
-        raise OSError(found.faults[slug])
+    if fault := found.production_fault(slug):
+        raise OSError(fault)
     return found.units.get(slug, {})
+
+
+def marked_unit(slug: str, name: str) -> MarkedUnit | None:
+    """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
+    slug = _lookup_slug(slug)
+    found = every_marked_unit()
+    if fault := found.faults.get(slug, {}).get(name):
+        raise OSError(fault)
+    return found.units.get(slug, {}).get(name)
 
 
 def main(arguments: list[str]) -> int:
@@ -234,7 +248,7 @@ def main(arguments: list[str]) -> int:
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
                     print("\t".join((unit.unit, place_text(unit.place), unit.place.session, running, *told)))
             case ["pane", slug, name]:
-                found = marked_units(slug).get(name)
+                found = marked_unit(slug, name)
                 if found is None:
                     return 1
                 print(place_text(found.place))

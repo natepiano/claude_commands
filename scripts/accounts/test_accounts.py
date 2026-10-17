@@ -481,6 +481,7 @@ class AccountsTests(unittest.TestCase):
         for probe, account_options in cases:
             with self.subTest(account_options=account_options), patch.dict(os.environ):
                 _ = os.environ.pop("CLAUDE_PROBE_SESSION", None)
+                os.environ.update(SHOWRUNNER_UNIT="show/demo-unit", SHOWRUNNER_UNIT_ID="id-demo")
                 with patch.object(os, "execvpe") as launch:
                     self.assertEqual(self.run_cli("exec", *account_options,
                                                   "-n", "throwaway", "--version"), (0, "", ""))
@@ -489,8 +490,11 @@ class AccountsTests(unittest.TestCase):
                 environment = cast(dict[str, str], launch.call_args.args[2])
                 if probe:
                     self.assertEqual(environment["CLAUDE_PROBE_SESSION"], "1")
+                    self.assertNotIn("SHOWRUNNER_UNIT", environment)
+                    self.assertNotIn("SHOWRUNNER_UNIT_ID", environment)
                 else:
                     self.assertNotIn("CLAUDE_PROBE_SESSION", environment)
+                    self.assertEqual(environment["SHOWRUNNER_UNIT"], "show/demo-unit")
 
     def test_exec_probe_preserves_claude_options_that_share_accounts_option_names(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
