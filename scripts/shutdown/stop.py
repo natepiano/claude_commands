@@ -309,13 +309,17 @@ RESUME_PROMPT = (
     "You were paused when your unit director stopped for an account move or restart. "
     "Continue the task you were on from where you stopped; your earlier instructions still hold."
 )
+IDLE_RESUME_PROMPT = (
+    "You were paused while idle when your unit director stopped for an account move or restart. "
+    "Nothing was in progress: reply ready and wait for your next assignment; your earlier instructions still hold."
+)
 
 
 def _capture_codex_seats(session: Session) -> list[PausedSeat]:
     seats = codex_seats([Path(directory) for directory in _run_directories(session)])
     for seat in seats:
-        if seat["turn_live"]:
-            _ = (Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md").write_text(RESUME_PROMPT + "\n", encoding="utf-8")
+        prompt = RESUME_PROMPT if seat["turn_live"] else IDLE_RESUME_PROMPT
+        _ = (Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md").write_text(prompt + "\n", encoding="utf-8")
     return seats
 
 
