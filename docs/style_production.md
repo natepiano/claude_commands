@@ -45,7 +45,8 @@ One ticket per phase:
   they merge.
 
 Run tier D first. Structure crates are taken in order of the other-family
-pending cells they block, most first. A repair phase always precedes a new ticket.
+pending cells they block inside a unit's pilot scope, most first, so a crate
+blocking a pilot unit comes first. A repair phase always precedes a new ticket.
 After an interruption, resume the assigned or checkpointed ticket from
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`; never take a second
 one. A checkpointed ticket waits for its merge into the style branch before

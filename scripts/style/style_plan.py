@@ -12,9 +12,11 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -45,6 +47,8 @@ class PilotCrates:
 
 PilotScope = AllCrates | PilotCrates
 _ALL_CRATES = AllCrates()
+_ALL_FAMILY_SCOPES: Mapping[rules.Family, PilotScope] = MappingProxyType(
+    {family: _ALL_CRATES for family in FAMILIES})
 
 
 def crate_in_scope(scope: PilotScope, crate: str) -> bool:
@@ -67,6 +71,22 @@ def parse_pilot_scope(text: str, repo: Path) -> PilotScope:
         if name not in members:
             raise style_ledger.LedgerError(f"pilot scope names unknown crate {name}")
     return PilotCrates(frozenset(members[name] for name in names))
+
+
+def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
+    """Read each style unit's scope from its own standing plan copy."""
+    scopes: dict[rules.Family, PilotScope] = {}
+    for row in unit_worktrees(doc):
+        for family in FAMILIES:
+            if row.unit == family + "-unit":
+                plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
+                try:
+                    text = plan.read_text()
+                except FileNotFoundError:
+                    scopes[family] = AllCrates()
+                else:
+                    scopes[family] = parse_pilot_scope(text, repo)
+    return scopes
 
 
 @dataclass(frozen=True)
@@ -266,7 +286,8 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
-                      family: rules.Family, scope: PilotScope = _ALL_CRATES) -> tuple[TicketSelection, ...]:
+                      family: rules.Family, scope: PilotScope = _ALL_CRATES,
+                      family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
@@ -277,7 +298,8 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
             pending.append(cell)
             if cell.tier == "D":
                 structure_crates.add(cell.crate)
-            elif cell.family != "modules":
+            elif (cell.family is not None and cell.family != "modules" and cell.family in family_scopes
+                  and crate_in_scope(family_scopes[cell.family], cell.crate)):
                 blocked[cell.crate] += 1
     crates = sorted(stale, key=lambda crate: (-stale[crate], crate))
     if family == "modules":
@@ -522,7 +544,7 @@ def _select_phase(
             style_proposals.proposal_command("start", str(issue.path))
             write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
             return PhaseWritten(ticket_id)
-    candidates = candidate_tickets(repo, ledger, busy, family, scope)
+    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
     if not candidates:
         return NoAvailableWork()
     selected = candidates[0]
@@ -625,11 +647,13 @@ def main(argv: list[str]) -> int:
             with style_ledger.open_ledger(args.repo) as ledger:
                 doc = style_document(args.repo)
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
+                scopes = family_pilot_scopes(doc, args.repo)
                 for family in FAMILIES:
                     unit = family + "-unit"
                     if args.unit and args.unit != unit:
                         continue
-                    for ticket in candidate_tickets(args.repo, ledger, busy, family):
+                    for ticket in candidate_tickets(args.repo, ledger, busy, family,
+                                                    scopes.get(family, _ALL_CRATES), scopes):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)

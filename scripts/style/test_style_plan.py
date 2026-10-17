@@ -484,6 +484,86 @@ class StylePlanTests(unittest.TestCase):
                                              "modules", style_plan.PilotCrates(frozenset({"crates/alpha"})))
         self.assertEqual([(ticket.crate, ticket.kind) for ticket in scoped], [("crates/alpha", "structure")])
 
+    def test_structure_priority_counts_names_cells_only_inside_the_names_pilot_scope(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        for name in ("extra", "more"):
+            self.write(f"crates/beta/src/{name}.rs", "pub fn value() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        ledger = self.ledger()
+        busy = style_plan.BusyFiles(self.board(), frozenset())
+        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules")[0].crate, "crates/beta")
+
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, busy, "modules",
+            family_scopes={"modules": style_plan.AllCrates(),
+                           "names": style_plan.PilotCrates(frozenset({"crates/alpha"}))})
+
+        self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
+        self.assertEqual({path for ticket in tickets for path in ticket.files},
+                         set(self.sources) | {"crates/beta/src/extra.rs", "crates/beta/src/more.rs"})
+
+    def test_structure_priority_ignores_pending_cells_of_a_family_without_a_unit_row(self) -> None:
+        names = self.rule("read")
+        types = (self.rule("types-one", "tier: C\nfamily: types\ninput_scope: file\n"),
+                 self.rule("types-two", "tier: C\nfamily: types\ninput_scope: file\n"))
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        for rule in types:
+            for path in self.sources[:2]:
+                self.record(rule, path, self.tip)
+        for path in self.sources[2:]:
+            self.record(names, path, self.tip)
+        ledger = self.ledger()
+        busy = style_plan.BusyFiles(self.board(), frozenset())
+        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules")[0].crate, "crates/beta")
+
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, busy, "modules", family_scopes=style_plan.family_pilot_scopes(self.doc, self.repo))
+
+        self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
+
+    def test_family_pilot_scopes_reads_unit_copies_and_missing_plans_allow_all_crates(self) -> None:
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        template = self.style / "docs/style-production/units/names-unit.md"
+        _ = template.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
+        _ = self.doc.write_text(self.doc.read_text() + f"| product-unit | docs/product.md | {self.root / 'product'} | product |\n")
+
+        self.assertEqual(style_plan.family_pilot_scopes(self.doc, self.repo), {
+            "names": style_plan.PilotCrates(frozenset({"crates/alpha"})), "modules": style_plan.AllCrates(),
+        })
+        self.plan.unlink()
+        self.assertEqual(style_plan.family_pilot_scopes(self.doc, self.repo), {
+            "names": style_plan.AllCrates(), "modules": style_plan.AllCrates(),
+        })
+
+    def test_modules_refill_and_queue_prioritize_the_crate_blocking_a_pilot_unit(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.write("crates/beta/src/extra.rs", "pub fn value() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        preview = io.StringIO()
+        with redirect_stdout(preview):
+            self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "modules-unit"]), 0)
+        self.assertTrue(preview.getvalue().startswith("modules-unit: structure crates/alpha "), preview.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
+
+        self.assertEqual((code, output.getvalue()), (0, "phase written: modules-unit-1\n"))
+        ticket = self.ledger().ticket_open("modules-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["crate"], ticket["files"]),
+                         ("structure", "crates/alpha", list(self.sources[:2])))
+
     def test_equal_blocked_structure_counts_use_staleness_then_crate_name(self) -> None:
         read = self.rule("read")
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
