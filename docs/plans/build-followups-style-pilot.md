@@ -517,6 +517,34 @@ Pending: parent's saved style child summary and rendered style line.
   collection parameter it sits in; one renames `key` after
   `CFString::from_static_str(string)`; one binding fills two parameters
   with different names.
+- **Fix W — a name-bindings ticket skips single-letter parameters and
+  array elements** (commit `45438d3d`): the ticket line now says a
+  parameter with a single-letter name gives no name to match, and a binding
+  placed as one element of an array or slice literal does not fill the
+  collection parameter. Fix V's accessor sentence stays word for word, so
+  `overview.rs:72` stays lost; the bar is 36 of 37.
+- **Name-bindings rerun 5 — new findings pass, recall fails**: 33 of the
+  37 settled findings caught (89.2%). Besides `overview.rs:72`, three
+  findings rerun 4 caught were lost to one judge mistake, reading a
+  conversion's own parameter as the target or as a second target:
+  `usize::from(saved_width)` into `push_display_padded(width)` was read as
+  a derived value, `ThemeId::new(name)` into `find(id)` was judged to match
+  at `new(name)`, and `WorktreeRootDisplay::from(item)` beside `Some(item)`
+  was counted as a second target, although `from` takes the generic
+  `value`. None of the four involves fix W's sentences. The pass raised 311
+  findings; 47 sit where rerun 2 had none. Three blind judges called 1 of
+  the 47 false, and that one (`actions.rs:835`) is a settled finding, so
+  none are false after the hand-check (bar 10%). Of a random 30 of the 264
+  older findings they called 1 false (3.3%), a binding that keeps a
+  type-named prefix.
+- **Fix X — a name-bindings ticket never targets a conversion's own
+  parameter** (commit `8cd73ea4`): the ticket line now says a conversion's
+  own parameter, such as the `value` of `From::from` or the `name` of a
+  newtype constructor, is never the target and never a second target, and
+  the judge follows the converted value to the parameter it fills. Rerun 6
+  is measured on both bars. From rerun 6 on, a failed rerun whose misses
+  share no cause the ticket leaves uncovered runs the same ticket twice
+  more, and the median is judged against the bar.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
