@@ -193,14 +193,21 @@ Pending: parent's saved style child summary and rendered style line.
   while any remain, naming each one. A ticket that drops a file on a conflict
   records it with `ticket yield`, which clears its verdicts and unfiled held
   findings there and leaves the file's cells for later work.
-- **Fix E — tier and family** (commit `pending`):
+- **Fix E — tier and family** (commits `202614d8`, `1385595f`):
   `rules.py` makes a local tier A or E rule impossible: local requires a family,
   while A and E forbid one. A types-family tier D rule was also classified,
   though tier D belongs to modules alone. Settled with cargo-liner's style
   showrunner: E1 requires a family for B, C and D and forbids it for A and E,
-  whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules,
+  whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules (`1385595f`),
   after cargo-liner re-tiered trait-tutorial-format as E (`a351f6be`) and moved
   readme-diagnostic-section to the modules family (`707bb4c6`).
+- **Fix F — structure tickets list every finding** (commit `pending`):
+  the crate pass held 2/12 known defects (16.7%); the file-by-file rerun held
+  10/12 (83.3%) on the same four cargo-berth files, six pinned rules and commit.
+  The cause was crate-level summarizing, not rule sharing. Structure Work Orders
+  now judge file by file after reading each file's siblings and direct callers,
+  hold every distinct defect separately and a cross-file defect once, and record
+  crate verdicts only after every file is judged.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
 Live verification of the fixes and subsequent measurements remain pending.

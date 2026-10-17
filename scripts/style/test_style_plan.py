@@ -422,6 +422,60 @@ class StylePlanTests(unittest.TestCase):
         pin = self.ledger().pinned_rule_texts(ticket["id"])[0]
         self.assertIn(str(plan.parent.parent / "rules" / (pin.blob + ".md")), text)
 
+    def test_only_structure_phases_require_each_file_and_every_distinct_defect(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        read = self.rule("read")
+        listed = self.rule("listed", "tier: B\nfamily: names\npre_filter: value\n")
+        self.sync()
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        text = plan.read_text()
+        instructions = (
+            "Judge file by file", "sibling files in the same module", "direct callers",
+            "every distinct defect as its own finding", "never stop at a file's first finding",
+            "spans files is held once", "several rules name is held once",
+            "only after every file has been judged",
+        )
+        for phrase in instructions:
+            self.assertIn(phrase, text)
+        self.assertIn("Read only these pinned rule texts.", text)
+        self.assertIn("#uncovered rule is the parent rule's uncovered read.", text)
+        ledger = self.ledger()
+        self.assertEqual(ledger.ticket_open("modules-unit")[0]["rules"], [structure])
+        issue = self.root / "approved.md"
+        blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == read)
+        finding = ledger.hold(read, self.sources[0], 1, "value", "type", "u32", "u64", blob, "outside")
+        ledger.file_held(finding.finding_id, issue)
+        kinds: tuple[style_ledger.TicketKind, ...] = ("read", "listed", "proposal")
+        for number, kind in enumerate(kinds, 1):
+            with self.subTest(kind=kind):
+                rule = listed if kind == "listed" else read
+                ticket_id = f"names-unit-{number}"
+                ledger.ticket_add(ticket_id, "names-unit", kind, "names", "crates/alpha", [self.sources[0]],
+                                  [rule], rule=rule if kind == "listed" else "",
+                                  proposal=str(issue) if kind == "proposal" else "")
+                ticket = ledger.queued_tickets("names-unit")[-1]
+                phase = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan,
+                                              style_plan.delegation_context(self.plan.read_text()))
+                self.assertIn("Read only these pinned rule texts.", phase)
+                self.assertIn("#uncovered rule is the parent rule's uncovered read.", phase)
+                self.assertNotIn("For a structure ticket, judge", phase)
+                for phrase in instructions:
+                    self.assertNotIn(phrase, phase)
+        legacy = "\n".join(line for line in text.splitlines()
+                           if not any(phrase in line for phrase in instructions)) + "\n"
+        legacy = legacy.replace("Read only these pinned rule texts.",
+                                "Read only these pinned rule texts. For a structure ticket, judge each rule's "
+                                + "listed sites and its uncovered surface together; read the uncovered instructions in the pinned text.")
+        _ = plan.write_text(legacy)
+        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.Resumed("modules-unit-1"))
+        self.assertEqual(plan.read_text(), text)
+        self.assertEqual(len(ledger.ticket_open("modules-unit")), 1)
+
     def test_listed_packing_keeps_whole_files_and_selects_remaining_file_after_judgment(self) -> None:
         for path, count in zip(self.sources, (100, 100, 151, 0), strict=True):
             self.write(path, "pub fn hit() {}\n" * count)

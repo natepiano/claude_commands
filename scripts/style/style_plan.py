@@ -309,8 +309,18 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "**Goal:**", f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below.",
         "", "**Spec:**", *rule_lines, *sites, *uncovered,
         authorization,
-        "Read only these pinned rule texts. For a structure ticket, judge each rule's listed sites and its uncovered surface together; "
-        + "read the uncovered instructions in the pinned text. A #uncovered rule is the parent rule's uncovered read.",
+        "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
+        *([
+            "Judge file by file: take each file under **Files** in turn and judge it against every rule above, with that rule's listed sites "
+            + "in it and its uncovered surface; read the uncovered instructions in the pinned text.",
+            "Before judging a file, read its sibling files in the same module and its direct callers "
+            + "(search the crate for its types and functions), so placement and ownership are judged against the code around it.",
+            "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
+            + "and never stop at a file's first finding.",
+            "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
+            + "under the rule it breaks most directly, naming the others in its text.",
+            "Record each rule's crate verdict only after every file has been judged against it.",
+        ] if ticket["kind"] == "structure" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "

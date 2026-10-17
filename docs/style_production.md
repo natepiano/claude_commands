@@ -38,7 +38,7 @@ One ticket per phase:
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
-- **Structure:** one crate.
+- **Structure:** one crate, judged file by file, every distinct defect held as its own finding.
 
 Run tier D first. Structure crates are taken in order of the other-family
 pending cells they block, most first. A repair phase always precedes a new ticket.
