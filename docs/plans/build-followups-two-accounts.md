@@ -1469,25 +1469,24 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 50
 
-#### Work Order
+#### As-built
 
-**Goal:** the user's move rule (2026-10-16 20:14 EDT): when a group's account reads 1% weekly, hold for a set time, then move to claude4; when claude4 reaches 1%, hold the same, then move to claude2.
-
-**Constraints from prior phases:** Phase 49-50's `run_auto_moves` reads `auto_moves` rules from `~/.claude/config/accounts.json` in order; the first matching rule for a group wins, with the existing guards (fresh readings, target room above every low threshold, no in-flight transition, not the current account, not moved this run). `refusal_watch.json` holds rule state. Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
-
-**Spec:**
-1. **Hold.** A `left_at_most` rule takes an optional `hold_minutes` (absent or 0 means no hold). The rule fires only when the group's current account has read ≤ the percent continuously for at least that long: the first fresh reading at or under it is stored per rule in `refusal_watch.json` (aware time, typed in code, string only at the file boundary); a fresh reading above it clears the start; a stale or missing reading neither starts nor clears it. A malformed `hold_minutes` makes the rule malformed with a printed problem. Dry runs read without writing.
-2. **Chains.** Rules for one group are tried in config order, and a rule whose target is the group's current account is skipped, so `units → claude4` then `units → claude2` moves units to claude4 first and to claude2 once claude4 reads low. A hold started on one account never carries to another: the start is cleared when the group's account changes.
-3. **Docs.** `docs/accounts.md` documents `hold_minutes`, the chain example from the Goal, and the stored hold start.
+- `LeftAtMost(percent, hold_minutes: float = 0)`: a `left_at_most` condition accepts an optional `hold_minutes`, finite and nonnegative; absent or `0` is no hold. A bool, negative, non-finite, non-numeric or overflowing value prints `auto_moves <name>: hold_minutes must be a finite nonnegative number` and later rules still run. `after_reset` takes no hold.
+- `refusal_watch.HoldStarted(account, at, move_id: str | accounts.NoGroupTransition, percent)` is frozen, with `at` zone-checked in `__post_init__`. `WatchState.auto_move_holds[<rule name>]` holds it; `HoldStartedDocument {account, at, move_id, percent}` is the `refusal_watch.json` form, with `""` for a legacy selection's missing transition. An unparsable, naive or incomplete saved hold is dropped at load.
+- `run_auto_moves` discards a rule's saved hold when the group's account, its selection `move_id` or the rule percent differs from the stored one, so a move away and back between timer passes starts a new clock. For a held rule it skips an unconfigured group, a group already on the target or moved this run, then reads the source account: a stale or missing reading leaves the hold, a fresh reading above the percent clears it, and the first fresh reading at or below it stores the pass time. The target guards run only once `hold_minutes` have elapsed. A rule without a hold checks the source reading after the target guards, as in Phase 49.
+- A recorded move clears the holds of every rule for that group. Rules run in config order and skip a target that is the group's account, so `units → claude4` then `units → claude2` moves to claude4 first and to claude2 after claude4 reads low; when both holds have elapsed and the first target is unavailable or lacks room, the next rule moves the group.
+- `--dry-run` keeps hold changes in memory and writes nothing.
 
 **Files:**
-- `scripts/accounts/refusal_watch.py`
-- `docs/accounts.md`
-- `scripts/accounts/test_refusal_watch.py`
+- `scripts/accounts/refusal_watch.py` — `LeftAtMost.hold_minutes` and its parsing, `HoldStarted`, `HoldStartedDocument`, hold load and save, the hold pass in `run_auto_moves`.
+- `docs/accounts.md` — `hold_minutes`, the claude4-then-claude2 chain example, the stored hold and what clears it.
+- `scripts/accounts/test_refusal_watch.py` — the full interval, a fresh high reading restarting the clock, stale and missing readings, an account change, a round trip between passes, a percent change, malformed and oversized values, the chain, a zero hold, dry runs.
 
-**Workers:** `impl` owns `refusal_watch.py` and `docs/accounts.md`; `test` owns `test_refusal_watch.py`.
+**Binds later work:** holds live in `refusal_watch.json` `auto_move_holds`, keyed by rule name and bound to account, selection `move_id` and percent; a recorded group move clears every hold for that group; rule order is chain order.
 
-**Acceptance gate:** tests cover no move before the hold elapses, a move after it, a reading above the percent resetting the clock, a stale reading leaving it alone, a group move clearing a hold, the chain picking claude4 first and claude2 after, `hold_minutes` absent behaving as Phase 49, a malformed value, and dry runs. The account suites pass on natedev and the Mac; the merge gate is green.
+**Gotchas:** the hold start is the pass time, not the reading's timestamp. Holds for a rule no longer in config stay in `refusal_watch.json`; nothing prunes them.
+
+**Ruled out:** clearing a hold only on an account-label change (a move away and back between passes reused the old clock).
 
 ### Phase 52 — What happens next: one-shot Claude moves replace the low-quota alert  · status: todo
 
