@@ -303,6 +303,10 @@ def _is_name_bindings_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "name-bindings-to-match-parameters.md"
 
 
+def _is_when_to_split_rule(rule_id: str) -> bool:
+    return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "when-to-split-a-module.md"
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -540,6 +544,12 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             + "(search the crate for its types and functions), so placement and ownership are judged against the code around it.",
             "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
             + "and never stop at a file's first finding.",
+            *(["For every file, name its type clusters (each type with the impls and functions that serve it) "
+               + "and its test domains (groups of tests that exercise separate behaviour), then decide against "
+               + "`when-to-split-a-module` whether the file should split, and hold a finding when it should. "
+               + "Ask this of every file, also one where other rules already hold findings: moving or reordering "
+               + "code under another rule does not answer whether the file should split."]
+              if any(_is_when_to_split_rule(pinned.rule_id) for pinned in texts) else []),
             "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
             + "under the rule it breaks most directly, naming the others in its text.",
             ("Record each file's verdict for every rule above as soon as that file has been judged against it, "
