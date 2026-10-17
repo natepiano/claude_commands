@@ -6356,6 +6356,7 @@ class MacCleanupTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
         _ = self.enterContext(patch.object(sys, "platform", "darwin"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unconfigured command")))
+        _ = self.enterContext(patch.object(codex_mesh, "user_zone", return_value=ZoneInfo("UTC")))
         _ = self.enterContext(patch.object(account, "mac_process_record", side_effect=AssertionError("no native process record")))
         _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=AssertionError("no native environment")))
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=AssertionError("no native process start")))

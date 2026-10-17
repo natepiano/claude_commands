@@ -63,8 +63,8 @@ against the union of one-rule findings using the same model.
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
 | modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
-| names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
-| types | FAIL | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
+| names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 63 of 117, 53.8%, below the 100 of 117 a windowed pass reached before fixes P to X; type-named bindings 30/66 and comments 29/43 fell as the name-bindings paragraph drew the judges (`resample_names_table.md`). Rerun 7, after fixes Y and Z, on the six rules left in the names ticket (111 findings; name-bindings moved to its own ticket and met its own bar, 36 of 37): runs of 104, 99 and 104, a median of 104 of 111, 93.7%; comments 36 to 40 of 43, type-named 62 to 64 of 66 (`rerun7_names_table.md`). | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
+| types | PASS | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 55 of 61, 90.2%; owned bools 43/43, if-else 8/13, From 3/4, public failures 1/1, and none of the ten out-of-scope `pub` sites flagged (`resample_types_table.md`). Rerun 7, after fixes Y and Z: 59 of 61, 96.7%, which meets the bar; if-else 12/13, From 3/4 (`rerun7_types_table.md`). | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
 
 Per-rule recall and candidate file-local rules: pending.
 
@@ -409,7 +409,197 @@ Pending: parent's saved style child summary and rendered style line.
   for structure only when every cell they have left is on a closed file.
   The modules unit's own selection is unchanged.
 
+- **Name-bindings rerun:** 120 cargo-liner files in six groups of 20, read
+  in fix O's windows. For each group, one blind judge held the rule alone and
+  another held the rule, fix R's conversion line and the trace. The traced
+  pass caught 34 of the 38 in-scope one-rule findings (89.5%), under the 95%
+  bar, and found many sites the one-rule pass missed. Out of scope, as for
+  the first pass: a binding that fills differently named parameters, a
+  general-purpose library parameter (`Path::join(path)`, `fs::write(path)`,
+  `Write::write_all(buf)`), a name already bound in the scope, a conversion
+  that ends in a struct field or return value, a value built from the
+  binding (a `format!` message, an enum variant holding it), and one element
+  filling a plural collection parameter. Fix R held for `From`, `into` and
+  `map_or`; the four losses are two other gaps. Two are conversions the judge
+  did not pass through: an accessor (`temp.path()`) and a method that returns
+  the value in another form (`.to_local_def_id()`). Two are bindings dropped
+  as filling several parameters when they fill one: a second loop that binds
+  the same name, and a value derived from the binding
+  (`directory.path().join("config")`). Fix S states both in the ticket.
+
+- **Fix S — a name-bindings ticket names accessors and counts one value per
+  target** (commit `96395dde`): fix R's conversion line now also passes
+  through an accessor (`.path()`, `.as_str()`) and a method that returns the
+  same value in another form (`.to_local_def_id()`). It says a binding fills
+  several parameters only when that same value fills them: a value derived
+  from it, or a later binding of the same name, is another value. Tickets
+  without the name-bindings rule are unchanged. A second rerun of the traced
+  pass on the same 120 files, under the same scope reading, measures it
+  against the 95% bar.
+- **Name-bindings rerun 2 — fix S misses the bar**: 33 of the 38 settled
+  findings caught (87%), against 34 (89%) in the first rerun; the bar allows
+  one loss. Three earlier losses are now caught (`visit.rs:37`,
+  `target.rs:404`, `unused_pub.rs:5`), and four earlier catches are lost.
+  Two come from the traced pass's own exclusions: a call inside
+  `tracing::trace!` (`disk_usage.rs:153`) and a value wrapped in an enum
+  variant (`dispatch.rs:803`). One is a later binding inside a loop read as
+  a collision when it would only shadow (`refresh.rs:403`). One is the
+  several-targets drop, reached now that `.path()` passes through
+  (`presentation.rs:103`). The type-prefix drop at `actions.rs:835` holds as
+  in the first rerun. The showrunner ruled `presentation.rs:103` out of
+  scope, so the settled reference is 37 findings: both reruns caught 33 of
+  37 (89.2%).
+- **Fix T — a name-bindings ticket follows macros and enum variants and
+  tells shadowing from collision** (commit `3b422e81`): the ticket line now
+  says a call inside a macro's arguments counts, an enum tuple variant
+  wrapping the binding (`Pane::App(id)`) passes through like a conversion,
+  and a same-named binding declared later in an inner block only shadows
+  the renamed binding, so it is no collision. That answers three of the four
+  rerun 2 losses; `actions.rs:835` stays a miss, so the best a third rerun
+  can reach is 36 of 37 (97.3%). A third rerun on the same files measures it.
+- **Name-bindings rerun 3 — fix T meets the bar**: 36 of the 37 settled
+  findings caught (97.3%), the best fix T allows. The three rerun 2 losses
+  it targeted are caught (`disk_usage.rs:153`, `refresh.rs:403`,
+  `dispatch.rs:803`); `actions.rs:835` stays the one miss, as ruled. The
+  pass raised 375 findings against 346 in rerun 2. That rise is net: 57
+  findings are new at their place and 26 earlier ones dropped out. A blind
+  check of the 57 against the rule decides whether the new ones hold, under
+  the same 10% bar.
+- **Rerun 3 false-positive check — fails the 10% bar**: three blind judges,
+  reading only the rule, called 16 of the 57 new findings false (28%); one
+  judge rejected every finding whose change adds a binding, and the other
+  two accepted 8 of that shape, so read consistently 24 of 57 are false
+  (42%). Twenty-two of them propose adding a binding instead of renaming
+  one: naming an inline expression (a literal path, a slice, an array, a
+  setting's `.get()`) or opening a scoped alias that keeps the old name.
+  The rule only renames a binding that already feeds the parameter. Part
+  of that shape came from the measurement itself: since the first run the
+  pilot's traced procedure told judges to count an inline expression the
+  change would bind first, a sentence production tickets never carried.
+  Two more are single cases: fix T's shadowing sentence let a rename hide
+  an inner binding that the loop compares with the renamed one
+  (`local_use.rs:96`), and fix S's accessor clause let a lookup of another
+  value pass as a conversion (`provenance.rs:98`).
+- **Fix V — a name-bindings ticket asks only for renames, and narrows
+  accessors and shadowing** (commit `a1af8705`): the ticket line now says
+  the rule renames a binding that already exists and a finding whose change
+  only adds a binding is none, that a method taking arguments or looking up
+  another value is no accessor, and that a later inner binding is no
+  collision only when that inner block does not also read the renamed
+  binding. All 37 settled findings rename an existing binding, so the
+  change costs no recall by construction. Rerun 4 drops the traced
+  procedure's inline sentence and is measured on recall, on a blind check
+  of its new findings, and on a blind check of 30 findings rerun 2 already
+  had, each against its bar.
+- **Fix U — structure file cells are keyed by their module, not their
+  crate** (commit `07d86ebe`): a structure verdict on a file inside a crate
+  was keyed by the whole crate, so an edit anywhere in it made every such
+  verdict stale and the planner queued them all again. The key now covers
+  the Rust files in the file's own directory and the module file that
+  declares that directory; a crate root keeps the crate key and manifest
+  rules keep theirs. Rows recorded under the old key are not rewritten: a
+  held verdict carries over when the module key at its own commit still
+  matches, so an existing ledger needs no migration. Accepted risk: a
+  structure verdict that depends on a caller outside the module's own
+  directory no longer goes stale when that caller changes. Ticket 19 in the
+  modules pass waits on it.
+- **Name-bindings rerun 4 — recall holds, new findings fail the 10% bar**:
+  36 of the 37 settled findings caught (97.3%). The pair that moved cancel:
+  `actions.rs:835` is caught for the first time, and `overview.rs:72` is
+  lost because its judge read `lines.join("\n")` under fix V's accessor
+  sentence as a method that takes arguments. The pass raised 331 findings;
+  52 sit where rerun 2 had none. Three blind judges called none of a random
+  30 of the 279 older findings false (0%), so fix V removed the shape that
+  may have predated fix S. Of the 52 new ones they called 8 false (15%):
+  four rename `column` and `row` after `Position::new(x, y)`, whose
+  parameters are single letters that give no name to match; two name one
+  element of an array literal (`&[item]`, `[path.as_path()]`) after the
+  collection parameter it sits in; one renames `key` after
+  `CFString::from_static_str(string)`; one binding fills two parameters
+  with different names.
+- **Fix W — a name-bindings ticket skips single-letter parameters and
+  array elements** (commit `45438d3d`): the ticket line now says a
+  parameter with a single-letter name gives no name to match, and a binding
+  placed as one element of an array or slice literal does not fill the
+  collection parameter. Fix V's accessor sentence stays word for word, so
+  `overview.rs:72` stays lost; the bar is 36 of 37.
+- **Name-bindings rerun 5 — new findings pass, recall fails**: 33 of the
+  37 settled findings caught (89.2%). Besides `overview.rs:72`, three
+  findings rerun 4 caught were lost to one judge mistake, reading a
+  conversion's own parameter as the target or as a second target:
+  `usize::from(saved_width)` into `push_display_padded(width)` was read as
+  a derived value, `ThemeId::new(name)` into `find(id)` was judged to match
+  at `new(name)`, and `WorktreeRootDisplay::from(item)` beside `Some(item)`
+  was counted as a second target, although `from` takes the generic
+  `value`. None of the four involves fix W's sentences. The pass raised 311
+  findings; 47 sit where rerun 2 had none. Three blind judges called 1 of
+  the 47 false, and that one (`actions.rs:835`) is a settled finding, so
+  none are false after the hand-check (bar 10%). Of a random 30 of the 264
+  older findings they called 1 false (3.3%), a binding that keeps a
+  type-named prefix.
+- **Fix X — a name-bindings ticket never targets a conversion's own
+  parameter** (commit `8cd73ea4`): the ticket line now says a conversion's
+  own parameter, such as the `value` of `From::from` or the `name` of a
+  newtype constructor, is never the target and never a second target, and
+  the judge follows the converted value to the parameter it fills. Rerun 6
+  is measured on both bars. From rerun 6 on, a failed rerun whose misses
+  share no cause the ticket leaves uncovered runs the same ticket twice
+  more, and the median is judged against the bar.
+- **Name-bindings rerun 6 — both bars met**: 36 of the 37 settled findings
+  caught (97.3%), the bar. Only `overview.rs:72` is lost, as expected; the
+  three sites rerun 5 lost to the conversion-parameter mistake are all
+  caught again. The pass raised 321 findings; 47 sit where rerun 2 had
+  none. Three blind judges called none of the 47 false (bar 10%), and none
+  of a random 30 of the 274 older findings. The name-bindings pass is done.
+- **Types and names re-sample — both fail, names by a wide margin**: the
+  sample files of both families, judged as one read ticket per family
+  through the ticket text the planner writes now, by two blind judges per
+  family. Types: 55 of 61 (90.2%, bar 95%), up from the ledger's 50. Owned
+  bools are complete at 43 of 43, and fix P holds: no judge flagged the ten
+  out-of-scope `pub` sites. If-else stays weak at 8 of 13: two of its misses
+  were seen and recorded only under the owned-bool rule, three are
+  decisions found only by comparing branches across a file, and
+  `identity.rs:169` was kept under the const exception although no caller
+  is a const context. Names: 63 of 117 (53.8%), down from the 100 of 117
+  the windowed pass reached before fixes P to X. The judges raised 73
+  name-bindings findings, against none in the windowed pass, while
+  type-named bindings fell to 30 of 66 and comments to 29 of 43: the long
+  name-bindings paragraph draws the pass to one rule of seven. Some lost
+  type-named sites were recorded under name-bindings instead.
+- **Fix Y — a read ticket holds a site under every rule it breaks**
+  (commit `781ff3ef`): the re-sample's judges held a defect that breaks two
+  pinned rules under one of them only, so the other rule's cell was
+  recorded clean. The read-ticket procedure now says a site that breaks
+  more than one rule is held under each rule it breaks, once per rule, even
+  when one change fixes both. Structure tickets keep their own rule: a
+  defect several rules name is held once, under the rule it breaks most
+  directly.
+- **Fix Z — name-bindings gets its own read ticket** (commit `c79c21be`):
+  the name-bindings rule needs a long paragraph of its own, and inside the
+  names ticket it drew the pass away from the other six rules. The planner
+  now splits a file's read work so the name-bindings rule goes to a read
+  ticket of its own and the family's other rules stay together. From here
+  the names family is scored on its other six rules (111 one-rule
+  findings; the re-sample caught 60 of them), and name-bindings keeps its
+  own bar of 36 of 37.
+- **Rerun 7 — types and name-bindings pass, names falls short**: both
+  families' samples judged again through the ticket text after fixes Y and
+  Z, by fresh blind judges on the same halves. Types: 59 of 61 (96.7%, bar
+  95%). The two defects held under one rule only are now held under both,
+  owned bools stay complete at 43 of 43, and `identity.rs:169` is again
+  kept under the const exception (`rerun7_types_table.md`). Name-bindings
+  in its own ticket: 36 of 37, the bar, so fix Z does not undo rerun 6
+  (`rerun7_bindings_table.md`). Names, six rules: run 1 caught 104 of 111
+  (93.7%), with misses that share no cause, so the ticket ran twice more;
+  runs 2 and 3 caught 99 and 104, a median of 104 (93.7%, bar 106). Fixes
+  Y and Z lifted names from 60 to 104: type-named bindings are back to 62
+  to 64 of 66 and comments to 36 to 40 of 43. Only two sites are missed in
+  every run (`render.rs:132`, `constants.rs:8`); every other miss is
+  caught by another run. Combining two runs' findings passes in every
+  pairing, 108 to 109 of 111 (`rerun7_names_table.md`).
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
-`a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`.
+`a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`.
 Live verification of the fixes and subsequent measurements remain pending.

@@ -228,6 +228,33 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
         self.assertEqual(self.plan.read_text(), text)
 
+    def test_written_read_phase_holds_a_site_under_each_broken_rule_before_recording_verdicts(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("another-read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Hold that window's findings before opening the next window. "
+            + "Hold each distinct defect as its own finding; never stop at a window's first finding.\n"
+            + "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
+            + "even when one change fixes both: each rule's cell records its own verdict.\n"
+            + "Record a file's verdict for every rule only after its last window has been judged, ",
+            self.plan.read_text())
+
+    def test_written_structure_phase_holds_a_multi_rule_defect_once_without_read_holding_guidance(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [rule], cells=tuple((rule, path) for path in self.sources[:2]))
+        ticket = ledger.queued_tickets("modules-unit")[0]
+        text = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket["id"]), self.plan,
+                                     style_plan.delegation_context(self.plan.read_text()))
+        self.assertNotIn("A site that breaks more than one rule above", text)
+        self.assertIn(
+            "A defect several rules name is held once, under the rule it breaks most directly, "
+            + "naming the others in its text.", text)
+
     def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
@@ -262,8 +289,28 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["rules"], [rule])
         self.assertIn(
             "uncovered read.\n"
-            + "A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
-            + "name the binding after the parameter the converted value fills.\nJudge window by window:",
+            + "A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
+            + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
+            + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+            + "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+            + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+            + "follow the converted value to the parameter it fills. "
+            + "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
+            + "is no accessor: its result is another value. "
+            + "A binding fills several parameters only when that same value fills them: "
+            + 'a value derived from it (`dir.join("config")`) is another value, '
+            + "and a later binding of the same name, as in a second loop, is another binding. "
+            + "A call inside a macro's arguments counts, and an enum tuple variant wrapping the binding "
+            + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
+            + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
+            + "binding; it is no collision unless that inner block also reads the renamed binding. "
+            + "A parameter with a single-letter name, such as `x` and `y` in `Position::new(x, y)`, "
+            + "gives no name to match: report no finding for it. "
+            + "A binding placed as one element of an array or slice literal (`&[item]`) "
+            + "does not fill the collection parameter: its name names one element. "
+            + "The rule renames a binding that already exists: report no finding whose fix only adds a binding, "
+            + "whether it names an inline expression, literal, array or field projection, "
+            + "or adds a scoped alias that keeps the old name.\nJudge window by window:",
             self.plan.read_text())
 
     def test_written_uncovered_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
@@ -274,9 +321,102 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["rules"], [rule + "#uncovered"])
         self.assertIn(
             "uncovered read.\n"
-            + "A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
-            + "name the binding after the parameter the converted value fills.\nJudge window by window:",
+            + "A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
+            + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
+            + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+            + "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+            + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+            + "follow the converted value to the parameter it fills. "
+            + "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
+            + "is no accessor: its result is another value. "
+            + "A binding fills several parameters only when that same value fills them: "
+            + 'a value derived from it (`dir.join("config")`) is another value, '
+            + "and a later binding of the same name, as in a second loop, is another binding. "
+            + "A call inside a macro's arguments counts, and an enum tuple variant wrapping the binding "
+            + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
+            + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
+            + "binding; it is no collision unless that inner block also reads the renamed binding. "
+            + "A parameter with a single-letter name, such as `x` and `y` in `Position::new(x, y)`, "
+            + "gives no name to match: report no finding for it. "
+            + "A binding placed as one element of an array or slice literal (`&[item]`) "
+            + "does not fill the collection parameter: its name names one element. "
+            + "The rule renames a binding that already exists: report no finding whose fix only adds a binding, "
+            + "whether it names an inline expression, literal, array or field projection, "
+            + "or adds a scoped alias that keeps the old name.\nJudge window by window:",
             self.plan.read_text())
+
+    def test_written_names_phase_traces_accessors_and_distinguishes_derived_values_and_later_bindings(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn("an accessor such as `.path()` or `.as_str()`", text)
+        self.assertIn("such as `.to_local_def_id()`", text)
+        self.assertIn(
+            "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
+            + "is no accessor: its result is another value.", text)
+        self.assertIn(
+            "A binding fills several parameters only when that same value fills them: "
+            + 'a value derived from it (`dir.join("config")`) is another value, '
+            + "and a later binding of the same name, as in a second loop, is another binding.",
+            text)
+
+    def test_written_names_phase_traces_calls_in_macros_and_variants_and_allows_inner_shadowing(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn("A call inside a macro's arguments counts", text)
+        self.assertIn("an enum tuple variant wrapping the binding (`Pane::App(id)`)", text)
+        self.assertIn(
+            "A binding of the same name declared later in an inner block, such as a loop or closure body, "
+            + "would only shadow the renamed binding; it is no collision "
+            + "unless that inner block also reads the renamed binding.", text)
+
+    def test_written_names_phase_limits_findings_to_existing_bindings_and_checks_accessor_and_shadowing_exceptions(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        for guidance in (
+            "is no accessor: its result is another value",
+            "no collision unless that inner block also reads the renamed binding",
+            "report no finding whose fix only adds a binding",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, text)
+
+    def test_written_names_phase_excludes_single_letter_parameters_and_array_elements_before_rename_guidance(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        exclusions = (
+            "A parameter with a single-letter name, such as `x` and `y` in `Position::new(x, y)`, "
+            + "gives no name to match: report no finding for it.",
+            "A binding placed as one element of an array or slice literal (`&[item]`) "
+            + "does not fill the collection parameter: its name names one element.",
+        )
+        for guidance in exclusions:
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, text)
+                self.assertLess(text.index(guidance), text.index("The rule renames a binding that already exists"))
+        self.assertIn(exclusions[0] + " " + exclusions[1] + " The rule renames a binding that already exists", text)
+
+    def test_written_names_phase_never_targets_a_conversion_parameter_before_following_the_call(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        guidance = (
+            "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+            + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+            + "follow the converted value to the parameter it fills."
+        )
+        self.assertIn(guidance, text)
+        self.assertIn(
+            "name the binding after the parameter the converted value fills. "
+            + guidance + " A method that takes arguments", text)
 
     def test_written_names_phase_for_other_rules_keeps_the_existing_spec_without_conversion_guidance(self) -> None:
         _ = self.rule("name-bindings-to-match-parameters-extra")
@@ -433,8 +573,11 @@ class StylePlanTests(unittest.TestCase):
     def test_structure_batches_own_only_pending_pairs_and_manifest_only_work_is_selectable(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        nested = "crates/alpha/src/nested/inner.rs"
+        self.write(nested, "pub fn inner() {}\n")
+        self.tip = self.commit()
         self.sync()
-        for path in self.sources[:2]:
+        for path in (*self.sources[:2], nested):
             self.record(structure, path, self.tip)
         batches = [ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha"]
         self.assertEqual([(ticket.files, ticket.rules, ticket.cells) for ticket in batches], [
@@ -448,7 +591,10 @@ class StylePlanTests(unittest.TestCase):
         self.sync()
         batch = next(ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha")
         self.assertEqual((batch.files, batch.rules, batch.cells),
-                         ((self.sources[0],), (structure,), ((structure, self.sources[0]),)))
+                         (tuple(self.sources[:2]), (structure,),
+                          tuple((structure, path) for path in self.sources[:2])))
+        self.assertNotIn(nested, batch.files)
+        self.assertNotIn((structure, nested), batch.cells)
 
     def test_structure_work_order_shows_existing_holds_on_the_batch_files_only(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -1000,6 +1146,42 @@ class StylePlanTests(unittest.TestCase):
         _ = self.git("commit", "-qm", "Later edit", cwd=self.style)
         self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
         self.assertEqual(next(cell.state for cell in self.ledger().cells() if cell.path == path), "stale")
+
+    def test_read_tickets_separate_name_bindings_from_other_names_rules_on_each_pending_file(self) -> None:
+        bindings = self.rule("name-bindings-to-match-parameters")
+        other = self.rule("other-names")
+        self.sync()
+        self.record(bindings, self.sources[2], self.tip)
+        self.record(other, self.sources[3], self.tip)
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (bindings,)),
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (other,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", (self.sources[3],), (bindings,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", (self.sources[2],), (other,)),
+        ))
+
+    def test_read_tickets_separate_uncovered_name_bindings_from_other_names_rules(self) -> None:
+        bindings = self.rule("name-bindings-to-match-parameters", "tier: B\nfamily: names\ncandidates:\n"
+                             + "  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read every binding.\n")
+        other = self.rule("other-names")
+        self.sync()
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (bindings + "#uncovered",)),
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (other,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", self.sources[2:], (bindings + "#uncovered",)),
+            style_plan.TicketSelection("read", "names", "crates/beta", self.sources[2:], (other,)),
+        ))
+
+    def test_read_tickets_without_name_bindings_keep_rules_grouped_on_their_pending_files(self) -> None:
+        first = self.rule("first-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        second = self.rule("second-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        self.record(second, self.sources[0], self.tip)
+        self.assertEqual(self.candidates("types"), (
+            style_plan.TicketSelection("read", "types", "crates/alpha", (self.sources[0],), (first,)),
+            style_plan.TicketSelection("read", "types", "crates/alpha", (self.sources[1],), (first, second)),
+            style_plan.TicketSelection("read", "types", "crates/beta", self.sources[2:], (first, second)),
+        ))
 
     def test_partial_b_reads_uncovered_and_zero_sites_has_no_listed_ticket(self) -> None:
         rule = self.rule("partial", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read everything else.\n")

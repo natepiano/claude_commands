@@ -299,6 +299,10 @@ def blocked_by_structure(cell: style_ledger.Cell, structure: tuple[style_ledger.
                for blocker in structure)
 
 
+def _is_name_bindings_rule(rule_id: str) -> bool:
+    return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "name-bindings-to-match-parameters.md"
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -369,7 +373,11 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                 read_rules[cell.path].add(cell.rule)
         by_rules: dict[tuple[str, ...], list[str]] = defaultdict(list)
         for path, rule_ids in sorted(read_rules.items()):
-            by_rules[tuple(sorted(rule_ids))].append(path)
+            name_bindings = tuple(sorted(rule_id for rule_id in rule_ids if _is_name_bindings_rule(rule_id)))
+            other_rules = tuple(sorted(rule_id for rule_id in rule_ids if not _is_name_bindings_rule(rule_id)))
+            for group in (name_bindings, other_rules):
+                if group:
+                    by_rules[group].append(path)
         for rule_ids, paths in sorted(by_rules.items()):
             for files in read_slices(repo, tip, tuple(paths)):
                 result.append(TicketSelection("read", family, crate, files, rule_ids))
@@ -490,10 +498,29 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]
           if crate_targets is CrateTargets.BINARY_ONLY else []),
-        *(["A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
-           + "name the binding after the parameter the converted value fills."]
-          if any(PurePosixPath(pinned.rule_id.removesuffix("#uncovered")).name
-                 == "name-bindings-to-match-parameters.md" for pinned in texts) else []),
+        *(["A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
+           + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
+           + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+           + "A conversion's own parameter, such as the `value` of `From::from` or the `name` "
+           + "of a newtype constructor such as `ThemeId::new(name)`, is never the target and never a second target: "
+           + "follow the converted value to the parameter it fills. "
+           + "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
+           + "is no accessor: its result is another value. "
+           + "A binding fills several parameters only when that same value fills them: "
+           + "a value derived from it (`dir.join(\"config\")`) is another value, "
+           + "and a later binding of the same name, as in a second loop, is another binding. "
+           + "A call inside a macro's arguments counts, and an enum tuple variant wrapping the binding "
+           + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
+           + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
+           + "binding; it is no collision unless that inner block also reads the renamed binding. "
+           + "A parameter with a single-letter name, such as `x` and `y` in `Position::new(x, y)`, "
+           + "gives no name to match: report no finding for it. "
+           + "A binding placed as one element of an array or slice literal (`&[item]`) "
+           + "does not fill the collection parameter: its name names one element. "
+           + "The rule renames a binding that already exists: report no finding whose fix only adds a binding, "
+           + "whether it names an inline expression, literal, array or field projection, "
+           + "or adds a scoped alias that keeps the old name."]
+          if any(_is_name_bindings_rule(pinned.rule_id) for pinned in texts) else []),
         *([
             "Judge file by file: take each file under **Files** in turn and judge it against every rule above, with that rule's listed sites "
             + "in it and its uncovered surface; read the uncovered instructions in the pinned text.",
@@ -517,6 +544,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             + "judge them against every rule before any code.",
             "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
             + "never stop at a window's first finding.",
+            "A site that breaks more than one rule above is held under each rule it breaks, once per rule, "
+            + "even when one change fixes both: each rule's cell records its own verdict.",
             "Record a file's verdict for every rule only after its last window has been judged, "
             + "with `record --rule <rule> --path <file>` for each rule/file cell.",
         ] if ticket["kind"] == "read" else []),

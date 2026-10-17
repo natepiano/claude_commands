@@ -135,19 +135,18 @@ def common_session(
 
 
 class LeftSessionClient:
-    """The herdr session a moved session left: its panes, one pane's activity, and the panes closed."""
+    """The herdr session a moved session left: its panes, the ones running a program, and the panes closed."""
 
-    def __init__(self, rows: list[str], activity: herdr.PaneAtShell | herdr.PaneRunning) -> None:
+    def __init__(self, rows: list[str], activity: dict[str, herdr.PaneRunning]) -> None:
         self.rows: list[str] = rows
-        self.activity: herdr.PaneAtShell | herdr.PaneRunning = activity
+        self.activity: dict[str, herdr.PaneRunning] = activity
         self.closed: list[str] = []
 
     def panes(self) -> list[dict[str, str]]:
         return [{"pane_id": pane} for pane in self.rows]
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
-        _ = pane
-        return self.activity
+        return self.activity.get(pane, herdr.PaneAtShell())
 
     def close_pane(self, pane: str) -> None:
         self.closed.append(pane)
@@ -846,12 +845,13 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(leave.call_args.args[1:], ("natedev", "w1:p1"))
 
     def test_leaving_a_recorded_session_stops_it_when_emptied_and_closes_only_a_shell_pane(self) -> None:
-        shell = herdr.PaneAtShell()
+        vim = herdr.PaneRunning(commands=("vim",))
         for rows, activity, stopped, closed in (
-            (["w1:p1"], shell, True, []),
-            (["w1:p1", "w1:p2"], shell, False, ["w1:p1"]),
-            (["w1:p2"], shell, False, []),
-            (["w1:p1"], herdr.PaneRunning(commands=("vim",)), False, []),
+            (["w1:p1"], {}, True, []),
+            (["w1:p1", "w2:p1"], {}, True, []),
+            (["w1:p1", "w1:p2"], {"w1:p2": vim}, False, ["w1:p1"]),
+            (["w1:p2"], {"w1:p2": vim}, False, []),
+            (["w1:p1"], {"w1:p1": vim}, False, []),
         ):
             client = LeftSessionClient(rows, activity)
             output = io.StringIO()
@@ -860,7 +860,7 @@ class RestartTests(ShutdownTestCase):
                 restart._leave_recorded_session("natedev", "natedev", "w1:p1")  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(stop.called, stopped)
                 self.assertEqual(client.closed, closed)
-                self.assertEqual("still runs a program" in output.getvalue(), isinstance(activity, herdr.PaneRunning))
+                self.assertEqual("still runs a program" in output.getvalue(), "w1:p1" in activity)
 
     def test_legacy_default_record_restarts_on_the_numbered_home_without_rewriting_it_on_read(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
