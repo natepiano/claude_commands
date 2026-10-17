@@ -183,6 +183,25 @@ def _check_stopped(rename: UnitRename) -> None:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
 
+def _check_stoppable(rename: UnitRename) -> None:
+    """What the stop step cannot settle: the new id running, a Claude it cannot read, or processes
+    in the worktree of a unit with no Claude to stop. A live old unit is the stop step's to stop."""
+    try:
+        marked = unit_lookup.marked_units(rename.slug, every_host=True)
+    except OSError as error:
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
+    old, new = marked.get(rename.old), marked.get(rename.new)
+    if new and not isinstance(new.claude, unit_lookup.ClaudeNotRunning):
+        raise RenameRefused(f"{rename.new} already runs in session {new.label}")
+    if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
+        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
+    if old and isinstance(old.claude, unit_lookup.LiveClaude):
+        return
+    pids = unit_move.processes_inside(rename.worktree())
+    if pids:
+        raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
+
+
 def _check_checkout(rename: UnitRename) -> None:
     # Untracked files are left alone: the doc commit stages only tracked changes, and the checkout
     # keeps untracked files of its own, such as the production log, which `!docs/**` keeps visible.
@@ -210,7 +229,7 @@ def _preflight(rename: UnitRename) -> None:
     phase = unit_move.open_phase(run) if run else ""
     if phase:
         raise RenameRefused(f"{rename.old} is in phase {phase}; rename between phases")
-    _check_stopped(rename)
+    _check_stoppable(rename)
 
 
 def _token(old: str, new: str, text: str) -> str:
