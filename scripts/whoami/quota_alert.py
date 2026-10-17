@@ -345,7 +345,7 @@ class CodexZeroEpisode(TypedDict):
     phone: str
     forecast_at: str
     forecast_phone: NotRequired[str]
-    # Keep failed phone retries identical to the opening notice.
+    # Save empty-queue facts; queued advice is applied only when rendering a retry.
     notice: ZeroEpisodeNotice
     forecast_notice: NotRequired[ZeroEpisodeNotice]
     credits_off_fallback: NotRequired[Literal["waiting_for_next_entry"]]
@@ -928,10 +928,13 @@ def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> Qu
     if not groups:
         return QuotaStatusNote(note.label, "no Claude group uses this account")
     try:
-        covered: set[str] = ({entry.group for entry in next_moves.read_next_moves()
-                             if isinstance(entry, next_moves.ClaudeGroupMove) and entry.to != note.label}
-                            if isinstance(role_map.recorded_auto_moves(role_map.groups_file().with_name("roles.jsonl")),
-                                          role_map.RecordedAutoMoves) else set())
+        heads: dict[str, next_moves.ClaudeGroupMove] = {}
+        for entry in next_moves.read_next_moves():
+            if isinstance(entry, next_moves.ClaudeGroupMove):
+                _ = heads.setdefault(entry.group, entry)
+        covered: set[str] = ({group for group, head in heads.items() if head.to != note.label}
+                   if isinstance(role_map.recorded_auto_moves(role_map.groups_file().with_name("roles.jsonl")),
+                                 role_map.RecordedAutoMoves) else set())
     except next_moves.NextMoveError as error:
         return QuotaStatusNote(note.label, str(error))
     if groups <= covered:
@@ -1074,10 +1077,10 @@ def blocked_next_move_line(group: str, target: str, entry_id: str, reason: Block
 
 
 def notify_blocked_next_move(group: str, target: str, entry_id: str, reason: BlockedHeadReason,
-                             now: datetime) -> None:
+                             now: datetime) -> bool:
     config = load_config()
     text = blocked_next_move_line(group, target, entry_id, reason)
-    _ = deliver_and_record([Job("", recipient, text, "next move blocked")
+    return deliver_notice([Job("", recipient, text, "next move blocked")
         for recipient in recipients(config)], now.isoformat())
 
 
@@ -1096,10 +1099,12 @@ def _workers_head_blocked(entry: next_moves.WorkersMove, reason: BlockedHeadReas
         notices = state.setdefault("workers_move_notices", {})
         if notices.get(entry.id) == fingerprint:
             return
-        notices[entry.id] = fingerprint
+        _ = notices.pop(entry.id, None)
     target = next_moves.target_label(entry)
     print(blocked_next_move_line("workers", target, entry.id, reason))
-    notify_blocked_next_move("workers", target, entry.id, reason, now)
+    if notify_blocked_next_move("workers", target, entry.id, reason, now):
+        with state_file() as state:
+            state.setdefault("workers_move_notices", {})[entry.id] = fingerprint
 
 
 def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> WorkersNextMovePass:
@@ -1324,6 +1329,12 @@ def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
             + ("sent" if error is None else f"not delivered: {error}") for job, error in zip(jobs, errors)]
 
 
+def deliver_notice(jobs: list[Job], stamp: str) -> bool:
+    """Confirm every recipient's delivery before a caller suppresses future attempts."""
+    outcomes = deliver_and_record(jobs, stamp)
+    return bool(jobs) and outcomes == [f"quota {job.kind} {job.name} -> {job.recipient}: sent" for job in jobs]
+
+
 def alert(notes: list[AgentNote], now: datetime | None = None, *,
           selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
@@ -1408,6 +1419,13 @@ def _work_routing_failure_cause(cause: str) -> str:
     if "longer than" in cause.lower() or "timeout" in cause.lower():
         return "the work-routing update timed out"
     return "the work-routing settings could not be updated"
+
+
+def _queued_credit_choices(label: str) -> dict[str, str]:
+    return {
+        "turn_off": f"Turn off: paid spending stops. Workers stay on {label} and wait for the account move you queued.",
+        "leave_on": f"Leave on: workers spend {label}'s credits until that move runs or the credits run out, then wait.",
+    }
 
 
 def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexCreditsSetting,
@@ -1548,11 +1566,20 @@ def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroE
     return ZeroEpisodeNotice(id="quota.codex_credits_forecast", values={"account": label, "horizon": horizon, "forecast": forecast, "destination": destination})
 
 
-def _current_notice(label: str, notice: ZeroEpisodeNotice) -> ZeroEpisodeNotice:
-    """Keep a pending delivery's facts while updating its account note filename."""
+def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bool = False) -> ZeroEpisodeNotice:
+    """Copy pending facts for rendering; never persist the queued advice overlay."""
     values = dict(notice["values"])
     if "file" in values:
         values["file"] = note_file.note_name(label)
+    if workers_queued:
+        if notice["id"] in ("quota.codex_on_credits", "quota.codex_on_credits_last"):
+            values.update(_queued_credit_choices(label))
+            if "credit_action" in values:
+                values["credit_action"] = "To stop paid credit use"
+            if "clarification" in values:
+                values["clarification"] = ""
+        elif notice["id"] == "quota.codex_credits_forecast":
+            values["destination"] = "When credits run out, workers wait for the account move you queued."
     return ZeroEpisodeNotice(id=notice["id"], values=values)
 
 
@@ -1607,7 +1634,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 phone="due", forecast_at=stamp, notice=notice)
             if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
                 episodes[label]["credits_off_fallback"] = "waiting_for_next_entry"
-            rendered = render(notice["id"], **notice["values"])
+            current = _current_notice(label, notice, workers_queued=workers_queued)
+            rendered = render(current["id"], **current["values"])
             log.append(f"quota zero {label}: {rendered.title}\n{rendered.body}")
         episode = episodes[label]
         setting = agent_accounts.codex_credits_setting(label)
@@ -1628,20 +1656,21 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             log.append(f"quota credits off {label}: {result.body}")
 
         if episode["phone"] == "due":
-            notice = _current_notice(label, episode["notice"])
-            episode["notice"] = notice
+            episode["notice"] = _current_notice(label, episode["notice"])
+            notice = _current_notice(label, episode["notice"], workers_queued=workers_queued)
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "phone", episode["since"]))
         if at_zero and episode["credits"] == "on" and now - datetime.fromisoformat(episode["forecast_at"]) >= timedelta(hours=1):
             notice = _credits_forecast_notice(label, report, now)
-            rendered = render(notice["id"], **notice["values"])
+            current = _current_notice(label, notice, workers_queued=workers_queued)
+            rendered = render(current["id"], **current["values"])
             log.append(f"quota credits forecast {label}: {rendered.title}\n{rendered.body}")
             episode["forecast_at"] = stamp
             if "forecast_phone" not in episode:
                 episode["forecast_phone"] = "due"
                 episode["forecast_notice"] = notice
         if episode.get("forecast_phone") == "due" and "forecast_notice" in episode:
-            notice = _current_notice(label, episode["forecast_notice"])
-            episode["forecast_notice"] = notice
+            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"])
+            notice = _current_notice(label, episode["forecast_notice"], workers_queued=workers_queued)
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "forecast_phone", episode["since"]))
     for push, field, since in pushes:
         delivery = tell_user(push.rendered)
@@ -1849,15 +1878,18 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                      and selected.home == readings.workers.home)
         if owns_role and not isinstance(readings.workers, NoWorkersHome):
             entries = moves.read_moves()
-            if (isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
-                    and isinstance(reset, refusals.KnownReset) and timedelta(0) < reset.at - now < timedelta(minutes=20)):
+            if (isinstance(reset, refusals.KnownReset) and (pending_head
+                    or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
+                    and timedelta(0) < reset.at - now < timedelta(minutes=20))):
+                window_name = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
+                window_text = "5-hour" if window_name == "five_hour" else window_name
                 if any(entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "waited"
                        and entry["reset"] == reset.at.isoformat() for entry in entries):
-                    return [f"workers already wait for {name}'s 5-hour reset"]
+                    return [f"workers already wait for {name}'s {window_text} reset"]
                 move_id = uuid.uuid4().hex
                 moves.append_move(moves.WaitedMove(kind="waited", at=stamp, tool="codex", subject="workers",
-                    move_id=move_id, window="five_hour", reset=reset.at.isoformat()))
-                transition_line = f"workers wait for {name}'s 5-hour reset at {reset_display(reset)}"
+                    move_id=move_id, window=window_name, reset=reset.at.isoformat()))
+                transition_line = f"workers wait for {name}'s {window_text} reset at {reset_display(reset)}"
             elif pending_head:
                 return [f"workers next entry is pending; {name} refusal recorded without a fallback move"]
             else:

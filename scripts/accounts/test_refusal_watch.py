@@ -25,6 +25,9 @@ import agent_accounts
 import usage_store
 import quota_alert
 
+send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPrivateUsage]
+deliver_notice_jobs = quota_alert.deliver_and_record
+
 if TYPE_CHECKING:
     from scripts.shutdown import inventory, record, settle
     from scripts.message import sessions
@@ -209,12 +212,13 @@ class RefusalWatchTests(unittest.TestCase):
         return {str(path.relative_to(self.home)): path.read_bytes()
                 for path in self.home.rglob("*") if path.is_file() and not path.is_symlink() and path.suffix != ".lock"}
 
-    def notified(self, text: str, _now: datetime) -> None:
+    def notified(self, text: str, _now: datetime) -> bool:
         self.notifications.append(text)
+        return True
 
     def deliver_head_notice(self, jobs: list[quota_alert.Job], _stamp: str) -> list[str]:
         self.head_deliveries.append(jobs)
-        return []
+        return [f"quota {job.kind} {job.name} -> {job.recipient}: sent" for job in jobs]
 
     def down(self, command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
         self.assertTrue(any(part.endswith("/shutdown.py") for part in command), command)
@@ -495,6 +499,45 @@ class RefusalWatchTests(unittest.TestCase):
         self.next_entries(entry)
         _ = self.cli()
         self.assertEqual(len(self.head_deliveries), 2)
+
+    def test_failed_group_blocked_head_delivery_retries_until_it_is_delivered(self) -> None:
+        _ = self.groups()
+        head = self.low_rule(target="claude1")
+        self.next_entries(head)
+        with (patch.object(quota_alert, "deliver_and_record", wraps=deliver_notice_jobs) as delivery,
+              patch.object(quota_alert, "relay", side_effect=["fixture recipient unavailable", None]) as relay):
+            for minute in (0, 2, 4):
+                WatchTime.at = NOW + timedelta(minutes=minute)
+                _ = self.cli()
+                state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(head.id in state.get("auto_move_notices", {}), minute > 0)
+        self.assertEqual(delivery.call_count, 2)
+        self.assertEqual(relay.call_count, 2)
+        self.assertEqual(relay.call_args_list[0], relay.call_args_list[1])
+        self.assertEqual(self.commands, [])
+
+    def test_failed_no_room_delivery_retries_until_it_is_delivered(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        _ = self.transcript("unit")
+        for login in ("main@example.invalid", TARGET_LOGIN):
+            refusals.write_refusal(refusals.AccountRefusal("claude", login,
+                refusals.KnownWindow("weekly"), refusals.KnownReset(WEEKLY_RESET), NOW))
+        before = path.read_bytes()
+        with (patch.object(refusal_watch, "_notify_no_room", side_effect=send_no_room_notice),
+              patch.object(quota_alert, "deliver_and_record", wraps=deliver_notice_jobs) as delivery,
+              patch.object(quota_alert, "relay", side_effect=["fixture recipient unavailable", None]) as relay):
+            for minute in (0, 2, 4):
+                WatchTime.at = NOW + timedelta(minutes=minute)
+                _ = self.cli()
+                state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(SOURCE_LOGIN in state["notices"], minute > 0)
+        self.assertEqual(delivery.call_count, 2)
+        self.assertEqual(relay.call_count, 2)
+        self.assertEqual(relay.call_args_list[0], relay.call_args_list[1])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.commands, [])
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["no room"])
 
     def test_due_head_waits_silently_while_its_group_shutdown_is_in_progress(self) -> None:
         path = self.groups()

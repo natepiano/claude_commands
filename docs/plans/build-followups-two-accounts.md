@@ -1683,7 +1683,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** skipping a blocked head to try the next entry (the 2026-10-17 11:49 EDT showrunners claude1 → claude2 move skipped the queued claude4 head); a target threshold taken from the highest percent in the list.
 
-### Phase 59 — Codex workers under a queued head wait and promise no fallback  · status: todo
+### Phase 59 — Codex workers under a queued head wait and promise no fallback  · status: done
 
 **Depends on:** Phase 58
 
@@ -1695,19 +1695,23 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Spec:**
 
-1. While a workers entry is queued, the credits-on zero notice's `turn_off` and `leave_on` lines name no other Codex account and no move to Claude: turning credits off leaves the workers on `<account>` waiting for their queued next entry; leaving them on spends `<account>`'s credits until the entry runs or the credits run out, then the workers wait for the entry. The picker is not called while queued.
+1. While a workers entry is queued, the credits-on zero notice's `turn_off` and `leave_on` lines name no other Codex account and no move to Claude: turning credits off leaves the workers on `<account>` waiting for their queued next entry; leaving them on spends `<account>`'s credits until the entry runs or the credits run out, then the workers wait for the entry. No account is chosen or moved while queued; the read-only picker runs only to save the empty-queue text a later retry renders once the queue empties (repair round 1).
 2. While queued, the credits forecast's `destination` says the workers wait for their queued next entry when credits run out.
 3. With no workers entry, every notice is byte-identical to today's.
 4. Keep the existing push ids; the new lines are values of the existing templates. Add one example per changed template for the queued case and record its approval.
 5. **Codex wait until a known reset** (showrunner, 2026-10-17: a wrong result to fix now). In `quota_alert._route_refusal` (~1837–1895), when the refusing account owns the workers role and a workers entry is queued, a refusal whose reset is known records one workers `waited` move until that reset (any distance, either window; the same reset is not recorded twice) and returns its transition line `workers wait for <account>'s <window> reset at <time>`; `_finish_workers_transitions` closes it at the reset as it does for the brief wait. No account is picked or swapped. A queued refusal with no known reset keeps today's `refusal recorded without a fallback move`. With no workers entry queued, refusal routing is unchanged.
+6. **A failed notice is retried** (showrunner, 2026-10-17). The blocked-head notices (`refusal_watch._record_blocked_head`, `quota_alert._workers_head_blocked`) and the no-room notice (`refusal_watch._notify_no_room`) store their dedupe fingerprint only when `deliver_and_record` reports the notice delivered; a failed send leaves it unset so the next pass sends again.
+7. **A blocked head is not cover** (showrunner, 2026-10-17). `quota_alert.claude_next_move_push` counts a group as covered only by its head entry; when that head targets the group's current account, later entries do not cover the group and the reminder fires.
 
 **Files:**
-- `scripts/whoami/quota_alert.py` — queue-aware credits-on and forecast lines; the queued wait until a known refusal reset.
+- `scripts/whoami/quota_alert.py` — queue-aware credits-on and forecast lines; the queued wait until a known refusal reset; delivered-only fingerprints; head-only reminder cover.
+- `scripts/accounts/refusal_watch.py` — delivered-only fingerprints for the blocked-head and no-room notices.
+- `scripts/accounts/test_refusal_watch.py` — failed-delivery retry regressions.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the queued examples and their approvals.
 - `docs/quota_alerts.md` — one sentence: with a workers entry queued, credit notices name the queue, not a fallback.
 - `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_quota_alert.py` — regressions.
 
-**Workers:** 1 writer + 1 tester. impl owns `scripts/whoami/quota_alert.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` and `docs/quota_alerts.md`; test owns `scripts/whoami/test_codex_alert_accounts.py` and `scripts/whoami/test_quota_alert.py`.
+**Workers:** 1 writer + 1 tester. impl owns `scripts/whoami/quota_alert.py`, `scripts/accounts/refusal_watch.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` and `docs/quota_alerts.md`; test owns `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_quota_alert.py` and `scripts/accounts/test_refusal_watch.py`.
 
 **Tests (each fails on the pre-phase tree):**
 - credits on at 0% with a queued self-target workers head and a second Codex account with room: the notice names neither that account nor Claude; turning credits off on a later pass swaps nothing and records no `requested`;
@@ -1716,13 +1720,54 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - an empty queue keeps today's notices (existing tests keep passing).
 - a queued workers head not yet due and a five-hour refusal 3 hours from reset, and separately a weekly refusal with a known reset: one `waited` move each, no pick and no swap, a second pass records no second wait, and the wait ends at the reset; with no queued entry the same refusals keep today's move.
 
-**Verification:** from the worktree root, in a scratch HOME: `python3 -m unittest scripts.whoami.test_quota_alert scripts.whoami.test_codex_alert_accounts scripts.notify.test_push_texts scripts.notify.test_review`; basedpyright on every changed Python file reports 0 errors and 0 warnings.
+**Verification:** from the worktree root, in a scratch HOME: `python3 -m unittest scripts.whoami.test_quota_alert scripts.whoami.test_codex_alert_accounts scripts.notify.test_push_texts scripts.notify.test_review scripts.accounts.test_refusal_watch`; basedpyright on every changed Python file reports 0 errors and 0 warnings.
 
 **Acceptance gate:** the regressions pass and fail on the pre-phase tree; no notice names a fallback while a workers entry is queued; notices with an empty queue are unchanged; the merge gate (`merge_gate --tests-only`) passes on natedev; the Mac suites pass.
 
-### Phase 60 — The next list is numbered per group  · status: todo
+### Phase 60 — A moved session's first prompt is proven sent  · status: todo
 
 **Depends on:** Phase 59
+
+**Prerequisite:** herdr-trial's top-priority change (the user's shared herdr "agents" session: stop closes only the unit's tab, restart puts window hosts into a tab; edits `scripts/shutdown/stop.py` and `restart.py`) is merged into build-followups; merge origin/build-followups after it lands and before the checkpoint (showrunner, 2026-10-17).
+
+#### Work Order
+
+**Goal:** a restart is confirmed only once its first prompt reached the session as a user turn; a prompt that did not submit is retried, then reported (user report via the showrunner, 2026-10-17 13:45 EDT: demo's move prompt sat typed but unsent for 18.5 hours after move 457fbdea was recorded `confirmed`). Read-only investigation, 2026-10-17: 14 of 36 sessions in move 457fbdea, 2 in 6b55cb99, 1 in c2d4179a and organon's /shutdown restart kept the text in the input box; three were later flushed glued to the next peer prompt.
+
+**Constraints from prior phases:** `herdr.Herdr.start_agent` (`scripts/herdr/herdr.py`, ~582–622) runs `herdr agent start … --timeout` and then `self.prompt(pane, text)` (~721), `herdr agent prompt <pane> <text>` with no `--wait`; herdr pastes the text and presses Enter. The prompt goes out about 3.4 s after herdr first sees the Claude process; a resumed session that is still loading (its `/remote-control is active` system line lands 3–20 s later) keeps the text and loses the Enter. `herdr agent prompt --wait` returns `agent_prompt_stalled` when no working state follows within 5 s. Both callers use it: `add_unit.py:launch_session` (~755, units, via `restart.py:_unit_argv` `--restart-note`) and `restart.py:_herdr_launch` (~1058). Confirmation: `restart.py` `_confirm_entries` → `wait_for_confirmation` → `confirm_entry` (~1803) → `_prove_move` (~1422) → `_confirm_move` checks only that the session id is live and its config dir is the target account's. `mark_restart_failed` (~1525) writes the `failed` move line. `Herdr.send_keys` (~751) and `pane_activity` (~529) exist. A session's transcript is `<config dir>/projects/*/<session id>.jsonl`; a peer or task message is `isMeta`. The stop note (`_stop_note`, ~603, from `settle.ready`'s `where`) was correct when written; its age is what misled. Tests never touch live directories, never run ssh, never send keys to a real pane and never read a real credential.
+
+**Spec:**
+
+1. **Proof of submit.** After typing the first prompt, the launcher waits for a non-meta user turn in the session's transcript, later than the launch, whose text contains the prompt. Its outcome is typed: `PromptSubmitted(at) | PromptNotSubmitted(reason)`.
+2. **Retry with Enter only.** When no such turn appears within a bounded wait, read the pane; if the prompt text sits in the input, send Enter only (never retype the text), then wait again, at most 3 times. Text not in the input and no turn is `PromptNotSubmitted`.
+3. **Ready before typing.** The prompt is typed only once the resumed session is ready for input (herdr's working/idle state or the transcript's ready signal), not at first sight of the process; a session that never becomes ready within the launch timeout is `PromptNotSubmitted`.
+4. **Confirmation means submitted.** `confirm_entry` records `confirmed` only with `PromptSubmitted`; `PromptNotSubmitted` goes through `mark_restart_failed(record, "restart prompt not submitted")`, so the `failed` move line, the restart result and its push name the session. Units launched by `add_unit.py` and sessions launched by `_herdr_launch` behave the same. The proof holds for a session restarted into a herdr tab, where every restart goes after herdr-trial's change.
+5. **The move note carries its times.** `account_move_note` states when the session paused and when it resumed, as the /shutdown note does, so a late-submitted note reads as old.
+
+**Files:**
+- `scripts/herdr/herdr.py` — readiness gate, submit proof, Enter-only retry, typed outcome.
+- `scripts/shutdown/restart.py` — confirmation requires the proof; failure marking; move-note times.
+- `scripts/production/add_unit.py` — only if the unit launch must pass the outcome through.
+- `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_account_move.py` — regressions.
+- `docs/shutdown.md` or the doc that describes restart confirmation — one sentence: confirmed means the first prompt arrived.
+
+**Workers:** 1 writer + 1 tester. impl owns production and docs; test owns test files.
+
+**Tests (each fails on the pre-phase tree):**
+- a fake herdr whose first Enter is lost and whose pane shows the text: one Enter-only retry, then `PromptSubmitted`; the text is typed once;
+- no user turn and no text in the input: `PromptNotSubmitted`, the move line is `failed` with "restart prompt not submitted", no `confirmed`;
+- a session not ready until 10 s after the process appears: the prompt is typed after ready, not before;
+- a meta (peer) turn does not count as the submit;
+- a session restarted into a herdr tab gets the same proof, retry and failure;
+- the move note names its pause and resume times.
+
+**Verification:** scratch-HOME suites `scripts.herdr.test_herdr scripts.shutdown.test_restart scripts.shutdown.test_account_move scripts.shutdown.test_shutdown_cli`; basedpyright on every changed Python file reports 0 errors and 0 warnings.
+
+**Acceptance gate:** confirmation requires a submitted first prompt; a lost Enter is retried without duplicating text; an unsent prompt is reported as a failed restart; merge gate (`merge_gate --tests-only`) on natedev and the Mac suites pass.
+
+### Phase 61 — The next list is numbered per group  · status: todo
+
+**Depends on:** Phase 59 (independent of Phase 60's files; runs while Phase 60 waits on herdr-trial)
 
 #### Work Order
 
@@ -1755,9 +1800,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** grouped numbered listing; move, remove and insert by position, each leaving other groups' order unchanged; head changes clear the displaced head's hold and notices; ids never printed or accepted; merge gate and Mac suites pass.
 
-### Phase 61 — A half-point hold from pace history  · status: todo
+### Phase 62 — A half-point hold from pace history  · status: todo
 
-**Depends on:** Phase 60
+**Depends on:** Phase 61
 
 **Prerequisite:** the phase-start merge of build-followups brings model-study's run-out pace fix (a8ff96e8, "run-out pace skips an account waiting its turn", merged into build-followups as edce365a and promoted); confirm `git merge-base --is-ancestor edce365a HEAD` before dispatch.
 
@@ -1765,7 +1810,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Goal:** the user's rule is to stay on an account at 1% until about half a point more is used, judged by pace history, not a typed minute count (user, 2026-10-17, via the showrunner).
 
-**Constraints from prior phases:** Phase 58 starts a hold only for a group's head, in `refusal_watch._run_auto_moves_locked` (`scripts/accounts/refusal_watch.py`, ~920–945), after the unconfigured, moved-this-pass and shutdown-in-progress guards, a numbered source identity, a fresh source reading and that reading at or below the head's percent; a fresh reading above the percent drops the hold. `HoldStarted(account, at, move_id, percent)` (~147) stores no duration, and elapsed time compares against the entry's current `LeftAtMost.hold_minutes` (~942); a hold is dropped when the account, selection `move_id` or percent changes, and for any entry that is not its group's head. Workers entries take no hold (`decode_next_moves` refuses a workers `hold_minutes` above 0). `scripts/whoami/run_out.py` records account observations (`read_readings`, ~115) and computes `weighted_rate(readings, end) -> float | None` (~153) per account, with no group attribution. Phase 60 numbers the list per group and resolves positional edits on natedev under the locks, keeping entry ids.
+**Constraints from prior phases:** Phase 58 starts a hold only for a group's head, in `refusal_watch._run_auto_moves_locked` (`scripts/accounts/refusal_watch.py`, ~920–945), after the unconfigured, moved-this-pass and shutdown-in-progress guards, a numbered source identity, a fresh source reading and that reading at or below the head's percent; a fresh reading above the percent drops the hold. `HoldStarted(account, at, move_id, percent)` (~147) stores no duration, and elapsed time compares against the entry's current `LeftAtMost.hold_minutes` (~942); a hold is dropped when the account, selection `move_id` or percent changes, and for any entry that is not its group's head. Workers entries take no hold (`decode_next_moves` refuses a workers `hold_minutes` above 0). `scripts/whoami/run_out.py` records account observations (`read_readings`, ~115) and computes `weighted_rate(readings, end) -> float | None` (~153) per account, with no group attribution. Phase 61 numbers the list per group and resolves positional edits on natedev under the locks, keeping entry ids.
 
 **Spec:** `next add <group> … --hold half-point` stores a typed hold mode (`FixedHold(minutes) | HalfPointHold`) on a Claude group entry; `--hold-minutes N` still stores a fixed hold; a workers entry refuses `--hold half-point`. When a `HalfPointHold` head's hold starts, the runner computes its minutes once from the selected account's weighted pace (shared-account usage included: the account's own allowance is what runs out) as the minutes to use 0.5 point, rounded up to a whole minute, and stores the resolved duration and its source (`PaceEstimate(points_per_hour) | NoUsablePace`) in the hold with account, start time, selection transition and percent; restarts and later readings never change a started hold. `weighted_rate`'s `None` or a nonpositive rate converts at that boundary into `NoUsablePace`, which uses a 40-minute default and says so. Legacy holds without a stored duration decode as fixed holds read from the entry. `next list` shows a half-point entry's minutes as it would compute them now (`hold half a point (≈40 min)`, or `hold half a point (40 min default: no pace history)`). One locked hold-mode update (`next hold <group> <n> half-point|<minutes>`) changes an entry's mode in place, keeping its id, its order and every other entry, and drops that entry's started hold. After this lands and is promoted, the unit director converts the live entries the showrunner named (showrunners claude4 → claude2, claude2 → claude3; units claude2 → claude3) with that update, after checking it on scratch fixtures.
 
