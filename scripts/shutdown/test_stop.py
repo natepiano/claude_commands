@@ -734,7 +734,7 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(seats["review"], record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="review-thread", turn_live=False, launcher_command=[]))
         prompt = run / "busy.resume-prompt.md"
         self.assertEqual(prompt.read_text().strip(), "You were paused when your unit director stopped for an account move or restart. Continue the task you were on from where you stopped; your earlier instructions still hold.")
-        self.assertFalse((run / "review.resume-prompt.md").exists())
+        self.assertEqual((run / "review.resume-prompt.md").read_text().strip(), "You were paused while idle when your unit director stopped for an account move or restart. Nothing was in progress: reply ready and wait for your next assignment; your earlier instructions still hold.")
         self.assertTrue(foreign.exists())
         self.assertEqual(self.stored_record().get("codex_seats"), finished.get("codex_seats"))
 

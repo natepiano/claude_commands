@@ -404,6 +404,7 @@ class RestartTests(ShutdownTestCase):
                 seats = [
                     record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
                     record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="private-thread-review", turn_live=False, launcher_command=[]),
+                    record.PausedSeat(run_dir=str(run), seat="test", role="test", thread_id="private-thread-test", turn_live=True, launcher_command=[]),
                 ]
                 saved = entry(owner)
                 saved["codex_seats"] = seats
@@ -433,8 +434,16 @@ class RestartTests(ShutdownTestCase):
                 expected[expected.index(old_prompt)] = str(run / "impl.resume-prompt.md")
                 # Shell parsing preserves every original argument, including spaces.
                 self.assertIn(shlex.join(expected), work_line)
+                # Seats with no readable launcher get every launcher argument, ready to run as pasted.
                 idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
-                self.assertIn("review.sh --to review", idle_line)
+                self.assertTrue(idle_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "review.sh"), "--to", "review", str(run), owner["cwd"],
+                    str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
+                unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
+                self.assertTrue(unread_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
+                self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
                 self.assertNotIn(old_prompt, text)
                 self.assertNotIn("private-thread-", text)
