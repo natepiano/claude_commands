@@ -169,6 +169,7 @@ class MergeGateTests(unittest.TestCase):
         self.main = Path()
         self.bin = Path()
         self.state = Path()
+        self.quiet_production = Path()
         self.environment: dict[str, str] = {}
         self.base = ""
         self.checkpoint = ""
@@ -197,7 +198,12 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
+            # The calling showrunner is found from these update timers, never the live ones.
+            "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
         }
+        # A production with no Change review line: a gate always names one, and these write no rows.
+        self.quiet_production = self.root / "quiet-production.md"
+        self.write(self.quiet_production, "# quiet\n")
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         self.environment["PYTHONPATH"] = self.environment["MERGE_GATE_TEST_PYTHONPATH"]
         _ = self.git(self.root, "init", "--bare", str(self.origin))
@@ -257,7 +263,7 @@ class MergeGateTests(unittest.TestCase):
         return self.git(checkout, "rev-parse", "HEAD")
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False) -> subprocess.CompletedProcess[str]:
+                 ignored_signals: bool = False, callers_production: bool = False) -> subprocess.CompletedProcess[str]:
         prefix = [sys.executable, str(SCRIPT)]
         if ignored_signals:
             prefix = [sys.executable, "-c",
@@ -274,6 +280,7 @@ class MergeGateTests(unittest.TestCase):
              "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
              "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
+             *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
              *extra], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=300,
         )
@@ -382,12 +389,17 @@ class MergeGateTests(unittest.TestCase):
         self.assert_refused_before_gate(result)
         self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
 
-    def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
+    def review_list(self) -> tuple[Path, Path]:
+        """A change-review list holding C7, and the production doc that names it."""
         review = self.root / "change-review.md"
         self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
                    + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
         doc = self.root / "production.md"
         self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        return review, doc
+
+    def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
+        review, doc = self.review_list()
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
                                             + "Change-Review: The grid fades gently | Look across the floor\n"
                                             + "Change-Review: none — the gate script")
@@ -403,6 +415,29 @@ class MergeGateTests(unittest.TestCase):
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+    def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
+        review, doc = self.review_list()
+        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / "showrunner-fixture"
+        timer.mkdir(parents=True)
+        self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
+                   + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor\n"
+                                            + "Change-Review: The sky dims | Look up")
+        result = self.run_gate(checkpoint=checkpoint, callers_production=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Change review: 2 row(s) added to {review}: C8–C9", result.stdout)
+        self.assertEqual([line.split(" | ")[1] for line in review.read_text(encoding="utf-8").splitlines()[-2:]],
+                         ["The grid fades gently", "The sky dims"])
+
+    def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor")
+        result = self.run_gate(checkpoint=checkpoint, callers_production=True)
+        self.assert_refused_before_gate(result)
+        self.assertIn("pass --production <doc>: the gate adds this merge's change-review rows to its list",
+                      result.stderr)
 
     def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
         doc = self.root / "production.md"
@@ -480,7 +515,7 @@ class MergeGateTests(unittest.TestCase):
                      "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
                      "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
                      "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
-                     "--ssh", str(self.bin / "ssh")]
+                     "--ssh", str(self.bin / "ssh"), "--production", str(self.quiet_production)]
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
             merge_gate, "notify_style", side_effect=malformed_notification,
@@ -622,7 +657,7 @@ class MergeGateTests(unittest.TestCase):
                     [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
                      "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
-                     "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
+                     "--production", str(self.quiet_production), "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     deadline = time.monotonic() + 300
@@ -661,7 +696,8 @@ class MergeGateTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
-             "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob],
+             "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
+             "--production", str(self.quiet_production)],
             env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         hook_pid = 0
         try:
