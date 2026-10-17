@@ -1098,7 +1098,10 @@ def _herdr_launch(
 
 
 def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
-    """Close the pane a session left behind when it moved into the shared session; stop the server it emptied."""
+    """Close the pane a session left behind when it moved into the shared session; stop the server it emptied.
+
+    A server whose other panes are idle shells, such as the one its attach window opened, counts as emptied.
+    """
     client = herdr.Herdr(recorded)
     try:
         rows = client.panes()
@@ -1106,7 +1109,7 @@ def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
         if left and not isinstance(client.pane_activity(pane), herdr.PaneAtShell):
             print(f"{name} restart issue: herdr {recorded}:{pane} still runs a program; left open")
             return
-        if len(rows) == len(left):
+        if all(isinstance(client.pane_activity(row["pane_id"]), herdr.PaneAtShell) for row in rows):
             herdr.stop_session(recorded)
         elif left:
             client.close_pane(pane)
