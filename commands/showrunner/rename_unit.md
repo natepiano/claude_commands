@@ -17,9 +17,11 @@ Run from the showrunner session, between the unit's phases. `<old>` is the unit'
    It refuses when:
    - the unit is in a phase;
    - the unit has a checkpoint the merge branch has not taken;
-   - the new name is taken;
+   - the new name is taken, or a session already runs under it;
    - the unit is a reserved one;
    - the unit is on the Mac.
+
+   A running unit is not a refusal: apply stops it itself, at step 1.
 2. Run `apply`. It journals each step, so a rerun resumes from the step that stopped. The steps are:
    1. stop the unit through the shutdown path;
    2. merge the merge branch into the unit;

@@ -22,9 +22,12 @@ journal `rename_unit.json` before changing anything, and checks the showrunner c
 each step. Every step except the first and the last also checks that the unit is stopped. The
 steps:
 
-1. **Stop.** The unit stops through `shutdown.py down --only <session>`. A live process cannot
-   change its env mark, so every rename is a relaunch. While the stop settles, apply exits 2 and a
-   rerun resumes.
+1. **Stop.** A running unit is not a refusal: plan lists this step, and apply stops the unit
+   through `shutdown.py down --only <session>`. The unit's id is `SHOWRUNNER_UNIT_ID` in the
+   environment of its Claude process in its herdr pane, set at launch, and a live process cannot
+   change it, so every rename is a relaunch. While the stop settles, apply exits 2 and a rerun
+   resumes. Refused up front: the new id already running, a Claude that cannot be read, and
+   processes inside the worktree of a unit with no Claude to stop.
 2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree.
 3. **Git.** The new branch is pushed and the worktree moved, which repairs it and copies
    `cargoBerthTarget`.
