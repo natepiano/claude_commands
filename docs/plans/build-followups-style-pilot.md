@@ -465,6 +465,32 @@ Pending: parent's saved style child summary and rendered style line.
   findings are new at their place and 26 earlier ones dropped out. A blind
   check of the 57 against the rule decides whether the new ones hold, under
   the same 10% bar.
+- **Rerun 3 false-positive check — fails the 10% bar**: three blind judges,
+  reading only the rule, called 16 of the 57 new findings false (28%); one
+  judge rejected every finding whose change adds a binding, and the other
+  two accepted 8 of that shape, so read consistently 24 of 57 are false
+  (42%). Twenty-two of them propose adding a binding instead of renaming
+  one: naming an inline expression (a literal path, a slice, an array, a
+  setting's `.get()`) or opening a scoped alias that keeps the old name.
+  The rule only renames a binding that already feeds the parameter. Part
+  of that shape came from the measurement itself: since the first run the
+  pilot's traced procedure told judges to count an inline expression the
+  change would bind first, a sentence production tickets never carried.
+  Two more are single cases: fix T's shadowing sentence let a rename hide
+  an inner binding that the loop compares with the renamed one
+  (`local_use.rs:96`), and fix S's accessor clause let a lookup of another
+  value pass as a conversion (`provenance.rs:98`).
+- **Fix V — a name-bindings ticket asks only for renames, and narrows
+  accessors and shadowing** (commit `a1af8705`): the ticket line now says
+  the rule renames a binding that already exists and a finding whose change
+  only adds a binding is none, that a method taking arguments or looking up
+  another value is no accessor, and that a later inner binding is no
+  collision only when that inner block does not also read the renamed
+  binding. All 37 settled findings rename an existing binding, so the
+  change costs no recall by construction. Rerun 4 drops the traced
+  procedure's inline sentence and is measured on recall, on a blind check
+  of its new findings, and on a blind check of 30 findings rerun 2 already
+  had, each against its bar.
 - **Fix U — structure file cells are keyed by their module, not their
   crate** (commit `07d86ebe`): a structure verdict on a file inside a crate
   was keyed by the whole crate, so an edit anywhere in it made every such
