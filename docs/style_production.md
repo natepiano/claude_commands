@@ -18,7 +18,8 @@ the repository's local rule directories. This document holds the procedure.
 
 One unit director per family applies an exception decided in one crate the same
 way in every crate. Use `rules.py list` for the current classified rules and
-canonical ids; repository-local rules join their declared family.
+canonical ids. A repository-local rule of tier B, C or D declares the family
+it joins; a tier A or E rule, local or global, has no family.
 
 | Unit | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
