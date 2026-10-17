@@ -13,10 +13,11 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, cast, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
@@ -1249,7 +1250,7 @@ class LowerProductionTests(unittest.TestCase):
         middle = {**report(False), "children": [child("leaf", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1),
                                                       expand=True)]}
         with tempfile.TemporaryDirectory() as scratch:
-            summary = last_report(middle, Path(scratch) / "none.json", AT, 30)
+            summary = last_report(middle, Path(scratch) / "none.json", AT, dailies_render.ReportsEvery(30))
         self.assertEqual({key: summary[key] for key in ("written", "zone", "interval", "units", "held")},
                          {"written": AT, "zone": ZONE, "interval": 30, "units": 4, "held": 1})
         self.assertEqual(summary["rows"], [
@@ -1271,6 +1272,145 @@ class LowerProductionTests(unittest.TestCase):
                      child("kid", saved("2026-10-04T10:40", zone="Mars/Base")))
         self.refused("children[0].report.rows[0].eta: required",
                      child("kid", saved("2026-10-04T10:40", {"name": "fps", "started": "2026-10-04T09:10"})))
+
+
+class StyleSummaryFields(TypedDict):
+    rules_done: int
+    rules_total: int
+    unclassified_rules: int
+    cells_current_pct: float
+    stale: int
+    proposals: int
+    waiting_to_merge_back: int
+    oldest_waiting: str | None
+    synced_at: str
+    synced_tip: str
+
+
+def style_summary(**changed: object) -> dict[str, object]:
+    fields: StyleSummaryFields = {
+        "rules_done": 21, "rules_total": 51, "unclassified_rules": 0,
+        "cells_current_pct": 62.0, "stale": 1402, "proposals": 3,
+        "waiting_to_merge_back": 0, "oldest_waiting": None,
+        "synced_at": "2026-10-04T17:05:00+00:00", "synced_tip": "a" * 40,
+    }
+    return {**fields, **changed}
+
+
+@final
+class StyleChildReportTests(unittest.TestCase):
+    def saved_style(self, **changed: object) -> dict[str, object]:
+        return {**saved("2026-10-04T10:40", saved_row("names-unit")),
+                "style": style_summary(**changed)}
+
+    def parsed(self, fields: dict[str, object]) -> dailies_render.ChildReport:
+        return dailies_render.parse_child_report(fields, "report", ZoneInfo(ZONE))
+
+    def rendered(self, fields: dict[str, object], *, expand: bool = False) -> list[str]:
+        result = render({**report(False), "children": [child("hana-style", fields, expand=expand)]})
+        self.assertEqual(result.code, 0, result.error)
+        return result.lines
+
+    def test_legacy_report_has_no_style_line_and_keeps_its_child_row(self) -> None:
+        fields = saved("2026-10-04T10:40", saved_row("names-unit"))
+        self.assertIsInstance(self.parsed(fields).style, dailies_render.NoStyleSummary)
+        lines = self.rendered(fields)
+        self.assertEqual([line for line in lines if line.startswith("hana-style")],
+                         ["hana-style ?  2 units, 0 held"])
+        self.assertFalse(any("rules done" in line or "style summary" in line for line in lines))
+
+    def test_unavailable_summary_is_printed_directly_under_the_child_row(self) -> None:
+        fields = {**saved("2026-10-04T10:40", saved_row("names-unit")),
+                  "style": {"unavailable": "ledger database is locked"}}
+        parsed = self.parsed(fields).style
+        self.assertIsInstance(parsed, dailies_render.StyleSummaryUnavailable)
+        assert isinstance(parsed, dailies_render.StyleSummaryUnavailable)
+        self.assertEqual(parsed.reason, "ledger database is locked")
+        lines = self.rendered(fields)
+        row = next(index for index, line in enumerate(lines) if line.startswith("hana-style "))
+        self.assertEqual(lines[row + 1], "hana-style  style summary unavailable: ledger database is locked")
+
+    def test_summary_without_pending_handoffs_has_no_waiting_flag(self) -> None:
+        fields = self.saved_style()
+        parsed = self.parsed(fields).style
+        self.assertIsInstance(parsed, dailies_render.StyleSummary)
+        assert isinstance(parsed, dailies_render.StyleSummary)
+        self.assertIsInstance(parsed.waiting, dailies_render.NoPendingHandoffs)
+        self.assertEqual(parsed.synced_tip, "a" * 40)
+        self.assertEqual(parsed.synced_at, datetime(2026, 10, 4, 10, 5))
+        lines = self.rendered(fields)
+        row = next(index for index, line in enumerate(lines) if line.startswith("hana-style "))
+        self.assertEqual(lines[row + 1],
+                         "hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 10:05")
+        self.assertFalse(any("hand-off waiting" in line for line in lines))
+
+    def test_pending_handoff_is_flagged_only_after_four_hours(self) -> None:
+        for created, flag in (("2026-10-04T14:00:00+00:00", ""),
+                              ("2026-10-04T12:00:00+00:00", " · hand-off waiting 6h")):
+            with self.subTest(created=created):
+                fields = self.saved_style(waiting_to_merge_back=1, oldest_waiting=created)
+                parsed = self.parsed(fields).style
+                assert isinstance(parsed, dailies_render.StyleSummary)
+                self.assertIsInstance(parsed.waiting, dailies_render.PendingHandoffs)
+                assert isinstance(parsed.waiting, dailies_render.PendingHandoffs)
+                self.assertEqual(parsed.waiting.count, 1)
+                lines = self.rendered(fields)
+                summary = next(line for line in lines if "rules done" in line)
+                self.assertEqual(summary,
+                                 "hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 10:05" + flag)
+
+    def test_unclassified_rules_add_the_pull_instruction(self) -> None:
+        lines = self.rendered(self.saved_style(unclassified_rules=7))
+        self.assertIn("hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 10:05"
+                      + " · unclassified 7 — pull nate_style", lines)
+
+    def test_pending_handoff_age_is_elapsed_time_across_both_daylight_saving_changes(self) -> None:
+        for stamp in ("2026-03-08T08:30:00+00:00", "2026-11-01T07:30:00+00:00"):
+            with self.subTest(created=stamp):
+                created = datetime.fromisoformat(stamp)
+                at = (created + timedelta(hours=5, minutes=1)).astimezone(ZoneInfo(ZONE))
+                fields = self.saved_style(waiting_to_merge_back=1, oldest_waiting=stamp)
+                result = render({**report(False), "children": [child("hana-style", fields)]},
+                                at=at.strftime("%Y-%m-%dT%H:%M"))
+                self.assertEqual(result.code, 0, result.error)
+                summary = next(line for line in result.lines if "rules done" in line)
+                self.assertTrue(summary.endswith(" · hand-off waiting 5h"), summary)
+
+    def test_sync_from_an_earlier_day_names_its_weekday(self) -> None:
+        lines = self.rendered(self.saved_style(synced_at="2026-10-01T17:05:00+00:00"))
+        summary = next(line for line in lines if "rules done" in line)
+        self.assertTrue(summary.endswith(" · synced Thu 10:05"), summary)
+
+    def test_cells_percent_is_floored_and_reaches_one_hundred_only_when_complete(self) -> None:
+        for percentage, expected in ((99.6, 99), (100.0, 100), (0.5, 0)):
+            with self.subTest(percentage=percentage):
+                lines = self.rendered(self.saved_style(cells_current_pct=percentage, stale=1))
+                summary = next(line for line in lines if "rules done" in line)
+                self.assertIn(f" · cells {expected}% · stale 1 · ", summary)
+
+    def test_unknown_key_inside_the_style_summary_is_refused(self) -> None:
+        with self.assertRaisesRegex(dailies_render.InputError, r"report\.style.*unknown.*invented"):
+            _ = self.parsed(self.saved_style(invented=1))
+
+    def test_style_child_expansion_keeps_all_four_unit_rows(self) -> None:
+        names = ("names-unit", "types-unit", "modules-unit", "structure-unit")
+        fields = {**saved("2026-10-04T10:40", *(saved_row(name) for name in names), units=4),
+                  "style": style_summary()}
+        lines = self.rendered(fields, expand=True)
+        self.assertEqual([line.split()[0] for line in lines if line.startswith("hana-style/")],
+                         [f"hana-style/{name}" for name in names])
+        self.assertEqual(sum("rules done" in line for line in lines), 1)
+
+    def test_saved_cadence_variants_preserve_the_legacy_json_bytes(self) -> None:
+        for interval, cadence in ((None, dailies_render.ReportsOnDemand()),
+                                  (30, dailies_render.ReportsEvery(30))):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as scratch:
+                legacy = saved(AT, units=0, interval=interval)
+                parsed = self.parsed(legacy)
+                self.assertEqual(parsed.cadence, cadence)
+                current = last_report({"length": "simple", "zone": ZONE, "units": []},
+                                      Path(scratch) / "none.json", AT, cadence)
+                self.assertEqual(json.dumps(current, indent=2).encode(), json.dumps(legacy, indent=2).encode())
 
 
 if __name__ == "__main__":
