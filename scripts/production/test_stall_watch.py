@@ -453,7 +453,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         """START is 12:00 PDT: a hold ending at 14:00, dated or not, bumps only once 14:00 is past."""
         for status in ("— holding: waiting on the re-measure window, which ends 2026-10-06 14:00 PDT",
                        "— holding: waiting on the re-measure window until 14:00 PDT",
-                       "— holding: waiting on the window until 21:00 UTC"):
+                       "— holding: waiting on the window until 21:00 UTC",
+                       "— holding: waiting on the window, which opens Tue 10-06 14:00 PDT"):
             with self.subTest(status=status):
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
@@ -469,7 +470,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
     def test_a_hold_naming_a_past_time_still_bumps(self) -> None:
         """A time without a date is the nearest one: 11:50 read at 12:00 is this morning, not tonight."""
         for status in ("— holding: waiting on the tests since 11:50 PDT",
-                       "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT"):
+                       "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT",
+                       "— holding: waiting on the window, which closed Mon 10-05 14:00 PDT"):
             with self.subTest(status=status):
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
