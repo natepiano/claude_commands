@@ -140,7 +140,7 @@ def counted(count: int, noun: str) -> str:
 
 
 def table_row(name: str, progress: style_ledger.RuleCounts, counts: style_ledger.RuleCounts) -> str:
-    current = (f"{counts.current:,} of {counts.total:,} crates" if progress.tier == "D"
+    current = (f"{counts.current:,} of {counts.total:,} {'crates' if progress.input_scope == 'manifest' else 'files'}" if progress.tier == "D"
                else f"{counts.current:,} ({percent(counts.current, counts.total)}%)")
     if counts.complete:
         done = f"yes, {counts.held:,} held" if counts.held else "yes"

@@ -11,7 +11,7 @@ the repository's local rule directories. This document holds the procedure.
 | A | A full clippy, mend and rustfmt lint record per synced tip; a merge's quick gate is insufficient. |
 | B | A worker judges every listed generator site or `pre_filter` hit; a partial generator also needs the uncovered read as C. |
 | C | A worker reads each included Rust file against the rule. |
-| D | One check per crate, including its listed sites and uncovered read. |
+| D | One check per file in reach and listed site path; manifest rules check each crate. |
 | E | Governs how fixes are made; never swept or counted as coverage. |
 
 ## Families
@@ -38,7 +38,11 @@ One ticket per phase:
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
-- **Structure:** one crate, judged file by file, every distinct defect held as its own finding.
+- **Structure:** a small batch from one crate, at most 6 files and 3,000 lines,
+  keeping directories together when they fit. Judge and record each file against
+  every rule; the gate refuses the ticket while a file lacks a verdict.
+  Structure tickets opened before this change keep their crate cells until
+  they merge.
 
 Run tier D first. Structure crates are taken in order of the other-family
 pending cells they block, most first. A repair phase always precedes a new ticket.
@@ -144,7 +148,8 @@ no cells or tickets; show their count with the action **pull nate_style**.
 The Rust cell universe contains tracked, included non-vendor `.rs` files.
 Listed rules also gain cells for tracked non-Rust files holding their sites;
 those cells use file fingerprints regardless of the rule's input scope.
-Tier D has crate cells. Sources outside workspace members belong to crate `.`.
+Tier D has file cells; manifest-scope D rules keep crate cells. Sources outside
+workspace members belong to crate `.`.
 
 | Cell state | Meaning |
 | --- | --- |
@@ -172,7 +177,7 @@ A partial B rule has listed file cells and `<rule id>#uncovered` C cells for
 every included Rust file in reach. Both components must be current to finish
 the parent rule; pseudo-rules never increase the rule count. Zero listed sites
 complete only the listed component. A whole B rule or a `pre_filter`-only rule
-has no uncovered component. A partial D rule's crate cell covers both reads.
+has no uncovered component. A partial D rule's file cell covers both reads.
 
 `set-tip` fills listed sites from committed files. Coverage and site reads
 refresh sites when the rule blob changes, even at the same tip; zero-site

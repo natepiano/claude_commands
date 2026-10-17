@@ -148,6 +148,17 @@ class CoverageReportTests(unittest.TestCase):
             *(f"| {unit} | docs/{unit}.md | {self.root / unit} | main |" for unit in units), "",
         ]))
 
+
+    def test_manifest_structure_progress_counts_crates_while_file_structure_counts_files(self) -> None:
+        manifest = self.rule("manifests", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        self.record(manifest, "crates/alpha")
+        self.record(structure, self.sources[0])
+        rows = self.rows(self.report().stdout)
+        self.assertEqual(rows["manifests"].current, "1 of 2 crates")
+        self.assertEqual(rows["structure"].current, "1 of 4 files")
+
     def test_rows_cover_each_counted_tier_and_held_and_waived_judgments_still_finish_a_rule(self) -> None:
         _ = self.rule("lint", "tier: A\nmechanism: clippy\n")
         listed = self.rule("listed", "tier: B\nfamily: names\ninput_scope: file\npre_filter: value\n")
@@ -160,8 +171,8 @@ class CoverageReportTests(unittest.TestCase):
         for path in self.sources:
             self.record(listed, path)
             self.record(read, path, "held" if path == self.sources[0] else "waived")
-        for crate in ("crates/alpha", "crates/beta"):
-            self.record(structure, crate)
+        for path in self.sources:
+            self.record(structure, path)
         _ = self.held(read)
 
         output = self.report().stdout
@@ -173,7 +184,7 @@ class CoverageReportTests(unittest.TestCase):
         self.assertEqual(rows["read"].current, "4 (100%)")
         self.assertEqual(rows["read"].held, "1")
         self.assertEqual(rows["read"].done, "yes, 1 held")
-        self.assertEqual(rows["structure"].current, "2 of 2 crates")
+        self.assertEqual(rows["structure"].current, "4 of 4 files")
         self.assertEqual(rows["listed"].done, "yes")
         self.assertIn("Rules done: 4 of 4 (1 by lint)", output)
 
