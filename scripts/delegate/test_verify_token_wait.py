@@ -102,7 +102,7 @@ exit 97
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
-    *"status --porcelain"*) : ;;
+    *"status --porcelain"*|*" ls-tree "*) : ;;
     *) exit 1 ;;
 esac
 ''')

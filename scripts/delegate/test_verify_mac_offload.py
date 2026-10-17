@@ -95,6 +95,7 @@ class CargoPackageMetadata(TypedDict):
     id: str
     features: dict[str, list[str]]
     manifest_path: str
+    dependencies: list[dict[str, str]]
     targets: list[CargoTargetMetadata]
 
 
@@ -171,7 +172,7 @@ if has "$@"; then
     wanted=--short
     if has "$@"; then printf 'abc1234\n'; exit 0; fi
 fi
-for wanted in status diff ls-files; do if has "$@"; then exit 0; fi; done
+for wanted in status diff ls-files ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
 
@@ -528,6 +529,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     "id": "sample-id",
                     "features": {"default": [], "extra": []},
                     "manifest_path": str(self.root / "Cargo.toml"),
+                    "dependencies": [],
                     "targets": [
                         {
                             "name": "sample",
