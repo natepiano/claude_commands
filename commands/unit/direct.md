@@ -102,7 +102,9 @@ mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 When the production doc names a review pool, send code reviews with
 `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
-review resumes the unit's own reviewer, which is never reset.
+review resumes the unit's own reviewer, which is never reset. A refusal ending
+`no primed code template` means `review-unit` has not primed the pool yet: send
+that review to an idle worker with `--to`, and tell the showrunner once.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
