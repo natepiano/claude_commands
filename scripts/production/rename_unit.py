@@ -184,8 +184,11 @@ def _check_stopped(rename: UnitRename) -> None:
 
 
 def _check_checkout(rename: UnitRename) -> None:
+    # Untracked files are left alone: the doc commit stages only tracked changes, and the checkout
+    # keeps untracked files of its own, such as the production log, which `!docs/**` keeps visible.
     checkout = Path(rename.checkout)
-    if git(checkout, "branch", "--show-current") != rename.merge_branch or git(checkout, "status", "--porcelain"):
+    if (git(checkout, "branch", "--show-current") != rename.merge_branch
+            or git(checkout, "status", "--porcelain", "--untracked-files=no")):
         raise RenameRefused(f"showrunner checkout must be clean and on {rename.merge_branch}")
 
 
@@ -304,7 +307,7 @@ def _commit_doc(rename: UnitRename, save: Callable[[], None]) -> None:
                     write_text(path, updated)
             changed = set(git(checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
             allowed = {str(path.relative_to(checkout)) for path in (doc, *plans)}
-            if changed - allowed or git(checkout, "ls-files", "--others", "--exclude-standard"):
+            if changed - allowed:
                 raise RenameRefused("unrelated checkout changes during unit rename")
             _ = git(checkout, "add", "--", *sorted(changed))
             _ = git(checkout, "commit", "-m", rename.message)

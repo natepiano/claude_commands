@@ -365,6 +365,18 @@ class UnitRenameTests(unittest.TestCase):
                 self.assert_refused(self.rename("apply", old, new), text)
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
 
+    def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
+        for name in ("demo-log.md", "demo-log-recovered.md"):
+            self.write(self.checkout / "docs/plans" / name, "alpha-unit merged phase 2\n")
+        self.write(self.doc, self.doc.read_text() + "a tracked edit\n")
+        self.assert_refused(self.rename("apply"), "showrunner checkout must be clean")
+        _ = self.git("checkout", "--", str(self.doc))
+        self.assert_ok(self.rename("apply"))
+        self.assertEqual(self.git("ls-files", "--others", "--exclude-standard").split(),
+                         ["docs/plans/demo-log-recovered.md", "docs/plans/demo-log.md"])
+        self.assertNotIn("demo-log", self.git("show", "--name-only", "--format=", "HEAD"))
+        self.assertEqual((self.checkout / "docs/plans/demo-log.md").read_text(), "alpha-unit merged phase 2\n")
+
     def test_refuses_an_unmerged_checkpoint(self) -> None:
         worktree = self.rust / "claude-demo-alpha"
         self.write(worktree / "work.md", "phase work\n")

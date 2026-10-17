@@ -697,13 +697,17 @@ def host_session_name(request: UnitLaunch) -> str:
     """The destination name, limited to characters supported by named herdr sessions.
 
     A new launch's name leads with the production slug, since every production may have a unit of
-    the same name (each has a review-unit); a restore keeps the name its session was recorded under.
+    the same name (each has a review-unit). A restore keeps the name its session was recorded under
+    when that name leads with the slug; a record from before the slug led, such as `review`, would
+    take another production's live session of that name, so it gets the new launch's name instead.
     """
     import herdr
 
-    if isinstance(request.launch_kind, UnitRestoreLaunch):
-        return herdr.generated_session_name(request.launch_kind.host_session)
     slug = request.production.slug
+    if isinstance(request.launch_kind, UnitRestoreLaunch):
+        recorded = herdr.generated_session_name(request.launch_kind.host_session)
+        if recorded.startswith(f"{slug}-"):
+            return recorded
     name = request.identity.session
     return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
 
