@@ -8,12 +8,15 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import style_plan
 import style_proposals
@@ -555,6 +558,49 @@ class StylePlanTests(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger().database)) as connection:
             _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
             connection.commit()
+
+    def test_refill_waits_without_selecting_work_when_the_branch_point_is_unsynced(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        before = self.plan.read_bytes()
+        self.write("README.md", "Branch point moved without a sync notice.\n")
+        branch_tip = self.commit()
+        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read before sync")):
+            self.assertEqual(self.run_next(), (
+                3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_refill_selects_work_after_sync_merges_the_branch_point_into_a_distinct_style_tip(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.write("README.md", "Incoming branch-point work.\n")
+        branch_tip = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+        _ = self.git("merge", "--no-ff", "-qm", "Sync branch point", "main", cwd=self.style)
+        self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
+        self.assertNotEqual(self.tip, branch_tip)
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.count_tickets(), 1)
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_assigned_ticket_resumes_unchanged_while_the_branch_point_is_unsynced(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        before = self.plan.read_bytes()
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.write("README.md", "Branch point moved during an assigned ticket.\n")
+        _ = self.commit()
+        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read on resume")):
+            self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0], ticket)
+        self.assertEqual(self.count_tickets(), 1)
+        self.assertEqual(self.sync_wait_rows(), [])
 
     def test_sync_wait_is_recorded_until_structure_finishes_and_refill_writes_a_phase(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
