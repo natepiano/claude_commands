@@ -9,7 +9,10 @@ ids; a Codex worker member is its thread id, since a Codex worker has no Claude 
 - a showrunner to each unit director marked with its production, role `unit`;
 - a unit director to each Codex worker of its run, with the worker's role from `mesh_roster.json`;
 - a unit director to each Claude worker of its run, its member that worker's Claude session id and
-  its role the one `board.sh roles` reports for its slot.
+  its role the one `board.sh roles` reports for its slot;
+- a unit director to each pool reviewer it leases, role `review`, its member the reviewer's thread
+  id, from the review pool's `pool.json`. It also carries `unit` (the lease's unit), `thread_id`,
+  `state` (`busy` while its `busy_pid` runs, else `idle`) and `type`. Templates are left out.
 
 Only local records are read, nothing over ssh. An edge is printed while its member runs on this
 machine; its manager may run on another one, since cargo-handler joins session ids across machines,
@@ -51,6 +54,17 @@ class Edge(TypedDict):
     role: Role
 
 
+class ReviewerEdge(Edge):
+    unit: str
+    thread_id: str
+    state: Literal["busy", "idle"]
+    type: str
+
+
+def pool_root() -> Path:
+    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
+
+
 def _warn(text: str) -> None:
     print(f"production_tree: {text}", file=sys.stderr)
 
@@ -86,12 +100,15 @@ def showrunner_edges(sessions: dict[str, str], running: set[str]) -> list[Edge]:
     ]
 
 
-def unit_edges(sessions: dict[str, str], running: set[str]) -> list[Edge]:
+def marked_units() -> unit_lookup.MarkedProductions | None:
     try:
-        marked = unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit()
     except OSError as error:
         _warn(f"unit marks unreadable: {error}")
-        return []
+        return None
+
+
+def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.MarkedProductions) -> list[Edge]:
     edges: list[Edge] = []
     for slug, units in sorted(marked.units.items()):
         manager = sessions.get(slug, "")
@@ -181,6 +198,43 @@ def _claude_edges(director: str, run: Path, running: set[str]) -> list[Edge]:
     return edges
 
 
+def _pid_running(pid: object) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def reviewer_edges(running: set[str], marked: unit_lookup.MarkedProductions) -> list[ReviewerEdge]:
+    """Each leased pool reviewer under the running unit director that holds its lease."""
+    edges: list[ReviewerEdge] = []
+    for slug, units in sorted(marked.units.items()):
+        reviewers = _json_object(pool_root() / slug / "pool.json").get("reviewers")
+        if not isinstance(reviewers, dict):
+            continue
+        for _name, raw in sorted(cast(dict[str, object], reviewers).items()):
+            if not isinstance(raw, dict):
+                continue
+            reviewer = cast(dict[str, object], raw)
+            lease = reviewer.get("lease")
+            leased = cast(dict[str, object], lease).get("unit") if isinstance(lease, dict) else None
+            thread, kind = reviewer.get("thread_id"), reviewer.get("type")
+            director = units.get(leased) if isinstance(leased, str) else None
+            claude = director.claude if director is not None else None
+            if (isinstance(leased, str) and isinstance(thread, str) and thread and isinstance(kind, str)
+                    and isinstance(claude, unit_lookup.LiveClaude) and claude.session_id in running):
+                edges.append(ReviewerEdge(manager=claude.session_id, member=thread, role="review", unit=leased,
+                                          thread_id=thread,
+                                          state="busy" if _pid_running(reviewer.get("busy_pid")) else "idle",
+                                          type=kind))
+    return edges
+
+
 def worker_edges(running: set[str]) -> list[Edge]:
     edges: list[Edge] = []
     for active in unit_runs.active_dirs():
@@ -204,7 +258,9 @@ def worker_edges(running: set[str]) -> list[Edge]:
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
     sessions = showrunner_sessions()
-    return [*showrunner_edges(sessions, running), *unit_edges(sessions, running), *worker_edges(running)]
+    marked = marked_units()
+    managed: list[Edge] = [*unit_edges(sessions, running, marked), *reviewer_edges(running, marked)] if marked is not None else []
+    return [*showrunner_edges(sessions, running), *managed, *worker_edges(running)]
 
 
 def main(argv: list[str]) -> int:

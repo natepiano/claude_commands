@@ -16,10 +16,10 @@ ENTRIES = (
             "operation": "restart",
             "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),),
         session=SessionTemplate("{session}")),
-    PushText("shutdown.holdout_unanswered", "shutdown", "decision", "{session} {operation} is blocked",
-        ActionTemplate("in a terminal on {machine}, stop {session} with the command below"),
-        "Reason: {operation} is blocked because {session}'s claude session has not paused for it and it can't proceed.\n\n"
-        + "Stopping ends only that session, and the {operation} goes on. In a terminal on {machine}: {command}",
+    PushText("shutdown.holdout_unanswered", "shutdown", "decision", "Your Claude {operation} is stuck",
+        ActionTemplate("In a terminal on {machine}, stop {session} with the command below"),
+        "Your Claude {operation} waits for each session to pause. The session {session} has not paused, so the {operation} is stuck.\n\n"
+        + "Stopping it ends only that session and keeps its uncommitted work. Then the {operation} goes on.\n\n{command}",
         (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
             "operation": "restart",
             "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),

@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Select available style work and refill a unit's standing plan."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import cast
+
+SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS / "lib"))
+sys.path.insert(0, str(SCRIPTS / "production"))
+
+import berth_board
+import rules
+import style_ledger
+from add_unit import read_production
+from production_units import Refusal, cell_value, plan_cell_is_retired, production_field, unit_table
+
+FAMILIES: tuple[rules.Family, ...] = ("modules", "names", "values", "types")
+
+
+@dataclass(frozen=True)
+class PhaseWritten:
+    ticket_id: str
+
+
+@dataclass(frozen=True)
+class Resumed:
+    ticket_id: str
+
+
+@dataclass(frozen=True)
+class RepairFirst:
+    pass
+
+
+@dataclass(frozen=True)
+class WaitingForMerge:
+    ticket_id: str
+    checkpoint: str
+
+
+@dataclass(frozen=True)
+class WaitingForSync:
+    unclassified: int
+
+
+@dataclass(frozen=True)
+class TicketSelection:
+    kind: style_ledger.TicketKind
+    family: rules.Family
+    crate: str
+    files: tuple[str, ...]
+    rules: tuple[str, ...]
+    rule: str = ""
+    sites: tuple[style_ledger.ListedSite, ...] = ()
+
+
+@dataclass(frozen=True)
+class UnitWorktree:
+    unit: str
+    branch: str
+    worktree: Path
+    merge_branch: str
+
+
+@dataclass(frozen=True)
+class BusyFiles:
+    board: berth_board.Board
+    paths: frozenset[str]
+
+    def contains(self, path: str) -> bool:
+        return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
+
+
+NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | berth_board.BoardUnavailable
+
+
+def git(repo: Path, *arguments: str) -> str:
+    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise style_ledger.LedgerError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+    return result.stdout
+
+
+def style_document(repo: Path) -> Path:
+    main = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent
+    slug = main.name + "-style"
+    return main.parent / slug / "docs" / f"{slug}-production.md"
+
+
+def unit_worktrees(doc: Path) -> tuple[UnitWorktree, ...]:
+    production = read_production(doc)
+    rows = unit_table(doc.read_text().splitlines())
+    return tuple(
+        UnitWorktree(cell_value(row["Unit"]), cell_value(row["Branch"]),
+                     Path(cell_value(row["Worktree"])).expanduser(), production.merge_branch)
+        for row in rows if not plan_cell_is_retired(row.get("Plan", ""))
+    )
+
+
+def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, board: berth_board.Board) -> BusyFiles:
+    lines = doc.read_text().splitlines()
+    parent = Path(production_field(lines, "Parent production")).expanduser()
+    units = (*unit_worktrees(parent), *unit_worktrees(doc))
+    busy: set[str] = set()
+    for row in units:
+        # A retained Units row with a branch is conservatively treated as live.
+        exists = subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+                                 "refs/heads/" + row.branch.removeprefix("refs/heads/")], check=False)
+        if exists.returncode == 0:
+            busy.update(filter(None, git(repo, "diff", "--name-only", "--no-renames", "-z", f"{row.merge_branch}...{row.branch}").split("\0")))
+        if (row.worktree / ".git").exists():
+            entries = iter(git(row.worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all").split("\0"))
+            for entry in entries:
+                if not entry:
+                    continue
+                busy.add(entry[3:])
+                if "R" in entry[:2] or "C" in entry[:2]:
+                    busy.add(next(entries))
+        if row.unit != unit:
+            for ticket in ledger.ticket_open(row.unit):
+                busy.update(ticket["files"])
+    return BusyFiles(board, frozenset(busy))
+
+
+def synced_tip(ledger: style_ledger.Ledger) -> str:
+    with closing(sqlite3.connect(ledger.database)) as connection:
+        rows = cast(list[tuple[str]], connection.execute("SELECT tip FROM sync WHERE id=1").fetchall())
+    if not rows:
+        raise style_ledger.LedgerError("no synced tip; run set-tip first")
+    return rows[0][0]
+
+
+def read_slices(repo: Path, tip: str, files: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """Keep directories together, splitting only an oversized directory."""
+    directories: dict[str, list[str]] = defaultdict(list)
+    lengths = {path: len(git(repo, "show", f"{tip}:{path}").splitlines()) for path in files}
+    for path in sorted(files):
+        directories[str(PurePosixPath(path).parent)].append(path)
+    groups: list[tuple[str, ...]] = []
+    for directory in sorted(directories, key=lambda path: PurePosixPath(path).parts):
+        paths = tuple(directories[directory])
+        if len(paths) > 25 or sum(lengths[path] for path in paths) > 5000:
+            groups.extend((path,) for path in paths)
+        else:
+            groups.append(paths)
+    return balanced_slices(tuple(groups), lengths)
+
+
+def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]) -> tuple[tuple[str, ...], ...]:
+    """Prefer feasible lower bounds before minimizing and balancing slice sizes."""
+    costs = {len(groups): (0, 0, 0)}
+    ends: dict[int, int] = {}
+    for start in reversed(range(len(groups))):
+        files, lines = 0, 0
+        options: list[tuple[tuple[int, int, int], int]] = []
+        for end in range(start + 1, len(groups) + 1):
+            files += len(groups[end - 1])
+            lines += sum(lengths[path] for path in groups[end - 1])
+            if end > start + 1 and (files > 25 or lines > 5000):
+                break
+            tail = costs[end]
+            options.append(((tail[0] + int(files < 10), tail[1] + 1, tail[2] + files * files), end))
+        costs[start], ends[start] = min(options)
+    result: list[tuple[str, ...]] = []
+    start = 0
+    while start < len(groups):
+        end = ends[start]
+        result.append(tuple(path for group in groups[start:end] for path in group))
+        start = end
+    return tuple(result)
+
+
+def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
+                      family: rules.Family) -> tuple[TicketSelection, ...]:
+    cells = tuple(ledger.cells())
+    pending = tuple(cell for cell in cells if cell.state in ("open", "stale"))
+    stale = {crate: sum(cell.state == "stale" for cell in cells if cell.crate == crate)
+             for crate in {cell.crate for cell in cells}}
+    tip = synced_tip(ledger)
+    result: list[TicketSelection] = []
+    for crate in sorted(stale, key=lambda crate: (-stale[crate], crate)):
+        structure = tuple(cell for cell in pending if cell.crate == crate and cell.tier == "D")
+        if structure:
+            if family == "modules":
+                files = ledger.rust_files(crate)
+                rule_ids = tuple(sorted({cell.rule for cell in structure}))
+                sites = tuple(site for rule_id in rule_ids for site in ledger.listed_sites(rule_id, crate))
+                available = tuple(path for path in sorted(set(files) | {site.path for site in sites}) if not busy.contains(path))
+                if available:
+                    result.append(TicketSelection("structure", family, crate, available, rule_ids,
+                                                  sites=tuple(site for site in sites if site.path in available)))
+            continue
+        own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family and not busy.contains(cell.path))
+        for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
+            files = {cell.path for cell in own if cell.rule == rule_id}
+            sites_by_file: dict[str, list[style_ledger.ListedSite]] = defaultdict(list)
+            for site in ledger.listed_sites(rule_id, crate):
+                if site.path in files:
+                    sites_by_file[site.path].append(site)
+            packed: list[style_ledger.ListedSite] = []
+            for path in sorted(sites_by_file):
+                sites = sites_by_file[path]
+                if packed and len(packed) + len(sites) > 150:
+                    result.append(TicketSelection("listed", family, crate, tuple(dict.fromkeys(site.path for site in packed)),
+                                                  (rule_id,), rule_id, tuple(packed)))
+                    packed = []
+                packed.extend(sites)
+            if packed:
+                result.append(TicketSelection("listed", family, crate, tuple(dict.fromkeys(site.path for site in packed)),
+                                              (rule_id,), rule_id, tuple(packed)))
+        read_rules: dict[str, set[str]] = defaultdict(set)
+        for cell in own:
+            if cell.tier == "C":
+                read_rules[cell.path].add(cell.rule)
+        by_rules: dict[tuple[str, ...], list[str]] = defaultdict(list)
+        for path, rule_ids in sorted(read_rules.items()):
+            by_rules[tuple(sorted(rule_ids))].append(path)
+        for rule_ids, paths in sorted(by_rules.items()):
+            for files in read_slices(repo, tip, tuple(paths)):
+                result.append(TicketSelection("read", family, crate, files, rule_ids))
+    return tuple(result)
+
+
+def delegation_context(text: str) -> str:
+    match = re.search(r"(?ms)^## Delegation Context\n(.*?)(?=^## |\Z)", text)
+    if match is None:
+        raise style_ledger.LedgerError("plan lacks Delegation Context")
+    return match.group(1).strip()
+
+
+def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
+               context: str) -> str:
+    ticket_id = ticket["id"]
+    number = ticket_id.rsplit("-", 1)[1]
+    rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
+    sites = [f"- {json.dumps(site, sort_keys=True, ensure_ascii=False)}" for site in ticket["sites"]]
+    uncovered = [f"- `{pinned.rule_id}` uncovered: {match.group(1).strip()}"
+                 for pinned in texts
+                 if ticket["kind"] == "structure" or pinned.rule_id.endswith("#uncovered")
+                 for match in re.finditer(r"(?m)^\s+uncovered:\s*(.+)$", pinned.text.decode())]
+    workers = "2 writers; split files by subtree." if len(ticket["files"]) > 12 else (
+        "1 writer + 1 tester; the tester opens as impl and re-reads the diff against the pinned rules."
+    )
+    return "\n".join([
+        f"### Phase {number} — {ticket_id}  · status: todo", "", "#### Work Order", "", context, "",
+        "**Goal:**", f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below.",
+        "", "**Spec:**", *rule_lines, *sites, *uncovered,
+        "Every structure finding is held as a proposal. Apply only mechanical findings from other tickets.",
+        "Read only these pinned rule texts. For a structure ticket, judge each rule's listed sites and its uncovered surface together; "
+        + "read the uncovered instructions in the pinned text. A #uncovered rule is the parent rule's uncovered read.",
+        "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
+        "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: "
+        + f"`style_ledger.py held add --ticket {ticket_id}` with rule, site path, line and text, kind, before and after; "
+        + "record that cell with `record --verdict held`.",
+        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
+        "", "**Files:**", *(f"- `{path}`" for path in ticket["files"]), "", "**Workers:**", workers, "",
+        "**Acceptance gate:**", "For each touched package run:",
+        "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
+        "`bash ~/.claude/scripts/delegate/verify.sh test <package>`",
+        "`bash ~/.claude/scripts/delegate/verify.sh lint <package>`",
+        f"`~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base {ticket['base']} --head HEAD`",
+        "Every ticket cell has a recorded verdict.", "",
+    ])
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as temporary:
+        staged = Path(temporary.name)
+        try:
+            _ = temporary.write(data)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(staged, path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, plan: Path, text: str) -> None:
+    texts = ledger.pinned_rule_texts(ticket["id"])
+    ticket["base"] = ledger.ticket_base(ticket["id"])
+    phase = phase_text(ticket, texts, plan, delegation_context(text))
+    for pinned in texts:
+        path = plan.parent.parent / "rules" / (pinned.blob + ".md")
+        if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
+            atomic_write(path, pinned.text)
+    if any(match.group("id") == ticket["id"] for match in PHASE.finditer(text)):
+        updated = PHASE.sub(lambda match: phase if match.group("id") == ticket["id"] else match.group(0), text)
+        if updated != text:
+            atomic_write(plan, updated.encode())
+        return
+    heading = re.search(r"^## Phases\s*$", text, re.MULTILINE)
+    if heading is None:
+        raise style_ledger.LedgerError("plan lacks Phases heading")
+    following = re.search(r"^## ", text[heading.end():], re.MULTILINE)
+    end = heading.end() + following.start() if following else len(text)
+    atomic_write(plan, (text[:end].rstrip() + "\n\n" + phase + text[end:]).encode())
+
+
+PHASE = re.compile(r"(?ms)^### Phase \d+ — (?P<id>[^\s]+)[^\n]*(?:\n|\Z).*?(?=^### Phase |^## |\Z)")
+
+
+def discard_finished(ledger: style_ledger.Ledger, text: str) -> tuple[str, tuple[str, ...]]:
+    with closing(sqlite3.connect(ledger.database)) as connection:
+        states = dict(cast(list[tuple[str, str]], connection.execute("SELECT id,state FROM tickets").fetchall()))
+    changes: list[str] = []
+    def keep(match: re.Match[str]) -> str:
+        ticket_id = match.group("id")
+        state = states.get(ticket_id, "")
+        if state in ("merged", "dropped"):
+            changes.append(f"discarded {ticket_id}: {state}")
+            return ""
+        return match.group(0)
+    return PHASE.sub(keep, text), tuple(changes)
+
+
+def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
+    plan, repo = plan.expanduser().resolve(), repo.expanduser().resolve()
+    doc = style_document(repo)
+    row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
+    if row is None:
+        raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
+    expected = row.worktree.resolve() / "docs/style-production/units" / (unit + ".md")
+    if plan != expected:
+        raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
+    original = plan.read_text()
+    if any("repair" in line.lower() and re.search(r"status:\s*todo", line) for line in original.splitlines() if line.startswith("### Phase ")):
+        return RepairFirst()
+    with style_ledger.open_ledger(repo) as ledger:
+        text, changes = discard_finished(ledger, original)
+        if text != original:
+            atomic_write(plan, text.encode())
+        for change in changes:
+            print(change)
+        opened = ledger.ticket_open(unit)
+        if opened:
+            ticket = opened[0]
+            if ticket["state"] == "checkpointed":
+                return WaitingForMerge(ticket["id"], ticket["checkpoint"])
+            write_phase(ledger, ticket, plan, text)
+            return Resumed(ticket["id"])
+        board = berth_board.read_board(repo)
+        if isinstance(board, berth_board.BoardUnavailable):
+            return board
+        busy = busy_files(repo, doc, ledger, unit, board)
+        queued = ledger.queued_tickets(unit)
+        for index, ticket in enumerate(queued):
+            if index == 0 and not any(busy.contains(path) for path in ticket["files"]):
+                ledger.ticket_assign(ticket["id"], row.branch)
+                for extra in queued[1:]:
+                    ledger.ticket_drop(extra["id"])
+                    print(f"dropped {extra['id']}: files busy")
+                write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+                return PhaseWritten(ticket["id"])
+            ledger.ticket_drop(ticket["id"])
+            print(f"dropped {ticket['id']}: files busy")
+        family = unit.removesuffix("-unit")
+        if family not in FAMILIES:
+            raise style_ledger.LedgerError(f"{unit}: unknown style family")
+        candidates = candidate_tickets(repo, ledger, busy, family)
+        if not candidates:
+            return WaitingForSync(len(ledger.unclassified_rules()))
+        selected = candidates[0]
+        ticket_id = ledger.next_ticket_id(unit)
+        ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
+                          list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites])
+        ledger.ticket_assign(ticket_id, row.branch)
+        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        return PhaseWritten(ticket_id)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    refill = sub.add_parser("next-phase")
+    _ = refill.add_argument("--unit", required=True)
+    _ = refill.add_argument("--plan", type=Path, required=True)
+    _ = refill.add_argument("--repo", type=Path, required=True)
+    queue = sub.add_parser("queue")
+    _ = queue.add_argument("--repo", type=Path, required=True)
+    _ = queue.add_argument("--unit")
+    args = cast(PlanArguments, parser.parse_args(argv))
+    try:
+        if args.command == "queue":
+            board = berth_board.read_board(args.repo)
+            if isinstance(board, berth_board.BoardUnavailable):
+                print(f"board unavailable: {board.reason}")
+                return 4
+            with style_ledger.open_ledger(args.repo) as ledger:
+                doc = style_document(args.repo)
+                busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
+                for family in FAMILIES:
+                    unit = family + "-unit"
+                    if args.unit and args.unit != unit:
+                        continue
+                    for ticket in candidate_tickets(args.repo, ledger, busy, family):
+                        print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
+            return 0
+        result = next_phase(args.unit, args.plan, args.repo)
+        match result:
+            case PhaseWritten(ticket_id):
+                print(f"phase written: {ticket_id}")
+            case Resumed(ticket_id):
+                print(f"resume {ticket_id}")
+            case RepairFirst():
+                print("repair first")
+            case WaitingForMerge(ticket_id, checkpoint):
+                print(f"waiting for merge: {ticket_id} checkpointed at {checkpoint[:7]}")
+                return 5
+            case berth_board.BoardUnavailable(reason):
+                print(f"board unavailable: {reason}")
+                return 4
+            case WaitingForSync(unclassified):
+                print("waiting for sync")
+                if unclassified:
+                    print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
+                return 3
+        return 0
+    except (OSError, ValueError, Refusal, sqlite3.Error) as error:
+        print(f"style_plan: {error}", file=sys.stderr)
+        return 2
+
+
+class PlanArguments(argparse.Namespace):
+    command: str = ""
+    repo: Path = Path()
+    unit: str = ""
+    plan: Path = Path()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

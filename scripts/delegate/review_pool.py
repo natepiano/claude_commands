@@ -328,6 +328,32 @@ def command_prime(args: PoolArguments) -> int:
     return 0
 
 
+def rename_unit(production: str, old: str, new: str) -> int:
+    """Carry a renamed unit's reviewers and memory to its new id; returns the leases moved.
+
+    Thread ids and ordinals stay, so the unit keeps the reviewers that already know it.
+    """
+    pool_dir = _production(production)
+    if not pool_dir.directory.exists():
+        return 0
+    moved = 0
+    with pool_dir.locked() as pool:
+        for reviewer in pool.reviewers.values():
+            lease = reviewer.lease
+            if isinstance(lease, UnitLease) and lease.unit == new:
+                raise PoolError(f"a reviewer is already leased to {new}")
+            if isinstance(lease, UnitLease) and lease.unit == old:
+                reviewer.lease = UnitLease(new, lease.ordinal)
+                moved += 1
+        memory = pool_dir.directory / "memory"
+        source, destination = memory / f"{old}.md", memory / f"{new}.md"
+        if source.exists():
+            if destination.exists():
+                raise PoolError(f"memory for {new} already exists")
+            _ = source.rename(destination)
+    return moved
+
+
 def command_unit_memory(args: PoolArguments) -> int:
     if not args.unit or Path(args.unit).name != args.unit or args.unit in (".", ".."):
         raise PoolError("unit must name one memory file")

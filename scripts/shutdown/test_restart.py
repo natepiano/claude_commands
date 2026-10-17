@@ -56,6 +56,21 @@ RESTARTED = "2026-10-10T01:02:03+00:00"
 EMPTY_SESSION_IDS: frozenset[str] = frozenset()
 
 
+# herdr 0.9.0, Mac, 2026-10-16 19:47 EDT: verbatim startup-shell list entries.
+STARTUP_PANE_JSON = '{"agent_status":"unknown","cwd":"/Users/natemccoy","focused":false,"foreground_cwd":"/Users/natemccoy","pane_id":"wG:p1","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":61},"tab_id":"wG:t1","terminal_id":"term_65dfdc73afbe63","workspace_id":"wG"}'
+STARTUP_WORKSPACE_JSON = '{"active_tab_id":"wG:t1","agent_status":"unknown","focused":false,"label":"~","number":1,"pane_count":1,"tab_count":1,"workspace_id":"wG"}'
+
+
+def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    """Adapt the captured shell's identity and home directory for this fixture."""
+    workspace = herdr.decode_object(STARTUP_WORKSPACE_JSON, "captured startup workspace")
+    pane = herdr.decode_object(STARTUP_PANE_JSON, "captured startup pane")
+    workspace.update(workspace_id=workspace_id, active_tab_id=workspace_id + ":t1")
+    pane.update(workspace_id=workspace_id, pane_id=workspace_id + ":p1", tab_id=workspace_id + ":t1",
+                cwd=str(Path.home()), foreground_cwd=str(Path.home()))
+    return workspace, pane
+
+
 class RestartAttemptTime(datetime):
     @classmethod
     @override
@@ -374,6 +389,136 @@ class RestartTests(ShutdownTestCase):
         saved["why"] = "weekly refusal"
         self.create([saved])
         return saved
+
+    def test_confirmed_unit_restart_sends_one_resume_message_for_all_recorded_seats(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        for moved in (False, True):
+            with self.subTest(account_move=moved):
+                owner = unit("resume-moved" if moved else "resume-plain")
+                owner["cwd"] = str(self.root / "working directory")
+                run = self.root / "worker run"
+                run.mkdir(exist_ok=True)
+                old_prompt = str(run / "old prompt.md")
+                launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
+                            "task", "task instructions", "impl", "continue task", "0", "impl", "mesh-prefix"]
+                seats = [
+                    record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
+                    record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="private-thread-review", turn_live=False, launcher_command=[]),
+                    record.PausedSeat(run_dir=str(run), seat="test", role="test", thread_id="private-thread-test", turn_live=True, launcher_command=[]),
+                ]
+                saved = entry(owner)
+                saved["codex_seats"] = seats
+                if moved:
+                    saved["target"] = "claude3"
+                    saved["source_label"] = LABEL
+                self.create([saved])
+                run_commands = CommandRecorder()
+                live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                with (patch.object(restart, "_run", run_commands),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude3"))):
+                    restart.confirm_entry(saved, RESTARTED, True)
+                sends = [argv for argv in run_commands.calls if "--key" in argv and "resume-workers-" + owner["session_id"] in argv]
+                self.assertEqual(len(sends), 1)
+                argv = sends[0]
+                self.assertIn(str(restart.SEND), argv)
+                self.assertEqual(argv[argv.index("--to") + 1], "session:" + owner["session_id"])
+                self.assertEqual(argv[argv.index("--from") + 1], "shutdown")
+                text = argv[argv.index("--text") + 1]
+                lines = text.splitlines()
+                self.assertEqual(lines[0], "Resume your Codex workers; do not open new ones.")
+                self.assertEqual(lines[-1], "Each seat continues its own thread; after resuming, send later work with --to as usual.")
+                work_line = next(line for line in lines if line.startswith("impl (impl, was working):"))
+                expected = list(launcher) if moved else [*launcher[:4], "--to", "impl", *launcher[4:]]
+                expected[expected.index(old_prompt)] = str(run / "impl.resume-prompt.md")
+                # Shell parsing preserves every original argument, including spaces.
+                self.assertIn(shlex.join(expected), work_line)
+                # Seats with no readable launcher get every launcher argument, ready to run as pasted.
+                idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
+                self.assertTrue(idle_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "review.sh"), "--to", "review", str(run), owner["cwd"],
+                    str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
+                unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
+                self.assertTrue(unread_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
+                self.assertNotIn("usual arguments", text)
+                self.assertIn(owner["cwd"], text)
+                self.assertNotIn(old_prompt, text)
+                self.assertNotIn("private-thread-", text)
+                persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
+                self.assertEqual(persisted["progress"]["kind"], "restarted")
+
+    def test_confirmed_top_level_restart_with_a_paused_seat_also_gets_the_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        owner = top_level("standalone-run")
+        saved = entry(owner)
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread",
+                                                  turn_live=False, launcher_command=[])]
+        self.create([saved])
+        commands = CommandRecorder()
+        with patch.object(restart, "_run", commands):
+            restart.confirm_entry(saved, RESTARTED, True)
+        sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][sends[0].index("--to") + 1], "session:" + owner["session_id"])
+        self.assertIn("implement.sh --to impl", sends[0][sends[0].index("--text") + 1])
+
+    def test_move_on_the_source_account_receives_no_worker_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        saved = entry(unit("source-still-live"))
+        saved["target"] = "claude3"
+        saved["source_label"] = LABEL
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept", turn_live=True, launcher_command=[])]
+        self.create([saved])
+        owner = saved["session"]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        commands = CommandRecorder()
+        with (patch.object(restart, "_run", commands),
+              patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2"))):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(commands.calls, [])
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
+
+    def test_confirmed_restart_without_seats_and_unconfirmed_restart_send_no_resume_message(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        for live, seats in ((True, []), (False, [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread", turn_live=True, launcher_command=[])])):
+            with self.subTest(live=live):
+                saved = entry(unit("empty" if live else "not-back"))
+                saved["codex_seats"] = seats
+                self.create([saved])
+                commands = CommandRecorder()
+                with patch.object(restart, "_run", commands):
+                    restart.confirm_entry(saved, RESTARTED, live)
+                self.assertFalse(any("--key" in argv and any(value.startswith("resume-workers-") for value in argv) for argv in commands.calls))
+                self.assertEqual(saved["progress"]["kind"], "restarted" if live else "restart failed")
+
+    def test_resume_message_failure_is_logged_once_and_does_not_fail_restart(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        saved = entry(unit("queued-workers"))
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept-thread", turn_live=True, launcher_command=[])]
+        self.create([saved])
+        calls: list[list[str]] = []
+
+        def failed_send(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.CompletedProcess[str]:
+            del dry_run, check
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "QUEUED: director has no socket\n", "")
+
+        with (patch.object(restart, "_run", failed_send),
+              patch.object(syslog, "syslog") as logged,
+              redirect_stderr(io.StringIO()) as errors,
+              redirect_stdout(io.StringIO()) as output):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(saved["progress"]["kind"], "restarted")
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
+        log_lines = [*errors.getvalue().splitlines(), *output.getvalue().splitlines(), *[str(cast(object, call.args[-1])) for call in logged.call_args_list]]
+        self.assertEqual(len(log_lines), 1)
+        self.assertIn("resume", log_lines[0].lower())
 
     def test_live_source_account_cannot_confirm_a_move(self) -> None:
         saved = self.moved_record()
@@ -1000,6 +1145,7 @@ class RestartTests(ShutdownTestCase):
                 owner["host"] = host
                 name = "kept-name" if host["kind"] == "terminal" else "writing"
                 self.configure_mac_bootstrap(responses, name)
+                self.configure_startup_shell(responses, name)
                 log.unlink(missing_ok=True)
                 state = restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession())
                 with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
@@ -1019,7 +1165,64 @@ class RestartTests(ShutdownTestCase):
                 self.assertLess(calls.index(["--session", name, "status", "server"], calls.index(opener)), calls.index(created))
                 self.assertLess(calls.index(created), calls.index(start))
                 self.assertLess(calls.index(prompt), calls.index(focus))
-                self.assertFalse(any(row[2:4] == ["workspace", "close"] for row in calls))
+                closed = ["--session", name, "workspace", "close", "w9"]
+                self.assertLess(calls.index(focus), calls.index(closed))
+                self.assertEqual([row for row in calls if row[2:4] == ["workspace", "close"]], [closed])
+
+    def configure_startup_shell(self, responses: Path, name: str) -> None:
+        replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+        workspace, pane = startup_shell("w9")
+        replies[f"--session {name} workspace list"] = [
+            {"stdout": json.dumps({"result": {"workspaces": []}}), "code": 0},
+            {"stdout": json.dumps({"result": {"workspaces": [
+                workspace,
+                dict(workspace_id="w2", label=name)]}}), "code": 0}]
+        replies[f"--session {name} pane list"] = {"stdout": json.dumps({"result": {"panes": [pane]}}), "code": 0}
+        _ = responses.write_text(json.dumps(replies))
+
+    def test_window_restore_survives_startup_workspace_read_or_close_failure_with_one_session_issue(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        for failed in ("workspace list", "pane list", "workspace close w9"):
+            with self.subTest(failed=failed):
+                self.configure_mac_bootstrap(responses, "writing")
+                self.configure_startup_shell(responses, "writing")
+                replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+                failure = CommandResponse(stdout="", code=1, stderr="cleanup refused")
+                if failed in {"workspace list", "pane list"}:
+                    field = "workspaces" if failed == "workspace list" else "panes"
+                    replies[f"--session writing {failed}"] = [
+                        CommandResponse(stdout=json.dumps({"result": {field: []}}), code=0), failure]
+                else:
+                    replies[f"--session writing {failed}"] = failure
+                _ = responses.write_text(json.dumps(replies))
+                log.unlink(missing_ok=True)
+                state = restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession())
+                with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+                      patch.object(herdr, "stop_created_server", side_effect=AssertionError("running agent stopped")),
+                      redirect_stdout(io.StringIO()) as output):
+                    result = restart._launch_session(entry(owner), "restart", state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                issues = [line for line in output.getvalue().splitlines() if "restart issue:" in line]
+                self.assertEqual(len(issues), 1)
+                self.assertIn("writing", issues[0])
+                self.assertIn("cleanup refused", issues[0])
+                calls = self.herdr_calls(log)
+                self.assertIn(["--session", "writing", "workspace", "focus", "w2"], calls)
+                self.assertEqual(len([row for row in calls if row[2:4] == ["agent", "start"]]), 1)
+
+    def test_detached_restore_does_not_list_or_close_startup_workspaces_on_either_platform(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        for platform in ("linux", "darwin"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(herdr, "_PLATFORM", platform),
+                  patch.object(herdr, "restore_server", return_value=herdr.ServerCreated())):
+                log.unlink(missing_ok=True)
+                result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                calls = self.herdr_calls(log)
+                self.assertTrue(any(row[2:4] == ["agent", "start"] for row in calls))
+                self.assertFalse(any(row[2:4] in (["workspace", "list"], ["workspace", "close"])
+                                     for row in calls))
 
     def test_ssh_mac_refusal_keeps_claude_records_restartable_and_reaches_peer_json(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -1073,6 +1276,7 @@ class RestartTests(ShutdownTestCase):
         snapshot, saved, responses, log = self.codex_recovery_fixture(attached=True)
         name = "trusted-folder-codex-01f232c067f3d73a"
         self.configure_mac_bootstrap(responses, name)
+        self.configure_startup_shell(responses, name)
         state = restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession())
         with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
               patch.object(restart, "_herdr_window", side_effect=AssertionError("second window"))):
@@ -1082,9 +1286,35 @@ class RestartTests(ShutdownTestCase):
         start = next(row for row in calls if row[2:4] == ["agent", "start"])
         self.assertLess(calls.index(opener), calls.index(start))
         self.assertLess(calls.index(start), calls.index(["--session", name, "workspace", "focus", "w2"]))
+        self.assertLess(calls.index(["--session", name, "workspace", "focus", "w2"]),
+                        calls.index(["--session", name, "workspace", "close", "w9"]))
         remaining = record.read_snapshot(snapshot["login"])
         assert not isinstance(remaining, record.NoRecoverySnapshot)
         self.assertEqual(remaining["sessions"], [])
+
+    def test_codex_window_cleanup_failure_keeps_the_agent_and_acknowledges_its_snapshot(self) -> None:
+        snapshot, saved, responses, log = self.codex_recovery_fixture(attached=True)
+        name = "trusted-folder-codex-01f232c067f3d73a"
+        self.configure_mac_bootstrap(responses, name)
+        self.configure_startup_shell(responses, name)
+        replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+        replies[f"--session {name} workspace close w9"] = CommandResponse(stdout="", code=1, stderr="shell close refused")
+        _ = responses.write_text(json.dumps(replies))
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(herdr, "stop_created_server", side_effect=AssertionError("Codex stopped")),
+              redirect_stdout(io.StringIO()) as output):
+            restart._launch_codex_snapshot(snapshot, saved,  # pyright: ignore[reportPrivateUsage]
+                restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession()), dry_run=False)
+        remaining = record.read_snapshot(snapshot["login"])
+        assert not isinstance(remaining, record.NoRecoverySnapshot)
+        self.assertEqual(remaining["sessions"], [])
+        issues = [line for line in output.getvalue().splitlines() if "restart issue:" in line]
+        self.assertEqual(len(issues), 1)
+        self.assertIn(name, issues[0])
+        self.assertIn("shell close refused", issues[0])
+        calls = self.herdr_calls(log)
+        self.assertLess(calls.index(["--session", name, "workspace", "focus", "w2"]),
+                        calls.index(["--session", name, "workspace", "close", "w9"]))
 
     def test_mac_terminal_without_live_supervisor_resumes_in_herdr_and_opens_ghostty_attach(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -2624,6 +2854,13 @@ class RestartTests(ShutdownTestCase):
         lines = [line for line in result["lines"] if "manual restart kept name:" in line]
         self.assertEqual(len(lines), 1, "\n".join(result["lines"]))
         self.assertIn(restart.resume_command(saved["session"], "claude3", LABEL), lines[0])
+
+    def test_a_renamed_unit_hears_its_new_names_first(self) -> None:
+        saved = entry(unit("unit"))
+        saved["renamed"] = "While you were stopped the showrunner renamed you: you are now gamma-unit."
+        note = restart.restart_note(saved, RESTARTED)
+        self.assertTrue(note.startswith(saved["renamed"] + " Restarted after /shutdown"), note)
+        self.assertNotIn("renamed you", restart.restart_note(entry(unit("unit")), RESTARTED))
 
     def test_move_restart_note_names_source_target_reason_and_continuation_for_every_session_kind(self) -> None:
         for owner in (top_level("top"), unit("unit"), showrunner("runner")):

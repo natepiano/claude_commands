@@ -718,6 +718,30 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
         self.assertEqual(self.sent(), [])
 
+    def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        kept = self.checkout / "productions/example-production.md"
+        kept.parent.mkdir()
+        _ = self.git("mv", str(self.doc), str(kept))
+        _ = self.git("commit", "-m", "keep the doc in productions/")
+        _ = self.git("push", "origin", "production")
+        self.doc = kept
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        relative = "archive/checkout/example/example-production.md"
+        archived = self.checkout / relative
+        self.assertIn(f"wrap: ok — moved the doc out of productions/ to {relative}", result.stdout)
+        self.assertFalse(kept.exists())
+        self.assertIn("wrapped", archived.read_text())
+        self.assertEqual(self.git("status", "--short"), "")
+        moved = self.git("show", "--name-status", "--format=%s", "HEAD")
+        self.assertIn("production(example): wrapped", moved)
+        self.assertIn(relative, moved)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
+
     def test_wrap_names_herdr_and_tmux_sessions_for_close_out(self) -> None:
         self.merged_units()
         result = self.run_lifecycle("wrap", "--no-ci")

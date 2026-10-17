@@ -3200,6 +3200,38 @@ class MeshCommandTests(unittest.TestCase):
     def test_swap_resumes_socketless_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=False, ended_run=True)
 
+    def test_account_move_between_marker_read_and_idle_check_resumes_same_thread(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.server.hold_turn_completion = False
+        interrupted = False
+
+        def interrupt_after_marker_read(session_dir: str, name: str, thread_id: str) -> bool:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                self.assertEqual(thread_id, THREAD_ID)
+                self.assertEqual(self.live_turn, "turn-1")
+                self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+                self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+                self.assertEqual(agent_accounts.workers_home(), target)
+                move = codex_mesh._interrupt_worker_for_account_move(  # pyright: ignore[reportPrivateUsage]
+                    session_dir, name, self.worker_record(), self.server.port, "codex1")
+                self.assertIsInstance(move, codex_mesh.InterruptedWorkerMove)
+                self.assertEqual(self.live_turn, "")
+            return False
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", side_effect=interrupt_after_marker_read),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            code, errors = self.run_start()
+
+        self.assertTrue(interrupted)
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertNotIn("idle with no completion notice", output.getvalue() + errors)
+        self.assertNotIn("no completion notice arrived", (self.session_dir / "worker.log").read_text())
+
     def test_sign_in_change_resumes_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=True, ended_run=True)
 
@@ -4770,6 +4802,66 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("timed out", errors)
         self.assertEqual(self.methods("thread/start"), [])
+
+    def test_stop_pause_interrupts_live_work_drops_messages_and_preserves_threads(self) -> None:
+        entries: dict[str, object] = {
+            "working": {"thread_id": THREAD_ID, "status": "running", "turn_id": "live-turn", "role": "impl"},
+            "idle": {"thread_id": "idle-thread", "status": "done", "role": "review"},
+            "ended": {"thread_id": "ended-thread", "status": "ended", "role": "impl"},
+        }
+        self.write_pool_roster(entries)
+        self.live_turn = "live-turn"
+        self.thread_statuses["idle-thread"] = "idle"
+        self.queued = [{"id": "queued-task"}]
+        ended_marker = codex_mesh._end_marker_path(str(self.session_dir), "ended")  # pyright: ignore[reportPrivateUsage]
+        ended_marker.touch()
+        with patch.object(codex_mesh, "_reap") as reap:
+            code, _output, errors = self.run_mesh(["stop", "--pause"])
+        self.assertEqual((code, errors), (0, ""))
+        reap.assert_called_once_with(os.getpid())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+        roster = self.roster()
+        for seat, previous, live in (("working", "running", True), ("idle", "done", False)):
+            paused = cast(dict[str, object], roster[seat])
+            self.assertEqual(paused["status"], "paused")
+            self.assertEqual(paused["paused_from"], previous)
+            self.assertIs(paused["paused_turn"], live)
+            self.assertFalse(codex_mesh._end_marker_path(str(self.session_dir), seat).exists())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(cast(dict[str, object], roster["working"])["thread_id"], THREAD_ID)
+        self.assertEqual(roster["ended"], entries["ended"])
+        self.assertTrue(ended_marker.exists())
+        self.assertEqual(self.queued, [])
+        interrupts = self.methods("turn/interrupt")
+        self.assertEqual(len(interrupts), 1)
+        self.assertEqual(cast(dict[str, object], interrupts[0]["params"]), {"threadId": THREAD_ID, "turnId": "live-turn"})
+
+    def test_launcher_completion_after_pause_cannot_overwrite_resume_metadata(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "running", "role": "impl", "turn_id": "live-turn",
+        }})
+        self.live_turn = "live-turn"
+        with patch.object(codex_mesh, "_reap"):
+            code, _output, errors = self.run_mesh(["stop", "--pause"])
+        self.assertEqual((code, errors), (0, ""))
+        # An interrupted launcher's final completion/failure writes arrive after stop.
+        late_records: list[codex_mesh.FollowableRecord] = [
+            {"thread_id": THREAD_ID, "status": "done"},
+            {"thread_id": THREAD_ID, "status": "failed"},
+        ]
+        for late_record in late_records:
+            codex_mesh._update_roster(str(self.session_dir), "worker", late_record)  # pyright: ignore[reportPrivateUsage]
+            entry = self.worker_record()
+            self.assertEqual(entry["status"], "paused")
+            self.assertEqual(entry["paused_from"], "running")
+            self.assertIs(entry["paused_turn"], True)
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)):
+            code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertNotIn("paused_from", self.worker_record())
+        self.assertNotIn("paused_turn", self.worker_record())
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(len(self.methods("thread/resume")), 1)
 
     def test_end_interrupts_real_id_when_read_has_no_turn(self) -> None:
         """An active status without persisted turn uses a real id."""

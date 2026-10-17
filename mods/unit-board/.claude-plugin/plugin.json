@@ -1,0 +1,9 @@
+{
+  "name": "unit-board",
+  "version": "0.1.0",
+  "description": "An on-demand production board and unit detail pane.",
+  "author": {
+    "name": "Nate"
+  },
+  "types": "./types/index.d.ts"
+}

@@ -233,7 +233,9 @@ if "--copy" in arguments:
         claimed = True
     with (root / "copy-events.jsonl").open("a", encoding="utf-8") as output:
         output.write(json.dumps(arguments) + "\n")
-    (root / "copy-started").write_text(str(os.getpid()), encoding="utf-8")
+    # Renamed into place, so the test never reads it before the pid is written.
+    (root / "copy-started.tmp").write_text(str(os.getpid()), encoding="utf-8")
+    os.replace(root / "copy-started.tmp", root / "copy-started")
     if os.environ.get("TEST_COPY_WAIT") == "1":
         while not (root / "copy-release").exists():
             time.sleep(0.01)

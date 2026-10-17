@@ -604,3 +604,53 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Gotchas:** a locked or logged-out Mac makes Ghostty start with no child, so the window never starts the server. herdr relaunches session.json panes when a server starts. A session with a pending restart record is left out of snapshots. A herdr server started from an ssh login cannot read the keychain, so Claude comes back signed out.
 
 **Ruled out:** an ownership-token proof for a window-started server (gold plating; such a server is never stopped instead).
+
+### Phase 22 — Codex restores land in their conversation  · status: done
+
+#### As-built
+
+- A recovery snapshot records a talked-to Codex session as `CodexSessionId`, so restart runs `codex resume <id>` and opens the conversation; a session that never talked stays `CodexResumePicker`. `restart.py` is unchanged.
+- `_observed_codex_resume(reader, process, home, cwd) -> CodexSessionId | CodexResumePicker` tries `reader.rollout(process, home)` first (open rollout via `/proc/<pid>/fd` on Linux, `herdr.darwin_open_files` on Darwin; `CodexDescriptorsUnreadable` counts as picker), then falls back to `_codex_disk_resume(home, cwd, reader.started_at(process))`. The same fallback serves both platforms.
+- `_codex_disk_resume(home: Path, cwd: str, started: datetime)` reads only the first line (`session_meta`) of each `rollout-<time>-<id>.jsonl` and keeps those whose `payload.cwd` equals the process cwd, `payload.timestamp` is at or after process start, and `payload.id` matches the filename id. One match gives the id; none or several give the picker. Vanished or unparseable rollouts are skipped. `session_index.jsonl` is not used.
+- `_codex_rollout_paths(root: Path, first_day: date) -> Iterator[Path]` walks `<CODEX_HOME>/sessions/YYYY/MM/DD` with `iterdir` from the process start's local date on; any `OSError` other than a missing root raises `ObservationFailure`, which makes the snapshot partial.
+- `started_at(process) -> datetime` on each reader returns the process start in UTC: Linux from `/proc` start ticks plus `btime`, Darwin from `lstart` read with `LC_ALL=C TZ=UTC`.
+
+**Files:**
+- `scripts/shutdown/inventory.py` — open-rollout lookup, disk fallback, readers' `started_at`.
+- `scripts/shutdown/test_inventory.py` — disk id, none, two matches, pre-start rollout ignored, open rollout preferred, local-date folders, unreadable folder.
+- `scripts/lib/test_user_zone.py` — lists `inventory.py` in `USES_THE_MACHINE_ZONE`.
+
+**Gotchas:** Codex closes its rollout file between turns, so the open-file lookup alone misses idle sessions. Codex names day folders by the machine's local date, not UTC. `Path.glob` hides unreadable folders; enumerate with `iterdir`.
+
+**Ruled out:** picking one of several matching rollouts — ambiguity always yields the picker.
+
+### Phase 23 — Restored windows show only what was restored  · status: done
+
+#### As-built
+
+- `Herdr.close_startup_workspaces(restored_workspace)` closes every other workspace that is still herdr's untouched startup shell. Before each close it lists workspaces and panes again, so a shell typed into while an earlier one closed is kept.
+- Untouched means: workspace label `~`, one tab, one pane, `agent_status` `unknown`; the pane has no agent, `agent_status` `unknown`, cwd and foreground cwd equal to home, `revision` 0, scroll offset 0. `_WorkspaceStartupState` and `_PaneStartupState` carry `_StartupShellEvidence` (`UNTOUCHED` / `PRESERVE`); missing or mistyped evidence keeps the workspace.
+- `restart.py` calls it only after `_focus_restored_pane` succeeds and the server is `WindowServerCreated`, on the Claude and Codex paths. A `HerdrFailure` prints `<session> restart issue: startup workspace left open: <error>` and the restore stands.
+- `restore_server` preflight: a timeout reading server status or `lsof` raises `HerdrFailure("herdr session <name>: could not check existing listener: ...")`, not `MacDesktopUnavailable`. The listener-refusal test uses the in-process command fake and holds under load.
+- The Mac live check failed: the check read the scroll offset flat, herdr 0.9.0 nests it under `scroll`, so both restored windows kept the shell. Phase 24 fixes it.
+
+**Files:**
+- `scripts/herdr/herdr.py` — startup evidence types and close; preflight timeout handling.
+- `scripts/herdr/test_herdr.py` — untouched, kept, re-read before close, listener refusal under load.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — cleanup after focus on the window path.
+
+**Gotchas:** herdr's attach client makes the `~` workspace after the server answers, so `_clear_restored_workspaces` never sees it. Fakes of herdr JSON must come from captured output: the flat-shape fakes passed while the real run failed.
+
+### Phase 24 — Startup shell check reads herdr's real pane list  · status: done
+
+#### As-built
+
+- `_pane_startup_state` reads the scroll offset from herdr's nested `scroll` object (`scroll.max_offset_from_bottom`); a missing or non-object `scroll`, or a missing or non-int offset, keeps the workspace. Every startup-check fixture in `test_herdr.py` and `test_restart.py` derives from one captured herdr 0.9.0 pane-list entry and workspace entry. Live on the Mac, a restart's windows each show one workspace, the restored agent.
+- A herdr client that exits mid-read counts as gone. Linux `attached_clients` skips `ProcessLookupError` as well as `FileNotFoundError`. On Darwin, `_require_darwin_process_read` raises `_DarwinProcessGone` (a private `HerdrFailure`) only when `ps` exits nonzero with empty stdout and stderr and `os.kill(pid, 0)` raises `ProcessLookupError`. `darwin_process_environment` uses it for all three reads, and `_darwin_processes` uses it to drop a pid missing from the argument scan. Any other failure stays `ClientsUnreadable`.
+
+**Files:**
+- `scripts/herdr/herdr.py` — nested scroll read; confirmed-gone client reads.
+- `scripts/herdr/test_herdr.py` — captured-shape fixtures; Linux and fake-`ps` Darwin disappearance regressions.
+- `scripts/shutdown/test_restart.py` — captured-shape fixtures.
+
+**Gotchas:** herdr 0.9.0 and 0.9.5 both nest the offset under `scroll`, and 0.9.5 omits `scroll` when unset. macOS `ps -p <gone pid>` exits 1 with no output.

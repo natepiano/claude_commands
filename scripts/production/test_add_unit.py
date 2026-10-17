@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import fcntl
 import io
 import json
@@ -797,7 +798,7 @@ class AddUnitTests(ShutdownTestCase):
 
     def test_restore_returns_zero_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+            "session-123", self.root / "restart-note", "recorded-name", "build-followups-recorded-tmux"
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -807,7 +808,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach recorded-tmux\n")
+        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach build-followups-recorded-tmux\n")
 
     def test_restore_already_running_returns_zero_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -832,7 +833,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach alpha\n")
+        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach build-followups-alpha\n")
 
     def test_restore_replaces_marked_tmux_without_running_claude(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -875,15 +876,35 @@ class AddUnitTests(ShutdownTestCase):
 
     def test_unit_start_not_ready_prints_screen_and_sends_no_prompt_or_key(self) -> None:
         screen = "Do you trust this folder?"
-        self.herdr_overrides['--session alpha agent start alpha --kind claude --pane w1:p1 --timeout 90000 -- --model opus --effort xhigh --remote-control alpha -n alpha --settings {"disableAgentView": true}'] = CommandResponse(
+        self.herdr_overrides['--session build-followups-alpha agent start build-followups-alpha --kind claude --pane w1:p1 --timeout 90000 -- --model opus --effort xhigh --remote-control alpha -n alpha --settings {"disableAgentView": true}'] = CommandResponse(
             code=1, stdout=json.dumps({"error": {"code": "agent_not_ready", "message": "dialog"}}))
-        self.herdr_overrides["--session alpha pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
+        self.herdr_overrides["--session build-followups-alpha pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("add_unit: the session is not ready:\n" + screen, result.stderr)
         self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
                              for row in self.herdr_calls()))
+
+    def test_each_production_names_its_unit_session_and_a_restore_keeps_the_recorded_name(self) -> None:
+        production = add_unit.read_production(self.doc)
+        request = add_unit.UnitLaunch(
+            production=production, identity=add_unit.UnitIdentity("review-unit", "review"),
+            branch="build-followups-review", worktree=self.root / "project-review",
+            plan=add_unit.PlanGiven(Path("docs/plans/given.md")), port=add_unit.OmittedCell(),
+            owns=add_unit.OmittedCell(), session=add_unit.NewSession(), launch_kind=add_unit.NewWorkLaunch(),
+            timeout=90)
+        hana = dataclasses.replace(request, production=production._replace(slug="hana"))
+        self.assertEqual(add_unit.host_session_name(request), "build-followups-review")
+        self.assertEqual(add_unit.host_session_name(hana), "hana-review")
+        named = dataclasses.replace(request, identity=add_unit.UnitIdentity("review-unit", "build-followups-review"))
+        self.assertEqual(add_unit.host_session_name(named), "build-followups-review")
+        restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
+        self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
+                         "build-followups-review")
+        # A record from before the slug led: its bare name may be another production's live session.
+        before = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "review")
+        self.assertEqual(add_unit.host_session_name(dataclasses.replace(hana, launch_kind=before)), "hana-review")
 
     def test_failed_unit_restore_stops_its_created_server_after_agent_exit(self) -> None:
         prior = self.root / "prior-session"
@@ -900,14 +921,15 @@ class AddUnitTests(ShutdownTestCase):
                 plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
                 port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
                 session=add_unit.ResumedSession("session-123", prior),
-                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "alpha"),
+                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "build-followups-alpha"),
                 timeout=90,
             )
+            self.configure_herdr(request)
             with self.assertRaises(herdr.AgentExited):
                 add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                                         "Resume this unit.", accounts.role_account("unit"))
-        stopped.assert_called_once_with("alpha")
-        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-alpha.service"] for row in self.herdr_calls()))
+        stopped.assert_called_once_with("build-followups-alpha")
+        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-build-followups-alpha.service"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
@@ -930,12 +952,12 @@ class AddUnitTests(ShutdownTestCase):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md"])
         self.assertEqual(code, 1)
         self.assertEqual(errors.getvalue(), f"add_unit: {timeout}\n")
-        start.assert_called_once_with("alpha", 90_000)
+        start.assert_called_once_with("build-followups-alpha", 90_000)
         opened.assert_not_called()
         agent.assert_not_called()
 
     def test_destination_taken_during_start_refuses_without_opening_a_pane(self) -> None:
-        self.herdr_overrides["--session alpha status server"] = CommandResponse(code=0, stdout="status: running\n")
+        self.herdr_overrides["--session build-followups-alpha status server"] = CommandResponse(code=0, stdout="status: running\n")
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"], ["agent", "prompt"])
@@ -997,7 +1019,7 @@ class AddUnitTests(ShutdownTestCase):
             json.dumps({"type": "user", "message": {"model": "ignored"}}),
             json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}), "{partial"]))
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
-        self.assertIn("herdr session attach alpha", result.stdout)
+        self.assertIn("herdr session attach build-followups-alpha", result.stdout)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertEqual(self.agent_arguments()[:4], ["--model", "opus", "--effort", "high"])
         self.assertIn(["--session", "alpha", "server", "stop"], self.herdr_calls())
@@ -1070,6 +1092,27 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
+    def test_restart_from_a_record_before_the_slug_led_skips_another_productions_live_session(self) -> None:
+        self.commit_prepared_row(self.unit_row("review"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        # hana's review-unit holds the bare name this record was written under.
+        self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
+            herdr.SessionListResult(sessions=[herdr.SessionEntry(name="review", running=True, default=False,
+                                                                 session_dir="/fixture", socket_path="/fixture/socket")])))
+
+        result = self.successful(
+            "review", "--plan", "docs/plans/given.md", "--resume", "session-review", "--cwd", str(prior),
+            "--restart-note", str(note), "--session-name", "review", "--host-session", "review",
+        )
+
+        self.assertIn("review-unit restore launched", result.stdout)
+        self.assertEqual(len(self.servers_started()), 1)
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual([row[1] for row in starts], ["build-followups-review"])
+
     def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
         self.env["CLAUDE_PROBE_SESSION"] = "1"
         prior = self.root / "prior-session"
@@ -1084,19 +1127,20 @@ class AddUnitTests(ShutdownTestCase):
                 result = self.successful(
                     name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
                     "--cwd", str(prior), "--restart-note", str(note),
-                    "--session-name", name, "--host-session", name,
+                    "--session-name", name, "--host-session", f"build-followups-{name}",
                     *(["--probe"] if probe else []),
                     *(["--account", target] if target else []),
                 )
                 self.assertIn(f"{name}-unit restore launched", result.stdout)
                 self.assertEqual(len(self.servers_started()), count)
-                opened = self.opened(name)
+                opened = self.opened(f"build-followups-{name}")
                 self.assertEqual(opened[opened.index("--cwd") + 1], str(prior))
-                starts = [row for row in self.herdr_calls() if row[:4] == ["--session", name, "agent", "start"]]
+                starts = [row for row in self.herdr_calls()
+                          if row[:4] == ["--session", f"build-followups-{name}", "agent", "start"]]
                 self.assertEqual(len(starts), 1)
                 arguments = starts[0][starts[0].index("--") + 1:]
                 self.assertEqual(arguments[arguments.index("--resume") + 1], f"session-{name}")
-                environment = self.pane_environment(name)
+                environment = self.pane_environment(f"build-followups-{name}")
                 self.assertEqual(environment.get("CLAUDE_PROBE_SESSION", ""), "1" if probe else "")
                 self.assertNotIn("CLAUDE_TEST_SECRET", environment)
 
@@ -1577,7 +1621,7 @@ class AddUnitTests(ShutdownTestCase):
             "oauthAccount": {"emailAddress": "owner@example.com"},
             "projects": {**self.trusted_projects(), str(folder): {"hasTrustDialogAccepted": True}}}))
         result = self.successful("nightly-review", "--permanent")
-        self.assertIn("nightly-review-unit started: herdr session attach nightly-review", result.stdout)
+        self.assertIn("nightly-review-unit started: herdr session attach build-followups-nightly-review", result.stdout)
         self.assertEqual(self.opened()[7], str(folder))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(config.parent))
         arguments = self.agent_arguments()
@@ -1683,9 +1727,9 @@ class AddUnitTests(ShutdownTestCase):
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
                          self.git("rev-parse", "build-followups"))
-        self.assertEqual(self.servers_started(), [["--user", "--unit=herdr-alpha.service", "--collect",
-            self.env["HERDR_BIN"], "--session", "alpha", "server"]])
-        self.assertEqual(self.opened()[4:8], ["--label", "alpha", "--cwd", str(worktree)])
+        self.assertEqual(self.servers_started(), [["--user", "--unit=herdr-build-followups-alpha.service", "--collect",
+            self.env["HERDR_BIN"], "--session", "build-followups-alpha", "server"]])
+        self.assertEqual(self.opened()[4:8], ["--label", "build-followups-alpha", "--cwd", str(worktree)])
         self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
             "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
@@ -1701,7 +1745,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("alpha-unit started: herdr session attach alpha", result.stdout)
+        self.assertIn("alpha-unit started: herdr session attach build-followups-alpha", result.stdout)
 
     def test_review_unit_uses_an_ordinary_row_and_worktree_with_review_direct_opening(self) -> None:
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
@@ -2001,7 +2045,7 @@ class AddUnitTests(ShutdownTestCase):
         for name, mode in (("alpha", ("--plan", "docs/plans/given.md")), ("beta", ("--standby",))):
             with self.subTest(mode=mode):
                 _ = self.successful(name, *mode)
-                self.assertEqual(self.pane_environment(name)["CLAUDE_CONFIG_DIR"], str(directory))
+                self.assertEqual(self.pane_environment(f"build-followups-{name}")["CLAUDE_CONFIG_DIR"], str(directory))
 
     def test_unit_accepts_explicit_account_matching_configured_units(self) -> None:
         """F004: matching --account selects no alternative account."""
@@ -2036,10 +2080,10 @@ class AddUnitTests(ShutdownTestCase):
 
     def test_a_rerun_finds_the_unit_by_its_mark_after_its_session_was_renamed(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        _ = (self.state / "herdr-live-alpha").rename(self.state / "herdr-live-renamed")
+        _ = (self.state / "herdr-live-build-followups-alpha").rename(self.state / "herdr-live-renamed")
         _ = (self.root / "proc/101/cmdline").write_bytes(b"herdr\0--session\0renamed\0server\0")
         sockets = self.root / "proc/net/unix"
-        _ = sockets.write_text(sockets.read_text().replace("/sessions/alpha/herdr.sock", "/sessions/renamed/herdr.sock"))
+        _ = sockets.write_text(sockets.read_text().replace("/sessions/build-followups-alpha/herdr.sock", "/sessions/renamed/herdr.sock"))
         self.herdr_overrides["--session renamed pane read w1:p1 --source recent --lines 60"] = CommandResponse(
             code=0, stdout="/remote-control is active")
         result = self.successful("alpha", "--plan", "docs/plans/given.md")
@@ -2204,7 +2248,7 @@ class AddUnitTests(ShutdownTestCase):
         prompt = self.opening_prompt()
         self.assertIn("Write the full phased plan there", prompt)
         self.assertIn("wait for its approval before you run /unit:direct docs/plans/build-followups-alpha.md", prompt)
-        self.assertIn("alpha-unit started: herdr session attach alpha", result.stdout)
+        self.assertIn("alpha-unit started: herdr session attach build-followups-alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
 
     def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
@@ -2259,6 +2303,48 @@ class AddUnitTests(ShutdownTestCase):
                 self.assertEqual(self.git("rev-parse", "HEAD"), head)
                 self.assertFalse(self.config.exists())
 
+    def test_excluded_standing_plan_launches_and_keeps_the_units_copy(self) -> None:
+        plan = Path("docs/style-production/units/alpha-unit.md")
+        source = self.checkout / plan
+        source.parent.mkdir(parents=True)
+        header = "# Standing plan\n\n> **Production: build-followups** — unit `alpha-unit`\n"
+        standing = header + "> **Standing:** style_plan.py\n"
+        _ = source.write_text(standing, encoding="utf-8")
+        initial = self.repository_state()
+        refusal = f"plan {plan} is missing on build-followups or lacks the Production header"
+
+        with self.subTest(plan="untracked but not excluded"):
+            result = self.cli("alpha", "--plan", plan.as_posix(), "--check")
+            self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+            self.assertIn(refusal, result.stderr)
+            self.assertEqual(self.repository_state(), initial)
+
+        exclude = self.checkout / ".git/info/exclude"
+        _ = exclude.write_text(exclude.read_text() + "\n/docs/style-production/\n", encoding="utf-8")
+        _ = source.write_text(header, encoding="utf-8")
+        with self.subTest(plan="excluded without Standing header"):
+            result = self.cli("alpha", "--plan", plan.as_posix(), "--check")
+            self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+            self.assertIn(refusal, result.stderr)
+            self.assertEqual(self.repository_state(), initial)
+
+        _ = source.write_text(standing, encoding="utf-8")
+        _ = self.successful("alpha", "--plan", plan.as_posix(), "--check")
+        self.assertEqual(self.repository_state(), initial)
+        _ = self.successful("alpha", "--plan", plan.as_posix())
+        worktree = self.root / "project-alpha"
+        copied = worktree / plan
+        self.assertEqual(copied.read_text(encoding="utf-8"), standing)
+        self.assertEqual(self.git("check-ignore", "--", plan.as_posix(), cwd=worktree), plan.as_posix())
+        self.assertEqual(self.git("ls-tree", "HEAD", "--", plan.as_posix()), "")
+        self.assertIn(f"/unit:direct {plan}", self.opening_prompt())
+
+        progress = standing + "\n### Phase 1 — ticket in progress\n"
+        _ = copied.write_text(progress, encoding="utf-8")
+        _ = source.write_text(standing + "\nShowrunner template changed\n", encoding="utf-8")
+        _ = self.successful("alpha", "--plan", plan.as_posix())
+        self.assertEqual(copied.read_text(encoding="utf-8"), progress)
+
     def test_refuses_plan_without_production_header(self) -> None:
         _ = self.plan.write_text("# No production header\n", encoding="utf-8")
         _ = self.git("add", "docs/plans/given.md")
@@ -2294,10 +2380,10 @@ class AddUnitTests(ShutdownTestCase):
         taken = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(taken.returncode, 2, (taken.stdout, taken.stderr))
         _ = self.doc.write_text(original)
-        _ = (self.state / "herdr-live-alpha").touch()
+        _ = (self.state / "herdr-live-build-followups-alpha").touch()
         live = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(live.returncode, 2, (live.stdout, live.stderr))
-        self.assertIn("herdr session alpha is already live and is not marked as alpha-unit", live.stderr)
+        self.assertIn("herdr session build-followups-alpha is already live and is not marked as alpha-unit", live.stderr)
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(len(self.servers_started()), 0)
 
@@ -2411,7 +2497,7 @@ class AddUnitTests(ShutdownTestCase):
         restart_note = "Restarted with spaces, 'quotes', and $() unchanged."
         _ = note.write_text(restart_note, encoding="utf-8")
         recorded_session = "restored 'session' $()"
-        recorded_tmux = "restore $()"
+        recorded_tmux = "build-followups restore $()"
         existing_prompt = "Keep this previously scheduled prompt."
         with patch.dict(os.environ, self.env):
             conversation_pause.record_scheduled_prompts(
@@ -2428,7 +2514,7 @@ class AddUnitTests(ShutdownTestCase):
             "--host-session", recorded_tmux,
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        self.assertEqual(self.opened()[1], "restore----")
+        self.assertEqual(self.opened()[1], "build-followups-restore----")
         self.assertEqual(self.opened()[7], str(prior))
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
@@ -2442,7 +2528,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(recorded, (existing_prompt, prompt))
         self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
                       conversation_pause.PromptSource.SCHEDULED)
-        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-restore----.service")
+        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-build-followups-restore----.service")
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
         self.commit_prepared_row(self.unit_row())
@@ -2542,7 +2628,7 @@ class AddUnitTests(ShutdownTestCase):
                 session_dir="/fixture", socket_path="/fixture/socket")])))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
-        self.assertIn(["--session", "alpha", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60"], self.herdr_calls())
+        self.assertIn(["--session", "build-followups-alpha", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60"], self.herdr_calls())
 
     def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
         request = add_unit.UnitLaunch(

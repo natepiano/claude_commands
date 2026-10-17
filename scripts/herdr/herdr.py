@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
@@ -46,6 +47,10 @@ class HerdrFailure(Exception):
 
 class HerdrMissing(HerdrFailure):
     """No herdr binary is available."""
+
+
+class _DarwinProcessGone(HerdrFailure):
+    """An empty failed ps read was confirmed by the pid no longer existing."""
 
 
 class SessionTaken(HerdrFailure):
@@ -372,6 +377,23 @@ class TabIdentity(TypedDict):
     tab_id: str
 
 
+class _StartupShellEvidence(Enum):
+    UNTOUCHED = "untouched startup shell"
+    PRESERVE = "activity or incomplete startup evidence"
+
+
+@dataclass(frozen=True)
+class _WorkspaceStartupState:
+    workspace_id: str
+    evidence: _StartupShellEvidence
+
+
+@dataclass(frozen=True)
+class _PaneStartupState:
+    pane_id: str
+    evidence: _StartupShellEvidence
+
+
 class AgentLifecycle(TypedDict):
     agent_status: str
 
@@ -535,6 +557,22 @@ class Herdr:
     def focus_workspace(self, workspace_id: str) -> None:
         """Show a workspace in the session's attached clients."""
         _ = self.run("workspace", "focus", workspace_id)
+
+    def close_startup_workspaces(self, restored_workspace: str) -> None:
+        """Remove only untouched home shells left by this restore's attach window."""
+        candidates = [_workspace_startup_state(item) for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        for candidate in candidates:
+            if candidate.workspace_id == restored_workspace:
+                continue
+            # A previous close can take long enough for another shell to receive input.
+            workspaces = [_workspace_startup_state(item) for item in json_items(
+                self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+            panes = [_pane_startup_state(item) for item in json_items(
+                self.result("pane", "list").get("panes"), "herdr pane list")]
+            if any(workspace.workspace_id == candidate.workspace_id and _untouched_startup_shell(workspace, panes)
+                   for workspace in workspaces):
+                _ = self.run("workspace", "close", candidate.workspace_id)
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
@@ -830,6 +868,36 @@ def server_answering(status: subprocess.CompletedProcess[str]) -> bool:
     return status.returncode == 0 and "status: running" in status.stdout.splitlines()
 
 
+def _workspace_startup_state(value: object) -> _WorkspaceStartupState:
+    workspace = json_object(value, "herdr workspace")
+    workspace_id = json_text(workspace.get("workspace_id"), "herdr workspace id")
+    tab_count, pane_count = workspace.get("tab_count"), workspace.get("pane_count")
+    untouched = (workspace.get("label") == "~" and type(tab_count) is int and tab_count == 1
+                 and type(pane_count) is int and pane_count == 1 and workspace.get("agent_status") == "unknown")
+    return _WorkspaceStartupState(workspace_id,
+        _StartupShellEvidence.UNTOUCHED if untouched else _StartupShellEvidence.PRESERVE)
+
+
+def _pane_startup_state(value: object) -> _PaneStartupState:
+    pane = json_object(value, "herdr pane")
+    pane_id = json_text(pane.get("pane_id"), "herdr pane id")
+    revision, scroll = pane.get("revision"), pane.get("scroll")
+    scrollback = (json_object(cast(object, scroll), "herdr pane scroll").get("max_offset_from_bottom")
+                  if isinstance(scroll, dict) else None)
+    untouched = (pane.get("agent") is None and pane.get("agent_status") == "unknown"
+                 and pane.get("cwd") == str(Path.home()) and pane.get("foreground_cwd") == str(Path.home())
+                 and type(revision) is int and revision == 0 and type(scrollback) is int and scrollback == 0)
+    return _PaneStartupState(pane_id,
+        _StartupShellEvidence.UNTOUCHED if untouched else _StartupShellEvidence.PRESERVE)
+
+
+def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_PaneStartupState]) -> bool:
+    """Missing evidence preserves the workspace rather than risking live work."""
+    members = [pane for pane in panes if pane.pane_id.split(":", 1)[0] == workspace.workspace_id]
+    return (workspace.evidence is _StartupShellEvidence.UNTOUCHED and len(members) == 1
+            and members[0].evidence is _StartupShellEvidence.UNTOUCHED)
+
+
 def _clear_restored_workspaces(client: Herdr) -> None:
     """A server we just spawned holds restored layout, never live work."""
     result = client.result("workspace", "list")
@@ -1023,6 +1091,11 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
         if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
                 timeout=max(0.001, deadline - time.monotonic()))):
             raise SessionTaken(name)
+    except SessionTaken:
+        raise
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        raise HerdrFailure(f"herdr session {name}: could not check existing listener: {error}") from error
+    try:
         require_success(run_program([
             os.environ.get("SHUTDOWN_OPEN", "open"), "-na", "/Applications/Nix Apps/Ghostty.app",
             "--args", "-e", herdr_binary(), "session", "attach", name,
@@ -1035,8 +1108,6 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
-    except SessionTaken:
-        raise
     except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
         raise MacDesktopUnavailable() from error
     raise MacDesktopUnavailable()
@@ -1200,7 +1271,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
             if session and not command:
                 environment = _process_environment(process)
                 session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError as error:
             return ClientsUnreadable(str(error))
@@ -1241,18 +1312,29 @@ def darwin_open_files(pid: int) -> list[Path]:
     return [Path(field[1:]) for field in result.stdout.splitlines() if field.startswith("n/")]
 
 
+def _require_darwin_process_read(result: subprocess.CompletedProcess[str], pid: int, context: str) -> None:
+    if result.returncode != 0 and not result.stdout and not result.stderr:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError as error:
+            raise _DarwinProcessGone(f"process {pid}: exited") from error
+        except OSError:
+            pass
+    require_success(result, context)
+
+
 def darwin_process_environment(pid: int) -> dict[str, str]:
     """Read only the environment following a stable, separately read argv."""
     ps = os.environ.get("HERDR_PS", "ps")
     command = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(command, f"process {pid} command")
+    _require_darwin_process_read(command, pid, f"process {pid} command")
     arguments = command.stdout.rstrip("\r\n").lstrip()
     if arguments.startswith("(") and arguments.endswith(")"):
         raise HerdrFailure(f"process {pid}: arguments are unreadable")
     expanded = run_program([ps, "eww", "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(expanded, f"process {pid} environment")
+    _require_darwin_process_read(expanded, pid, f"process {pid} environment")
     confirmed = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(confirmed, f"process {pid} command confirmation")
+    _require_darwin_process_read(confirmed, pid, f"process {pid} command confirmation")
     text = expanded.stdout.rstrip("\r\n").lstrip()
     if not arguments or confirmed.stdout != command.stdout or not text.startswith(arguments):
         raise HerdrFailure(f"process {pid}: environment does not follow stable command")
@@ -1548,6 +1630,14 @@ def _darwin_processes() -> list[_UserProcess]:
         if uid != os.getuid() or pid <= 0:
             continue
         executable = fields[3].rstrip()
+        if pid not in commands:
+            try:
+                current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)], timeout=5)
+                _require_darwin_process_read(current, pid, f"process {pid} command")
+            except _DarwinProcessGone:
+                continue
+            except (HerdrFailure, subprocess.TimeoutExpired):
+                pass
         command = commands.get(pid, "")
         arguments: ReadProcessArguments | UnreadableProcessArguments = UnreadableProcessArguments(
             f"process {pid}: arguments are unreadable or changed")
@@ -1563,7 +1653,7 @@ def _darwin_processes() -> list[_UserProcess]:
 def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     try:
         processes = _darwin_processes()
-    except (HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
@@ -1576,7 +1666,9 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
         if session and not command:
             try:
                 environment = darwin_process_environment(process.pid)
-            except (HerdrFailure, subprocess.TimeoutExpired) as error:
+            except _DarwinProcessGone:
+                continue
+            except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
                 return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
         if (session == name and not command) or command == ["session", "attach", name]:

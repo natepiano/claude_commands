@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from collections.abc import Iterator
@@ -77,6 +78,45 @@ class TranscriptReadCounter(io.BufferedReader):
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
+        run = self.root / "paused run"
+        run.mkdir()
+        command = ["bash", "/config/scripts/delegate/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/delegate/implement.sh", "outer arguments"]
+        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
+        self.herdr_process(811, 812, command, {})
+        self.herdr_process(812, 1, outer, {})
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "busy": {"role": "review", "thread_id": "busy-thread", "turn_id": "turn", "status": "running", "launcher_pid": 810},
+            "idle": {"role": "impl", "thread_id": "idle-thread", "status": "done"},
+            "orphan": {"role": "impl", "thread_id": "orphan-thread", "status": "starting", "launcher_pid": 99999999},
+            "ended": {"role": "impl", "thread_id": "ended-thread", "status": "ended"},
+        }))
+        def launcher_alive(pid: int) -> bool:
+            return pid in {810, 811, 812}
+
+        with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+            found = inventory.codex_seats([run])
+        seats = {seat["seat"]: seat for seat in found}
+        self.assertEqual(set(seats), {"busy", "idle", "orphan"})
+        self.assertEqual(seats["busy"], record.PausedSeat(run_dir=str(run), seat="busy", role="review", thread_id="busy-thread", turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], record.PausedSeat(run_dir=str(run), seat="idle", role="impl", thread_id="idle-thread", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["orphan"]["launcher_command"], [])
+
+    def test_old_shutdown_record_reads_back_without_codex_seats_and_new_seats_survive_wire_roundtrip(self) -> None:
+        saved = entry(top_level("legacy-director"))
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        _ = document.pop("codex_seats", None)
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertNotIn("codex_seats", parsed)
+        seats = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="thread-kept", turn_live=True, launcher_command=["bash", "/scripts/implement.sh", "argument with spaces"])]
+        document["codex_seats"] = seats
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed.get("codex_seats"), seats)
+        document["codex_seats"] = [{**seats[0], "turn_live": "true"}]
+        with self.assertRaisesRegex(record.InvalidRecord, "turn_live"):
+            _ = record.parse_session_records(json.dumps([document]))
+
     def test_updated_at_preserves_registry_milliseconds_through_inventory_wire_parse(self) -> None:
         timestamp = 1_791_563_350_123
         self.write_session(DESKTOP_PID, DESKTOP_ID, "notes", self.root / "plain", updated_at=timestamp)
@@ -1607,6 +1647,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
         _ = boot.write_text("boot-one\n")
+        _ = (self.proc / "stat").write_text("btime 1792065600\n")  # 2026-10-15 12:00 UTC
         fake_responses = self.root / "herdr-responses.json"
         _ = fake_responses.write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions":[]}'}}))
         fake_state = self.root / "tmux.json"
@@ -1982,6 +2023,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         process = self.process(2001, command="codex", arguments=["codex", "--model", "exec"], environment={"CODEX_HOME": str(home)})
         session_id = "12345678-1234-1234-1234-123456789abc"
         (process / "fd/3").symlink_to(home / f"sessions/2026/10/15/rollout-date-{session_id}.jsonl")
+        _ = self.codex_rollout(home, OTHER_ID)
         for pid, command in enumerate(("exec", "app-server", "mcp", "mcp-server", "proto"), start=2002):
             _ = self.process(pid, command="codex", arguments=["codex", "--config", "model=x", command])
         _ = self.process(2007, command="codex", terminal=0)
@@ -1997,6 +2039,106 @@ class RecoveryInventoryTests(unittest.TestCase):
             resume=record.CodexSessionId(kind="session id", session_id=session_id)))
         self.assertEqual((entry["session"]["pid"], entry["session"]["cwd"], entry["session"]["host"]),
                          (2001, str(self.root), inventory.TerminalHost(kind="terminal")))
+
+    def codex_rollout(self, home: Path, session_id: str, *, timestamp: str = "2026-10-15T12:05:00Z",
+                      day: str = "2026/10/15", cwd: str = "") -> Path:
+        path = home / "sessions" / day / f"rollout-date-{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": session_id, "cwd": cwd or str(self.root), "timestamp": timestamp}}) +
+            "\nnot session metadata: later conversation lines must not be read\n")
+        return path
+
+    def observed_codex_resume(self) -> inventory.CodexSessionId | inventory.CodexResumePicker:
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        entry = found.sessions["codex-.codex"][0]
+        assert entry["agent"] == "codex"
+        return entry["codex"]["resume"]
+
+    def test_codex_closed_rollout_identifies_the_conversation_from_its_first_line(self) -> None:
+        _ = self.process(2001, command="codex")
+        _ = self.codex_rollout(self.root / ".codex", OTHER_ID)
+        self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
+
+    def test_codex_without_a_rollout_keeps_the_resume_picker(self) -> None:
+        _ = self.process(2001, command="codex")
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_multiple_closed_conversations_in_the_same_cwd_keep_the_picker(self) -> None:
+        _ = self.process(2001, command="codex")
+        for identity in (OTHER_ID, UNKNOWN_ID):
+            _ = self.codex_rollout(self.root / ".codex", identity)
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_evening_start_finds_its_local_day_and_keeps_ambiguity_after_midnight(self) -> None:
+        self.addCleanup(time.tzset)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"TZ": "America/New_York"})))
+        time.tzset()
+        process = self.process(2001, command="codex")
+        # 20:30 EDT on October 15 is already October 16 in UTC.
+        started = datetime.fromisoformat("2026-10-16T00:30:00+00:00")
+        _ = (self.proc / "stat").write_text(f"btime {int(started.timestamp())}\n")
+        stat = process / "stat"
+        _ = stat.write_text(stat.read_text().rsplit(" ", 1)[0] + " 0")
+        home = self.root / ".codex"
+        _ = self.codex_rollout(home, OTHER_ID, day="2026/10/15", timestamp="2026-10-16T00:31:00Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
+        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T04:01:00Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_unreadable_session_folders_make_the_snapshot_partial_instead_of_picking_an_id(self) -> None:
+        _ = self.process(2001, command="codex")
+        home = self.root / ".codex"
+        hidden = self.codex_rollout(home, OTHER_ID)
+        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T00:00:00Z")
+        scandir = os.scandir
+        for unreadable in (home / "sessions", hidden.parent.parent.parent, hidden.parent.parent, hidden.parent):
+            def readable_directories(path: str | os.PathLike[str]):
+                if Path(path) == unreadable:
+                    raise PermissionError(f"{unreadable}: directory denied")
+                return scandir(path)
+
+            with self.subTest(unreadable=unreadable), patch.object(os, "scandir", readable_directories):
+                found = inventory.snapshot_inventory()
+            self.assertIsInstance(found, inventory.PartialInventory)
+            assert isinstance(found, inventory.PartialInventory)
+            self.assertIn("directory denied", "; ".join(found.failures))
+
+    def test_codex_closed_rollout_before_process_birth_or_in_another_cwd_is_ignored(self) -> None:
+        process = self.process(2001, command="codex")
+        # Born two seconds after boot; a one-second-old session predates this process.
+        stat = process / "stat"
+        _ = stat.write_text(stat.read_text().rsplit(" ", 1)[0] + f" {2 * os.sysconf('SC_CLK_TCK')}")
+        _ = self.codex_rollout(self.root / ".codex", OTHER_ID, timestamp="2026-10-15T12:00:01Z")
+        _ = self.codex_rollout(self.root / ".codex", UNKNOWN_ID, cwd=str(self.root / "other"))
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_disk_lookup_does_not_visit_days_before_process_birth(self) -> None:
+        _ = self.process(2001, command="codex")
+        home = self.root / ".codex"
+        old = self.codex_rollout(home, OTHER_ID, day="2026/10/14")
+        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T00:00:00Z")
+        iterdir = Path.iterdir
+
+        def relevant_days(path: Path) -> Iterator[Path]:
+            self.assertNotEqual(path, old.parent, "scanned a day before process birth")
+            return iterdir(path)
+
+        with patch.object(Path, "iterdir", relevant_days):
+            self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=UNKNOWN_ID))
+
+    def test_darwin_codex_closed_rollouts_use_process_birth_and_refuse_ambiguity(self) -> None:
+        responses = self.darwin_snapshot()
+        responses["-a -p 2001 -Fn"] = {"code": 0, "stdout": ""}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        home = self.root / ".codex"
+        _ = self.codex_rollout(home, OTHER_ID, timestamp="2026-10-15T11:59:59Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+        _ = self.codex_rollout(home, OTHER_ID, timestamp="2026-10-15T12:00:00Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
+        _ = self.codex_rollout(home, UNKNOWN_ID)
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
 
     def test_codex_unreadable_fd_list_uses_picker_without_file_time_identity(self) -> None:
         process = self.process(2001, command="codex")

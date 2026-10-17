@@ -12,9 +12,9 @@ import socket
 import stat
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
@@ -27,6 +27,7 @@ import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
+    from record import PausedSeat
     from ..delegate.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
@@ -879,6 +880,61 @@ def _model(session_id: str, config_dir: Path) -> LastModel:
     )
 
 
+def _launcher_command(pid: int) -> list[str]:
+    """Find the nearest live launcher ancestor without flattening argv boundaries."""
+    try:
+        darwin = _DarwinSnapshotProcesses().processes if sys.platform == "darwin" else {}
+    except (OSError, herdr.HerdrFailure):
+        return []
+    visited: set[int] = set()
+    while pid > 1 and pid not in visited and len(visited) < 64:
+        visited.add(pid)
+        if not _pid_alive(pid):
+            return []
+        try:
+            if sys.platform == "linux":
+                process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
+                argv = [os.fsdecode(part) for part in process.joinpath("cmdline").read_bytes().split(b"\0") if part]
+                fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
+                parent = int(fields[1])
+            else:
+                process = darwin.get(pid)
+                if process is None or isinstance(process.arguments, herdr.UnreadableProcessArguments):
+                    return []
+                parent = process.parent
+                argv = list(process.arguments.argv)
+        except (OSError, ValueError, IndexError, UnicodeError, subprocess.SubprocessError):
+            return []
+        if any(Path(arg).name in {"implement.sh", "review.sh"} for arg in argv):
+            return argv
+        pid = parent
+    return []
+
+
+def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
+    from record import PausedSeat
+
+    seats: list[PausedSeat] = []
+    for directory in run_directories:
+        run_dir = str(directory)
+        for name, raw in sorted(_json_object(Path(run_dir) / "mesh_roster.json").items()):
+            if not isinstance(raw, dict):
+                continue
+            entry = cast(dict[str, object], raw)
+            if entry.get("status") == "ended":
+                continue
+            thread_id, role = entry.get("thread_id", ""), entry.get("role", "impl")
+            launcher = entry.get("launcher_pid", 0)
+            turn_live = entry.get("status") in {"running", "starting"} or entry.get("paused_turn") is True
+            seat = PausedSeat(run_dir=run_dir, seat=name,
+                              role=role if isinstance(role, str) else "impl",
+                              thread_id=thread_id if isinstance(thread_id, str) else "",
+                              turn_live=turn_live,
+                              launcher_command=_launcher_command(launcher) if isinstance(launcher, int) else [])
+            seats.append(seat)
+    return seats
+
+
 def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
     servers: list[CodexServer] = []
     for directory in run_directories:
@@ -1187,6 +1243,14 @@ class _SnapshotProcesses:
     def rollout(self, process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
         return _codex_resume(process, home)
 
+    def started_at(self, process: Path) -> datetime:
+        started, _ = self.identity(process)
+        for line in (self.root / "stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return datetime.fromtimestamp(int(line.split()[1]) +
+                    int(started) / os.sysconf("SC_CLK_TCK"), timezone.utc)
+        raise ObservationFailure("process start: boot time is missing")
+
     def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
         found: dict[str, RecoveryHostProcess] = {}
         for pid, name in herdr._live_server_processes(processes).items():  # pyright: ignore[reportPrivateUsage]
@@ -1268,6 +1332,12 @@ class _DarwinSnapshotProcesses(_SnapshotProcesses):
         if len(ids) > 1:
             raise ObservationFailure(f"Codex rollout {process}: more than one open session id")
         return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
+
+    @override
+    def started_at(self, process: Path) -> datetime:
+        started, _ = self.identity(process)
+        # darwin_process_identity reads lstart with LC_ALL=C and TZ=UTC.
+        return datetime.strptime(started, "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
 
     @override
     def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
@@ -1447,6 +1517,85 @@ def _codex_resume(process: Path, home: Path) -> CodexSessionId | CodexResumePick
     return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
 
 
+class _CodexSessionMetadata(TypedDict):
+    id: str
+    cwd: str
+    timestamp: str
+
+
+def _codex_rollout_metadata(line: str) -> _CodexSessionMetadata:
+    value = _wire_object(cast(object, json.loads(line)), "Codex rollout")
+    if value.get("type") != "session_meta":
+        raise ValueError("Codex rollout does not begin with session_meta")
+    payload = _wire_object(value.get("payload"), "Codex session_meta")
+    return _CodexSessionMetadata(id=_wire_string(payload.get("id"), "Codex session_meta.id"),
+        cwd=_wire_string(payload.get("cwd"), "Codex session_meta.cwd"),
+        timestamp=_wire_string(payload.get("timestamp"), "Codex session_meta.timestamp"))
+
+
+def _codex_rollout_paths(root: Path, first_day: date) -> Iterator[Path]:
+    """Enumerate relevant folders without glob's suppression of read errors."""
+    try:
+        years = list(root.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ObservationFailure(f"Codex sessions {root}: {error}") from error
+    try:
+        for year in years:
+            if not year.name.isdecimal() or int(year.name) < first_day.year or not stat.S_ISDIR(year.stat().st_mode):
+                continue
+            for month in year.iterdir():
+                if not month.name.isdecimal() or not stat.S_ISDIR(month.stat().st_mode):
+                    continue
+                if (int(year.name), int(month.name)) < (first_day.year, first_day.month):
+                    continue
+                for day in month.iterdir():
+                    if not day.name.isdecimal() or not stat.S_ISDIR(day.stat().st_mode):
+                        continue
+                    try:
+                        candidate_day = date(int(year.name), int(month.name), int(day.name))
+                    except ValueError:
+                        continue
+                    if candidate_day >= first_day:
+                        yield from day.iterdir()
+    except OSError as error:
+        raise ObservationFailure(f"Codex sessions {root}: {error}") from error
+
+
+def _codex_disk_resume(home: Path, cwd: str, started: datetime) -> CodexSessionId | CodexResumePicker:
+    """Consider only local day folders and the first line of each rollout."""
+    ids: set[str] = set()
+    for rollout in _codex_rollout_paths(home / "sessions", started.astimezone().date()):
+        match = _ROLLOUT_ID.fullmatch(rollout.name)
+        if not match:
+            continue
+        try:
+            with rollout.open(encoding="utf-8") as handle:
+                metadata = _codex_rollout_metadata(handle.readline())
+            timestamp = datetime.fromisoformat(metadata["timestamp"])
+        except (FileNotFoundError, ValueError, UnicodeError):
+            # A vanished or unfinished rollout is not evidence of an identity.
+            continue
+        if (timestamp.tzinfo is not None and timestamp >= started and
+                metadata["cwd"] == cwd and metadata["id"].lower() == match[1].lower()):
+            ids.add(metadata["id"].lower())
+            if len(ids) > 1:
+                return CodexResumePicker(kind="picker")
+    return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
+
+
+def _observed_codex_resume(reader: _SnapshotProcesses, process: Path, home: Path,
+                           cwd: str) -> CodexSessionId | CodexResumePicker:
+    try:
+        resume = reader.rollout(process, home)
+    except CodexDescriptorsUnreadable:
+        resume = CodexResumePicker(kind="picker")
+    if resume["kind"] == "session id":
+        return resume
+    return _codex_disk_resume(home, cwd, reader.started_at(process))
+
+
 def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> dict[str, list[SnapshotSession]]:
     reader = hosts.reader
     found: dict[str, list[SnapshotSession]] = {}
@@ -1461,16 +1610,13 @@ def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> di
                 continue
             environment = reader.environment(process)
             home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
-            try:
-                resume = reader.rollout(process, home)
-            except CodexDescriptorsUnreadable:
-                resume = CodexResumePicker(kind="picker")
+            cwd = reader.cwd(process)
+            resume = _observed_codex_resume(reader, process, home, cwd)
             identity = resume["session_id"] if resume["kind"] == "session id" else f"codex-{process.name}-{started}"
             login = "codex-" + home.name.casefold()
             if login in homes and homes[login] != home:
                 raise ObservationFailure(f"Codex home collision: {homes[login]} and {home}")
             homes[login] = home
-            cwd = reader.cwd(process)
             owner = TopLevelSession(kind="top-level", session_id=identity, pid=int(process.name), proc_start=started,
                 name=f"codex-{process.name}", cwd=cwd, probe=False, status="unknown", updated_at=0,
                 model=NoReplyYet(kind="no reply yet"), checkout=_checkout(cwd), run_dirs=[], codex_servers=[], timers=[],

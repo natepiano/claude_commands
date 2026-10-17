@@ -235,38 +235,14 @@
   },
   "shutdown.holdout_unanswered": {
     "long_session": {
-      "objections": [
-        {
-          "quote": "Reason: shutdown is blocked because build-followups-director's claude session has not paused for it and it can't proceed.",
-          "rule": "short-plain-sentences"
-        }
-      ],
-      "reviewer": "user-spec: user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner); Phase 14 split by the showrunner 2026-10-15. After 3 review passes the remaining objections target the user's title, Action and Reason (recorded, not applied) and the stop line's what-you-lose; the stop line names the account by label, never the login.; reviewer: opus",
-      "sha256": "a6e6dce0d515bc65821d718b32775934aa380975aeccffa03ec78ef77b640cf8",
-      "time": "2026-10-15T11:47:28.739116-04:00"
+      "reviewer": "opus",
+      "sha256": "39d83183464c5b7c29393976fe486518e8ea078f018d71d15d55220ba5813890",
+      "time": "2026-10-16T19:15:42.586534-04:00"
     },
     "typical": {
-      "objections": [
-        {
-          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session has not paused for it",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session has not paused for it and it can't proceed.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "Stopping ends only that session, and the restart goes on.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "pm-move-ghostty restart is blocked",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner); Phase 14 split by the showrunner 2026-10-15. After 3 review passes the remaining objections target the user's title, Action and Reason (recorded, not applied) and the stop line's what-you-lose; the stop line names the account by label, never the login.; reviewer: opus",
-      "sha256": "a6e6dce0d515bc65821d718b32775934aa380975aeccffa03ec78ef77b640cf8",
-      "time": "2026-10-15T11:47:15.105664-04:00"
+      "reviewer": "opus",
+      "sha256": "39d83183464c5b7c29393976fe486518e8ea078f018d71d15d55220ba5813890",
+      "time": "2026-10-16T19:15:31.911755-04:00"
     }
   },
   "shutdown.manual_restart": {
