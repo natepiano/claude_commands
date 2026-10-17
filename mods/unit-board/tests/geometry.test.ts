@@ -1,8 +1,14 @@
 import { describe, expect, test } from "claude-code/testing";
-import { cellWidth, doneText, fitText, labelRuns, rulerCells, runsOf, stripCells } from "../hooks/geometry";
+import { cellWidth, doneText, fitText, labelRuns, overdueText, rulerCells, runsOf, stripCells } from "../hooks/geometry";
 import { fixture, NOW, phase, time } from "./kit";
 
 describe("board geometry", () => {
+  for (const [minutes, expected] of [[59, "59m"], [60, "1h 0m"], [320, "5h 20m"], [1500, "1d 1h"]] as const) {
+    test(`a promise overdue by ${minutes} minutes uses a compact duration`, () => {
+      expect(overdueText(NOW / 1000 - minutes * 60, NOW / 1000)).toBe(` · overdue ${expected}`);
+    });
+  }
+
   test("terminal widths count wide characters and emoji twice and combining marks zero times", () => {
     expect(cellWidth("A界Ａ😀e\u0301")).toBe(8);
     expect(cellWidth("\u0301\u200d\ufe0f")).toBe(0);
