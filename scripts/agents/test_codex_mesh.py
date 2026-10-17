@@ -3200,6 +3200,38 @@ class MeshCommandTests(unittest.TestCase):
     def test_swap_resumes_socketless_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=False, ended_run=True)
 
+    def test_account_move_between_marker_read_and_idle_check_resumes_same_thread(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.server.hold_turn_completion = False
+        interrupted = False
+
+        def interrupt_after_marker_read(session_dir: str, name: str, thread_id: str) -> bool:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                self.assertEqual(thread_id, THREAD_ID)
+                self.assertEqual(self.live_turn, "turn-1")
+                self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+                self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+                self.assertEqual(agent_accounts.workers_home(), target)
+                move = codex_mesh._interrupt_worker_for_account_move(  # pyright: ignore[reportPrivateUsage]
+                    session_dir, name, self.worker_record(), self.server.port, "codex1")
+                self.assertIsInstance(move, codex_mesh.InterruptedWorkerMove)
+                self.assertEqual(self.live_turn, "")
+            return False
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", side_effect=interrupt_after_marker_read),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            code, errors = self.run_start()
+
+        self.assertTrue(interrupted)
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertNotIn("idle with no completion notice", output.getvalue() + errors)
+        self.assertNotIn("no completion notice arrived", (self.session_dir / "worker.log").read_text())
+
     def test_sign_in_change_resumes_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=True, ended_run=True)
 

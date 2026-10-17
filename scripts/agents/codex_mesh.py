@@ -2753,6 +2753,10 @@ def _stream_turn(
                             continue
                         quota_owed = _continuation_is_owed(session_dir, name)
                         if not resume_owed and _ended_unseen(client, thread_id):
+                            # A move can write its marker and interrupt after the first marker read.
+                            if (isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker)
+                                    and not end_marker.exists()):
+                                continue
                             moved = _move_resident(args, session_dir, name, thread_id, client)
                             if isinstance(moved, WorkerThreadStateUnknown):
                                 if isinstance(moved.cleanup, WorkerTurnCleanup):
