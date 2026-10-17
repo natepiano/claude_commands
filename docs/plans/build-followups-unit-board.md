@@ -96,143 +96,160 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - Tests patch `plan_history.now_epoch` for the clock.
 
 ### Phase 3 — Board data  · status: done
-**Depends on:** 2
+
+#### As-built
+
+- `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/board_json.py (--cwd <path> | --production <slug>)` writes each resolved production's board atomically (temp file in the same dir, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json` and prints one line `{"files": [<paths>], "focus": <unit key or null>}`; nothing resolved exits 0 with `"files": []`. It logs nothing and reads only the production's units' files.
+- Resolve: `--cwd` inside a unit worktree (`showrunners.registered_showrunners()` + `production_units.live_unit_table`) gives that production with `focus` = the unit; inside a showrunner checkout, its production; anywhere else, every production whose showrunner is running, `focus` null.
+- Top level: `production`, `as_of`, `zone`, `utc_offset_minutes` (at `as_of`), `units`, `sources`. Every time is `{"at": <epoch s>, "text": "HH:MM"}` in the production zone, `ddd DD Mon HH:MM` when not today.
+- Per unit: `key` (Unit cell less `-unit`), `plan`, `state`, `phase {id, of, title}` or null, `phases` (each with `status` `done|open|todo|gated`, `title`, record `took`/`fix_done`/`fix_running`/`findings {blocker, minor, nit}`/`eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, and `gate` `{kind: none}` | `{kind: timed, gate, until, waits_on}` | `{kind: untimed, gate, waits_on}`; a non-`none` gate makes the status `gated`), `finish` (`predicted` | `finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage` (`Build`/`Tests`/`Review`/`Repair round <n>` from the open pass, else the open activity label, else `Run done`/`Standing by`/`Waiting on G<k>`), `eta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}` or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]`), `workers` (`slot`, `role`, `state`, `model`, `doing` ≤ 80 chars from `board.log`).
+- `phase_table` exposes `OpenPhase.instance_id`, `OpenPhase.schedule_end` (the chain's open end for a stated, projected or duration-only estimate) and `PhaseHistory.fix_open_passes`; `fix_running` is a 0/1 property and `fix_rounds` stays the sum of done and open fix passes. Tests pin resolve and focus, every stage, gate and `finish` kind, the promise/schedule split, the fix split, existing-only `sources`, the atomic write, and every output key against `board.d.ts`.
+
+**Files:**
+- `scripts/delegate/board_json.py` — the board data generator.
+- `scripts/delegate/test_board_json.py` — its tests.
+- `mods/unit-board/types/board.d.ts` — the JSON contract, field for field.
+- `scripts/delegate/phase_table.py`, `scripts/delegate/test_phase_table.py` — fix split, open instance id, schedule end.
+
+**Binds later work:** the CLI and its `{"files", "focus"}` output line; the `<slug>.json` location under `UNIT_BOARD_DIR`; `board.d.ts` as the contract the output is tested against; `eta.at`/`first`/`trail` are stated promises only, while `schedule_end` is the chain's end (now once a promise has passed) and never a trail entry; `fix_done` counts finished fix passes and `fix_running` is 0 or 1; `state` comes from the unit's own newest run (standing-by, running, run-finished); `steps` and `stage` follow `build_plan`'s selected open instance; `OpenPhase.instance_id` and `OpenPhase.schedule_end`; `fix_open_passes` with `fix_rounds` as the sum. `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_history.plan_runs` `.jsonl`, the production doc, plus each session dir and the history `runs/` dir so a run that starts later moves a watched mtime. The recorder does not write the board file.
+
+**Gotchas:** `build_plan` can select an older resumed phase as open, so the newest `phase_started` is the wrong instance for `steps`/`stage`. `phase_table show --json` drops gates and turns `GateBlockedFinish` into null; the board builds from `build_plan`'s record instead.
+
+**Ruled out:** `unit_lookup.run_state` for `state`, which reads every history run file per unit.
+
+### Phase 4 — The board mod  · status: done
+
+#### As-built
+
+- `/unit-board [<unit>|close]` runs `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/delegate/board_json.py --cwd <cwd>` once and opens pane `unit-board` (`Units`): the unit view for `<unit>` or `focus`, else the board view; `open`/`board` buttons switch views. `session.start` only registers the command and, if `$.ui.panes()` shows the pane open (reload), restarts its refresh; nothing shows by itself.
+- The generator prints `BoardResult { files; focus; watch }`; `watch` is the existing notifier registry dir, so an open pane finds a production started later.
+- Pane state (`unit-board.panes`, keyed by pane id): `loading` | `board {data, now}` | `unit {data, production, unit, now}` | `failed {reason}`; closed = no entry. A module-level `OpenPane {timer, cwd, busy, paths, selection}` per pane (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`) keeps paths and selection across a failed refresh.
+- Refresh only while open: a 10 s `$.clock.every` tick and `turn.complete` call `refreshIfChanged(files, paths, generator, set, isOpen)` with `RefreshPaths = {kind:'board'; board; sources} | {kind:'discovery'; sources; loadedAt}` (sources newer than the board file, or than `loadedAt`, run the generator once). `isOpen` is checked before each stat, the generator and the set. An unchanged tick only moves the ruler's `now`. `ui.close` (any origin) cancels the timer and drops the state; closed, `turn.complete` calls `next` at once.
+- `loadBoard(calls, cwd, isOpen, watch)` returns `{files, boards, focus, watch, loadedAt}`; the registry comes from `NOTIFIER_STATE_DIR` (default `$HOME/.local/state/notifier`).
+- Views draw the `as_of` snapshot and never recompute an ETA; the ETA mark is `eta.at`, never `schedule_end`. The strip shows counts above 30 phases; the workers line groups by role and state. Theme-key colours only; no band, status line or toast.
+
+**Files:**
+- `mods/unit-board/hooks/register.tsx` — all direct engine calls; `data.ts` — refresh and load; `geometry.ts` — pure strip and ruler; `board.tsx`, `unit.tsx` — views.
+- `mods/unit-board/types/board.d.ts`, `types/index.d.ts` — generator contract; pane state.
+- `mods/unit-board/tests/` — kit, geometry and register tests; `mods/.claude-plugin/marketplace.json` — local marketplace.
+
+**Binds later work:** "Accounts view" reuses `refreshIfChanged` with its own timer and state, an `isOpen` guard and tagged paths (`discovery` needs no output file); its engine calls stay in its register file; there is no `$.ui.list()`.
+
+**Gotchas:**
+- The mod runs the generator installed under `$HOME/.claude`, not the worktree's, so a contract change cannot be live-checked before promotion; the board's live and design checks wait for promotion.
+- A failed stat counts as a change: a `failed` pane retries each tick while a source stays newer than the board file, and recovers on the next good run.
+- The user installs per machine (`/plugin marketplace add ~/.claude/mods`, `/plugin install unit-board`); `settings.json` is never edited.
+
+**Ruled out:** a scratch HOME for the live check (refused as credential exploration); a watcher process or timer outside the mod.
+
+### Phase 5 — Shorter terminal report  · status: done
+
+#### As-built
+
+- `progress` (and `_print_last_recorded` between windows) prints the short report by default: the phase heading, one ETA line from `_phase_eta_line`, the stage line and one `- **Agent N**` line per worker (slot, role, elapsed, state, model, last board line). The ETA line forms are `ETA HH:MM (first HH:MM, +H:MM, moved N×, …)`, `ETA HH:MM (on its first ETA, …)`, a leading `passed` when an open phase is overdue, fix rounds as `N fix rounds`, `+ 1 running` or `1 fix round running`, `gated until Wed 22 Oct 11:47`, `gated by <gate>: <Waits on>`, and `ETA unavailable` when no plan, state, row or promise exists. A promise on another local day shows weekday and date.
+- `ETA` is the latest promise in `eta_trail`, never the schedule end an overdue phase is advanced to, and the line reads only the reported phase's own row and gate.
+- Worker lines come from `_current_worker_windows` / `_current_worker_cells`: per slot, the live window, else the most recent finished one, independent of the director's own activity.
+- `progress --tables` adds the clocks table (`_summary_table`) and the round table, `Earlier:` and verification gate lines; `/unit:report tables` passes it, ordinary reports and notifier ticks do not.
+- The legacy (non-dual) layout keeps its old form plus one ETA line after the phase line. The vault phase note keeps the full phase list.
+- `/unit:report` sections run phase and stage, ETA line, worker table, summary sentences, `See /unit-board for the board.`; `/unit:direct`'s `<DelegationResultFormat/>` closes every result and launch with this short report.
+
+**Files:**
+- `scripts/delegate/progress_history.py` — `_phase_eta_line`, `_current_worker_windows`, `_current_worker_cells`, `_phase_section(tables=…)`, `_print_last_recorded(tables=…)`, `progress --tables`.
+- `scripts/delegate/test_progress_history.py` — ETA line forms, worker lines, the tables flag, between-window output.
+- `commands/unit/report.md` — short report contract; tables only on `tables`; names `/unit-board`.
+- `commands/unit/direct.md` — `<DelegationResultFormat/>` closes with the short report.
+
+**Gotchas:** taking worker cells from the round table's last row blanks them once the director opens an activity; reading the next gated phase instead of the reported one gives the wrong ETA line.
+
+### Phase 6 — Accounts view  · status: done
+
+#### As-built
+
+- `/accounts-board` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `{kind: "loading"}`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored", "--with-login"]` once and replies `Accounts opened.`; `/accounts-board close` closes it (`Accounts closed.`). Every open and refresh run is exactly that argv; the text table is never parsed. `session.start` registers the command and, when `$.ui.panes()` shows the pane open, restarts its refresh.
+- `AccountsView(elements, status, zone)` draws the units/showrunners line from `roles` (units match both `units` and `unit directors`; none → `unassigned`), the table (Label, Login, Roles comma-joined, Weekly left, Weekly resets, On credits, Credits left, Read; weekly left under 10 % `error`, under 25 % `warning`) and a Problems list. `accountDisplay(account)` turns the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`); dates format in the resolved zone.
+- `resolveUserZone(calls, isActive): Promise<ZoneLookup>` mirrors `scripts/lib/user_zone.py`: `USER_ZONE` env, then the `zone=` line of `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`, validated through `Intl.DateTimeFormat`; returns `{kind: "cancelled"}` when the pane lifecycle moves on.
+- `loadAccounts(calls, isOpen, watch)` watches `usage.json`, `groups.json`, `~/.claude/config/accounts.json` and `role_map_cache.json` as one `discovery` path against `loadedAt`: an existing input is watched by itself, a missing one by its nearest existing parent. A 10 s `$.clock.every` tick calls the shared `refreshIfChanged` with a `busy` guard; a newer mtime reruns the stored read once and redraws. Pane state `AccountsPaneState<Status>` (`loading` | `accounts {data, zone}` | `failed {reason}`) lives under state key `accountsPanes`, apart from the board's `panes`, with its own timer, so either pane opens and closes without touching the other.
+- Invariants: pane closed = no timer, no stat, no process (`ui.close` bumps the lifecycle counter and cancels the timer; `turn.complete` does nothing for this pane). The mod never opens `.claude.json`, `auth.json` or an `id_token`; logins come only from the `login` field and are only drawn, never in a command reply, log, toast or message. A failed run surfaces a fixed reason, never process output.
+
+**Files:**
+- `mods/unit-board/hooks/accounts.tsx` — `AccountsView`, `accountDisplay` and the display-state types.
+- `mods/unit-board/hooks/data.ts` — `refreshIfChanged`, `loadAccounts`, `resolveUserZone` and their narrow service interfaces.
+- `mods/unit-board/hooks/register.tsx` — `/accounts-board` command, open/close lifecycle, timer and render wiring.
+- `mods/unit-board/types/accounts.d.ts` — `StoredAccount` / `StoredAccountsStatus` wire shape (`credits: number | "unlimited" | null`, nullable readings, optional `login`).
+- `mods/unit-board/types/index.d.ts` — `AccountsPaneState` and the `accountsPanes` state key.
+- `mods/unit-board/tests/accounts.test.ts` — argv, no credential paths, no address in replies, per-input mtime refresh, missing-input discovery, closed quiet, independent panes, failure recovery, close during a pending run, zone order, display states.
+
+**Gotchas:** the mod always runs the generator under `$HOME/.claude`, so the live check of the pane with real data runs after promotion to main, together with the board's deferred live check. A close during a pending `session.start` load must not restart the timer; the lifecycle counter guards it.
+
+### Phase 7 — The board opens at once  · status: done
+
+The live check on 2026-10-16 found `/unit-board` in the trunk failing with "process.run … still running after 30000ms". `board_json.py` took 35 s for three productions under load. 90% of that was `unit_run.local_run`, which parsed every line of all 184 run files once per unit (1.16M JSON parses for 22 units).
 
 #### Work Order
 
-**Goal:** `board_json.py` writes one JSON file per production holding everything the board draws, and lists the files whose change makes it stale.
+**Goal:** `board_json.py --cwd ~/.claude` finishes in a few seconds, so the trunk board opens within the mod's 30 s process limit even under load.
 
-**Spec:**
-- CLI: `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/board_json.py (--cwd <path> | --production <slug>)`. It writes each resolved production's file atomically (temp file in the same dir, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one JSON line `{"files": [<paths>], "focus": <unit key or null>}`. Exit 0 with `"files": []` when nothing resolves.
-- **Resolve.** `--cwd`: a cwd inside a unit's worktree (a `Worktree` cell of any registered showrunner's production, `showrunners.registered_showrunners()` + `production_units.live_unit_table`) → that production, `focus` = the unit; inside a showrunner checkout → its production; anything else → every production whose showrunner is running, `focus` null.
-- **Per unit** (rows of `live_unit_table`), with the run from `unit_run.local_run(history_root, worktree)` and the session dir `<run_root>/<run_id>` (`unit_runs.run_roots()`, first that exists):
-  - `key` (Unit cell less `-unit`), `plan` (Plan cell), `state` (`unit_lookup.run_state`).
-  - `phase` `{id, of, title}` of the open phase, or null; `phases`: every plan phase with `status` (`done` | `open` | `todo` | `gated`), `title`, and the phase record from "Predictions chain from the stated ETA" (`took` seconds, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`), the predicted `start`/`finish` for todo phases, and each todo phase's `gate` (below). `status` is `gated` for a todo phase whose gate is not `none`.
-  - `finish`: the unit's plan finish, `{"kind": "predicted", "at": <time>}`, `{"kind": "finished", "at": <time>}`, `{"kind": "after_gate", "gate", "waits_on"}` (`GateBlockedFinish`) or `{"kind": "unknown"}`.
-  - `stage`: open pass `impl` → `Build`, `test` → `Tests`, `review` → `Review`, `fix` → `Repair round <fix_pass>`; else the open activity's label (`units_table.open_step`); else `Run done`, `Standing by`, or `Waiting on G<k>`.
-  - `eta`: `{at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}` for the open phase, or null. `at`, `first` and `trail` are stated promises only; `delta_minutes` is `at` − `first` (the slip so far); `schedule_end` is the end the chain uses, which is now when the promise has passed — never a promise, never a trail entry.
-  - `summary`: the newest `progress_reported` `activity` text of the run.
-  - `steps`: the open phase instance's passes and activities in order, `[state, what, started, took_seconds]`.
-  - `workers`: one per `mesh_roster.json` entry: `slot`, `role`, `state` (its `status`), `model` (`impl_worker_<slot>.json` `family/model`), `doing` (the body of that agent's newest `board.log` line, ≤ 80 chars).
-- **Gates.** Each todo phase's `gate` is `{"kind": "none"}`, `{"kind": "timed", "gate": "G<k>", "until": <time>, "waits_on"}` or `{"kind": "untimed", "gate", "waits_on"}`, from `build_plan`'s `NoGate` / `TimedGate` / `UntimedGate`. A cleared gate is `none`.
-- **Fix rounds.** `fix_done` counts fix passes that finished, `fix_running` is 1 while one is open, else 0. Split the phase record's `fix_rounds` in `phase_table` into these two (and keep every existing reader's meaning: the sum).
-- **Times.** Every time is `{"at": <epoch seconds>, "text": "<HH:MM>"}` in the production zone, `text` `ddd DD Mon HH:MM` when not today. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes` (at `as_of`, for the mod's `now` label), `units`, and `sources`.
-- **`sources`:** absolute paths whose mtime moving means the file is stale: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, plan doc, every run `.jsonl` of the plan the predictions read (`plan_history.plan_runs`), and the production doc; plus, for discovery, each unit's session dir and the history `runs/` dir, whose mtimes move when a run or file is created there, so a pane opened before a run exists sees it start. Only paths that exist.
-- **Types.** The JSON shape is also written as TypeScript in `mods/unit-board/types/board.d.ts` (the mod phase reads it), field for field, so the two cannot drift silently; the test below checks the field names against it.
-- No recorder change: the recorder does not write the board file (the mod asks for it while open).
-- Cost: one run reads only the production's units' files. Log nothing.
+**Spec:** `scripts/production/unit_run.py` `local_run` stops reading a run file at its `run_started` event, matching or not; a run file holds exactly one, on line 1 (checked across all 184 files). Lines that do not contain `"run_started"` are skipped before `json.loads`. Results are unchanged.
 
 **Files:**
-- `scripts/delegate/board_json.py` — new.
-- `scripts/delegate/test_board_json.py` — new.
-- `mods/unit-board/types/board.d.ts` — new, the JSON contract.
-- `scripts/delegate/phase_table.py` — the `fix_done`/`fix_running` split, and a public accessor if the record needs one.
-- `scripts/delegate/test_phase_table.py` — the split.
+- `scripts/production/unit_run.py` — `local_run`.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `board_json.py`, `types/board.d.ts`, `phase_table.py`; hub: `mods/unit-board/types/board.d.ts` (the contract the test checks).
-- `test` — `test_board_json.py` and the split's cases in `test_phase_table.py`: a temp production doc, a showrunner conf under `NOTIFIER_STATE_DIR`, a unit worktree with a plan, a run stream under `PLAN_DELEGATE_HISTORY_DIR` and a session dir with `mesh_roster.json`, `impl_worker_1.json` and `board.log`: `--cwd <worktree>` focuses the unit; `--cwd /` lists every running production; stages for each pass kind; timed, untimed and cleared gates, each with and without an open phase, and every `finish` kind; an overdue unchanged promise adds no `trail` entry and its `schedule_end` is now; a running fix counts in `fix_running` only; `sources` lists only existing files; with no run yet, creating the run and session files moves a listed dir's mtime; the write is atomic (no partial file on a failed write); every key in the output appears in `types/board.d.ts`.
+**Workers:** none. The showrunner approved a director-written fix (2026-10-16), already in the tree.
 
-**Constraints from prior phases:** stated ETAs select by `eta_phase_id`; `phase_table` builds the chain with gates and exposes the per-phase record (`first_eta`, `moves`, `eta_trail`, `finished_at`, `delta_minutes`, `fix_rounds`, `findings`), read only from the row's own title family (a retired task's attempts under a reused number are excluded). The plan readers live in `scripts/delegate/plan_history.py` (`plan_runs`, `plan_phases`, `PlanPhase`, `history_root`, `now_epoch`, `resolve_plan_path`, `eta_band_seconds`); `phase_table` imports it, never `progress_history`; tests patch `plan_history.now_epoch` for the clock. Todo rows carry `gate`: `NoGate`, `TimedGate(gate, until, waits_on)` or `UntimedGate(gate, waits_on)`; `plan_finish` may be `GateBlockedFinish(gate, waits_on)`. An overdue open phase's `StatedEta.time` is already advanced to now for scheduling, while `eta_trail` keeps the real promises. `phase_table show --json` omits gates and turns `GateBlockedFinish` into null, so build from `build_plan`'s record, not that JSON.
+**Constraints from prior phases:** none beyond Delegation Context.
 
-**Acceptance gate:** the Test and Lint lines of Delegation Context green; `board_json.py --production build-followups` on natedev writes a file whose units match `/showrunner:units`.
+**Acceptance gate:** `scripts.production.test_unit_run` and `scripts.delegate.test_board_json` green; `merge_gate --tests-only` green; basedpyright clean on `unit_run.py`; `board_json.py --cwd ~/.claude` 35 s → under 5 s.
 
-### Phase 4 — The board mod  · status: todo
-**Depends on:** 3
+### Phase 8 — Board layout fixes  · status: done
+
+The design check of the live board (fresh reviewer, 2026-10-16) said "ship after these fixes". The showrunner made them a phase of this run.
 
 #### Work Order
 
-**Goal:** `/unit-board` opens a pane showing the production board (or, in a unit worktree, that unit), it stays current while open, and nothing runs or shows while it is closed.
+**Goal:** the production board shows every unit at a glance, with one style and no empty or repeated lines. The unit view lines up and shows a finished unit's phases.
 
 **Spec:**
-- **Plugin.** `mods/unit-board/.claude-plugin/plugin.json` (`name: unit-board`, `version: 0.1.0`), `hooks/hooks.json` `{"modules": ["./register.tsx"]}`, `tsconfig.json` as `mods/postmaster/tsconfig.json` (with `.tsx` in `include` and `jsx` settings from the prototype). Local marketplace `mods/.claude-plugin/marketplace.json` listing `unit-board` (and `postmaster`, unchanged in behaviour).
-- **Modules.** `hooks/register.tsx` holds only wiring; `hooks/data.ts` (generator call, file read, stat refresh), `hooks/geometry.ts` (strip, ruler, label runs), `hooks/board.tsx` (A), `hooks/unit.tsx` (B). Types from `types/board.d.ts`; plugin state declared in `types/index.d.ts`.
-- **Pane state.** Each pane owns its state, keyed by pane id, as a tagged union, never a nullable board plus a string: `{kind: "loading"}`, `{kind: "board", data}`, `{kind: "unit", data, unit}`, `{kind: "failed", reason}`; a closed pane has no entry. Each open pane owns its own timer handle. `hooks/data.ts` exports one stat-and-run helper that takes a pane's paths, generator and state setter, so a second pane (Phase "Accounts view") reuses it without sharing a timer or state with this one.
-- **Commands.** `session.start` only registers `/unit-board` and, when `$.ui.list()` shows the pane already open (a module reload), restarts the refresh; nothing else.
-  - `/unit-board` — run the generator once (`$.process.run([py, board_json.py, "--cwd", cwd])`, `py` = `$HOME/.claude/scripts/lib/py`), read its files, open pane `unit-board` (title `Units`): B for `focus`, else A.
-  - `/unit-board <unit>` — B for that unit. `/unit-board close` — close the pane. The command result text is one short line (`Unit board opened.`).
-  - In the pane: each unit's `open` button shows B; B has a `board` button back to A.
-- **Refresh while open only.** On open start `$.clock.every(10_000)`: `$.fs.stat` each path in `sources` (files and the discovery dirs) and the board file; if any mtime is newer than the board file, run the generator once, then `$.fs.read` and `$.state` update (a redraw follows the state write). A missing board file runs the generator once; a `sources` path that has disappeared counts as a change. `turn.complete`: when open, the same check; when closed, `next(e)` at once. `ui.close` (any origin, `plugin`, `person`, `unload`): cancel that pane's timer, drop its state and pass to `next`.
-- **Clock while open.** Each tick also moves the ruler's `now` mark from the engine clock, with no file read and no generator. Predictions belong to the board file's `as_of` snapshot, which the header shows; the mod never recomputes an ETA, and a promise that has passed stays drawn as recorded until the generator's next run.
-- **A (board).** Per production: header (slug, unit count, `as of HH:MM`), then per unit: `● key  Phase n/of  title  open`; the phase strip (█ done, ▓ open, ░ todo, ▒ gated; above 30 phases show counts `44/45 done` instead of shrinking); stage; ETA line from `eta` (`ETA 18:30  first 17:15 · moved 2× · +1:15 late · fix rounds 1 + 1 running` from `fix_done` + `fix_running`, or `on its first ETA`); the next gated phase's line from its `gate` (`timed`: `Phase n gated until Wed 22 Oct 11:47 — G3: <waits_on>`; `untimed`: `Phase n gated by G3: <waits_on>`); the unit's finish from `finish` (`done by 21:40`, `finished 17:02`, `after G3`, or nothing for `unknown`); the ruler; a workers line (`1 fix running · 2 review idle`). Layout as `mockup-A-board.txt`.
-- **B (unit).** Summary; ETA and its trail (`17:15 said 14:42 → 17:45 said 14:48 → 18:30 said 15:03`); ruler; the current phase's steps with times; workers table; phase record rows (`took`, fix rounds as dots, `-1:13 early, said 14:15`). Layout as `mockup-B-unit.txt`.
-- **Ruler** (geometry.ts, pure): window from phase start to max(ETA, now) + 10 %; elapsed `━`, earlier ETAs `○` (`eta.trail`), current ETA `●` (`eta.at`, the promise, never `schedule_end`), now a red `│`; labels that would overlap are dropped, later mark wins; `now` is the engine clock, labelled with `utc_offset_minutes`.
-- **Colours** are theme keys only (`success`, `error`, `warning`, `suggestion`, `inactive`, `subtle`).
-- **No band, no status line, no toast** (Invariants).
-- **Tests** (`tests/*.test.ts`, the postmaster kit style): mount on `terminal` and `desktop`; `/unit-board` opens A and, with a `focus`, B; `open`/`board` presses switch views; the generator is called with exactly `[py, board_json.py, "--cwd", cwd]`; a changed source mtime runs the generator once and redraws; a new mtime on a discovery dir (a run started after open) does the same; an unchanged one reads nothing; advancing the fake clock past a promised ETA with unchanged files moves the `now` mark, keeps the promise drawn and runs no generator; timed, untimed and cleared gates and each `finish` kind draw their lines; closed → no `fs`, `process` or timer call on `turn.complete` or over a fake-clock minute; `ui.close` cancels the timer and drops the pane's state; geometry cases for the ruler window, label dropping and the strip's count form.
-- **Install.** The user runs once per machine: `/plugin marketplace add ~/.claude/mods` then `/plugin install unit-board` at user scope. The unit director adds that to the change review (`/change_review`) with the live check below; it never edits `settings.json`.
-- **Live check** (unit director): load with `command claude --plugin-dir <worktree>/mods/unit-board` in a throwaway tmux session on a private socket (`tmux -L unitboard`), at 170 columns: `/unit-board` from the trunk checkout draws A with real data, from this worktree draws B; close it and confirm with a fake source touch that no generator runs while closed. Capture both panes as text. The phone check (Remote Control, `/unit-board` from the phone) goes to the change review for the user.
+
+Board (`mods/unit-board/hooks/board.tsx` `BoardView`):
+
+1. Order and size. Units sort as running, then standing by (any other state), then run done, keeping the JSON order within each group. A unit whose `state` is `run-finished` draws one line: dot, key, then `Run done` and its `finishText` when non-empty, right-aligned `open` button. It has no strip, stage, ETA, ruler or workers lines. With 22 units, mostly done, the whole production then fits a 50-row pane.
+2. No phase, no repetition. When `unit.phase` is null, the header line reads `● <key>  <stage>` (no `no phase running`), and no separate stage line is drawn. With a phase, the header stays `● <key>  Phase i/n  <title>` and the strip line carries the stage.
+3. Strip separator. The two spaces before the stage on the strip line print only when the strip has cells. No line starts with 4 spaces of indent.
+4. Empty roles. `workersText` joins `[count, role, state]` with single spaces, skipping empty parts: `2 paused`, never `2  paused`.
+5. Predicted finish with no phase running. `done by HH:MM` under a unit with no phase running keeps its text only when a later phase is predicted. Otherwise `finishText` is not drawn for that unit. The JSON already says which: a `todo` or `gated` row in `phases`.
+
+Worker states (`scripts/delegate/board_json.py` `workers`):
+
+6. One word per state. Map the roster `status` to `running`, `paused`, `idle` (roster `done`: the turn finished, the thread is open) and `ended` (the thread is closed). Any other value passes through. Units with all workers `ended` draw no workers line on the board.
+
+Unit view (`mods/unit-board/hooks/unit.tsx` `UnitView`):
+
+7. No blank block. The ETA/gate/finish/ruler/trail box and the strip box render only when at least one child has content, so a finished unit shows no blank lines under `as of`.
+8. Aligned workers. Pad `slot` to the widest slot in the list plus one space, the role to the widest role plus one, and the state to the widest state plus one.
+9. Worker activity text. `doing` (`board_json.py` `workers`, from the newest `board.log` line) drops a leading `launcher: ` and any trailing `; summary at …` / `; findings in …` clause, so the row reads `adversary review finished`.
+10. Phase record of a finished unit. When the plan doc resolves to no phases, `board_json.py` `unit` builds `phases` from the found run's own events (`units_table.run_events`). There is one `done` row per `phase_finished` (id `phase_id`, title `phase_title`, took `phase_elapsed_seconds`). `fix_done` counts that instance's repair passes, `findings` counts its `finding_opened` by severity, and `eta` comes from its `eta_stated` events by `eta_phase_id` (first, trail, finished = `phase_finished` time, delta). An instance with `phase_started` and no `phase_finished` is `open`. Rows keep the `BoardPhase` contract in `mods/unit-board/types/board.d.ts`, so the mod needs no change for it. `phase.of` and the strip follow from those rows. A unit with no plan phases and no run phases draws `Phase record` with one subtle line, `no phases recorded`.
+
+Keep every Delegation Context invariant: nothing opens by itself, no work while closed, the mod never computes ETAs.
 
 **Files:**
-- `mods/unit-board/.claude-plugin/plugin.json`, `mods/unit-board/hooks/hooks.json`, `mods/unit-board/tsconfig.json` — the plugin's manifest, module list and type-check config.
-- `mods/unit-board/hooks/register.tsx` — wiring only: commands, open/close, refresh.
-- `mods/unit-board/hooks/data.ts`, `mods/unit-board/hooks/geometry.ts` — load and refresh; strip, ruler and runs.
-- `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx` — views A and B.
-- `mods/unit-board/types/index.d.ts` — plugin state.
-- `mods/unit-board/tests/` — geometry and register tests.
-- `mods/.claude-plugin/marketplace.json` — the local folder marketplace.
+- `mods/unit-board/hooks/board.tsx` — items 1–5.
+- `mods/unit-board/hooks/unit.tsx` — items 7, 8, 10 (empty record line).
+- `scripts/delegate/board_json.py` — items 6, 9, 10.
+- `scripts/delegate/test_board_json.py` — tests for 6, 9, 10.
+- `mods/unit-board/tests/board.test.tsx` — new: render tests for 1–5, 7, 8 using the kit in `tests/kit.ts`.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — every file except `tests/`; hub: `mods/unit-board/types/index.d.ts` (plugin state both sides use).
-- `test` — `tests/geometry.test.ts` from the ruler and strip rules above, and `tests/register.test.ts` from the command, refresh and closed-quiet rules, against `types/board.d.ts` fixtures.
+**Workers:** 1 writer + 1 tester.
+- `impl` — `board.tsx`, `unit.tsx`, `board_json.py`.
+- `test` — `test_board_json.py` and `tests/board.test.tsx`, written from this Spec alone.
 
-**Constraints from prior phases:** the generator CLI, output line `{"files", "focus"}`, file location and JSON contract `mods/unit-board/types/board.d.ts` (Phase "Board data"); times are `{at, text}`; `sources` lists the files and discovery dirs to stat. Todo phases carry a tagged `gate` (`none`, `timed`, `untimed`) and each unit a tagged `finish` (`predicted`, `finished`, `after_gate`, `unknown`); `eta.at`, `eta.first` and `eta.trail` are promises, `eta.schedule_end` is not; fix rounds come as `fix_done` and `fix_running`.
+**Constraints from prior phases:**
+- Phase 7: `unit_run.local_run` reads each run file only to its `run_started` line.
+- The JSON contract is `types/board.d.ts` field for field, and `test_board_json.py` checks every output key against it. A changed field changes both.
+- Board JSON times are `BoardTime {at, text}` in the production zone; Python writes them with `astimezone(user_zone())`.
 
-**Acceptance gate:** `tsc`, `command claude plugin validate --strict mods/unit-board` and `command claude plugin test mods/unit-board` exit 0; the live check's captures match the mockups' layout.
-
-### Phase 5 — Shorter terminal report  · status: todo
-**Depends on:** 4
-
-#### Work Order
-
-**Goal:** `/unit:report` and its notifier ticks print a short text report — phase and stage, one ETA line, the workers, the summary — and the two recorder tables only on `/unit:report tables`.
-
-**Spec:**
-- The ETA line, printed by `progress_history.py progress` and by `_print_last_recorded`: `ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)`; on its first ETA `ETA 16:10 (on its first ETA, 1 fix round)`; gated `gated until Wed 22 Oct 11:47` or `gated by G3: <Waits on>`. From the phase record and chain of Phase "Predictions chain from the stated ETA" and the `fix_done`/`fix_running` split of Phase "Board data": `ETA` is the latest promise, never the schedule end an overdue phase is advanced to; an overdue phase reads `ETA 18:30 (passed, first 17:15, …)`.
-- The clocks table and round table (`_summary_table`, `_phase_section`) print only with a new `progress --tables` flag; `commands/unit/report.md` passes it only for `/unit:report tables`.
-- **Report inputs stay.** `_phase_section` also supplies the worker narration and stage the report's worker table is built from. Without `--tables`, `progress` still prints the stage line and the workers (slot, role, state, model, what each is doing), from the same sources as today, so `commands/unit/report.md` can build its worker table with the tables hidden.
-- `commands/unit/report.md`: the report's sections become phase and stage, the ETA line, the worker table, the summary sentences, and one line naming `/unit-board` as the place to see the board.
-- The vault note keeps the full phase list.
-
-**Files:**
-- `scripts/delegate/progress_history.py` — the ETA line and `progress --tables`.
-- `scripts/delegate/test_progress_history.py` — the line forms and the tables flag.
-- `commands/unit/report.md` — tables only on request; names `/unit-board`.
-
-**Workers:** 1 writer + 1 tester
-- `impl` — `progress_history.py`, `commands/unit/report.md`; hub: `scripts/delegate/progress_history.py`.
-- `test` — `progress` prints the ETA line forms above, the stage and worker lines, and no tables; `progress --tables` prints both tables as before; between windows (`_print_last_recorded`) the same short form prints; an activity still open after its phase finished still shows as the stage; an overdue unchanged promise prints `passed`, never a new time.
-
-**Constraints from prior phases:** the phase record (`first_eta`, `moves`, `eta_trail`, `delta_minutes`, `fix_done`, `fix_running`) and the gate text come from `phase_table` (`build_plan`, gates `NoGate`/`TimedGate`/`UntimedGate`); plan readers from `plan_history`, and tests patch `plan_history.now_epoch`. An overdue open phase's `StatedEta.time` is the schedule end, not a promise. The board command is `/unit-board`.
-
-**Acceptance gate:** the Test and Lint lines of Delegation Context green.
-
-### Phase 6 — Accounts view  · status: todo
-**Depends on:** 4
-
-#### Work Order
-
-**Goal:** `/accounts-board` opens a pane showing the units/showrunners line, the accounts table with each login's address, and the problems under it, drawn from disk straight to the screen, current while open, with nothing running while closed.
-
-**Spec:**
-- **Data source.** two-accounts-unit's stored status with logins is promoted (49fde9b3; the showrunner, 2026-10-16): `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status --json --stored --with-login`. It prints `{"accounts": [{label, tool, roles[], weekly_left_percent, resets_at, credits, use_credits, read_at, login}], "problems": [...]}`. `--stored` reads stored readings only — no live read, no subprocess, no `ssh`; `--with-login` needs `--json`. Never parse the text table. Copy the exact field types into `mods/unit-board/types/accounts.d.ts` from the code on the merge branch. Every run this phase makes, the open run included, is exactly that command. This phase does not edit `accounts.py`.
-- **The mod never opens a credential file** (the showrunner, 2026-10-16: those files are read for nothing beyond what they must be): no read of `~/.claude<N>/.claude.json`, any `auth.json` or any `id_token`, not even to decode the email. Login addresses come only from the `login` field of `--with-login`, and are only drawn: never in a command result, `$.ui.log`, a toast or a message.
-- **Mod** (`hooks/accounts.tsx`, wiring in `register.tsx`): `session.start` also registers `/accounts-board`, and restarts its refresh when `$.ui.list()` shows the pane open. `/accounts-board` runs the command once, opens pane `accounts-board` (title `Accounts`), and draws: the units/showrunners line built from the `roles` fields; the table (Label, Login, Roles (comma-joined), Weekly left, Weekly resets, On credits, Credits left, Read; weekly left under 10 % `error`, under 25 % `warning`); the problems under it. `/accounts-board close` closes it. The command result text is `Accounts opened.` only.
-- **Refresh while open only.** `$.clock.every(10_000)` stats `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json` and `~/.claude/config/accounts.json`; on a newer mtime run the same command once and redraw. `usage.json` moves about every 2 min (the `agent-sessions-snapshot` timer), so an open pane runs one stored read per move and none between. `ui.close` cancels the timer; `turn.complete` does nothing for this pane. Closed: no timer, stat or process. Reuse the board's stat-and-run helper in `hooks/data.ts`, with this pane's own state entry (`{kind: "loading"}`, `{kind: "accounts", data}`, `{kind: "failed", reason}`) and its own timer: either pane opens and closes without touching the other's. Any change the helper or the shared pane state needs is this phase's writer's.
-- **Tests** (`tests/accounts.test.ts`): `/accounts-board` opens and draws a fixture with logins and rows holding several roles; the open run and each refresh run are called with exactly `[py, accounts.py, "status", "--json", "--stored", "--with-login"]`; no `$.fs` call names a `.claude.json`, `auth.json` or `id_token` path; a changed `usage.json` mtime runs the stored read once and an unchanged one runs nothing; closed → nothing over a fake-clock minute; the command result holds no address; with both panes open, closing either stops only its own timer, stats and runs while the other keeps refreshing.
-- **Live check:** in the throwaway session, `/accounts-board` draws the table; touching `usage.json` redraws within 10 s; with `/unit-board` also open, closing the accounts pane stops its stats while the board keeps refreshing, and the reverse; closing both stops every stat. Capture the pane to a scratchpad file and confirm it by headings and row count only, never pasting rows into a reply or message.
-
-**Files:**
-- `mods/unit-board/hooks/accounts.tsx` — the accounts view.
-- `mods/unit-board/hooks/register.tsx` — the wiring for `/accounts-board`.
-- `mods/unit-board/hooks/data.ts`, `mods/unit-board/types/index.d.ts` — only what the second pane needs from the shared helper and pane state.
-- `mods/unit-board/types/accounts.d.ts` — the stored-status JSON shape.
-- `mods/unit-board/tests/accounts.test.ts` — the view's tests.
-
-**Workers:** 1 writer + 1 tester
-- `impl` — `hooks/accounts.tsx`, `types/accounts.d.ts`, `hooks/register.tsx`, and any shared helper or pane-state change in `hooks/data.ts` and `types/index.d.ts`; hub: `mods/unit-board/hooks/register.tsx`.
-- `test` — `tests/accounts.test.ts` from the Spec and a fixture in the merged JSON's shape, and any change the shared helper needs in the board's tests.
-
-**Constraints from prior phases:** the mod's layout, `register.tsx` wiring-only rule, the open/close and closed-quiet pattern, the 10 s stat refresh, the per-pane tagged state and timer, the `hooks/data.ts` stat-and-run helper and the test kit usage come from Phase "The board mod".
-
-**Acceptance gate:** `tsc`, `command claude plugin validate --strict mods/unit-board` and `command claude plugin test mods/unit-board` exit 0; the live check above, both panes open and each closed in turn.
+**Acceptance gate:**
+- `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/unit-board` clean.
+- `command claude plugin test mods/unit-board` and `command claude plugin validate --strict mods/unit-board` green.
+- `basedpyright scripts/delegate` reports 0 errors, 0 warnings.
+- `merge_gate --tests-only` green.
+- Live (director): trunk `/unit-board` shows all of build-followups' units in one 50-row pane at 170 columns. `/unit-board` in this worktree shows phases 1–8 under `Phase record`. A fresh design reviewer passes both captures.

@@ -57,11 +57,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 - `ImmutableGitSeed.create(root, branch, author, email, files)` builds one checkout plus a bare origin per test class, with `GIT_CONFIG_GLOBAL=/dev/null`. `copy_to(checkout, origin)` copies both trees and repoints the remote, so each case has private refs, config, index and origin without re-running git setup.
 - Converted test modules keep one `subprocess_cli=True` case per script, covering parsing, exit status and the launch contract. `mac_test/test_offload.py` imports `cli_fixture` through a `sys.path` insertion.
 
-**`scripts/production/fake_tmux.sh`** (bash + jq) replaces `fake_tmux.py` on hot paths (`UNIT_LOOKUP_TMUX`, state in `FAKE_TMUX_STATE`) and reads and writes the same JSON.
-- Verbs: `list-panes -a -F`, `show-environment -t`, `set-environment -t`, `capture-pane -p -e -t`, `send-keys -t`.
-- Exit 2: a malformed or unexpected call. Exit 1: a missing session or pane (jq `halt_error(1)` prints a diagnostic naming the target and leaves the state unchanged) or a missing state file.
-- Writes go through a temp file and `mv`.
-- Used by `test_waiting.py` and `test_dailies_input.py`. The `ci_points` fake `gh` is likewise a shell + jq stub.
+**Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes marked unit panes, their pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` and `test_dailies_input.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
 
 **`scripts/delegate/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
@@ -104,20 +100,31 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 ## Invariants
 
-- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, the live tmux server (real tmux only with a private `TMUX_TMPDIR`), the real `codex app-server`, and phone sends.
-  - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `workers_home` raises on any fallback to a live Codex home.
+- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, a real herdr server, the real `codex app-server`, and phone sends. Test discovery never starts a real session host or builds a missing host binary.
+  - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `observe_workers_home` raises on any fallback to a live Codex home.
   - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
   - No test writes into the repo.
+
 - **No wall-clock thresholds.** A timing claim is a work count (launches in flight, subshells traced with a DEBUG trap, barrier arrivals), a controlled clock (token clock file, injected durations), or a comparison calibrated in the same run (buildlog report: CLI CPU at full and quarter log size, three runs each). Fixture deadlines are 300 s hang guards, never pass/fail limits.
+
 - **Nothing is skipped to save time.** No skipped tests, no weakened assertions, no tier left out of the gate. A red under load is fixed at its source: an event-driven wait, a drained pipe, an injected `TimeoutExpired`, a hang guard.
+
 - **The gate covers only `TEST_SUITES`.** Every new suite joins it, and `run_suites` refuses a listed suite with no modules. Discovery is non-recursive, so `scripts/<suite>/tests/` is not gated. Directories with tests outside the list (berth, fix, prioritize, hana_shot, shot_report, screen_record, exclude, bevy_migration_plan) are not gated today.
+
 - **Override defaults stay as they are.** Each default is pinned by a test that runs the real script or module with the override unset and observes the default through behavior: the sleep argument, the attempt count, the clock source, the fsync/PRAGMA call, the computed module value. No test reads a literal from source. A new override needs the same pin.
+
 - **CLI contract kept.** A script converted to in-process tests keeps one subprocess test for parsing, exit status and launch. A moved test replaces its subprocess form; it never sits beside it with the same inputs and assertion.
+
 - **No trivial tests.** A test is trivial when it cannot fail for a real defect: (1) it asserts a constant, literal or default against itself; (2) it repeats the implementation; (3) it tests the standard library or a mock it configured; (4) it only checks that a name exists or a module imports; (5) it duplicates another test's inputs and assertion. A short test that pins behavior a user or another script depends on is not trivial; when unsure, keep it. `docs/delegate/write_prompt_contract.md` section 6 (`## Work Specification`) carries this as one line copied into every worker prompt that writes tests.
+
 - **Phone-send guards stay.** `whoami/test_quota_alert.py::test_setup_blocks_real_phone_sends` and `lint/test_sweep.py::test_base_blocks_real_phone_sends` pin the fixture patch that stops real sends.
+
 - **Signals.** A test that signals a child restores `SIG_DFL` before exec and waits for a ready marker written after the child installs its handlers (for example `runner-signals-ready`).
+
 - **Fixture cleanup.** A fixture that times out reaps its process group and owned threads (`communicate_launcher`) before restoring the mesh stub or HOME.
+
 - **In-process cases are synchronous only.** `invoke_cli` suits scripts that do not mutate containers held in module globals. Cache-holding functions (`_config_digest`) are cleared around each case.
+
 - **The gate kills only what it started:** its own process groups, never by pattern.
 
 ## Calibration / gotchas
@@ -143,16 +150,25 @@ Representative gate runs on natedev (32 cores):
 The largest module peaks near 0.5 GiB. The gate's wall time is its slowest module, currently one of delegate's (`test_verify_mac_offload`, `test_review_launcher`, `test_progress_history`). Times taken at different loads are not comparable; compare at matched load.
 
 - **Inherited SIGINT.** A suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores. `SUITE_BOOTSTRAP` resets dispositions for gate jobs; a signal test still restores `SIG_DFL` itself.
+
 - **Admission is not an OS limit.** It works on RSS samples, so a module that grows suddenly can still pass the cap; that turns the run red rather than killing anything.
+
 - **macOS has no inotify.** `local_release_wait` and `wait_until` fall back to interval polling there.
+
 - **pidfds stay readable** after the process exits; `wait_until` observes each one once and drops it.
+
 - **Import-time paths.** A module first imported under a fixture HOME computes its import-time paths from it, and restoring bindings then restores the fixture paths. Preload such modules before swapping the environment; `invoke_cli(production_state=True)` and `recorder_fixture.py` do this. Pinned by `test_dailies_render.py::ReportFooterTests::test_cold_imported_production_paths_return_to_the_callers_home_after_each_case`.
+
 - **Bindings, not containers.** `invoke_cli` restores module bindings, not mutable containers in module globals.
-- **fake_tmux.sh exit codes.** A missing target exits 1 through jq `halt_error(1)`; jq's own failure exit is 5; malformed calls exit 2. Pinned by `test_waiting.py::WaitingTests::test_shell_tmux_names_missing_targets_and_preserves_state_on_every_targeted_call`.
+
 - **Shell override defaults** are pinned by unset-default tests in `test_review_launcher.py`, `test_implement_launcher.py` and `test_verify_token_wait.py`; each pops all four shell overrides.
+
 - **Mac ssh status.** The Mac ssh command always exits 0; read `ff_rc=`.
+
 - **Red-suite reruns.** Whether to rerun a red suite is the showrunner's rule, outside the command.
+
 - **fsync on tmpfs is already cheap.** `PLAN_DELEGATE_SYNC_WRITES=0` matters on disk-backed TMPDIRs; `test_progress_history`'s remaining cost is process launches.
+
 - **`build_targets` is already at 4 launches per module run.** Further launch cuts belong elsewhere.
 
 ## Why

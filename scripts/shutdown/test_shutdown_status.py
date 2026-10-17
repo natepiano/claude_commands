@@ -19,6 +19,7 @@ from test_support import ShutdownSendLeaf, ShutdownTestCase
 import shutdown
 import settle
 import inventory
+from scripts.accounts import accounts
 import record as record_store
 from account import UnreadableAccount
 from inventory import Inventory
@@ -59,6 +60,7 @@ def empty_recovery_inventory() -> shutdown.RecoveryStatusInventory:
 def complete_session(*, host: object) -> dict[str, object]:
     return {
         "session_id": "11111111-1111-1111-1111-111111111111",
+        "config_dir": str(Path.home() / ".claude2"),
         "pid": 1234,
         "proc_start": "process-start",
         "name": "shutdown",
@@ -144,7 +146,7 @@ class ShutdownStatusTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.notes = self.root / "agents"
         self.notes.mkdir()
         self.state = self.root / "shutdown-state"
@@ -175,6 +177,7 @@ else:
         ssh.chmod(0o755)
         environment = {
             **os.environ,
+            "HOME": str(self.root),
             "AGENT_NOTES_DIR": str(self.notes),
             "PATH": str(binary_root) + os.pathsep + os.environ.get("PATH", ""),
             "SHUTDOWN_STATE_DIR": str(self.state),
@@ -495,12 +498,12 @@ else:
             record_store.CodexServerLeftRunning(
                 kind="codex server left running", at=at, run_dir="/tmp/run", cause="stop not confirmed",
             ),
-            record_store.UnitSessionLeftRunning(
-                kind="unit session left running", at=at, host="tmux",
+            record_store.LegacyTmuxSessionLeftRunning(
+                kind="legacy tmux session left running", at=at,
                 session_name="demo-unit", cause="owner identity lost",
             ),
         ]
-        self.assertEqual(remote_record["stop_issues"][-1]["kind"], "unit session left running")
+        self.assertEqual(remote_record["stop_issues"][-1]["kind"], "legacy tmux session left running")
         write_old(local)
         os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps([remote_record])
         result, output, error = self.run_plain_status_with_ssh()
@@ -512,9 +515,108 @@ else:
             "    not stopped: account unreadable",
             "  remote: waiting",
             "    Codex server /tmp/run left running: stop not confirmed",
-            "    tmux session demo-unit left running: owner identity lost",
+            "    legacy tmux session demo-unit left running: owner identity lost; tmux kill-session -t =demo-unit",
         ]
         self.assertEqual([line for line in output.splitlines() if line in expected], expected)
+
+    def test_legacy_hosts_and_leftovers_show_manual_commands_in_status_and_now(self) -> None:
+        saved = session_shutdown(name="old session")
+        saved["session"] = cast(inventory.TopLevelSession, cast(object, {
+            **saved["session"], "kind": "top-level", "host": inventory.LegacyTmuxHost(
+                kind="legacy tmux", session_name="old:name")}))
+        saved["progress"] = record_store.SessionStopped(kind="stopped", at=saved["requested_at"])
+        saved["stop_issues"] = [record_store.LegacyTmuxSessionLeftRunning(
+            kind="legacy tmux session left running", at=saved["requested_at"],
+            session_name="old:name", cause="stop not confirmed")]
+        self.assertTrue(record_store.create_session(saved))
+        for verb in ("status", "now"):
+            with self.subTest(verb=verb), patch.object(shutdown, "inventory", return_value=empty_inventory()), \
+                 patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(io.StringIO()) as output:
+                status = shutdown.main([verb, LOGIN, "--here", "--only", "old session-id"])
+                self.assertEqual(status, 1 if verb == "now" else 0)
+                self.assertIn("tmux kill-session -t =old:name", output.getvalue())
+                self.assertIn("--session-id 'old session-id'", output.getvalue())
+                conductor.assert_not_called()
+        remaining = record_store.find_session(LOGIN, "old session-id")
+        assert remaining is not None
+        self.assertEqual(remaining["session"], saved["session"])
+        self.assertEqual(remaining["stop_issues"], saved["stop_issues"])
+        self.assertEqual(remaining["progress"], saved["progress"])
+
+    def test_every_legacy_cleanup_cause_holds_status_and_now(self) -> None:
+        for index, cause in enumerate(cast(tuple[record_store.StopLeftRunningCause, ...],
+                ("stop not confirmed", "owner identity lost"))):
+            saved = session_shutdown(name=f"leftover-{index}")
+            saved["progress"] = record_store.SessionNeedsManualRestart(kind="manual restart", command="old command")
+            saved["stop_issues"] = [record_store.LegacyTmuxSessionLeftRunning(
+                kind="legacy tmux session left running", at=saved["requested_at"], session_name="old:name", cause=cause)]
+            self.assertTrue(record_store.create_session(saved))
+            for verb in ("status", "now"):
+                with self.subTest(cause=cause, verb=verb), patch.object(shutdown, "inventory", return_value=empty_inventory()), \
+                     patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(shutdown.main([verb, LOGIN, "--here", "--only", saved["session"]["session_id"]]),
+                        1 if verb == "now" else 0)
+                    self.assertIn("manual restart", output.getvalue())
+                    self.assertIn("tmux kill-session -t =old:name", output.getvalue())
+                    conductor.assert_not_called()
+            self.assertEqual(record_store.find_session(LOGIN, saved["session"]["session_id"]), saved)
+
+    def test_legacy_unit_status_and_now_print_the_selected_group_resume_command(self) -> None:
+        self.write_note("claude3", LOGIN)
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
+        self.assertEqual(accounts.setup("claude3"), [])
+        _ = (self.root / ".claude3/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
+        group_file = accounts.groups_file()
+        group_file.parent.mkdir(parents=True, exist_ok=True)
+        _ = group_file.write_text(json.dumps({"units": "claude3", "showrunners": "claude3"}))
+        saved = session_shutdown(name="old unit")
+        saved["session"] = cast(inventory.UnitSession, cast(object, {**saved["session"], "kind": "unit",
+            "host": inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo", unit="old",
+                doc="/tmp/demo.md", session_name="old-destination")}))
+        saved["progress"] = record_store.SessionStopped(kind="stopped", at=saved["requested_at"])
+        self.assertTrue(record_store.create_session(saved))
+        for verb in ("status", "now"):
+            with self.subTest(verb=verb), patch.object(shutdown, "inventory", return_value=empty_inventory()), \
+                 patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main([verb, LOGIN, "--here", "--only", saved["session"]["session_id"]]),
+                    1 if verb == "now" else 0)
+                self.assertIn("exec claude3 --session-id 'old unit-id'", output.getvalue())
+                self.assertNotIn("--session old-destination", output.getvalue())
+                conductor.assert_not_called()
+        self.assertEqual(record_store.find_session(LOGIN, saved["session"]["session_id"]), saved)
+
+    def test_unresolved_legacy_claude_and_codex_snapshots_print_manual_commands(self) -> None:
+        owner = cast(inventory.TopLevelSession, cast(object, {
+            **session_shutdown(name="snapshot claude")["session"], "kind": "top-level",
+            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-claude")}))
+        claude = record_store.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
+            last_seen="2026-10-09T21:49:10+00:00", state="unresolved")
+        codex_owner = cast(inventory.TopLevelSession, cast(object, {
+            **owner, "name": "snapshot codex", "session_id": "codex-id",
+            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-codex")}))
+        codex = record_store.SnapshotCodexSession(agent="codex", session=codex_owner, workers=[], timers=[],
+            last_seen=claude["last_seen"], state="unresolved", codex=inventory.CodexLaunch(
+                home=str(self.root / "recorded-codex"), resume=inventory.CodexSessionId(kind="session id", session_id="recorded-id")))
+        snapshot = record_store.RecoverySnapshot(machine="natedev", login=LOGIN, label="claude2",
+            taken_at=claude["last_seen"], sessions=[claude, codex])
+        record_store.write_snapshot(snapshot)
+        with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn("--session-id 'snapshot claude-id'", output.getvalue())
+        self.assertIn(f"CODEX_HOME={self.root}/recorded-codex codex resume recorded-id", output.getvalue())
+        self.assertEqual(record_store.read_snapshot(LOGIN), snapshot)
+        self.assertEqual(record_store.session_records(LOGIN), [])
+
+    def test_legacy_live_inventory_uses_the_same_fresh_manual_resume_command(self) -> None:
+        owner = cast(inventory.TopLevelSession, cast(object, {
+            **session_shutdown(name="live old")["session"], "kind": "top-level",
+            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-destination")}))
+        report = empty_inventory()
+        report["sessions"] = [owner]
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn("--session-id 'live old-id'", output.getvalue())
+        self.assertNotIn("--session old-destination", output.getvalue())
 
     def test_status_lists_progress_details_and_message_delivery_per_session(self) -> None:
         failed = session_shutdown(name="failed launch")

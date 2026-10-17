@@ -103,7 +103,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 - Every prompt carries the Three Gods sentence written out in full: opening, later-phase, repair, review and follow-up prompts alike. It also carries the Type Design Contract, verbatim for a new worker or as the allowed pointer for a follow-up. Compaction can erase earlier prompt text, which is why each prompt repeats them.
 - A new worker opens only when no open worker can take the work: the assignment needs more workers, every open worker is busy, or a reusable thread is gone. A replacement under the same name starts fresh and gets an opening prompt.
 
-`scripts/delegate/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` column after `impl` and `test`, in the order workers first appear. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
+`scripts/delegate/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` number after `impl` and `test`, in the order workers first appear: a `- **Agent N**` line in every report, and a round-table column under `progress --tables`. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
 
 ### Cleanup
 

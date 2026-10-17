@@ -196,18 +196,17 @@ class CodexServerLeftRunning(TypedDict):
     cause: StopLeftRunningCause
 
 
-class UnitTmuxLeftRunning(TypedDict):
-    """Legacy wire form; readers normalize it to UnitSessionLeftRunning."""
-    kind: Literal["unit tmux session left running"]
+class LegacyTmuxSessionLeftRunning(TypedDict):
+    kind: Literal["legacy tmux session left running"]
     at: str
-    tmux_session: str
+    session_name: str
     cause: StopLeftRunningCause
 
 
 class UnitSessionLeftRunning(TypedDict):
     kind: Literal["unit session left running"]
     at: str
-    host: Literal["tmux", "herdr"]
+    host: Literal["herdr"]
     session_name: str
     cause: StopLeftRunningCause
 
@@ -218,7 +217,13 @@ SessionStopIssue = (
     | AccountUnreadableAtStop
     | CodexServerLeftRunning
     | UnitSessionLeftRunning
+    | LegacyTmuxSessionLeftRunning
 )
+
+
+def legacy_tmux_leftovers(record: SessionShutdown) -> list[LegacyTmuxSessionLeftRunning]:
+    """Every legacy leftover requires explicit manual cleanup, whatever its cause."""
+    return [issue for issue in record["stop_issues"] if issue["kind"] == "legacy tmux session left running"]
 
 
 class _LegacyStopClaimFailed(TypedDict):
@@ -501,6 +506,8 @@ class SessionShutdown(TypedDict):
     target: NotRequired[str]
     source_label: NotRequired[str]
     why: NotRequired[str]
+    # Set by rename_unit while the unit is stopped: the restart note tells the session its new names.
+    renamed: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -812,6 +819,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
                 "worker still live",
                 "codex server left running",
                 "unit tmux session left running",
+                "legacy tmux session left running",
                 "unit session left running",
             }
         ),
@@ -832,25 +840,19 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
-    elif kind in {"unit tmux session left running", "unit session left running"}:
-        if kind == "unit tmux session left running":
-            values = {
-                **values,
-                "kind": "unit session left running",
-                "host": "tmux",
-                "session_name": _string(
-                    _required(values, "tmux_session", place), f"{place}.tmux_session"
-                ),
-            }
-            del values["tmux_session"]
-        else:
-            _ = _string(_required(values, "session_name", place), f"{place}.session_name")
-            host = _string(_required(values, "host", place), f"{place}.host")
-            if host not in {"tmux", "herdr"}:
-                raise InvalidRecord(f"{place}.host is invalid")
+    elif kind in {"unit tmux session left running", "unit session left running", "legacy tmux session left running"}:
+        key = "tmux_session" if kind == "unit tmux session left running" else "session_name"
+        name = _string(_required(values, key, place), f"{place}.{key}")
+        host = "tmux" if kind != "unit session left running" else _string(
+            _required(values, "host", place), f"{place}.host")
+        if host not in {"tmux", "herdr"}:
+            raise InvalidRecord(f"{place}.host is invalid")
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
+        if host == "tmux":
+            values = {"kind": "legacy tmux session left running", "at": values["at"],
+                      "session_name": name, "cause": cause}
     return cast(SessionStopIssue, cast(object, values))
 
 
@@ -1157,7 +1159,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
-    for field in ("source_label", "why"):
+    for field in ("source_label", "why", "renamed"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (

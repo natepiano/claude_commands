@@ -109,14 +109,12 @@ class RegistrationTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
-                    # No test here may ask a real tmux which unit sessions exist.
-                    "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
         self.doc.parent.mkdir(parents=True)
-        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        # A linked worktree, where `.git` is a file: herdr is never asked whether its unit is gone.
         alpha = self.root / "alpha"
         alpha.mkdir()
         _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
@@ -180,7 +178,7 @@ class RegistrationTests(unittest.TestCase):
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
         self.assertEqual(updates[updates.index("--to") + 1], "session:current-session-id")
         self.assertIn("next_due", first.stdout)
-        for instance in ("stall-watch", "tmux-names"):
+        for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
 
         new_env = {**self.env, "CLAUDE_CODE_SESSION_ID": "resume-session-id"}
@@ -197,7 +195,7 @@ class RegistrationTests(unittest.TestCase):
         updates = [call for call in calls if call[:2] == ["new", "showrunner-example"]]
         self.assertEqual([call[call.index("--to") + 1] for call in updates],
                          ["session:current-session-id", "session:resume-session-id", "session:resume-session-id"])
-        for instance in ("stall-watch", "tmux-names"):
+        for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
     def test_register_reports_unexpected_usage_write_failure_and_completes(self) -> None:
@@ -259,7 +257,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["status", "new", "stop", "status", "status"])
+                         ["status", "new", "stop", "status"])
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
     def without_updates_line(self) -> None:
@@ -665,6 +663,27 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
 
+    def test_footer_state_replaces_reports_only_when_report_to_user_is_present(self) -> None:
+        written = self.outstanding().parent.parent / "reports/example.json"
+        state = self.root / "judgment.json"
+        report = {"text": "hanadocs is back", "until": "2026-10-17T09:00"}
+        _ = state.write_text(json.dumps({"report_to_user": [report]}), encoding="utf-8")
+        saved = self.run_command("footer", "--state", str(state))
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
+        kept = self.run_command("footer", "--state", str(state))
+        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        for bad in ([{"text": "x", "until": "tomorrow"}], [{"text": "", "until": "2026-10-17T09:00"}],
+                    [{"text": "x", "until": "2026-10-17T09:00", "question": "?"}], "x"):
+            with self.subTest(bad=bad):
+                _ = state.write_text(json.dumps({"report_to_user": bad}), encoding="utf-8")
+                refused = self.run_command("footer", "--state", str(state))
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertIn("report_to_user", refused.stdout)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+
     def test_footer_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-01T08:00", "text": "Choose a compiler."}]))
@@ -744,14 +763,15 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
         stored = self.run_command("footer", "--state", str(state))
         self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
-        self.assertEqual(stored.stdout.strip(), "footer: ok — footers off")
+        # The deferred item is not counted until its `after` time.
+        self.assertEqual(stored.stdout.strip(), "For you: 1 question\nfooter: ok — footers off")
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
         self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
         before = outstanding.read_bytes()
         _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
         kept = self.run_command("footer", "--state", str(state))
-        self.assertEqual(kept.stdout.strip(), "footer: ok — footers off")
+        self.assertEqual(kept.stdout.strip(), "For you: 1 question\nfooter: ok — footers off")
         self.assertEqual(outstanding.read_bytes(), before)
         _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
                              encoding="utf-8")

@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from unittest import mock
 import production_tree
 import showrunners
 import unit_lookup
+from herdr import HerdrPlace
 import unit_runs
 
 RUNNER, CHILD_RUNNER, GONE_RUNNER = "sid-runner", "sid-child-runner", "sid-gone-runner"
@@ -30,7 +32,7 @@ def record(session_id: str) -> dict[str, object]:
 
 def unit(session_id: str, name: str) -> unit_lookup.MarkedUnit:
     claude = unit_lookup.LiveClaude(name, session_id, f"/run/{name}.sock", 1)
-    return unit_lookup.MarkedUnit(name, name, claude, unit_lookup.TmuxPlace(f"%{name}"))
+    return unit_lookup.MarkedUnit(name, claude, HerdrPlace(name, "w1:p1"))
 
 
 def server_recorded(run: Path) -> bool:
@@ -58,6 +60,7 @@ class ProductionTreeTests(unittest.TestCase):
             mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"),
             mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"),
             mock.patch.object(production_tree, "_server_running", side_effect=server_recorded),
+            mock.patch.object(production_tree, "pool_root", return_value=self.root / "review-pool"),
         ):
             _ = self.enterContext(patch)
 
@@ -98,6 +101,30 @@ class ProductionTreeTests(unittest.TestCase):
             {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
         ])
 
+    def test_each_leased_pool_reviewer_reports_to_its_running_unit_director(self) -> None:
+        pool = self.root / "review-pool" / "main" / "pool.json"
+        pool.parent.mkdir(parents=True)
+        _ = pool.write_text(json.dumps({
+            "generation": 1, "next_index": 5,
+            "templates": {"code": {"thread_id": "thread-template"}},
+            "reviewers": {
+                "code1": {"type": "code", "thread_id": "thread-busy", "lease": {"unit": "one", "ordinal": 1},
+                          "busy_pid": os.getpid()},
+                "design2": {"type": "design", "thread_id": "thread-idle", "lease": {"unit": "one", "ordinal": 2},
+                            "busy_pid": None},
+                "code3": {"type": "code", "thread_id": "thread-free", "lease": None, "busy_pid": None},
+                "code4": {"type": "code", "thread_id": "thread-stopped", "lease": {"unit": "two", "ordinal": 1},
+                          "busy_pid": None},
+            },
+        }))
+        edges = self.tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one"), "two": unit(OLD_DIRECTOR, "two")}})
+        self.assertEqual([edge for edge in edges if edge["role"] == "review"], [
+            {"manager": DIRECTOR, "member": "thread-busy", "role": "review", "unit": "one",
+             "thread_id": "thread-busy", "state": "busy", "type": "code"},
+            {"manager": DIRECTOR, "member": "thread-idle", "role": "review", "unit": "one",
+             "thread_id": "thread-idle", "state": "idle", "type": "design"},
+        ])
+
     def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}}, server=False)
         _ = self.run_folder("unit", ORPHAN, {"c-impl": {"thread_id": "thread-orphan", "role": "impl", "status": "running"}})
@@ -120,11 +147,11 @@ class ProductionTreeTests(unittest.TestCase):
 
     def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
-                mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("tmux: gone")), \
+                mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("herdr: gone")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             edges = production_tree.tree()
         self.assertEqual(edges, [{"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}])
-        self.assertIn("unit marks unreadable: tmux: gone", errors.getvalue())
+        self.assertIn("unit marks unreadable: herdr: gone", errors.getvalue())
 
     def test_claude_workers_take_their_slot_role_from_the_board_without_a_server(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {}, server=False)
@@ -168,20 +195,22 @@ class ProductionTreeTests(unittest.TestCase):
             _ = self.run_folder("unit", director, {
                 f"w{seat}-impl": {"thread_id": f"{director}-{seat}", "role": "impl", "status": "running"} for seat in range(6)
             })
-        started = time.perf_counter()
+        started = time.process_time()
         edges = self.tree({RUNNER, *directors}, {"main": {director: unit(director, director) for director in directors}})
-        self.assertLess(time.perf_counter() - started, 0.25)
+        self.assertLess(time.process_time() - started, 0.25)
         self.assertEqual(len(edges), 40 + 40 * 6)
 
     def test_the_command_prints_schema_one_and_starts_fast(self) -> None:
         with mock.patch.object(production_tree, "tree", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(production_tree.main(["--json"]), 0)
         self.assertEqual(cast(object, json.loads(out.getvalue())), {"schema": 1, "edges": []})
-        started = time.perf_counter()
+        # The child's CPU time, not the wall clock: on a loaded machine waiting for a CPU adds only to the clock.
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
         shown = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, check=False,
                                env={**os.environ, "NOTIFIER_STATE_DIR": str(self.root / "notifier")}, stdin=subprocess.DEVNULL)
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertLess(time.perf_counter() - started, 0.75)
+        self.assertLess((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime), 0.75)
 
 
 if __name__ == "__main__":

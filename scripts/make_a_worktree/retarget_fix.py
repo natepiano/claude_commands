@@ -175,6 +175,22 @@ def revert(lines: list[str], worktree: str) -> tuple[list[str], list[str]]:
     return out, removed
 
 
+def move(lines: list[str], old: str, new: str) -> tuple[list[str], list[str]]:
+    """Point [active_checkout] redirects into worktree `old` at worktree `new`, member subpaths kept.
+
+    Returns (new_lines, moved-descriptions).
+    """
+    out = list(lines)
+    moved: list[str] = []
+    for i in _entry_indices(lines, "active_checkout"):
+        entry, _, value = lines[i].partition("=")
+        head, slash, rest = value.strip().partition("/")
+        if head == old:
+            out[i] = f"{entry.strip()} = {new}{slash}{rest}"
+            moved.append(f"redirect: {out[i]}")
+    return out, moved
+
+
 class CommitResult(TypedDict):
     committed: bool
     commit: str

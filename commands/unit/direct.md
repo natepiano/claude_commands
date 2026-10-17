@@ -1066,19 +1066,14 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-**Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
-current pass or activity. This is unconditional: the numbered items say what
-happened, and the tables say how far into the phase and the plan it happened,
-which is the half the user cannot reconstruct. Emit it after any launch,
-printed below the sections above exactly as the recorder emits it. With the
-phase active and no pass or activity open, the recorder prints the same tables
-from the phase's last recorded values under an `as of` line: paste them like any
-tick. When the last phase is closed but an activity is still open, the recorder
-prints both tables from that phase's last recorded values with the activity as
-the running row: paste them like any tick. `No active phase to report` remains
-only when no phase is active and no activity is open; then continue without the
-tables rather than stalling the turn.
+**Close every delegation result and launch with the short progress report**
+from <ProgressReport/>: phase and stage, ETA line, workers, summary, board link,
+and wall clock. Copy the recorder's phase, stage, ETA and clock exactly. Include
+both recorder tables only for `/unit:report tables`.
+
+Between windows, keep the recorder's `as of` and no-open-window lines. An
+activity still open after its phase closes remains the stage. If the recorder
+reports `No active phase to report`, continue without the progress report.
 </DelegationResultFormat>
 
 <FixDispatch>
