@@ -11,9 +11,9 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
-from agent_accounts import Quota, Report
+from agent_accounts import ClaudeDirectorySource, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip
 from note_file import canonical_label
 
 
@@ -39,6 +39,15 @@ class StoredUsage(TypedDict, total=False):
     weekly: StoredWindow
     # Codex only: the credits that carry work once an allowance is used up.
     credits: StoredCredits
+    # The latest attempt skipped this login; successful reading timestamps stay unchanged.
+    weekly_read_skip: Literal["stale_token"]
+    # Identifies a later failed attempt even when authentication returns no login.
+    weekly_read_skip_directory: str
+
+
+def weekly_read_skip(usage: StoredUsage) -> StaleTokenSkip | NoWeeklyReadSkip:
+    """Decode the latest attempt's skip reason without inspecting display text."""
+    return StaleTokenSkip() if usage.get("weekly_read_skip") == "stale_token" else NoWeeklyReadSkip()
 
 
 def key(tool: str, login: str) -> str:
@@ -117,6 +126,11 @@ def load() -> dict[str, StoredUsage]:
             usage["weekly"] = weekly
         if (credits := _credits(held.get("credits"))) is not None:
             usage["credits"] = credits
+        if held.get("weekly_read_skip") == "stale_token":
+            usage["weekly_read_skip"] = "stale_token"
+            directory = held.get("weekly_read_skip_directory")
+            if isinstance(directory, str):
+                usage["weekly_read_skip_directory"] = directory
         stored[login] = usage
     return stored
 
@@ -133,17 +147,42 @@ def _read(quota: Quota, checked_at: datetime) -> StoredWindow | None:
 
 
 def merge(stored: dict[str, StoredUsage], reports: list[Report], checked_at: datetime) -> bool:
-    """Put each reading the Claude and Codex reports hold into `stored`. A refused read changes nothing.
+    """Save readings and the latest typed skip reason, preserving last good numbers on failure.
 
     Returns whether anything changed.
     """
     changed = False
     for report in reports:
+        if report.tool == "Claude" and isinstance(report.source, ClaudeDirectorySource):
+            directory = str(report.source.directory)
+            for login, held in stored.items():
+                if (held.get("weekly_read_skip_directory") == directory
+                        and (not report.email or login != key(report.tool, report.email))):
+                    _ = held.pop("weekly_read_skip", None)
+                    _ = held.pop("weekly_read_skip_directory", None)
+                    changed = True
+        if report.tool not in ("Claude", "Codex") or not report.email:
+            continue
+        login = key(report.tool, report.email)
+        if isinstance(report.weekly_read_skip, StaleTokenSkip):
+            usage = stored.setdefault(login, StoredUsage())
+            if "weekly_read_skip" not in usage:
+                usage["weekly_read_skip"] = "stale_token"
+                changed = True
+            if isinstance(report.source, ClaudeDirectorySource):
+                directory = str(report.source.directory)
+                if usage.get("weekly_read_skip_directory") != directory:
+                    usage["weekly_read_skip_directory"] = directory
+                    changed = True
+        elif login in stored and "weekly_read_skip" in stored[login]:
+            del stored[login]["weekly_read_skip"]
+            _ = stored[login].pop("weekly_read_skip_directory", None)
+            changed = True
         weekly_quota = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
         weekly = _read(weekly_quota, checked_at) if weekly_quota is not None else None
-        if report.tool not in ("Claude", "Codex") or not report.email or weekly is None:
+        if weekly is None:
             continue
-        usage = stored.setdefault(key(report.tool, report.email), StoredUsage())
+        usage = stored.setdefault(login, StoredUsage())
         usage["weekly"] = weekly
         if report.credit_balance is not None:
             usage["credits"] = StoredCredits(
