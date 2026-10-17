@@ -59,6 +59,9 @@ only the first-launch template. Edit a launched unit's copy for changes meant
 for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
+Before selecting a new ticket, refill waits for sync if the branch point's
+current tip is not an ancestor of the ledger's synced tip; an open ticket still
+resumes or waits for merge.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before

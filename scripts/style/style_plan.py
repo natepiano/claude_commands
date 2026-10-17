@@ -96,6 +96,13 @@ class WaitingForSync:
 
 
 @dataclass(frozen=True)
+class WaitingForBranchPointSync:
+    branch_point: str
+    branch_tip: str
+    synced_tip: str
+
+
+@dataclass(frozen=True)
 class TicketSelection:
     kind: style_ledger.TicketKind
     family: rules.Family
@@ -115,7 +122,7 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | berth_board.BoardUnavailable
+NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForBranchPointSync | berth_board.BoardUnavailable
 
 
 def style_document(repo: Path) -> Path:
@@ -487,6 +494,20 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             write_phase(ledger, ticket, plan, text)
             ledger.clear_sync_wait(unit)
             return Resumed(ticket["id"])
+        tip = synced_tip(ledger)
+        standing = standing_style_production(repo)
+        if not isinstance(standing, StandingStyleProduction):
+            raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+        branch_tip = git(repo, "rev-parse", "--verify", f"{standing.branch_point}^{{commit}}").strip()
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", branch_tip, tip],
+            capture_output=True, text=True, check=False,
+        )
+        if ancestry.returncode == 1:
+            ledger.wait_for_sync(unit)
+            return WaitingForBranchPointSync(standing.branch_point, branch_tip, tip)
+        if ancestry.returncode:
+            raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
             return board
@@ -557,6 +578,9 @@ def main(argv: list[str]) -> int:
                 print("waiting for sync")
                 if unclassified:
                     print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
+                return 3
+            case WaitingForBranchPointSync(branch_point, branch_tip, tip):
+                print(f"waiting for sync: {branch_point} {branch_tip[:7]} is not in the synced tip {tip[:7]}")
                 return 3
         return 0
     except (OSError, ValueError, Refusal, sqlite3.Error) as error:
