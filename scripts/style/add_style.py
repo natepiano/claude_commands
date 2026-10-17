@@ -34,6 +34,48 @@ class StyleBranchPointTaken(Refusal):
 
 
 @dataclass(frozen=True)
+class PilotUnit:
+    family: rules.Family
+    packages: tuple[str, ...]  # An empty selection covers every workspace package.
+
+
+@dataclass(frozen=True)
+class AllStyleUnits:
+    """Launch all four families without crate restrictions."""
+
+
+@dataclass(frozen=True)
+class PilotUnits:
+    units: tuple[PilotUnit, ...]
+
+
+def _pilot_units(arguments: list[str], repository: Path) -> AllStyleUnits | PilotUnits:
+    if not arguments:
+        return AllStyleUnits()
+    manifests = {
+        path.relative_to(repository).as_posix(): path.read_text()
+        for path in repository.rglob("Cargo.toml") if path.is_file()
+    }
+    packages = {member.package_name for member in rules.workspace_members(manifests)}
+    units: list[PilotUnit] = []
+    seen: set[str] = set()
+    for argument in arguments:
+        unit, separator, selected = argument.partition("=")
+        family: rules.Family | None = next((family for family in FAMILIES if unit == f"{family}-unit"), None)
+        if family is None:
+            raise Refusal(f"unknown pilot unit {unit!r}")
+        if unit in seen:
+            raise Refusal(f"duplicate pilot unit {unit!r}")
+        seen.add(unit)
+        requested = tuple(package.strip() for package in selected.split(",")) if separator else ()
+        for package in requested:
+            if package not in packages:
+                raise Refusal(f"unknown pilot crate {package!r}")
+        units.append(PilotUnit(family, tuple(dict.fromkeys(requested))))
+    return PilotUnits(tuple(units))
+
+
+@dataclass(frozen=True)
 class StandingStyleProduction:
     repository: Path
     slug: str
@@ -135,12 +177,15 @@ def _check_existing(style: StyleProduction) -> bool:
     return style.doc.exists() and style.slug in showrunners.timer_slugs()
 
 
-def _production_text(style: StyleProduction) -> str:
-    rows = [
+def _unit_row(style: StyleProduction, family: rules.Family) -> str:
+    return (
         f"| {family}-unit | {PLAN_DIRECTORY}/{family}-unit.md | {style.repository.parent / (style.slug + '-' + family)} "
         + f"| {style.slug}-{family} | — | none — takes what the board leaves free |"
-        for family in FAMILIES
-    ]
+    )
+
+
+def _production_text(style: StyleProduction) -> str:
+    rows = [_unit_row(style, family) for family in FAMILIES]
     return "\n".join([
         f"# Production — {style.slug}", "",
         "> **Status: PRODUCTION — running.** Standing style coverage and mechanical fixes.", "",
@@ -188,6 +233,68 @@ def _write_missing(path: Path, text: str) -> None:
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(text)
+
+
+def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
+    selected = {unit.family: unit for unit in pilot.units}
+    launched = {
+        family for family in FAMILIES
+        if (style.repository.parent / f"{style.slug}-{family}").exists()
+    }
+    previous = style.doc.read_text()
+    lines = previous.splitlines(keepends=True)
+    start = next(index for index, line in enumerate(lines) if line.rstrip() == "## Units") + 1
+    end = next((index for index in range(start, len(lines)) if lines[index].startswith("## ")), len(lines))
+    rows: list[str] = []
+    present: set[rules.Family] = set()
+    for line in lines[start:end]:
+        unit = line.split("|")[1].strip() if line.startswith("|") else ""
+        row_family: rules.Family | None = next((family for family in FAMILIES if unit == f"{family}-unit"), None)
+        if row_family is None or row_family in launched:
+            rows.append(line)
+        elif row_family in selected:
+            rows.append(_unit_row(style, row_family) + "\n")
+        if row_family is not None:
+            present.add(row_family)
+    additions = [_unit_row(style, family) + "\n" for family in FAMILIES
+                 if family in selected and family not in launched and family not in present]
+    if additions:
+        last_row = max((index for index, line in enumerate(rows) if line.startswith("|")), default=-1)
+        rows[last_row + 1:last_row + 1] = additions
+    updated = "".join([*lines[:start], *rows, *lines[end:]])
+    if updated != previous:
+        _ = style.doc.write_text(updated)
+    for family in FAMILIES:
+        if family in launched:
+            continue
+        path = style.checkout / PLAN_DIRECTORY / f"{family}-unit.md"
+        original = path.read_text()
+        plan = original.splitlines(keepends=True)
+        context = plan.index("## Delegation Context\n") + 1
+        stop = next((index for index in range(context, len(plan)) if plan[index].startswith("## ")), len(plan))
+        plan[context:stop] = [line for line in plan[context:stop] if not line.lstrip("- ").startswith("**Pilot scope:**")]
+        unit = selected.get(family)
+        if unit is not None and unit.packages:
+            family_line = next(index for index in range(context, len(plan)) if plan[index].startswith("- **Family:**"))
+            insertion = family_line + 1
+            while insertion < len(plan) and plan[insertion].startswith("  - "):
+                insertion += 1
+            plan.insert(insertion, "- **Pilot scope:** " + ", ".join(unit.packages) + "\n")
+        text = "".join(plan)
+        if text != original:
+            _ = path.write_text(text)
+
+
+def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits) -> tuple[str, ...]:
+    if isinstance(pilot, AllStyleUnits):
+        return steps
+    units = "; ".join(f"{unit.family}-unit" for unit in pilot.units)
+    scopes = "; ".join(
+        f"{unit.family}-unit: {', '.join(unit.packages) if unit.packages else 'all crates'}"
+        for unit in pilot.units
+    )
+    return (*steps[:3], steps[3] + f"; pilot units {units}",
+            steps[4] + f"; pilot scopes {scopes}; preserve launched units", *steps[5:])
 
 
 def _exclude(style: StyleProduction) -> None:
@@ -269,13 +376,18 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--model", required=True)
     _ = parser.add_argument("--effort", required=True)
     _ = parser.add_argument("--check", action="store_true")
+    _ = parser.add_argument("--pilot", action="append", default=[], metavar="UNIT[=CRATE,...]")
     args = parser.parse_args(argv)
     try:
         style = _request(cast(Path, args.production))
         existing = _check_existing(style)
+        pilot_arguments = cast(list[str], args.pilot)
+        if existing and pilot_arguments:
+            raise Refusal(f"--pilot applies only while creating {style.slug}")
+        pilot = _pilot_units(pilot_arguments, style.repository)
         catalog = rules.load_rules(style.repository)
         if cast(bool, args.check):
-            for number, step in enumerate(_steps(style, existing), 1):
+            for number, step in enumerate(_pilot_steps(_steps(style, existing), pilot), 1):
                 print(f"{number}. {step}")
             return 0
         if existing:
@@ -297,6 +409,8 @@ def main(argv: list[str]) -> int:
         _update_destination(style)
         for family in FAMILIES:
             _write_missing(style.checkout / PLAN_DIRECTORY / f"{family}-unit.md", _plan_text(style, family, catalog))
+        if isinstance(pilot, PilotUnits):
+            _configure_pilot(style, pilot)
         _exclude(style)
         with style_ledger.open_ledger(style.checkout) as ledger:
             try:

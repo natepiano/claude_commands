@@ -98,6 +98,22 @@ the uncommitted tree the checkpoint will stage, using a temporary index; it
 never changes the real index. No private Git ref
 keeps a dropped ticket's abandoned commits reachable.
 
+## Pilot scope
+
+Create a restricted pilot with repeated `add_style.py --pilot <unit>[=<package>,...]`.
+Only named units get Units rows; all four standing plans are written. A unit
+without a scope covers every crate. Package names map to workspace member
+directories through `rules.workspace_members`.
+
+The plan's Delegation Context carries `- **Pilot scope:** cargo-handler, cargo-port`
+below its Family snapshot. Before first launch, edit the showrunner copy;
+an interrupted bootstrap rewrites only unlaunched units' rows and scope lines.
+After launch, only the unit's own copy counts:
+`<main checkout parent>/<slug>-<family>/docs/style-production/units/<family>-unit.md`.
+`next-phase` honors the `--plan` copy it receives for coverage and approved
+proposals. An out-of-scope approved proposal stays approved and unassigned;
+coverage selection proceeds.
+
 ## Ledger
 
 One style production and one synced branch point per repository. The ledger is
