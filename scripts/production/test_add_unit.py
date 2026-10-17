@@ -21,6 +21,7 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import autocompact
 import production_units
@@ -44,6 +45,7 @@ SCRIPT = Path(__file__).with_name("add_unit.py")
 REAL_WORKTREE_IS_LINKED = production_units.worktree_is_linked
 MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
 NO_LAUNCH_FIXTURE = add_unit.NoMarkedUnit()
+SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.utc))
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
               "| --- | --- | --- | --- | --- | --- | --- |"]
 STUB = r'''#!/usr/bin/env python3
@@ -101,6 +103,14 @@ class AddUnitTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        # These CLI fixtures prove launcher plumbing; transcript proof is exercised
+        # through the real submit method in PromptSubmissionTests.
+        def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
+                      _at: datetime, _timeout_ms: int) -> herdr.PromptSubmitted:
+            client.prompt(pane, opening.text)
+            return herdr.PromptSubmitted(datetime.now(timezone.utc))
+
+        _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
         # test asks the real disk, and a row with a worktree never asks herdr. RetiredRowTests covers the rule.
         _ = self.enterContext(patch.object(production_units, "worktree_is_linked", return_value=True))
@@ -165,7 +175,34 @@ class AddUnitTests(ShutdownTestCase):
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.herdr_overrides = {}
-        fake = str(SCRIPT.parents[1] / "herdr/fake_herdr.py")
+        fake_path = self.bin / "fake-herdr"
+        source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
+        # Match a command verb when its trailing generated session id is unknown.
+        source = source.replace('responses.get("default", {"stdout": "", "code": 0})',
+            'responses.get(" ".join(argv[2:4]), responses.get("default", {"stdout": "", "code": 0}))')
+        source = source.replace("raise SystemExit(main(sys.argv[1:]))", "raise SystemExit(submitting_main(sys.argv[1:]))")
+        hook = r'''def submitting_main(argv):
+    result = main(argv)
+    if result == 0 and argv[2:4] == ["agent", "prompt"]:
+        from datetime import datetime, timezone
+        calls = [json.loads(line) for line in Path(os.environ["FAKE_HERDR_LOG"]).read_text().splitlines()]
+        start = next(row for row in reversed(calls) if row[:2] == argv[:2] and row[2:4] == ["agent", "start"])
+        flag = "--resume" if "--resume" in start else "--session-id"
+        session_id = start[start.index(flag) + 1]
+        config = next((value.split("=", 1)[1] for row in reversed(calls) for value in row
+                       if row[:2] == argv[:2] and value.startswith("CLAUDE_CONFIG_DIR=")),
+                      str(Path.home() / ".claude"))
+        path = Path(config) / "projects/fixture" / (session_id + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                                   "message": {"role": "user", "content": argv[-1]}}) + "\n")
+    return result
+
+'''
+        source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
+        _ = fake_path.write_text(source)
+        fake_path.chmod(0o755)
+        fake = str(fake_path)
         self.env.update({"HERDR_BIN": fake, "SYSTEMD_RUN": fake, "SYSTEMCTL": fake,
                          "HERDR_PROC": str(self.root / "proc"),
                          "FAKE_HERDR_LOG": str(self.state / "herdr.jsonl"),
@@ -337,6 +374,7 @@ class AddUnitTests(ShutdownTestCase):
             "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}'),
             "default": CommandResponse(code=0, stdout='{"result": {"root_pane": {"pane_id": "w1:p1"}}}'),
         }
+        responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
         # An already launched fixture advertises its session on subsequent CLI calls.
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("herdr-live-"), running=True,
                     default=False, session_dir="/fixture", socket_path="/fixture/socket")
@@ -345,6 +383,7 @@ class AddUnitTests(ShutdownTestCase):
             code=0, stdout=json.dumps(herdr.SessionListResult(sessions=sessions)))
         if isinstance(request, add_unit.UnitLaunch):
             name = add_unit.host_session_name(request)
+            responses[f"--session {name} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
             responses[f"--session {name} status server"] = [
                 CommandResponse(code=0, stdout="status: stopped\n"),
                 CommandResponse(code=0, stdout="status: running\n")]
@@ -627,6 +666,7 @@ class AddUnitTests(ShutdownTestCase):
         *,
         already_marked: bool = True,
         place: unit_lookup.Place = MARKED_HERDR_PLACE,
+        outcome: herdr.PromptSubmitOutcome = SUBMITTED_PROMPT,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
             production=add_unit.read_production(self.doc),
@@ -683,7 +723,7 @@ class AddUnitTests(ShutdownTestCase):
             prompt: str,
             _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "", autocompact_window: str = "",
-        ) -> None:
+        ) -> herdr.PromptSubmitOutcome:
             self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
             self.assertEqual((model, autocompact_window), ("", ""))
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
@@ -696,6 +736,7 @@ class AddUnitTests(ShutdownTestCase):
                     conversation_pause.PromptSource.SCHEDULED,
                 )
             launches.append(prompt)
+            return outcome
 
         error = io.StringIO()
         with (
@@ -729,6 +770,24 @@ class AddUnitTests(ShutdownTestCase):
                 wait.assert_called_once_with(request)
         return result, error.getvalue(), commands, len(launches), write_stub.call_count
 
+    def test_restore_reports_not_submitted_to_its_parent_and_does_not_report_launched(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code, error, _commands, launches, _writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.ClaudeNotRunning(), already_marked=False,
+                outcome=herdr.PromptNotSubmitted("fixture prompt remains in input"))
+        self.assertEqual(code, 1)
+        self.assertEqual(launches, 1)
+        self.assertIn("alpha-unit", error)
+        self.assertIn("restart prompt not submitted", error)
+        self.assertNotIn("restore launched", output.getvalue())
+        line, = output.getvalue().splitlines()
+        self.assertTrue(line.startswith("restart-prompt-outcome: "))
+        self.assertEqual(herdr.decode_prompt_outcome(line.removeprefix("restart-prompt-outcome: ")),
+                         herdr.PromptNotSubmitted("fixture prompt remains in input"))
+
     def test_restore_returns_zero_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
             "session-123", self.root / "restart-note", "recorded-name", "build-followups-recorded-herdr"
@@ -741,9 +800,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach build-followups-recorded-herdr\n")
+        self.assertEqual(output.getvalue(), "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\nalpha-unit restore launched: herdr session attach build-followups-recorded-herdr\n")
 
-    def test_restore_already_running_returns_zero_without_waiting_for_remote_control(self) -> None:
+    def test_restore_already_running_reports_missing_submit_proof_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
             "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
@@ -752,10 +811,12 @@ class AddUnitTests(ShutdownTestCase):
             result, error, commands, launches, _writes = self.run_with_marked_unit(
                 launch_kind, unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123)
             )
-        self.assertEqual(result, 0, error)
+        self.assertEqual(result, 1)
+        self.assertIn("restart prompt not submitted", error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
-        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach marked-herdr\n")
+        self.assertNotIn("restore launched", output.getvalue())
+        self.assertIn("restart-prompt-outcome: ", output.getvalue())
 
     def test_new_work_launch_still_waits_for_remote_control(self) -> None:
         output = io.StringIO()
@@ -782,21 +843,23 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(commands, [])
         self.assertEqual((launches, writes), (1, 1))
 
-    def test_restore_already_live_in_herdr_launches_nothing_and_prints_herdr_attach(self) -> None:
+    def test_restore_already_live_in_herdr_launches_nothing_and_reports_missing_submit_proof(self) -> None:
         kind = add_unit.UnitRestoreLaunch("session-123", self.root / "restart-note", "recorded-name", "native-unit")
         output = io.StringIO()
         with redirect_stdout(output):
             result, error, commands, launches, _writes = self.run_with_marked_unit(kind,
                 unit_lookup.LiveClaude("recorded-name", "session-123", "/socket", 123),
                 place=HerdrPlace("native-unit", "w1:p1"))
-        self.assertEqual(result, 0, error)
+        self.assertEqual(result, 1)
+        self.assertIn("restart prompt not submitted", error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
-        self.assertEqual(output.getvalue(), "alpha-unit restore launched: herdr session attach native-unit\n")
+        self.assertNotIn("restore launched", output.getvalue())
+        self.assertIn("restart-prompt-outcome: ", output.getvalue())
 
     def test_unit_start_not_ready_prints_screen_and_sends_no_prompt_or_key(self) -> None:
         screen = "Do you trust this folder?"
-        self.herdr_overrides['--session build-followups-alpha agent start build-followups-alpha --kind claude --pane w1:p1 --timeout 90000 -- --model opus --effort xhigh --remote-control alpha -n alpha --settings {"disableAgentView": true}'] = CommandResponse(
+        self.herdr_overrides["agent start"] = CommandResponse(
             code=1, stdout=json.dumps({"error": {"code": "agent_not_ready", "message": "dialog"}}))
         self.herdr_overrides["--session build-followups-alpha pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
@@ -846,7 +909,7 @@ class AddUnitTests(ShutdownTestCase):
             )
             self.configure_herdr(request)
             with self.assertRaises(herdr.AgentExited):
-                add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+                _ = add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                                         "Resume this unit.", accounts.role_account("unit"))
         stopped.assert_called_once_with("build-followups-alpha")
         self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-build-followups-alpha.service"] for row in self.herdr_calls()))
@@ -1350,7 +1413,7 @@ class AddUnitTests(ShutdownTestCase):
             _prompt: str,
             _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "", autocompact_window: str = "",
-        ) -> None:
+        ) -> herdr.PromptSubmitted:
             self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
             self.assertEqual((model, autocompact_window), ("", ""))
             self.assertIsNotNone(creator)
@@ -1363,6 +1426,8 @@ class AddUnitTests(ShutdownTestCase):
                     fcntl.flock(
                         contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                     )
+
+            return SUBMITTED_PROMPT
 
         def finish_shutdown() -> None:
             self.assertIsNotNone(creator)
@@ -1424,7 +1489,7 @@ class AddUnitTests(ShutdownTestCase):
         )
         self.assertEqual(launches, 0)
 
-    def test_restore_keeps_marked_herdr_with_live_claude(self) -> None:
+    def test_restore_keeps_marked_herdr_with_live_claude_and_reports_missing_submit_proof(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
             "session-123", self.root / "restart-note", "recorded-name", "recorded-herdr"
         )
@@ -1432,7 +1497,8 @@ class AddUnitTests(ShutdownTestCase):
 
         result, error, commands, launches, writes = self.run_with_marked_unit(launch_kind, live)
 
-        self.assertEqual(result, 0, error)
+        self.assertEqual(result, 1, error)
+        self.assertIn("restart prompt not submitted", error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 1)
@@ -1597,8 +1663,11 @@ class AddUnitTests(ShutdownTestCase):
             "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
             "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
-        self.assertEqual(self.agent_arguments(), ["--model", "opus", "--effort", "xhigh",
-            "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}'])
+        arguments = self.agent_arguments()
+        session_index = arguments.index("--session-id")
+        self.assertTrue(arguments[session_index + 1])
+        self.assertEqual(arguments[:session_index] + arguments[session_index + 2:],
+            ["--model", "opus", "--effort", "xhigh", "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}'])
         self.assertEqual(self.opening_prompt(), "/unit:direct docs/plans/given.md")
         self.assertEqual(len([row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]]), 1)
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.

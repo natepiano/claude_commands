@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from zoneinfo import ZoneInfo
+from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -31,6 +32,7 @@ from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
 if TYPE_CHECKING:
+    import herdr
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
@@ -714,7 +716,7 @@ def launch_session(
     target: str = "",
     model: str = "",
     autocompact_window: str = "",
-) -> None:
+) -> herdr.PromptSubmitOutcome:
     """Start Claude in its own herdr session carrying this unit's marks."""
     import herdr
     from scripts.accounts import accounts
@@ -737,7 +739,11 @@ def launch_session(
     if isinstance(director.effort, Effort):
         arguments.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
-        arguments.extend(["--resume", request.session.session_id])
+        session_id = request.session.session_id
+        arguments.extend(["--resume", session_id])
+    else:
+        session_id = str(uuid4())
+        arguments.extend(["--session-id", session_id])
     if autocompact_window:
         arguments.extend(["--autocompact", autocompact_window])
     session_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
@@ -758,8 +764,10 @@ def launch_session(
         herdr.start_new_server(host, timeout_ms)
         pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
     try:
-        herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
-                          opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
+        outcome = herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
+            opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
+            timeout_ms=timeout_ms)
+        return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
     except herdr.AgentExited:
         herdr.close_agent(host, pane)
         raise
@@ -995,6 +1003,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(
                 f"shutdown state unreadable: launch barrier: {error}"
             ) from error
+        outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
         try:
             purpose: launch_permission.LaunchPurpose = (
                 launch_permission.RecordedSessionRestoreLaunchPurpose(
@@ -1064,12 +1073,15 @@ def main(argv: list[str]) -> int:
                     record_scheduled_restore_prompt(
                         request.launch_kind.session_id, prompt
                     )
-                launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
+                outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
                                autocompact_window=resume_autocompact)
         finally:
             _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):
+            print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
+            if isinstance(outcome, herdr.PromptNotSubmitted):
+                raise RuntimeError(f"{request.identity.unit}: restart prompt not submitted: {outcome.reason}")
             record(request)
             attach = f"herdr session attach {host_session_name(request)}"
             if isinstance(marked_unit, MarkedUnitFound):
@@ -1077,6 +1089,8 @@ def main(argv: list[str]) -> int:
                 attach = f"herdr session attach {unit.place.session}"
             print(f"{request.identity.unit} restore launched: {attach}")
             return 0
+        if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(marked_unit, NoMarkedUnit):
+            raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}")
         launched = wait_for_remote_control(request)
         record(request)
         attach = f"herdr session attach {launched.place.session}"

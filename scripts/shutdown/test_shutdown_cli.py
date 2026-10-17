@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.whoami.note_file import note_name
 
 import io
+from datetime import datetime
 import json
 import os
 import shutil
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_support import linux_process_fixture, registry_confirmation, ShutdownTestCase
 import inventory
@@ -594,7 +597,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         with (patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionNotLive()),
               patch.object(restart_work, "_live_session_ids", return_value=frozenset()),
               patch.object(restart_work, "_retire"),
-              patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched()),
+              patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(herdr.PromptSubmitted(datetime.fromisoformat(OCTOBER)))),
               patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed),
               patch.object(restart_work, "remote_control_missing"),
               redirect_stdout(io.StringIO()) as output):
@@ -1789,7 +1792,8 @@ class OnlySessionCliTests(ShutdownTestCase):
         def confirmed(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
             return registry_confirmation(ids)
         _ = self.enterContext(patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed))
-        _ = self.enterContext(patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched()))
+        _ = self.enterContext(patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(herdr.PromptSubmitted(datetime.fromisoformat(OCTOBER)))))
+        _ = self.enterContext(patch.object(restart_work, "_prompt_outcome", return_value=herdr.PromptSubmitted(datetime.fromisoformat(OCTOBER))))
 
     def save_three(self, progress: record.SessionProgress) -> list[record.SessionShutdown]:
         saved: list[record.SessionShutdown] = []
@@ -2170,7 +2174,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         alert.assert_called_once()
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values["stopped"], "One session")
+        self.assertEqual(push.values["stopped"], "One session (Beta)")
         self.assertIn("window launch failed", output)
 
     def test_selected_now_refuses_in_progress_and_clean_stopped_records_without_work(self) -> None:
@@ -2282,6 +2286,22 @@ class OnlySessionCliTests(ShutdownTestCase):
                                          "Beta is waiting, not stopped; nothing to restart"])
         self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertEqual(result["refused"], [{"kind": "not stopped", "session_id": "beta-id", "name": "Beta", "progress": "waiting"}])
+
+    def test_unit_restart_without_prompt_submission_reports_the_named_failure_and_push(self) -> None:
+        _ = self.save_three(record.SessionStopped(kind="stopped", at=OCTOBER))
+        with (patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched()) as launch,
+              patch.object(settle, "alert_user") as alert):
+            code, output, error = self.action("restart", "beta-id")
+        self.assertEqual(code, 1, (output, error))
+        self.assertEqual(launch.call_count, 1)
+        self.assertIn("Beta", output)
+        self.assertIn("restart prompt not submitted", output)
+        saved = record.find_session(LOGIN, "beta-id")
+        assert saved is not None
+        self.assertEqual(saved["progress"]["kind"], "restart failed")
+        alert.assert_called_once()
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertIn("Beta", push.title + "\n" + push.body)
 
     def test_up_json_keeps_remote_control_quiet_and_emits_legacy_empty_key(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})

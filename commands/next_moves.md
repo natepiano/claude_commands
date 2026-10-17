@@ -8,7 +8,10 @@ Translate $ARGUMENTS into `python3 ~/.claude/scripts/accounts/accounts.py next`:
 - “when workers reach 1% switch to codex2” → `add workers 1 codex2`; `claude` is also a workers target.
 - For units or showrunners, a requested hold adds `--hold-minutes N`.
 - “what's set up” → `list`.
-- “drop the units one” → list, identify the matching entry, then `remove ID`; clarify only if several match.
+- “drop units 2” → `remove units 2`.
+- “swap showrunners 1 and 2” → `move showrunners 1 2`; `move GROUP N M` moves position N to M.
+- Insert at a position with `add GROUP PERCENT TARGET --at N`; omission appends.
+- Positions start at 1 within each group; never accept or show internal ids.
 
 Workers entries cannot have a minute hold. A workers move to Claude holds there until the source account’s weekly reset.
 

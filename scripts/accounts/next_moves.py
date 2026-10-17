@@ -24,8 +24,48 @@ class NextMoveError(ValueError):
     """The next-move log or requested change is invalid or unavailable."""
 
 
-class NextMoveHoldRemoval(Protocol):
-    def removing_next_move(self, entry_id: str) -> AbstractContextManager[None]: ...
+class NextMoveCommit(Protocol):
+    def commit(self, entries: tuple[NextMove, ...]) -> None: ...
+
+
+class NextMoveEdit(Protocol):
+    def editing_next_moves(self) -> AbstractContextManager[NextMoveCommit]: ...
+
+
+@dataclass(frozen=True)
+class GroupPosition:
+    value: int
+
+    def __post_init__(self) -> None:
+        value = cast(object, self.value)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise NextMoveError("next: position must be a positive integer")
+
+
+@dataclass(frozen=True)
+class AppendToGroup:
+    """Add after the group's existing entries."""
+
+
+@dataclass(frozen=True)
+class InsertAt:
+    position: GroupPosition
+
+
+class GroupPositionOutOfRange(NextMoveError):
+    group: NextMoveGroup
+    requested: GroupPosition
+    size: int
+
+    def __init__(self, group: NextMoveGroup, requested: GroupPosition, size: int) -> None:
+        self.group = group
+        self.requested = requested
+        self.size = size
+        super().__init__(f"next: {group} has {size} entries; position {requested.value} is out of range")
+
+
+APPEND_TO_GROUP = AppendToGroup()
+FIRST_GROUP_POSITION = GroupPosition(1)
 
 
 @dataclass(frozen=True)
@@ -185,48 +225,108 @@ def write_next_moves(entries: tuple[NextMove, ...]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> None:
+    """Insert a validated machine entry, resolving positions under both edit locks."""
+    watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
+    try:
+        with watcher.editing_next_moves() as edit:
+            entries = list(read_next_moves())
+            if any(saved.id == entry.id for saved in entries):
+                raise NextMoveError("next: duplicate entry")
+            indices = [index for index, saved in enumerate(entries) if saved.group == entry.group]
+            if isinstance(insertion, InsertAt):
+                position = insertion.position
+                if position.value > len(indices) + 1:
+                    raise GroupPositionOutOfRange(entry.group, position, len(indices))
+                index = (indices[position.value - 1] if position.value <= len(indices)
+                         else indices[-1] + 1 if indices else len(entries))
+            else:
+                index = indices[-1] + 1 if indices else len(entries)
+            entries.insert(index, entry)
+            edit.commit(tuple(entries))
+    except OSError as error:
+        raise NextMoveError(f"next: cannot add entry: {error}") from error
+
+
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
-                  hold_minutes: float = 0) -> NextMove:
+                  hold_minutes: float = 0, *, insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
     # All text-to-domain conversions use the same boundary as file and remote reads.
     entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
         hold_minutes=hold_minutes, to=to, added_at=datetime.now(timezone.utc).isoformat())]))[0]
     if not role_map.is_role_map_host():
         try:
-            response = role_map.ssh_role_map(("next-write", encode_next_moves((entry,))))
-            received = decode_next_moves(response)
+            arguments = ("next-write", encode_next_moves((entry,)))
+            if isinstance(insertion, InsertAt):
+                arguments += ("--at", str(insertion.position.value))
+            received = decode_next_moves(role_map.ssh_role_map(arguments))
             if len(received) != 1:
                 raise NextMoveError("next: remote add returned no entry")
             return received[0]
+        except role_map.RemoteCommandRefused as error:
+            raise NextMoveError(str(error)) from error
         except (OSError, subprocess.TimeoutExpired) as error:
             raise NextMoveError(f"next: remote add failed: {error}") from error
-    try:
-        with next_moves_lock():
-            write_next_moves((*read_next_moves(), entry))
-    except OSError as error:
-        raise NextMoveError(f"next: cannot add entry: {error}") from error
+    insert_next_move(entry, insertion)
     return entry
 
 
-def remove_next_move(entry_id: str) -> None:
+def remove_next_move(group: NextMoveGroup, position: GroupPosition) -> None:
     if not role_map.is_role_map_host():
         try:
-            _ = role_map.ssh_role_map(("next", "remove", entry_id))
+            _ = role_map.ssh_role_map(("next", "remove", group, str(position.value)))
+        except role_map.RemoteCommandRefused as error:
+            raise NextMoveError(str(error)) from error
         except (OSError, subprocess.TimeoutExpired) as error:
             raise NextMoveError(f"next: remote remove failed: {error}") from error
         return
     try:
-        watcher = cast(NextMoveHoldRemoval, cast(object, import_module("scripts.accounts.refusal_watch")))
-        with watcher.removing_next_move(entry_id), next_moves_lock():
+        watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
+        with watcher.editing_next_moves() as edit:
             entries = read_next_moves()
-            kept = tuple(entry for entry in entries if entry.id != entry_id)
-            if len(kept) == len(entries):
-                raise NextMoveError(f"next: no entry {entry_id}")
-            write_next_moves(kept)
+            group_entries = [entry for entry in entries if entry.group == group]
+            if position.value > len(group_entries):
+                raise GroupPositionOutOfRange(group, position, len(group_entries))
+            removed = group_entries[position.value - 1]
+            edit.commit(tuple(entry for entry in entries if entry.id != removed.id))
     except OSError as error:
         raise NextMoveError(f"next: cannot remove entry: {error}") from error
 
 
-def render_next_move(entry: NextMove) -> str:
-    hold = (f" (hold {entry.hold_minutes:g} minutes)"
+def move_next_move(group: NextMoveGroup, source: GroupPosition, destination: GroupPosition) -> None:
+    if not role_map.is_role_map_host():
+        try:
+            _ = role_map.ssh_role_map(("next", "move", group, str(source.value), str(destination.value)))
+        except role_map.RemoteCommandRefused as error:
+            raise NextMoveError(str(error)) from error
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise NextMoveError(f"next: remote move failed: {error}") from error
+        return
+    try:
+        watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
+        with watcher.editing_next_moves() as edit:
+            entries = read_next_moves()
+            group_entries = [entry for entry in entries if entry.group == group]
+            for position in (source, destination):
+                if position.value > len(group_entries):
+                    raise GroupPositionOutOfRange(group, position, len(group_entries))
+            if source == destination:
+                return
+            entry = group_entries.pop(source.value - 1)
+            group_entries.insert(destination.value - 1, entry)
+            reordered = iter(group_entries)
+            edit.commit(tuple(next(reordered) if entry.group == group else entry for entry in entries))
+    except OSError as error:
+        raise NextMoveError(f"next: cannot move entry: {error}") from error
+
+
+def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSITION) -> str:
+    hold = (f", hold {entry.hold_minutes:g} min"
             if isinstance(entry, ClaudeGroupMove) and entry.hold_minutes else "")
-    return f"{entry.id}: when {entry.group} reach {entry.at_percent:g}% → {target_label(entry)}{hold}"
+    return f"{entry.group} {position.value}: at {entry.at_percent:g}% → {target_label(entry)}{hold}"
+
+
+def render_next_moves(entries: tuple[NextMove, ...]) -> str:
+    sections = ["\n".join(render_next_move(entry, GroupPosition(index))
+                          for index, entry in enumerate((entry for entry in entries if entry.group == group), 1))
+                for group in ("showrunners", "units", "workers")]
+    return "\n\n".join(section for section in sections if section) or "nothing set up"

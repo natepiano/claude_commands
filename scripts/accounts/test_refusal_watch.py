@@ -111,6 +111,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "load_config", return_value={"always": ["fixture-showrunner"]}))
         _ = self.enterContext(patch.object(quota_alert, "recipients", return_value=["fixture-showrunner"]))
         _ = self.enterContext(patch.object(quota_alert, "deliver_and_record", side_effect=self.deliver_head_notice))
+        _ = self.enterContext(patch.object(quota_alert, "STATE", self.home / "quota_alert.json"))
         self.commands = []
         self.reading("main@example.invalid", 80, reset=NOW + timedelta(days=6))
         self.reading(SOURCE_LOGIN, 0)
@@ -265,6 +266,197 @@ class RefusalWatchTests(unittest.TestCase):
                   minutes: float = 10) -> next_moves.ClaudeGroupMove:
         return next_moves.ClaudeGroupMove(name, "units", 1, minutes, target, NOW)
 
+    def test_positional_head_changes_clear_the_displaced_hold_and_both_notices_under_the_watch_lock(self) -> None:
+        _ = self.groups()
+        watch_lock = refusal_watch._watch_lock  # pyright: ignore[reportPrivateUsage]
+        save_state = refusal_watch._save_state  # pyright: ignore[reportPrivateUsage]
+        write_log = next_moves.write_next_moves
+        log_lock = next_moves.next_moves_lock
+        quota_state = quota_alert.state_file
+        locked = False
+
+        @contextmanager
+        def tracked_watch_lock() -> Generator[None]:
+            nonlocal locked
+            with watch_lock():
+                self.assertFalse(locked)
+                locked = True
+                try:
+                    yield
+                finally:
+                    locked = False
+
+        @contextmanager
+        def tracked_log_lock() -> Generator[None]:
+            self.assertTrue(locked, "log lock acquired before the watch lock")
+            with log_lock():
+                yield
+
+        @contextmanager
+        def tracked_quota_state() -> Generator[quota_alert.State]:
+            self.assertTrue(locked, "workers notice cleared outside the watch lock")
+            with quota_state() as state:
+                yield state
+
+        def checked_write(entries: tuple[next_moves.NextMove, ...]) -> None:
+            self.assertTrue(locked, "log changed outside the watch lock")
+            write_log(entries)
+
+        def checked_save(state: refusal_watch.WatchState) -> None:
+            self.assertTrue(locked, "head state cleared outside the watch lock")
+            save_state(state)
+
+        groups: tuple[next_moves.NextMoveGroup, ...] = ("units", "showrunners", "workers")
+        for group in groups:
+            for edit in ("move", "remove", "insert"):
+                with self.subTest(group=group, edit=edit):
+                    if group == "workers":
+                        head: next_moves.NextMove = next_moves.WorkersMove("old-worker-head", 1,
+                            next_moves.DelegateToClaude(), NOW)
+                        later: next_moves.NextMove = next_moves.WorkersMove("next-worker-head", 1,
+                            next_moves.DelegateToClaude(), NOW)
+                    else:
+                        head = self.low_rule("old-head", group=group)
+                        later = self.low_rule("next-head", group=group, target="claude3")
+                    other = self.low_rule("unrelated-head", group="showrunners" if group == "units" else "units")
+                    self.next_entries(head, other, later)
+                    hold = refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1)
+                    save_state(refusal_watch.WatchState(sessions={}, notices={},
+                        auto_move_holds={head.id: hold, other.id: hold},
+                        auto_move_notices={head.id: "delivered", other.id: "keep"}))
+                    with quota_alert.state_file() as state:
+                        state["workers_move_notices"] = {head.id: "delivered", other.id: "keep"}
+                    args = (["move", group, "2", "1"] if edit == "move" else
+                            ["remove", group, "1"] if edit == "remove" else
+                            ["add", group, "1", "claude" if group == "workers" else "claude2", "--at", "1"])
+                    with (patch.object(refusal_watch, "_watch_lock", side_effect=tracked_watch_lock),
+                          patch.object(refusal_watch, "_save_state", side_effect=checked_save),
+                          patch.object(next_moves, "next_moves_lock", side_effect=tracked_log_lock),
+                          patch.object(quota_alert, "state_file", side_effect=tracked_quota_state),
+                          patch.object(next_moves, "write_next_moves", side_effect=checked_write),
+                          redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                        self.assertEqual(accounts.main(["next", *args]), 0)
+                    saved = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(saved.get("auto_move_holds"), {other.id: hold})
+                    self.assertEqual(saved.get("auto_move_notices"), {other.id: "keep"})
+                    with quota_alert.state_file() as state:
+                        self.assertEqual(state.get("workers_move_notices"), {other.id: "keep"})
+                    self.assertEqual([entry for entry in next_moves.read_next_moves() if entry.group == other.group],
+                                     [other])
+
+    def test_positional_edits_that_leave_the_head_keep_its_hold_and_notice_keys(self) -> None:
+        _ = self.groups()
+        head, second, third = self.hold_rule("head"), self.hold_rule("second"), self.hold_rule("third")
+        for args in (["move", "units", "2", "3"], ["remove", "units", "2"],
+                     ["add", "units", "1", "claude2", "--at", "2"], ["move", "units", "1", "1"]):
+            with self.subTest(args=args):
+                self.next_entries(head, second, third)
+                original = refusal_watch.WatchState(sessions={}, notices={},
+                    auto_move_holds={head.id: refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1)},
+                    auto_move_notices={head.id: "keep"})
+                refusal_watch._save_state(original)  # pyright: ignore[reportPrivateUsage]
+                with quota_alert.state_file() as state:
+                    state["workers_move_notices"] = {head.id: "keep"}
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(accounts.main(["next", *args]), 0)
+                self.assertEqual(refusal_watch._load_state(), original)  # pyright: ignore[reportPrivateUsage]
+                with quota_alert.state_file() as state:
+                    self.assertEqual(state.get("workers_move_notices"), {head.id: "keep"})
+
+    def test_failed_head_cleanup_keeps_the_log_unchanged_before_a_fresh_hold_can_start(self) -> None:
+        _ = self.groups()
+        head, later = self.hold_rule("elapsed-head"), self.hold_rule("successor")
+        self.reading(SOURCE_LOGIN, 1)
+        for failure in ("watch save", "workers notice save"):
+            with self.subTest(failure=failure):
+                self.next_entries(head, later)
+                original = refusal_watch.WatchState(sessions={}, notices={},
+                    auto_move_holds={head.id: refusal_watch.HoldStarted(
+                        "claude1", NOW - timedelta(minutes=20), accounts.NoGroupTransition(), 1)},
+                    auto_move_notices={head.id: "delivered"})
+                refusal_watch._save_state(original)  # pyright: ignore[reportPrivateUsage]
+                with quota_alert.state_file() as state:
+                    state["workers_move_notices"] = {head.id: "delivered"}
+                before = next_moves.next_moves_file().read_bytes()
+
+                @contextmanager
+                def failed_workers_notice_save() -> Generator[quota_alert.State]:
+                    state = quota_alert.State(episodes={}, fallback=quota_alert.NoCodexQuotaFallback(),
+                        workers_move_notices={head.id: "delivered"})
+                    yield state
+                    raise OSError("fixture workers notice save failed")
+
+                with (patch.object(refusal_watch, "_save_state", side_effect=OSError("fixture watch save failed"))
+                      if failure == "watch save" else
+                      patch.object(quota_alert, "state_file", side_effect=failed_workers_notice_save)):
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+                        code = accounts.main(["next", "move", "units", "1", "2"])
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("save failed", error.getvalue())
+                self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+                with quota_alert.state_file() as state:
+                    self.assertEqual(state.get("workers_move_notices"), {head.id: "delivered"})
+                if failure == "watch save":
+                    self.assertEqual(refusal_watch._load_state(), original)  # pyright: ignore[reportPrivateUsage]
+                next_moves.move_next_move("units", next_moves.GroupPosition(1), next_moves.GroupPosition(2))
+                next_moves.move_next_move("units", next_moves.GroupPosition(2), next_moves.GroupPosition(1))
+                self.assertEqual(next_moves.read_next_moves(), (head, later))
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+                WatchTime.at = NOW + timedelta(minutes=2)
+                _ = self.cli()
+                hold = refusal_watch._load_state().get("auto_move_holds", {})[head.id]  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(hold.at, WatchTime.at)
+                self.assertEqual(next_moves.read_next_moves(), (head, later))
+                self.assertEqual(self.commands, [])
+                WatchTime.at = NOW
+
+    def test_failed_log_write_leaves_displaced_head_state_cleared_so_the_hold_restarts(self) -> None:
+        _ = self.groups()
+        head, later = self.hold_rule("elapsed-head"), self.hold_rule("successor")
+        self.next_entries(head, later)
+        self.reading(SOURCE_LOGIN, 1)
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={head.id: refusal_watch.HoldStarted(
+                "claude1", NOW - timedelta(minutes=20), accounts.NoGroupTransition(), 1)},
+            auto_move_notices={head.id: "delivered"}))
+        with quota_alert.state_file() as state:
+            state["workers_move_notices"] = {head.id: "delivered"}
+        before = next_moves.next_moves_file().read_bytes()
+        with patch.object(next_moves, "write_next_moves", side_effect=OSError("fixture log write failed")):
+            with self.assertRaisesRegex(next_moves.NextMoveError, "log write failed"):
+                next_moves.move_next_move("units", next_moves.GroupPosition(1), next_moves.GroupPosition(2))
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+        state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(state.get("auto_move_holds", {}), {})
+        self.assertEqual(state.get("auto_move_notices", {}), {})
+        with quota_alert.state_file() as quota_state:
+            self.assertEqual(quota_state.get("workers_move_notices", {}), {})
+        _ = self.cli()
+        hold = refusal_watch._load_state().get("auto_move_holds", {})[head.id]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(hold.at, NOW)
+        self.assertEqual(self.commands, [])
+
+    def test_demoting_and_promoting_a_head_before_the_next_pass_restarts_its_hold(self) -> None:
+        _ = self.groups()
+        head, second = self.hold_rule("original-head"), self.hold_rule("successor")
+        self.next_entries(head, second)
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        first_hold = refusal_watch._load_state().get("auto_move_holds", {})[head.id]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(first_hold.at, NOW)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(accounts.main(["next", "move", "units", "1", "2"]), 0)
+            self.assertEqual(accounts.main(["next", "move", "units", "2", "1"]), 0)
+        self.assertEqual(next_moves.read_next_moves(), (head, second))
+        self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+        WatchTime.at = NOW + timedelta(minutes=2)
+        _ = self.cli()
+        holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(set(holds), {head.id})
+        self.assertEqual(holds[head.id].at, WatchTime.at)
+        self.assertEqual(self.commands, [])
+
     def test_stale_due_head_blocks_the_fresh_second_entry_and_reports_once_per_reason(self) -> None:
         self.assertEqual(accounts.setup("claude4"), [])
         _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
@@ -293,7 +485,8 @@ class RefusalWatchTests(unittest.TestCase):
             self.assertEqual(len(self.head_deliveries), 1)
             job, = self.head_deliveries[0]
             self.assertEqual(job.recipient, "fixture-showrunner")
-            for text in (first.id, "showrunners", "claude4", "due", "19:43"):
+            self.assertNotIn(first.id, job.text)
+            for text in ("showrunners 1", "claude4", "due", "19:43"):
                 self.assertIn(text, job.text)
             self.assertIn(job.text, output)
             _ = self.cli()
@@ -419,7 +612,8 @@ class RefusalWatchTests(unittest.TestCase):
             select.assert_not_called()
             notice.assert_called_once_with("units", "claude1", head.id,
                                            quota_alert.TargetIsCurrentAccount(), NOW)
-        for text in (head.id, "units", "claude1", "due", "already the current account"):
+        self.assertNotIn(head.id, self.head_deliveries[0][0].text)
+        for text in ("units 1", "claude1", "due", "already the current account"):
             self.assertIn(text, self.head_deliveries[0][0].text)
         self.assertEqual(self.commands, [])
         self.assertEqual(self.notifications, [])
@@ -480,7 +674,8 @@ class RefusalWatchTests(unittest.TestCase):
         before = self.snapshot()
         code, output, error = self.cli("--dry-run")
         self.assertEqual((code, error), (0, ""))
-        for text in ("units-low", "claude3", "due", "07:49"):
+        self.assertNotIn("units-low", output)
+        for text in ("units 1", "claude3", "due", "07:49"):
             self.assertIn(text, output)
         self.assertEqual(self.head_deliveries, [])
         self.assertEqual(self.snapshot(), before)
@@ -493,7 +688,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(TARGET_LOGIN, 80, at=NOW - timedelta(minutes=11))
         _ = self.cli()
         self.assertEqual(len(self.head_deliveries), 1)
-        next_moves.remove_next_move(entry.id)
+        next_moves.remove_next_move("units", next_moves.GroupPosition(1))
         state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
         self.assertNotIn(entry.id, state.get("auto_move_notices", {}))
         self.next_entries(entry)
@@ -738,7 +933,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         before = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(set(before.get("auto_move_holds", {})), {first.id})
-        next_moves.remove_next_move(first.id)
+        next_moves.remove_next_move("units", next_moves.GroupPosition(1))
         self.assertEqual(next_moves.read_next_moves(), (second,))
         after = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(after.get("auto_move_holds", {}), {})
@@ -1110,7 +1305,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.next_entries(first, second)
         code, output, error = self.cli()
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("missing-target", output)
+        self.assertNotIn("missing-target", output)
+        self.assertIn("units 1", output)
         self.assertIn("claude99", output)
         self.assertNotIn("valid-target", output)
         self.assertEqual(stored_group_labels(path)["units"], "claude1")

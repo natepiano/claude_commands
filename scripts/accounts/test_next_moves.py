@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -11,6 +12,8 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.accounts import next_moves, role_map
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
+import quota_alert
 
 NOW = datetime(2026, 10, 17, tzinfo=timezone.utc)
 
@@ -22,6 +25,7 @@ class NextMovesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = self.enterContext(patch.object(quota_alert, "STATE", self.home / "quota_alert.json"))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
 
@@ -33,15 +37,94 @@ class NextMovesTests(unittest.TestCase):
         runner = next_moves.add_next_move("showrunners", 2, "claude2")
         self.assertEqual(next_moves.read_next_moves(), (first, second, runner))
         self.assertNotEqual(first.id, second.id)
-        next_moves.remove_next_move(second.id)
+        next_moves.remove_next_move("units", next_moves.GroupPosition(2))
         self.assertEqual(next_moves.read_next_moves(), (first, runner))
         before = next_moves.next_moves_file().read_bytes()
         with self.assertRaises(next_moves.NextMoveError):
-            next_moves.remove_next_move("absent")
+            next_moves.remove_next_move("units", next_moves.GroupPosition(2))
         self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
-        next_moves.remove_next_move(first.id)
-        next_moves.remove_next_move(runner.id)
+        next_moves.remove_next_move("units", next_moves.GroupPosition(1))
+        next_moves.remove_next_move("showrunners", next_moves.GroupPosition(1))
         self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_group_positions_are_one_based_and_out_of_range_edits_preserve_the_log(self) -> None:
+        for value in (0, -1, True):
+            with self.subTest(value=value), self.assertRaises(next_moves.NextMoveError):
+                _ = next_moves.GroupPosition(value)
+        entry = next_moves.add_next_move("units", 1, "claude2")
+        before = next_moves.next_moves_file().read_bytes()
+        with self.assertRaises(next_moves.GroupPositionOutOfRange) as error:
+            next_moves.move_next_move("units", next_moves.GroupPosition(1), next_moves.GroupPosition(2))
+        self.assertEqual((error.exception.group, error.exception.requested, error.exception.size),
+                         ("units", next_moves.GroupPosition(2), 1))
+        with self.assertRaises(next_moves.GroupPositionOutOfRange) as error:
+            _ = next_moves.add_next_move("units", 1, "claude3",
+                insertion=next_moves.InsertAt(next_moves.GroupPosition(3)))
+        self.assertEqual((error.exception.group, error.exception.requested, error.exception.size),
+                         ("units", next_moves.GroupPosition(3), 1))
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+    def test_positional_edits_preserve_surviving_ids_and_the_other_groups_interleaved_order(self) -> None:
+        entries: tuple[next_moves.NextMove, ...] = (
+            next_moves.ClaudeGroupMove("unit-one", "units", 1, 5, "claude2", NOW),
+            next_moves.WorkersMove("worker-one", 1, next_moves.DelegateToClaude(), NOW),
+            next_moves.ClaudeGroupMove("runner-one", "showrunners", 1, 0, "claude3", NOW),
+            next_moves.ClaudeGroupMove("unit-two", "units", 2, 5, "claude3", NOW),
+            next_moves.ClaudeGroupMove("runner-two", "showrunners", 2, 0, "claude2", NOW),
+            next_moves.WorkersMove("worker-two", 2, next_moves.CodexWorkersTarget("codex2"), NOW))
+        groups: tuple[next_moves.NextMoveGroup, ...] = ("showrunners", "units", "workers")
+        for group in groups:
+            with self.subTest(group=group):
+                with next_moves.next_moves_lock():
+                    next_moves.write_next_moves(entries)
+                own = [entry for entry in entries if entry.group == group]
+                others = [entry for entry in entries if entry.group != group]
+                next_moves.move_next_move(group, next_moves.GroupPosition(2), next_moves.GroupPosition(1))
+                changed = next_moves.read_next_moves()
+                self.assertEqual([entry for entry in changed if entry.group == group], list(reversed(own)))
+                self.assertEqual([entry for entry in changed if entry.group != group], others)
+                self.assertEqual({entry.id for entry in changed}, {entry.id for entry in entries})
+                inserted = next_moves.add_next_move(group, 3, "claude" if group == "workers" else "claude4",
+                    insertion=next_moves.InsertAt(next_moves.GroupPosition(2)))
+                changed = next_moves.read_next_moves()
+                self.assertEqual([entry for entry in changed if entry.group == group], [own[1], inserted, own[0]])
+                self.assertEqual([entry for entry in changed if entry.group != group], others)
+                next_moves.remove_next_move(group, next_moves.GroupPosition(3))
+                changed = next_moves.read_next_moves()
+                self.assertEqual([entry for entry in changed if entry.group == group], [own[1], inserted])
+                self.assertEqual([entry for entry in changed if entry.group != group], others)
+                self.assertEqual({entry.id for entry in changed},
+                                 ({entry.id for entry in entries} - {own[0].id}) | {inserted.id})
+                appended = next_moves.add_next_move(group, 4, "claude" if group == "workers" else "claude4",
+                    insertion=next_moves.AppendToGroup())
+                self.assertEqual([entry for entry in next_moves.read_next_moves() if entry.group == group],
+                                 [own[1], inserted, appended])
+
+    def test_remote_position_verbs_forward_group_and_positions_without_reading_the_queue(self) -> None:
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", return_value="") as remote):
+            next_moves.move_next_move("showrunners", next_moves.GroupPosition(2), next_moves.GroupPosition(1))
+            remote.assert_called_once_with(("next", "move", "showrunners", "2", "1"))
+            remote.reset_mock()
+            next_moves.remove_next_move("workers", next_moves.GroupPosition(3))
+            remote.assert_called_once_with(("next", "remove", "workers", "3"))
+        self.assertFalse(next_moves.next_moves_file().exists())
+
+    def test_remote_insert_sends_a_position_resolved_by_the_host_instead_of_a_replacement_log(self) -> None:
+        def remote(arguments: tuple[str, ...]) -> str:
+            self.assertEqual(arguments[0], "next-write")
+            self.assertEqual(arguments[2:], ("--at", "2"))
+            entry, = next_moves.decode_next_moves(arguments[1])
+            self.assertEqual((entry.group, next_moves.target_label(entry)), ("workers", "claude"))
+            return next_moves.encode_next_moves((entry,))
+
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote) as transport):
+            _ = next_moves.add_next_move("workers", 1, "claude",
+                insertion=next_moves.InsertAt(next_moves.GroupPosition(2)))
+        transport.assert_called_once()
+        self.assertFalse(next_moves.next_moves_file().exists())
 
     def test_remote_read_uses_host_log_without_creating_a_local_copy(self) -> None:
         document = json.dumps([{"id": "remote-entry", "group": "units", "at_percent": 1,
@@ -65,12 +148,12 @@ class NextMovesTests(unittest.TestCase):
         self.assertEqual(claude.to, next_moves.DelegateToClaude())
         entries = next_moves.read_next_moves()
         self.assertEqual(entries, (unit, codex, claude))
-        self.assertIn("when workers reach 1% → codex2", next_moves.render_next_move(codex))
-        self.assertIn("when workers reach 0% → claude", next_moves.render_next_move(claude))
+        self.assertIn("workers 1: at 1% → codex2", next_moves.render_next_move(codex))
+        self.assertIn("workers 1: at 0% → claude", next_moves.render_next_move(claude))
         stored = cast(list[dict[str, object]], json.loads(next_moves.encode_next_moves(entries)))
         self.assertEqual([row["to"] for row in stored], ["claude4", "codex2", "claude"])
         self.assertNotIn("hold_minutes", stored[1])
-        next_moves.remove_next_move(codex.id)
+        next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
         self.assertEqual(next_moves.read_next_moves(), (unit, claude))
 
     def test_workers_hold_and_wrong_tool_targets_are_refused_without_changing_the_log(self) -> None:

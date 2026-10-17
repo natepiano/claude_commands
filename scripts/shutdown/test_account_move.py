@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
 
@@ -32,13 +33,26 @@ from importlib import import_module
 import account
 import agent_accounts
 from scripts.accounts import accounts, refusals
-from test_restart import entry, worker_session, showrunner, top_level, unit
+from test_restart import RESTARTED, STOPPED, entry, worker_session, showrunner, top_level, unit
 from test_support import ShutdownTestCase
 
 
 class AccountMoveTests(ShutdownTestCase):
     root: Path = Path()
     owner: inventory.Session = top_level("move-id", name="kept name")
+
+    def test_move_opening_note_dates_the_pause_and_resume_even_when_delivered_late(self) -> None:
+        saved = entry(top_level("dated-move"))
+        saved.update(target="claude3", source_label="claude1", why="weekly allowance exhausted")
+        note = restart.restart_note(saved, RESTARTED)
+        paused = restart._user_time(STOPPED)  # pyright: ignore[reportPrivateUsage]
+        resumed = restart._user_time(RESTARTED)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn(paused, note)
+        self.assertIn(resumed, note)
+        self.assertLess(note.index(paused), note.index(resumed))
+        self.assertIn("claude1", note)
+        self.assertIn("claude3", note)
+        self.assertIn(saved["where"]["text"] if saved["where"]["kind"] == "said" else "", note)
 
     def test_move_opening_note_points_to_resume_message_only_when_workers_were_paused(self) -> None:
         director = unit("moved-director")
