@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import re
@@ -13,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -25,19 +23,6 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 import rules
 import style_ledger
 from user_zone import user_zone
-
-
-@dataclass(frozen=True)
-class CoverageCounts:
-    current: int
-    stale: int
-    open: int
-    awaiting_merge: int
-    held: int
-
-    @property
-    def total(self) -> int:
-        return self.current + self.stale + self.open + self.awaiting_merge
 
 
 class RuleSnapshot(TypedDict):
@@ -94,19 +79,6 @@ def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
     return StyleProduction(slug, branch_point, units)
-
-
-def coverage(ledger: style_ledger.Ledger, crate: str = "") -> dict[str, CoverageCounts]:
-    # status is the ledger's public reader for counts that include held verdicts.
-    output = io.StringIO()
-    with redirect_stdout(output):
-        ledger.status(crate=crate or None)
-    result: dict[str, CoverageCounts] = {}
-    for line in output.getvalue().splitlines():
-        fields = line.split("\t")
-        if len(fields) == 7 and fields[0] != "rule":
-            result[fields[0]] = CoverageCounts(*(int(field) for field in fields[1:6]))
-    return result
 
 
 def previous_report(path: Path) -> FirstReport | PreviousReport:
@@ -167,10 +139,10 @@ def counted(count: int, noun: str) -> str:
     return f"{count:,} {noun}" + ("" if count == 1 else "s")
 
 
-def table_row(name: str, progress: style_ledger.RuleProgress, counts: CoverageCounts) -> str:
+def table_row(name: str, progress: style_ledger.RuleCounts, counts: style_ledger.RuleCounts) -> str:
     current = (f"{counts.current:,} of {counts.total:,} crates" if progress.tier == "D"
                else f"{counts.current:,} ({percent(counts.current, counts.total)}%)")
-    if counts.current == counts.total:
+    if progress.complete:
         done = f"yes, {counts.held:,} held" if counts.held else "yes"
     else:
         done = f"no: {counts.stale:,} stale" if counts.stale else "no"
@@ -178,7 +150,7 @@ def table_row(name: str, progress: style_ledger.RuleProgress, counts: CoverageCo
             + f"{counts.awaiting_merge:,} | {counts.held:,} | {done} |")
 
 
-def resolve_rule(name: str, progress: tuple[style_ledger.RuleProgress, ...]) -> str:
+def resolve_rule(name: str, progress: tuple[style_ledger.RuleCounts, ...]) -> str:
     matches = [row.rule_id for row in progress if name in (row.rule_id, PurePosixPath(row.rule_id).stem)]
     if len(matches) != 1:
         detail = ": " + ", ".join(matches) if matches else ""
@@ -200,8 +172,9 @@ def ticket_line(ticket: style_ledger.TicketRecord) -> str:
 def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> str:
     if rule and crate:
         raise style_ledger.LedgerError("choose --rule or --crate")
-    summary = ledger.summary()
-    progress = tuple(row for row in ledger.rules() if row.tier in ("A", "B", "C", "D"))
+    repository_counts = ledger.rule_counts(style_ledger.WholeRepository())
+    summary = ledger.summary_of(repository_counts)
+    progress = tuple(row for row in repository_counts if row.tier in ("A", "B", "C", "D"))
     selected_rule = resolve_rule(rule, progress) if rule else ""
     members = workspace(ledger, summary.synced_tip)
     if crate:
@@ -209,8 +182,9 @@ def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") 
         if len(matches) != 1:
             raise style_ledger.LedgerError(f"unknown or ambiguous crate {crate}")
         crate = matches[0]
-    counts = coverage(ledger)
-    shown_counts = coverage(ledger, crate) if crate else counts
+    counts = {row.rule_id: row for row in repository_counts}
+    shown_counts = ({row.rule_id: row for row in ledger.rule_counts(style_ledger.CrateCoverage(crate))}
+                    if crate else counts)
     style = production(ledger, summary.synced_tip)
     file_count = sum(len(ledger.rust_files(directory)) for directory in {".", *(member.directory for member in members)})
     snapshot_path = ledger.database.parent / "last_report.json"
@@ -222,7 +196,7 @@ def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") 
     synced = summary.synced_at.astimezone(user_zone())
     lines = [
         f"{style.slug} — synced {style.branch_point} {summary.synced_tip[:7]} at {synced:%H:%M %Z}, {file_count:,} files{file_delta}",
-        f"Rules done: {summary.rules_done} of {summary.rules_total} ({sum(row.done and row.tier == 'A' for row in progress)} by lint)"
+        f"Rules done: {summary.rules_done} of {summary.rules_total} ({sum(row.complete and row.tier == 'A' for row in progress)} by lint)"
         + f" · cells current {one_decimal(summary.cells_current_pct)}% · open {sum(row.open for row in counts.values()):,}"
         + f" · stale {summary.stale:,} · awaiting merge {sum(row.awaiting_merge for row in counts.values()):,}"
         + f" · held {sum(row.held for row in counts.values()):,}",
@@ -257,9 +231,9 @@ def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") 
                          if isinstance(finding.state, style_ledger.Filed)}
     proposals = summary.proposals
     if isinstance(previous, PreviousReport):
-        gained = sum(row.done and not previous.rules.get(row.rule_id, {"done": False, "cells_total": 0})["done"] for row in progress)
-        lost = sum(not row.done and previous.rules.get(row.rule_id, {"done": False, "cells_total": 0})["done"] for row in progress)
-        lost_to_new_files = sum(not row.done and old["done"] and row.cells_total > old["cells_total"]
+        gained = sum(row.complete and not previous.rules.get(row.rule_id, {"done": False, "cells_total": 0})["done"] for row in progress)
+        lost = sum(not row.complete and previous.rules.get(row.rule_id, {"done": False, "cells_total": 0})["done"] for row in progress)
+        lost_to_new_files = sum(not row.complete and old["done"] and row.total > old["cells_total"]
                                 for row in progress if (old := previous.rules.get(row.rule_id)) is not None)
         proposals = len(current_proposals - previous.proposals)
     cause = " to new files" if lost > 0 and lost == lost_to_new_files else ""
@@ -267,7 +241,7 @@ def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") 
                   + f'{counted(proposals, "proposal")} filed.'])
     days[now.date().isoformat()] = file_count
     snapshot: ReportSnapshot = {
-        "rules": {row.rule_id: {"done": row.done, "cells_total": row.cells_total} for row in progress},
+        "rules": {row.rule_id: {"done": row.complete, "cells_total": row.total} for row in progress},
         "proposals": sorted(current_proposals), "files_by_day": dict(sorted(days.items())[-31:]),
     }
     save_snapshot(snapshot_path, snapshot)

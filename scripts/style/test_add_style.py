@@ -265,7 +265,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertEqual({row["rule_id"] for row in rows}, {rule.rule_id for rule in catalog})
         with style_ledger.open_ledger(self.checkout) as ledger:
             ledger.set_tip(self.initial_tip, "style/main")
-            self.assertIn("local:docs/style/local.md", {row.rule_id for row in ledger.rules()})
+            self.assertIn("local:docs/style/local.md", {row.rule_id for row in ledger.rule_counts(style_ledger.WholeRepository())})
 
     def test_rerun_keeps_plans_ledger_and_excludes_and_does_not_launch_twice(self) -> None:
         _ = self.run_bootstrap()

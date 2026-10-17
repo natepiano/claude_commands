@@ -13,7 +13,8 @@ import sqlite3
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -54,13 +55,40 @@ class ListedSite:
 
 
 @dataclass(frozen=True)
-class RuleProgress:
+class RuleCounts:
     rule_id: str
     tier: Tier
-    family: Family | None
-    cells_current: int
-    cells_total: int
-    done: bool
+    current: int
+    stale: int
+    open: int
+    awaiting_merge: int
+    held: int
+
+    @property
+    def total(self) -> int:
+        return self.current + self.stale + self.open + self.awaiting_merge
+
+    @property
+    def complete(self) -> bool:
+        return self.current == self.total
+
+
+@dataclass(frozen=True)
+class WholeRepository:
+    """Coverage across every crate in the repository."""
+
+
+@dataclass(frozen=True)
+class CrateCoverage:
+    crate: str
+
+
+CoverageScope = WholeRepository | CrateCoverage
+_WHOLE_REPOSITORY = WholeRepository()
+
+
+def _crate_filter(scope: CoverageScope) -> str | None:
+    return scope.crate if isinstance(scope, CrateCoverage) else None
 
 
 FindingKind = Literal["rename", "type", "restructure"]
@@ -840,15 +868,18 @@ class Ledger:
         return tuple(changes)
 
     def summary(self) -> StyleLedgerSummary:
-        cells = tuple(self.cells())
-        progress = tuple(rule for rule in self._rule_progress(cells) if rule.tier in ("A", "B", "C", "D"))
+        return self.summary_of(self.rule_counts(WholeRepository()))
+
+    def summary_of(self, repository_counts: tuple[RuleCounts, ...]) -> StyleLedgerSummary:
+        progress = tuple(rule for rule in repository_counts if rule.tier in ("A", "B", "C", "D"))
+        total = sum(rule.total for rule in repository_counts)
         waiting_rows = self.pending_handoffs()
         waiting = PendingHandoffs(len(waiting_rows), datetime.fromisoformat(waiting_rows[0]["created_at"])) if waiting_rows else NoPendingHandoffs()
         proposals = cast(tuple[int], self._connection.execute("SELECT COUNT(DISTINCT proposal) FROM held_findings WHERE state='filed'").fetchone())[0]
         return StyleLedgerSummary(
-            sum(rule.done for rule in progress), len(progress), sum(rule.tier == "unclassified" for rule in self._catalog),
-            100.0 * sum(cell.state == "current" for cell in cells) / len(cells) if cells else 0.0,
-            sum(cell.state == "stale" for cell in cells), proposals, waiting, self.synced_at(), self._synced_tip().commit,
+            sum(rule.complete for rule in progress), len(progress), sum(rule.tier == "unclassified" for rule in self._catalog),
+            100.0 * sum(rule.current for rule in repository_counts) / total if total else 0.0,
+            sum(rule.stale for rule in repository_counts), proposals, waiting, self.synced_at(), self._synced_tip().commit,
         )
 
     def _refresh_sites(self, tip: RepositoryTip) -> None:
@@ -1121,35 +1152,47 @@ class Ledger:
         for cell, _ in self._coverage(rule, crate):
             yield cell
 
-    def rules(self) -> Iterator[RuleProgress]:
-        yield from self._rule_progress(tuple(self.cells()))
+    def rule_counts(self, scope: CoverageScope) -> tuple[RuleCounts, ...]:
+        return self._count_rows(self._coverage(None, _crate_filter(scope)))
 
-    def _rule_progress(self, cells: tuple[Cell, ...]) -> Iterator[RuleProgress]:
+    def _count_rows(self, coverage: Iterable[tuple[Cell, str]]) -> tuple[RuleCounts, ...]:
+        states: dict[str, Counter[CellState]] = {}
+        held: Counter[str] = Counter()
+        for cell, verdict in coverage:
+            rule_id = cell.rule.removesuffix("#uncovered")
+            if rule_id not in states:
+                states[rule_id] = Counter()
+            states[rule_id][cell.state] += 1
+            if cell.state == "current" and verdict == "held":
+                held[rule_id] += 1
+        rows: list[RuleCounts] = []
         for definition in self._catalog:
             if definition.tier == "unclassified":
                 continue
-            own = [cell for cell in cells if cell.rule in (definition.rule_id, definition.rule_id + "#uncovered")]
-            current = sum(cell.state == "current" for cell in own)
-            yield RuleProgress(definition.rule_id, definition.tier, definition.family, current, len(own),
-                               current == len(own))
+            counts = states.get(definition.rule_id, Counter())
+            rows.append(RuleCounts(definition.rule_id, definition.tier,
+                                   counts["current"], counts["stale"], counts["open"], counts["awaiting merge"],
+                                   held[definition.rule_id]))
+        return tuple(rows)
 
-
-    def status(self, rule: str | None = None, crate: str | None = None, as_json: bool = False) -> None:
-        coverage = tuple(self._coverage(rule, crate))
-        unclassified = self.unclassified_rules()
+    def status(self, rule: str | None = None, scope: CoverageScope = _WHOLE_REPOSITORY, as_json: bool = False) -> None:
         if as_json:
+            coverage = tuple(self._coverage(rule, _crate_filter(scope)))
+            unclassified = self.unclassified_rules()
             print(json.dumps({"cells": [asdict(cell) for cell, _ in coverage], "unclassified_rules": unclassified}, sort_keys=True))
         else:
+            rows = self._count_rows(self._coverage(rule, _crate_filter(scope)))
+            repository_rows = self.rule_counts(WholeRepository()) if rule or isinstance(scope, CrateCoverage) else rows
+            complete = {row.rule_id: row.complete for row in repository_rows}
+            unclassified = self.unclassified_rules()
             if unclassified:
                 print(f"unclassified: {len(unclassified)} rules — pull nate_style")
             print("rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone")
-            for progress in self.rules():
-                if rule and progress.rule_id != rule.removesuffix("#uncovered"):
+            for row in rows:
+                if rule and row.rule_id != rule.removesuffix("#uncovered"):
                     continue
-                own = [(cell, verdict) for cell, verdict in coverage if cell.rule in (progress.rule_id, progress.rule_id + "#uncovered")]
-                counts = [str(sum(cell.state == state for cell, _ in own)) for state in ("current", "stale", "open", "awaiting merge")]
-                held = sum(cell.state == "current" and verdict == "held" for cell, verdict in own)
-                print("\t".join([progress.rule_id, *counts, str(held), str(progress.done).lower()]))
+                counts = [str(count) for count in (row.current, row.stale, row.open, row.awaiting_merge, row.held)]
+                print("\t".join([row.rule_id, *counts, str(complete[row.rule_id]).lower()]))
 
 
 
@@ -1314,7 +1357,8 @@ def main() -> None:
                     raise LedgerError("diagnostics must be an object of file paths to nonnegative counts")
                 ledger.lint_record(args.tip, args.tool, args.passed == "1", cast(dict[str, int], value))
             elif args.command == "status":
-                ledger.status(args.rule or None, args.crate or None, args.json)
+                scope = CrateCoverage(args.crate) if args.crate else WholeRepository()
+                ledger.status(args.rule or None, scope, args.json)
             elif args.command == "summary":
                 result = ledger.summary().to_json()
                 if args.json:

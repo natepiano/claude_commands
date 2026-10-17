@@ -242,11 +242,17 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual([ticket.files for ticket in tickets], [(path,) for path in self.sources[:3]])
         self.record(rule, self.sources[0], self.tip)
         self.assertEqual([ticket.files for ticket in self.candidates()], [(path,) for path in self.sources[1:3]])
-        self.assertFalse(next(progress for progress in self.ledger().rules() if progress.rule_id == rule).done)
+        self.assertFalse(next(
+            progress for progress in self.ledger().rule_counts(style_ledger.WholeRepository())
+            if progress.rule_id == rule
+        ).complete)
         for path in self.sources[1:3]:
             self.record(rule, path, self.tip)
         self.assertEqual(self.candidates(), ())
-        self.assertTrue(next(progress for progress in self.ledger().rules() if progress.rule_id == rule).done)
+        self.assertTrue(next(
+            progress for progress in self.ledger().rule_counts(style_ledger.WholeRepository())
+            if progress.rule_id == rule
+        ).complete)
 
     def test_awaiting_merge_is_skipped_until_later_style_edit_makes_it_stale(self) -> None:
         rule = self.rule("read")

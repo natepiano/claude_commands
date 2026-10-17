@@ -14,6 +14,7 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import coverage_report
 import rules
 import style_ledger
 import style_rules
@@ -377,10 +378,31 @@ class CoverageReportTests(unittest.TestCase):
                 ledger.ticket_assign(unit + "-1", "main")
         output = self.report("--crate", "crates/alpha").stdout
         row = self.rows(output)["read"]
-        self.assertEqual((row.current, row.open, row.done), ("2 (100%)", "0", "yes"))
+        self.assertEqual((row.current, row.open, row.done), ("2 (100%)", "0", "no"))
         oldest_line = next(line for line in output.splitlines() if "oldest" in line.lower())
         self.assertIn("oldest-1", oldest_line)
         self.assertNotIn("elsewhere-1", output)
+
+    def test_report_counts_coverage_once_and_adds_one_pass_only_for_a_crate(self) -> None:
+        read = self.rule("read")
+        _ = self.rule("partial", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+                      + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other names\n")
+        self.sync()
+        for path in self.sources[:2]:
+            self.record(read, path)
+        with style_ledger.open_ledger(self.repo) as ledger:
+            for crate, passes in (("", 1), ("crates/alpha", 2)):
+                with self.subTest(crate=crate):
+                    with (
+                        mock.patch.object(ledger, "_coverage", wraps=cast(object, getattr(ledger, "_coverage"))) as coverage,
+                        mock.patch.object(ledger, "status", side_effect=AssertionError("report parsed status text")),
+                    ):
+                        output = coverage_report.render_report(ledger, crate=crate)
+                        self.assertEqual(coverage.call_count, passes)
+                    row = self.rows(output)["read"]
+                    self.assertEqual(row.current, "2 (100%)" if crate else "2 (50%)")
+                    self.assertEqual(row.done, "no")
+                    self.assertIn("Rules done: 0 of 2", output)
 
     def test_awaiting_merge_is_neither_current_nor_done_until_sync_after_merge(self) -> None:
         read = self.rule("read")

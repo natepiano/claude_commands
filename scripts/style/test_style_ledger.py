@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from typing import TypedDict, cast, final, override
 from unittest import mock
@@ -181,11 +182,11 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.cells(listed), [])
         self.assertEqual(self.cells(process), [])
         ledger = self.ledger()
-        progress = {rule.rule_id: rule for rule in ledger.rules()}
-        self.assertTrue(progress[listed].done)
-        self.assertEqual(progress[listed].cells_total, 0)
-        self.assertEqual(progress[file_rule].cells_total, 4)
-        self.assertFalse(progress[file_rule].done)
+        progress = {rule.rule_id: rule for rule in ledger.rule_counts(style_ledger.WholeRepository())}
+        self.assertTrue(progress[listed].complete)
+        self.assertEqual(progress[listed].total, 0)
+        self.assertEqual(progress[file_rule].total, 4)
+        self.assertFalse(progress[file_rule].complete)
         self.assertEqual({cell.path for cell in ledger.cells(crate="crates/alpha")}, {
             "crates/alpha", "crates/alpha/src/lib.rs", "crates/alpha/src/other.rs",
         })
@@ -193,6 +194,151 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIn(file_rule, status)
         self.assertIn(listed, status)
         self.assertNotIn("unclassified:", status)
+
+    def test_rule_counts_fold_components_and_filter_every_state_and_current_held_verdicts(self) -> None:
+        read = self.rule("read")
+        partial = self.rule(
+            "partial", "tier: B\nfamily: types\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other sites\n",
+        )
+        process = self.rule("process", "tier: E\n")
+        _ = self.rule("legacy", "mechanism: llm\n")
+        self.set_tip(self.initial_tip)
+        self.record(read, self.sources[0], self.initial_tip, "held")
+        self.record(read, self.sources[1], self.initial_tip)
+        for path in self.sources:
+            self.record(partial, path, self.initial_tip)
+        self.record(partial + "#uncovered", self.sources[0], self.initial_tip, "held")
+        self.write(self.sources[1], "pub fn value() -> u32 { 2 }\n")
+        main_tip = self.commit("Make judged inputs stale")
+        _ = self.cli("set-tip", "--tip", main_tip, "--style-branch", "style/main")
+        _ = self.git("checkout", "-qb", "style/main")
+        self.write(self.sources[2], "pub fn corrected() {}\n")
+        pending_tip = self.commit("Judge a pending style correction")
+        self.record(read, self.sources[2], pending_tip, "held")
+        ledger = self.ledger()
+
+        with mock.patch.object(ledger, "_coverage", wraps=cast(object, getattr(ledger, "_coverage"))) as coverage:
+            repository_counts = ledger.rule_counts(style_ledger.WholeRepository())
+            coverage.assert_called_once_with(None, None)
+        by_rule = {row.rule_id: row for row in repository_counts}
+        self.assertEqual(by_rule, {
+            read: style_ledger.RuleCounts(read, "C", 1, 1, 1, 1, 1),
+            partial: style_ledger.RuleCounts(partial, "B", 4, 1, 3, 0, 1),
+            process: style_ledger.RuleCounts(process, "E", 0, 0, 0, 0, 0),
+        })
+        self.assertEqual({row.rule_id: (row.total, row.complete) for row in repository_counts}, {
+            read: (4, False), partial: (8, False), process: (0, True),
+        })
+        text_rows = [line.split("\t") for line in self.cli("status").stdout.splitlines()
+                     if line.startswith("global:")]
+        self.assertEqual({fields[0]: tuple(int(value) for value in fields[1:6]) for fields in text_rows}, {
+            row.rule_id: (row.current, row.stale, row.open, row.awaiting_merge, row.held)
+            for row in repository_counts
+        })
+        for crate, expected in (
+            ("crates/alpha", {
+                read: style_ledger.RuleCounts(read, "C", 1, 1, 0, 0, 1),
+                partial: style_ledger.RuleCounts(partial, "B", 2, 1, 1, 0, 1),
+                process: by_rule[process],
+            }),
+            ("crates/beta", {
+                read: style_ledger.RuleCounts(read, "C", 0, 0, 1, 1, 0),
+                partial: style_ledger.RuleCounts(partial, "B", 2, 0, 2, 0, 0),
+                process: by_rule[process],
+            }),
+        ):
+            with self.subTest(crate=crate):
+                with mock.patch.object(ledger, "_coverage", wraps=cast(object, getattr(ledger, "_coverage"))) as coverage:
+                    scoped = ledger.rule_counts(style_ledger.CrateCoverage(crate))
+                    coverage.assert_called_once_with(None, crate)
+                self.assertEqual({row.rule_id: row for row in scoped}, expected)
+
+        finding = self.hold_finding(read, 1)
+        ledger.file_held(finding, self.root / "proposal.md")
+        ledger.handoff_add(pending_tip)
+        with mock.patch.object(ledger, "_coverage", side_effect=AssertionError("summary_of rescanned cells")):
+            summary = ledger.summary_of(repository_counts)
+        self.assertEqual(summary, ledger.summary())
+        self.assertEqual((summary.rules_done, summary.rules_total, summary.stale, summary.proposals), (0, 2, 2, 1))
+        self.assertAlmostEqual(summary.cells_current_pct, 100 * 5 / 12)
+        self.assertEqual(summary.unclassified_rules, 1)
+        self.assertIsInstance(summary.waiting, style_ledger.PendingHandoffs)
+
+    def test_status_crate_counts_keep_repository_wide_done_false(self) -> None:
+        read = self.rule("read")
+        self.set_tip(self.initial_tip)
+        for path in self.sources[:2]:
+            self.record(read, path, self.initial_tip)
+
+        output = self.cli("status", "--crate", "crates/alpha").stdout
+
+        self.assertEqual(output,
+                         "rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone\n"
+                         + "global:rust/read.md\t2\t0\t0\t0\t0\tfalse\n")
+
+    def test_status_reuses_repository_counts_and_scans_again_only_for_a_selector(self) -> None:
+        read = self.rule("read")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        for rule, scope, passes in ((None, style_ledger.WholeRepository(), 1),
+                                    (read, style_ledger.WholeRepository(), 2),
+                                    (None, style_ledger.CrateCoverage("crates/alpha"), 2)):
+            with self.subTest(rule=rule, scope=scope):
+                output = io.StringIO()
+                with (
+                    redirect_stdout(output),
+                    mock.patch.object(ledger, "_coverage", wraps=cast(object, getattr(ledger, "_coverage"))) as coverage,
+                ):
+                    ledger.status(rule=rule, scope=scope)
+                    self.assertEqual(coverage.call_count, passes)
+                self.assertIn(read + "\t", output.getvalue())
+
+    def test_status_cli_converts_omitted_empty_and_named_crates_to_coverage_scopes(self) -> None:
+        read = self.rule("read")
+        _ = self.git("mv", "crates/alpha", "alpha")
+        self.write("Cargo.toml", '[workspace]\nmembers = ["alpha", "crates/beta"]\nresolver = "2"\n')
+        tip = self.commit("Move alpha crate to the workspace root")
+        self.set_tip(tip)
+        self.record(read, "alpha/src/lib.rs", tip)
+        header = "rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone\n"
+        whole = header + "global:rust/read.md\t1\t0\t3\t0\t0\tfalse\n"
+        selected = header + "global:rust/read.md\t1\t0\t1\t0\t0\tfalse\n"
+        for arguments, scope, expected in (
+            ([], style_ledger.WholeRepository(), whole),
+            (["--crate", ""], style_ledger.WholeRepository(), whole),
+            (["--crate", "alpha"], style_ledger.CrateCoverage("alpha"), selected),
+        ):
+            with self.subTest(arguments=arguments):
+                output = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", ["style_ledger.py", "status", "--repo", str(self.repo), *arguments]),
+                    mock.patch.object(style_ledger.Ledger, "status", autospec=True,
+                                      side_effect=style_ledger.Ledger.status) as status,
+                    redirect_stdout(output),
+                ):
+                    style_ledger.main()
+                status.assert_called_once_with(mock.ANY, None, scope, False)
+                self.assertEqual(output.getvalue(), expected)
+
+    def test_status_uncovered_selector_prints_only_component_counts_and_parent_done(self) -> None:
+        partial = self.rule(
+            "partial", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other sites\n",
+        )
+        self.set_tip(self.initial_tip)
+        for path in self.sources:
+            self.record(partial + "#uncovered", path, self.initial_tip,
+                        "held" if path == self.sources[0] else "clean")
+
+        output = self.cli("status", "--rule", partial + "#uncovered").stdout
+
+        self.assertEqual(output,
+                         "rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone\n"
+                         + "global:rust/partial.md\t4\t0\t0\t0\t1\tfalse\n")
+        self.assertEqual(self.cli("status", "--rule", partial).stdout,
+                         "rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone\n"
+                         + "global:rust/partial.md\t4\t0\t4\t0\t1\tfalse\n")
 
     def test_zero_site_partial_rule_requires_uncovered_cells_and_counts_only_its_parent(self) -> None:
         rule_id = self.rule(
@@ -208,15 +354,15 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual({cell.rule for cell in ledger.cells()}, {uncovered})
         self.assertEqual({cell.tier for cell in ledger.cells()}, {"C"})
         self.assertEqual({cell.family for cell in ledger.cells()}, {"names"})
-        progress, = ledger.rules()
-        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertEqual((progress.rule_id, progress.current, progress.total, progress.complete),
                          (rule_id, 0, 4, False))
 
         for path in self.sources:
             self.record(uncovered, path, self.initial_tip)
 
-        progress, = ledger.rules()
-        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertEqual((progress.rule_id, progress.current, progress.total, progress.complete),
                          (rule_id, 4, 4, True))
         row = next(line.split("\t") for line in self.cli("status").stdout.splitlines()
                    if line.startswith(rule_id + "\t"))
@@ -233,14 +379,14 @@ class StyleLedgerTests(unittest.TestCase):
         for path in self.sources:
             self.record(uncovered, path, self.initial_tip)
         ledger = self.ledger()
-        progress, = ledger.rules()
-        self.assertEqual((progress.cells_current, progress.cells_total, progress.done), (4, 8, False))
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertEqual((progress.current, progress.total, progress.complete), (4, 8, False))
 
         for path in self.sources:
             self.record(rule_id, path, self.initial_tip)
 
-        progress, = ledger.rules()
-        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertEqual((progress.rule_id, progress.current, progress.total, progress.complete),
                          (rule_id, 8, 8, True))
         rule_path = self.rule_dir / "partial.md"
         _ = rule_path.write_text(rule_path.read_text() + "Another requirement\n")
@@ -260,8 +406,8 @@ class StyleLedgerTests(unittest.TestCase):
         })
         self.record(rule_id, "crates/alpha", self.initial_tip)
         self.record(rule_id, "crates/beta", self.initial_tip)
-        progress, = ledger.rules()
-        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertEqual((progress.rule_id, progress.current, progress.total, progress.complete),
                          (rule_id, 2, 2, True))
 
     def test_pre_filter_lists_matching_rust_lines_and_accepts_a_file_judgment(self) -> None:
@@ -279,8 +425,8 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.states(rule_id), {self.sources[0]: "open"})
         self.record(rule_id, self.sources[0], tip)
         self.assertEqual(self.states(rule_id), {self.sources[0]: "current"})
-        progress, = ledger.rules()
-        self.assertTrue(progress.done)
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertTrue(progress.complete)
 
     def test_shell_sites_are_rule_specific_file_cells_even_for_crate_scoped_rules(self) -> None:
         rule_id = self.rule(
@@ -462,8 +608,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         for _ in range(2):
             self.assertEqual(ledger.listed_sites(rule_id), ())
-            progress, = ledger.rules()
-            self.assertTrue(progress.done)
+            progress, = ledger.rule_counts(style_ledger.WholeRepository())
+            self.assertTrue(progress.complete)
         with closing(sqlite3.connect(ledger.database)) as connection:
             markers = cast(list[tuple[str, str, str]], connection.execute(
                 "SELECT rule,rule_blob,tip FROM listed_rules",
@@ -474,8 +620,8 @@ class StyleLedgerTests(unittest.TestCase):
         _ = rule_path.write_text(rule_path.read_text().replace("absent_marker", "value"))
 
         self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, set(self.sources))
-        progress, = ledger.rules()
-        self.assertFalse(progress.done)
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertFalse(progress.complete)
 
     def test_pre_filter_also_reads_non_rust_files_named_by_other_listed_rules(self) -> None:
         _ = self.rule(
@@ -531,9 +677,9 @@ class StyleLedgerTests(unittest.TestCase):
             self.record(rule_id, path, self.initial_tip)
         self.assertEqual(self.states(rule_id), dict.fromkeys(self.sources, "current"))
         ledger = self.ledger()
-        progress, = ledger.rules()
-        self.assertTrue(progress.done)
-        self.assertEqual((progress.cells_current, progress.cells_total), (4, 4))
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
+        self.assertTrue(progress.complete)
+        self.assertEqual((progress.current, progress.total), (4, 4))
 
         self.write(self.sources[0], "pub fn value() -> u32 { 2 }\n")
         tip = self.commit("Change alpha source")
@@ -890,7 +1036,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
 
         self.assertEqual(list(ledger.cells()), [])
-        self.assertEqual(list(ledger.rules()), [])
+        self.assertEqual(list(ledger.rule_counts(style_ledger.WholeRepository())), [])
         self.assertEqual(set(ledger.unclassified_rules()), {legacy, tool})
         self.assertIn("unclassified: 2 rules — pull nate_style", self.cli("status").stdout)
         status = cast(LedgerStatus, json.loads(self.cli("status", "--json").stdout))
@@ -915,9 +1061,9 @@ class StyleLedgerTests(unittest.TestCase):
 
         self.assertEqual({cell.rule for cell in ledger.cells()}, {classified})
         self.assertEqual(ledger.unclassified_rules(), (legacy,))
-        progress, = ledger.rules()
+        progress, = ledger.rule_counts(style_ledger.WholeRepository())
         self.assertEqual(progress.rule_id, classified)
-        self.assertTrue(progress.done)
+        self.assertTrue(progress.complete)
         self.assertIn("unclassified: 1 rules — pull nate_style", self.cli("status").stdout)
 
     def test_same_stem_global_and_member_rules_have_independent_cells_and_record_reach(self) -> None:
@@ -1269,20 +1415,20 @@ class StyleLedgerTests(unittest.TestCase):
             self.record(read_rule, path, self.initial_tip)
             self.record(partial, path, self.initial_tip)
         ledger = self.ledger()
-        progress = {row.rule_id: row for row in ledger.rules()}
-        self.assertTrue(progress[lint_rule].done)
-        self.assertTrue(progress[read_rule].done)
-        self.assertFalse(progress[partial].done)
-        self.assertFalse(progress[structure].done)
+        progress = {row.rule_id: row for row in ledger.rule_counts(style_ledger.WholeRepository())}
+        self.assertTrue(progress[lint_rule].complete)
+        self.assertTrue(progress[read_rule].complete)
+        self.assertFalse(progress[partial].complete)
+        self.assertFalse(progress[structure].complete)
         self.assertIn(process, progress)
         self.assertNotIn(legacy, progress)
         counted = [row for row in progress.values() if row.tier in ("A", "B", "C", "D")]
 
-        with mock.patch.object(ledger, "cells", wraps=ledger.cells) as cells:
+        with mock.patch.object(ledger, "_coverage", wraps=cast(object, getattr(ledger, "_coverage"))) as coverage:
             summary = ledger.summary()
-            cells.assert_called_once_with()
+            coverage.assert_called_once_with(None, None)
 
-        self.assertEqual(summary.rules_done, sum(row.done for row in counted))
+        self.assertEqual(summary.rules_done, sum(row.complete for row in counted))
         self.assertEqual(summary.rules_total, len(counted))
         self.assertEqual(summary.unclassified_rules, 1)
 
