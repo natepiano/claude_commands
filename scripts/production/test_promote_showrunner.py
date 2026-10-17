@@ -120,7 +120,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
         self.assertEqual(accounts.setup("claude2"), [])
         for module, name, stand_in in (
-                (showrunners, "production_of", self.production_of), (unit_lookup, "marked_units", self.marked_units),
+                (showrunners, "production_of", self.production_of), (unit_lookup, "marked_unit", self.marked_unit),
                 (herdr, "stop_session", self.stop_host), (promote_showrunner, "type_place", self.type_pane), (promote_showrunner, "_alive", self.is_alive),
                 (promote_showrunner, "POLL_S", 0), (add_showrunner, "checked", self.child_checked),
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
@@ -143,8 +143,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def verdict(self, _capture: str) -> unit_effort.Ready | unit_effort.Skipped:
         return self.pane
 
-    def marked_units(self, _slug: str) -> dict[str, unit_lookup.MarkedUnit]:
-        return self.marked
+    def marked_unit(self, _slug: str, name: str) -> unit_lookup.MarkedUnit | None:
+        return self.marked.get(name)
 
     def role_account(self, _role: str) -> accounts.ClaudeLaunchAccount:
         return self.unit_account

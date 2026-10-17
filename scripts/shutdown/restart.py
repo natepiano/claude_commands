@@ -131,6 +131,8 @@ class ShutdownServices(Protocol):
         self, push: RenderedPush, *, machine: str = "",
     ) -> None: ...
     def tell_showrunners_outcome(self, records: list[SessionShutdown]) -> None: ...
+    def not_back_text(self, saved: SessionShutdown) -> str: ...
+    def mark_not_back_pushed(self, saved: SessionShutdown) -> None: ...
 
 
 settle = cast(ShutdownServices, cast(object, import_module("settle")))
@@ -699,7 +701,21 @@ class RecordedHerdrPane:
     pane_id: str
 
 
-HerdrDestination = NewHerdrSession | RecordedHerdrPane
+@dataclass(frozen=True)
+class SharedHerdrTab:
+    """A new tab in the shared session, in the workspace named for the session's production."""
+    name: str
+
+
+HerdrDestination = NewHerdrSession | RecordedHerdrPane | SharedHerdrTab
+
+
+def herdr_space(session: Session) -> str:
+    """The shared session's workspace for a Claude session: its production, else `sessions`."""
+    if session["kind"] == "showrunner":
+        from showrunners import production_slug
+        return production_slug(session["doc"])
+    return "sessions"
 
 
 class HerdrDestinationTaken(OSError):
@@ -1010,6 +1026,7 @@ def _herdr_launch(
     name = destination.name
     if dry_run:
         location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
+                    else f"a new tab in {herdr_space(session)}" if isinstance(destination, SharedHerdrTab)
                     else "a new pane")
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return herdr.ServerAdopted()
@@ -1036,7 +1053,8 @@ def _herdr_launch(
                 )
         client = herdr.Herdr(name)
         agents = client.agents()
-        if any((isinstance(destination, NewHerdrSession) or row["pane_id"] == destination.pane_id)
+        if any((isinstance(destination, NewHerdrSession)
+                or (isinstance(destination, RecordedHerdrPane) and row["pane_id"] == destination.pane_id))
                and row.get("agent")
                and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
             location = (f"{name}:{destination.pane_id}" if isinstance(destination, RecordedHerdrPane)
@@ -1051,12 +1069,18 @@ def _herdr_launch(
             else:
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
-        pane = herdr.open_pane(name, name, parts.cwd, environment)
+        if name == herdr.shared_session():
+            pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
+        else:
+            pane = herdr.open_pane(name, name, parts.cwd, environment)
         try:
             client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
                                opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
         except herdr.AgentExited:
-            herdr.stop_created_server(name, server)
+            if name == herdr.shared_session():
+                herdr.close_agent(name, pane)
+            else:
+                herdr.stop_created_server(name, server)
             raise
         if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
             focused = _focus_restored_pane(client, pane, session["name"])
@@ -1071,6 +1095,26 @@ def _herdr_launch(
         raise HerdrDestinationTaken(str(error)) from error
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+
+
+def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
+    """Close the pane a session left behind when it moved into the shared session; stop the server it emptied.
+
+    A server whose other panes are idle shells, such as the one its attach window opened, counts as emptied.
+    """
+    client = herdr.Herdr(recorded)
+    try:
+        rows = client.panes()
+        left = [row for row in rows if row["pane_id"] == pane]
+        if left and not isinstance(client.pane_activity(pane), herdr.PaneAtShell):
+            print(f"{name} restart issue: herdr {recorded}:{pane} still runs a program; left open")
+            return
+        if all(isinstance(client.pane_activity(row["pane_id"]), herdr.PaneAtShell) for row in rows):
+            herdr.stop_session(recorded)
+        elif left:
+            client.close_pane(pane)
+    except herdr.HerdrFailure as error:
+        print(f"{name} restart issue: herdr session {recorded} left open: {error}")
 
 
 def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> bool:
@@ -1178,9 +1222,13 @@ def _launch_session(
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
                           at=record["requested_at"], probe=record.get("probe", False))
     if host["kind"] == "herdr":
-        server = _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
-                      session, dry_run=dry_run, session_kind=desktop_state.session_kind)
-        name = host["herdr_session"]
+        shared = herdr.shared_session()
+        moving = bool(shared) and host["herdr_session"] != shared
+        destination = SharedHerdrTab(shared) if moving else RecordedHerdrPane(host["herdr_session"], host["pane_id"])
+        server = _herdr_launch(parts, destination, session, dry_run=dry_run, session_kind=desktop_state.session_kind)
+        if moving and not dry_run:
+            _leave_recorded_session(session["name"], host["herdr_session"], host["pane_id"])
+        name = destination.name
         if isinstance(server, herdr.WindowServerCreated):
             return SessionLaunched()
         if herdr_presentation(host) == "attached window":
@@ -1196,9 +1244,10 @@ def _launch_session(
             print(shlex.join(["herdr", "session", "attach", name]))
         return SessionLaunched()
     if host["kind"] == "ghostty" or host["kind"] == "zed" or (host["kind"] == "terminal" and sys.platform == "darwin"):
-        name = herdr.generated_session_name(session["name"])
-        server = _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run,
-                    session_kind=desktop_state.session_kind)
+        shared = herdr.shared_session()
+        name = shared or herdr.generated_session_name(session["name"])
+        server = _herdr_launch(parts, SharedHerdrTab(name) if shared else NewHerdrSession(name), session,
+                    dry_run=dry_run, session_kind=desktop_state.session_kind)
         if isinstance(server, herdr.WindowServerCreated):
             return SessionLaunched()
         if host["kind"] == "ghostty" or host["kind"] == "terminal":
@@ -1214,6 +1263,8 @@ def _launch_session(
                 else:
                     relaunch.write_request(supervisor["pid"], request)
                 return SessionLaunched()
+        if shared and not dry_run and isinstance(herdr.attached_clients(name), herdr.ClientsAttached):
+            return SessionLaunched()
         desktop = (DesktopNotInSnapshot(kind="not in snapshot") if host["kind"] == "terminal"
                    else host["desktop"])
         _herdr_window(record, name, parts.cwd, desktop, desktop_state, dry_run=dry_run)
@@ -2662,6 +2713,29 @@ def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerR
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
+def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]:
+    try:
+        records = session_records(login)
+    except (InvalidRecord, OSError, ValueError):
+        return []
+    return [saved for saved in records
+            if saved["machine"] == settle.local_machine()
+            and saved["progress"]["kind"] in {"restart failed", "manual restart"}
+            and (not ids or saved["session"]["session_id"] in ids)]
+
+
+def _pushed_not_back(login: str, ids: tuple[str, ...]) -> set[str]:
+    """Names of this machine's sessions whose unchanged not-back state was already pushed."""
+    return {saved["session"]["name"] for saved in _not_back_records(login, ids)
+            if saved.get("restore_alerted") == settle.not_back_text(saved)}
+
+
+def _mark_pushed_not_back(login: str, ids: tuple[str, ...], names: set[str]) -> None:
+    for saved in _not_back_records(login, ids):
+        if saved["session"]["name"] in names:
+            settle.mark_not_back_pushed(saved)
+
+
 def restart_push(label: str, names: list[str], *, machine: str) -> RenderedPush:
     """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
     if names:
@@ -2757,20 +2831,27 @@ def restart(
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
         try:
             if failure_alert:
-                names = [item.name for item in local.failed_sessions]
+                # A retry that fails the same way as a pushed failure tells the user nothing new.
+                pushed = _pushed_not_back(selected.login, ids)
+                failed = [item for item in local.failed_sessions if item.name not in pushed]
+                manual = [item for item in local.manual_sessions if item.name not in pushed]
+                names = [item.name for item in failed]
                 names.extend(match.group(1) for line in peer["lines"]
                              if (match := re.match(r"[^:]+: (.+) restart failed:", line)) is not None)
-                machines = [local.machine] if local.status == "partial" else []
+                local_partial = local.status == "partial" and (failed or manual or not (
+                    local.failed_sessions or local.manual_sessions))
+                machines = [local.machine] if local_partial else []
                 if peer["outcome"] == "partial" or not_reached:
                     machines.append(peer["machine"])
                 # Pending scheduled jobs are reported in the command output; they need no user step.
                 peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
                     re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+)", line)
                     for line in peer["lines"]))
-                if names or not_reached or local.failed or peer_requires_retry:
+                if names or not_reached or failed or peer_requires_retry:
                     settle.alert_user(restart_push(selected.label, names, machine=" and ".join(machines)))
-                for item in local.manual_sessions:
+                for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
+                _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})
                 for line in peer["lines"]:
                     if match := re.match(r"[^:]+: manual restart (.+?):", line):
                         settle.alert_user(render("shutdown.manual_restart", session=match.group(1), machine=peer["machine"]))

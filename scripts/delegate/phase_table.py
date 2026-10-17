@@ -545,35 +545,42 @@ def _newest_open_instance(
         )
     for instance in reversed(started):
         if instance.instance_id not in closed:
-            progress_event = _last_progress(runs, instance.instance_id)
-            stated_event = _latest_stated_eta(runs, instance)
-            projection = _reported_eta(progress_event, instance.start)
-            if isinstance(stated_event, LatestStatedEtaEvent):
-                first_stated: FirstStatedEtaTarget | EtaNeverStated = (
-                    stated_event.first
-                )
-                eta: StatedEta | ProjectedEta | EtaUnavailable
-                eta = stated_event.eta
-                now = datetime.fromtimestamp(plan_history.now_epoch(), UTC)
-                if eta.time < now:
-                    delay = now - eta.time
-                    eta_range = eta.range
-                    if isinstance(eta_range, EtaRange):
-                        eta_range = EtaRange(
-                            earliest=eta_range.earliest + delay,
-                            latest=eta_range.latest + delay,
-                        )
-                    eta = eta._replace(time=now, range=eta_range)
-            else:
-                first_stated = EtaNeverStated()
-                eta = projection
-            return OpenPhaseInstance(
-                phase=instance,
-                progress=_reported_progress(progress_event),
-                eta=eta,
-                first_stated=first_stated,
-            )
+            return _open_instance(runs, instance)
     return NoOpenPhase()
+
+
+def _open_instance(
+    runs: list[list[dict[str, object]]], instance: PhaseInstance
+) -> OpenPhaseInstance:
+    """Read progress and promises for one unfinished phase instance."""
+    progress_event = _last_progress(runs, instance.instance_id)
+    stated_event = _latest_stated_eta(runs, instance)
+    projection = _reported_eta(progress_event, instance.start)
+    if isinstance(stated_event, LatestStatedEtaEvent):
+        first_stated: FirstStatedEtaTarget | EtaNeverStated = (
+            stated_event.first
+        )
+        eta: StatedEta | ProjectedEta | EtaUnavailable
+        eta = stated_event.eta
+        now = datetime.fromtimestamp(plan_history.now_epoch(), UTC)
+        if eta.time < now:
+            delay = now - eta.time
+            eta_range = eta.range
+            if isinstance(eta_range, EtaRange):
+                eta_range = EtaRange(
+                    earliest=eta_range.earliest + delay,
+                    latest=eta_range.latest + delay,
+                )
+            eta = eta._replace(time=now, range=eta_range)
+    else:
+        first_stated = EtaNeverStated()
+        eta = projection
+    return OpenPhaseInstance(
+        phase=instance,
+        progress=_reported_progress(progress_event),
+        eta=eta,
+        first_stated=first_stated,
+    )
 
 
 def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
@@ -795,17 +802,26 @@ def _instance_eta_events(
             ),
             -1,
         )
-        if start < 0:
-            continue
-        first = 0
         last = len(events)
+        if start < 0:
+            # Run records also retain completions whose start event is absent.
+            start = next(
+                (index for index, event in enumerate(events)
+                 if _text(event.get("event_type")) == "phase_finished"
+                 and _text(event.get("phase_instance_id")) == instance.instance_id),
+                -1,
+            )
+            if start < 0:
+                continue
+            last = start + 1
+        first = 0
         for index, event in enumerate(events[:start]):
             if (
                 _text(event.get("phase_id")) == instance.phase
                 and _text(event.get("event_type")) in ("phase_started", "phase_finished")
             ):
                 first = index + 1
-        for index in range(start + 1, len(events)):
+        for index in range(start + 1, last):
             event = events[index]
             if (
                 _text(event.get("event_type")) == "phase_started"
@@ -1049,8 +1065,69 @@ def build_plan(plan_path: Path) -> PhaseRecord:
     run_events = [_events(path) for path in plan_history.plan_runs(plan_path)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
+    return _build_phase_record(
+        plan_path, phases, run_events, _instances_by_phase(phases, instances),
+        [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+    )
+
+
+def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
+    """Build a phase record from one run after its plan headings are gone.
+
+    Each recorded instance keeps its own row, including unfinished phases in
+    a closed run. Event titles and completion events replace plan headings.
+    """
+    run_events = [[event for event in events if event.get("event_type") != "run_finished"]]
+    instances = _phase_instances(run_events)
+    by_instance = {instance.instance_id: instance for instance in instances}
+    started_ids: set[str] = set()
+    finished_ids: set[str] = set()
+    finished: list[PhaseInstance] = []
+    for index, event in enumerate(run_events[0]):
+        instance_id = _text(event.get("phase_instance_id"))
+        event_type = _text(event.get("event_type"))
+        if event_type == "phase_started":
+            started_ids.add(instance_id)
+        if event_type != "phase_finished":
+            continue
+        finished_ids.add(instance_id)
+        at = _moment(event.get("timestamp_epoch"))
+        if at is None:
+            continue
+        seconds = _duration(event.get("phase_elapsed_seconds")) or 0
+        instance = by_instance.get(instance_id) if instance_id in started_ids else None
+        finished.append(PhaseInstance(
+            instance_id=instance_id,
+            phase=_text(event.get("phase_id")) or (instance.phase if instance else ""),
+            title=_text(event.get("phase_title")) or (instance.title if instance else ""),
+            start=instance.start if instance else at - timedelta(seconds=seconds),
+            finish=InstanceFinished(at=at, status="completed", seconds=seconds, written_at=index),
+        ))
+    opened = [instance for instance in instances if instance.instance_id not in finished_ids]
+    ordered = finished + opened
+    phases: list[plan_history.PlanPhase] = [
+        {"id": instance.phase, "title": instance.title,
+         "done": isinstance(instance.finish, InstanceFinished),
+         "depends_on": None, "blocked_by": ""}
+        for instance in ordered
+    ]
+    return _build_phase_record(
+        plan_path.expanduser().resolve(), phases, run_events,
+        [[instance] for instance in ordered],
+        [_open_instance(run_events, instance) for instance in opened],
+    )
+
+
+def _build_phase_record(
+    plan_path: Path,
+    phases: list[plan_history.PlanPhase],
+    run_events: list[list[dict[str, object]]],
+    assigned: list[list[PhaseInstance]],
+    open_instances: list[OpenPhaseInstance],
+) -> PhaseRecord:
+    """Apply the same timing and history rules to plan and run phase rows."""
+    open_instance = open_instances[-1] if open_instances else NoOpenPhase()
     open_ids = _open_phase_ids(run_events)
-    assigned = _instances_by_phase(phases, instances)
     in_production = any(phase["blocked_by"] and not phase["done"] for phase in phases) and isinstance(
         _production_reference(plan_path), ProductionReference
     )
@@ -1089,23 +1166,25 @@ def build_plan(plan_path: Path) -> PhaseRecord:
             if _normalized_title(instance.title) == title
         ]
         row_instances.append(related)
-        if (
-            isinstance(current_position, PlanPhasePosition)
-            and index == current_position.offset
-            and isinstance(open_instance, OpenPhaseInstance)
-        ):
+        row_open = next(
+            (candidate for candidate in open_instances if any(
+                instance.instance_id == candidate.phase.instance_id for instance in assigned[index]
+            )),
+            NoOpenPhase(),
+        )
+        if isinstance(row_open, OpenPhaseInstance):
             earliest = min(
                 (instance.start for instance in related),
-                default=open_instance.phase.start,
+                default=row_open.phase.start,
             )
             current = OpenPhase(
                 phase=phase["id"],
                 title=phase["title"],
                 started=earliest,
-                progress=open_instance.progress,
-                eta=open_instance.eta,
-                first_stated=open_instance.first_stated,
-                instance_id=open_instance.phase.instance_id,
+                progress=row_open.progress,
+                eta=row_open.eta,
+                first_stated=row_open.first_stated,
+                instance_id=row_open.phase.instance_id,
             )
             rows.append(current)
             open_ids.add(phase["id"])
@@ -1574,7 +1653,7 @@ def _production_document(plan_path: Path, reference: ProductionReference) -> Pat
 def _phase_note_name(production: str, unit: str) -> str:
     name = unit
     try:
-        marked = unit_lookup.marked_units(production).get(unit)
+        marked = unit_lookup.marked_unit(production, unit)
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
             if marked.claude.name:
                 name = marked.claude.name

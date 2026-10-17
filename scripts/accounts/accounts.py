@@ -433,7 +433,7 @@ class CodexStatus:
 
 class CommandLine(argparse.Namespace):
     next_action: str = ""
-    group: ClaudeGroup = "units"
+    group: next_moves.NextMoveGroup = "units"
     percent: float = 0
     hold_minutes: float = 0
     entry_id: str = ""
@@ -1258,7 +1258,11 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
     if probe:
+        from scripts.herdr.herdr import UNIT_MARKS
+
         environment[PROBE_ENV] = "1"
+        for name in UNIT_MARKS:
+            _ = environment.pop(name, None)
     try:
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
@@ -2721,12 +2725,13 @@ def _roles_lock() -> Generator[None]:
         yield
 
 
-def _write_role(role: str, label: str) -> None:
+def _write_role(role: str, label: str, *, why: str = "by hand",
+                cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> None:
     _validate_role(role)
     if role != "workers":
         raise AccountsError(UNIT_ROLE_GONE)
-    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), "by hand",
-                               datetime.now(timezone.utc).isoformat()))
+    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), why,
+                               datetime.now(timezone.utc).isoformat(), cause=cause))
 
 
 def set_role(role: str, label: str) -> None:
@@ -3260,7 +3265,8 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
     return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
 
 
-def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
+def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
+                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> WorkersSwapOutcome:
     refuse_default(label)
     try:
         workers_home = _workers_home()
@@ -3290,7 +3296,7 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
         switches = _retire_workers_servers(target_home, account_label, dry_run=True)
         return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
     try:
-        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label)
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, why=why, cause=cause)
     except OSError as error:
         raise AccountsError(f"accounts: could not move the workers role: {error}") from error
     try:
@@ -3302,11 +3308,12 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     return WorkersSwapStarted(lines)
 
 
-def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:
+def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
+         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> SwapOutcome | WorkersSwapOutcome:
     """Select the new unit account only after every old-account session can move."""
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -3610,6 +3617,14 @@ class StatusUnavailable:
 
 
 @dataclass(frozen=True)
+class WeeklyNotReadSince:
+    """The last reading predates a weekly reset; it cannot describe this week's allowance."""
+
+    read_at: datetime
+    reason: agent_accounts.StaleTokenSkip | agent_accounts.NoWeeklyReadSkip
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -3618,7 +3633,7 @@ class StatusRow:
     login: str
     login_cell: str
     roles: tuple[str, ...]
-    weekly_left_percent: float | StatusUnavailable
+    weekly_left_percent: float | StatusUnavailable | WeeklyNotReadSince
     resets_at: datetime | StatusUnavailable
     credits: float | Literal["unlimited"] | StatusUnavailable
     on_credits: str
@@ -3680,7 +3695,7 @@ def _status_row(
     tool = "codex" if isinstance(status, CodexStatus) else "claude"
     login_cell = ("not set up" if not status.is_set_up else "unavailable" if not status.account_is_safe_to_inspect
                   else status.login or "not logged in")
-    weekly: float | StatusUnavailable = StatusUnavailable()
+    weekly: float | StatusUnavailable | WeeklyNotReadSince = StatusUnavailable()
     resets: datetime | StatusUnavailable = StatusUnavailable()
     credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
     read_at: datetime | StatusUnavailable = StatusUnavailable()
@@ -3699,6 +3714,9 @@ def _status_row(
                 weekly = StatusUnavailable("unavailable")
                 resets = StatusUnavailable("unavailable")
             read_at = _read_at(usage) or StatusUnavailable()
+            if (window is not None and isinstance(read_at, datetime)
+                    and (reset := _stored_time(window["resets"])) is not None and reset <= now):
+                weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now)
     return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
@@ -3713,8 +3731,14 @@ def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
     credits = row.credits
     read = row.read_at
     role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    if isinstance(weekly, WeeklyNotReadSince):
+        weekly_cell = f"not read since {weekly.read_at.astimezone(zone):%H:%M}"
+        if isinstance(weekly.reason, agent_accounts.StaleTokenSkip):
+            weekly_cell += ": no session to refresh its login"
+    else:
+        weekly_cell = weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%"
     return (row.folder, row.label, row.login_cell, role_cell,
-        weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%",
+        weekly_cell,
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
@@ -3725,7 +3749,7 @@ def render_status_json(reading: StatusReading, *, with_login: bool = False) -> s
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
-            weekly_left_percent=None if isinstance(row.weekly_left_percent, StatusUnavailable) else row.weekly_left_percent,
+            weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
@@ -3999,7 +4023,7 @@ def _parser() -> argparse.ArgumentParser:
     next_command = commands.add_parser("next")
     next_verbs = next_command.add_subparsers(dest="next_action", required=True)
     next_add = next_verbs.add_parser("add")
-    _ = next_add.add_argument("group", choices=CLAUDE_GROUPS)
+    _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
     _ = next_add.add_argument("--hold-minutes", type=float, default=0)
@@ -4054,6 +4078,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_next_move_target(entry: next_moves.NextMove) -> None:
+    if isinstance(entry, next_moves.ClaudeGroupMove):
+        _ = claude_account_dir(entry.to)
+    elif isinstance(entry.to, next_moves.CodexWorkersTarget):
+        _ = check_codex_target(entry.to.label, accounts_home() / ".codex", repair=False)
+
+
 @role_map.role_map_command
 def main(argv: list[str]) -> int:
     parser = _parser()
@@ -4075,7 +4106,7 @@ def main(argv: list[str]) -> int:
                 if len(entries) != 1:
                     raise AccountsError("accounts: next-write requires one entry")
                 entry = entries[0]
-                _ = claude_account_dir(entry.to)
+                validate_next_move_target(entry)
                 with next_moves.next_moves_lock():
                     current = next_moves.read_next_moves()
                     if any(saved.id == entry.id for saved in current):
@@ -4086,7 +4117,10 @@ def main(argv: list[str]) -> int:
         if options.action == "next":
             if options.next_action == "add":
                 if role_map.is_role_map_host():
-                    _ = claude_account_dir(options.label)
+                    candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
+                        at_percent=options.percent, hold_minutes=options.hold_minutes, to=options.label,
+                        added_at=datetime.now(timezone.utc).isoformat())]))[0]
+                    validate_next_move_target(candidate)
                 entry = next_moves.add_next_move(options.group, options.percent, options.label,
                                                  options.hold_minutes)
                 print(next_moves.render_next_move(entry))

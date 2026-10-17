@@ -437,6 +437,20 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertNotIn("3-impl", board)
 
+    def test_a_dispatch_names_its_director_in_the_run_folder(self) -> None:
+        # The production tree reads the director here: its one marker names only one of the runs
+        # it has open side by side, and a run opened by hand has none.
+        session_dir = self.start_phase("director")
+        environment = self.environment()
+        environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
+        result = subprocess.run(
+            ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
+             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "director").read_text(encoding="utf-8"), "sid-director\n")
+
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()
         environment["PLAN_DELEGATE_CODEX_MESH"] = "1"
@@ -1170,6 +1184,19 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "error")
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
+
+    def test_a_repair_pass_leaves_the_impl_worker_followable(self) -> None:
+        session_dir = self.start_phase("repair-keeps-impl")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        impl = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
+        repair = self.mesh_launch(session_dir, kind="fix")
+        self.assertEqual(repair.returncode, 0, repair.stderr)
+        self.assertEqual(json.loads((session_dir / "impl_worker_impl.json").read_text()), impl)
+        fix = cast("dict[str, object]", json.loads((session_dir / "impl_worker_fix.json").read_text()))
+        self.assertTrue(str(fix["name"]).endswith("-fix"))
+        result = self.mesh_launch(session_dir, to=str(impl["name"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_follow_up_reads_an_old_identity_and_leaves_only_worker_names(self) -> None:
         session_dir = self.start_phase("old-run-follow")

@@ -73,7 +73,7 @@ class RoleMapChange:
     why: str
     at: str
     move_id: str = ""
-    cause: Literal["by hand", "refusal", "auto"] = "by hand"
+    cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand"
     window: Literal["weekly", "five_hour", "unknown"] = "unknown"
     reset: str = ""
 
@@ -101,7 +101,7 @@ class RoleChangeDocument(TypedDict):
     why: str
     at: str
     move_id: str
-    cause: Literal["by hand", "refusal", "auto"]
+    cause: Literal["by hand", "refusal", "auto", "credits off"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: str
 
@@ -114,7 +114,7 @@ class RoleHistoryEntry(TypedDict):
     group: NotRequired[Role]
     account_label: NotRequired[str]
     move_id: NotRequired[str]
-    cause: NotRequired[Literal["by hand", "refusal", "auto"]]
+    cause: NotRequired[Literal["by hand", "refusal", "auto", "credits off"]]
     window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
     reset: NotRequired[str]
 
@@ -376,8 +376,10 @@ def decode_role_map_change(text: str) -> RoleMapChange:
     move_id, reset = fields.get("move_id", ""), fields.get("reset", "")
     cause, window = fields.get("cause", "by hand"), fields.get("window", "unknown")
     if (not isinstance(move_id, str) or not isinstance(reset, str)
-            or cause not in ("by hand", "refusal", "auto") or window not in ("weekly", "five_hour", "unknown")):
+            or cause not in ("by hand", "refusal", "auto", "credits off") or window not in ("weekly", "five_hour", "unknown")):
         raise ValueError("invalid role change")
+    if role != "workers" and cause == "credits off":
+        raise ValueError("credits off is a workers transition cause")
     change = RoleMapChange(role, cast(str, label), cast(str, why), cast(str, at), move_id, cause, window, reset)
     if datetime.fromisoformat(change.at).tzinfo is None:
         raise ValueError("invalid role change")
@@ -419,6 +421,7 @@ def write_role_map(change: RoleMapChange) -> None:
                         values = worker_names.configuration(values)
                         values["workers"] = change.label
                     else:
+                        assert change.cause != "credits off"
                         selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
                             cause=change.cause, window=change.window, why=change.why)
                         if change.reset:
@@ -439,10 +442,10 @@ def write_role_map(change: RoleMapChange) -> None:
                     try:
                         _atomic_write(path, json.dumps(values, sort_keys=True) + "\n")
                         history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        descriptor = os.open(history, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                        descriptor = os.open(history, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
                         with os.fdopen(descriptor, "a", encoding="utf-8") as output:
                             fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-                            _ = output.write(json.dumps(row, sort_keys=True) + "\n")
+                            append_journal_line(output.fileno(), json.dumps(row, sort_keys=True), valid_row=lambda _row: True)
                     except OSError:
                         if previous:
                             _atomic_write(path, previous)
@@ -465,9 +468,78 @@ def write_role_map(change: RoleMapChange) -> None:
         if change.role == "workers":
             workers = change.label
         else:
+            assert change.cause != "credits off"
             selected = StoredGroupSelection(label=change.label, move_id=change.move_id,
                 cause=change.cause, window=change.window, why=change.why)
             if change.reset:
                 selected["reset"] = change.reset
             groups[change.role] = selected
         scope.value = RoleMap(groups, workers)
+
+
+def append_journal_line(descriptor: int, document: str, *, valid_row: Callable[[object], bool]) -> None:
+    """Write a complete encoded row on an O_APPEND descriptor under its flock."""
+    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    _ = fcntl.fcntl(descriptor, fcntl.F_SETFL, flags | os.O_APPEND)
+    data = (document + "\n").encode("utf-8")
+    # Remove an interrupted final append before adding a new independent row.
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size:
+        tail = os.pread(descriptor, size, 0)
+        if not tail.endswith(b"\n"):
+            final = tail.rsplit(b"\n", 1)[-1]
+            try:
+                if not valid_row(cast(object, json.loads(final))):
+                    raise ValueError("invalid journal row")
+            except (ValueError, UnicodeError):
+                os.ftruncate(descriptor, size - len(final))
+            else:
+                _ = os.write(descriptor, b"\n")
+    while data:
+        count = os.write(descriptor, data)
+        if count <= 0:
+            raise OSError("journal append made no progress")
+        data = data[count:]
+
+
+@dataclass(frozen=True)
+class UnreadableAutoMoveHistory:
+    """Replay protection is unavailable, so no log entry may run this pass."""
+
+
+@dataclass(frozen=True)
+class RecordedAutoMoves:
+    entry_ids: frozenset[str]
+
+
+def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    """Recorded choices consume their entries even if log removal was interrupted."""
+    try:
+        text = path.read_bytes()
+        lines = text.splitlines(keepends=True)
+    except FileNotFoundError:
+        return RecordedAutoMoves(frozenset())
+    except OSError as error:
+        print(f"next moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
+    consumed: set[str] = set()
+    try:
+        for index, line in enumerate(lines):
+            try:
+                raw = cast(object, json.loads(line))
+            except (ValueError, UnicodeError):
+                if index == len(lines) - 1 and not line.endswith(b"\n"):
+                    print(f"next moves: skipping torn final line in {path}")
+                    continue
+                raise
+            if not isinstance(raw, dict):
+                continue
+            fields = cast(dict[str, object], raw)
+            why = fields.get("why")
+            if (fields.get("cause") == "auto" and fields.get("group") in ("units", "showrunners")
+                    and isinstance(why, str) and why.startswith("auto: ")):
+                consumed.add(why.removeprefix("auto: "))
+    except ValueError as error:
+        print(f"next moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
+    return RecordedAutoMoves(frozenset(consumed))

@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+import autocompact
 import production_units
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
@@ -391,7 +392,7 @@ class AddUnitTests(ShutdownTestCase):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "owns", "resume", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model"):
+        for flag in ("plan", "brief", "port", "owns", "resume", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -681,10 +682,10 @@ class AddUnitTests(ShutdownTestCase):
             _director: add_unit.DirectorAgent,
             prompt: str,
             _selected: accounts.ClaudeLaunchAccount,
-            *, target: str = "", model: str = "",
+            *, target: str = "", model: str = "", autocompact_window: str = "",
         ) -> None:
             self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
-            self.assertEqual(model, "")
+            self.assertEqual((model, autocompact_window), ("", ""))
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
                 self.assertEqual(recorded[-1], prompt)
@@ -1348,10 +1349,10 @@ class AddUnitTests(ShutdownTestCase):
             _director: add_unit.DirectorAgent,
             _prompt: str,
             _selected: accounts.ClaudeLaunchAccount,
-            *, target: str = "", model: str = "",
+            *, target: str = "", model: str = "", autocompact_window: str = "",
         ) -> None:
             self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
-            self.assertEqual(model, "")
+            self.assertEqual((model, autocompact_window), ("", ""))
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
@@ -1765,6 +1766,107 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior))
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+
+    def test_resume_autocompact_is_recorded_and_passed_to_claude(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                            "--cwd", str(prior), "--autocompact", "200k")
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--resume"):arguments.index("--resume") + 4],
+                         ["--resume", "session-123", "--autocompact", "200k"])
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(autocompact.recorded("session-123"), "200k")
+
+    def test_restart_restore_carries_the_recorded_autocompact_window(self) -> None:
+        """A /shutdown restart, account move or rename relaunches through a restore with no flag of its own."""
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        with patch.dict(os.environ, self.env):
+            autocompact.record("session-compact", "200k")
+        for name, flags, expected in (("compact", (), "200k"), ("reverted", ("--autocompact", "auto"), None)):
+            with self.subTest(name=name):
+                self.commit_prepared_row(self.unit_row(name))
+                _ = self.successful(name, "--plan", "docs/plans/given.md", "--resume", "session-compact",
+                                    "--cwd", str(prior), "--restart-note", str(note), "--session-name", name,
+                                    "--host-session", f"build-followups-{name}", *flags)
+                start = next(row for row in self.herdr_calls()
+                             if row[:4] == ["--session", f"build-followups-{name}", "agent", "start"])
+                arguments = start[start.index("--") + 1:]
+                if expected is None:
+                    self.assertNotIn("--autocompact", arguments)
+                else:
+                    self.assertEqual(arguments[arguments.index("--autocompact") + 1], expected)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(autocompact.recorded("session-compact"), "")
+
+    def set_unit_autocompact(self, value: str, *flags: str) -> subprocess.CompletedProcess[str]:
+        """A running unit's window, set as live: its row off the naming pattern and its plan since changed."""
+        prior = self.root / "prior-session"
+        prior.mkdir(exist_ok=True)
+        return self.successful("trunk", "--plan", "docs/plans/other.md", "--resume", "session-trunk",
+                               "--cwd", str(prior), "--autocompact", value, *flags)
+
+    def test_registered_unit_autocompact_records_without_new_work_checks(self) -> None:
+        _ = self.commit_row_off_the_naming_pattern()
+        before = self.repository_state()
+        result = self.set_unit_autocompact("200k")
+        self.assertEqual(result.stdout.strip(),
+                         "trunk-unit: auto-compact 200k applies to session session-trunk at its next restart")
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(autocompact.recorded("session-trunk"), "200k")
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_registered_unit_autocompact_auto_deletes_the_record(self) -> None:
+        _ = self.commit_row_off_the_naming_pattern()
+        with patch.dict(os.environ, self.env):
+            autocompact.record("session-trunk", "200k")
+        result = self.set_unit_autocompact("auto")
+        self.assertIn("the saved setting applies", result.stdout)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(autocompact.recorded("session-trunk"), "")
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_registered_unit_autocompact_check_writes_nothing(self) -> None:
+        _ = self.commit_row_off_the_naming_pattern()
+        before = self.repository_state()
+        result = self.set_unit_autocompact("300k", "--check")
+        self.assertEqual(result.stdout.strip(),
+                         "trunk-unit: auto-compact 300k would apply to session session-trunk at its next restart")
+        self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_registered_unit_autocompact_reaches_its_restore_launch(self) -> None:
+        worktree = self.commit_row_off_the_naming_pattern()
+        _ = self.set_unit_autocompact("200k")
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        _ = self.successful("trunk", "--plan", "docs/plans/given.md", "--resume", "session-trunk",
+                            "--cwd", str(worktree), "--restart-note", str(note), "--session-name", "trunk",
+                            "--host-session", "build-followups-trunk")
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--autocompact") + 1], "200k")
+
+    def test_autocompact_refusals_launch_nothing_and_record_nothing(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        before = self.repository_state()
+        for flags, reason in ((("--autocompact", "200k"), "--autocompact requires --resume"),
+                              (("--resume", "session-123", "--cwd", str(prior), "--autocompact", "50k"),
+                               "outside 100k to 1M"),
+                              (("--resume", "session-123", "--cwd", str(prior), "--autocompact", "big"),
+                               "token count such as 200k")):
+            with self.subTest(flags=flags):
+                result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn(reason, result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.servers_started(), [])
+        self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
 
     def test_unit_resume_uses_configured_account_instead_of_recorded_account(self) -> None:
         """F004: the configured units account decides resumes too."""

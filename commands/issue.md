@@ -26,6 +26,7 @@ Look up the project shorthand from the base files in the vault's home-base/ fold
 | brp | bevy_brp_mcp | issues - brp.base |
 | bwm | bevy_window_manager | issues - bwm.base |
 | cargo-berth | cargo-berth | issues - cargo-berth.base |
+| cargo-liner | cargo-liner | issues - cargo-liner.base |
 | cargo-mend | cargo-mend | issues - cargo-mend.base |
 | cargo-port | cargo-port | issues - cargo-port.base |
 | conduit | hana_conduit | issues - conduit.base |

@@ -431,7 +431,7 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
         rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
         return
     try:
-        found = unit_lookup.marked_units(rename.slug).get(rename.old)
+        found = unit_lookup.marked_unit(rename.slug, rename.old)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
@@ -548,7 +548,8 @@ def _state_failures(rename: UnitRename) -> list[str]:
                 if (directory / "projects" / unit_move.project_folder(str(old))).exists()]
     if stall_watch.stretch_path(rename.slug, rename.old).exists():
         failures.append(f"stall-watch: the stretch is still under {rename.old}")
-    if unit_move.newest_run(old) is not None:
+    # Step 7 moves the newest run, the one run_state reads; older runs under the old path are history.
+    if unit_move.newest_run(old) is not None and unit_move.newest_run(new) is None:
         failures.append(f"run records: the newest run still names {old}")
     failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
     failures.extend(f"{note}: phase note still names {rename.old}"

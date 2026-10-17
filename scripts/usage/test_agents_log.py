@@ -702,7 +702,8 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         archive, live, _, _ = self.backfill_fixture()
         run = archive / "archived-run"
         old_log = run / "review_agent_adversary.log"
-        phase_log = run / "phases" / "4" / "review_agent_2_contract.log"
+        # A worker seat's log carries its slot after the lens.
+        phase_log = run / "phases" / "4" / "review_agent_2_contract-review2.log"
         phase_log.parent.mkdir(parents=True)
         _ = phase_log.write_text("worker=project-test; role=review\n", encoding="utf-8")
         for index, path in enumerate((old_log, phase_log)):

@@ -166,6 +166,9 @@ fi
 PY="${SCRIPT_DIR}/../lib/py"
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
+# Every dispatch names the run's director in the run folder (unit_runs.py), which the
+# production tree reads: a marker names one run per director, and a director runs phases side by side.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
@@ -227,10 +230,11 @@ from pathlib import Path
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
-identity_file = root / f"impl_worker_{slot}.json"
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
-from worker_state import worker_claim_lock, worker_ledger
+from worker_state import worker_claim_lock, worker_ledger, worker_record_path
+
+identity_file = worker_record_path(root, name, slot)
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)

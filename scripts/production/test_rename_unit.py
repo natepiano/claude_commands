@@ -77,6 +77,7 @@ class UnitRenameTests(unittest.TestCase):
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "PLAN_DELEGATE_SYNC_WRITES": "0",
@@ -391,6 +392,17 @@ class UnitRenameTests(unittest.TestCase):
     def test_a_running_new_id_is_refused(self) -> None:
         self.mark_live("gamma-unit", "sid-gamma")
         self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
+
+    def test_an_older_run_keeps_the_old_path_as_history(self) -> None:
+        old = self.rust / "claude-demo-alpha"
+        older = self.root / "history/runs/run-0.jsonl"
+        self.write(older, json.dumps({"event_type": "run_started", "run_started_at": 0, "working_dir": str(old)})
+                   + "\n" + json.dumps({"event_type": "run_finished"}) + "\n")
+        self.assert_ok(self.rename("apply"))
+        self.assertIn(str(old), older.read_text())
+        newest = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
+        self.assertEqual(newest["working_dir"], str(self.rust / "claude-demo-gamma"))
+        self.assert_ok(self.rename("verify"))
 
     def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
         for name in ("demo-log.md", "demo-log-recovered.md"):

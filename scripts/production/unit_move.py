@@ -281,6 +281,8 @@ def merge_into(worktree: Path, ref: str, message: str) -> str:
 
 def processes_inside(worktree: Path) -> list[int]:
     """Pids on this machine whose working directory is the worktree or inside it."""
+    if sys.platform == "darwin":
+        return _darwin_processes_inside(worktree)
     found: list[int] = []
     root = str(worktree)
     for entry in Path("/proc").iterdir():
@@ -292,4 +294,20 @@ def processes_inside(worktree: Path) -> list[int]:
             continue
         if cwd == root or cwd.startswith(f"{root}/"):
             found.append(int(entry.name))
+    return sorted(found)
+
+
+def _darwin_processes_inside(worktree: Path) -> list[int]:
+    """The Mac has no /proc: lsof names every process's working directory, resolved, so /tmp reads as /private/tmp."""
+    listed = subprocess.run(["lsof", "-w", "-d", "cwd", "-Fpn"], capture_output=True, text=True, check=False)
+    if listed.returncode and not listed.stdout:
+        raise RenameRefused(f"cannot list working directories: {listed.stderr.strip() or 'lsof failed'}")
+    root = str(worktree.resolve())
+    found: set[int] = set()
+    pid = 0
+    for field in listed.stdout.splitlines():
+        if field.startswith("p"):
+            pid = int(field[1:])
+        elif field.startswith("n") and (field[1:] == root or field[1:].startswith(f"{root}/")):
+            found.add(pid)
     return sorted(found)

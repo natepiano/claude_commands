@@ -35,6 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
 _PLATFORM = sys.platform
+# The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
+# server started from inside a unit, drops them so that the unit's lookup never finds a second session.
+UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+
+
+def _platform() -> str:
+    """The platform herdr reads processes as: HERDR_PLATFORM names the one a test's fake process tree was built for."""
+    return os.environ.get("HERDR_PLATFORM", _PLATFORM)
 
 
 class HerdrFailure(Exception):
@@ -132,7 +140,7 @@ class WindowServerCreated:
 
 def security_session() -> SecuritySession:
     """Read the command's security context once; a failed query grants no access."""
-    if _PLATFORM != "darwin":
+    if _platform() != "darwin":
         return NotMacSession()
     try:
         result = run_program([os.environ.get("LAUNCHCTL", "launchctl"), "managername"])
@@ -446,10 +454,16 @@ def json_items(value: object, context: str) -> list[object]:
     return cast(list[object], value)
 
 
+def unmarked_environment() -> dict[str, str]:
+    """This process's environment without a unit's marks, so that no server it starts carries them."""
+    return {key: value for key, value in os.environ.items() if key not in UNIT_MARKS}
+
+
 def run_program(argv: list[str], timeout: float = 10.0, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout, env=environment)
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
+                              env=unmarked_environment() if environment is None else environment)
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
 
@@ -553,6 +567,47 @@ class Herdr:
         pane = json_text(root_pane.get("pane_id"), "herdr workspace root pane id")
         _ = self.run("pane", "rename", pane, label)
         return pane
+
+    def open_tab(self, space: str, label: str, cwd: str, environment: dict[str, str]) -> str:
+        """Open a tab named `label` in the workspace named `space`, creating the workspace first."""
+        options = ["--label", label, "--cwd", cwd]
+        for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
+            options.extend(["--env", f"{key}={value}"])
+        workspaces = [json_object(item, "herdr workspace") for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        found = [item for item in workspaces if item.get("label") == space]
+        if found:
+            workspace = json_text(found[0].get("workspace_id"), "herdr workspace id")
+            result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
+        else:
+            options[1] = space
+            result = self.result("workspace", "create", *options, "--no-focus")
+            tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
+            _ = self.run("tab", "rename", tab, label)
+        root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
+        pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
+        _ = self.run("pane", "rename", pane, label)
+        return pane
+
+    def tab_labels(self) -> list[str]:
+        return [json_text(json_object(item, "herdr tab").get("label"), "herdr tab label")
+                for item in json_items(self.result("tab", "list").get("tabs"), "herdr tab list")]
+
+    def close_tab_labelled(self, label: str) -> None:
+        """Close every tab named `label`; none named so leaves nothing to close."""
+        for item in json_items(self.result("tab", "list").get("tabs"), "herdr tab list"):
+            tab = json_object(item, "herdr tab")
+            if tab.get("label") == label:
+                _ = self.run("tab", "close", json_text(tab.get("tab_id"), "herdr tab id"))
+
+    def close_tab_of(self, pane: str) -> None:
+        """Close the tab holding `pane`; a pane already gone leaves nothing to close."""
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        for row in rows:
+            if row.get("pane_id") == pane:
+                _ = self.run("tab", "close", json_text(row.get("tab_id"), "herdr pane tab id"))
+                return
 
     def focus_workspace(self, workspace_id: str) -> None:
         """Show a workspace in the session's attached clients."""
@@ -936,7 +991,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 
 
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
-    from detached import DiscardOutput, InheritEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
+    from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
     try:
@@ -971,7 +1026,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
 
     try:
         pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic(),
-                             output=DiscardOutput(), environment=InheritEnvironment())
+                             output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
     except DetachedChildExited as error:
         if holders and holders != {error.pid}:
             if exclusive:
@@ -998,7 +1053,7 @@ def start_server(name: str, timeout_ms: int, *,
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _start_darwin_server(herdr, timeout_ms, exclusive=False,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
     deadline = time.monotonic() + timeout_ms / 1000
@@ -1031,7 +1086,7 @@ def start_new_server(name: str, timeout_ms: int, *,
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         _ = _start_darwin_server(herdr, timeout_ms, exclusive=True,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
         return
@@ -1069,14 +1124,14 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
     _validate_session_name(name)
     _timeout(timeout_ms)
-    if _PLATFORM != "darwin" or isinstance(session_kind, DesktopSession):
+    if _platform() != "darwin" or isinstance(session_kind, DesktopSession):
         if exclusive:
-            if _PLATFORM == "darwin":
+            if _platform() == "darwin":
                 start_new_server(name, timeout_ms, session_kind=session_kind)
             else:
                 start_new_server(name, timeout_ms)
             return ServerCreated()
-        if _PLATFORM == "darwin":
+        if _platform() == "darwin":
             return start_server(name, timeout_ms, session_kind=session_kind)
         return start_server(name, timeout_ms)
     client = Herdr(name)
@@ -1120,10 +1175,37 @@ def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | Wi
     stop_session(name)
 
 
+def shared_session() -> str:
+    """The one herdr session every production lives in, one workspace per production and one tab
+    per Claude session, named in `herdr/shared-session` under the config directory. Empty when the
+    file is absent: each Claude session then gets a herdr session of its own."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "shared-session"
+    try:
+        name = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    _validate_session_name(name)
+    return name
+
+
+def open_tab(name: str, space: str, label: str, cwd: str, environment: dict[str, str]) -> str:
+    return Herdr(name).open_tab(space, label, cwd, environment)
+
+
+def close_agent(session: str, pane: str) -> None:
+    """End one Claude session's place: its tab in the shared session, else its own session."""
+    if session and session == shared_session():
+        Herdr(session).close_tab_of(pane)
+        return
+    stop_session(session)
+
+
 def stop_session(name: str) -> None:
     _validate_session_name(name)
+    if name == shared_session():
+        raise HerdrFailure(f"herdr session {name} holds every production; close one tab instead")
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         require_success(run_program(herdr.argv("server", "stop")), f"stop herdr session {name}")
         return
     try:
@@ -1253,7 +1335,7 @@ def _herdr_command(arguments: list[str], default_session: str) -> tuple[str, lis
 
 
 def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
         processes = list(_proc_root().iterdir())
@@ -1382,7 +1464,7 @@ def server_environment(name: str) -> dict[str, str]:
     """Read the environment of the process holding this session's listener."""
     context = f"herdr session {name} server environment"
     socket_path = str(_session_socket(name))
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         try:
             holders = {listener.pid for listener in _darwin_bound_sockets() if str(listener.path) == socket_path}
             if len(holders) != 1:
@@ -1431,7 +1513,7 @@ def server_environment(name: str) -> dict[str, str]:
 
 
 def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
     try:
         environment = _process_environment(_proc_root() / str(pid))
@@ -1734,7 +1816,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
             pane = environment.get("HERDR_PANE_ID", "")
             if environment.get("TMUX_PANE") or not pane:
                 continue
-            marks = {key: environment[key] for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID") if key in environment}
+            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -1743,7 +1825,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
 
 
 def herdr_processes() -> list[HerdrProcess]:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
@@ -1764,7 +1846,7 @@ def herdr_processes() -> list[HerdrProcess]:
             if not arguments:
                 continue
             cwd = str(process.joinpath("cwd").resolve(strict=True))
-            marks = {key: environment[key] for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID") if key in environment}
+            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue

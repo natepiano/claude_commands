@@ -1,6 +1,7 @@
+import type { RenderElement } from 'claude-code';
 import type { PaneElements } from './board';
 import type { BoardData, BoardPhase, BoardUnit } from '../types/board';
-import { duration, runsOf, signedMinutes, stripCells } from './geometry';
+import { cellWidth, duration, fitText, runsOf, signedMinutes, stripCells } from './geometry';
 import { etaText, finishText, gateText, RulerView } from './board';
 
 function recordText(phase: BoardPhase): string {
@@ -11,42 +12,154 @@ function recordText(phase: BoardPhase): string {
   return eta.trail.length ? `ETA ${eta.trail.at(-1)?.[0].text}` : 'none stated';
 }
 
-export function UnitView(elements: PaneElements, columns: number, data: BoardData, unit: BoardUnit, now: number, back: () => void) {
+/** Explicit wrapping makes each rendered row's height known before folding. */
+function wrappedLines(text: string, columns: number): string[] {
+  const width = Math.max(1, columns);
+  return text.split('\n').flatMap(paragraph => {
+    const lines: string[] = [];
+    let rest = paragraph;
+    while (cellWidth(rest) > width) {
+      let prefix = '';
+      let used = 0;
+      for (const ch of rest) {
+        if (used + cellWidth(ch) > width) break;
+        prefix += ch;
+        used += cellWidth(ch);
+      }
+      const space = prefix.lastIndexOf(' ');
+      const end = space > 0 ? space : prefix.length;
+      if (!end) {
+        lines.push('…');
+        rest = rest.slice(Array.from(rest)[0]!.length);
+      } else {
+        lines.push(rest.slice(0, end).trimEnd());
+        rest = rest.slice(end).trimStart();
+      }
+    }
+    if (rest.length) lines.push(rest);
+    return lines;
+  });
+}
+
+/** Rows are removed in this order only after history and steps have folded. */
+type UnitRowRetention = 'context' | 'worker' | 'step' | 'fold' | 'phase' | 'heading' | 'open-phase' | 'navigation';
+interface UnitRow { view: RenderElement; height: number; retention: UnitRowRetention }
+interface UnitSection { rows: UnitRow[]; gap: number }
+
+function sectionHeight(sections: readonly UnitSection[]): number {
+  return sections.reduce((total, section) => total + (section.rows.length
+    ? section.gap + section.rows.reduce((height, row) => height + row.height, 0) : 0), 0);
+}
+
+function earlierIds(phases: readonly BoardPhase[]): string {
+  const ids = phases.map(phase => phase.id);
+  const consecutive = ids.every((id, index) => id === String(Number(ids[0]) + index));
+  return ids.length > 1 && consecutive ? `${ids[0]}–${ids.at(-1)}` : ids.join(', ');
+}
+
+function padCells(text: string, width: number): string {
+  return text + ' '.repeat(Math.max(0, width - cellWidth(text)));
+}
+
+export function UnitView(elements: PaneElements, columns: number, bodyRows: number, data: BoardData, unit: BoardUnit, now: number, back: () => void) {
   const { Box, Text, Button } = elements;
-  return <Box flexDirection="column">
-    <Box justifyContent="space-between">
-      <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {unit.phase ? `Phase ${unit.phase.id} of ${unit.phase.of}` : 'No phase running'} · {unit.stage}</Text>
+  const limit = Math.max(0, Math.floor(bodyRows));
+  const eta = etaText(unit, now);
+  const gate = gateText(unit);
+  const finish = finishText(unit, now);
+  const trail = unit.eta?.trail.map(([eta, stated]) => `${eta.text} said ${stated.text}`).join(' → ') ?? '';
+  const strip = stripCells(unit.phases);
+  const slotWidth = Math.max(0, ...unit.workers.map(worker => cellWidth(worker.slot))) + 1;
+  const roleWidth = Math.max(0, ...unit.workers.map(worker => cellWidth(worker.role || worker.slot))) + 1;
+  const stateWidth = Math.max(0, ...unit.workers.map(worker => cellWidth(worker.state))) + 1;
+  const idWidth = Math.max(3, ...unit.phases.map(phase => cellWidth(phase.id)));
+  const fixWidth = Math.max(0, ...unit.phases.map(phase => phase.fix_done + (phase.fix_running ? 1 : 0))) + 1;
+  const timingWidth = Math.max(7, ...unit.phases.map(phase => (phase.took === null ? phase.status : duration(phase.took)).length + 1));
+  const recordWidth = Math.max(0, ...unit.phases.map(phase => cellWidth(recordText(phase))));
+  const stepTimes = unit.steps.map(step => `${step[2].text} · ${duration(step[3])}`);
+  const markWidth = Math.max(cellWidth('✓ '), cellWidth('▶ '));
+  const timeWidth = Math.min(Math.max(0, columns - markWidth - 2), Math.max(0, ...stepTimes.map(cellWidth)));
+  const labelWidth = Math.max(0, columns - timeWidth - markWidth - 2);
+  const done = unit.phases.filter(phase => phase.status === 'done');
+  const future = unit.phases.filter(phase => phase.status === 'todo' || phase.status === 'gated');
+  const hiddenDone = new Set<BoardPhase>();
+  const hiddenFuture = new Set<BoardPhase>();
+  let hiddenSteps = 0;
+  const row = (view: RenderElement, retention: UnitRowRetention = 'context', height = 1): UnitRow => ({ view, height, retention });
+
+  function sections(): UnitSection[] {
+    const overview = [row(<Box justifyContent="space-between">
+      <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {unit.phase ? `Phase ${unit.phase.id} of ${unit.phase.of} · ` : ''}{unit.stage}</Text>
       <Button key="back" label="board" plain onPress={back} />
-    </Box>
-    <Text bold wrap="truncate-end">{unit.phase?.title ?? unit.plan}</Text>
-    <Text color="subtle" wrap="wrap">{unit.summary}</Text>
-    <Text color="subtle">as of {data.as_of.text}</Text>
-    <Box flexDirection="column" marginTop={1}>
-      {etaText(unit) && <Text wrap="wrap">{etaText(unit)}</Text>}
-      {gateText(unit) && <Text color="warning" wrap="wrap">{gateText(unit)}</Text>}
-      {finishText(unit) && <Text color="subtle">{finishText(unit)}</Text>}
-      {RulerView(elements, unit, data, now, Math.max(8, columns - 2))}
-      {unit.eta && <Text color="subtle" wrap="wrap">{unit.eta.trail.map(([eta, stated]) => `${eta.text} said ${stated.text}`).join(' → ')}</Text>}
-    </Box>
-    <Box marginTop={1}><Text>{runsOf(stripCells(unit.phases)).map(run => <Text color={run.tone}>{run.text}</Text>)}</Text></Box>
-    {unit.steps.length > 0 && <Box flexDirection="column" marginTop={1}>
-      <Text bold>This phase</Text>
-      {unit.steps.map(([state, what, started, took]) => <Box justifyContent="space-between">
-        <Text wrap="truncate-end"><Text color={state === 'running' ? 'suggestion' : 'success'}>{state === 'running' ? '▶' : '✓'} </Text>{what}</Text>
-        <Text color="subtle">{started.text} · {duration(took)}</Text>
-      </Box>)}
-    </Box>}
-    {unit.workers.length > 0 && <Box flexDirection="column" marginTop={1}>
-      <Text bold>Workers</Text>
-      {unit.workers.map(worker => <Text wrap="truncate-end"><Text color="subtle">{worker.slot} </Text><Text bold>{worker.role.padEnd(7)}</Text><Text color={worker.state === 'running' ? 'suggestion' : 'inactive'}>{worker.state.padEnd(8)}</Text>{worker.doing}</Text>)}
-    </Box>}
-    <Box flexDirection="column" marginTop={1}>
-      <Text bold>Phase record</Text>
-      {[...unit.phases].reverse().map(phase => <Text wrap="truncate-end">
-        <Text color="subtle">{phase.id.padStart(3)}  </Text>{(phase.took === null ? phase.status : duration(phase.took)).padEnd(7)}
-        <Text color="warning">{'●'.repeat(phase.fix_done)}{phase.fix_running ? '○' : ''} </Text>
-        <Text color={phase.eta.delta_minutes !== null && phase.eta.delta_minutes > 0 ? 'error' : 'subtle'}>{recordText(phase)}</Text>  {phase.title}
-      </Text>)}
-    </Box>
-  </Box>;
+    </Box>, 'navigation')];
+    if (unit.phase?.title || unit.plan) overview.push(row(<Text bold wrap="truncate-end">{unit.phase?.title || unit.plan}</Text>));
+    if (unit.phase && unit.plan) overview.push(row(<Text color="subtle" wrap="truncate-end">{unit.plan}</Text>));
+    overview.push(...wrappedLines(unit.summary, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
+    overview.push(row(<Text color="subtle" wrap="truncate-end">as of {data.as_of.text}</Text>));
+    const timing: UnitRow[] = [];
+    timing.push(...wrappedLines(eta, columns).map(line => row(<Text wrap="truncate-end">{line}</Text>)));
+    timing.push(...wrappedLines(gate, columns).map(line => row(<Text color="warning" wrap="truncate-end">{line}</Text>)));
+    timing.push(...wrappedLines(finish, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
+    if (unit.phase) timing.push(row(RulerView(elements, unit, data, now, Math.max(1, columns - 2)), 'context', 2));
+    timing.push(...wrappedLines(trail, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
+    const steps: UnitRow[] = [];
+    if (unit.steps.length) {
+      steps.push(row(<Text bold>This phase</Text>, 'heading'));
+      if (hiddenSteps) steps.push(row(<Text color="subtle" wrap="truncate-end">+{hiddenSteps} earlier steps</Text>, 'fold'));
+      unit.steps.slice(hiddenSteps).forEach(([state, what], offset) => {
+        const label = fitText(what, labelWidth);
+        steps.push(row(<Text wrap="truncate-end"><Text color={state === 'running' ? 'suggestion' : 'success'}>{padCells(state === 'running' ? '▶ ' : '✓ ', markWidth)}</Text>{padCells(label, labelWidth)}  <Text color="subtle">{fitText(stepTimes[hiddenSteps + offset]!, timeWidth)}</Text></Text>, 'step'));
+      });
+    }
+    const workers: UnitRow[] = unit.workers.length ? [row(<Text bold>Workers</Text>, 'heading'), ...unit.workers.map(worker => row(
+      <Text wrap="truncate-end"><Text color="subtle">{padCells(worker.slot, slotWidth)}</Text><Text bold>{padCells(worker.role || worker.slot, roleWidth)}</Text><Text color={worker.state === 'running' ? 'suggestion' : 'inactive'}>{padCells(worker.state, stateWidth)}</Text>{worker.doing}</Text>, 'worker'))] : [];
+    const record = [row(<Text bold>Phase record</Text>, 'heading')];
+    if (!unit.phases.length) record.push(row(<Text color="subtle">no phases recorded</Text>, 'phase'));
+    if (hiddenFuture.size) record.push(row(<Text color="subtle" wrap="truncate-end">+{hiddenFuture.size} later</Text>, 'fold'));
+    [...unit.phases].reverse().filter(phase => !hiddenDone.has(phase) && !hiddenFuture.has(phase)).forEach(phase => {
+      const id = ' '.repeat(Math.max(0, idWidth - cellWidth(phase.id))) + phase.id;
+      record.push(row(<Text wrap="truncate-end">
+        <Text color="subtle">{id}  </Text>{(phase.took === null ? phase.status : duration(phase.took)).padEnd(timingWidth)}
+        <Text color="warning">{('●'.repeat(phase.fix_done) + (phase.fix_running ? '○' : '')).padEnd(fixWidth)}</Text>
+        <Text color={phase.eta.delta_minutes !== null && phase.eta.delta_minutes > 0 ? 'error' : 'subtle'}>{padCells(recordText(phase), recordWidth)}</Text>  {phase.title}
+      </Text>, phase.status === 'open' ? 'open-phase' : 'phase'));
+    });
+    if (hiddenDone.size) record.push(row(<Text color="subtle" wrap="truncate-end">{fitText(`+${hiddenDone.size} earlier: ${earlierIds(done.filter(phase => hiddenDone.has(phase)))}`, columns)}</Text>, 'fold'));
+    return [{ rows: overview, gap: 0 }, { rows: timing, gap: 1 },
+      { rows: strip.length ? [row(<Text wrap="truncate-end">{runsOf(strip).map(run => <Text color={run.tone}>{run.text}</Text>)}</Text>)] : [], gap: 1 },
+      { rows: steps, gap: 1 }, { rows: workers, gap: 1 }, { rows: record, gap: 1 }];
+  }
+
+  let content = sections();
+  if (sectionHeight(content) > limit || future.length > 3) {
+    // A useful fold replaces at least two old rows with one notice.
+    future.slice(3).forEach(phase => hiddenFuture.add(phase));
+    if (done.length > 2) done.slice(0, 2).forEach(phase => hiddenDone.add(phase));
+    if (unit.steps.length > 2) hiddenSteps = 2;
+    content = sections();
+    for (const phase of done.slice(hiddenDone.size, -1)) {
+      if (sectionHeight(content) <= limit) break;
+      hiddenDone.add(phase);
+      content = sections();
+    }
+    while (sectionHeight(content) > limit && unit.steps.length - hiddenSteps > 1) {
+      hiddenSteps++;
+      content = sections();
+    }
+  }
+  if (sectionHeight(content) > limit) content.forEach(section => { section.gap = 0; });
+  // Extremely short panes retain navigation and the open record row longest.
+  for (const retention of ['context', 'worker', 'step', 'fold', 'phase', 'open-phase', 'navigation'] as const) {
+    for (const section of content) {
+      for (let index = section.rows.length - 1; index >= 0 && sectionHeight(content) > limit; index--) {
+        if (section.rows[index]!.retention === retention) section.rows.splice(index, 1);
+        if (section.rows.every(row => row.retention === 'heading')) {
+          section.rows = [];
+          break;
+        }
+      }
+    }
+  }
+  return <Box flexDirection="column">{content.filter(section => section.rows.length).map(section =>
+    <Box flexDirection="column" flexShrink={0} marginTop={section.gap}>{section.rows.map(row => row.view)}</Box>)}</Box>;
 }

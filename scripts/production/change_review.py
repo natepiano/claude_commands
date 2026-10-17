@@ -242,6 +242,11 @@ def _cells(line: str) -> list[str]:
     return [cell.strip() for cell in _BOUNDARY.split(line.strip())[1:-1]]
 
 
+def row_id(row: str) -> str:
+    """A written row's id, such as C24."""
+    return _cells(row)[0]
+
+
 def read(path: Path) -> str:
     """The list's text; a list not yet written reads as the skeleton's tables."""
     return path.read_text(encoding="utf-8") if path.exists() else BODY
@@ -420,7 +425,7 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         return rows
 
     def what(rows: list[str]) -> str:
-        ids = [_cells(row)[0] for row in rows]
+        ids = [row_id(row) for row in rows]
         named = ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"
         if not merged:
             return f"add {named}"
@@ -560,7 +565,7 @@ def _run(options: CommandLine) -> int:
             rows = append_rows(_list(options), [Visible(_words("change", options.change),
                                                         _words("check", options.check))],
                                today(), options.merged.strip(), doc)
-            print(_cells(rows[0])[0])
+            print(row_id(rows[0]))
         case "show":
             waiting = pending(_list(options))
             print("\n\n".join(describe(row) for row in waiting) if waiting else "nothing to review")
