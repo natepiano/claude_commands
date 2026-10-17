@@ -446,7 +446,17 @@ Pending: parent's saved style child summary and rendered style line.
   a collision when it would only shadow (`refresh.rs:403`). One is the
   several-targets drop, reached now that `.path()` passes through
   (`presentation.rs:103`). The type-prefix drop at `actions.rs:835` holds as
-  in the first rerun.
+  in the first rerun. The showrunner ruled `presentation.rs:103` out of
+  scope, so the settled reference is 37 findings: both reruns caught 33 of
+  37 (89.2%).
+- **Fix T — a name-bindings ticket follows macros and enum variants and
+  tells shadowing from collision** (commit `3b422e81`): the ticket line now
+  says a call inside a macro's arguments counts, an enum tuple variant
+  wrapping the binding (`Pane::App(id)`) passes through like a conversion,
+  and a same-named binding declared later in an inner block only shadows
+  the renamed binding, so it is no collision. That answers three of the four
+  rerun 2 losses; `actions.rs:835` stays a miss, so the best a third rerun
+  can reach is 36 of 37 (97.3%). A third rerun on the same files measures it.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
