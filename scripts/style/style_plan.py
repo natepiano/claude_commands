@@ -294,6 +294,11 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
     return tuple(result)
 
 
+def blocked_by_structure(cell: style_ledger.Cell, structure: tuple[style_ledger.Cell, ...]) -> bool:
+    return any(blocker.crate == cell.crate and blocker.path in (cell.crate, cell.path)
+               for blocker in structure)
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -338,8 +343,9 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                                   if site.path in files)
                     result.append(TicketSelection("structure", family, crate, files, rule_ids, sites=sites,
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
-            continue
-        own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family and not busy.contains(cell.path))
+                continue
+        own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family
+                    and not busy.contains(cell.path) and not blocked_by_structure(cell, structure))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
             files = {cell.path for cell in own if cell.rule == rule_id}
             sites_by_file: dict[str, list[style_ledger.ListedSite]] = defaultdict(list)
@@ -657,9 +663,11 @@ def _select_phase(
         if family != "modules":
             pending = tuple(cell for cell in ledger.cells()
                             if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
-            structure = {cell.crate for cell in pending if cell.tier == "D"}
-            own = {cell.crate for cell in pending if cell.family == family}
-            blocked = tuple(sorted(structure & own))
+            structure = tuple(cell for cell in pending if cell.tier == "D")
+            own = tuple(cell for cell in pending if cell.family == family)
+            blocked = tuple(sorted(crate for crate in {cell.crate for cell in own}
+                                   if all(blocked_by_structure(cell, structure)
+                                          for cell in own if cell.crate == crate)))
             if blocked:
                 return WaitingForStructure(blocked, len(ledger.unclassified_rules()))
         return NoAvailableWork()

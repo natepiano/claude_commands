@@ -655,6 +655,87 @@ class StylePlanTests(unittest.TestCase):
             self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo)]), 0)
         self.assertIn("names-unit: read", output.getvalue())
 
+    def test_names_read_refill_takes_only_files_without_pending_structure_cells(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        read = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
+                         ("read", [read], [self.sources[1]]))
+        self.assertIn(f"- `{self.sources[1]}` — lines 1-1\n", self.plan.read_text())
+        self.assertNotIn(f"- `{self.sources[0]}`", self.plan.read_text())
+
+    def test_names_listed_refill_packs_only_sites_on_files_without_pending_structure_cells(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        listed = self.rule("listed", "tier: B\nfamily: names\npre_filter: value\n")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
+                         ("listed", [listed], [self.sources[1]]))
+        self.assertEqual([(site["path"], site["line"]) for site in ticket["sites"]], [(self.sources[1], 1)])
+
+    def test_pending_manifest_structure_cell_keeps_names_crate_closed_after_file_judgments(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        _ = self.rule("read")
+        self.sync()
+        for path in self.sources:
+            self.record(structure, path, self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        self.record(manifest, "crates/alpha", self.tip)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+
+    def test_names_waits_for_structure_when_every_pending_names_file_is_closed(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        read = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        self.record(read, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        before = self.plan.read_bytes()
+
+        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_names_waits_for_sync_when_an_open_names_file_is_busy_despite_other_closed_files(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])):
+            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_modules_still_selects_only_pending_structure_files_when_names_can_refill(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(structure, path, self.tip)
+        before = self.candidates("modules")
+        self.assertEqual([(ticket.kind, ticket.crate, ticket.files, ticket.cells) for ticket in before], [
+            ("structure", "crates/alpha", (self.sources[0],), ((structure, self.sources[0]),)),
+        ])
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.candidates("modules"), before)
+
     def test_structure_first_unblocks_more_other_family_cells_before_staler_crates(self) -> None:
         read = self.rule("read")
         own = self.rule("module-read", "tier: C\nfamily: modules\ninput_scope: file\n")

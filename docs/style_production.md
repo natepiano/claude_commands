@@ -93,8 +93,9 @@ Refill only the unit worktree's own plan copy:
 
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
 reporting `repair first`; 3 means `waiting for sync`, or
-`waiting for structure: <crates>` when pending structure cells in those in-scope
-crates hold the unit back until the modules unit's structure tickets merge
+`waiting for structure: <crates>` when every pending family cell in those
+in-scope crates is blocked by a structure cell on its file or crate, until the
+modules unit's structure tickets merge
 (an unclassified catalog also says `pull nate_style`); 4 means
 `board unavailable: <reason>`; 5 means
 `waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
