@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label, note_name
-
 import fcntl
 import io
 import json
@@ -31,15 +29,8 @@ import merge_checkpoint
 import update_registration
 import waiting
 from cli_fixture import invoke_cli
-import unit_lookup
-import herdr
 from fake_herdr import CommandResponse
 import fake_unit_host
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-import agent_accounts
-import quota_alert
-from scripts.accounts.accounts import CodexWorkersAccount
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -49,14 +40,6 @@ ALPHA = "alpha-unit"
 BETA = "beta-unit"
 GAMMA = "gamma-unit"
 PHASE = "Phase 2 of 3: panel labels stay clear"
-# Quota notices read no live account dirs: each test names the Claude accounts in use.
-MAIN_CLAUDE = agent_accounts.NumberedAccount("claude2", Path.home() / ".claude", "main@example.invalid")
-UNIT_CLAUDE = agent_accounts.NumberedAccount("claude3", Path("/unread/.claude3"), "unit@example.invalid")
-ONE_CLAUDE_ACCOUNT = agent_accounts.ClaudeAccountsInUse(MAIN_CLAUDE, False, (), frozenset())
-TWO_CLAUDE_ACCOUNTS = agent_accounts.ClaudeAccountsInUse(
-    MAIN_CLAUDE, True,
-    (agent_accounts.CheckedNamedClaudeAccount("claude3", Path("/unread/.claude3"), UNIT_CLAUDE),),
-    frozenset((UNIT_CLAUDE.login,)))
 PHASE_IDENTITY = "Phase 2 of 3"
 BERTH_STUB = '''#!__PYTHON__
 import os
@@ -98,29 +81,6 @@ raise SystemExit(codes[recipient])
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
-
-
-@final
-class QuotaNote:
-    path: Path
-    tool: str
-    values: dict[str, str]
-    label: str
-
-    def __init__(self, path: Path, tool: str, values: dict[str, str]) -> None:
-        self.path = path
-        self.tool = tool
-        parsed = parse_account_label(path.stem)
-        assert isinstance(parsed, NumberedAccountLabel)
-        self.label = parsed.label
-        self.values = values
-
-    def get(self, key: str) -> str | None:
-        return self.values.get(key)
-
-    def get_list(self, key: str) -> tuple[str, ...]:
-        value = self.get(key)
-        return (value,) if value and value != "[]" else ()
 
 
 @final
@@ -184,8 +144,6 @@ class WaitingTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
-        _ = self.enterContext(mock.patch.object(quota_alert, "observe_workers_home", side_effect=AssertionError(
-            "quota tests must supply Codex readings instead of resolving a live home")))
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
             fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
@@ -462,34 +420,6 @@ class WaitingTests(unittest.TestCase):
         resolved = dailies_render.resolve_eta_moments(report, previous, moment)
         return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
 
-    def quota_note(self, name: str, tool: str = "codex", login: str = "") -> QuotaNote:
-        return QuotaNote(self.root / note_name(name), tool, {
-            "role": "worker" if tool == "codex" else "unit", "sessions": "0",
-            "weekly_remaining_usage": "4",
-            "resets": "2026-10-12 09:00 PDT",
-            "weekly_usage_checked_at": "2026-10-07 02:00 PDT",
-            **({"login": login} if login else {}),
-        })
-
-    def quota_message(self, note: QuotaNote,
-                      selection: agent_accounts.ClaudeAccountsInUse = ONE_CLAUDE_ACCOUNT) -> str:
-        config: quota_alert.Config = {
-            "threshold_percent": 5.0,
-            "repeat_minutes": 30.0,
-            "stall_minutes": 5.0,
-            "faults_to": "showrunner-example",
-            "always": [],
-        }
-        home = self.root / "codex-fixture"
-        readings = quota_alert.CodexAlertPassReadings(
-            CodexWorkersAccount(note.label, home),
-            agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.label),
-            (),
-        )
-        return quota_alert.message(note, [], config, selection=selection, codex_readings=readings)
-
-    def acknowledgement_message(self, account: str) -> str:
-        return f'Quota alert acknowledged: the user silenced {account} in session "showrunner-example" at 2026-10-07T06:00:00+00:00.'
 
     def test_scratch_green_uses_detached_unit_tip_and_lift_accepts_its_log(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")
@@ -983,180 +913,12 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(agenda.returncode, 0, agenda.stdout + agenda.stderr)
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", agenda.stdout)
 
-    def test_quota_tracks_full_account_stems_through_acknowledgment_and_restore(self) -> None:
-        first_note, second_note = self.quota_note("codex1"), self.quota_note("codex2")
-        for note in (first_note, second_note):
-            result = self.run_waiting("quota", "--notice", self.quota_message(note),
-                                      "--state-dir", str(self.state))
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        seen_path = self.state / "quota_seen.json"
-        held = cast(dict[str, object], json.loads(seen_path.read_text()))
-        self.assertEqual(set(held), {"codex1", "codex2"})
 
-        acknowledged = self.run_waiting("quota", "--notice", self.acknowledgement_message("codex1"),
-                                        "--state-dir", str(self.state))
-        self.assertEqual(acknowledged.returncode, 0, acknowledged.stdout + acknowledged.stderr)
-        held = cast(dict[str, object], json.loads(seen_path.read_text()))
-        self.assertEqual(set(held), {"codex2"})
-
-        restored_notes: list[quota_alert.AgentNote] = [second_note]
-        restored_notice = quota_alert.restored_message(restored_notes, "the codex2 alert is closed", 5.0,
-                                                       selection=ONE_CLAUDE_ACCOUNT)
-        restored = self.run_waiting("quota", "--notice", restored_notice,
-                                    "--state-dir", str(self.state))
-        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
-        self.assertEqual(json.loads(seen_path.read_text()), {})
-
-    def test_quota_prints_each_held_alert_with_percent_left_and_reset_time(self) -> None:
-        first_note, second_note = self.quota_note("codex1"), self.quota_note("codex2")
-        first = self.run_waiting("quota", "--notice", self.quota_message(first_note),
-                                 "--state-dir", str(self.state))
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        second = self.run_waiting("quota", "--notice", self.quota_message(second_note),
-                                  "--state-dir", str(self.state))
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        held = [line for line in second.stdout.splitlines() if line.startswith("held: ")]
-        self.assertEqual(len(held), 2, second.stdout)
-        for account in ("codex1", "codex2"):
-            line = next(item for item in held if account in item)
-            self.assertIn("4%", line)
-            self.assertIn("resets 2026-10-12 09:00 PDT", line)
-
-    def test_canonical_ack_clears_a_legacy_keyed_hold_without_losing_other_accounts(self) -> None:
-        path = self.state / "quota_seen.json"
-        legacy = self.quota_message(self.quota_note("codex1")).replace("codex1", "codex 1")
-        other = self.quota_message(self.quota_note("codex2"))
-        _ = path.write_text(json.dumps({"codex 1": legacy.splitlines()[0], "codex 2": other.splitlines()[0]}))
-
-        result = self.run_waiting("quota", "--notice", self.acknowledgement_message("codex1"),
-                                  "--state-dir", str(self.state))
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(json.loads(path.read_text()), {"codex2": other.splitlines()[0]})
-        self.assertNotIn("held: Quota alert: codex 1", result.stdout)
-
-    def test_reading_legacy_holds_normalizes_identity_and_text_without_rewriting_the_file(self) -> None:
-        path = self.state / "quota_seen.json"
-        canonical = self.quota_message(self.quota_note("codex2")).splitlines()[0]
-        legacy = canonical.replace("codex2", "codex 2")
-        original = json.dumps({"codex 2": legacy}, indent=4) + "\n"
-        _ = path.write_text(original)
-
-        held = waiting.read_quota_state(path)
-
-        self.assertEqual(held, {"codex2": canonical})
-        self.assertEqual(path.read_bytes(), original.encode())
-
-    def test_legacy_ack_notice_matches_a_canonical_held_account(self) -> None:
-        path = self.state / "quota_seen.json"
-        _ = path.write_text(json.dumps({"codex1": self.quota_message(self.quota_note("codex1")).splitlines()[0]}))
-        notice = self.acknowledgement_message("codex1").replace("codex1", "codex 1")
-
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(json.loads(path.read_text()), {})
-
-    def test_claude_quota_notices_are_not_relayed_or_saved_as_waits(self) -> None:
-        for notice in ("Quota alert: claude3 (unit) at 1% weekly usage left.",
-                       "Quota alert: claude 3 (unit) at 1% weekly usage left.",
-                       "Quota restored: work on claude3 can resume."):
-            with self.subTest(notice=notice):
-                result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertNotIn("send ", result.stdout)
-                self.assertFalse(self.sends.exists())
-                seen = self.state / "quota_seen.json"
-                if seen.exists():
-                    self.assertEqual(json.loads(seen.read_text()), {})
-
-    def test_legacy_claude_waits_are_dropped_while_codex_waits_remain(self) -> None:
-        path = self.state / "quota_seen.json"
-        codex = self.quota_message(self.quota_note("codex2")).splitlines()[0]
-        for notice in ("Quota restored: work on claude3 can resume.",
-                       self.quota_message(self.quota_note("codex1"))):
-            with self.subTest(notice=notice.splitlines()[0]):
-                _ = path.write_text(json.dumps({
-                    "claude 3": "Quota alert: claude 3 (unit) at 1% weekly usage left.",
-                    "claude2": "Quota alert: claude2, the active Claude account, has 1% weekly usage left.",
-                    "codex2": codex,
-                }))
-                self.assertEqual(waiting.read_quota_state(path), {"codex2": codex})
-                result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                held = cast(dict[str, object], json.loads(path.read_text()))
-                self.assertNotIn("claude2", held)
-                self.assertNotIn("claude3", held)
-                self.assertNotIn("claude 3", held)
-                self.assertEqual(held["codex2"], codex)
-                self.assertNotIn("held: Quota alert: claude", result.stdout)
-
-    def test_quota_tells_units_to_keep_delegating_on_codex(self) -> None:
-        codex = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("codex1")),
-                                 "--state-dir", str(self.state))
-        self.assertEqual(codex.returncode, 0, codex.stdout + codex.stderr)
-        self.assertIn(f"send {ALPHA}: From the showrunner: keep delegating on Codex:", codex.stdout)
-        self.assertIn("tell the showrunner at once if Codex refuses work for quota", codex.stdout)
-        self.assertNotIn("start no new", codex.stdout)
-
-    def test_quota_reaches_a_live_herdr_unit_by_its_claude_name(self) -> None:
-        native_name = "native-director"
-        fake_unit_host.write(self.env, [
-            fake_unit_host.HostedUnit("native", "w1:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": ALPHA}),
-            fake_unit_host.HostedUnit(BETA, "w2:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": BETA}),
-            fake_unit_host.HostedUnit(GAMMA, "w3:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": GAMMA}),
-        ])
-        path = self.root / "sessions/1.json"
-        record = cast(dict[str, object], json.loads(path.read_text()))
-        fake_unit_host.place_process(self.env, int(str(record["pid"])), "w1:p1")
-        record.update(name=native_name)
-        self.write(path, json.dumps(record))
-        with mock.patch.dict(os.environ, self.env):
-            marked = unit_lookup.marked_units("example")[ALPHA]
-        self.assertEqual(marked.place, herdr.HerdrPlace("native", "w1:p1"))
-        place = subprocess.run(
-            [sys.executable, str(SCRIPT.with_name("unit_lookup.py")), "pane", "example", ALPHA],
-            env=self.env, capture_output=True, text=True, check=False,
-        )
-        self.assertEqual((place.returncode, place.stdout), (0, "herdr:native:w1:p1\n"), place.stderr)
-
-        notice = self.quota_message(self.quota_note("codex1"))
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [native_name, BETA])
-        self.assertIn(f"send {native_name}: From the showrunner: keep delegating on Codex:", result.stdout)
-        native_call = calls[0]
-        text = native_call[native_call.index("--text") + 1]
-        self.assertTrue(text.startswith("From the showrunner: keep delegating on Codex:"), text)
-        self.assertIn("tell the showrunner at once if Codex refuses work for quota", text)
-
-
-    def test_quota_queues_one_unit_collects_failure_and_saves_held_alert(self) -> None:
-        self.add_gamma()
-        send = self.bin_path / "send.py"
-        self.write(send, SEND_OUTCOME_STUB.replace("__PYTHON__", sys.executable))
-        send.chmod(0o755)
-        notice = self.quota_message(self.quota_note("codex1"))
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
+    def test_removed_quota_subcommand_refuses_without_sending(self) -> None:
+        result = self.run_waiting("quota", "--notice", "Codex usage exhausted", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [ALPHA, BETA, GAMMA])
-        self.assertIn(f"send {ALPHA}:", result.stdout)
-        self.assertIn(f"queued {BETA}:", result.stdout)
-        self.assertIn(f"quota: failed — {GAMMA}:", result.stdout)
-        held = cast(dict[str, object], json.loads((self.state / "quota_seen.json").read_text()))
-        self.assertEqual(set(held), {"codex1"})
-
-    def test_quota_reports_a_unit_with_no_claude_running_and_tells_the_others(self) -> None:
-        (self.root / "sessions" / "2.json").unlink()
-        notice = self.quota_message(self.quota_note("codex1"))
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [ALPHA])
-        self.assertIn(f"quota: failed — {BETA}: no Claude is running in its session, so it was not told",
-                      result.stdout)
+        self.assertFalse(self.sends.exists())
+        self.assertEqual(list(self.state.glob("*quota*")), [])
 
     def test_agenda_reports_missing_merge_branch_without_traceback(self) -> None:
         self.write(self.doc, self.doc.read_text(encoding="utf-8").replace(
@@ -1186,26 +948,20 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn("Ask again only if", unmeasured)
         self.assertIn("the command will not repeat the request", unmeasured)
 
-    def test_quota_alert_and_agenda_contracts_keep_every_user_surface(self) -> None:
-        root = SCRIPT.parents[2]
-        produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
-        quota = produce.split("<QuotaAlert>", 1)[1].split("</QuotaAlert>", 1)[0]
-        agenda = produce.split("<Agenda>", 1)[1].split("</Agenda>", 1)[0]
-        agenda_words = " ".join(agenda.split())
-        open_topics = dailies.split("5. **Open topics.**", 1)[1].split("6. **Review watch.**", 1)[0]
 
-        self.assertIn("listed first in every Waiting on block", " ".join(quota.split()))
-        self.assertIn("led by `quota: `", " ".join(quota.split()))
+    def test_agenda_contract_has_no_quota_hold_protocol(self) -> None:
+        root = SCRIPT.parents[2]
+        produce = (root / "commands/showrunner/produce.md").read_text()
+        dailies = (root / "commands/showrunner/dailies.md").read_text()
+        self.assertNotIn("<QuotaAlert>", produce)
+        self.assertNotIn("held quota alerts", dailies)
         nested = " ".join(produce.split("- **Nested showrunners.**", 1)[1].split("- **What reaches the user:**", 1)[0].split())
-        # A lower showrunner's item lives only in its owner's list, so clearing it there is all it takes.
         self.assertIn("never copy a lower showrunner's item into your own `open_for_user`", nested)
         self.assertIn("The root's count drops by itself: send the root nothing to drop it.", nested)
-        self.assertIn("held quota alerts", open_topics)
-        self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda_words)
-        self.assertEqual(agenda_words.count("`For discussion with you`"), 1)
-        self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda_words)
-
+        agenda = " ".join(produce.split("<Agenda>", 1)[1].split("</Agenda>", 1)[0].split())
+        self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda)
+        self.assertEqual(agenda.count("`For discussion with you`"), 1)
+        self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda)
 
 if __name__ == "__main__":
     _ = unittest.main()

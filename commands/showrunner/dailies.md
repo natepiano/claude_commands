@@ -85,7 +85,7 @@ Read the current state, not memory, and check what you state the way
    shows a suggestion dimmed (`\e[2m`) on both hosts.
 4. **Merge branch.** The input builder reads the last merge and whether the
    branch is pushed. Supply anything held or testing in the judgment file.
-5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,
+5. **Open topics.** Everything in `LOG` not yet closed: CI,
    defects routed between units, gates, and items waiting on the user.
 6. **Review watch.** The input builder runs `review_regime.py watch` and adds
    its line as a topic until it prints `acknowledged`; exit 3 sets

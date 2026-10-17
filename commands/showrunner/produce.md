@@ -123,7 +123,7 @@ State:
   have a natural home under an L1".
   - **A child showrunner is never a unit.** It has no Units row, and you never
     merge its branch, type into its pane or type into its units' panes.
-  - **A broadcast** (a build hold, a quota alert, an announcement) already
+  - **A broadcast** (a build hold, an announcement) already
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
   - **The user's words for a production below you** go to your child that
@@ -193,7 +193,6 @@ State:
   - anything that cannot be undone;
   - a block that waits on the user, and a step only they can run;
   - a fault they would see;
-  - a quota alert (<QuotaAlert/>);
   - the discussion agenda (<Agenda/>).
 
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
@@ -259,7 +258,7 @@ State:
   director answered without a time, message it yourself, because
   the command will not repeat the request. Report `none measured - requested`
   until it answers.
-- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. A held quota alert comes next, led by `quota: ` (<QuotaAlert/>). Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
+- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
 - **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
   footer --production PRODUCTION_DOC` for the footer, adding
   `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
@@ -507,7 +506,7 @@ script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minute
 that report (`/showrunner:dailies` → Status check and clock).
 `/showrunner:report_interval <minutes>` changes N.
 
-Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
+Log `UPDATES` and its `next_due`.
 
 Each run of the script does two things:
 - It scans every unit director for a form or decision waiting on the user.
@@ -533,7 +532,6 @@ whatever arrived:
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
 | a unit director's decision only the user can settle | show it to the user; relay the answer |
-| a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
@@ -1156,12 +1154,6 @@ back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
 process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
 each in your session.
 </PauseForMove>
-
-<QuotaAlert>
-Read `~/.claude/docs/quota_alerts.md` at <StartUpdates/>. Relay only Codex notices through `python3 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR --notice "<full notice>"`.
-
-Codex notices that say nothing switched keep delegation on Codex; report a quota refusal at once. A move to Claude continues delegation there. Held Codex alerts are listed first in every Waiting on block, led by `quota: `, until restored; restoration resumes delegation and drops them. Claude has no session quota relay: `/next_moves` controls its one-shot group moves, and an uncovered low account gets one phone reminder.
-</QuotaAlert>
 
 ---
 

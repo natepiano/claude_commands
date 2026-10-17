@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude gets one phone reminder when a low account lacks a next-move entry.
 
-Codex retains its refusal, zero and restoration notices and worker fallback paths.
+Codex refusal reruns reach only the stopped command's director; other notices are logged.
 Failed phone delivery stays due until the next timer pass. Claude recovery closes
 its episode silently; /quota_refresh still refreshes readings.
 """
@@ -283,7 +283,6 @@ class CreditsOffHold:
     until: datetime
 
 
-
 @dataclass(frozen=True)
 class ScheduledMoveHold:
     """A requested Claude route lasts until this source account's weekly reset."""
@@ -343,10 +342,9 @@ class CodexZeroEpisode(TypedDict):
     weekly_reset: str
     credits: Literal["on", "off"]
     phone: str
-    sessions: str
     forecast_at: str
     forecast_phone: NotRequired[str]
-    # Keep failed phone retries identical to the text already relayed.
+    # Keep failed phone retries identical to the opening notice.
     notice: ZeroEpisodeNotice
     forecast_notice: NotRequired[ZeroEpisodeNotice]
 
@@ -462,7 +460,6 @@ class NoCodexFallbackRestoration:
 
 
 CodexFallbackRestoration = NoCodexFallbackRestoration | SwitchBack
-NO_CODEX_FALLBACK_RESTORATION = NoCodexFallbackRestoration()
 
 
 class AgentNote(Protocol):
@@ -530,23 +527,8 @@ def showrunners_now() -> list[Showrunner]:
         return []
 
 
-def not_live(names: list[str]) -> list[str]:
-    """Those of `names` that no live session is called now. A lookup that cannot say leaves a name out."""
-    missed: list[str] = []
-    for name in names:
-        try:
-            if socket_for(name) is None:
-                missed.append(name)
-        except OSError:
-            continue
-    return missed
-
-
 def recipients(config: Config, here: str | None = None) -> list[str]:
-    """The configured names, offline or not, then each running showrunner by its name now.
-
-    A showrunner that is not running has no name to send to; it hears the next repeat after it resumes.
-    """
+    """Recipients for Claude five-hour and Claude no-room notices, excluding the caller."""
     names = [*config["always"], *(runner["session"] for runner in showrunners_now() if runner["session"])]
     return list(dict.fromkeys(name for name in names if name != here))
 
@@ -622,12 +604,6 @@ def low(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
     return [note for note in notes
             if note_file.in_use(note) and ahead(note.get("resets"))
             and (value := remaining(note)) is not None and value <= threshold]
-
-
-def usable(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
-    """Notes in use known to be above the threshold."""
-    return [note for note in notes
-            if note_file.in_use(note) and (value := remaining(note)) is not None and value > threshold]
 
 
 def recovered(name: str, notes: list[AgentNote], threshold: float,
@@ -914,52 +890,10 @@ def _readings_after_restoration(readings: CodexAlertPassReadings, back: CodexFal
     return readings
 
 
-def account_line(note: AgentNote, threshold: float, selection: ClaudeAccountsInUse) -> str:
-    roles = claude_roles(note, selection)
-    if note.tool == "claude" and selection.multiple_accounts:
-        return (f"{note.label} ({', '.join(roles) or 'spare'}) at {percent(note)} of its weekly "
-                + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
-    return (f"{note.label}, the active {note.tool.capitalize()} account, has {percent(note)} of its weekly "
-            + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
-
-
 def claude_roles(note: AgentNote, selection: ClaudeAccountsInUse) -> tuple[str, ...]:
     """Roles come from the account configuration written on the note."""
     del selection
     return note.get_list("role") if note.tool == "claude" else ()
-
-
-def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAccountsInUse) -> str:
-    """Forecast each group's destination and the destination for ungrouped owners."""
-    from scripts.accounts import accounts
-
-    login = (note.get("login") or "").casefold()
-    excluded = {named.label for named in selection.named_accounts if named.identity.login.casefold() == login}
-    if selection.is_home_directory_login(login):
-        home = selection.home_directory_account
-        if isinstance(home, agent_accounts.NumberedAccount):
-            excluded.add(home.label)
-    excluded.update(accounts.account_labels_for_logins(frozenset({login})))
-    now = datetime.now(timezone.utc)
-    destinations = [accounts.placement(group, now, exclude=frozenset(excluded))
-                    for group in accounts.CLAUDE_GROUPS]
-    selected = accounts.pick("claude", now, exclude=frozenset(excluded), keep=accounts.NoKeep())
-    label = note.label
-
-    def no_room(outcome: accounts.NoAccountWithRoom) -> str:
-        reset = outcome.earliest_reset
-        time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, accounts.EarliestReset) else "an unknown reset"
-        return f"no other account has room until {time}"
-
-    if isinstance(selected, accounts.NoAccountWithRoom) and all(
-            isinstance(destination.reason, accounts.GroupNoRoom) for destination in destinations):
-        return f"{label} is low; {no_room(selected)}"
-    forecasts = [f"{destination.group}: " + (no_room(destination.reason.outcome)
-                 if isinstance(destination.reason, accounts.GroupNoRoom) else f"move to {destination.label}")
-                 for destination in destinations]
-    forecasts.append("ungrouped sessions: " + (f"move to {selected.label}"
-        if isinstance(selected, accounts.PickedAccount) else no_room(selected)))
-    return f"{label} is low; when refused, " + "; ".join(forecasts)
 
 
 def credit_line(note: AgentNote) -> str:
@@ -972,14 +906,6 @@ def credit_line(note: AgentNote) -> str:
         return f"Credits left on {name}: {float(balance or ''):,.0f}."
     except ValueError:
         return f"No credit balance is reported for {name}."
-
-
-def user_time(stamp: str | None) -> str:
-    """A machine-local note time rendered in the user's zone."""
-    try:
-        return datetime.fromisoformat(stamp or "").astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
-    except ValueError:
-        return "an unknown time"
 
 
 def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> QuotaNotice:
@@ -1002,7 +928,6 @@ def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> Qu
         return QuotaStatusNote(note.label, "what happens next is set up")
     return UserPush(note.label, render("quota.claude_next_move", account=note.label,
                                       remaining=percent(note)))
-
 
 
 def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODEX_QUOTA_FALLBACK,
@@ -1045,7 +970,6 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
     return UserPush(note.label, render("quota.codex_next_move", account=note.label,
                                       remaining=percent(note), fallback=destination,
                                       outcome_title=outcome_title, outcome_body=outcome_body))
-
 
 
 @dataclass(frozen=True)
@@ -1178,16 +1102,6 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
     return WorkersNextMovePass(readings, history)
 
 
-def run_out_push(note: AgentNote, selection: ClaudeAccountsInUse, notes: list[AgentNote]) -> QuotaNotice:
-    """The actionable push or log note when this account's episode opens."""
-    del notes
-    if note.tool == "claude":
-        return claude_next_move_push(note, selection)
-    first = (f"The {note.label} account has {percent(note)} weekly usage left. "
-             + f"It refills {user_time(note.get('resets'))}.")
-    return QuotaStatusNote(note.label, f"{first} Codex keeps working on its credits. {credit_line(note)}")
-
-
 def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> QuotaNotice:
     """The one direct user message sent when Codex refuses this episode."""
     from push_texts import render
@@ -1204,77 +1118,6 @@ def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None
     if not isinstance(switch, NoCodexQuotaFallback) or not failed:
         return QuotaStatusNote(name, f"Codex refused work on {name}. {credits} {outcome}.")
     return UserPush(name, render("quota.codex_refused", account=name))
-
-
-def instruction(tool: str, switch: CodexQuotaFallback, failed: str | None) -> str:
-    """What the alert asks of its recipient, given the switch to Claude made or refused."""
-    if tool == "Claude":
-        return "Set up what happens next with natedev; Claude groups move through the next-move log."
-    refused = f"The automatic switch from {tool} to Claude failed: {failed} " if failed else ""
-    if isinstance(switch, NoCodexQuotaFallback) and tool == "Codex" and not failed:
-        return ("Its weekly allowance is used up or nearly so, and Codex may keep working on the account's credits, "
-                + "so nothing was switched to Claude: keep delegating Codex work. Bring this to your user, and if "
-                + "Codex refuses work for quota, bring that to them at once.")
-    if isinstance(switch, NoCodexQuotaFallback):
-        return (f"{refused}Bring this to your user, and if you delegate {tool} work, start no new {tool} work "
-                + 'until a "Quota restored:" notice.')
-    return (f"{refused}Every function that ran on {tool} ({', '.join(switch.moved)}) was moved to Claude at "
-            + f"{switch.at}, so delegation continues on Claude with no pause; {tool} work already in flight may "
-            + 'fail and should be run again. They move back with the "Quota restored:" notice. Bring this to your '
-            + "user.")
-
-
-def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: CodexQuotaFallback = NO_CODEX_QUOTA_FALLBACK,
-            failed: str | None = None, *,
-            selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
-            codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
-            now: datetime | None = None) -> str:
-    selection = _selection(selection)
-    name = note.label
-    tool = note.tool.capitalize()
-    lines = [f"Quota alert: {account_line(note, config['threshold_percent'], selection)}"]
-    if note.tool == "claude":
-        lines.append(unit_swap_line(note, notes, selection))
-    if note.tool == "codex":
-        lines.append(credit_line(note))
-        readings = resolve_codex_readings(codex_readings)
-        swap_line = codex_swap_line(readings, now or datetime.now(timezone.utc))
-        if swap_line:
-            lines.append(swap_line)
-        # Only a Codex count is read live; a Claude note's count is never stated.
-        count = note.get("limit_reset_count")
-        if count and count != "null":
-            lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
-    for other in notes:
-        if other.tool == note.tool and other.path != note.path:
-            lines.append(f"{other.label}: role {', '.join(other.get_list('role')) or 'none'}, {other.get('sessions') or '0'} live sessions, {percent(other)} weekly usage left, "
-                         + f"resets {other.get('resets')}.")
-    guidance = instruction(tool, switch, failed)
-    lines += ["", f"{guidance} It repeats every {config['repeat_minutes']:g} minutes until quota recovers.",
-              f"Protocol: {PROTOCOL}. Read from {note.path}, checked {note.get('weekly_usage_checked_at')}. Sent by "
-              + f"{Path(__file__)} to the sessions in {CONFIG}."]
-    lines += [f"{missed}, which {CONFIG} names to always get this alert, is not a live session and has not seen it."
-              for missed in not_live(config["always"])]
-    return "\n".join(lines)
-
-
-def restored_message(accounts: list[AgentNote], reason: str, threshold: float,
-                     back: CodexFallbackRestoration = NO_CODEX_FALLBACK_RESTORATION, *,
-                     selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> str:
-    selection = _selection(selection)
-    tools = " and ".join(sorted({note.tool.capitalize() for note in accounts}))
-    names = ", ".join(note.label for note in accounts)
-    first = (f"Quota restored: work on {names} can resume; {reason}."
-             if selection.multiple_accounts and any(note.tool == "claude" for note in accounts)
-             else f"Quota restored: delegation on {tools} can resume; {reason}.")
-    return "\n".join([
-        first,
-        *(account_line(note, threshold, selection) for note in accounts),
-        *([f"The automatic switch is undone: {back.describe()}."] if isinstance(back, SwitchBack) else []),
-        "",
-        "Resume work you paused for a quota alert on these accounts, and drop any held copies of those alerts.",
-        f"Protocol: {PROTOCOL}. Sent by {Path(__file__)}.",
-    ])
 
 
 def relay(recipient: str, text: str, key: str | None) -> str | None:
@@ -1569,7 +1412,6 @@ def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroE
     return ZeroEpisodeNotice(id="quota.codex_credits_forecast", values={"account": label, "horizon": horizon, "forecast": forecast, "destination": destination})
 
 
-
 def _current_notice(label: str, notice: ZeroEpisodeNotice) -> ZeroEpisodeNotice:
     """Keep a pending delivery's facts while updating its account note filename."""
     values = dict(notice["values"])
@@ -1581,10 +1423,11 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice) -> ZeroEpisodeNotice:
 def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: datetime) -> list[str]:
     from push_texts import render
 
+    del config
+
     identity = readings.selected_account
     report = selected_codex_report(readings, now)
     stamp = now.isoformat(timespec="seconds")
-    jobs: list[Job] = []
     pushes: list[tuple[QuotaNote, Literal["phone", "forecast_phone"], str]] = []
     log: list[str] = []
     warnings: set[str] = set()
@@ -1623,10 +1466,9 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             notice = _zero_open_notice(label, report, credits, now, state=state, owner=identity)
             episodes[label] = CodexZeroEpisode(since=stamp, weekly_reset=reset.isoformat(),
                 credits="off" if isinstance(credits, agent_accounts.CreditsOff) else "on",
-                phone="due", sessions=stamp, forecast_at=stamp, notice=notice)
+                phone="due", forecast_at=stamp, notice=notice)
             rendered = render(notice["id"], **notice["values"])
-            jobs += [Job(label, recipient, f"{rendered.title}\n{rendered.body}", "zero")
-                     for recipient in recipients(config)]
+            log.append(f"quota zero {label}: {rendered.title}\n{rendered.body}")
         episode = episodes[label]
         setting = agent_accounts.codex_credits_setting(label)
         if at_zero and episode["credits"] == "on" and isinstance(setting, agent_accounts.CreditsOff):
@@ -1645,8 +1487,7 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
         if at_zero and episode["credits"] == "on" and now - datetime.fromisoformat(episode["forecast_at"]) >= timedelta(hours=1):
             notice = _credits_forecast_notice(label, report, now)
             rendered = render(notice["id"], **notice["values"])
-            jobs += [Job(label, recipient, f"{rendered.title}\n{rendered.body}", "credits forecast")
-                     for recipient in recipients(config)]
+            log.append(f"quota credits forecast {label}: {rendered.title}\n{rendered.body}")
             episode["forecast_at"] = stamp
             if "forecast_phone" not in episode:
                 episode["forecast_phone"] = "due"
@@ -1655,7 +1496,6 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             notice = _current_notice(label, episode["forecast_notice"])
             episode["forecast_notice"] = notice
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "forecast_phone", episode["since"]))
-    log += deliver_and_record(jobs, stamp)
     for push, field, since in pushes:
         delivery = tell_user(push.rendered)
         with state_file() as state:
@@ -1673,7 +1513,6 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
     stamp = now.isoformat(timespec="seconds")
     config = load_config()
     threshold = config["threshold_percent"]
-    jobs: list[Job] = []
     pushes: list[UserPush] = []
     workers_pass = _workers_next_move_pass(codex_readings, now)
     workers_history = workers_pass.history
@@ -1681,9 +1520,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
     log = _codex_zero_alert(config, codex_readings, now)
     with state_file() as state:
         episodes = state["episodes"]
-        # A zero episode has always closed silently, including at its reset.
-        silent_codex_episodes = {name for name, episode in episodes.items() if episode.get("reached_zero")}
-        closed = close_recovered(state, notes, threshold, selection, now, codex_readings)
+        _ = close_recovered(state, notes, threshold, selection, now, codex_readings)
         back = switch_back(state, now, codex_readings)
         codex_readings = _readings_after_restoration(codex_readings, back)
         for note in [*low([note for note in notes if note.tool != "codex"], threshold),
@@ -1711,34 +1548,9 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     log.append(f"quota status {name}: {push.text}")
     if isinstance(back, SwitchBack):
         log.append(f"switch to claude undone: {back.describe()}")
-        identity = codex_readings.selected_account
-        if isinstance(identity, agent_accounts.KnownCodexAccount):
-            selected_notes = [note for note in notes if note.tool == "codex"
-                              and (note.get("login") or "").casefold() == identity.login.casefold()]
-            text = restored_message(selected_notes, f"{identity.label} can work on allowance or credits",
-                                    threshold, back, selection=selection)
-            jobs += [Job(identity.label, recipient, text, "restored") for recipient in recipients(config)]
-    for name in closed:
-        if name in silent_codex_episodes:
-            continue
-        parsed_label = note_file.parse_account_label(name)
-        tool = parsed_label.tool if isinstance(parsed_label, note_file.NumberedAccountLabel) else name
-        accounts = [note for note in usable(notes, threshold) if note.tool == tool]
-        if tool == "codex" or tool == "claude" and selection.multiple_accounts:
-            accounts = [note for note in notes if note.label == name]
-        if (tool == "codex" and isinstance(back, SwitchBack)
-                and isinstance(codex_readings.selected_account, agent_accounts.KnownCodexAccount)
-                and name == codex_readings.selected_account.label):
-            continue
-        if accounts and tool != "claude":
-            text = restored_message(accounts, f"the {name} alert is closed", threshold,
-                                    back if tool == "codex" else NoCodexFallbackRestoration(), selection=selection)
-            jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
     with ThreadPoolExecutor() as pool:
-        relay_future = pool.submit(deliver_and_record, jobs, stamp)
         push_futures = [pool.submit(tell_user, push.rendered) for push in pushes]
         push_deliveries = [future.result() for future in push_futures]
-        relay_log = relay_future.result()
     if pushes:
         with state_file() as state:
             for push, delivery in zip(pushes, push_deliveries):
@@ -1747,7 +1559,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     episode["push"] = stamp
                 outcome = "sent" if isinstance(delivery, PushSent) else f"not delivered: {delivery.why}"
                 log.append(f"quota push {push.name} -> user: {outcome}")
-    return log + relay_log
+    return log
 
 
 @dataclass
@@ -1799,10 +1611,24 @@ REFUSAL_TIME_UNKNOWN = RefusalTimeUnknown()
 @dataclass(frozen=True)
 class FallbackRefusalDelivery:
     lines: list[str]
-    text: str
     quota_notice: QuotaNotice
     notice: KnownRefusalNotice
     failures_to_stamp: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StoppedWorkerCommand:
+    session_id: str
+    worker: str
+    command: str
+
+
+@dataclass(frozen=True)
+class StoppedCommandUnknown:
+    """The refusal did not stop a command with a known director."""
+
+
+STOPPED_COMMAND_UNKNOWN = StoppedCommandUnknown()
 
 
 def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCodexAccount,
@@ -1810,17 +1636,34 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
             window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
+            refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN,
+            stopped: StoppedWorkerCommand | StoppedCommandUnknown = STOPPED_COMMAND_UNKNOWN) -> list[str]:
+    log: list[str] = []
+    if isinstance(stopped, StoppedWorkerCommand):
+        text = (f"Codex refused work for quota. Worker {stopped.worker} stopped: {stopped.command}\n"
+                + "Rerun this command on Claude.")
+        error = relay(f"session:{stopped.session_id}", text, None)
+        outcome = f"not delivered: {error}" if error else "sent"
+        log.append(f"quota rerun {stopped.worker} -> {stopped.session_id}: {outcome}")
+    return log + _route_refusal(notes, refusing_account, now, selection=selection,
+                                codex_readings=codex_readings, window=window, refused_at=refused_at)
+
+
+def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCodexAccount,
+            now: datetime | None = None, *,
+            selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
+            codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
+            window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
             refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN) -> list[str]:
     """A provider refusal waits briefly, moves workers, or opens the Claude fallback."""
     from scripts.accounts import accounts
-    selection = _selection(selection)
+    del selection
     readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
     refusal_time = refused_at.at if isinstance(refused_at, RefusedAt) else now
     _save_codex_readings(readings, now)
     _finish_workers_transitions(now)
     stamp = now.isoformat(timespec="seconds")
-    config = load_config()
     home = str(refusing_account.home)
     if isinstance(refusing_account, agent_accounts.UnknownCodexAccount):
         with state_file() as state:
@@ -1831,8 +1674,7 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             notices[home] = UnknownRefusalNotice(kind="unknown")
         text = (f"Codex refused work for quota at {home}; refusing account unknown: "
                 + f"{refusing_account.reason}. Nothing switched to Claude.")
-        return [text, *deliver_and_record(
-            [Job("", recipient, text, "refusal") for recipient in recipients(config)], stamp)]
+        return [text]
     name = refusing_account.label
     reading = refusals.stored_reading("codex", refusing_account.login, now)
     window = _refusal_window(window, _reading_for_account(readings, refusing_account, now), refusal_time)
@@ -1927,8 +1769,6 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             failed = None
             if owns_role:
                 failed = notice.get("switch_failed") or (episode.get("switch_failed") if episode is not None else None)
-                text = message(note, notes, config, fallback, failed,
-                               selection=selection, codex_readings=readings, now=now) + "\n" + no_room
                 push = refusal_push(note, fallback, failed, already)
             else:
                 text = f"Codex refused work on {name}, {account_status}. Nothing switched to Claude."
@@ -1937,18 +1777,13 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
                     log.append(f"quota status {status.name}: {status.text}")
                     notice["push"] = stamp
                 return log
-            swap_line = codex_swap_line(readings, now)
-            if swap_line:
-                text += "\n" + swap_line
             new_failure = owns_role and not already and failed is not None and failed not in notice.get("failure_pushes", [])
             if not moved and not new_failure and ("push" in notice or episode is not None and "refusal_push" in episode):
                 return log
-            delivery = FallbackRefusalDelivery(log, text, push, notice, (failed,) if failed is not None else ())
+            delivery = FallbackRefusalDelivery(log, push, notice, (failed,) if failed is not None else ())
     if isinstance(delivery, WorkersTransitionDelivery):
-        return [delivery.text, *deliver_and_record(
-            [Job(name, recipient, delivery.text, "refusal") for recipient in recipients(config)], stamp)]
+        return [delivery.text]
     log = delivery.lines
-    log += deliver_and_record([Job(name, recipient, delivery.text, "refusal") for recipient in recipients(config)], stamp)
     quota_notice = delivery.quota_notice
     if isinstance(quota_notice, QuotaStatusNote):
         log.append(f"quota status {quota_notice.name}: {quota_notice.text}")
@@ -1972,11 +1807,8 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
 def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = None, *,
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
-    """After the user reports a reset: close what recovered, alert what is still low, tell the others.
-
-    The notice goes out even when the timer already closed the episode, since that
-    is the case where nothing else has told anyone.
-    """
+    """Refresh readings and restore routing without messaging sessions."""
+    del here
     selection = _selection(selection)
     codex_readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
@@ -1991,16 +1823,7 @@ def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = Non
     lines += _alert_for_saved_readings(notes, now, selection, codex_readings)
     lines += [f"{note.label}: {percent(note)} left, resets {note.get('resets')}"
               for note in notes if note_file.in_use(note)]
-    accounts: list[AgentNote] = []
-    report = selected_codex_report(codex_readings, now)
-    identity = codex_readings.selected_account
-    if isinstance(identity, agent_accounts.KnownCodexAccount) and isinstance(codex_can_work(report, now, agent_accounts.codex_credits_setting(identity.label)), CodexWorkAvailable):
-        accounts += [note for note in notes if note.tool == "codex"
-                     and (note.get("login") or "").casefold() == identity.login.casefold()]
-    if not accounts:
-        return [*lines, "no active account is above the threshold; nothing announced"]
-    reason = "the user reported a usage reset and the notes were refreshed"
-    return lines + tell_others(restored_message(accounts, reason, threshold, back, selection=selection), here)
+    return [*lines, "notes refreshed; nobody was told"]
 
 
 def current_session() -> str | None:
@@ -2017,14 +1840,6 @@ def current_session() -> str | None:
         except ValueError:
             return None
     return None
-
-
-def tell_others(text: str, here: str | None) -> list[str]:
-    """Echo a user's act to every configured session except `here`, the one it was done in."""
-    others = recipients(load_config(), here)
-    errors = deliver([Job("", recipient, text, "echo") for recipient in others])
-    return [f"told {recipient}" if error is None else f"could not tell {recipient}: {error}"
-            for recipient, error in zip(others, errors)]
 
 
 def notice(here: Callable[[], str | None] = current_session) -> str | None:
