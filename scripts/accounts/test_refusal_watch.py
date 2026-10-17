@@ -292,6 +292,73 @@ class RefusalWatchTests(unittest.TestCase):
                    for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual([saved["why"] for saved in history], ["auto: units-low", "operator return"])
 
+    def test_failed_consumption_cannot_replay_a_recorded_move_when_role_history_becomes_malformed(self) -> None:
+        path = self.groups()
+        entry = self.low_rule()
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(next_moves, "write_next_moves", side_effect=OSError("injected log replacement failure")) as write:
+            try:
+                _ = self.cli()
+            except OSError:
+                pass
+        write.assert_called_once()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        history = accounts.roles_history_file()
+        recorded = history.read_text()
+        malformed = recorded + "not JSON\n"
+        _ = history.write_text(malformed)
+        for _ in range(2):
+            code, output, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(len([line for line in output.splitlines()
+                                  if "cannot read recorded auto moves" in line]), 1)
+            self.assertEqual(stored_group_labels(path)["units"], "claude1")
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+            self.assertEqual(history.read_text(), malformed)
+        rows = [cast(dict[str, object], json.loads(line)) for line in recorded.splitlines()]
+        self.assertEqual([row["why"] for row in rows], [f"auto: {entry.id}", "operator return"])
+        # Once the journal is readable, reconcile consumption without replaying the move.
+        _ = history.write_text(recorded)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(history.read_text(), recorded)
+
+    def test_unreadable_role_history_reports_once_and_leaves_all_log_entries_untouched(self) -> None:
+        read_text = Path.read_text
+        for problem in ("permission", "malformed", "encoding"):
+            with self.subTest(problem=problem):
+                path = self.groups()
+                entry = self.low_rule(f"units-{problem}")
+                skipped = self.low_rule(f"runner-{problem}", group="showrunners", target="claude3")
+                self.next_entries(entry, skipped)
+                self.reading(SOURCE_LOGIN, 1)
+                history = accounts.roles_history_file()
+                # A valid prefix is insufficient evidence when the rest cannot be decoded.
+                prefix = json.dumps({"cause": "auto", "group": "showrunners", "why": f"auto: {skipped.id}"}) + "\n"
+                original = prefix.encode() + (b"not JSON\n" if problem == "malformed" else
+                                              b"\xff\n" if problem == "encoding" else b"")
+                _ = history.write_bytes(original)
+
+                def read_with_failure(file: Path, encoding: str | None = None,
+                                      errors: str | None = None) -> str:
+                    if file == history and problem == "permission":
+                        raise PermissionError("fixture history unreadable")
+                    return read_text(file, encoding=encoding, errors=errors)
+
+                with patch.object(Path, "read_text", read_with_failure):
+                    code, output, error = self.cli()
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertEqual(len([line for line in output.splitlines()
+                                          if "cannot read recorded auto moves" in line]), 1)
+                    self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                    self.assertEqual(next_moves.read_next_moves(), (entry, skipped))
+                self.assertEqual(history.read_bytes(), original)
+
     def test_legacy_reset_state_is_ignored_and_dropped_on_the_next_watch_write(self) -> None:
         path = self.groups()
         state_file = self.home / ".local/state/accounts/refusal_watch.json"

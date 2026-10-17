@@ -1518,9 +1518,33 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** consuming an entry only through the log write (an interrupted write replayed a recorded move once the group came back); a reminder for an account used only by ungrouped sessions (no entry could silence it).
 
-### Phase 53 — What happens next for Codex workers  · status: todo
+### Phase 53 — A self-targeting entry no longer silences the reminder  · status: done
 
 **Depends on:** Phase 52
+
+#### Work Order
+
+**Goal:** fix two defects the Phase 52 review found. The 2% Claude phone reminder must count only entries that can run, and an unreadable role history must not stop the watcher's run.
+
+**Constraints from prior phases:** Phase 52's `next_moves.py` log, `quota_alert.py` reminder (`quota.claude_next_move`) and `refusal_watch.py` engine. The engine skips an entry whose `to` is the group's current account (`source_label == rule.to`). `_recorded_auto_move_ids` reads `roles.jsonl` to stop a replay after an interrupted log write. Tests never touch live directories or config, never run ssh, and never read a real keychain, process or credential file.
+
+**Spec:**
+1. **Cover counts only runnable entries.** In `quota_alert.py` (the `covered` set near :951), an entry covers a group only when its `to` differs from the low account. An entry targeting the low account itself leaves the group uncovered, so the reminder is sent. Regression: units on claude2 with only "units → claude2" in the log, claude2 at 2%: one reminder.
+2. **Unreadable role history.** When `roles.jsonl` cannot be read or parsed, `_recorded_auto_move_ids` (refusal_watch.py:804–825) prints one diagnostic line and returns no recorded ids for that run, so the group pass and the rest of the watcher still run, and no entry is consumed on that evidence. Regression: an unreadable history leaves the watcher exit 0, prints the diagnostic, and moves nothing twice.
+
+**Files:**
+- `scripts/whoami/quota_alert.py`
+- `scripts/accounts/refusal_watch.py`
+- `scripts/whoami/test_quota_alert.py`
+- `scripts/accounts/test_refusal_watch.py`
+
+**Workers:** `impl` owns the two production files; `test` owns the two test files.
+
+**Acceptance gate:** both regressions; account and whoami suites pass on natedev and the Mac; the merge gate is green.
+
+### Phase 54 — What happens next for Codex workers  · status: todo
+
+**Depends on:** Phase 53
 
 #### Work Order
 

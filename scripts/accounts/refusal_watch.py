@@ -801,14 +801,20 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     return lines
 
 
-def _recorded_auto_move_ids() -> frozenset[str]:
+@dataclass(frozen=True)
+class UnreadableAutoMoveHistory:
+    """Replay protection is unavailable, so no log entry may run this pass."""
+
+
+def _recorded_auto_move_ids() -> frozenset[str] | UnreadableAutoMoveHistory:
     """Recorded choices consume their entries even if log removal was interrupted."""
     try:
         lines = accounts.roles_history_file().read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return frozenset()
-    except OSError as error:
-        raise next_moves.NextMoveError("auto: cannot read recorded group moves") from error
+    except (OSError, ValueError) as error:
+        print(f"next moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
     consumed: set[str] = set()
     try:
         for line in lines:
@@ -821,7 +827,8 @@ def _recorded_auto_move_ids() -> frozenset[str]:
                     and isinstance(why, str) and why.startswith("auto: ")):
                 consumed.add(why.removeprefix("auto: "))
     except ValueError as error:
-        raise next_moves.NextMoveError("auto: cannot decode recorded group moves") from error
+        print(f"next moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
     return frozenset(consumed)
 
 
@@ -835,10 +842,13 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
     lines = [rule.reason for rule in configured if isinstance(rule, MalformedAutoMoveRule)]
     if not rules:
         return lines
+    recorded = _recorded_auto_move_ids()
+    if isinstance(recorded, UnreadableAutoMoveHistory):
+        return lines
     state = _load_state()
     original = deepcopy(state)
     holds = state.get("auto_move_holds", {})
-    consumed = _recorded_auto_move_ids() & {rule.name for rule in rules}
+    consumed = recorded & {rule.name for rule in rules}
     if consumed:
         rules = [rule for rule in rules if rule.name not in consumed]
         for entry_id in consumed:

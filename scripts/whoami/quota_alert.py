@@ -948,7 +948,7 @@ def claude_next_move_push(note: AgentNote, selection: ClaudeAccountsInUse) -> Qu
     if not groups:
         return QuotaStatusNote(note.label, "no Claude group uses this account")
     try:
-        covered = {entry.group for entry in next_moves.read_next_moves()}
+        covered = {entry.group for entry in next_moves.read_next_moves() if entry.to != note.label}
     except next_moves.NextMoveError as error:
         return QuotaStatusNote(note.label, str(error))
     if groups <= covered:

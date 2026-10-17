@@ -333,6 +333,18 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(len(self.noted), 2)
         self.assertEqual(self.sent, [])
 
+    def test_self_targeting_entry_does_not_silence_the_two_percent_claude_reminder(self) -> None:
+        config = quota_alert.load_config()
+        config["threshold_percent"] = 2
+        _ = quota_alert.CONFIG.write_text(json.dumps(config))
+        entry = next_moves.add_next_move("units", 1, "claude2")
+        note = self.note("claude2.md", "active", "2")
+        for minute in (0, 2, 32):
+            _ = self.alert([note], self.now + timedelta(minutes=minute))
+        self.assertEqual([push.values["account"] for push in self.noted], ["claude2"])
+        self.assertEqual((self.sent, self.pushed), ([], []))
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+
     def test_claude_account_used_only_by_ungrouped_sessions_sends_no_phone_reminder(self) -> None:
         note = self.note("claude2.md", "inactive", "1")
         _ = note.path.write_text(note.path.read_text().replace("sessions: 0", "sessions: 2"))
