@@ -1044,6 +1044,49 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.open_pane("fixture", "worker", "/repo", {"SHOWRUNNER_UNIT": "prod", "CLAUDE_CONFIG_DIR": "/account"}), "pane-1")
         self.assertEqual(self.commands(), [["--session", "fixture", *arguments], ["--session", "fixture", "pane", "rename", "pane-1", "worker"]])
 
+    def share(self) -> None:
+        folder = self.root / "config/herdr"
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = (folder / "shared-session").write_text("fixture\n")
+
+    def test_shared_session_is_empty_until_named(self) -> None:
+        self.assertEqual(herdr.shared_session(), "")
+        self.share()
+        self.assertEqual(herdr.shared_session(), "fixture")
+
+    def test_open_tab_creates_the_production_workspace_once_then_adds_tabs(self) -> None:
+        options = ["--label", "prod", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
+        self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
+            "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
+        self.assertEqual(herdr.open_tab("fixture", "prod", "prod-showrunner", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
+        self.assertEqual(self.commands()[1:], [["--session", "fixture", "workspace", "create", *options],
+                                               ["--session", "fixture", "tab", "rename", "w1:t1", "prod-showrunner"],
+                                               ["--session", "fixture", "pane", "rename", "w1:p1", "prod-showrunner"]])
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "prod"}]}}))
+        tab = ["tab", "create", "--workspace", "w1", "--label", "alpha", "--cwd", "/wt", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
+        self.configure_herdr(tab, json.dumps({"result": {"root_pane": {"pane_id": "w1:p2"}}}))
+        self.assertEqual(herdr.open_tab("fixture", "prod", "alpha", "/wt", {}), "w1:p2")
+        self.assertEqual(self.commands()[-2:], [["--session", "fixture", *tab],
+                                                ["--session", "fixture", "pane", "rename", "w1:p2", "alpha"]])
+
+    def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
+        self.share()
+        with self.assertRaisesRegex(herdr.HerdrFailure, "close one tab instead"):
+            herdr.stop_session("fixture")
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
+        herdr.close_agent("fixture", "w1:p2")
+        self.assertEqual(self.commands()[-1], ["--session", "fixture", "tab", "close", "w1:t2"])
+        self.assertNotIn(["--session", "fixture", "server", "stop"], self.commands())
+
+    def test_close_tab_labelled_closes_the_named_tab(self) -> None:
+        self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "prod"}, {"tab_id": "w2:t3", "label": "alpha"}]}}))
+        self.herdr.close_tab_labelled("alpha")
+        self.assertEqual(self.commands()[-1], ["--session", "fixture", "tab", "close", "w2:t3"])
+        self.assertEqual(self.herdr.tab_labels(), ["prod", "alpha"])
+
     def test_focus_workspace_targets_the_named_session_and_reports_refusal(self) -> None:
         self.herdr.focus_workspace("w3")
         self.assertEqual(self.commands(), [["--session", "fixture", "workspace", "focus", "w3"]])

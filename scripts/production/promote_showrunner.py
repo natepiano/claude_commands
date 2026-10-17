@@ -164,7 +164,7 @@ def stop(promotion: Promotion) -> bool:
             return False
         time.sleep(POLL_S)
     try:
-        herdr.stop_session(place.session)
+        herdr.close_agent(place.session, place.pane)
     except HerdrFailure as error:
         raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
     return True
