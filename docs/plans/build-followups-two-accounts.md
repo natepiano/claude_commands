@@ -1606,7 +1606,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** relaying zero, forecast, refusal, restore or Codex 5-hour notices to showrunners.
 
-### Phase 56 — A finished continuation sends no rerun  · status: todo
+### Phase 56 — A finished continuation sends no rerun  · status: done
 
 **Depends on:** Phase 55
 
