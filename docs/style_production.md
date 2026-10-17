@@ -18,7 +18,8 @@ the repository's local rule directories. This document holds the procedure.
 
 One unit director per family applies an exception decided in one crate the same
 way in every crate. Use `rules.py list` for the current classified rules and
-canonical ids; repository-local rules join their declared family.
+canonical ids. A repository-local rule of tier B, C or D declares the family
+it joins; a tier A or E rule, local or global, has no family.
 
 | Unit | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
@@ -37,10 +38,11 @@ One ticket per phase:
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
-- **Structure:** one crate.
+- **Structure:** one crate, judged file by file, every distinct defect held as its own finding.
 
-Run tier D first. A repair phase always precedes a new ticket. After an
-interruption, resume the assigned or checkpointed ticket from
+Run tier D first. Structure crates are taken in order of the other-family
+pending cells they block, most first. A repair phase always precedes a new ticket.
+After an interruption, resume the assigned or checkpointed ticket from
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`; never take a second
 one. A checkpointed ticket waits for its merge into the style branch before
 refill. Clear the cargo-liner backlog before hana.
@@ -57,8 +59,13 @@ only the first-launch template. Edit a launched unit's copy for changes meant
 for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
+Before selecting a new ticket, refill waits for sync if the branch point's
+current tip is not an ancestor of the ledger's synced tip; an open ticket still
+resumes or waits for merge.
 Report a waiting state once and end the turn blocked until sync, a board retry
-message, or `ticket <id> merged; refill.` wakes the director.
+message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
+sends that wake to every unit waiting for sync. Refill records its wait before
+checking once more for work; delivery clears only that wait, preserving a later one.
 
 A ticket with no code changes makes no commit: record its cells at HEAD, verify
 `git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
@@ -68,6 +75,7 @@ the checkpoint procedure's atomic committed-awaiting-release record using that
 ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
 refill at once. If ancestry fails, leave the ticket assigned and report it.
+The gate and `ticket checkpoint` refuse any ticket with owned cells unjudged and name each one.
 
 Refill only the unit worktree's own plan copy:
 
@@ -120,7 +128,12 @@ One style production and one synced branch point per repository. The ledger is
 `~/.local/state/style/<repo>/ledger.sqlite`; only `style_ledger.py` writes it.
 Startup runs `style_ledger.py reconcile --repo <checkout> --branch-point <branch>
 --style-branch <style branch>` and logs its change lines. Reconcile recovers work
-state from Git without advancing an existing synced tip.
+state from Git without advancing a tip already associated with that style branch.
+When initializing or changing the style branch, reconcile syncs the ledger at
+that branch's commit, falling back to the branch-point tip only if the style
+branch does not exist. Creating a production likewise syncs at the style branch's
+commit; a fresh branch takes that commit from the branch point. An interrupted
+bootstrap already synced at that tip and branch leaves the row untouched.
 
 Rule ids are `global:rust/<rule>.md` and
 `local:docs/<member>/style/<rule>.md`. A member-local rule governs its member
@@ -219,7 +232,7 @@ with one `--also <path>` for each entry of the unit's open ticket's `files`
 `none — takes what the board leaves free`; paths outside that ticket stay refused.
 
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
-and send the unit director
+to wake every unit waiting for sync, and send the owning unit director
 `From the showrunner of <style slug>: ticket <id> merged; refill.`
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
@@ -272,7 +285,8 @@ This also clears hand-offs a departing parent had not merged.
 
 On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
 nothing and send neither a hand-off nor a refill message: the unit refills
-itself. When `<n>` is positive, run `style_proposals.py file`.
+itself; its `ticket merge` already woke units waiting for sync.
+When `<n>` is positive, run `style_proposals.py file`.
 
 ## Yielding
 
@@ -285,6 +299,9 @@ checkpointing and record the new fingerprint. On a conflict or berth overlap,
 drop every finding touching that file, including all its edits in other files;
 a multi-file rename is dropped as a whole. Release reservations no remaining
 finding touches, rerun the gate, and leave dropped cells stale for later work.
+Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
+--id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
+findings on it, leaving its cells for later work.
 Style units obey build holds and memory admission like any unit.
 
 ## Big changes
@@ -339,7 +356,9 @@ after every ticket checkpoint with held cells and every no-change ticket notice
 with a positive held count. Read the folder from the current production doc's
 `**Proposals:**` line and the parent from `showrunners.py parent <style slug>`
 each time. Filing recovers issues created before a crash and skips findings
-judged against an older rule blob.
+judged against an older rule blob. Findings held by assigned or checkpointed
+tickets stay unfiled until those tickets close; filing reports their counts per
+open ticket.
 
 Record approval with `proposal_issue.py approve <issue> --showrunner <parent>
 --unit <unit> --plan <plan phase>`. Refill selects the oldest approved style issue

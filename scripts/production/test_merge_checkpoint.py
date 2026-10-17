@@ -367,21 +367,34 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertFalse(any(".venv" in arg for arg in all_args))
         self.assertIn("test: ok", result.process.stdout)
 
-    def test_missing_merge_test_executable_is_red_and_restores_unpushed_merge(self) -> None:
-        self.production_doc(merge_tests_line="- **Merge tests:** `checkpoint-executable-that-does-not-exist`")
+    def test_merge_tests_that_are_not_commands_are_refused_by_name_before_the_merge(self) -> None:
+        """cargo-liner wrote packages and a crate directory where the line wants commands."""
+        (self.checkout / "crates/tui_pane").mkdir(parents=True)
         sha = self.checkpoint()
-        origin_before = self.git("rev-parse", "refs/heads/production", cwd=self.origin)
+        for entry, detail in (("crates/tui_pane", "crates/tui_pane is neither on PATH"),
+                              ("tui-pane-package", "tui-pane-package is neither on PATH"),
+                              ("checkpoint-executable-that-does-not-exist", "does-not-exist is neither on PATH"),
+                              ("$MERGE_TEST_UNSET/bin/tool --all", "names $MERGE_TEST_UNSET, which is not set")):
+            with self.subTest(entry=entry):
+                self.production_doc(merge_tests_line=f"- **Merge tests:** `checkpoint-test`, `{entry}`")
+                result = self.run_checkpoint(sha)
+                self.assertEqual(result.process.returncode, 1)
+                self.assert_stopped_before_merge(result, "failed", f"Merge tests entry `{entry}`")
+                self.assertIn(detail, result.process.stdout)
+
+    def test_merge_tests_expand_home_and_variables(self) -> None:
+        """The commands run with no shell, so ~ and $VAR are expanded before they run."""
+        tools = Path(self.env["HOME"]) / "tools"
+        tools.mkdir()
+        self.executable(tools / "merge-tool", STUB)
+        self.env["MERGE_TEST_DIR"] = "scripts/buildlog"
+        self.production_doc(merge_tests_line="- **Merge tests:** `~/tools/merge-tool $MERGE_TEST_DIR`, "
+                                             + "`$HOME/tools/merge-tool ${MERGE_TEST_DIR}/one ~/two`")
+        sha = self.checkpoint()
         result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 1)
-        self.assertIn("red: failed", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
-        merge_head = subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
-                                    cwd=self.checkout, capture_output=True, text=True, check=False)
-        self.assertNotEqual(merge_head.returncode, 0)
-        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), origin_before)
-        self.assertIn("send alpha-unit:", result.process.stdout)
-        log = self.root / "scratch" / f"merge_{sha[:7]}_test.log"
-        self.assertIn("merge_test_1_EXIT=127", log.read_text(encoding="utf-8"))
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertEqual(self.events("merge-tool"),
+                         [["scripts/buildlog"], ["scripts/buildlog/one", str(tools.parent / "two")]])
 
     def test_merge_tests_field_is_required_but_dash_runs_no_merge_test(self) -> None:
         sha = self.checkpoint()
@@ -780,12 +793,13 @@ class MergeCheckpointTests(unittest.TestCase):
         base = self.git("rev-parse", "HEAD^1")
         _ = self.git("push", "--force", "origin", f"{base}:refs/heads/main")
         _ = self.git("push", "--force", "origin", f"{base}:refs/heads/production")
-        request = request_from(argparse.Namespace(
-            production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
-            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
-            cancel_prior=False, started=STARTED, regime="after", holds=0,
-            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
-        ))
+        with mock.patch.dict(os.environ, {"PATH": self.env["PATH"]}):  # Merge tests names a stub on the test PATH
+            request = request_from(argparse.Namespace(
+                production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
+                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+                cancel_prior=False, started=STARTED, regime="after", holds=0,
+                merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+            ))
         output = StringIO()
         with redirect_stdout(output):
             promote(request, tip)
@@ -1070,12 +1084,13 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIsInstance(last_any.kind, ShrinkCommit)
         self.assertEqual(last_code.merge_hash, code_merge)
         self.assertIsInstance(last_code.kind, CodeCheckpoint)
-        request = request_from(argparse.Namespace(
-            production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
-            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
-            cancel_prior=False, started=STARTED, regime="after", holds=0,
-            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
-        ))
+        with mock.patch.dict(os.environ, {"PATH": self.env["PATH"]}):  # Merge tests names a stub on the test PATH
+            request = request_from(argparse.Namespace(
+                production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
+                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+                cancel_prior=False, started=STARTED, regime="after", holds=0,
+                merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+            ))
         latest = merge_history(request)
         self.assertIsInstance(latest, LastMerged)
         if isinstance(latest, LastMerged):
@@ -1093,12 +1108,13 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual((entry.unit, entry.phase, entry.short), ("alpha-unit", "2", code[:7]))
         self.assertTrue(history.has_code_merge("alpha-unit", "2"))
         self.assertIsInstance(history.last_for_unit("old-alpha-unit"), NoMerge)
-        request = request_from(argparse.Namespace(
-            production=str(self.doc), unit="alpha-unit", phase="3", hash=code,
-            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
-            cancel_prior=False, started=STARTED, regime="after", holds=0,
-            merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
-        ))
+        with mock.patch.dict(os.environ, {"PATH": self.env["PATH"]}):  # Merge tests names a stub on the test PATH
+            request = request_from(argparse.Namespace(
+                production=str(self.doc), unit="alpha-unit", phase="3", hash=code,
+                also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
+                cancel_prior=False, started=STARTED, regime="after", holds=0,
+                merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
+            ))
         latest = merge_history(request)
         if not isinstance(latest, LastMerged):
             self.fail("a renamed unit read as never merged, so its first-merge gate would fire again")

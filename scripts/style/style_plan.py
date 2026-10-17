@@ -96,6 +96,13 @@ class WaitingForSync:
 
 
 @dataclass(frozen=True)
+class WaitingForBranchPointSync:
+    branch_point: str
+    branch_tip: str
+    synced_tip: str
+
+
+@dataclass(frozen=True)
 class TicketSelection:
     kind: style_ledger.TicketKind
     family: rules.Family
@@ -115,7 +122,7 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | berth_board.BoardUnavailable
+NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForBranchPointSync | berth_board.BoardUnavailable
 
 
 def style_document(repo: Path) -> Path:
@@ -137,6 +144,11 @@ def gate(repo: Path, ticket_id: str) -> int:
         with style_ledger.open_ledger(repo) as ledger:
             origin = ledger.ticket_origin(ticket_id)
             if isinstance(origin, style_ledger.SelectedByCoverage):
+                missing = ledger.unjudged_ticket_cells(ticket_id)
+                if missing:
+                    for cell in missing:
+                        print(f"unjudged: {cell.rule} {cell.path}")
+                    return 1
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", origin.base, "--worktree"], check=False)
                 return 0 if result.returncode == 0 else 1
@@ -208,13 +220,26 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES) -> tuple[TicketSelection, ...]:
-    cells = tuple(ledger.cells())
-    pending = tuple(cell for cell in cells if cell.state in ("open", "stale"))
-    stale = {crate: sum(cell.state == "stale" for cell in cells if cell.crate == crate)
-             for crate in {cell.crate for cell in cells}}
+    pending: list[style_ledger.Cell] = []
+    stale: dict[str, int] = defaultdict(int)
+    blocked: dict[str, int] = defaultdict(int)
+    structure_crates: set[str] = set()
+    for cell in ledger.cells():
+        stale[cell.crate] += cell.state == "stale"
+        if cell.state in ("open", "stale"):
+            pending.append(cell)
+            if cell.tier == "D":
+                structure_crates.add(cell.crate)
+            elif cell.family != "modules":
+                blocked[cell.crate] += 1
+    crates = sorted(stale, key=lambda crate: (-stale[crate], crate))
+    if family == "modules":
+        crates = sorted(structure_crates, key=lambda crate: (-blocked[crate], -stale[crate], crate)) + [
+            crate for crate in crates if crate not in structure_crates
+        ]
     tip = synced_tip(ledger)
     result: list[TicketSelection] = []
-    for crate in sorted(stale, key=lambda crate: (-stale[crate], crate)):
+    for crate in crates:
         if not crate_in_scope(scope, crate):
             continue
         structure = tuple(cell for cell in pending if cell.crate == crate and cell.tier == "D")
@@ -291,8 +316,18 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "**Goal:**", f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below.",
         "", "**Spec:**", *rule_lines, *sites, *uncovered,
         authorization,
-        "Read only these pinned rule texts. For a structure ticket, judge each rule's listed sites and its uncovered surface together; "
-        + "read the uncovered instructions in the pinned text. A #uncovered rule is the parent rule's uncovered read.",
+        "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
+        *([
+            "Judge file by file: take each file under **Files** in turn and judge it against every rule above, with that rule's listed sites "
+            + "in it and its uncovered surface; read the uncovered instructions in the pinned text.",
+            "Before judging a file, read its sibling files in the same module and its direct callers "
+            + "(search the crate for its types and functions), so placement and ownership are judged against the code around it.",
+            "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
+            + "and never stop at a file's first finding.",
+            "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
+            + "under the rule it breaks most directly, naming the others in its text.",
+            "Record each rule's crate verdict only after every file has been judged against it.",
+        ] if ticket["kind"] == "structure" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
@@ -363,6 +398,71 @@ def discard_finished(ledger: style_ledger.Ledger, text: str) -> tuple[str, tuple
     return PHASE.sub(keep, text), tuple(changes)
 
 
+@dataclass(frozen=True)
+class NoAvailableWork:
+    pass
+
+
+def _select_phase(
+    ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
+    doc: Path, text: str, scope: PilotScope, busy: BusyFiles,
+) -> PhaseWritten | NoAvailableWork:
+    queued = ledger.queued_tickets(unit)
+    for index, ticket in enumerate(queued):
+        in_scope = crate_in_scope(scope, ticket["crate"])
+        if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
+            ledger.ticket_assign(ticket["id"], branch)
+            for extra in queued[1:]:
+                ledger.ticket_drop(extra["id"])
+                print(f"dropped {extra['id']}: files busy")
+            origin = ledger.ticket_origin(ticket["id"])
+            if isinstance(origin, style_ledger.ApprovedProposal):
+                style_proposals.proposal_command("start", str(origin.issue))
+            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+            return PhaseWritten(ticket["id"])
+        ledger.ticket_drop(ticket["id"])
+        reason = "files busy" if in_scope else "outside pilot scope"
+        print(f"dropped {ticket['id']}: {reason}")
+    family = unit.removesuffix("-unit")
+    if family not in FAMILIES:
+        raise style_ledger.LedgerError(f"{unit}: unknown style family")
+    try:
+        folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
+    except Refusal:
+        issue = style_proposals.NoApprovedProposal()
+    else:
+        if not folder.is_absolute():
+            folder = doc.parent.parent / folder
+        issue = style_proposals.approved_issue(folder, unit, ledger)
+    if not isinstance(issue, style_proposals.NoApprovedProposal):
+        findings = style_proposals.issue_findings(ledger, issue.path)
+        if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != issue.path for finding in findings):
+            raise style_ledger.LedgerError(f"{issue.path}: every approved finding must be filed")
+        if any(not crate_in_scope(scope, style_proposals.crate_for(ledger, finding.path)) for finding in findings):
+            print(f"waiting {issue.path}: outside pilot scope")
+        elif any(busy.contains(finding.path) for finding in findings):
+            print(f"waiting {issue.path}: files busy")
+        else:
+            ticket_id = ledger.next_ticket_id(unit)
+            ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(ledger, findings[0].path),
+                              sorted({finding.path for finding in findings}), sorted({finding.rule for finding in findings}),
+                              proposal=str(issue.path))
+            ledger.ticket_assign(ticket_id, branch)
+            style_proposals.proposal_command("start", str(issue.path))
+            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+            return PhaseWritten(ticket_id)
+    candidates = candidate_tickets(repo, ledger, busy, family, scope)
+    if not candidates:
+        return NoAvailableWork()
+    selected = candidates[0]
+    ticket_id = ledger.next_ticket_id(unit)
+    ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
+                      list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites])
+    ledger.ticket_assign(ticket_id, branch)
+    write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+    return PhaseWritten(ticket_id)
+
+
 def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     plan, repo = plan.expanduser().resolve(), repo.expanduser().resolve()
     doc = style_document(repo)
@@ -392,65 +492,40 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             if isinstance(origin, style_ledger.ApprovedProposal):
                 style_proposals.proposal_command("start", str(origin.issue))
             write_phase(ledger, ticket, plan, text)
+            ledger.clear_sync_wait(unit)
             return Resumed(ticket["id"])
+        tip = synced_tip(ledger)
+        standing = standing_style_production(repo)
+        if not isinstance(standing, StandingStyleProduction):
+            raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+        branch_tip = git(repo, "rev-parse", "--verify", f"{standing.branch_point}^{{commit}}").strip()
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", branch_tip, tip],
+            capture_output=True, text=True, check=False,
+        )
+        if ancestry.returncode == 1:
+            ledger.wait_for_sync(unit)
+            return WaitingForBranchPointSync(standing.branch_point, branch_tip, tip)
+        if ancestry.returncode:
+            raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
             return board
         busy = busy_files(repo, doc, ledger, unit, board)
-        queued = ledger.queued_tickets(unit)
-        for index, ticket in enumerate(queued):
-            in_scope = crate_in_scope(scope, ticket["crate"])
-            if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
-                ledger.ticket_assign(ticket["id"], row.branch)
-                for extra in queued[1:]:
-                    ledger.ticket_drop(extra["id"])
-                    print(f"dropped {extra['id']}: files busy")
-                origin = ledger.ticket_origin(ticket["id"])
-                if isinstance(origin, style_ledger.ApprovedProposal):
-                    style_proposals.proposal_command("start", str(origin.issue))
-                write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-                return PhaseWritten(ticket["id"])
-            ledger.ticket_drop(ticket["id"])
-            reason = "files busy" if in_scope else "outside pilot scope"
-            print(f"dropped {ticket['id']}: {reason}")
-        family = unit.removesuffix("-unit")
-        if family not in FAMILIES:
-            raise style_ledger.LedgerError(f"{unit}: unknown style family")
-        try:
-            folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
-        except Refusal:
-            issue = style_proposals.NoApprovedProposal()
-        else:
-            if not folder.is_absolute():
-                folder = doc.parent.parent / folder
-            issue = style_proposals.approved_issue(folder, unit, ledger)
-        if not isinstance(issue, style_proposals.NoApprovedProposal):
-            findings = style_proposals.issue_findings(ledger, issue.path)
-            if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != issue.path for finding in findings):
-                raise style_ledger.LedgerError(f"{issue.path}: every approved finding must be filed")
-            if any(not crate_in_scope(scope, style_proposals.crate_for(ledger, finding.path)) for finding in findings):
-                print(f"waiting {issue.path}: outside pilot scope")
-            elif any(busy.contains(finding.path) for finding in findings):
-                print(f"waiting {issue.path}: files busy")
-            else:
-                ticket_id = ledger.next_ticket_id(unit)
-                ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(ledger, findings[0].path),
-                                  sorted({finding.path for finding in findings}), sorted({finding.rule for finding in findings}),
-                                  proposal=str(issue.path))
-                ledger.ticket_assign(ticket_id, row.branch)
-                style_proposals.proposal_command("start", str(issue.path))
-                write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-                return PhaseWritten(ticket_id)
-        candidates = candidate_tickets(repo, ledger, busy, family, scope)
-        if not candidates:
-            return WaitingForSync(len(ledger.unclassified_rules()))
-        selected = candidates[0]
-        ticket_id = ledger.next_ticket_id(unit)
-        ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
-                          list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites])
-        ledger.ticket_assign(ticket_id, row.branch)
-        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-        return PhaseWritten(ticket_id)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy)
+        if isinstance(selected, PhaseWritten):
+            ledger.clear_sync_wait(unit)
+            return selected
+        ledger.wait_for_sync(unit)
+        board = berth_board.read_board(repo)
+        if isinstance(board, berth_board.BoardUnavailable):
+            return board
+        busy = busy_files(repo, doc, ledger, unit, board)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy)
+        if isinstance(selected, PhaseWritten):
+            ledger.clear_sync_wait(unit)
+            return selected
+        return WaitingForSync(len(ledger.unclassified_rules()))
 
 
 def main(argv: list[str]) -> int:
@@ -503,6 +578,9 @@ def main(argv: list[str]) -> int:
                 print("waiting for sync")
                 if unclassified:
                     print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
+                return 3
+            case WaitingForBranchPointSync(branch_point, branch_tip, tip):
+                print(f"waiting for sync: {branch_point} {branch_tip[:7]} is not in the synced tip {tip[:7]}")
                 return 3
         return 0
     except (OSError, ValueError, Refusal, sqlite3.Error) as error:

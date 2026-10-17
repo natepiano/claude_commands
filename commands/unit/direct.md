@@ -1514,7 +1514,7 @@ never take a second ticket while one is open.
 
 | Exit | Unit status and next action |
 | --- | --- |
-| 3 | `waiting for sync`; report once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message. |
+| 3 | `waiting for sync`; report once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
 | 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
 | 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
 | Other nonzero | Report the error and retain the ticket; repair it before refill. |
@@ -1527,7 +1527,8 @@ PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,
 leaves the new rule's cell stale until a later ticket.
 
 The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
-worktree. Run it again at <CheckpointCommit/> step 6 before staging. Coverage
+worktree. Run it again at <CheckpointCommit/> step 6 before staging. The gate and
+`ticket checkpoint` refuse unjudged owned cells, naming each one. Coverage
 selection runs the mechanical filter at the ticket's recorded base; an approved
 proposal permits only files of its approved findings. Exit 1 retains the
 reservation and returns to repair. Exit 0 permits committing exactly that tree,

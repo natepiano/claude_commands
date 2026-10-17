@@ -354,6 +354,9 @@ class CoverageReportTests(unittest.TestCase):
                 if number != 3:
                     ledger.ticket_assign(ticket, "main")
                 if number == 2:
+                    definition = next(row for row in rules.load_rules(self.repo) if row.rule_id == rule)
+                    for path in self.sources[:2]:
+                        ledger.record(rule, path, self.tip, definition.blob, "clean", ticket=ticket, worker="test")
                     ledger.ticket_checkpoint(ticket, self.tip)
         output = self.report("--rule", "selected").stdout
         self.assertEqual(set(self.rows(output)), {"selected"})

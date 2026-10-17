@@ -7,15 +7,17 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
 import style_sync
 import style_ledger
+import style_rules
 import showrunners
 from scripts.delegate import test_verify_lint_scope as verify_fixture
 
@@ -79,6 +81,7 @@ class StyleSyncTests(unittest.TestCase):
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
         })))
+        _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         sender = self.root / "send.py"
         _ = sender.write_text(
             "import json,sys\nfrom pathlib import Path\n"
@@ -105,6 +108,211 @@ class StyleSyncTests(unittest.TestCase):
             code = style_sync.main(["notify", "--repo-dir", str(repo or self.repo),
                                     "--branch", "refs/heads/main", "--tip", self.tip])
         return code, output.getvalue()
+
+    def checkpoint_for_wake(self, *, on_style_branch: bool = True) -> None:
+        rule = "global:rust/read-modules.md"
+        _ = (self.root / "nate_style/rust/read-modules.md").write_text(
+            "---\ntier: C\nfamily: modules\ninput_scope: file\n---\n# Modules\nReview module names.\n"
+        )
+        _ = self.git("branch", "style/main")
+        if not on_style_branch:
+            _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
+            _ = self.git("commit", "-qam", "Unit checkpoint")
+        checkpoint = self.git("rev-parse", "HEAD")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip, "style/main")
+            ledger.ticket_add("modules-unit-1", "modules-unit", "read", "modules", ".",
+                              ["src/lib.rs"], [rule])
+            ledger.ticket_assign("modules-unit-1", "main")
+            blob = ledger.pinned_rule_texts("modules-unit-1")[0].blob
+            ledger.record(rule, "src/lib.rs", checkpoint, blob, "clean", ticket="modules-unit-1", worker="test")
+            ledger.ticket_checkpoint("modules-unit-1", checkpoint)
+
+    def waiting_units(self, *units: str) -> None:
+        with style_ledger.open_ledger(self.repo) as ledger:
+            for unit in units:
+                ledger.wait_for_sync(unit)
+
+    def remaining_waiters(self) -> list[str]:
+        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            rows = cast(list[tuple[str]], connection.execute("SELECT unit FROM sync_waits ORDER BY unit").fetchall())
+        return [unit for (unit,) in rows]
+
+    def wake_roster(self, units: tuple[str, ...] = ("names-unit", "types-unit")) -> None:
+        entries: list[dict[str, str]] = [
+            {"role": "unit director", "production": "sample-style", "unit": unit,
+             "name": unit.removesuffix("-unit"), "address": "session:fake-" + unit}
+            for unit in units
+        ]
+        entries.extend([
+            {"role": "unit director", "production": "another-style", "unit": "names-unit",
+             "name": "names", "address": "session:wrong-production"},
+            {"role": "worker", "production": "sample-style", "unit": "names-unit",
+             "name": "names-impl", "address": "seat:wrong-worker"},
+        ])
+        roster = self.root / "roster.py"
+        _ = roster.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            + f"Path({str(self.root / 'roster-args')!r}).write_text(' '.join(sys.argv[1:]))\n"
+            + f"print({json.dumps({'entries': entries, 'problems': []})!r})\n",
+        )
+        _ = self.enterContext(mock.patch.object(style_sync, "ROSTER", roster, create=True))
+
+    def wake_sender(self, failed_unit: str = "") -> None:
+        self.wake_roster()
+        _ = (self.root / "send.py").write_text(
+            "import json,sys\nfrom pathlib import Path\n"
+            + f"with Path({str(self.root / 'wakes.jsonl')!r}).open('a') as output:\n"
+            + "    output.write(json.dumps(sys.argv[1:])+'\\n')\n"
+            + f"if sys.argv[sys.argv.index('--to')+1] == {('session:fake-' + failed_unit)!r}:\n"
+            + "    print('FAILED: unavailable'); raise SystemExit(3)\n",
+        )
+
+    def recorded_wakes(self) -> list[list[str]]:
+        path = self.root / "wakes.jsonl"
+        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def merge_for_wake(self) -> tuple[int, str, str]:
+        # Keep the CLI's success/refusal routing real; replace only its process boundary.
+        def wake_in_process(repo: Path, ticket: str) -> None:
+            self.assertEqual(style_sync.main(["wake-waiters", "--repo", str(repo), "--ticket", ticket]), 0)
+
+        output, errors = io.StringIO(), io.StringIO()
+        code = 0
+        with mock.patch.object(style_ledger, "_wake_sync_waiters", wake_in_process, create=True), mock.patch.object(
+            sys, "argv", ["style_ledger.py", "ticket", "merge", "--repo", str(self.repo), "--id", "modules-unit-1"],
+        ), redirect_stdout(output), redirect_stderr(errors):
+            try:
+                style_ledger.main()
+            except SystemExit as error:
+                code = cast(int, error.code)
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_ticket_merge_wakes_two_waiters_once_and_clears_their_rows(self) -> None:
+        self.production()
+        self.checkpoint_for_wake()
+        self.waiting_units("names-unit", "types-unit")
+        self.wake_sender()
+        self.assertEqual(self.merge_for_wake(), (0, "", ""))
+        self.assertEqual(self.recorded_wakes(), [
+            ["--to", "session:fake-" + unit, "--from", "sample-style", "--text",
+             "From the showrunner of sample-style: ticket modules-unit-1 merged; refill.", "--timeout", "10"]
+            for unit in ("names-unit", "types-unit")
+        ])
+        self.assertEqual(self.remaining_waiters(), [])
+        self.assertEqual((self.root / "roster-args").read_text(), "--json")
+        self.assertEqual(self.merge_for_wake(), (0, "", ""))
+        self.assertEqual(len(self.recorded_wakes()), 2)
+
+    def test_an_older_in_flight_wake_cannot_erase_the_units_new_wait(self) -> None:
+        self.production()
+        self.waiting_units("names-unit")
+        self.wake_sender()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            first = ledger.sync_waits()[0]
+        interleaved = False
+
+        def refill_during_send(arguments: list[str], **options: object) -> object:
+            nonlocal interleaved
+            if (len(arguments) > 1 and arguments[1] == str(style_sync.SEND)
+                    and options.get("timeout") == 15 and not interleaved):
+                interleaved = True
+                style_sync.wake_waiters(self.repo, "modules-unit-2")
+                with style_ledger.open_ledger(self.repo) as ledger:
+                    self.assertEqual(ledger.sync_waits(), ())
+                    # Equal timestamps ensure that only a wait identity protects the new row.
+                    with mock.patch.object(style_ledger, "_now", return_value=first.since):
+                        ledger.wait_for_sync("names-unit")
+            return cast(object, mock.DEFAULT)
+
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run, side_effect=refill_during_send):
+            style_sync.wake_waiters(self.repo, "modules-unit-1")
+        self.assertTrue(interleaved)
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+        with style_ledger.open_ledger(self.repo) as ledger:
+            second = ledger.sync_waits()[0]
+        self.assertEqual((second.unit, second.since), (first.unit, first.since))
+        self.assertNotEqual(second.token, first.token)
+        self.assertEqual([call[5] for call in self.recorded_wakes()], [
+            "From the showrunner of sample-style: ticket modules-unit-2 merged; refill.",
+            "From the showrunner of sample-style: ticket modules-unit-1 merged; refill.",
+        ])
+
+    def test_failed_wake_keeps_only_that_waiter_and_an_already_merged_ticket_retries_it(self) -> None:
+        self.production()
+        self.checkpoint_for_wake()
+        self.waiting_units("names-unit", "types-unit")
+        self.wake_sender("names-unit")
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: FAILED: unavailable\n", ""))
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='modules-unit-1'").fetchone(), ("merged",))
+        self.wake_sender()
+        self.assertEqual(self.merge_for_wake(), (0, "", ""))
+        self.assertEqual(self.remaining_waiters(), [])
+        self.assertEqual([arguments[1] for arguments in self.recorded_wakes()], ["session:fake-names-unit", "session:fake-types-unit", "session:fake-names-unit"])
+
+    def test_merge_without_waiters_or_a_standing_production_sends_nothing(self) -> None:
+        self.checkpoint_for_wake()
+        self.waiting_units()
+        self.production()
+        self.wake_sender()
+        self.assertEqual(self.merge_for_wake(), (0, "", ""))
+        self.doc.unlink()
+        self.waiting_units("names-unit")
+        self.assertEqual(self.merge_for_wake(), (0, "", ""))
+        self.assertEqual(self.recorded_wakes(), [])
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+
+    def test_director_without_an_address_does_not_block_other_waiters(self) -> None:
+        self.production()
+        self.checkpoint_for_wake()
+        self.waiting_units("names-unit", "types-unit")
+        self.wake_sender()
+        roster = self.root / "roster.py"
+        _ = roster.write_text(roster.read_text().replace("session:fake-names-unit", ""))
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: no live director\n", ""))
+        self.assertEqual(self.recorded_wakes(), [[
+            "--to", "session:fake-types-unit", "--from", "sample-style", "--text",
+            "From the showrunner of sample-style: ticket modules-unit-1 merged; refill.", "--timeout", "10",
+        ]])
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+
+    def test_merge_without_a_matching_director_keeps_the_wait_and_reports_why(self) -> None:
+        self.production()
+        self.checkpoint_for_wake()
+        self.waiting_units("names-unit")
+        self.wake_sender()
+        self.wake_roster(())
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: no live director\n", ""))
+        self.assertEqual(self.recorded_wakes(), [])
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+
+    def test_ambiguous_or_unreadable_roster_does_not_send_or_forget_the_wait(self) -> None:
+        self.production()
+        self.checkpoint_for_wake()
+        self.waiting_units("names-unit")
+        self.wake_sender()
+        self.wake_roster(("names-unit", "names-unit"))
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: 2 directors\n", ""))
+        self.assertEqual(self.recorded_wakes(), [])
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+        _ = (self.root / "roster.py").write_text("print('roster unavailable'); raise SystemExit(3)\n")
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: roster: roster.py exited 3\n", ""))
+        self.assertEqual(self.recorded_wakes(), [])
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
+
+    def test_refused_checkpoint_merge_does_not_wake_or_clear_waiters(self) -> None:
+        self.production()
+        self.checkpoint_for_wake(on_style_branch=False)
+        self.waiting_units("names-unit")
+        self.wake_sender()
+        code, output, errors = self.merge_for_wake()
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        self.assertIn("is not on refs/heads/style/main", errors)
+        self.assertEqual(self.recorded_wakes(), [])
+        self.assertEqual(self.remaining_waiters(), ["names-unit"])
 
     def test_no_style_production_and_another_branch_point_are_silent(self) -> None:
         self.assertEqual(self.notice(), (0, ""))
