@@ -3289,6 +3289,33 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(body, "")
         self.assertNotIn("--action", args)
 
+    def test_retry_that_fails_as_already_pushed_sends_no_push_but_a_new_failure_does(self) -> None:
+        saved = entry(top_level("stuck"), state=record.SessionRestartFailed(kind="restart failed", at=STOPPED, reason="name taken"))
+        saved["restore_alerted"] = settle.not_back_text(saved)
+        self.create([saved])
+        pushes: list[str] = []
+
+        def alert(push: RenderedPush, *, machine: str = "") -> None:
+            del machine
+            pushes.append(push.id)
+        for reason, expected in (("name taken", []), ("not trusted", ["shutdown.restart_failed"])):
+            with self.subTest(reason=reason):
+                pushes.clear()
+                _ = record.update_session(LOGIN, "stuck", lambda current: current.update(
+                    progress=record.SessionRestartFailed(kind="restart failed", at=STOPPED, reason=reason)))
+                result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=1,
+                    failed_sessions=(restart.FailedSessionRestart("stuck", reason),))
+                with (patch.object(restart, "named_claude_account", return_value=self.account),
+                      patch.object(restart, "_up", return_value=result),
+                      patch.object(settle, "local_machine", return_value="natedev"),
+                      patch.object(settle, "alert_user", side_effect=alert),
+                      redirect_stdout(io.StringIO())):
+                    _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                        alerts=restart.AlertWhenNotBack(), only=["stuck"], here=True)
+                self.assertEqual(pushes, expected)
+        # The new failure is marked, so the next identical retry stays quiet.
+        self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
+
     def test_restart_failure_push_uses_only_account_count_and_machine_facts(self) -> None:
         push = restart.restart_push("claude2", ["Beta"], machine="natedev")
         self.assertEqual(push.id, "shutdown.restart_failed")

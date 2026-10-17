@@ -1381,7 +1381,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
     stop_due = [saved for saved in failed if saved["hold"] == "account" and saved["alerts"] == "user"]
     unpushed = [saved for saved in restore_failed
                 if saved["progress"]["kind"] != "timers pending" and saved["alerts"] == "user"
-                and saved.get("restore_alerted") != _not_back_text(saved)]
+                and saved.get("restore_alerted") != not_back_text(saved)]
     try:
         due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
         text_id = "shutdown.stop_failed" if stop_due else "shutdown.restart_failed"
@@ -1391,12 +1391,12 @@ def report_stop(records: list[SessionShutdown]) -> None:
                               stopped=stopped_sessions_text(len(items))), machine=route)
             if not stop_due:
                 for saved in items:
-                    _mark_not_back_pushed(saved)
+                    mark_not_back_pushed(saved)
         if not stop_due:
             for saved in unpushed:
                 if saved["progress"]["kind"] == "manual restart":
                     alert_user(render("shutdown.manual_restart", session=saved["session"]["name"], machine=saved["machine"]), machine=route)
-                    _mark_not_back_pushed(saved)
+                    mark_not_back_pushed(saved)
     finally:
         if not origins:
             print(text)
@@ -1404,7 +1404,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
             _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-result-{first['login']}")
 
 
-def _not_back_text(saved: SessionShutdown) -> str:
+def not_back_text(saved: SessionShutdown) -> str:
     """What a not-back push says about this record; an unchanged one is not pushed again."""
     progress = saved["progress"]
     if progress["kind"] == "restart failed":
@@ -1474,7 +1474,7 @@ def tell_showrunners_outcome(records: list[SessionShutdown]) -> None:
             summary = f"{name} is back on {saved.get('target') or saved['label']}"
             text = summary
         elif progress["kind"] in {"restart failed", "manual restart"}:
-            told = _not_back_text(saved)
+            told = not_back_text(saved)
             reason = progress["reason"] if progress["kind"] == "restart failed" else "it needs a manual restart"
             summary = f"{name} did not come back: {reason}"
             command = shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
@@ -1489,10 +1489,10 @@ def tell_showrunners_outcome(records: list[SessionShutdown]) -> None:
             _ = send_message(showrunner, summary, text, key=f"shutdown-unit-{saved['session']['session_id']}")
 
 
-def _mark_not_back_pushed(saved: SessionShutdown) -> None:
+def mark_not_back_pushed(saved: SessionShutdown) -> None:
     def mark(current: SessionShutdown) -> None:
         if current["request_id"] == saved["request_id"] and current["progress"] == saved["progress"]:
-            current["restore_alerted"] = _not_back_text(saved)
+            current["restore_alerted"] = not_back_text(saved)
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], mark)
     except store.NoLiveRecord:

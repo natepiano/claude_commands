@@ -131,6 +131,8 @@ class ShutdownServices(Protocol):
         self, push: RenderedPush, *, machine: str = "",
     ) -> None: ...
     def tell_showrunners_outcome(self, records: list[SessionShutdown]) -> None: ...
+    def not_back_text(self, saved: SessionShutdown) -> str: ...
+    def mark_not_back_pushed(self, saved: SessionShutdown) -> None: ...
 
 
 settle = cast(ShutdownServices, cast(object, import_module("settle")))
@@ -2609,6 +2611,29 @@ def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerR
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
+def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]:
+    try:
+        records = session_records(login)
+    except (InvalidRecord, OSError, ValueError):
+        return []
+    return [saved for saved in records
+            if saved["machine"] == settle.local_machine()
+            and saved["progress"]["kind"] in {"restart failed", "manual restart"}
+            and (not ids or saved["session"]["session_id"] in ids)]
+
+
+def _pushed_not_back(login: str, ids: tuple[str, ...]) -> set[str]:
+    """Names of this machine's sessions whose unchanged not-back state was already pushed."""
+    return {saved["session"]["name"] for saved in _not_back_records(login, ids)
+            if saved.get("restore_alerted") == settle.not_back_text(saved)}
+
+
+def _mark_pushed_not_back(login: str, ids: tuple[str, ...], names: set[str]) -> None:
+    for saved in _not_back_records(login, ids):
+        if saved["session"]["name"] in names:
+            settle.mark_not_back_pushed(saved)
+
+
 def restart_push(label: str, names: list[str], *, machine: str) -> RenderedPush:
     """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
     if names:
@@ -2704,20 +2729,27 @@ def restart(
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
         try:
             if failure_alert:
-                names = [item.name for item in local.failed_sessions]
+                # A retry that fails the same way as a pushed failure tells the user nothing new.
+                pushed = _pushed_not_back(selected.login, ids)
+                failed = [item for item in local.failed_sessions if item.name not in pushed]
+                manual = [item for item in local.manual_sessions if item.name not in pushed]
+                names = [item.name for item in failed]
                 names.extend(match.group(1) for line in peer["lines"]
                              if (match := re.match(r"[^:]+: (.+) restart failed:", line)) is not None)
-                machines = [local.machine] if local.status == "partial" else []
+                local_partial = local.status == "partial" and (failed or manual or not (
+                    local.failed_sessions or local.manual_sessions))
+                machines = [local.machine] if local_partial else []
                 if peer["outcome"] == "partial" or not_reached:
                     machines.append(peer["machine"])
                 # Pending scheduled jobs are reported in the command output; they need no user step.
                 peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
                     re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+)", line)
                     for line in peer["lines"]))
-                if names or not_reached or local.failed or peer_requires_retry:
+                if names or not_reached or failed or peer_requires_retry:
                     settle.alert_user(restart_push(selected.label, names, machine=" and ".join(machines)))
-                for item in local.manual_sessions:
+                for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
+                _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})
                 for line in peer["lines"]:
                     if match := re.match(r"[^:]+: manual restart (.+?):", line):
                         settle.alert_user(render("shutdown.manual_restart", session=match.group(1), machine=peer["machine"]))
