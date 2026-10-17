@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
-import fake_tmux
-from fake_tmux import FakeSession
+import fake_unit_host
+from fake_unit_host import HostedUnit
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -28,9 +28,6 @@ name = Path(sys.argv[0]).name
 with (state / "calls").open("a") as output:
     output.write(name + " " + " ".join(sys.argv[1:])
                  + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
-if name == "tmux" and sys.argv[1:2] == ["has-session"]:
-    session = sys.argv[-1].removeprefix("=")
-    raise SystemExit(0 if (state / ("live-" + session)).exists() else 1)
 if name == "ssh":
     print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
     raise SystemExit(0)
@@ -90,7 +87,7 @@ class LifecycleTests(unittest.TestCase):
         self.phase_table_vault.parent.mkdir()
         bin_path = self.root / "bin"
         bin_path.mkdir()
-        for name in ("tmux", "claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
+        for name in ("claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
             self.stub(bin_path / name)
         for relative in (".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py",
@@ -98,9 +95,6 @@ class LifecycleTests(unittest.TestCase):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
-                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
-                    "FAKE_TMUX_STATE": str(self.state / "tmux.json"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -109,6 +103,7 @@ class LifecycleTests(unittest.TestCase):
                     "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
+        self.env.update(fake_unit_host.environment(self.root))
         self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
@@ -320,12 +315,11 @@ class LifecycleTests(unittest.TestCase):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        fake_tmux.write(self.state / "tmux.json", {
-            # A session that only has the name the unit was launched under is not the unit.
-            "$1": FakeSession(label="alpha", panes=["%1"], env={}),
-            "$2": FakeSession(label="renamed-since-launch", panes=["%2"],
-                              env={"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
-        })
+        fake_unit_host.write(self.env, [
+            HostedUnit("alpha", "w1:p1", {}),
+            HostedUnit("renamed-since-launch", "w2:p1", {
+                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
+        ])
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
         self.assertIn("alpha-unit: gone", result.stdout)
@@ -742,11 +736,11 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(relative, moved)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
 
-    def test_wrap_names_herdr_and_tmux_sessions_for_close_out(self) -> None:
+    def test_wrap_names_herdr_sessions_for_close_out(self) -> None:
         self.merged_units()
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertIn("| Next | close herdr or tmux sessions |", result.stdout)
+        self.assertIn("| Next | close herdr sessions |", result.stdout)
 
     def test_wrap_detaches_from_its_parent_and_leaves_each_child_a_root(self) -> None:
         self.merged_units()

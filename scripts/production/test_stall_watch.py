@@ -13,16 +13,15 @@ import unittest
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
-from fake_herdr import herdr_listener
+import fake_unit_host
+from fake_unit_host import HostedUnit
 
-if TYPE_CHECKING:
-    from herdr import SessionListResult
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
@@ -51,14 +50,13 @@ class StallWatchTests(unittest.TestCase):
         self.projects: Path = Path()
         self.state: Path = Path()
         self.ps_file: Path = Path()
-        self.tmux_file: Path = Path()
         self.send_log: Path = Path()
         self.fail_file: Path = Path()
         self.environment: dict[str, str] = {}
         self.panes: dict[str, dict[str, str | int]] = {}
         self.process_rows: list[str] = []
         self.children: list[subprocess.Popen[bytes]] = []
-        # A unit's Plan cell and the state mark on its tmux session, where a test sets one.
+        # A unit's Plan cell and the state mark on its herdr pane, where a test sets one.
         self.plans: dict[str, str] = {}
         self.states: dict[str, str] = {}
 
@@ -100,32 +98,12 @@ raise SystemExit(1)
         self.projects.mkdir()
         self.state = self.root / "stall-state"
         self.ps_file = self.root / "ps.txt"
-        self.tmux_file = self.root / "tmux.json"
         self.send_log = self.root / "sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
         self.config = self.root / "showrunners.json"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
-        # Each pane is one tmux session marked as the unit it is keyed by.
-        executable(self.bin / "tmux", """#!/usr/bin/env python3
-import json, os, sys
-panes = json.load(open(os.environ['STALL_TEST_TMUX_FILE']))
-args = sys.argv[1:]
-if args[0] == 'list-panes':
-    for unit, data in panes.items():
-        print(f"${data['id']}\\t%{data['id']}\\t{data['label']}")
-    raise SystemExit(0)
-target = args[args.index('-t') + 1]
-matches = [unit for unit, data in panes.items() if target in (f"${data['id']}", f"%{data['id']}")]
-if len(matches) != 1:
-    raise SystemExit(1)
-data = panes[matches[0]]
-if args[0] == 'show-environment':
-    print(f"SHOWRUNNER_UNIT={data['slug']}\\nSHOWRUNNER_UNIT_ID={matches[0]}")
-else:
-    print(data['pane'])
-""")
         executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
         executable(self.bin / "send.py", """#!/usr/bin/env python3
 import json, os, sys, time
@@ -156,11 +134,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_WATCH_STATE_DIR": str(self.state),
             "STALL_WATCH_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_PROJECTS_DIR": str(self.projects),
-            "STALL_WATCH_TMUX": "tmux",
-            "UNIT_LOOKUP_TMUX": str(self.bin / "tmux"),
             "STALL_WATCH_PS": "ps",
             "STALL_WATCH_SEND": str(self.bin / "send.py"),
-            "STALL_TEST_TMUX_FILE": str(self.tmux_file),
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
@@ -236,9 +211,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
         child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
         pane_pid = 10_000 + len(self.panes)
-        self.process_rows += [f"{pane_pid} 1 tmux pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
+        self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
-        self.panes[name] = {"pane": PANE, "id": pane_id, "slug": "showrunner", "label": f"label-of-{name}"}
+        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "slug": "showrunner", "label": f"label-of-{name}"}
         socket_path = self.record_session(child.pid, f"sid-{name}", "different-remote-name")
         # The lookup reads the record itself: it needs the pane the session runs in, and a real socket.
         held = socket.socket(socket.AF_UNIX)
@@ -246,7 +221,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.addCleanup(held.close)
         record_path = self.sessions / f"{child.pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
-        _ = record_path.write_text(json.dumps({**record, "tmux": f"name-at-start:@1.%{pane_id}"}))
+        _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
         transcript = self.projects / "project" / f"sid-{name}.jsonl"
         transcript.parent.mkdir(exist_ok=True)
         _ = transcript.write_text("{}\n")
@@ -255,8 +230,13 @@ raise SystemExit(1 if record['to'] in fail else 0)
 
     def tick(self, at: int, *, together: int = 0) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
-        _ = self.tmux_file.write_text(json.dumps({
-            name: dict(pane) for name, pane in self.panes.items()}))
+        units = [
+            HostedUnit(str(data["label"]), f"w{data['id']}:p1",
+                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]))
+            for name, data in self.panes.items()]
+        fake_unit_host.write(self.environment, units)
+        for unit, data in zip(units, self.panes.values()):
+            fake_unit_host.place_process(self.environment, int(data["pid"]), unit.pane)
         # A unit's run state is read from the record of the newest /unit:direct run in its worktree.
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
@@ -282,33 +262,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
 
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
-        pid = self.children[0].pid
-        record_path = self.sessions / f"{pid}.json"
-        record = cast(dict[str, object], json.loads(record_path.read_text()))
-        _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
-        # Keep the fixture's unit for its run record, but remove its tmux mark from this production.
-        self.panes["unit-one"]["slug"] = "other"
-        for process_pid, parent, argv, environment in (
-            (991000, 0, ["herdr", "--session", "native", "server"], {}),
-            (pid, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "showrunner",
-                                      "SHOWRUNNER_UNIT_ID": "unit-one"}),
-        ):
-            path = self.root / "proc" / str(process_pid)
-            path.mkdir(parents=True)
-            _ = (path / "stat").write_text(f"{process_pid} (fixture) S {parent} 0 0")
-            _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
-            _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
-            (path / "cwd").symlink_to(self.root)
-        herdr_listener(self.root / "proc", 991000, "native", self.environment)
-        sessions: SessionListResult = {"sessions": [{
-            "name": "native", "running": True, "default": False,
-            "session_dir": "/fixture", "socket_path": "/fixture/socket"}]}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
-            "--session default session list --json": {"code": 0, "stdout": json.dumps(sessions)},
-            "--session native pane read w1:p1 --source recent-unwrapped --lines 400": {
-                "code": 0, "stdout": PANE},
-            "default": {"code": 1, "stdout": "unexpected herdr command"},
-        }))
+        self.panes["unit-one"]["label"] = "native"
         first = self.tick(START)
         second = self.tick(START + 300)
         self.assertEqual((first.returncode, second.returncode), (0, 0), first.stderr + second.stderr)
@@ -321,7 +275,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 300).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
-        # A rename changes the tmux label and the Claude name. The mark, and so the unit, stays.
+        # A rename changes the herdr label and the Claude name. The mark, and so the unit, stays.
         self.panes["unit-one"]["label"] = "renamed-by-the-user"
         record_path = self.sessions / f"{self.children[0].pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))

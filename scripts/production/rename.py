@@ -492,7 +492,7 @@ def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
 
 def _stopped_unit(plan: RenamePlan, name: str) -> None:
     try:
-        found = unit_lookup.marked_units(plan.new, every_host=True).get(name)
+        found = unit_lookup.marked_units(plan.new).get(name)
     except OSError as error:
         raise RenameRefused(f"{name}: cannot tell whether Claude is running: {error}") from error
     state = found.claude if found else unit_lookup.ClaudeNotRunning()
@@ -626,7 +626,7 @@ def unit(new: str, name: str) -> None:
             unit_move.delete_branch(result.checkout, _string(record, "old_branch"), _string(record, "tip"))
             record["step"] = 5
             write_json(result.journal, journal)
-        print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit rewrites the tmux mark at next launch")
+        print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit writes the herdr mark at next launch")
 
 
 def finish(new: str) -> None:

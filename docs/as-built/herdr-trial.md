@@ -4,7 +4,7 @@
 
 On 2026-10-13 a fake production ran inside one herdr 0.9.0 session on natedev. It had one showrunner and three unit directors, all Claude, plus six Codex workers (one writer and one reviewer per unit). Each agent ran in its own pane, and the user could watch them all in one ghostty window. The point was to find out what breaks before a real production moves off tmux. The work itself was tiny: three one-phase units, each adding one helper to a small Python package, `textkit`, in a scratch repository with a bare local origin. Nothing was promoted to a real main branch, and the real `~/.claude` main was checked afterwards and holds nothing from the trial.
 
-`scripts/herdr/trial.py` drives the whole trial. Its 98 tests are in `test_trial.py`, where `fake_herdr.py` stands in for herdr and for every other program the driver calls. The trial is torn down; `scripts/herdr/` is kept as the starting point for moving productions to herdr (see "How `scripts/herdr/` works").
+A driver script, `scripts/herdr/trial.py`, ran the whole trial, with 98 tests over a fake herdr. The trial is torn down and the driver is removed: `scripts/herdr/herdr.py` replaced it, and [herdr-adoption.md](herdr-adoption.md) covers the code that exists now. This document is the record of what the trial ran and found.
 
 ## What ran
 
@@ -25,12 +25,12 @@ On 2026-10-13 a fake production ran inside one herdr 0.9.0 session on natedev. I
 
 ## Findings, ranked by what a real herdr production would have to change
 
-1. **Session identity and unit lookup.** Every production tool finds sessions through tmux or registered state. In the trial:
+1. **Session identity and unit lookup.** When the trial ran, every production tool found sessions through tmux or registered state. In the trial:
    - `production_lifecycle.py load` reported every director as `session: gone`, and `waiting.py quota` could not reach any of them (issues 5, 8).
    - `roster.py` listed none of the 10 agents at first. Once the showrunner's state registered, it listed the directors but filed them as `freestanding`, and it never listed the Codex pane workers (issues 7, 17).
 
    Fix before adopting herdr: the roster, the showrunner lookup and every tmux lookup need a herdr source. `herdr agent list` gives each pane's agent, status and pane id.
-2. **Delivering a Work Order.** herdr does not treat Codex's folder-trust screen as blocked. Two Work Orders were pasted into panes that were sitting at that screen and were lost there. Each director then waited the full 30 minutes before resending (issues 10–12, 15). `trial.py work` now:
+2. **Delivering a Work Order.** herdr does not treat Codex's folder-trust screen as blocked. Two Work Orders were pasted into panes that were sitting at that screen and were lost there. Each director then waited the full 30 minutes before resending (issues 10–12, 15). `trial.py work` was then changed so that it:
    - reads `agent get` and refuses a worker that is not `interactive_ready`;
    - confirms the turn started within `HERDR_TRIAL_TURN_START_TIMEOUT`.
 
@@ -67,131 +67,16 @@ One Codex pane stalled with `Working` and a frozen timer on a one-line task. `tr
 - `status server` exits 0 even when the server is stopped, so the trial reads its `status: running` line instead.
 - The server and client ran for the whole day as systemd user units.
 
-## How `scripts/herdr/` works
+## How the trial driver worked
 
-The trial driver was removed when `herdr.py` replaced it; see [the adoption plan](../plans/build-followups-herdr-adoption.md).
+The driver and its files (`trial.py`, `scaffold_files.py`, `test_trial.py`) are removed. What it did, as the method behind the findings:
 
-| File | Role |
-| --- | --- |
-| `trial.py` | The driver: herdr wrapper, systemd units, client window, launch, `work`/`wait`, teardown, `leftovers` |
-| `scaffold_files.py` | Trial-only texts: `UNITS` (slug, clamp, count), `TRIAL_RULE`, `TRIAL_SCRIPT`, the textkit package, production doc, log and unit plans |
-| `fake_herdr.py` | Test double for herdr, `systemd-run`, `systemctl`, `kdotool`, the process stopper and the model resolver |
-| `test_trial.py` | 98 tests in one class, `TrialTests` |
-
-`trial.py` must run from the full repository. It imports `scripts.herdr.scaffold_files` at load time, imports `scripts.accounts.accounts.role_account` when `HERDR_TRIAL_CODEX_HOME` is unset, and sources the checkout's `scripts/agents/agents_config.sh`.
-
-### The herdr wrapper
-
-The `Herdr` class runs `HERDR_BIN`, else the store path `/nix/store/pyqm5522kvk30b9vgb1ab976pjnjwn51-herdr-0.9.0/bin/herdr`, with `--session herdr-trial` on every call. A non-zero exit raises `TrialFailure` carrying herdr's JSON `error.message` when there is one. Panes are always addressed by id (`w3:p1`), looked up by label in `pane list`; `lookup` returns `PaneFound | NoPane | SeveralPanes`. Every herdr JSON shape has its own `TypedDict` (`PaneListResult`, `AgentListResult`, `CreatedWorkspace`, `CreatedTab`, `SplitPane`, `AgentWaitResult`, `WorkerReadiness`, `HerdrRefusal` and others).
-
-### Commands
-
-Exit 2 is a usage error (bad arguments, bad timeout values, bad `--desktop`) or a blocked worker. Exit 1 is any other failure. Every failure prints one stderr line starting `trial: `.
-
-| Command | Behavior |
-| --- | --- |
-| `up [--desktop N]` | Validates `started.json`, then `server start`, then `client open`. |
-| `server start` | Nothing if `status server` prints `status: running`. Else starts unit `herdr-trial-server` with `systemd-run --user`, records it, and polls until the start timeout; then exit 1, `server herdr-trial not answering after N seconds`. |
-| `server stop` | `herdr server stop`, then stops the unit if still active. |
-| `client open [--desktop N]` / `client close` | See "Client window". `close` stops `herdr-trial-client`. |
-| `open <label> [--cwd D] [--command C]` | One new workspace per label; renames its root pane to the label; runs the command. Refuses an existing label. |
-| `close <label>` | Closes that pane. |
-| `pane-id <label>` | Prints the id; exit 1 on zero or several matches. |
-| `read <label>` | Prints the visible pane text. |
-| `type <label> <text>` | Sends the text and Enter. No readiness check. |
-| `agents` | `label<TAB>agent<TAB>state` per agent. |
-| `issue <session> <expected> <happened>` | Appends one line to `issues.jsonl`. |
-| `trust-check <dir>` | Exit 0 only when both accounts trust the exact key (see "Trust"). |
-| `scaffold` | Builds the scratch repository. Trial-only. |
-| `launch` | Builds the 10-pane layout and starts the agents. |
-| `work <unit> <impl\|review> <file>` | Sends one Work Order to a worker pane. |
-| `wait <unit> <impl\|review>` | Waits for the worker's report and prints its path. |
-| `teardown` / `leftovers` | See "Teardown". |
-
-### Data files
-
-- **`<root>/started.json`** (`StartedResources`): `systemd_units`, `notifier_instances`, `codex_daemons_before`, `codex_daemons_started`. A daemon is a `ProcessIdentity` `{pid, start_time}`, where `start_time` is field 22 of `/proc/<pid>/stat`. A malformed file stops `up` and `launch` before anything starts.
-- **`<root>/work/<label>.json`** (`WorkerWorkOrder`): `{"file": "<abs path>"}`, one per worker, path from `work_record(label)`.
-- **`<root>/issues.jsonl`** (`TrialIssue`): `{time, session, expected, happened}`, UTC ISO time.
-- **The cleanup manifest** (`CleanupManifest`): see "Teardown".
-
-`started.json`, work records and the manifest are written by temp file and `os.replace`.
-
-### Launch
-
-- Workspace `herdr-fake`: tab `showrunner` (pane `showrunner`, cwd `repo/`), and per unit a tab with the director pane `<unit>`, `<unit>-impl` split right of it and `<unit>-review` split below `-impl`, cwd the unit's worktree.
-- Unit panes carry `SHOWRUNNER_UNIT=herdr-fake` and `SHOWRUNNER_UNIT_ID=<unit>`; the showrunner pane neither. Claude panes add `CLAUDE_CONFIG_DIR` and `ENABLE_TOOL_SEARCH=true`; Codex panes add `CODEX_HOME`. The caller's `CLAUDE_*` variables are removed from every launch subprocess.
-- Accounts: Claude from `HERDR_TRIAL_CLAUDE_CONFIG_DIR` (default `~/.claude1`); Codex from `HERDR_TRIAL_CODEX_HOME`, else the `workers` role account.
-- Models: `agents_resolve_print` for `production.director` (must be `claude`), `delegate.impl` and `delegate.review`, run under bash (sourced into zsh it returns empty rows). It reads `~/.claude/config/agents.conf` unless `AGENTS_CONFIG_FILE` says otherwise. `HERDR_TRIAL_RESOLVE` swaps in another program.
-- Argv: Codex `-m <model> -c model_reasoning_effort=<effort> -s danger-full-access -a never`. Claude `--model --effort`, plus `--remote-control <name>` for the showrunner and directors, then `-n <name>`. A worker that resolves to claude logs an issue and starts as Claude.
-- Start: `agent start` with no prompt; once ready, `agent prompt` sends the opening text (`/showrunner:produce` or `/unit:direct` with its doc plus `TRIAL_RULE`; workers a one-line wait message). Order: six workers, three directors, the showrunner.
-- Refusals before anything is created: server not answering, workspace `herdr-fake` exists, a start folder fails trust, or the director does not resolve to claude. `agent_not_ready` logs the visible screen and exits 1 with no keys sent.
-- `codex_daemons_before` is recorded once (a retry keeps it); new managed daemons go to `codex_daemons_started` after the workers start or fail.
-
-### Work Orders
-
-- `work` resolves the file (exit 1 if missing) and reads `agent get` as `WorkerReadiness`. Unless `interactive_ready` is true and `agent_status` is `idle` or `done`, it logs an issue and exits 2 with nothing sent. Otherwise it removes a stale `<file>.done`, writes the work record and sends `agent prompt` once: "Read and carry out <file>. When done, write your report to <file>.done." It then waits `--until working` under `HERDR_TRIAL_TURN_START_TIMEOUT`. A started turn, or a report already written, returns 0; else it removes the record, logs an issue and exits 1.
-- `wait` reads the work record (exit 1 when absent) and runs under one deadline, `HERDR_TRIAL_WAIT_TIMEOUT`. It runs a settled `agent wait`; when the worker is idle or done with no report, it waits `--until working` and loops. A `blocked` state or an `agent_blocked` refusal exits 2 with an issue line. At the deadline with no report it exits 1. It never sends the prompt again.
-
-### Trust
-
-One exact key serves both agents: the repository's main worktree root (the parent of `git rev-parse --path-format=absolute --git-common-dir`), or the folder itself outside git. Claude needs `projects[key].hasTrustDialogAccepted` true in `<claude>/.claude.json`; Codex needs `projects[key].trust_level = "trusted"` in `<codex>/config.toml`. Ancestor and sibling-prefix entries do not count. Nothing writes either file.
-
-### Client window
-
-`client open` launches `HERDR_TRIAL_TERMINAL` (default `ghostty`) `--gtk-single-instance=false --title=herdr-trial -e <herdr> --session herdr-trial` as unit `herdr-trial-client`. It polls `kdotool search --name ^herdr-trial$` until the start timeout and, with `--desktop N`, moves the window there. No window, or a failed move, stops the unit and exits 1. An active client unit that has a window is moved and kept; one with no window is replaced.
-
-### Environment variables
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `HERDR_BIN` | the store path | herdr binary |
-| `HERDR_TRIAL_ROOT` | `/home/natepiano/rust/herdr-trial-scratch` | scratch root |
-| `HERDR_TRIAL_START_TIMEOUT` | `10` s for server and client; `90000` ms for `launch` | readiness deadlines |
-| `HERDR_TRIAL_TURN_START_TIMEOUT` | `60000` ms | `work`: time for the turn to start |
-| `HERDR_TRIAL_WAIT_TIMEOUT` | `1800000` ms | `wait`: overall deadline |
-| `HERDR_TRIAL_MANIFEST` | `~/.local/state/herdr-trial/cleanup.json` | cleanup manifest; must sit outside the scratch root |
-| `HERDR_TRIAL_TERMINAL` | `ghostty` | client terminal |
-| `HERDR_TRIAL_KDOTOOL` | `kdotool` | window search and move |
-| `HERDR_TRIAL_SYSTEMD_RUN`, `HERDR_TRIAL_SYSTEMCTL` | `systemd-run`, `systemctl` | unit start, status and stop (always `--user`) |
-| `HERDR_TRIAL_GIT` | `git` | scaffold git and the trust key lookup |
-| `HERDR_TRIAL_RESOLVE` | bash plus `agents_config.sh` | model resolver |
-| `HERDR_TRIAL_CLAUDE_CONFIG_DIR` | `~/.claude1` | Claude account for launch and the manifest |
-| `HERDR_TRIAL_CODEX_HOME` | the `workers` role account | Codex account for launch and the manifest |
-| `HERDR_TRIAL_PROC` | `/proc` | process inspection root |
-| `HERDR_TRIAL_STOP_PROCESS` | `os.kill(pid, SIGTERM)` | program that stops a pid |
-| `HERDR_TRIAL_NOTIFIER_ROOT` | `~/.local/state/notifier` | notifier instance folders |
-| `HERDR_TRIAL_SHOWRUNNER_STATE` | `~/.local/state/showrunner` | showrunner state |
-| `HERDR_TRIAL_HERDR_CONFIG` | `~/.config/herdr` | herdr config and session state |
-| `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | `~/.claude1`, `~/.codex1` | `trust-check` only |
-
-The fixture boundaries are `HERDR_TRIAL_PROC`, `HERDR_TRIAL_STOP_PROCESS`, `HERDR_TRIAL_NOTIFIER_ROOT`, `HERDR_TRIAL_SHOWRUNNER_STATE` and `HERDR_TRIAL_HERDR_CONFIG`; the tests point every variable above at temp fixtures.
-
-### Tests
-
-- Run: `python3 -m unittest discover -s scripts/herdr -p 'test_*.py'` from the repository root. Tests never start herdr, Claude or Codex.
-- Lint: `basedpyright scripts/herdr`. A pass is its `0 errors, 0 warnings` line; it exits 3 on the missing `.venv`.
-- `fake_herdr.py` is copied into a temp folder with the test interpreter's shebang. Each call appends its argv as one JSON line to `FAKE_HERDR_LOG` and answers from `FAKE_HERDR_RESPONSES`, keyed by the space-joined argv, else `"default"`. A list of responses replays in order and repeats the last. Response fields: `stdout`, `code`, `stderr`, `write_files` (path to text, for report fixtures), `require_paths` (exit 98 when a path is missing) and `remove_paths`.
-- Two tests parse the scaffolded production doc with the real parsers, imported from the live `/home/natepiano/.claude/scripts/production`.
-
-### Reusable and trial-only parts
-
-Reusable: the `Herdr` wrapper, systemd unit start, record and stop, the `status: running` check, the ghostty and kdotool client, `worker_readiness` with the `work`/`wait` pattern and turn-start confirmation, exact-key trust, pane environment and argv building, process identity and the daemon-stop checks, atomic JSON writes and `remove_exact_path`.
-
-Trial-only: `scaffold` and its scratch git setup, all of `scaffold_files.py`, `SCRATCH_ROOT`, the worker labels and `work`/`wait` choices taken from `UNITS`, the names `herdr-fake` and `herdr-fake-*`, the fixed manifest state paths, the retained-grant report keyed on `<scratch>/repo`, and the `trial_process` markers.
-
-## Invariants
-
-- Nothing sends a key to a trust or permission prompt. `launch` reads and logs an unready screen; `work` refuses a worker that is not `interactive_ready` and `idle`/`done`; `agent_blocked` and a `blocked` state send nothing. The manual `type` command is the one exception.
-- One prompt per Work Order, never sent again. `wait` only observes.
-- Opening prompts follow a successful `agent start`; `agent start` carries no prompt.
-- Teardown sends no input: it runs only `workspace list`, `workspace close`, `server stop` and `status server`. A test asserts no `send-text`, `send-keys`, `prompt`, `run` or `start` call.
-- No kill by pattern. Only recorded systemd units and recorded, still-matching daemons are stopped.
-- Exact-path removal only. Notifier names must be plain folder names.
-- Fail closed: a shutdown failure, a server that still answers or a surviving trial process keeps the scratch tree and all state.
-- Trust grants are reported, never changed.
-- Scratch git clears every `GIT_*` variable and sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null` and no signing, so the user's global hooks and signing never fire.
-- Python: basedpyright 0/0, no file-level ignores, a `TypedDict` for every herdr JSON shape, no `Any`.
+- **Layout.** One herdr session, `herdr-trial`, with the server and a ghostty client as systemd user units (`herdr-trial-server`, `herdr-trial-client`). Workspace `herdr-fake` held a `showrunner` tab with cwd `repo/`, and per unit a tab with the director pane `<unit>`, `<unit>-impl` split right of it and `<unit>-review` split below, cwd the unit's worktree. Panes were addressed by id, looked up by label.
+- **Pane environment.** Unit panes carried `SHOWRUNNER_UNIT=herdr-fake` and `SHOWRUNNER_UNIT_ID=<unit>`. Claude panes added `CLAUDE_CONFIG_DIR` (claude1) and `ENABLE_TOOL_SEARCH=true`; Codex panes added `CODEX_HOME`. The caller's `CLAUDE_*` variables were removed.
+- **Start.** `agent start` with no prompt; once ready, `agent prompt` sent the opening text. Workers started first, then the directors, then the showrunner. An `agent_not_ready` screen was logged and no key was sent.
+- **Work Orders.** `work` refused a worker unless `agent get` read `interactive_ready` and `idle` or `done`, sent one prompt, and confirmed the turn started (`--until working`, 60 s). `wait` only observed, under a 30-minute deadline, and never sent the prompt again.
+- **Trust.** One exact key served both agents: the repository's main worktree root, or the folder itself outside git. Claude needed `projects[key].hasTrustDialogAccepted`; Codex needed `projects[key].trust_level = "trusted"` in `config.toml`. Ancestor entries did not count, and nothing wrote either file.
+- **Rules.** Nothing sent a key to a trust or permission prompt, except a manual `type` command. Nothing was killed by pattern: only recorded systemd units and recorded, still-matching daemons were stopped. Removal was by exact path. Scratch git cleared every `GIT_*` variable and ran with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null` and no signing.
 
 ## Gotchas
 
@@ -199,29 +84,19 @@ herdr 0.9.0:
 - `workspace create --label` labels only the workspace; the root pane needs `pane rename`.
 - `pane read` and `status server` print plain text, not JSON.
 - herdr creates `~/.config/herdr/` (`.plugins.lock`, `release-notes.json`, `sessions/<name>/`).
-- A standalone `agent wait` tracks the agent's lifecycle, not a turn: a worker that has not yet started its prompt reads as idle and returns at once. That is why `work` and `wait` wait for `working`.
+- A standalone `agent wait` tracks the agent's lifecycle, not a turn: a worker that has not yet started its prompt reads as idle and returns at once. That is why the trial's `work` and `wait` waited for `working`.
 - A typed `/quit` does not exit Codex; close the pane. `/exit` stops Claude.
 - A Claude pane on claude1 turns on Remote Control by itself.
 - Interactive Codex on `~/.codex1` uses the account's managed `codex app-server --managed-daemon`, which outlives its pane.
 
-In the code:
-- `HERDR_TRIAL_START_TIMEOUT` has two units: float seconds for server and client, integer milliseconds for `launch`. `0.5` makes `launch` exit 2; `90000` makes `server start` wait 25 hours.
-- `launch` addresses agents by the name given to `agent start`; `work` and `wait` use the pane id.
-- `trust-check` reads `CLAUDE_CONFIG_DIR` and `CODEX_HOME`; `launch` reads `HERDR_TRIAL_CLAUDE_CONFIG_DIR` and `HERDR_TRIAL_CODEX_HOME`. They can disagree.
-- `scaffold_files.TRIAL_SCRIPT` hard-codes this worktree's path to `trial.py`. It breaks when the worktree moves or is deleted.
-- A manifest already at the manifest path is reused as is. Delete it once `leftovers` passes, or it drives the next teardown.
-- Sourcing `agents_config.sh` can run `sync_codex_catalog.sh` when the catalog is stale.
-- The launch daemon scan matches `codex` as a substring of any argv element; `codex_process` matches it in an argv basename.
-- `production_check.sh` is zsh; under bash it fails.
+## Why the trial was built this way
 
-## Why it is built this way
-
-- **Scratch root under `~/rust`.** No session may face a trust prompt, and none is answered for the user. The scratch root `/home/natepiano/rust/herdr-trial-scratch/` sits where the user can grant trust once on `repo/`, which then covers every scratch worktree.
-- **One named herdr session, `herdr-trial`.** Nothing joins or disturbs a default herdr session.
-- **Units launched by `trial.py launch`, not `add_unit.py`.** `add_unit.py` started tmux sessions when the trial was built (herdr sessions since herdr-adoption Phase 7). Each place the production commands assume tmux became a finding.
-- **`Promote: none`.** The fake production merges to its own branch and pushes to the bare origin; nothing reaches `~/.claude`.
-- **One work record per worker.** Three directors call `work` at once; one file each needs no lock.
-- **The manifest outside the scratch tree.** Retries and `leftovers` still work after the scratch tree is deleted.
+- **Scratch root under `~/rust`.** No session could face a trust prompt, and none was answered for the user. The scratch root `/home/natepiano/rust/herdr-trial-scratch/` sat where the user could grant trust once on `repo/`, which then covered every scratch worktree.
+- **One named herdr session, `herdr-trial`.** Nothing joined or disturbed a default herdr session.
+- **Units launched by `trial.py launch`, not `add_unit.py`.** `add_unit.py` started tmux sessions when the trial was built. Each place the production commands assumed tmux became a finding.
+- **`Promote: none`.** The fake production merged to its own branch and pushed to the bare origin; nothing reached `~/.claude`.
+- **One work record per worker.** Three directors called `work` at once; one file each needed no lock.
+- **The manifest outside the scratch tree.** Retries and `leftovers` still worked after the scratch tree was deleted.
 
 ## Ruled out
 
@@ -236,30 +111,6 @@ In the code:
 
 ## Teardown
 
-`trial.py teardown` reads the cleanup manifest at `~/.local/state/herdr-trial/cleanup.json` (overridden by `HERDR_TRIAL_MANIFEST`), writing it on its first run from `started.json`. The manifest (`CleanupManifest`) holds the scratch root, the systemd units, the notifier instances (always `showrunner-herdr-fake`), the exact state paths, the herdr config, both account paths and the daemon baseline and started list. It sits outside the scratch tree so that retries and `leftovers` still work after the scratch tree is deleted. Teardown then:
-- copies `issues.jsonl` beside the manifest;
-- closes every workspace in session `herdr-trial` without sending a single key, then stops the server;
-- stops the recorded systemd units that are still active;
-- refuses to go on while the server still answers;
-- stops only a managed Codex daemon that it recorded as started, that is absent from the baseline, and that still runs `codex app-server --managed-daemon` on the same account with the same pid and start time, and only when no other Codex client or unreadable process of the current user uses the account;
-- refuses to delete anything while a trial process survives: environment `SHOWRUNNER_UNIT=herdr-fake` or `HERDR_SESSION=herdr-trial`, argv `--title=herdr-trial` or `--session herdr-trial|herdr-devcheck`, or a cwd under the scratch root;
-- removes the recorded state paths by exact name (the notifier instance, `~/.local/state/showrunner/herdr-fake/`, herdr's `sessions/herdr-trial` and `sessions/herdr-devcheck`, `.plugins.lock`, `release-notes.json`), then `sessions/` and `~/.config/herdr/` only if empty, then the scratch root;
-- runs the leftovers check and exits 1 if anything remains.
+The trial ended 2026-10-13 15:13 EDT, when the user said they were done and want herdr for every production and standalone session. `trial.py teardown` exited 0. It closed workspaces `w8` and `w9` without sending a key, stopped the herdr server and both systemd units, and removed the scratch tree, `~/.config/herdr/sessions/herdr-trial` and `herdr-devcheck`, and the fake showrunner's notifier and showrunner state. It named five delegate mesh servers as `not a managed Codex daemon; retained` and left them running; all five were alive afterwards. `trial.py leftovers` then exited 0. The 20 logged issues are in this document; their archive and the cleanup manifest were deleted.
 
-`trial.py leftovers` exits 0 only when no trial process, unit, timer, state folder or scratch path remains, and names each survivor:
-- It prints a surviving daemon as `trial-started` or `shared`.
-- It ignores Codex daemons from the baseline, daemons it never recorded, and delegate mesh servers.
-- It reports the retained trust grants without changing them.
-
-Review found that the first version would have recorded five other sessions' delegate mesh servers as trial-started. It would also have treated other users' unreadable processes as Codex clients. Both are fixed, with regression tests. Two narrower edges remain, found by the last review and left as written because this trial recorded no managed daemon, so neither can stop anything here: the outside-client scan runs once before all daemon stops rather than before each one, and any process with an argv element exactly `app-server` (a `codex exec app-server` call, not only the subcommand) is left out of the outside-client check. Fix both before reusing this teardown elsewhere.
-
-**Retained, by design:** Claude's `hasTrustDialogAccepted` for `repo/`, Codex's `trust_level=trusted` for `repo/`, and the Codex hooks trust in `~/.codex1/config.toml`. Teardown reports these and leaves them for the user to remove.
-
-**Status:** ended 2026-10-13 15:13 EDT, when the user said they were done and want herdr for every production and standalone session.
-- `trial.py teardown` exited 0. It closed workspaces `w8` and `w9` without sending a key, stopped the herdr server and both systemd units, and removed the scratch tree plus the recorded state:
-  - `~/.config/herdr/sessions/herdr-trial` and `herdr-devcheck`;
-  - the fake showrunner's notifier and showrunner state.
-- It named the five delegate mesh servers as `not a managed Codex daemon; retained` and left them running. All five were confirmed alive afterwards.
-- `trial.py leftovers` then exited 0, listing only the three retained trust grants above.
-- The 20 logged issues are in this document. Their archive and the cleanup manifest under `~/.local/state/herdr-trial/` were deleted after the checkpoint notice.
-- **`scripts/herdr/` is kept.** The user is moving productions and standalone sessions to herdr, and these helpers are the tested starting point: server and client as systemd units, readiness before a prompt, turn-start confirmation, and a teardown that never signals another session's processes. The trial-only parts (scaffold, fake units, scratch paths) go when that work replaces them.
+**Retained, by design:** Claude's `hasTrustDialogAccepted` for `repo/`, Codex's `trust_level=trusted` for `repo/`, and the Codex hooks trust in `~/.codex1/config.toml`. They are left for the user to remove.

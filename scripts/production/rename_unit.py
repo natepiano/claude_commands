@@ -169,7 +169,7 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
 def _check_stopped(rename: UnitRename) -> None:
     """The unit runs no Claude under either id, and nothing works inside its worktree."""
     try:
-        marked = unit_lookup.marked_units(rename.slug, every_host=True)
+        marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     for unit in (rename.old, rename.new):
@@ -187,12 +187,12 @@ def _check_stoppable(rename: UnitRename) -> None:
     """What the stop step cannot settle: the new id running, a Claude it cannot read, or processes
     in the worktree of a unit with no Claude to stop. A live old unit is the stop step's to stop."""
     try:
-        marked = unit_lookup.marked_units(rename.slug, every_host=True)
+        marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     old, new = marked.get(rename.old), marked.get(rename.new)
     if new and not isinstance(new.claude, unit_lookup.ClaudeNotRunning):
-        raise RenameRefused(f"{rename.new} already runs in session {new.label}")
+        raise RenameRefused(f"{rename.new} already runs in session {new.place.session}")
     if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
     if old and isinstance(old.claude, unit_lookup.LiveClaude):
@@ -431,7 +431,7 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
         rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
         return
     try:
-        found = unit_lookup.marked_units(rename.slug, every_host=True).get(rename.old)
+        found = unit_lookup.marked_units(rename.slug).get(rename.old)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
@@ -567,7 +567,7 @@ def _session_failures(rename: UnitRename) -> list[str]:
     saved = shutdown_record.find_session(rename.account, rename.session_id)
     if saved is not None and saved["session"]["host"]["kind"] == "unit" and saved["session"]["host"]["unit"] != rename.new:
         failures.append(f"shutdown record {rename.session_id} does not name {rename.new}")
-    marked = unit_lookup.marked_units(rename.slug, every_host=True)
+    marked = unit_lookup.marked_units(rename.slug)
     found = marked.get(rename.new)
     if found is None or not isinstance(found.claude, unit_lookup.LiveClaude):
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
