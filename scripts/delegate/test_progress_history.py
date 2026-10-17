@@ -395,7 +395,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 100,
         )
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -415,7 +415,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 160,
         )
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -520,7 +520,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         parsed: object = json.loads(calibration_text)  # pyright: ignore[reportAny]
         suggestion = cast(int, cast(dict[str, object], parsed)["suggested_percent"])
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -561,7 +561,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(calibration["apply_suggestion"], True)
 
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -579,25 +579,15 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 100,
         )
         self.assertEqual(
-            header.splitlines(),
+            self.table_rows(header, SUMMARY_HEADER)[:2],
             [
-                "**bevy_hana_rubric - feature/rubric**",
-                "",
-                "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
-                "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                f"| Project |  80 | 00:01:40 | {'—':>11} |           | {'—':>20} | {'—':>20} |",
-                "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
-                "",
-                "**Phase 3: Retry handling**",
-                "",
-                "| Stage | Start    | Elapsed | Agent 1        | Agent 2 | Result  |",
-                "| ----- | -------- | ------- | -------------- | ------- | ------- |",
-                "| Fix 2 | 05:33:30 | 1m      | fix 1m running | -       | running |",
-                "",
-                "▸ **Fix 2 - correcting retry recovery**",
-                "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                ["Project", "80", "00:01:40", "—", "", "—", "—"],
+                ["Phase 3", "25", "00:01:40", "today 05:40", "",
+                 "today 05:36 (-00:03)", "today 05:46 (+00:06)"],
             ],
         )
+        self.assertIn("▸ **Fix 2 - correcting retry recovery**", header)
+        self.assertEqual(header.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
 
         _ = self.run_command(
             "calibrate",
@@ -608,7 +598,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 160,
         )
         unchanged_header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -643,7 +633,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 180,
         )
         independently_changed = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -715,33 +705,39 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(decision_counts["raw"], 5)
         self.assertEqual(decision_counts["calibrated"], 1)
 
-    def test_legacy_progress_call_keeps_existing_header(self) -> None:
+    def test_legacy_progress_preserves_its_layout_and_only_adds_tables_on_request(self) -> None:
         started_at = 20_000
         session_dir = self.start_run("legacy", started_at)
         self.start_phase_and_pass(session_dir, started_at)
-        header = self.run_command(
-            "progress",
-            "--session-dir",
-            str(session_dir),
-            "--raw-percent",
-            "20",
-            "--percent",
-            "20",
-            "--activity",
-            "correcting retry recovery",
-            at=started_at + 100,
-        )
-        self.assertEqual(
-            header.splitlines(),
-            [
-                "**bevy_hana_rubric - feature/rubric**",
-                "**Phase 3: Retry handling - elapsed 00:01:40**",
-                "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
-                "**20% complete**",
-                "**Total elapsed 00:01:40**",
-                "**now 1970-01-01 05:35:00 - next report 05:38:00**",
-            ],
-        )
+        for tables in (False, True):
+            with self.subTest(tables=tables):
+                report = self.run_command(
+                    "progress", *(["--tables"] if tables else []),
+                    "--session-dir", str(session_dir), "--raw-percent", "20", "--percent", "20",
+                    "--activity", "correcting retry recovery", at=started_at + 100,
+                )
+                expected = [
+                    "**bevy_hana_rubric - feature/rubric**",
+                    "**Phase 3: Retry handling - elapsed 00:01:40**",
+                    "ETA unavailable",
+                    "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
+                    "**20% complete**",
+                    "**Total elapsed 00:01:40**",
+                ]
+                self.assertEqual(report.splitlines()[:6], expected)
+                self.assertEqual(report.splitlines()[-1],
+                                 "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+                if tables:
+                    self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:3],
+                                     ["Phase 3", "20", "00:01:40"])
+                    self.assertEqual(
+                        self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
+                        [["Fix 2", "05:33:30", "1m", "fix 1m running", "-", "running"]],
+                    )
+                else:
+                    self.assertEqual(report.splitlines(), [
+                        *expected, "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                    ])
 
     def test_ad_hoc_run_reuses_plan_project_time_for_the_same_worktree_branch(
         self,
@@ -799,7 +795,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
         self.start_phase_and_pass(ad_hoc_session, ad_hoc_start)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(ad_hoc_session),
             "--project-raw-percent",
@@ -941,7 +937,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
         ):
             result = self.run_failing_command(
-                "progress",
+                "progress", "--tables",
                 "--session-dir",
                 str(session_dir),
                 "--project-raw-percent",
@@ -1010,7 +1006,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
         ):
             result = self.run_failing_command(
-                "progress",
+                "progress", "--tables",
                 "--session-dir",
                 str(session_dir),
                 "--activity",
@@ -1072,7 +1068,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         events_before = history.read_text(encoding="utf-8")
         state_before = state_path.read_text(encoding="utf-8")
         report = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1162,7 +1158,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
 
         result = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--activity",
@@ -1172,35 +1168,24 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No active phase to report: phase completed.", result.stderr)
 
-    def test_an_active_phase_progress_report_keeps_its_exact_output(self) -> None:
+    def test_an_active_phase_tables_report_keeps_its_clocks_and_rounds(self) -> None:
         started_at = 20_000
         session_dir = self.start_run("active-phase-output", started_at)
         self.start_phase_and_pass(session_dir, started_at)
 
         report = self.run_progress(session_dir, at=started_at + 100)
 
+        self.assertEqual(report.splitlines()[0], "**bevy_hana_rubric - feature/rubric**")
         self.assertEqual(
-            report,
-            "\n".join(
-                (
-                    "**bevy_hana_rubric - feature/rubric**",
-                    "",
-                    "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
-                    "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                    f"| Project |  40 | 00:01:40 | {'—':>11} |           | {'—':>20} | {'—':>20} |",
-                    "| Phase 3 |  30 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
-                    "",
-                    "**Phase 3: Retry handling**",
-                    "",
-                    "| Stage | Start    | Elapsed | Agent 1        | Agent 2 | Result  |",
-                    "| ----- | -------- | ------- | -------------- | ------- | ------- |",
-                    "| Fix 2 | 05:33:30 | 1m      | fix 1m running | -       | running |",
-                    "",
-                    "▸ **Fix 2 - implementing**",
-                    "**now 1970-01-01 05:35:00 - next report 05:38:00**",
-                )
-            ),
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)[:2]],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
         )
+        self.assertEqual(
+            self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
+            [["Fix 2", "05:33:30", "1m", "fix 1m running", "-", "running"]],
+        )
+        self.assertIn("▸ **Fix 2 - implementing**", report)
+        self.assertEqual(report.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
 
     def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
         started_at = 21_000
@@ -1483,7 +1468,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             # Percents the tick passes are neither required nor checked: the
             # report shows what was recorded, not what this call claims.
             report = self.run_command(
-                "progress",
+                "progress", "--tables",
                 "--session-dir",
                 str(session_dir),
                 "--phase-raw-percent",
@@ -1536,7 +1521,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.start_phase_and_pass(session_dir, started_at)
         self.close_the_only_pass(session_dir, at=started_at + 200)
         report = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--activity",
@@ -1567,7 +1552,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session_dir = self.start_run("no-window-yet", started_at)
         self.start_phase(session_dir, started_at)
         report = self.run_command(
-            "progress", "--session-dir", str(session_dir), "--activity", "starting", at=started_at + 60
+            "progress", "--tables", "--session-dir", str(session_dir), "--activity", "starting", at=started_at + 60
         )
         self.assertEqual(
             self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
@@ -1595,7 +1580,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def report_phase_percent(self, session_dir: Path, percent: int, at: int) -> None:
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1659,14 +1644,14 @@ print('two homes isolated; recorder lock retained; caller restored')
     def test_a_run_with_no_phase_is_refused(self) -> None:
         session_dir = self.start_run("no-phase", 20_000)
         result = self.run_failing_command(
-            "progress", "--session-dir", str(session_dir), "--activity", "idle", at=20_100
+            "progress", "--tables", "--session-dir", str(session_dir), "--activity", "idle", at=20_100
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No active phase to report: phase missing.", result.stderr)
 
     def run_progress(self, session_dir: Path, at: int) -> str:
         return self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1767,7 +1752,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.start_phase_and_pass(session_dir, started_at)
 
         first = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -1781,7 +1766,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("elapsed 1 day 01:01:01", first)
 
         second = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -1800,7 +1785,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session_dir = self.start_run("capped", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1833,7 +1818,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session_dir = self.start_run("uncapped", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         result = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -2735,7 +2720,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 100,
         )
         failure = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -2751,7 +2736,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
         reason = "three of four recovery checks now pass"
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -2843,7 +2828,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 3_720,
         )
         failure = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -2870,7 +2855,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session_dir = self.start_run("endpoints", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         unstarted = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -2892,7 +2877,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertNotIn("today", unstarted)
 
         finished = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3038,7 +3023,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
         self.team_slot = ""
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3520,7 +3505,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 10,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3616,7 +3601,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 400,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3765,7 +3750,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 660,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3882,7 +3867,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.start_phase_and_pass(session_dir, started_at)
         _ = self.arm_early_review(session_dir, started_at + 100)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4251,7 +4236,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=70_010,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4284,7 +4269,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session_dir = self.start_run("band", 0)
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4327,7 +4312,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4367,7 +4352,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         session_dir = self.start_run("same_name", 0)
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4438,13 +4423,256 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=at(17, 40),
         )
         report = self.run_command(
-            "progress", "--session-dir", str(session_dir),
+            "progress", "--tables", "--session-dir", str(session_dir),
             "--project-raw-percent", "10", "--project-percent", "10",
             "--phase-raw-percent", "50", "--phase-percent", "50",
             "--cap-stage", "implementation", "--activity", "building the delivery",
             at=at(18, 0),
         )
         return session_dir, report
+
+    @staticmethod
+    def report_time(hour: int, minute: int = 0) -> int:
+        return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
+
+    def short_report_fixture(
+        self, name: str, *, promises: tuple[str, ...] = ("17:15", "17:45", "18:30"),
+        running_fix: bool = True, completed_fix: bool = True, gate: str = "",
+    ) -> Path:
+        session_dir = self.start_run(name, self.report_time(15))
+        plan = self.working_dir / "docs" / f"{name}.md"
+        _ = plan.write_text(
+            plan.read_text(encoding="utf-8") + "\n".join((
+                "### Phase 3 — Retry handling  · status: todo", "",
+                "### Phase 4 — Next delivery  · status: todo", "",
+                *(["**Blocked by:** G3", ""] if gate else []),
+            )), encoding="utf-8",
+        )
+        if gate:
+            self.add_production_marker(session_dir)
+            _ = (plan.parent / "example-production.md").write_text("\n".join((
+                "# Production — Example", "", "## Production Context", "",
+                "- **User zone:** UTC", "", "## Gates", "",
+                "| Gate | Waiting | Waits on | Clears when |",
+                "| --- | --- | --- | --- |",
+                f"| G3 | unit-a phase 4 | renderer phase 9 | {gate} |", "",
+            )), encoding="utf-8")
+        self.start_phase(session_dir, self.report_time(15))
+        if completed_fix:
+            self.start_slot_pass(session_dir, "impl", "fix", self.report_time(15, 1), fix_pass=1)
+            self.finish_slot_pass(session_dir, "impl", "completed", self.report_time(15, 3))
+        self.team_slot = ""
+        for index, target in enumerate(promises):
+            _ = self.run_command(
+                "eta", "--session-dir", str(session_dir), "--time", target,
+                "--basis", "remaining retry checks", at=self.report_time(15, 10 + index),
+            )
+        if running_fix:
+            # Two workers in one fix round must read as one running round.
+            for offset, slot in enumerate(("impl", "test")):
+                self.run_board(session_dir, "post", slot, "register", "up",
+                               at=self.report_time(15, 20) + offset)
+                self.run_board(session_dir, "role", slot, "fix", "retry repair",
+                               at=self.report_time(15, 21) + offset)
+                self.start_slot_pass(session_dir, slot, "fix", self.report_time(15, 22) + offset,
+                                     called_model=f"gpt-{slot}", fix_pass=2)
+            self.run_board(session_dir, "post", "impl", "status", "repairing retry recovery",
+                           at=self.report_time(15, 30))
+            self.run_board(session_dir, "post", "test", "blocked", "waiting for retry fixture",
+                           at=self.report_time(15, 31))
+            self.team_slot = ""
+        return session_dir
+
+    def short_progress(
+        self, session_dir: Path, at: int, *, tables: bool = False, zone: str = "UTC",
+    ) -> str:
+        return self.run_command(
+            "progress", *(["--tables"] if tables else []),
+            "--session-dir", str(session_dir),
+            "--project-raw-percent", "40", "--project-percent", "40",
+            "--phase-raw-percent", "30", "--phase-percent", "30",
+            "--cap-stage", "implementation", "--activity", "implementing",
+            at=at, zone=zone,
+        )
+
+    @staticmethod
+    def eta_report_line(report: str) -> str:
+        return next(line for line in report.splitlines()
+                    if line.startswith(("ETA ", "gated ")))
+
+    def test_short_progress_keeps_promises_stage_and_worker_narration_without_tables(self) -> None:
+        session_dir = self.short_report_fixture("short-workers")
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
+        self.assertIn("**Phase 3: Retry handling**", report)
+        self.assertIn("▸ **Fix 2 - implementing**", report)
+        impl = next(line for line in report.splitlines() if "repairing retry recovery" in line)
+        tester = next(line for line in report.splitlines() if "waiting for retry fixture" in line)
+        for slot, model, state, worker in (
+            ("impl", "gpt-impl", "running", impl), ("test", "gpt-test", "blocked", tester),
+        ):
+            self.assertIn(slot, worker)
+            self.assertIn(model, worker)
+            self.assertIn("fix", worker)
+            self.assertIn(state, worker)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_short_progress_names_the_first_eta_and_completed_fix_round(self) -> None:
+        session_dir = self.short_report_fixture("short-first", promises=("16:10",), running_fix=False)
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        self.assertEqual(self.eta_report_line(report), "ETA 16:10 (on its first ETA, 1 fix round)")
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_short_progress_retains_each_worker_while_the_director_runs_an_activity(self) -> None:
+        session_dir = self.short_report_fixture("short-concurrent-activity")
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir),
+            "--label", "Verify", "--activity", "checking the combined repair",
+            at=self.report_time(15, 40),
+        )
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        for slot, model, state in (("impl", "gpt-impl", "running"), ("test", "gpt-test", "waiting")):
+            worker = next(line for line in report.splitlines() if f"({slot})" in line)
+            self.assertRegex(worker, rf"\({slot}\) fix \S+ {state} ·")
+            self.assertIn(model, worker)
+        self.assertIn("▸ **Fix 2 - implementing**", report)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_short_eta_names_a_running_fix_round_without_zero_completed_rounds(self) -> None:
+        session_dir = self.short_report_fixture("short-running-fix", completed_fix=False)
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round running)")
+
+    def test_short_eta_includes_the_date_for_a_promise_on_a_different_local_day(self) -> None:
+        session_dir = self.short_report_fixture("short-next-day", promises=("2026-10-17T16:10",))
+
+        utc = self.short_progress(session_dir, self.report_time(16))
+        eastern = self.short_progress(session_dir, self.report_time(16), zone="America/New_York")
+
+        self.assertEqual(self.eta_report_line(utc),
+                         "ETA Sat 17 Oct 16:10 (on its first ETA, 1 fix round + 1 running)")
+        self.assertEqual(self.eta_report_line(eastern),
+                         "ETA Sat 17 Oct 12:10 (on its first ETA, 1 fix round + 1 running)")
+
+    def test_short_eta_line_formats_promises_in_the_user_zone(self) -> None:
+        session_dir = self.short_report_fixture("short-user-zone")
+
+        report = self.short_progress(session_dir, self.report_time(16), zone="America/New_York")
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 14:30 (first 13:15, +1:15, moved 2×, 1 fix round + 1 running)")
+
+    def test_short_progress_keeps_an_overdue_promise_instead_of_the_chain_schedule_end(self) -> None:
+        session_dir = self.short_report_fixture("short-overdue")
+
+        before = self.short_progress(session_dir, self.report_time(18, 31))
+        later = self.short_progress(session_dir, self.report_time(19))
+
+        for report in (before, later):
+            self.assertEqual(self.eta_report_line(report),
+                             "ETA 18:30 (passed, first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
+
+    def test_short_report_between_windows_keeps_the_eta_and_workers(self) -> None:
+        session_dir = self.short_report_fixture("short-between")
+        _ = self.short_progress(session_dir, self.report_time(16))
+        for offset, slot in enumerate(("impl", "test")):
+            self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
+        self.team_slot = ""
+        state = session_dir / "progress_history_state.json"
+        history = self.history_dir / "runs" / "short-between.jsonl"
+        before = (state.read_bytes(), history.read_bytes())
+
+        report = self.short_progress(session_dir, self.report_time(16, 10))
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
+        self.assertIn("repairing retry recovery", report)
+        self.assertIn("waiting for retry fixture", report)
+        self.assertIn("No pass or activity is open.", report)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assertEqual((state.read_bytes(), history.read_bytes()), before)
+
+    def test_tables_flag_adds_both_tables_and_keeps_the_same_eta_line(self) -> None:
+        session_dir = self.short_report_fixture("short-tables")
+
+        short = self.short_progress(session_dir, self.report_time(16))
+        detailed = self.short_progress(session_dir, self.report_time(16), tables=True)
+
+        self.assertEqual(self.eta_report_line(detailed), self.eta_report_line(short))
+        self.assertEqual(
+            [row[0] for row in self.table_rows(
+                detailed, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]],
+            )[:2]],
+            ["Project", "Phase 3"],
+        )
+        self.assertEqual(
+            [row[0] for row in self.table_rows(
+                detailed, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
+            )],
+            ["Fix 1", "Fix 2"],
+        )
+        self.assertIn("repairing retry recovery", detailed)
+
+    def test_later_phase_gates_do_not_replace_the_current_phase_promise(self) -> None:
+        for name, gate in (
+            ("timed", "release 2026-10-21 11:47"),
+            ("untimed", "reviewed checkpoint"),
+        ):
+            with self.subTest(gate=gate):
+                session_dir = self.short_report_fixture(f"short-{name}", gate=gate)
+
+                report = self.short_progress(session_dir, self.report_time(16))
+
+                self.assertEqual(self.eta_report_line(report),
+                                 "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
+                self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+                for offset, slot in enumerate(("impl", "test")):
+                    self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
+                self.team_slot = ""
+                between = self.short_progress(session_dir, self.report_time(16, 10))
+                self.assertEqual(self.eta_report_line(between),
+                                 "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
+                self.assertFalse(any(line.startswith("|") for line in between.splitlines()), between)
+
+    def test_eta_line_names_only_the_requested_phases_own_gate(self) -> None:
+        eta_line = cast(Callable[[Path, str], str], vars(progress_history)["_phase_eta_line"])
+        for name, gate, expected in (
+            ("timed", "release 2026-10-21 11:47", "gated until Wed 21 Oct 11:47"),
+            ("untimed", "reviewed checkpoint", "gated by G3: renderer phase 9"),
+        ):
+            with self.subTest(gate=gate):
+                session_dir = self.short_report_fixture(f"short-own-{name}", gate=gate)
+                with patch.dict(os.environ, {
+                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                    "PLAN_DELEGATE_NOW_EPOCH": str(self.report_time(16)), "USER_ZONE": "UTC",
+                }):
+                    self.assertEqual(eta_line(session_dir, "4"), expected)
+
+    def test_short_report_keeps_the_stage_of_an_activity_after_its_phase_finished(self) -> None:
+        session_dir = self.short_report_fixture("short-shrink", running_fix=False)
+        _ = self.run_command("finish-phase", "--session-dir", str(session_dir),
+                             "--status", "completed", at=self.report_time(16))
+        _ = self.run_command("start-activity", "--session-dir", str(session_dir),
+                             "--label", "shrink", "--activity", "recording the as-built phase",
+                             at=self.report_time(16, 1))
+
+        report = self.short_progress(session_dir, self.report_time(16, 2))
+
+        stage = next(line for line in report.splitlines() if line.startswith("▸ "))
+        self.assertIn("shrink", stage)
+        self.assertIn("recording the as-built phase", stage)
+        self.assertNotIn("No pass or activity is open.", report)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
 
     def test_project_eta_uses_the_last_chain_finish_and_shifts_the_open_eta_band(self) -> None:
         session_dir, report = self.report_eta_chain("project-chain")
