@@ -219,7 +219,7 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 **Ruled out:** `cargo clippy --fix` limited to one lint — with `-A warnings` plus `-W`, `-D`, or `-D` and `--cap-lints=deny`, it rewrote nothing.
 
-### Phase 6 — First live rewrite  · status: todo
+### Phase 6 — First live rewrite  · status: done
 
 **Depends on:** Phase 5
 **Blocked by:** G3, G5
