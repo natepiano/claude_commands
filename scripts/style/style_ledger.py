@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import tempfile
 import tomllib
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
@@ -33,6 +34,13 @@ LintTool = Literal["clippy", "mend", "rustfmt"]
 
 class LedgerError(ValueError):
     """A ledger operation cannot represent the requested check."""
+
+
+@dataclass(frozen=True)
+class SyncWait:
+    unit: str
+    since: str
+    token: str
 
 
 @dataclass(frozen=True)
@@ -487,6 +495,9 @@ MIGRATIONS = {
     6: """
         ALTER TABLE tickets ADD COLUMN proposal TEXT NOT NULL DEFAULT '';
     """,
+    7: """
+        CREATE TABLE sync_waits (unit TEXT PRIMARY KEY, since TEXT NOT NULL, token TEXT NOT NULL);
+    """,
 }
 
 
@@ -761,6 +772,28 @@ class Ledger:
         if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
             raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         self._ticket_transition(id, "merged")
+
+    def wait_for_sync(self, unit: str) -> None:
+        with self._connection:
+            _ = self._connection.execute(
+                "INSERT INTO sync_waits VALUES (?,?,?) ON CONFLICT(unit) DO NOTHING", (unit, _now(), uuid.uuid4().hex),
+            )
+
+    def clear_sync_wait(self, unit: str) -> None:
+        with self._connection:
+            _ = self._connection.execute("DELETE FROM sync_waits WHERE unit=?", (unit,))
+
+    def acknowledge_sync_wait(self, wait: SyncWait) -> None:
+        with self._connection:
+            _ = self._connection.execute(
+                "DELETE FROM sync_waits WHERE unit=? AND token=?", (wait.unit, wait.token),
+            )
+
+    def sync_waits(self) -> tuple[SyncWait, ...]:
+        rows = cast(list[tuple[str, str, str]], self._connection.execute(
+            "SELECT unit,since,token FROM sync_waits ORDER BY since,unit",
+        ).fetchall())
+        return tuple(SyncWait(unit, since, token) for unit, since, token in rows)
 
     def ticket_origin(self, id: str) -> ApprovedProposal | SelectedByCoverage:
         ticket = self._ticket(id)
@@ -1428,6 +1461,23 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
     return result
 
 
+def _wake_sync_waiters(repo: Path, ticket_id: str) -> None:
+    scripts = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run([
+            str(scripts / "lib/py"), str(scripts / "style/style_sync.py"),
+            "wake-waiters", "--repo", str(repo), "--ticket", ticket_id,
+        ], capture_output=True, text=True, check=False)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode:
+            print("style_ledger: wake: " + " ".join(
+                (result.stderr.strip() or f"style_sync.py exited {result.returncode}").splitlines(),
+            ))
+    except OSError as error:
+        print("style_ledger: wake: " + " ".join(str(error).splitlines()))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1543,6 +1593,8 @@ def main() -> None:
                     ledger.ticket_checkpoint(args.id, args.commit)
                 elif args.action == "merge":
                     ledger.ticket_merge(args.id)
+                    if ledger.sync_waits():
+                        _wake_sync_waiters(ledger.repo, args.id)
                 elif args.action == "drop":
                     ledger.ticket_drop(args.id)
                 else:

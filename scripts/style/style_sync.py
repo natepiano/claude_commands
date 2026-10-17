@@ -27,6 +27,7 @@ import style_ledger
 
 PYTHON = SCRIPTS / "lib/py"
 SEND = SCRIPTS / "message/send.py"
+ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
 VERIFY = SCRIPTS / "delegate/verify.sh"
 LEDGER = SCRIPTS / "style/style_ledger.py"
@@ -166,6 +167,83 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> None:
         raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
 
 
+@dataclass(frozen=True)
+class WaitingUnitDirector:
+    unit: str
+    address: str
+
+
+def _waiting_directors(slug: str) -> tuple[WaitingUnitDirector, ...]:
+    try:
+        result = subprocess.run(
+            [str(PYTHON), str(ROSTER), "--json"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        if result.returncode not in (0, 1):
+            raise Refusal(result.stderr.strip() or f"roster.py exited {result.returncode}")
+        payload = cast(object, json.loads(result.stdout))
+        if not isinstance(payload, dict):
+            raise Refusal("expected an object")
+        entries = cast(dict[str, object], payload).get("entries")
+        if not isinstance(entries, list):
+            raise Refusal("expected entries list")
+        directors: list[WaitingUnitDirector] = []
+        for entry in cast(list[object], entries):
+            if not isinstance(entry, dict):
+                raise Refusal("invalid entry")
+            fields = cast(dict[str, object], entry)
+            if fields.get("role") != "unit director" or fields.get("production") != slug:
+                continue
+            unit, address = fields.get("unit"), fields.get("address")
+            if not isinstance(unit, str) or not isinstance(address, str):
+                raise Refusal("invalid director unit or address")
+            if address:
+                directors.append(WaitingUnitDirector(unit, address))
+        return tuple(directors)
+    except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise Refusal("roster: " + " ".join(str(error).splitlines())) from error
+
+
+def wake_waiters(repo: Path, ticket_id: str) -> None:
+    """Retry waiting directors after a merge, retaining undelivered wakes."""
+    with style_ledger.open_ledger(repo) as ledger:
+        waits = ledger.sync_waits()
+        if not waits:
+            return
+        try:
+            standing = standing_style_production(repo)
+        except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            for wait in waits:
+                print(f"style_ledger: wake {wait.unit}: " + " ".join(str(error).splitlines()))
+            return
+        if isinstance(standing, NoStyleProduction):
+            return
+        try:
+            directors = _waiting_directors(standing.slug)
+        except Refusal as error:
+            for wait in waits:
+                print(f"style_ledger: wake {wait.unit}: {error}")
+            return
+        for wait in waits:
+            try:
+                addresses = [director.address for director in directors if director.unit == wait.unit]
+                if not addresses:
+                    raise Refusal("no live director")
+                if len(addresses) != 1:
+                    raise Refusal(f"{len(addresses)} directors")
+                result = subprocess.run([
+                    str(PYTHON), str(SEND), "--to", addresses[0], "--from", standing.slug,
+                    "--text", f"From the showrunner of {standing.slug}: ticket {ticket_id} merged; refill.",
+                    "--timeout", "10",
+                ], capture_output=True, text=True, check=False, timeout=15)
+                if result.returncode:
+                    raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+            except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+                print(f"style_ledger: wake {wait.unit}: " + " ".join(str(error).splitlines()))
+                continue
+            ledger.acknowledge_sync_wait(wait)
+
+
 def replay_handoffs(ledger: style_ledger.Ledger, slug: str, parent: str) -> int:
     failed = False
     for row in ledger.pending_handoffs():
@@ -228,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = run_lint.add_argument("--tip", required=True)
     replay = commands.add_parser("resume")
     handoff = commands.add_parser("send-handoff")
+    wake = commands.add_parser("wake-waiters")
+    _ = wake.add_argument("--repo", type=Path, required=True)
+    _ = wake.add_argument("--ticket", required=True)
     for command in (replay, handoff):
         _ = command.add_argument("--repo", type=Path, required=True)
         _ = command.add_argument("--slug", required=True)
@@ -239,6 +320,9 @@ def main(argv: list[str] | None = None) -> int:
         notify(cast(Path, args.repo_dir), cast(str, args.branch), cast(str, args.tip))
         return 0
     try:
+        if cast(str, args.command) == "wake-waiters":
+            wake_waiters(cast(Path, args.repo), cast(str, args.ticket))
+            return 0
         if cast(str, args.command) == "resume":
             return resume(cast(Path, args.repo), cast(str, args.slug),
                           cast(str, args.branch_point), cast(str, args.style_branch))

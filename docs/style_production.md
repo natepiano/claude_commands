@@ -59,7 +59,9 @@ for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
 Report a waiting state once and end the turn blocked until sync, a board retry
-message, or `ticket <id> merged; refill.` wakes the director.
+message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
+sends that wake to every unit waiting for sync. Refill records its wait before
+checking once more for work; delivery clears only that wait, preserving a later one.
 
 A ticket with no code changes makes no commit: record its cells at HEAD, verify
 `git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
@@ -225,7 +227,7 @@ with one `--also <path>` for each entry of the unit's open ticket's `files`
 `none — takes what the board leaves free`; paths outside that ticket stay refused.
 
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
-and send the unit director
+to wake every unit waiting for sync, and send the owning unit director
 `From the showrunner of <style slug>: ticket <id> merged; refill.`
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
@@ -278,7 +280,8 @@ This also clears hand-offs a departing parent had not merged.
 
 On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
 nothing and send neither a hand-off nor a refill message: the unit refills
-itself. When `<n>` is positive, run `style_proposals.py file`.
+itself; its `ticket merge` already woke units waiting for sync.
+When `<n>` is positive, run `style_proposals.py file`.
 
 ## Yielding
 
