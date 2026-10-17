@@ -495,6 +495,16 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
     return DirectorAgent(model, Effort(effort) if effort else DefaultEffort())
 
 
+def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
+    source = production.checkout / plan
+    if not source.is_file():
+        return False
+    lines = source.read_text(encoding="utf-8").splitlines()
+    return (any(line.startswith("> **Production:") for line in lines)
+            and any(line.startswith("> **Standing:**") for line in lines)
+            and git(production, "check-ignore", "-q", "--", plan.as_posix(), check=False).returncode == 0)
+
+
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
     from scripts.accounts.accounts import trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
@@ -555,7 +565,9 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         raise Refusal(f"branch {request.branch} already exists")
     if isinstance(launch.plan, PlanGiven):
         result = git(production, "show", f"{production.merge_branch}:{launch.plan.path.as_posix()}", check=False)
-        if result.returncode != 0 or not any(line.startswith("> **Production:") for line in result.stdout.splitlines()):
+        valid_plan = (_is_excluded_standing_plan(production, launch.plan.path) if result.returncode != 0
+                      else any(line.startswith("> **Production:") for line in result.stdout.splitlines()))
+        if not valid_plan:
             raise Refusal(f"plan {launch.plan.path} is missing on {production.merge_branch} or lacks the Production header")
     elif isinstance(launch.plan, BriefGiven) and (production.checkout / launch.plan.stub).exists():
         stub = production.checkout / launch.plan.stub
@@ -635,6 +647,11 @@ def ensure_worktree(request: UnitLaunch) -> None:
     else:
         _ = git(production, "worktree", "add", str(worktree), "-b", request.branch,
                 production.merge_branch)
+    if isinstance(request.plan, PlanGiven):
+        destination = worktree / request.plan.path
+        if not destination.exists() and _is_excluded_standing_plan(production, request.plan.path):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = destination.write_bytes((production.checkout / request.plan.path).read_bytes())
     if (production.checkout / ".claude/config/berth.toml").exists():
         key = f"branch.{request.branch}.cargoBerthTarget"
         current = git(production, "config", "--get", key, check=False).stdout.strip()

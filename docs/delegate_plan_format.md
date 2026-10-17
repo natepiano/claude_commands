@@ -39,6 +39,11 @@ to rediscover after a context compaction lives in the doc.
      it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
 > **Production: <name>** — unit `<unit>`; production doc `<path>`
 
+<!-- Optional; a standing plan never closes its run. <NextPhase/> refills it
+     through style_plan.py. Git-exclude the plan:
+     the ledger is its record; checkpoint and shrink never commit or shrink it. -->
+> **Standing:** style_plan.py
+
 <!-- Optional; the hanadocs issues whose work this plan builds (/showrunner:proposal).
      Preserved verbatim by every command that edits this doc. /unit:direct marks each
      active at run start; its end-of-run as-built pass closes each. -->

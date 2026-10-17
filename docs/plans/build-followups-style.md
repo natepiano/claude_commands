@@ -250,7 +250,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `git hash-object -w` for pinned rule text: `git gc` may prune loose objects; pinned text goes in a ledger `rule_texts` table.
 - Relaxing `handoff send` to accept a second parent; rerouting is a separate verb.
 
-### Phase 7 — Style production bootstrap: instruction doc, format fields and /showrunner:add_style  · status: todo
+### Phase 7 — Style production bootstrap: instruction doc, format fields and /showrunner:add_style  · status: done
 **Depends on:** Phase 6
 
 #### Work Order

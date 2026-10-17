@@ -19,6 +19,9 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 - the production doc;
 - what each unit director does (<ProductionUnit/>).
 
+When `PRODUCTION_DOC` carries `**Kind:** style`, read
+`~/.claude/docs/style_production.md` and follow it wherever it differs from this file.
+
 State:
 
 - `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
