@@ -1087,6 +1087,24 @@ def handoff_merge_evidence(production: Production, child: str, checkpoint: str) 
     return good(git(checkout, "rev-parse", branch), "merge")
 
 
+def record_handoff_merge(request: ChildHandoffRequest, merge_head: str) -> None:
+    try:
+        script = tool("style_ledger.py", Path(__file__).resolve().parents[1] / "style/style_ledger.py",
+                      "MERGE_CHECKPOINT_STYLE_LEDGER")
+        python = shutil.which("python3") or sys.executable
+        _ = sys.stdout.flush()
+        result = subprocess.run(
+            [python, script, "handoff", "merged", "--repo", str(request.child.checkout),
+             "--checkpoint", request.checkpoint, "--merge-commit", merge_head],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            print("hand-off ledger: " + detail.replace("\n", "; "), flush=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("hand-off ledger: " + str(error).replace("\n", "; "), flush=True)
+
+
 def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
     script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
     try:
@@ -1108,6 +1126,7 @@ def finish_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
     if request.root_self:
         print(f"root: run style_ledger.py reconcile to mark {request.checkpoint[:7]} merged", flush=True)
     else:
+        record_handoff_merge(request, merge_head)
         acknowledge_handoff(request, merge_head)
 
 

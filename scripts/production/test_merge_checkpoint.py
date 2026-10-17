@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from io import StringIO
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -161,7 +162,8 @@ class MergeCheckpointTests(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.unit)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=self.other)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.other)
-        for name in ("verify.sh", "checkpoint-test", "validate_and_push.sh", "review_regime.py", "ssh", "style_sync.py"):
+        for name in ("verify.sh", "checkpoint-test", "validate_and_push.sh", "review_regime.py", "ssh",
+                     "style_sync.py", "style_ledger.py"):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
         for relative, name in ((".claude/scripts/delegate", "verify.sh"),
@@ -172,6 +174,7 @@ class MergeCheckpointTests(unittest.TestCase):
             self.executable(directory / name, STUB)
         self.env = {**os.environ, "HOME": str(home),
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
+                    "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CHECKPOINT_TEST_STATE": str(self.state),
                     "MERGE_CHECKPOINT_SCRATCH": str(self.state),
@@ -1211,6 +1214,88 @@ class MergeCheckpointTests(unittest.TestCase):
         rows = [cast(dict[str, object], json.loads(line)) for line in (self.state / "events.jsonl").read_text().splitlines()]
         commands = [row["command"] for row in rows]
         self.assertLess(commands.index("style_sync.py"), commands.index("send.py"))
+        self.assertLess(commands.index("style_sync.py"), commands.index("style_ledger.py"))
+        self.assertLess(commands.index("style_ledger.py"), commands.index("send.py"))
+        self.assertEqual(self.events("style_ledger.py"), [[
+            "handoff", "merged", "--repo", str(self.unit), "--checkpoint", checkpoint,
+            "--merge-commit", merge,
+        ]])
+
+    def prepare_handoff_ledger(self, checkpoint: str, *, add_handoff: bool = True) -> None:
+        ledger = Path(__file__).resolve().parents[1] / "style/style_ledger.py"
+        self.env["MERGE_CHECKPOINT_STYLE_LEDGER"] = str(ledger)
+        self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "style-state")
+        catalog = self.root / "rule-catalog"
+        catalog.mkdir()
+        self.env["STYLE_HISTORY_NATE_STYLE_DIR"] = str(catalog)
+        commands = [["reconcile", "--branch-point", "production", "--style-branch", "alpha-branch"]]
+        if add_handoff:
+            commands.extend([
+                ["handoff", "add", "--checkpoint", checkpoint],
+                ["handoff", "send", "--checkpoint", checkpoint, "--to", "example"],
+            ])
+        for arguments in commands:
+            result = subprocess.run(
+                [sys.executable, str(ledger), *arguments, "--repo", str(self.unit)],
+                env=self.env, capture_output=True, text=True, check=False, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def handoff_ledger_row(self, checkpoint: str) -> tuple[str, str]:
+        database = self.root / "style-state" / self.checkout.name / "ledger.sqlite"
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+            rows = cast(list[tuple[str, str]], connection.execute(
+                "SELECT state,merge_commit FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchall())
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_child_handoff_records_the_pushed_merge_in_the_style_ledger(self) -> None:
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        self.prepare_handoff_ledger(checkpoint)
+        self.assertEqual(self.handoff_ledger_row(checkpoint), ("sent", ""))
+        result = self.run_handoff(checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        merge = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.handoff_ledger_row(checkpoint), ("merged", merge))
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
+        self.assertEqual(len(self.events("send.py")), 1)
+        self.assertNotIn("hand-off ledger:", result.stdout)
+        duplicate = self.run_handoff(checkpoint)
+        self.assertEqual((duplicate.returncode, duplicate.stdout, duplicate.stderr),
+                         (0, f"hand-off {checkpoint[:7]} already merged as {merge[:7]}\n", ""))
+        self.assertEqual(self.handoff_ledger_row(checkpoint), ("merged", merge))
+        self.assertEqual(len(self.events("send.py")), 2)
+
+    def test_child_handoff_ledger_failure_still_pushes_and_acknowledges(self) -> None:
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        self.prepare_handoff_ledger(checkpoint, add_handoff=False)
+        result = self.run_handoff(checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        merge = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
+        self.assertEqual(len(self.events("send.py")), 1)
+        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("hand-off ledger:")],
+                         [f"hand-off ledger: style_ledger: unknown hand-off {checkpoint}"])
+
+    def test_duplicate_child_notice_records_a_ledger_write_missed_at_the_merge(self) -> None:
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+        self.prepare_handoff_ledger(checkpoint)
+        self.env["MERGE_CHECKPOINT_STYLE_LEDGER"] = str(self.bin / "style_ledger.py")
+        self.assertEqual(self.run_handoff(checkpoint).returncode, 0)
+        merge = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.handoff_ledger_row(checkpoint), ("sent", ""))
+        self.env["MERGE_CHECKPOINT_STYLE_LEDGER"] = str(Path(__file__).resolve().parents[1] / "style/style_ledger.py")
+        result = self.run_handoff(checkpoint)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, f"hand-off {checkpoint[:7]} already merged as {merge[:7]}\n", ""))
+        self.assertEqual(self.handoff_ledger_row(checkpoint), ("merged", merge))
+        self.assertEqual(self.git("rev-parse", "HEAD"), merge)
+        self.assertEqual(len(self.events("send.py")), 2)
 
     def test_unattached_child_is_refused_before_merge_push_or_acknowledgment(self) -> None:
         _ = self.child_production(parent="someone-else")
@@ -1262,6 +1347,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)
         self.assertEqual(self.events("send.py"), [])
+        self.assertEqual(self.events("style_ledger.py"), [])
         self.assertIn(f"root: run style_ledger.py reconcile to mark {checkpoint[:7]} merged", result.stdout)
 
     def test_duplicate_child_notice_acknowledges_without_another_merge_push_or_notify(self) -> None:
