@@ -62,8 +62,8 @@ against the union of one-rule findings using the same model.
 
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
-| modules | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by modules-unit |
-| names | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by names-unit |
+| modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
+| names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
 | types | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by types-unit |
 
 Per-rule recall and candidate file-local rules: pending.
@@ -75,7 +75,10 @@ Clear means cargo-berth `edit_blocking_status` Clear, rather than release.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Sample size, median and maximum pending | cargo-berth board/journal history: claim time to first Clear |
+| pass | 4 style reservations, 0 still open: median 1.06 h, maximum 1.41 h (modules-unit), none over 6 h | Read-only replay of the cargo-berth journal `claim`, `checkpoint` and `holder_merge_extent_observed` entries, 12:00Z to 15:09Z; Clear is Outstanding with an empty merge extent (`reservation/record.rs:423-430`) |
+
+All four reservations were Clear before their release. Reservation-to-ticket links
+are time correlations: the ledger has no reservation column on a ticket.
 
 ## Quiet-branch hand-off
 
@@ -84,7 +87,27 @@ product merge between checkpoint and integration.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Checkpoint, integration commit and elapsed time pending | `git log main` and ledger hand-off timestamps |
+| fail | One hand-off, `28db0785` (Merge cargo-liner-style hand-off (8d6e25d) into main) at 15:09:24Z. It carried one new ticket checkpoint, names-unit-6's `c2a3160a` from 14:40:46Z: 0.48 h, under four hours, but tile-fixes-unit phase 21 merged to main at 14:55:35Z (`d2a10b35`) in between | `git log --first-parent --merges` on cargo-liner main; `git rev-list 28db0785^1..28db0785^2` |
+
+The other 16 merged tickets record checkpoint `d1ced22c`, already on main before
+the first ticket: they changed no code and carried nothing to hand off. From the
+`style/main` aggregate commit `8d6e25d1` to main took 0.04 h. The ledger's
+`handoffs` row still read `sent` after git showed the merge, and so did the
+`f091ed48` row, with no merge commit recorded. cargo-liner's style showrunner
+recorded both at 16:45:17Z; a read-only ledger check on 2026-10-17 shows
+both rows `merged`, `8d6e25d1` with merge commit `28db0785` and `f091ed48`
+with `ac95d94d`. Fix K makes the parent's merge record this itself.
+
+The showrunner counts this as a fail and changes nothing until two more
+hand-offs are measured. For each, record whether a product merge landed between
+checkpoint and hand-off, and whether `style/main` took it in cleanly; the
+criterion is then judged from three points.
+
+| Hand-off | Ticket checkpoint | Elapsed | Product merge between | `style/main` took it in cleanly |
+| --- | --- | --- | --- | --- |
+| `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
+| `ac95d94d` | names-unit-12 `96da4419` at 16:26:13Z, merged to main at 16:31:20Z | 0.09 h | no: main's last product merge, `ec3297e9`, landed at 15:16:13Z, before the checkpoint | yes: `f091ed48` merges the ticket onto `ec3297e9`, and its tree equals the automatic merge |
+| third | pending | pending | pending | pending |
 
 ## Restart
 
@@ -101,9 +124,26 @@ Pass criterion: no product unit waits on a style reservation.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Observed product waits and pilot interval pending | cargo-berth board history and product units' reports |
+| partial | 12:00Z to 15:09Z: 0 recorded overlap answers naming a style holder, 0 recorded incursions naming a style blocker, 0 `ticket_yields` rows | Read-only scan of the 3,033 journal entries in the interval |
 
-Tickets per hour per unit: pending.
+A refused check or claim is not journaled (`verb/check.rs:226-232`,
+`verb/claim/mod.rs:1473-1477`, `ledger/handle.rs:748-765`), so a product unit
+that waited and retried leaves no record. Zero recorded overlaps passes for what
+is recorded; the criterion itself cannot be shown from records.
+
+Open item the criterion waits on: cargo-berth journaling each refused check or
+claim (requester, paths, holder), placed as cargo-liner berth-parallel-unit's
+Phase 10, after its Phase 9. The yielding criterion can be measured once that
+phase merges.
+
+Tickets per hour per unit, merged tickets over first ticket created to last
+merged: modules 7 in 2.41 h (2.90/h), names 6 in 1.88 h (3.19/h), types 4 in
+0.98 h (4.08/h). At 15:09Z each unit held one assigned ticket (modules-unit-8,
+names-unit-7, types-unit-5) and none waited in any other state.
+
+16 of the 17 merged tickets carried no edit: their checkpoint is `d1ced22c`,
+already on main, and only names-unit-6 changed code. The retirement call weighs
+how many tickets changed code, not only how many merged.
 
 ## Ticket-gate evidence
 
@@ -141,7 +181,8 @@ Waiting to merge back: none
 
 Source: saved `pilot/coverage.txt`. The old sync tip is the defect described in
 Fix A below. The slash-command invocation itself, later held proposals and
-nonzero hand-off counts remain pending.
+nonzero hand-off counts remain pending; the first hand-off, `28db0785`, merged at
+15:09Z.
 
 ## --from-child trace
 
@@ -201,13 +242,74 @@ Pending: parent's saved style child summary and rendered style line.
   whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules (`1385595f`),
   after cargo-liner re-tiered trait-tutorial-format as E (`a351f6be`) and moved
   readme-diagnostic-section to the modules family (`707bb4c6`).
-- **Fix F — structure tickets list every finding** (commit `pending`):
+- **Fix F — structure tickets list every finding** (commit `2c5e4d5f`, merged as `f71d71ae`):
   the crate pass held 2/12 known defects (16.7%); the file-by-file rerun held
   10/12 (83.3%) on the same four cargo-berth files, six pinned rules and commit.
   The cause was crate-level summarizing, not rule sharing. Structure Work Orders
   now judge file by file after reading each file's siblings and direct callers,
   hold every distinct defect separately and a cross-file defect once, and record
   crate verdicts only after every file is judged.
+- **Fix G — refill waits for sync when the branch point is not in the synced tip** (commit `67ed4f25`):
+  two docs commits pushed straight to cargo-liner `main` bypassed
+  `merge_checkpoint`, so no sync notice went out and `next-phase` kept handing
+  out tickets against a base the style branch had not absorbed. Settled with the
+  showrunner: no git hook. Before selecting a new ticket, refill checks that the
+  branch point's tip is an ancestor of the ledger's synced tip (ancestry, since a
+  good sync merges the branch point and the tips then differ). When it is not,
+  refill records a sync wait and exits 3 with `waiting for sync: <branch point>
+  <tip7> is not in the synced tip <synced7>`. An assigned or checkpointed ticket
+  still resumes or waits for merge.
+- **Fix I — filing waits until the ticket that held a finding closes** (commit `5c8e823b`):
+  approving 15d2bb1b would have filed every unfiled held finding, including
+  those of modules-unit-8 and types-unit-7, whose tickets were still open and
+  could still revise them. Filing now leaves the findings of an assigned or
+  checkpointed ticket unfiled, prints `held for open ticket <id>: <count>
+  findings` for each such ticket, and files them on the first run after the
+  ticket closes.
+- **Fix J — the ticket gate measures from the style branch the ticket absorbed** (commit `fb08135a`):
+  modules-unit-8 was assigned at `d1ced22c` and fast-forwarded to style/main
+  `8d6e25d1` with no edit of its own. Its gate still exited 1 with `non-Rust
+  change requires review`: the four docs commits pushed straight to main sit on
+  the first-parent chain, and the footprint fold removes only merged-in side
+  parents. The coverage gate now measures from the unit's merge-base with the
+  style merge branch when the recorded start is its ancestor, and from the
+  recorded start otherwise (no style branch, unresolvable, or unrelated
+  history). The ledger's recorded base is unchanged, and the ticket's own edits
+  are still judged.
+- **Fix K — the parent's hand-off merge records itself in the style ledger** (commit `b5bf8336`):
+  hand-offs `8d6e25d1` (merged as `28db0785`) and `f091ed48` (merged as
+  `ac95d94d`) both left their handoffs rows `sent` with no merge commit. The
+  row became merged only when the style showrunner acted on the parent's
+  acknowledgment message. The first acknowledgment reached a stale session, and
+  the second has no delivery record. The parent's merge now runs
+  `style_ledger.py handoff merged` with the merge commit before it
+  acknowledges, both on the fresh merge and on a repeated notice. The
+  acknowledgment is now a notice only. A ledger failure prints one `hand-off
+  ledger:` line, and the merge and acknowledgment still go through.
 
-Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
+- **Fix L — modules tickets own small file batches, each file with its own verdict cell** (commit `23fd3edf`):
+  the modules recall sample above found 21 of 36 defects, and 7 of the misses
+  sat on files where the unit held nothing: a modules ticket owned a whole
+  crate, and the ledger asked for one crate verdict per rule, so nothing made
+  the worker judge every file. Modules rules now have one verdict cell per
+  file (the workspace-dependencies rules keep one per crate). A new modules
+  ticket owns a batch of at most 6 files and 3000 lines, directories kept
+  together, and its gate refuses the ticket while any file lacks a verdict.
+  The Work Order lists the batch, the cells it owns and the findings already
+  held on its files. Tickets opened before this change keep their crate
+  cells until they merge. Every crate's modules files start unjudged, so the
+  other families wait on each crate's batches; fix M orders the pilot crates
+  first.
+
+- **Fix M — modules takes first the crates that block a pilot unit** (commit `22fe6550`):
+  the types unit (pilot scope cargo-port) and the names unit (cargo-handler)
+  both waited on those crates' structure cells while refill handed modules
+  tui_pane, which sits in neither scope but held the most pending cells of
+  other families. A pending cell now counts toward a crate's place in the
+  structure order only when its family has a unit whose pilot scope holds
+  that crate, and a family with no unit counts nothing. Each unit's scope is
+  read from its own plan copy. `queue` shows the same order refill uses.
+
+Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
+fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`.
 Live verification of the fixes and subsequent measurements remain pending.

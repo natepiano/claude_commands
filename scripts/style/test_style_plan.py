@@ -8,12 +8,15 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import style_plan
 import style_proposals
@@ -147,6 +150,133 @@ class StylePlanTests(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger().database)) as connection:
             rows = cast(list[tuple[int]], connection.execute("SELECT COUNT(*) FROM tickets").fetchall())
         return rows[0][0]
+
+
+    def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        second = self.rule("structure-other", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        paths = self.sources[:2]
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(paths), [rule, second], cells=tuple((name, path) for name in (rule, second) for path in paths))
+        ledger.ticket_assign("modules-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("modules-unit-1")
+        for path in paths:
+            self.record(second, path, self.tip, "modules-unit-1")
+        self.record(rule, paths[0], self.tip, "modules-unit-1")
+        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stdout), (1, f"unjudged: {rule} {paths[1]}\n"))
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"unjudged cells: {rule} {paths[1]}"):
+            ledger.ticket_checkpoint("modules-unit-1", self.tip)
+        self.record(rule, paths[1], self.tip, "modules-unit-1")
+        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
+        ledger.ticket_checkpoint("modules-unit-1", self.tip)
+        self.assertEqual(ledger.ticket_open("modules-unit")[0]["state"], "checkpointed")
+
+    def test_structure_batches_cover_pending_files_once_keep_directories_and_isolate_large_files(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        expected = set(self.sources[:2])
+        for directory, count, lines in (("one", 4, 200), ("two", 4, 200), ("oversized", 8, 600)):
+            for number in range(count):
+                path = f"crates/alpha/src/{directory}/file{number}.rs"
+                self.write(path, "// content\n" * lines)
+                expected.add(path)
+        large = "crates/alpha/src/large.rs"
+        self.write(large, "// content\n" * 3001)
+        expected.add(large)
+        self.tip = self.commit()
+        self.sync()
+        batches = [ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha"]
+        self.assertGreater(len(batches), 1)
+        paths = [path for ticket in batches for path in ticket.files]
+        self.assertEqual(set(paths), expected)
+        self.assertEqual(len(paths), len(expected))
+        self.assertEqual([ticket.files for ticket in batches], sorted(ticket.files for ticket in batches))
+        for ticket in batches:
+            self.assertEqual(ticket.rules, (rule,))
+            self.assertEqual(set(ticket.cells), {(rule, path) for path in ticket.files})
+            if large in ticket.files:
+                self.assertEqual(ticket.files, (large,))
+            else:
+                self.assertLessEqual(len(ticket.files), 6)
+                self.assertLessEqual(sum(len(self.git("show", f"{self.tip}:{path}").splitlines())
+                                         for path in ticket.files), 3000)
+        for directory in ("one", "two"):
+            self.assertEqual(sum(any(f"/{directory}/" in path for path in ticket.files) for ticket in batches), 1)
+
+    def test_structure_manifest_cell_joins_first_batch_and_requires_its_crate_verdict(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.sync()
+        selected = self.candidates("modules")[0]
+        self.assertIn("crates/alpha/Cargo.toml", selected.files)
+        self.assertEqual(set(selected.cells), {(structure, path) for path in self.sources[:2]} | {(manifest, "crates/alpha")})
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", selected.crate,
+                          list(selected.files), list(selected.rules), cells=selected.cells)
+        ledger.ticket_assign("modules-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("modules-unit-1")
+        for path in self.sources[:2]:
+            self.record(structure, path, self.tip, "modules-unit-1")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_plan.gate(self.unit, "modules-unit-1"), 1)
+        self.assertEqual(output.getvalue(), f"unjudged: {manifest} crates/alpha\n")
+        self.record(manifest, "crates/alpha", self.tip, "modules-unit-1")
+        self.assertEqual(style_plan.gate(self.unit, "modules-unit-1"), 0)
+        phase = style_plan.phase_text(ledger.ticket_open("modules-unit")[0], ledger.pinned_rule_texts("modules-unit-1"),
+                                      self.plan, "context")
+        self.assertIn(f"Record `{manifest}` once with `--path crates/alpha` after reading the manifests.", phase)
+        self.assertIn("Owned pending verdict cells (record only these rule/path pairs):", phase)
+        for rule, path in selected.cells:
+            self.assertIn(f"- `{rule}` · `{path}`", phase)
+
+
+    def test_structure_batches_own_only_pending_pairs_and_manifest_only_work_is_selectable(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.sync()
+        for path in self.sources[:2]:
+            self.record(structure, path, self.tip)
+        batches = [ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha"]
+        self.assertEqual([(ticket.files, ticket.rules, ticket.cells) for ticket in batches], [
+            (("crates/alpha/Cargo.toml",), (manifest,), ((manifest, "crates/alpha"),)),
+        ])
+        self.assertFalse(any(ticket.crate == "crates/alpha" for ticket in
+                             self.candidates("modules", ("crates/alpha/Cargo.toml",))))
+        self.record(manifest, "crates/alpha", self.tip)
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        batch = next(ticket for ticket in self.candidates("modules") if ticket.crate == "crates/alpha")
+        self.assertEqual((batch.files, batch.rules, batch.cells),
+                         ((self.sources[0],), (structure,), ((structure, self.sources[0]),)))
+
+    def test_structure_work_order_shows_existing_holds_on_the_batch_files_only(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        held = ledger.hold(rule, self.sources[0], 1, "Split this module", "restructure", "before", "after", blob, "outside")
+        waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
+        _ = ledger.decline_held(waived.finding_id, "declined")
+        outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        text = plan.read_text()
+        self.assertIn(f"{held.finding_id} · {rule} · {self.sources[0]}:1 · Split this module", text)
+        self.assertIn("do not hold these again", text)
+        self.assertNotIn(waived.finding_id, text)
+        self.assertNotIn(outside.finding_id, text)
+        self.assertIn("Judge these 2 files of `crates/alpha`", text)
 
     def test_unit_plan_scope_resolves_package_names_and_exhausts_only_that_crate(self) -> None:
         rule = self.rule("read")
@@ -320,8 +450,8 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn(self.sources[0], preview.getvalue())
         self.assertIn(self.sources[1], preview.getvalue())
         ledger = self.ledger()
-        for crate in ("crates/alpha", "crates/beta"):
-            self.record(structure, crate, self.tip)
+        for path in self.sources:
+            self.record(structure, path, self.tip)
         reads = self.candidates()
         self.assertTrue(reads)
         self.assertEqual({rule for ticket in reads for rule in ticket.rules}, {read})
@@ -353,6 +483,86 @@ class StylePlanTests(unittest.TestCase):
         scoped = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
                                              "modules", style_plan.PilotCrates(frozenset({"crates/alpha"})))
         self.assertEqual([(ticket.crate, ticket.kind) for ticket in scoped], [("crates/alpha", "structure")])
+
+    def test_structure_priority_counts_names_cells_only_inside_the_names_pilot_scope(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        for name in ("extra", "more"):
+            self.write(f"crates/beta/src/{name}.rs", "pub fn value() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        ledger = self.ledger()
+        busy = style_plan.BusyFiles(self.board(), frozenset())
+        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules")[0].crate, "crates/beta")
+
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, busy, "modules",
+            family_scopes={"modules": style_plan.AllCrates(),
+                           "names": style_plan.PilotCrates(frozenset({"crates/alpha"}))})
+
+        self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
+        self.assertEqual({path for ticket in tickets for path in ticket.files},
+                         set(self.sources) | {"crates/beta/src/extra.rs", "crates/beta/src/more.rs"})
+
+    def test_structure_priority_ignores_pending_cells_of_a_family_without_a_unit_row(self) -> None:
+        names = self.rule("read")
+        types = (self.rule("types-one", "tier: C\nfamily: types\ninput_scope: file\n"),
+                 self.rule("types-two", "tier: C\nfamily: types\ninput_scope: file\n"))
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        for rule in types:
+            for path in self.sources[:2]:
+                self.record(rule, path, self.tip)
+        for path in self.sources[2:]:
+            self.record(names, path, self.tip)
+        ledger = self.ledger()
+        busy = style_plan.BusyFiles(self.board(), frozenset())
+        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules")[0].crate, "crates/beta")
+
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, busy, "modules", family_scopes=style_plan.family_pilot_scopes(self.doc, self.repo))
+
+        self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
+
+    def test_family_pilot_scopes_reads_unit_copies_and_missing_plans_allow_all_crates(self) -> None:
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        template = self.style / "docs/style-production/units/names-unit.md"
+        _ = template.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
+        _ = self.doc.write_text(self.doc.read_text() + f"| product-unit | docs/product.md | {self.root / 'product'} | product |\n")
+
+        self.assertEqual(style_plan.family_pilot_scopes(self.doc, self.repo), {
+            "names": style_plan.PilotCrates(frozenset({"crates/alpha"})), "modules": style_plan.AllCrates(),
+        })
+        self.plan.unlink()
+        self.assertEqual(style_plan.family_pilot_scopes(self.doc, self.repo), {
+            "names": style_plan.AllCrates(), "modules": style_plan.AllCrates(),
+        })
+
+    def test_modules_refill_and_queue_prioritize_the_crate_blocking_a_pilot_unit(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.write("crates/beta/src/extra.rs", "pub fn value() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        preview = io.StringIO()
+        with redirect_stdout(preview):
+            self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "modules-unit"]), 0)
+        self.assertTrue(preview.getvalue().startswith("modules-unit: structure crates/alpha "), preview.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
+
+        self.assertEqual((code, output.getvalue()), (0, "phase written: modules-unit-1\n"))
+        ticket = self.ledger().ticket_open("modules-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["crate"], ticket["files"]),
+                         ("structure", "crates/alpha", list(self.sources[:2])))
 
     def test_equal_blocked_structure_counts_use_staleness_then_crate_name(self) -> None:
         read = self.rule("read")
@@ -438,7 +648,7 @@ class StylePlanTests(unittest.TestCase):
             "Judge file by file", "sibling files in the same module", "direct callers",
             "every distinct defect as its own finding", "never stop at a file's first finding",
             "spans files is held once", "several rules name is held once",
-            "only after every file has been judged",
+            "as soon as that file has been judged",
         )
         for phrase in instructions:
             self.assertIn(phrase, text)
@@ -556,6 +766,49 @@ class StylePlanTests(unittest.TestCase):
             _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
             connection.commit()
 
+    def test_refill_waits_without_selecting_work_when_the_branch_point_is_unsynced(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        before = self.plan.read_bytes()
+        self.write("README.md", "Branch point moved without a sync notice.\n")
+        branch_tip = self.commit()
+        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read before sync")):
+            self.assertEqual(self.run_next(), (
+                3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_refill_selects_work_after_sync_merges_the_branch_point_into_a_distinct_style_tip(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.write("README.md", "Incoming branch-point work.\n")
+        branch_tip = self.commit()
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+        _ = self.git("merge", "--no-ff", "-qm", "Sync branch point", "main", cwd=self.style)
+        self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
+        self.assertNotEqual(self.tip, branch_tip)
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.count_tickets(), 1)
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_assigned_ticket_resumes_unchanged_while_the_branch_point_is_unsynced(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        before = self.plan.read_bytes()
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.write("README.md", "Branch point moved during an assigned ticket.\n")
+        _ = self.commit()
+        with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read on resume")):
+            self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0], ticket)
+        self.assertEqual(self.count_tickets(), 1)
+        self.assertEqual(self.sync_wait_rows(), [])
+
     def test_sync_wait_is_recorded_until_structure_finishes_and_refill_writes_a_phase(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
@@ -566,7 +819,8 @@ class StylePlanTests(unittest.TestCase):
         with mock.patch.object(style_ledger, "_now", return_value="2026-01-03T03:04:05+00:00"):
             self.assertEqual(self.run_next()[0], 3)
         self.assertEqual(self.sync_wait_rows(), [("names-unit", "2026-01-02T03:04:05+00:00")])
-        self.record(structure, "crates/alpha", self.tip)
+        for path in self.sources[:2]:
+            self.record(structure, path, self.tip)
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
@@ -583,7 +837,8 @@ class StylePlanTests(unittest.TestCase):
             reads += 1
             if reads == 2:
                 self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
-                self.record(structure, "crates/alpha", self.tip)
+                for path in self.sources[:2]:
+                    self.record(structure, path, self.tip)
             return self.board()
 
         with mock.patch.object(berth_board, "read_board", side_effect=board_after_merge):
@@ -928,6 +1183,7 @@ class StylePlanTests(unittest.TestCase):
         self.record(last, "crates/alpha", self.tip, "modules-unit-1")
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
             self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 0)
             footprint.assert_called_once()
@@ -950,6 +1206,7 @@ class StylePlanTests(unittest.TestCase):
         ledger.ticket_yield("names-unit-1", self.sources[0])
         self.assertEqual({(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}, before)
         with (mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
             self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
             footprint.assert_called_once()
@@ -969,10 +1226,48 @@ class StylePlanTests(unittest.TestCase):
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_ledger.Ledger, "ticket_origin", return_value=origin),
+              mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
             self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
         arguments = cast(list[str], run.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--base") + 1], "base-from-origin")
+
+    def take_style_work_into_judged_ticket(self) -> style_ledger.TicketRecord:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next()[0], 0)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        for rule in ticket["rules"]:
+            for path in ticket["files"]:
+                self.record(rule, path, self.tip, ticket["id"])
+        self.write("incoming.md", "Documentation from the branch point.\n")
+        incoming = self.commit()
+        _ = self.git("merge", "--ff-only", "main", cwd=self.style)
+        _ = self.git("merge", "--ff-only", "style/main", cwd=self.unit)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.unit), incoming)
+        return ticket
+
+    def test_coverage_gate_excludes_direct_branch_point_work_taken_in_from_the_style_branch(self) -> None:
+        ticket = self.take_style_work_into_judged_ticket()
+        result = subprocess.run(
+            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], ticket["base"])
+        self.assertEqual(ticket["base"], self.tip)
+
+    def test_coverage_gate_still_reviews_ticket_edits_after_taking_in_style_branch_work(self) -> None:
+        ticket = self.take_style_work_into_judged_ticket()
+        _ = (self.unit / ticket["files"][0]).write_text("pub fn value() { let count = 7; }\n")
+        result = subprocess.run(
+            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn("review: ", result.stdout)
+        self.assertIn("check 6:", result.stdout)
+        self.assertEqual(result.stderr, "")
 
     def test_slice_remainders_balance_across_small_directories(self) -> None:
         paths: list[str] = []

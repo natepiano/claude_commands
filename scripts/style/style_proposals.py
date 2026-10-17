@@ -116,8 +116,17 @@ def batch_name(label: str, findings: tuple[style_ledger.HeldFinding, ...]) -> st
 
 def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> tuple[Path, ...]:
     definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
+    waiting = ledger.held_findings(style_ledger.UnfiledFindingsFromOpenTickets())
+    open_ticket_counts: dict[str, int] = defaultdict(int)
+    for finding in waiting:
+        open_ticket_counts[finding.ticket] += 1
+    for ticket, count in sorted(open_ticket_counts.items()):
+        print(f"held for open ticket {ticket}: {count} findings")
+    waiting_ids = {finding.finding_id for finding in waiting}
     valid: list[style_ledger.HeldFinding] = []
     for finding in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")):
+        if finding.finding_id in waiting_ids:
+            continue
         definition = definitions.get(finding.rule.removesuffix("#uncovered"))
         if definition is None or definition.blob != finding.rule_blob:
             print(f"skipped {finding.finding_id}: rule changed since judged")

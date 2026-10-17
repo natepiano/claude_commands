@@ -170,7 +170,78 @@ class StyleLedgerTests(unittest.TestCase):
             "--after", "new_name", "--rule-blob", rule_blob or self.blob(rule), "--ticket", ticket,
         ).stdout.strip()
 
-    def test_initial_universe_has_file_and_crate_cells_but_no_vendor_or_process_cells(self) -> None:
+
+    def test_celled_structure_record_refuses_rule_path_pairs_outside_ticket_ownership(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        _ = self.cli("ticket", "add", "--id", "modules-1", "--unit", "modules", "--kind", "structure",
+                     "--family", "modules", "--crate", "crates/alpha", "--files", json.dumps(list(self.sources[:2])),
+                     "--rules", json.dumps([rule]), "--cells", json.dumps([[rule, self.sources[0]]]))
+        ledger.ticket_assign("modules-1", "main")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"{rule} {self.sources[1]} is outside ticket cells"):
+            ledger.record(rule, self.sources[1], self.initial_tip, "", "clean", ticket="modules-1")
+        ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="modules-1")
+        self.assertEqual(ledger.unjudged_ticket_cells("modules-1"), ())
+        with self.assertRaisesRegex(style_ledger.LedgerError, "different fields"):
+            ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha",
+                              list(self.sources[:2]), [rule], cells=((rule, self.sources[1]),))
+
+    def test_migration_nine_preserves_legacy_crate_ticket_and_does_not_cover_new_file_cells(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha", list(self.sources[:2]), [rule])
+        ledger.ticket_assign("modules-1", "main")
+        database = ledger.database
+        ledger.close()
+        with closing(sqlite3.connect(database)) as connection:
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
+            _ = connection.execute("UPDATE schema_version SET version=8")
+            connection.commit()
+        migrated = self.ledger()
+        self.assertEqual(migrated.ticket_open("modules")[0]["cells"], [])
+        self.assertEqual(migrated.unjudged_ticket_cells("modules-1"), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
+        migrated.record(rule, "crates/alpha", self.initial_tip, "", "clean", ticket="modules-1")
+        migrated.ticket_checkpoint("modules-1", self.initial_tip)
+        self.assertEqual(migrated.ticket_open("modules")[0]["state"], "checkpointed")
+        self.assertEqual(self.states(rule), dict.fromkeys(self.sources, "open"))
+
+    def test_structure_file_cells_keep_crate_fingerprints_and_decline_only_the_matching_file(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        holds = [ledger.hold(rule, path, 1, "Split module", "restructure", "before", "after", self.blob(rule), "outside")
+                 for path in self.sources[:2]]
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, "held")
+        self.assertIsInstance(ledger.decline_held(holds[0].finding_id, "declined"), style_ledger.CellWaived)
+        progress = next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule)
+        self.assertEqual((progress.current, progress.held), (2, 1))
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.set_tip(self.commit("Change a crate input"))
+        self.assertEqual(self.states(rule), {**dict.fromkeys(self.sources[:2], "stale"), **dict.fromkeys(self.sources[2:], "open")})
+
+
+    def test_structure_file_scope_includes_listed_non_rust_sites_and_preserves_file_fingerprints(self) -> None:
+        rule = self.rule("structure-sites", "tier: D\nfamily: modules\ninput_scope: file\ncandidates:\n"
+                         + "  kind: regex\n  pattern: PLACEHOLDER\n  globs: [README.md]\n  surface: partial\n"
+                         + "  uncovered: Read module ownership.\n")
+        self.write("README.md", "PLACEHOLDER module documentation\n")
+        tip = self.commit("Add a non-Rust structure site")
+        self.set_tip(tip)
+        ledger = self.ledger()
+        self.assertEqual({(cell.path, cell.crate) for cell in ledger.cells(rule)},
+                         {(path, "crates/alpha" if "/alpha/" in path else "crates/beta") for path in self.sources}
+                         | {("README.md", ".")})
+        self.record(rule, "README.md", tip)
+        self.record(rule, self.sources[0], tip)
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.set_tip(self.commit("Change another file"))
+        self.assertEqual(self.states(rule), {**dict.fromkeys(self.sources, "open"),
+                                           self.sources[0]: "current", "README.md": "current"})
+
+    def test_initial_universe_has_file_cells_but_no_vendor_or_process_cells(self) -> None:
         file_rule = self.rule("read")
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
         listed = self.rule("listed", "tier: B\nfamily: names\npre_filter: word\n")
@@ -178,7 +249,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.set_tip(self.initial_tip)
 
         self.assertEqual(self.states(file_rule), dict.fromkeys(self.sources, "open"))
-        self.assertEqual(self.states(structure), {"crates/alpha": "open", "crates/beta": "open"})
+        self.assertEqual(self.states(structure), dict.fromkeys(self.sources, "open"))
         self.assertEqual(self.cells(listed), [])
         self.assertEqual(self.cells(process), [])
         ledger = self.ledger()
@@ -188,7 +259,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(progress[file_rule].total, 4)
         self.assertFalse(progress[file_rule].complete)
         self.assertEqual({cell.path for cell in ledger.cells(crate="crates/alpha")}, {
-            "crates/alpha", "crates/alpha/src/lib.rs", "crates/alpha/src/other.rs",
+            "crates/alpha/src/lib.rs", "crates/alpha/src/other.rs",
         })
         status = self.cli("status").stdout
         self.assertIn(file_rule, status)
@@ -223,9 +294,9 @@ class StyleLedgerTests(unittest.TestCase):
             coverage.assert_called_once_with(None, None)
         by_rule = {row.rule_id: row for row in repository_counts}
         self.assertEqual(by_rule, {
-            read: style_ledger.RuleCounts(read, "C", 1, 1, 1, 1, 1),
-            partial: style_ledger.RuleCounts(partial, "B", 4, 1, 3, 0, 1),
-            process: style_ledger.RuleCounts(process, "E", 0, 0, 0, 0, 0),
+            read: style_ledger.RuleCounts(read, "C", 1, 1, 1, 1, 1, "file"),
+            partial: style_ledger.RuleCounts(partial, "B", 4, 1, 3, 0, 1, "file"),
+            process: style_ledger.RuleCounts(process, "E", 0, 0, 0, 0, 0, "crate"),
         })
         self.assertEqual({row.rule_id: (row.total, row.complete) for row in repository_counts}, {
             read: (4, False), partial: (8, False), process: (0, True),
@@ -238,13 +309,13 @@ class StyleLedgerTests(unittest.TestCase):
         })
         for crate, expected in (
             ("crates/alpha", {
-                read: style_ledger.RuleCounts(read, "C", 1, 1, 0, 0, 1),
-                partial: style_ledger.RuleCounts(partial, "B", 2, 1, 1, 0, 1),
+                read: style_ledger.RuleCounts(read, "C", 1, 1, 0, 0, 1, "file"),
+                partial: style_ledger.RuleCounts(partial, "B", 2, 1, 1, 0, 1, "file"),
                 process: by_rule[process],
             }),
             ("crates/beta", {
-                read: style_ledger.RuleCounts(read, "C", 0, 0, 1, 1, 0),
-                partial: style_ledger.RuleCounts(partial, "B", 2, 0, 2, 0, 0),
+                read: style_ledger.RuleCounts(read, "C", 0, 0, 1, 1, 0, "file"),
+                partial: style_ledger.RuleCounts(partial, "B", 2, 0, 2, 0, 0, "file"),
                 process: by_rule[process],
             }),
         ):
@@ -396,7 +467,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = rule_path.write_text(rule_path.read_text() + "Another requirement\n")
         self.assertEqual({cell.state for cell in ledger.cells()}, {"stale"})
 
-    def test_partial_structure_rule_keeps_crate_cells_without_uncovered_pseudo_rule(self) -> None:
+    def test_partial_structure_rule_keeps_file_cells_without_uncovered_pseudo_rule(self) -> None:
         rule_id = self.rule(
             "structure", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n"
             + "  pattern: value\n  surface: partial\n  uncovered: crate structure\n",
@@ -406,13 +477,13 @@ class StyleLedgerTests(unittest.TestCase):
 
         self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, set(self.sources))
         self.assertEqual({(cell.rule, cell.path, cell.tier) for cell in ledger.cells()}, {
-            (rule_id, "crates/alpha", "D"), (rule_id, "crates/beta", "D"),
+            (rule_id, path, "D") for path in self.sources
         })
-        self.record(rule_id, "crates/alpha", self.initial_tip)
-        self.record(rule_id, "crates/beta", self.initial_tip)
+        for path in self.sources:
+            self.record(rule_id, path, self.initial_tip)
         progress, = ledger.rule_counts(style_ledger.WholeRepository())
         self.assertEqual((progress.rule_id, progress.current, progress.total, progress.complete),
-                         (rule_id, 2, 2, True))
+                         (rule_id, 4, 4, True))
 
     def test_pre_filter_lists_matching_rust_lines_and_accepts_a_file_judgment(self) -> None:
         rule_id = self.rule("words", "tier: B\nfamily: names\ninput_scope: file\npre_filter: '\\bbanned\\b'\n")
@@ -671,7 +742,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(8,)])
+        self.assertEqual(versions, [(9,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -761,16 +832,17 @@ class StyleLedgerTests(unittest.TestCase):
         })
         self.assertEqual({cell.crate for cell in cells if cell.path == "tools/check.rs"}, {"."})
 
-    def test_member_structure_rule_has_only_its_member_crate(self) -> None:
+    def test_member_structure_rule_has_only_its_member_files(self) -> None:
         local_dir = self.repo / "docs" / "alpha" / "style"
         local_dir.mkdir(parents=True)
         _ = (local_dir / "structure.md").write_text("---\ntier: D\nfamily: modules\n---\n# Structure\n")
         local_id = "local:docs/alpha/style/structure.md"
         self.set_tip(self.initial_tip)
 
-        self.assertEqual(self.states(local_id), {"crates/alpha": "open"})
-        self.record(local_id, "crates/alpha", self.initial_tip)
-        self.assertEqual(self.states(local_id), {"crates/alpha": "current"})
+        self.assertEqual(self.states(local_id), dict.fromkeys(self.sources[:2], "open"))
+        for path in self.sources[:2]:
+            self.record(local_id, path, self.initial_tip)
+        self.assertEqual(self.states(local_id), dict.fromkeys(self.sources[:2], "current"))
 
     def test_rule_edit_stales_all_its_cells_and_old_supplied_blob_cannot_refresh_them(self) -> None:
         rule_id = self.rule("read")
@@ -1798,7 +1870,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(8,)])
+        self.assertEqual(versions, [(9,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -2036,7 +2108,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(8,)])
+        self.assertEqual(versions, [(9,)])
 
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
@@ -2096,6 +2168,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             _ = connection.execute("DROP TABLE IF EXISTS sync_waits")
             _ = connection.execute("DROP TABLE IF EXISTS ticket_yields")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

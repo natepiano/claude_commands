@@ -12,9 +12,11 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -45,6 +47,8 @@ class PilotCrates:
 
 PilotScope = AllCrates | PilotCrates
 _ALL_CRATES = AllCrates()
+_ALL_FAMILY_SCOPES: Mapping[rules.Family, PilotScope] = MappingProxyType(
+    {family: _ALL_CRATES for family in FAMILIES})
 
 
 def crate_in_scope(scope: PilotScope, crate: str) -> bool:
@@ -67,6 +71,22 @@ def parse_pilot_scope(text: str, repo: Path) -> PilotScope:
         if name not in members:
             raise style_ledger.LedgerError(f"pilot scope names unknown crate {name}")
     return PilotCrates(frozenset(members[name] for name in names))
+
+
+def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
+    """Read each style unit's scope from its own standing plan copy."""
+    scopes: dict[rules.Family, PilotScope] = {}
+    for row in unit_worktrees(doc):
+        for family in FAMILIES:
+            if row.unit == family + "-unit":
+                plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
+                try:
+                    text = plan.read_text()
+                except FileNotFoundError:
+                    scopes[family] = AllCrates()
+                else:
+                    scopes[family] = parse_pilot_scope(text, repo)
+    return scopes
 
 
 @dataclass(frozen=True)
@@ -96,6 +116,13 @@ class WaitingForSync:
 
 
 @dataclass(frozen=True)
+class WaitingForBranchPointSync:
+    branch_point: str
+    branch_tip: str
+    synced_tip: str
+
+
+@dataclass(frozen=True)
 class TicketSelection:
     kind: style_ledger.TicketKind
     family: rules.Family
@@ -104,6 +131,7 @@ class TicketSelection:
     rules: tuple[str, ...]
     rule: str = ""
     sites: tuple[style_ledger.ListedSite, ...] = ()
+    cells: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,7 +143,7 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | berth_board.BoardUnavailable
+NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForBranchPointSync | berth_board.BoardUnavailable
 
 
 def style_document(repo: Path) -> Path:
@@ -142,8 +170,9 @@ def gate(repo: Path, ticket_id: str) -> int:
                     for cell in missing:
                         print(f"unjudged: {cell.rule} {cell.path}")
                     return 1
+                base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
-                                         "--repo", str(repo), "--base", origin.base, "--worktree"], check=False)
+                                         "--repo", str(repo), "--base", base, "--worktree"], check=False)
                 return 0 if result.returncode == 0 else 1
             fields = frontmatter(origin.issue)
             findings = style_proposals.issue_findings(ledger, origin.issue)
@@ -171,7 +200,51 @@ def synced_tip(ledger: style_ledger.Ledger) -> str:
     return rows[0][0]
 
 
-def read_slices(repo: Path, tip: str, files: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+def synced_style_branch(ledger: style_ledger.Ledger) -> str:
+    with closing(sqlite3.connect(ledger.database)) as connection:
+        rows = cast(list[tuple[str]], connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+    return rows[0][0] if rows else ""
+
+
+def coverage_footprint_base(repo: Path, ledger: style_ledger.Ledger, recorded_base: str) -> str:
+    """Exclude style-branch work taken in since the ticket's recorded start."""
+    branch = synced_style_branch(ledger)
+    if not branch:
+        return recorded_base
+    resolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"],
+                              capture_output=True, text=True, check=False)
+    if resolved.returncode == 1:
+        return recorded_base
+    if resolved.returncode:
+        raise style_ledger.LedgerError(resolved.stderr.strip() or "git rev-parse failed")
+    merged = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD", resolved.stdout.strip()],
+                            capture_output=True, text=True, check=False)
+    if merged.returncode == 1:
+        return recorded_base
+    if merged.returncode:
+        raise style_ledger.LedgerError(merged.stderr.strip() or "git merge-base failed")
+    base = merged.stdout.strip()
+    ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", recorded_base, base],
+                              capture_output=True, text=True, check=False)
+    if ancestry.returncode == 1:
+        return recorded_base
+    if ancestry.returncode:
+        raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
+    return base
+
+
+@dataclass(frozen=True)
+class BatchLimits:
+    files: int
+    lines: int
+    floor: int
+
+
+_READ_LIMITS = BatchLimits(25, 5000, 10)
+_STRUCTURE_LIMITS = BatchLimits(6, 3000, 5)
+
+
+def read_slices(repo: Path, tip: str, files: tuple[str, ...], limits: BatchLimits = _READ_LIMITS) -> tuple[tuple[str, ...], ...]:
     """Keep directories together, splitting only an oversized directory."""
     directories: dict[str, list[str]] = defaultdict(list)
     lengths = {path: len(git(repo, "show", f"{tip}:{path}").splitlines()) for path in files}
@@ -180,14 +253,15 @@ def read_slices(repo: Path, tip: str, files: tuple[str, ...]) -> tuple[tuple[str
     groups: list[tuple[str, ...]] = []
     for directory in sorted(directories, key=lambda path: PurePosixPath(path).parts):
         paths = tuple(directories[directory])
-        if len(paths) > 25 or sum(lengths[path] for path in paths) > 5000:
+        if len(paths) > limits.files or sum(lengths[path] for path in paths) > limits.lines:
             groups.extend((path,) for path in paths)
         else:
             groups.append(paths)
-    return balanced_slices(tuple(groups), lengths)
+    return balanced_slices(tuple(groups), lengths, limits)
 
 
-def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]) -> tuple[tuple[str, ...], ...]:
+def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int],
+                    limits: BatchLimits = _READ_LIMITS) -> tuple[tuple[str, ...], ...]:
     """Prefer feasible lower bounds before minimizing and balancing slice sizes."""
     costs = {len(groups): (0, 0, 0)}
     ends: dict[int, int] = {}
@@ -197,10 +271,10 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
         for end in range(start + 1, len(groups) + 1):
             files += len(groups[end - 1])
             lines += sum(lengths[path] for path in groups[end - 1])
-            if end > start + 1 and (files > 25 or lines > 5000):
+            if end > start + 1 and (files > limits.files or lines > limits.lines):
                 break
             tail = costs[end]
-            options.append(((tail[0] + int(files < 10), tail[1] + 1, tail[2] + files * files), end))
+            options.append(((tail[0] + int(files < limits.floor), tail[1] + 1, tail[2] + files * files), end))
         costs[start], ends[start] = min(options)
     result: list[tuple[str, ...]] = []
     start = 0
@@ -212,7 +286,8 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
-                      family: rules.Family, scope: PilotScope = _ALL_CRATES) -> tuple[TicketSelection, ...]:
+                      family: rules.Family, scope: PilotScope = _ALL_CRATES,
+                      family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
@@ -223,7 +298,8 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
             pending.append(cell)
             if cell.tier == "D":
                 structure_crates.add(cell.crate)
-            elif cell.family != "modules":
+            elif (cell.family is not None and cell.family != "modules" and cell.family in family_scopes
+                  and crate_in_scope(family_scopes[cell.family], cell.crate)):
                 blocked[cell.crate] += 1
     crates = sorted(stale, key=lambda crate: (-stale[crate], crate))
     if family == "modules":
@@ -238,13 +314,21 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
         structure = tuple(cell for cell in pending if cell.crate == crate and cell.tier == "D")
         if structure:
             if family == "modules":
-                files = ledger.rust_files(crate)
-                rule_ids = tuple(sorted({cell.rule for cell in structure}))
-                sites = tuple(site for rule_id in rule_ids for site in ledger.listed_sites(rule_id, crate))
-                available = tuple(path for path in sorted(set(files) | {site.path for site in sites}) if not busy.contains(path))
-                if available:
-                    result.append(TicketSelection("structure", family, crate, available, rule_ids,
-                                                  sites=tuple(site for site in sites if site.path in available)))
+                manifest = str(PurePosixPath(crate) / "Cargo.toml")
+                manifest_cells = tuple(cell for cell in structure if cell.path == crate)
+                file_cells = tuple(cell for cell in structure if cell.path != crate and not busy.contains(cell.path))
+                available = {cell.path for cell in file_cells}
+                if manifest_cells and not busy.contains(manifest):
+                    available.add(manifest)
+                for files in sorted(read_slices(repo, tip, tuple(sorted(available)), _STRUCTURE_LIMITS)):
+                    batch_cells = tuple(cell for cell in file_cells if cell.path in files)
+                    if manifest in files:
+                        batch_cells += manifest_cells
+                    rule_ids = tuple(sorted({cell.rule for cell in batch_cells}))
+                    sites = tuple(site for rule_id in rule_ids for site in ledger.listed_sites(rule_id, crate)
+                                  if site.path in files)
+                    result.append(TicketSelection("structure", family, crate, files, rule_ids, sites=sites,
+                                                  cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
             continue
         own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family and not busy.contains(cell.path))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
@@ -285,7 +369,7 @@ def delegation_context(text: str) -> str:
 
 
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
-               context: str) -> str:
+               context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = ()) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -297,6 +381,13 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     workers = "2 writers; split files by subtree." if len(ticket["files"]) > 12 else (
         "1 writer + 1 tester; the tester opens as impl and re-reads the diff against the pinned rules."
     )
+    per_file_structure = ticket["kind"] == "structure" and bool(ticket["cells"])
+    manifest_rules = [rule for rule, path in ticket["cells"] if path == ticket["crate"]]
+    owned_lines = (["Owned pending verdict cells (record only these rule/path pairs):"]
+                   + [f"- `{rule}` · `{path}`" for rule, path in ticket["cells"]]) if per_file_structure else []
+    held_lines = (["Already-held findings: do not hold these again; record held for a file whose finding still stands."]
+                  + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
+                     for finding in held_findings]) if per_file_structure and held_findings else []
     approved = ticket["kind"] == "proposal"
     authorization = (
         f"Approved proposal `{ticket['proposal']}` overrides the mechanical-only invariant in the copied context "
@@ -306,8 +397,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     )
     return "\n".join([
         f"### Phase {number} — {ticket_id}  · status: todo", "", "#### Work Order", "", context, "",
-        "**Goal:**", f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below.",
-        "", "**Spec:**", *rule_lines, *sites, *uncovered,
+        "**Goal:**", (f"Judge these {len(ticket['files'])} files of `{ticket['crate']}` against every pinned rule below."
+                      if per_file_structure else f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below."),
+        "", "**Spec:**", *rule_lines, *sites, *uncovered, *owned_lines,
         authorization,
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([
@@ -319,7 +411,11 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             + "and never stop at a file's first finding.",
             "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
             + "under the rule it breaks most directly, naming the others in its text.",
-            "Record each rule's crate verdict only after every file has been judged against it.",
+            ("Record each file's verdict for every rule above as soon as that file has been judged against it, "
+             + "with `record --path <file>`; the gate refuses this ticket while any file lacks one."
+             if per_file_structure else "Record each rule's crate verdict only after every file has been judged against it."),
+            *[f"Record `{rule}` once with `--path {ticket['crate']}` after reading the manifests." for rule in manifest_rules],
+            *held_lines,
         ] if ticket["kind"] == "structure" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
@@ -356,7 +452,11 @@ def atomic_write(path: Path, data: bytes) -> None:
 def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, plan: Path, text: str) -> None:
     texts = ledger.pinned_rule_texts(ticket["id"])
     ticket["base"] = ledger.ticket_base(ticket["id"])
-    phase = phase_text(ticket, texts, plan, delegation_context(text))
+    held = (tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
+                  if finding.path in ticket["files"] and finding.rule in ticket["rules"]
+                  and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
+            if ticket["kind"] == "structure" and ticket["cells"] else ())
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
@@ -444,13 +544,14 @@ def _select_phase(
             style_proposals.proposal_command("start", str(issue.path))
             write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
             return PhaseWritten(ticket_id)
-    candidates = candidate_tickets(repo, ledger, busy, family, scope)
+    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
     if not candidates:
         return NoAvailableWork()
     selected = candidates[0]
     ticket_id = ledger.next_ticket_id(unit)
     ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
-                      list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites])
+                      list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
+                      cells=selected.cells)
     ledger.ticket_assign(ticket_id, branch)
     write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
     return PhaseWritten(ticket_id)
@@ -487,6 +588,20 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             write_phase(ledger, ticket, plan, text)
             ledger.clear_sync_wait(unit)
             return Resumed(ticket["id"])
+        tip = synced_tip(ledger)
+        standing = standing_style_production(repo)
+        if not isinstance(standing, StandingStyleProduction):
+            raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
+        branch_tip = git(repo, "rev-parse", "--verify", f"{standing.branch_point}^{{commit}}").strip()
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", branch_tip, tip],
+            capture_output=True, text=True, check=False,
+        )
+        if ancestry.returncode == 1:
+            ledger.wait_for_sync(unit)
+            return WaitingForBranchPointSync(standing.branch_point, branch_tip, tip)
+        if ancestry.returncode:
+            raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
             return board
@@ -532,11 +647,13 @@ def main(argv: list[str]) -> int:
             with style_ledger.open_ledger(args.repo) as ledger:
                 doc = style_document(args.repo)
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
+                scopes = family_pilot_scopes(doc, args.repo)
                 for family in FAMILIES:
                     unit = family + "-unit"
                     if args.unit and args.unit != unit:
                         continue
-                    for ticket in candidate_tickets(args.repo, ledger, busy, family):
+                    for ticket in candidate_tickets(args.repo, ledger, busy, family,
+                                                    scopes.get(family, _ALL_CRATES), scopes):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
@@ -557,6 +674,9 @@ def main(argv: list[str]) -> int:
                 print("waiting for sync")
                 if unclassified:
                     print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
+                return 3
+            case WaitingForBranchPointSync(branch_point, branch_tip, tip):
+                print(f"waiting for sync: {branch_point} {branch_tip[:7]} is not in the synced tip {tip[:7]}")
                 return 3
         return 0
     except (OSError, ValueError, Refusal, sqlite3.Error) as error:

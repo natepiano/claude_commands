@@ -11,7 +11,7 @@ the repository's local rule directories. This document holds the procedure.
 | A | A full clippy, mend and rustfmt lint record per synced tip; a merge's quick gate is insufficient. |
 | B | A worker judges every listed generator site or `pre_filter` hit; a partial generator also needs the uncovered read as C. |
 | C | A worker reads each included Rust file against the rule. |
-| D | One check per crate, including its listed sites and uncovered read. |
+| D | One check per file in reach and listed site path; manifest rules check each crate. |
 | E | Governs how fixes are made; never swept or counted as coverage. |
 
 ## Families
@@ -38,10 +38,15 @@ One ticket per phase:
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
-- **Structure:** one crate, judged file by file, every distinct defect held as its own finding.
+- **Structure:** a small batch from one crate, at most 6 files and 3,000 lines,
+  keeping directories together when they fit. Judge and record each file against
+  every rule; the gate refuses the ticket while a file lacks a verdict.
+  Structure tickets opened before this change keep their crate cells until
+  they merge.
 
 Run tier D first. Structure crates are taken in order of the other-family
-pending cells they block, most first. A repair phase always precedes a new ticket.
+pending cells they block inside a unit's pilot scope, most first, so a crate
+blocking a pilot unit comes first. A repair phase always precedes a new ticket.
 After an interruption, resume the assigned or checkpointed ticket from
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`; never take a second
 one. A checkpointed ticket waits for its merge into the style branch before
@@ -59,6 +64,9 @@ only the first-launch template. Edit a launched unit's copy for changes meant
 for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
+Before selecting a new ticket, refill waits for sync if the branch point's
+current tip is not an ancestor of the ledger's synced tip; an open ticket still
+resumes or waits for merge.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before
@@ -97,10 +105,11 @@ refill; a checkpointed ticket waits for the style showrunner to merge it.
 Refill writes plans and pinned texts atomically. Resume checks every pin's blob
 and rebuilds a damaged ticket phase from its recorded instructions. Before
 publishing a phase, it records the unit branch's starting commit once in the
-ledger ticket's `base` field. The footprint gate uses that literal commit id as
-`--base` and `--worktree`, including after an interruption. The gate judges
-the uncommitted tree the checkpoint will stage, using a temporary index; it
-never changes the real index. No private Git ref
+ledger ticket's `base` field. The footprint gate uses `--worktree` and measures
+from the later of that commit and the unit's merge-base with the style merge
+branch, so style-branch work the unit took in is never judged as ticket work.
+The gate judges the uncommitted tree the checkpoint will stage, using a temporary
+index; it never changes the real index. No private Git ref
 keeps a dropped ticket's abandoned commits reachable.
 
 ## Pilot scope
@@ -140,7 +149,8 @@ no cells or tickets; show their count with the action **pull nate_style**.
 The Rust cell universe contains tracked, included non-vendor `.rs` files.
 Listed rules also gain cells for tracked non-Rust files holding their sites;
 those cells use file fingerprints regardless of the rule's input scope.
-Tier D has crate cells. Sources outside workspace members belong to crate `.`.
+Tier D has file cells; manifest-scope D rules keep crate cells. Sources outside
+workspace members belong to crate `.`.
 
 | Cell state | Meaning |
 | --- | --- |
@@ -168,7 +178,7 @@ A partial B rule has listed file cells and `<rule id>#uncovered` C cells for
 every included Rust file in reach. Both components must be current to finish
 the parent rule; pseudo-rules never increase the rule count. Zero listed sites
 complete only the listed component. A whole B rule or a `pre_filter`-only rule
-has no uncovered component. A partial D rule's crate cell covers both reads.
+has no uncovered component. A partial D rule's file cell covers both reads.
 
 `set-tip` fills listed sites from committed files. Coverage and site reads
 refresh sites when the rule blob changes, even at the same tip; zero-site
@@ -245,9 +255,10 @@ as for a unit checkpoint, then runs
 The child must be attached, the checkpoint on its merge branch and descended
 from its last merged hand-off. The subject is
 `Merge <style slug> hand-off (<hash7>) into <branch point>`.
-After pushing, notifying sync and promoting, the attached receiver sends
+After pushing, notifying sync and promoting, the attached receiver records the
+hand-off as merged in the style ledger with its merge commit, then sends
 `From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
-On acknowledgment run
+The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
 ancestry on the branch point is the evidence. The receiver decides delivery
 state once. A local merge missing from origin is pushed, notified and promoted
@@ -333,7 +344,8 @@ is one finding. An optional JSON map assigns finding ids to file lists, or to
 objects with `files` and `hunks` lists. A hunk is identified by its `path`,
 `old_start` and `new_start` from a zero-context diff; every changed hunk must
 have one owner. The gate folds merged-in parents into the comparison base so
-their changes are not judged as ticket work. A conflicting fold requires review.
+their changes, like work the unit took in from the style merge branch, are not
+judged as ticket work. A conflicting fold requires review.
 Each finding must preserve behavior using only its own edits; another finding's
 call-site changes cannot complete its rename. Changed documented usage, including
 block documentation, requires review. Glob imports prevent proving a rename's
@@ -353,7 +365,9 @@ after every ticket checkpoint with held cells and every no-change ticket notice
 with a positive held count. Read the folder from the current production doc's
 `**Proposals:**` line and the parent from `showrunners.py parent <style slug>`
 each time. Filing recovers issues created before a crash and skips findings
-judged against an older rule blob.
+judged against an older rule blob. Findings held by assigned or checkpointed
+tickets stay unfiled until those tickets close; filing reports their counts per
+open ticket.
 
 Record approval with `proposal_issue.py approve <issue> --showrunner <parent>
 --unit <unit> --plan <plan phase>`. Refill selects the oldest approved style issue

@@ -71,6 +71,7 @@ class RuleCounts:
     open: int
     awaiting_merge: int
     held: int
+    input_scope: InputScope
 
     @property
     def total(self) -> int:
@@ -133,6 +134,11 @@ class AllHeldFindings:
 @dataclass(frozen=True)
 class HeldFindingsInState:
     state: HeldStateName
+
+
+@dataclass(frozen=True)
+class UnfiledFindingsFromOpenTickets:
+    """Findings still subject to revision by an assigned or checkpointed ticket."""
 
 
 @dataclass(frozen=True)
@@ -249,6 +255,7 @@ class TicketRecord(TypedDict):
     rule: str
     crate: str
     files: list[str]
+    cells: list[list[str]]
     sites: list[dict[str, object]]
     rules: list[str]
     rule_blobs: dict[str, str]
@@ -510,6 +517,7 @@ MIGRATIONS = {
             PRIMARY KEY(ticket, path)
         );
     """,
+    9: "ALTER TABLE tickets ADD COLUMN cells TEXT NOT NULL DEFAULT '[]';",
 }
 
 
@@ -607,8 +615,8 @@ class Ledger:
         return datetime.fromisoformat(rows[0][0])
 
     def _ticket(self, ticket_id: str) -> TicketRecord:
-        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str, str]],
-                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base,proposal FROM tickets WHERE id=?", (ticket_id,)).fetchall())
+        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str, str, str]],
+                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base,proposal,cells FROM tickets WHERE id=?", (ticket_id,)).fetchall())
         if not rows:
             raise LedgerError(f"unknown ticket {ticket_id}")
         row = rows[0]
@@ -617,7 +625,7 @@ class Ledger:
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
             "rules": cast(list[str], json.loads(row[8])), "rule_blobs": cast(dict[str, str], json.loads(row[9])),
             "state": row[10], "branch": row[11], "checkpoint": row[12], "created_at": row[13], "updated_at": row[14],
-            "base": row[15], "proposal": row[16],
+            "base": row[15], "proposal": row[16], "cells": cast(list[list[str]], json.loads(row[17])),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -636,7 +644,7 @@ class Ledger:
     def ticket_add(
         self, id: str, unit: str, kind: TicketKind, family: str, crate: str,
         files: list[str], rules: list[str], rule: str = "", sites: list[dict[str, object]] | None = None,
-        proposal: str = "",
+        proposal: str = "", cells: tuple[tuple[str, str], ...] = (),
     ) -> None:
         if not re.fullmatch(re.escape(unit) + r"-\d+", id):
             raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
@@ -648,6 +656,11 @@ class Ledger:
             raise LedgerError(f"{id}: sites are for listed or structure tickets only")
         if not rules:
             raise LedgerError(f"{id}: ticket must cover at least one rule")
+        if cells and kind != "structure":
+            raise LedgerError(f"{id}: explicit cells are for structure tickets only")
+        cells = tuple((rule_id, self._path(path)) for rule_id, path in cells)
+        if any(cell[0] not in rules for cell in cells):
+            raise LedgerError(f"{id}: cell rule is outside ticket rules")
         files = [self._path(path) for path in files]
         crate = self._path(crate)
         with self._connection:
@@ -655,7 +668,7 @@ class Ledger:
             exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
             if exists:
                 previous = self._ticket(id)
-                if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal):
+                if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells]):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return
             if kind == "proposal":
@@ -690,10 +703,10 @@ class Ledger:
                 )
             now = _now()
             _ = self._connection.execute(
-                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,proposal) "
-                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?,?)",
+                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,proposal,cells) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?,?,?)",
                 (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
-                 json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal),
+                 json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal, json.dumps(cells)),
             )
 
     def pinned_rule_texts(self, ticket_id: str) -> tuple[PinnedRuleText, ...]:
@@ -734,7 +747,8 @@ class Ledger:
         yielded = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
             "SELECT path FROM ticket_yields WHERE ticket=?", (id,),
         ).fetchall())}
-        owned = {(rule, path) for rule in rules for path in paths if path not in yielded}
+        owned = ({(rule, path) for rule, path in ticket["cells"] if path not in yielded}
+                 if ticket["cells"] else {(rule, path) for rule in rules for path in paths if path not in yielded})
         return tuple(UnjudgedTicketCell(rule, path) for rule, path in sorted(owned - judged))
 
     def ticket_yield(self, id: str, path: str) -> None:
@@ -997,8 +1011,14 @@ class Ledger:
         state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Built() if row[10] == "built" else Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state)
 
-    def held_findings(self, selection: AllHeldFindings | HeldFindingsInState) -> tuple[HeldFinding, ...]:
-        if isinstance(selection, HeldFindingsInState):
+    def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
+        if isinstance(selection, UnfiledFindingsFromOpenTickets):
+            query = self._connection.execute(
+                "SELECT h.finding_id FROM held_findings h JOIN tickets t ON t.id=h.ticket "
+                + "WHERE h.state='unfiled' AND t.state IN ('assigned','checkpointed') "
+                + "ORDER BY h.created_at,h.finding_id",
+            )
+        elif isinstance(selection, HeldFindingsInState):
             query = self._connection.execute(
                 "SELECT finding_id FROM held_findings WHERE state=? ORDER BY created_at,finding_id", (selection.state,),
             )
@@ -1020,7 +1040,7 @@ class Ledger:
             except LedgerError:
                 _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
                 return InputChangedSinceJudged()
-            path = tip.crate(finding.path) if definition.tier == "D" else finding.path
+            path = tip.crate(finding.path) if definition.tier == "D" and definition.input_scope == "manifest" else finding.path
             rows = cast(list[tuple[int, str, str, str, str, str, str, str, str]], self._connection.execute(
                 'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint FROM judgments '
                 + "WHERE rule=? AND path=? AND verdict='held' ORDER BY recorded_at DESC,id DESC",
@@ -1045,7 +1065,7 @@ class Ledger:
                 return InputChangedSinceJudged()
             others = tuple(other for other in self.held_findings(AllHeldFindings())
                            if other.rule == finding.rule and not isinstance(other.state, Waived)
-                           and (tip.crate(other.path) if definition.tier == "D" else other.path) == path)
+                           and (tip.crate(other.path) if definition.tier == "D" and definition.input_scope == "manifest" else other.path) == path)
             if others:
                 return CellStillHeld(judgment)
             _ = self._connection.execute(
@@ -1245,6 +1265,10 @@ class Ledger:
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
         path = self._path(path)
+        if ticket and self._connection.execute("SELECT 1 FROM tickets WHERE id=?", (ticket,)).fetchone():
+            owned = self._ticket(ticket)["cells"]
+            if owned and [rule, path] not in owned:
+                raise LedgerError(f"{ticket}: {rule} {path} is outside ticket cells")
         if isinstance(definition.reach, MemberReach) and not _under(path, definition.reach.crate_dir.as_posix()):
             raise LedgerError(f"{rule}: {path} is outside rule reach")
         if definition.tier in ("A", "E"):
@@ -1261,13 +1285,18 @@ class Ledger:
             if path not in tip.blobs:
                 raise LedgerError(f"{rule}: {path} is not a file at {tip.commit}")
         elif definition.tier == "D":
+            paths = set(tip.rust_files)
             crates = {tip.crate(file) for file in tip.rust_files}
             if definition.candidates is not None:
                 synced = self._synced_tip()
                 self._refresh_sites(synced)
-                crates.update(site.crate for site in self._listed_sites(rule, synced))
-            if path not in crates:
-                raise LedgerError(f"{rule}: {path} must name a crate with included files")
+                sites = self._listed_sites(rule, synced)
+                crates.update(site.crate for site in sites)
+                paths.update(site.path for site in sites)
+            if path not in crates and path not in paths:
+                raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
+            if path in crates and scope == "file":
+                scope = "crate"  # Legacy structure tickets still own crate verdicts.
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
         fingerprint = self._fingerprint(tip, scope, path)
@@ -1369,7 +1398,8 @@ class Ledger:
             if definition.tier == "B":
                 paths = sorted({site.path for site in sites})
             elif definition.tier == "D":
-                paths = sorted({tip.crate(path) for path in files} | {site.crate for site in sites})
+                paths = (sorted({tip.crate(path) for path in files} | {site.crate for site in sites})
+                         if definition.input_scope == "manifest" else sorted(set(files) | {site.path for site in sites}))
             else:
                 paths = files
             components = [(definition, paths)]
@@ -1385,7 +1415,7 @@ class Ledger:
                 if rule_id is not None and rule_id.endswith("#uncovered") and component.rule_id != rule_id:
                     continue
                 for path in component_paths:
-                    cell_crate = path if component.tier == "D" else tip.crate(path)
+                    cell_crate = path if component.tier == "D" and component.input_scope == "manifest" else tip.crate(path)
                     if crate is not None and cell_crate != crate:
                         continue
                     if component.tier == "A":
@@ -1423,7 +1453,7 @@ class Ledger:
             counts = states.get(definition.rule_id, Counter())
             rows.append(RuleCounts(definition.rule_id, definition.tier,
                                    counts["current"], counts["stale"], counts["open"], counts["awaiting merge"],
-                                   held[definition.rule_id]))
+                                   held[definition.rule_id], definition.input_scope))
         return tuple(rows)
 
     def status(self, rule: str | None = None, scope: CoverageScope = _WHOLE_REPOSITORY, as_json: bool = False) -> None:
@@ -1481,6 +1511,7 @@ class LedgerArguments(argparse.Namespace):
     family: str = ""
     files: str = "[]"
     sites: str = "[]"
+    cells: str = "[]"
     rules: str = "[]"
     checkpoint: str = ""
     to: str = ""
@@ -1499,6 +1530,21 @@ def _json_strings(serialized: str) -> list[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in cast(list[object], value)):
         raise LedgerError("expected a JSON list of strings")
     return cast(list[str], value)
+
+
+def _json_cells(serialized: str) -> tuple[tuple[str, str], ...]:
+    value = cast(object, json.loads(serialized))
+    if not isinstance(value, list):
+        raise LedgerError("expected a JSON list of [rule, path] pairs")
+    cells: list[tuple[str, str]] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, list):
+            raise LedgerError("expected a JSON list of [rule, path] pairs")
+        pair = cast(list[object], item)
+        if len(pair) != 2 or not isinstance(pair[0], str) or not isinstance(pair[1], str):
+            raise LedgerError("expected a JSON list of [rule, path] pairs")
+        cells.append((pair[0], pair[1]))
+    return tuple(cells)
 
 
 def _json_sites(serialized: str) -> list[dict[str, object]]:
@@ -1584,6 +1630,7 @@ def main() -> None:
                     _ = command.add_argument("--kind", choices=("read", "listed", "structure", "proposal"), required=True)
                     _ = command.add_argument("--rule", default="")
                     _ = command.add_argument("--sites", default="[]")
+                    _ = command.add_argument("--cells", default="[]")
                     _ = command.add_argument("--proposal", default="")
                 elif action == "assign":
                     _ = command.add_argument("--branch", required=True)
@@ -1643,7 +1690,7 @@ def main() -> None:
             elif args.command == "ticket":
                 if args.action == "add":
                     ledger.ticket_add(args.id, args.unit, cast(TicketKind, args.kind), args.family, args.crate,
-                                      _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites), args.proposal)
+                                      _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites), args.proposal, _json_cells(args.cells))
                 elif args.action == "assign":
                     ledger.ticket_assign(args.id, args.branch)
                 elif args.action == "checkpoint":
