@@ -8,7 +8,13 @@ A `/unit:direct` run opens its Codex workers once and keeps them for the rest of
 
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`
 
-Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it. The verbs:
+Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
+
+**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `PLAN_DELEGATE_BOARD_DIR` to that folder, replacing any value the caller carries. Seat processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A review pool's mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing. A server already running keeps its environment until it is next started.
+
+The berth hook takes the session directory from `PLAN_DELEGATE_BOARD_DIR` when it names a folder that exists. When the variable is unset or its folder is gone, it reads the director's run marker (`unit_runs.marker`), so a stale variable never lets an edit through unchecked. The marker names one run, so a seat in a director's side run would otherwise check the main run's reservations.
+
+The verbs:
 
 | Verb | Signature | Behavior |
 | --- | --- | --- |
@@ -108,15 +114,15 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 ### Cleanup
 
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. That removes Claude workers only and leaves Codex threads open. After a successful Claude session listing, and only under the real delegate root, it runs `codex_mesh.py sweep --stop` (best-effort). A sweep failure prints one line and worker cleanup continues.
-- **Run end.** `scripts/delegate/end_session.sh` takes these steps in order:
-  1. `remove_workers.py`
-  2. `codex_mesh.py stop`, whenever `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json` exists
-  3. `sweep --root <delegate root> --stop`
-  4. removal of `verify_cache/`
-  5. removal of the run's notifier
+- **Run end.** `scripts/delegate/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
+  1. one `remove_workers.py` call with a `--session-dir` per held run
+  2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
+  3. one `sweep --root <root of the first held run> --stop`
+  4. removal of each held run's `verify_cache/`
+  5. removal of the marker run's notifier
   6. removal of the run-active marker
 
-  Each step continues after a failure.
+  Steps 1 to 4 run even with no marker, for runs the session still holds. Each step continues after a failure. Tests point the scan at a temp folder with `PLAN_DELEGATE_RUN_ROOT` and the marker with `PLAN_DELEGATE_ACTIVE_DIR`.
 - **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. It then judges whether anything still needs the server:
   - Any connected client means in use.
   - For a current server, a run-active marker or a running worker means in use.
@@ -162,8 +168,9 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/delegate/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/delegate/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
-| `scripts/delegate/end_session.sh` | Ends the run's workers (`stop`) and sweeps |
-| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end; sweeps after a successful listing |
+| `scripts/delegate/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
+| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
+| `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
 | `scripts/delegate/progress_history.py` | Agent columns for extra workers |
 | `scripts/whoami/worker_usage.py` | Before/after usage report over the usage store |
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |

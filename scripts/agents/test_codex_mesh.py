@@ -8708,6 +8708,28 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertEqual(record["codex_home"], str(home))
         self.assertEqual(record["auto_compact_tokens"], codex_mesh.AUTO_COMPACT_TOKENS)
 
+    def started_environment(self, caller: dict[str, str]) -> dict[str, str]:
+        _ = self.select()
+        process = MagicMock(spec=subprocess.Popen)
+        process.pid = 99999999
+        cast(MagicMock, process.poll).return_value = None
+        with patch.dict(os.environ, caller), patch.object(subprocess, "Popen", return_value=process) as launch, patch.object(codex_mesh, "_free_port", return_value=4001), patch.object(codex_mesh, "WebSocket"), patch.object(codex_mesh, "_start_watcher"):
+            _ = codex_mesh._start_server(str(self.session_dir), agent_accounts.workers_home())  # pyright: ignore[reportPrivateUsage]
+        return cast(dict[str, str], launch.call_args.kwargs["env"])
+
+    def test_a_run_folders_server_names_its_run_whatever_the_caller_carries(self) -> None:
+        # implement.sh's claim step can start the server before the launcher exports the run.
+        with patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)):
+            for caller in ({}, {"PLAN_DELEGATE_BOARD_DIR": str(self.home / "other-run")}):
+                with self.subTest(caller=caller):
+                    environment = self.started_environment(caller)
+                    self.assertEqual(environment["PLAN_DELEGATE_BOARD_DIR"], str(self.session_dir))
+
+    def test_a_server_outside_the_run_roots_keeps_the_callers_environment(self) -> None:
+        # A review pool's mesh directory serves many units' turns, so it names no run.
+        with patch.object(codex_mesh, "RUN_ROOTS", (self.home,)):
+            self.assertNotIn("PLAN_DELEGATE_BOARD_DIR", self.started_environment({}))
+
     def test_home_change_retires_server_even_when_sign_in_timestamps_are_unchanged(self) -> None:
         home = self.select()
         self.record(self.home / ".codex")

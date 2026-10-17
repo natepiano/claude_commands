@@ -225,7 +225,7 @@ class RemoveWorkersTest(unittest.TestCase):
         with patch.object(remove_workers, "shutdown_held_sessions", return_value=held):
             live = remove_workers.live_runs(roots, {ORCHESTRATOR, GONE_ORCHESTRATOR})
         self.assertEqual(live, {new_live.resolve(), old_live.resolve()})
-        self.assertEqual(set(remove_workers.removal_targets(roots, None, [], live)), {"new2", "old2"})
+        self.assertEqual(set(remove_workers.removal_targets(roots, set(), [], live)), {"new2", "old2"})
 
     def test_legacy_names_follow_their_run(self) -> None:
         _ = self.run_dir(LEGACY_LIVE, [], orchestrator=ORCHESTRATOR)

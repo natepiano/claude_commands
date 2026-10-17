@@ -96,6 +96,37 @@ class UnitRunsTest(unittest.TestCase):
             self.assertEqual((run / unit_runs.DIRECTOR_FILE).read_text(encoding="utf-8"), "sid-shell\n")
             self.assertFalse((run / "missing").exists())
 
+    def test_held_lists_the_marker_run_then_every_run_the_session_directs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            new, old, active = Path(folder) / "unit", Path(folder) / "delegate", Path(folder) / "active"
+            for run in (new / "run-marked", new / "run-side", new / "run-other", old / "run-former"):
+                run.mkdir(parents=True)
+            active.mkdir()
+            _ = (active / "sid-me").write_text(f"{new / 'run-marked'}\n")
+            # The marker's run also records its director; it is listed once, first.
+            unit_runs.record_director(new / "run-marked", "sid-me")
+            unit_runs.record_director(new / "run-side", "sid-me")
+            unit_runs.record_director(new / "run-other", "sid-other")
+            unit_runs.record_director(old / "run-former", "sid-me")
+            with patch.object(unit_runs, "RUN_ROOT", new), patch.object(unit_runs, "FORMER_RUN_ROOT", old):
+                self.assertEqual(unit_runs.held("sid-me", active_override=active), [
+                    str(new / "run-marked"), str(new / "run-side"), str(old / "run-former")])
+                self.assertEqual(unit_runs.held("sid-other", active_override=active), [str(new / "run-other")])
+                self.assertEqual(unit_runs.held("sid-none", active_override=active), [])
+                self.assertEqual(unit_runs.held("", active_override=active), [])
+            self.assertEqual(unit_runs.held("sid-me", new, active), [str(new / "run-marked"), str(new / "run-side")])
+            with contextlib.redirect_stdout(io.StringIO()) as shown:
+                self.assertEqual(unit_runs.main(["held", "sid-me", "--root", str(new), "--active", str(active)]), 0)
+            self.assertEqual(shown.getvalue().splitlines(), [str(new / "run-marked"), str(new / "run-side")])
+
+    def test_held_without_a_marker_lists_only_the_directed_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            runs, active = Path(folder) / "runs", Path(folder) / "active"
+            (runs / "run-side").mkdir(parents=True)
+            unit_runs.record_director(runs / "run-side", "sid-me")
+            self.assertEqual(unit_runs.held("sid-me", runs, active), [str(runs / "run-side")])
+            self.assertEqual(unit_runs.held("sid-me", Path(folder) / "missing", active), [])
+
     def test_the_removal_check_refuses_while_a_running_session_owns_a_former_marker(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             former = Path(folder) / "delegate"

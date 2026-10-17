@@ -13,10 +13,12 @@ A test points a reader at its own folder with an override, which replaces both n
 A run's director is recorded in the run folder itself, not read off the markers: a director runs
 independent phases side by side, each in its own run folder, and its one marker names only one of
 them. implement.sh and review.sh call `record-director` on every dispatch, so no step depends on a
-model remembering to write it.
+model remembering to write it. `held` lists every run a director holds, so its run end stops the
+workers of each one, not only the run its marker names.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -91,13 +93,39 @@ def _claude_worker(run: Path, session_id: str) -> bool:
 def director(run: Path) -> str:
     """The run's director: its recorded one, else the session that started it, from the
     `run_started` event that opens its history, for a run nothing has dispatched in since
-    dispatches began recording it. The state's own `main_agent` is not used: a pass opened
-    inside a Codex worker rewrites it with that worker's thread."""
+    dispatches began recording it. The state's own `main_agent` is not used: in runs started before
+    2026-10-17 a pass opened inside a worker rewrote it with that worker's thread, and
+    progress_history reads the director from here to repair it."""
     try:
         recorded = (run / DIRECTOR_FILE).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         recorded = ""
     return recorded or _started_by(run)
+
+
+def held(session_id: str, root_override: str | Path | None = None,
+         active_override: str | Path | None = None) -> list[str]:
+    """Every run folder the session directs: its marker's run first, as the marker writes it, then
+    each folder under the run roots that names it as director. A plain scan, since reading the
+    director of every folder costs about 25 ms for the 224 live ones (2026-10-17)."""
+    if not session_id:
+        return []
+    try:
+        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        lines = []
+    runs = [lines[0].strip()] if lines and lines[0].strip() else []
+    seen = {Path(run).resolve() for run in runs}
+    for root in run_roots(root_override):
+        try:
+            folders = sorted(root.iterdir())
+        except OSError:
+            continue
+        for folder in folders:
+            if folder.is_dir() and folder.resolve() not in seen and director(folder) == session_id:
+                seen.add(folder.resolve())
+                runs.append(str(folder))
+    return runs
 
 
 def _json_object(text: str) -> dict[str, object]:
@@ -158,7 +186,20 @@ def removal_check(running: Mapping[str, str]) -> int:
     return 1
 
 
+def _held_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="unit_runs.py held", description="Print each run folder a session directs.")
+    _ = parser.add_argument("session_id")
+    _ = parser.add_argument("--root", default="", help="one run root in place of both run-folder names")
+    _ = parser.add_argument("--active", default="", help="one marker folder in place of both")
+    args = parser.parse_args(argv)
+    for run in held(cast(str, args.session_id), cast(str, args.root) or None, cast(str, args.active) or None):
+        print(run)
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "held":
+        return _held_main(argv[1:])
     if len(argv) == 2 and argv[0] == "record-director":
         try:
             record_director(Path(argv[1]), os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
@@ -167,7 +208,7 @@ def main(argv: list[str]) -> int:
             return 1
         return 0
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | record-director <run folder>", file=sys.stderr)
+        print("usage: unit_runs.py removal-check | record-director <run folder> | held <session id>", file=sys.stderr)
         return 2
     if TYPE_CHECKING:
         from ..message.sessions import running_sessions
