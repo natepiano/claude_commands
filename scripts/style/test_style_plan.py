@@ -255,6 +255,65 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn("window", text)
         self.assertEqual(self.ledger().ticket_open("modules-unit")[0]["rules"], [rule])
 
+    def prepare_binary_crate(self) -> None:
+        (self.repo / self.sources[0]).unlink()
+        self.write("crates/alpha/src/main.rs", "fn main() {}\n")
+        self.tip = self.commit()
+        for checkout in (self.style, self.unit):
+            _ = self.git("merge", "--ff-only", "main", cwd=checkout)
+        self.sync()
+
+    def test_written_read_phase_explains_binary_only_items_are_not_public_outside_the_crate(self) -> None:
+        _ = self.rule("read")
+        self.prepare_binary_crate()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.\n"
+            + "`crates/alpha` is binary-only (no library target): none of its items, `pub` or not, "
+            + "is public outside the crate.\nJudge window by window:", self.plan.read_text())
+
+    def test_written_read_phase_for_a_default_library_keeps_the_existing_spec(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.\n"
+            + "Judge window by window:", self.plan.read_text())
+        self.assertNotIn("binary-only", self.plan.read_text())
+
+    def test_written_read_phase_for_a_virtual_root_does_not_claim_a_binary_crate(self) -> None:
+        _ = self.rule("read")
+        self.write("root.rs", "pub fn root_helper() {}\n")
+        self.tip = self.commit()
+        for checkout in (self.style, self.unit):
+            _ = self.git("merge", "--ff-only", "main", cwd=checkout)
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["crate"], ticket["files"]), (".", ["root.rs"]))
+        self.assertIn("- `root.rs` — lines 1-1\n", self.plan.read_text())
+        self.assertNotIn("binary-only", self.plan.read_text())
+
+    def test_written_read_phase_recognizes_a_custom_library_target_without_src_lib(self) -> None:
+        _ = self.rule("read")
+        self.write("crates/alpha/Cargo.toml", '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+                   + '[lib]\npath = "library.rs"\n')
+        self.write("crates/alpha/library.rs", "pub fn library() {}\n")
+        self.prepare_binary_crate()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertNotIn("binary-only", self.plan.read_text())
+        self.assertIn("uncovered read.\nJudge window by window:", self.plan.read_text())
+
+    def test_written_read_phase_uses_base_targets_when_a_library_is_added_to_the_worktree(self) -> None:
+        _ = self.rule("read")
+        self.prepare_binary_crate()
+        _ = (self.unit / "crates/alpha/src/lib.rs").write_text("pub fn new_library() {}\n")
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn("`crates/alpha` is binary-only (no library target)", self.plan.read_text())
+        text = self.plan.read_text()
+        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.plan.read_text(), text)
+
 
     def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
