@@ -34,6 +34,42 @@ FAMILIES: tuple[rules.Family, ...] = ("modules", "names", "values", "types")
 
 
 @dataclass(frozen=True)
+class AllCrates:
+    pass
+
+
+@dataclass(frozen=True)
+class PilotCrates:
+    members: frozenset[str]
+
+
+PilotScope = AllCrates | PilotCrates
+_ALL_CRATES = AllCrates()
+
+
+def crate_in_scope(scope: PilotScope, crate: str) -> bool:
+    return isinstance(scope, AllCrates) or crate in scope.members
+
+
+def parse_pilot_scope(text: str, repo: Path) -> PilotScope:
+    """Resolve the supplied plan's pilot package names to member directories."""
+    lines: list[str] = [match.group(1) for match in re.finditer(
+        r"(?m)^\s*(?:- )?\*\*Pilot scope:\*\*[^\S\n]*(.*)$", delegation_context(text))]
+    if not lines:
+        return AllCrates()
+    if len(lines) > 1:
+        raise style_ledger.LedgerError("pilot scope has more than one scope line")
+    manifests = {path.relative_to(repo).as_posix(): path.read_text()
+                 for path in repo.rglob("Cargo.toml") if path.is_file()}
+    members = {member.package_name: member.directory for member in rules.workspace_members(manifests)}
+    names = tuple(name.strip() for name in lines[0].split(","))
+    for name in names:
+        if name not in members:
+            raise style_ledger.LedgerError(f"pilot scope names unknown crate {name}")
+    return PilotCrates(frozenset(members[name] for name in names))
+
+
+@dataclass(frozen=True)
 class PhaseWritten:
     ticket_id: str
 
@@ -171,7 +207,7 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
-                      family: rules.Family) -> tuple[TicketSelection, ...]:
+                      family: rules.Family, scope: PilotScope = _ALL_CRATES) -> tuple[TicketSelection, ...]:
     cells = tuple(ledger.cells())
     pending = tuple(cell for cell in cells if cell.state in ("open", "stale"))
     stale = {crate: sum(cell.state == "stale" for cell in cells if cell.crate == crate)
@@ -179,6 +215,8 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
     tip = synced_tip(ledger)
     result: list[TicketSelection] = []
     for crate in sorted(stale, key=lambda crate: (-stale[crate], crate)):
+        if not crate_in_scope(scope, crate):
+            continue
         structure = tuple(cell for cell in pending if cell.crate == crate and cell.tier == "D")
         if structure:
             if family == "modules":
@@ -335,6 +373,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
+    scope = parse_pilot_scope(original, repo)
     if any("repair" in line.lower() and re.search(r"status:\s*todo", line) for line in original.splitlines() if line.startswith("### Phase ")):
         return RepairFirst()
     with style_ledger.open_ledger(repo) as ledger:
@@ -360,7 +399,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         busy = busy_files(repo, doc, ledger, unit, board)
         queued = ledger.queued_tickets(unit)
         for index, ticket in enumerate(queued):
-            if index == 0 and not any(busy.contains(path) for path in ticket["files"]):
+            in_scope = crate_in_scope(scope, ticket["crate"])
+            if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
                 ledger.ticket_assign(ticket["id"], row.branch)
                 for extra in queued[1:]:
                     ledger.ticket_drop(extra["id"])
@@ -371,7 +411,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
                 write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
                 return PhaseWritten(ticket["id"])
             ledger.ticket_drop(ticket["id"])
-            print(f"dropped {ticket['id']}: files busy")
+            reason = "files busy" if in_scope else "outside pilot scope"
+            print(f"dropped {ticket['id']}: {reason}")
         family = unit.removesuffix("-unit")
         if family not in FAMILIES:
             raise style_ledger.LedgerError(f"{unit}: unknown style family")
@@ -387,7 +428,9 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             findings = style_proposals.issue_findings(ledger, issue.path)
             if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != issue.path for finding in findings):
                 raise style_ledger.LedgerError(f"{issue.path}: every approved finding must be filed")
-            if any(busy.contains(finding.path) for finding in findings):
+            if any(not crate_in_scope(scope, style_proposals.crate_for(ledger, finding.path)) for finding in findings):
+                print(f"waiting {issue.path}: outside pilot scope")
+            elif any(busy.contains(finding.path) for finding in findings):
                 print(f"waiting {issue.path}: files busy")
             else:
                 ticket_id = ledger.next_ticket_id(unit)
@@ -398,7 +441,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
                 style_proposals.proposal_command("start", str(issue.path))
                 write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
                 return PhaseWritten(ticket_id)
-        candidates = candidate_tickets(repo, ledger, busy, family)
+        candidates = candidate_tickets(repo, ledger, busy, family, scope)
         if not candidates:
             return WaitingForSync(len(ledger.unclassified_rules()))
         selected = candidates[0]

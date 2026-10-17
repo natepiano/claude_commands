@@ -19,6 +19,7 @@ import add_style
 import add_unit
 import rules
 import style_ledger
+import style_plan
 import style_rules
 from add_unit import read_production
 from production_units import production_field
@@ -41,6 +42,11 @@ if name == "style_sync.py":
     raise SystemExit(0)
 elif name == "launch.py":
     doc = Path(arguments[arguments.index("--production") + 1])
+    if os.environ.get("TEST_BOOTSTRAP_AT_LAUNCH"):
+        Path(os.environ["TEST_BOOTSTRAP_AT_LAUNCH"]).write_text(json.dumps({
+            "production": doc.read_text(),
+            "plans": {path.name: path.read_text() for path in (doc.parent / "style-production/units").glob("*.md")},
+        }))
     destination = next(line for line in doc.read_text().splitlines() if line.startswith("- **Parent production:**"))
     with Path(os.environ["TEST_LAUNCH_DESTINATIONS"]).open("a") as destinations:
         destinations.write(destination + "\\n")
@@ -90,6 +96,11 @@ with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.p
 class ScriptCall(TypedDict):
     command: str
     arguments: list[str]
+
+
+class BootstrapAtLaunch(TypedDict):
+    production: str
+    plans: dict[str, str]
 
 
 @final
@@ -195,6 +206,122 @@ class AddStyleTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / "ledger/sample/ledger.sqlite")) as connection:
             return cast(tuple[str, str, str], connection.execute("SELECT tip,style_branch,synced_at FROM sync").fetchone())
 
+    def add_workspace_packages(self) -> None:
+        manifest = self.repo / "Cargo.toml"
+        _ = manifest.write_text(manifest.read_text() + '\n[workspace]\nmembers = ["crates/handler", "crates/port"]\n')
+        for directory, package in (("handler", "cargo-handler"), ("port", "cargo-port")):
+            member = self.repo / "crates" / directory
+            (member / "src").mkdir(parents=True)
+            _ = (member / "Cargo.toml").write_text(f'[package]\nname = "{package}"\nversion = "0.1.0"\n')
+            _ = (member / "src/lib.rs").write_text("pub fn member() {}\n")
+        _ = self.git("add", "--all")
+        _ = self.git("commit", "-q", "-m", "Add workspace packages")
+
+    def test_pilot_rows_and_package_scopes_are_ready_before_the_showrunner_launches(self) -> None:
+        self.add_workspace_packages()
+        snapshot = self.root / "bootstrap-at-launch.json"
+        self.env["TEST_BOOTSTRAP_AT_LAUNCH"] = str(snapshot)
+
+        _ = self.run_bootstrap("--pilot", "modules-unit", "--pilot", "names-unit=cargo-handler,cargo-port",
+                               "--pilot", "types-unit=cargo-port")
+
+        launched = cast(BootstrapAtLaunch, json.loads(snapshot.read_text()))
+        self.assertEqual(launched["production"], self.doc.read_text())
+        self.assertEqual([line.split("|")[1].strip() for line in launched["production"].splitlines()
+                          if line.startswith("| ") and "-unit |" in line],
+                         ["names-unit", "types-unit", "modules-unit"])
+        self.assertEqual(set(launched["plans"]), {f"{family}-unit.md" for family in add_style.FAMILIES})
+        for unit, scope in (("names", "cargo-handler, cargo-port"), ("types", "cargo-port")):
+            lines = launched["plans"][f"{unit}-unit.md"].splitlines()
+            scope_index = lines.index(f"- **Pilot scope:** {scope}")
+            self.assertLess(lines.index("## Delegation Context"), scope_index)
+            self.assertTrue(lines[scope_index - 1].startswith("  - `"))
+            self.assertLess(scope_index, lines.index("## Phases"))
+        for unit in ("values", "modules"):
+            self.assertNotIn("**Pilot scope:**", launched["plans"][f"{unit}-unit.md"])
+        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["names-unit.md"], self.repo),
+                         style_plan.PilotCrates(frozenset({"crates/handler", "crates/port"})))
+        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["types-unit.md"], self.repo),
+                         style_plan.PilotCrates(frozenset({"crates/port"})))
+        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["modules-unit.md"], self.repo),
+                         style_plan.AllCrates())
+
+    def test_pilot_is_refused_for_an_existing_production_without_changing_it(self) -> None:
+        _ = self.run_bootstrap()
+        paths = (self.doc, *(self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))
+        before = {path: path.read_bytes() for path in paths}, self.calls(), self.sync()
+        for extra in ((), ("--check",)):
+            result = self.run_bootstrap("--pilot", "names-unit=sample", *extra, success=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stderr.strip(), "add_style: --pilot applies only while creating sample-style")
+            self.assertEqual(({path: path.read_bytes() for path in paths}, self.calls(), self.sync()), before)
+
+    def test_invalid_pilot_units_packages_and_duplicate_units_refuse_before_writes(self) -> None:
+        self.add_workspace_packages()
+        for arguments, bad in (
+            (("--pilot", "unknown-unit"), "unknown-unit"),
+            (("--pilot", "names-unit=absent"), "absent"),
+            (("--pilot", "names-unit=crates/handler"), "crates/handler"),
+            (("--pilot", "names-unit", "--pilot", "names-unit=sample"), "names-unit"),
+            (("--pilot", "names-unit="), "''"),
+        ):
+            for extra in ((), ("--check",)):
+                with self.subTest(arguments=arguments, extra=extra):
+                    result = self.run_bootstrap(*arguments, *extra, success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(bad, result.stderr)
+                    self.assertFalse(self.checkout.exists())
+                    self.assertFalse((self.root / "ledger").exists())
+                    self.assertEqual(self.calls(), [])
+
+    def test_interrupted_pilot_changes_only_unlaunched_rows_and_plan_scopes(self) -> None:
+        self.add_workspace_packages()
+        self.env["TEST_FAIL_LAUNCH"] = "1"
+        self.assertEqual(self.run_bootstrap("--pilot", "names-unit=cargo-handler", "--pilot", "types-unit=cargo-handler",
+                                           "--pilot", "values-unit=sample", success=False).returncode, 2)
+        launched = self.root / "sample-style-names"
+        launched.mkdir()
+        names_plan = self.checkout / add_style.PLAN_DIRECTORY / "names-unit.md"
+        _ = names_plan.write_text(names_plan.read_text() + "\n### Phase 1 — launched record\n")
+        _ = self.doc.write_text(self.doc.read_text().replace("| sample-style-names | — |", "| sample-style-names | 7777 |"))
+        names_row = next(line for line in self.doc.read_bytes().splitlines(keepends=True) if line.startswith(b"| names-unit |"))
+        names_before = names_plan.read_bytes(), names_plan.stat().st_mtime_ns
+        types_plan = self.checkout / add_style.PLAN_DIRECTORY / "types-unit.md"
+        _ = types_plan.write_text(types_plan.read_text() + "\nUnlaunched notes retained.\n")
+        log = self.checkout / "docs/sample-style-log.md"
+        _ = log.write_text("Interrupted bootstrap notes.\n")
+        sync, excluded = self.sync(), (self.repo / ".git/info/exclude").read_bytes()
+        del self.env["TEST_FAIL_LAUNCH"]
+
+        _ = self.run_bootstrap("--pilot", "types-unit=cargo-port", "--pilot", "modules-unit")
+
+        self.assertIn(names_row, self.doc.read_bytes().splitlines(keepends=True))
+        self.assertEqual((names_plan.read_bytes(), names_plan.stat().st_mtime_ns), names_before)
+        self.assertIn("| modules-unit |", self.doc.read_text())
+        self.assertNotIn("| values-unit |", self.doc.read_text())
+        self.assertIn("- **Pilot scope:** cargo-port\n", types_plan.read_text())
+        self.assertNotIn("**Pilot scope:** cargo-handler", types_plan.read_text())
+        self.assertIn("Unlaunched notes retained.", types_plan.read_text())
+        self.assertNotIn("**Pilot scope:**", (self.checkout / add_style.PLAN_DIRECTORY / "values-unit.md").read_text())
+        self.assertEqual(log.read_text(), "Interrupted bootstrap notes.\n")
+        self.assertEqual((self.sync(), (self.repo / ".git/info/exclude").read_bytes()), (sync, excluded))
+
+    def test_check_lists_pilot_units_and_scopes_in_steps_four_and_five_without_writes(self) -> None:
+        self.add_workspace_packages()
+        result = self.run_bootstrap("--check", "--pilot", "modules-unit", "--pilot", "names-unit=cargo-handler",
+                                    "--pilot", "types-unit=cargo-port")
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 7)
+        for unit in ("modules-unit", "names-unit", "types-unit"):
+            self.assertIn(unit, lines[3])
+        self.assertIn("modules-unit: all crates", lines[4])
+        self.assertIn("names-unit: cargo-handler", lines[4])
+        self.assertIn("types-unit: cargo-port", lines[4])
+        self.assertNotIn("values-unit", lines[3] + lines[4])
+        self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.root / "ledger").exists())
+        self.assertEqual(self.calls(), [])
+
     def test_lookup_from_main_and_linked_worktree_finds_the_same_standing_production(self) -> None:
         _ = self.run_bootstrap()
         main = add_style.standing_style_production(self.repo)
@@ -234,6 +361,7 @@ class AddStyleTests(unittest.TestCase):
             self.assertIn(f"| {family}-unit | docs/style-production/units/{family}-unit.md |", self.doc.read_text())
             self.assertIn(f"> **Production: sample-style** — unit `{family}-unit`", text)
             self.assertIn("> **Standing:** style_plan.py", text)
+            self.assertNotIn("**Pilot scope:**", text)
             self.assertIn(f"global:rust/{family}.md", text)
             self.assertIn("~/.claude/docs/style_production.md", text)
             self.assertNotIn("### Phase", text)
