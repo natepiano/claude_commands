@@ -42,6 +42,7 @@ from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
+from scripts.delegate import plan_history
 from scripts.message import process_table, sessions
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
@@ -1925,6 +1926,30 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
         self.assertEqual(self.methods("thread/start"), [])
         self.assertEqual(len(self.methods("thread/resume")), 1)
+
+    def test_reopen_leaves_a_finished_runs_seat_ended(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "ended", "role": "impl",
+            "launcher_pid": 99999999,
+        }})
+        marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+        marker.touch()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        state_path = self.session_dir / plan_history.STATE_FILENAME
+        _ = state_path.write_text(json.dumps({"status": "completed", "finished_at": 1760658000}))
+        before = self.roster()
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "skipped run: run finished (completed); worker stays ended\n")
+        self.assertEqual(self.roster(), before)
+        self.assertTrue(marker.exists())
+
+        _ = state_path.write_text(json.dumps({"status": "active"}))
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertFalse(marker.exists())
 
     def test_reopen_refuses_missing_thread_or_live_launcher_without_mutation(self) -> None:
         for fields in ({"launcher_pid": os.getpid(), "thread_id": THREAD_ID},
