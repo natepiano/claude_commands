@@ -116,6 +116,12 @@ class WaitingForSync:
 
 
 @dataclass(frozen=True)
+class WaitingForStructure:
+    crates: tuple[str, ...]
+    unclassified: int
+
+
+@dataclass(frozen=True)
 class WaitingForBranchPointSync:
     branch_point: str
     branch_tip: str
@@ -143,7 +149,7 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForBranchPointSync | berth_board.BoardUnavailable
+NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure | WaitingForBranchPointSync | berth_board.BoardUnavailable
 
 
 def style_document(repo: Path) -> Path:
@@ -499,7 +505,7 @@ class NoAvailableWork:
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles,
-) -> PhaseWritten | NoAvailableWork:
+) -> PhaseWritten | NoAvailableWork | WaitingForStructure:
     queued = ledger.queued_tickets(unit)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
@@ -546,6 +552,14 @@ def _select_phase(
             return PhaseWritten(ticket_id)
     candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
     if not candidates:
+        if family != "modules":
+            pending = tuple(cell for cell in ledger.cells()
+                            if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
+            structure = {cell.crate for cell in pending if cell.tier == "D"}
+            own = {cell.crate for cell in pending if cell.family == family}
+            blocked = tuple(sorted(structure & own))
+            if blocked:
+                return WaitingForStructure(blocked, len(ledger.unclassified_rules()))
         return NoAvailableWork()
     selected = candidates[0]
     ticket_id = ledger.next_ticket_id(unit)
@@ -619,6 +633,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
+        if isinstance(selected, WaitingForStructure):
+            return selected
         return WaitingForSync(len(ledger.unclassified_rules()))
 
 
@@ -672,6 +688,11 @@ def main(argv: list[str]) -> int:
                 return 4
             case WaitingForSync(unclassified):
                 print("waiting for sync")
+                if unclassified:
+                    print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
+                return 3
+            case WaitingForStructure(crates, unclassified):
+                print(f"waiting for structure: {', '.join(crates)}")
                 if unclassified:
                     print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
                 return 3
