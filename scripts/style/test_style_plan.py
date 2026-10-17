@@ -267,7 +267,11 @@ class StylePlanTests(unittest.TestCase):
             + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
             + "A binding fills several parameters only when that same value fills them: "
             + 'a value derived from it (`dir.join("config")`) is another value, '
-            + "and a later binding of the same name, as in a second loop, is another binding.\nJudge window by window:",
+            + "and a later binding of the same name, as in a second loop, is another binding. "
+            + "A call inside a macro's arguments counts, and an enum tuple variant wrapping the binding "
+            + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
+            + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
+            + "binding; it is no collision.\nJudge window by window:",
             self.plan.read_text())
 
     def test_written_uncovered_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
@@ -283,7 +287,11 @@ class StylePlanTests(unittest.TestCase):
             + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
             + "A binding fills several parameters only when that same value fills them: "
             + 'a value derived from it (`dir.join("config")`) is another value, '
-            + "and a later binding of the same name, as in a second loop, is another binding.\nJudge window by window:",
+            + "and a later binding of the same name, as in a second loop, is another binding. "
+            + "A call inside a macro's arguments counts, and an enum tuple variant wrapping the binding "
+            + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
+            + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
+            + "binding; it is no collision.\nJudge window by window:",
             self.plan.read_text())
 
     def test_written_names_phase_traces_accessors_and_distinguishes_derived_values_and_later_bindings(self) -> None:
@@ -298,6 +306,17 @@ class StylePlanTests(unittest.TestCase):
             + 'a value derived from it (`dir.join("config")`) is another value, '
             + "and a later binding of the same name, as in a second loop, is another binding.",
             text)
+
+    def test_written_names_phase_traces_calls_in_macros_and_variants_and_allows_inner_shadowing(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn("A call inside a macro's arguments counts", text)
+        self.assertIn("an enum tuple variant wrapping the binding (`Pane::App(id)`)", text)
+        self.assertIn(
+            "A binding of the same name declared later in an inner block, such as a loop or closure body, "
+            + "would only shadow the renamed binding; it is no collision.", text)
 
     def test_written_names_phase_for_other_rules_keeps_the_existing_spec_without_conversion_guidance(self) -> None:
         _ = self.rule("name-bindings-to-match-parameters-extra")
