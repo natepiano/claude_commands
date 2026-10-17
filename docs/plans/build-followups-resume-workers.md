@@ -31,59 +31,24 @@
 
 ### Phase 1 — A moved unit director resumes its Codex workers  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** after any shutdown stop and restart of a unit director (an account move included), every Codex seat it held is followable on the same thread, and the restarted director receives one message naming each seat with the exact command that resumes it and the instruction to resume, never open a new seat.
-
-**Spec:**
-
-*Seats survive the stop:*
-1. `codex_mesh.py stop --pause --session-dir <D>`: for each roster entry whose status is not `ended`, drop its queued messages and interrupt its live turn (as `command_end` does, without the end marker), then set its status to a new followable `paused` with `paused_from: <previous status>` and `paused_turn: true|false` (a turn was live). Then stop the server exactly as plain `stop` does. Plain `stop` (run end) is unchanged and still marks every seat `ended`. `sweep --stop` (run from `remove_workers.py` and `prepare_session.sh`) never ends a `paused` seat: only run end's plain `stop` does.
-2. `paused` joins `FOLLOWABLE_STATES`; `_claim_follow` and `_follow_refusal` accept it. A follow on a paused seat clears `paused_from` / `paused_turn`.
-3. `stop.py` stops a session's Codex work with `stop --pause` on every run dir and no longer calls `end` on busy workers.
-4. `codex_mesh.py reopen --session-dir <D> --to <seat>` recovers a seat an earlier move already ended (fps's `tool-based-ui-frame-time-impl`, herdr-trial's seat): when the entry is `ended`, has a `thread_id`, and its `launcher_pid` is absent or dead, remove its end marker and set it `paused` (`paused_from: "ended"`, `paused_turn: false`). Print `reopened <seat>; send its next turn with --to <seat>`. It also takes a seat left `running` or `starting` by a launcher a move killed (launcher dead, no live server on its port), the same way (`paused_from: <that status>`, `paused_turn: true`). Refuse with one stderr line and exit 2 when the thread id is missing or a launcher is alive. A follow on it then resumes the recorded thread on a new server.
-5. A launcher killed mid-turn (by a move or stop) leaves no stale refusal. `implement.sh`'s claim step today clears a dead claim pid but refuses `already implementing` when `impl_status_<slot>` reads `implementing` and the claim file is missing (cables hit this after its move). Treat a missing claim exactly like a dead one, unless the roster entry's `launcher_pid` is alive: write `error` to the status file and continue. `review.sh` gets the same rule if it has the same check.
-6. Every one of these, and fps's `--to` refusal on an `ended` seat, is covered by one command the restart message can give: after `stop --pause` (or `reopen` for a seat ended before this change), `implement.sh --to <seat>` / `review.sh --to <seat>` follows the seat on its recorded thread with no hand edits.
-
-*The stop records how to resume:*
-7. Before pausing, the stop records, per non-ended seat: `run_dir`, `seat`, `role`, `thread_id`, `turn_live: bool`, and for a seat with a live launcher, the launcher's command line (`implement.sh` or `review.sh`, the nearest ancestor of the roster's `launcher_pid` whose argv names one of them). It stores them on the session's `SessionShutdown` as `codex_seats: list[PausedSeat]` (`TypedDict`; old records read `[]`).
-8. For a seat with `turn_live`, write `<run_dir>/<seat>.resume-prompt.md`: "You were paused when your unit director stopped for an account move or restart. Continue the task you were on from where you stopped; your earlier instructions still hold." Its resume command is the recorded launcher command with `--to <seat>` added when absent and its prompt-file argument replaced by that file. A seat that was idle, or whose launcher command could not be read, has the resume command `implement.sh --to <seat>` (or `review.sh --to <seat>` for a review role) named as the form, with the director supplying its usual arguments.
-
-*The restart sends it:*
-9. After a restarted unit director's session is confirmed back (move or plain restart), `restart.py` sends it one message with `send.py --to session:<id> --from shutdown --key resume-workers-<session id>`. First line: `Resume your Codex workers; do not open new ones.` Then one line per seat: `<seat> (<role>, <was working | idle>): <exact command>`, run from `<working dir>`. Last line: `Each seat continues its own thread; after resuming, send later work with --to as usual.` No seats → no message. A failed send writes one line to the restart's own log and never fails the restart. The message also stays for `send.py pending`, which the opening prompt already tells the director to run first.
-10. `account_move_note` adds one sentence when `codex_seats` is non-empty: `Your Codex workers are paused, not ended; a message lists the command that resumes each.`
-
-*Docs:*
-11. `docs/as-built/shutdown-and-restart.md`: stopping pauses seats, the record's `codex_seats`, the restart message. `commands/unit/direct.md` <PauseForMove/> (per `commands/succinct_style.md`): on resume after a move, run the commands in the shutdown message before any dispatch; never open a new seat for a role a paused seat holds.
+- `codex_mesh.py stop --pause --session-dir <D>` drops queued messages, interrupts live turns and sets every non-ended seat to the followable status `paused` with `paused_from` and `paused_turn`; a late launcher completion cannot overwrite the pause. Plain `stop` (run end) still ends every seat, and `sweep --stop` leaves a paused seat paused. `FOLLOWABLE_STATES` is `("done", "failed", "paused")`; a follow clears the pause fields and resumes the recorded thread on a new server.
+- `codex_mesh.py reopen --session-dir <D> --to <seat>` turns an `ended` seat, or a `running`/`starting` seat whose launcher is dead and whose server is gone, back into `paused` on its recorded thread. It refuses (exit 2, one stderr line) when the thread id is missing or a launcher is alive.
+- `implement.sh` treats an `implementing` status with no claim file and no live roster launcher like a dead claim: it writes `error` and continues.
+- The launcher re-reads the account-move marker after an idle answer, so a turn a move interrupts between the marker read and the idle check resumes on the same thread instead of ending the worker.
+- `stop.py` pauses each run dir with `stop --pause` and calls no `end`. Before signalling it records `SessionShutdown.codex_seats: list[PausedSeat]` (`run_dir`, `seat`, `role`, `thread_id`, `turn_live`, `launcher_command`, the nearest live `implement.sh`/`review.sh` ancestor's argv, empty when unreadable; old records read `[]`) and writes `<run_dir>/<seat>.resume-prompt.md` for every seat: continue the earlier task when working, reply ready and wait when idle.
+- After any confirmed session with recorded seats comes back (unit director or standalone run), `restart.py` sends one `send.py --to session:<id> --from shutdown --key resume-workers-<session id>` message: `Resume your Codex workers; do not open new ones.`, one line per seat with a complete paste-and-run command, then `Each seat continues its own thread; after resuming, send later work with --to as usual.` A working seat with a complete recorded argv keeps its task arguments with the resume prompt swapped in and `--to` set; any other seat gets a full `implement.sh --to` (or `review.sh --to` for a review role) built from its role. A failed send logs one line and never fails the restart. `account_move_note` adds `Your Codex workers are paused, not ended; a message lists the command that resumes each.` when seats are recorded.
+- `shutdown.py restart` skips a local session whose unchanged not-back failure was already pushed, and marks the ones it pushes.
+- Live check: a probe session holding a real Codex seat moved between accounts; the seat paused, the resume message arrived, and its command resumed the same thread.
 
 **Files:**
-- `scripts/agents/codex_mesh.py`
-- `scripts/delegate/implement.sh`
-- `scripts/delegate/review.sh`
-- `scripts/shutdown/stop.py`
-- `scripts/shutdown/inventory.py`
-- `scripts/shutdown/record.py`
-- `scripts/shutdown/session_types.py`
-- `scripts/shutdown/restart.py`
-- `docs/as-built/shutdown-and-restart.md`
-- `commands/unit/direct.md`
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/delegate/test_implement_launcher.py`
-- `scripts/delegate/test_review_launcher.py`
-- `scripts/shutdown/test_stop.py`
-- `scripts/shutdown/test_restart.py`
-- `scripts/shutdown/test_inventory.py`
-- `scripts/shutdown/test_account_move.py`
-- `scripts/shutdown/test_support.py`
-
-**Workers:** 1 writer + 1 tester
-- `impl` (impl): `scripts/agents/codex_mesh.py`, `scripts/delegate/{implement,review}.sh`, `scripts/shutdown/{stop,inventory,record,session_types,restart}.py`, `docs/as-built/shutdown-and-restart.md`, `commands/unit/direct.md`; hub file `scripts/shutdown/record.py` (the `PausedSeat` type).
-- `test` (test): `scripts/agents/test_codex_mesh.py`, `scripts/delegate/test_implement_launcher.py`, `scripts/delegate/test_review_launcher.py`, `scripts/shutdown/test_{stop,restart,inventory,account_move}.py`, `scripts/shutdown/test_support.py`.
-
-**Tests:**
-- codex_mesh: `stop --pause` on a roster with `done`, `running` (fake server) and `ended` entries leaves the first two `paused` with the right `paused_from` / `paused_turn`, the third `ended`; plain `stop` still ends all; `can-follow` accepts a paused seat; `reopen` turns an ended seat, and a `running` seat with a dead launcher and no server, each with a thread, into `paused`; `sweep --stop` leaves a paused seat paused; and refuses one with a live launcher or no thread; a follow clears the pause fields.
-- launchers: `implement.sh --to` on a slot whose status reads `implementing` with no claim file and a dead roster launcher continues (status becomes `error` first); with a live roster launcher it still refuses; same for `review.sh` if it has the check.
-- stop: a stopped session with a busy and an idle seat calls `stop --pause` per run dir and no `end`; its record holds both seats with their launcher command or none.
-- restart: a confirmed unit restart with two recorded seats sends exactly one message to `session:<id>` with both command lines (one rebuilt from a recorded `implement.sh` argv with `--to` and the resume prompt swapped in); zero seats sends none; a failed send leaves the restart's outcome unchanged; an old record without `codex_seats` parses.
-
-**Live check (unit director, after install):** start a probe unit session with `accounts.py exec --probe claude2 -n resume-probe` outside any worktree and a scratch run dir holding one real Codex seat started on a two-line task. Move the probe to claude3 with the shutdown tool (`--only resume-probe --here --no-alert`). Confirm the message arrives in the probe with the seat's command, run it, and confirm the seat answers on the same `thread_id`. Also `reopen` one real seat a past move ended (ask fps or herdr-trial which) and confirm its next `--to` turn runs on its old thread. End the seat and the probe afterwards.
+- `scripts/agents/codex_mesh.py` — `paused` status, `stop --pause`, `reopen`, account-move marker re-read
+- `scripts/delegate/implement.sh` — stale `implementing` claim cleared
+- `scripts/shutdown/stop.py` — pause per run dir, seat record, resume prompts
+- `scripts/shutdown/inventory.py` — seat and launcher argv collection
+- `scripts/shutdown/record.py` — `PausedSeat`, `SessionShutdown.codex_seats`
+- `scripts/shutdown/restart.py` — resume-workers message, `account_move_note` sentence, no repeat push
+- `scripts/shutdown/settle.py` — not-back push text
+- `commands/unit/direct.md` — <PauseForMove/>: run the shutdown message's resume commands before any dispatch; never open a new seat for a role a paused seat holds
+- `docs/as-built/shutdown-and-restart.md` — stopping, restart and resume message
