@@ -62,7 +62,7 @@ against the union of one-rule findings using the same model.
 
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
-| modules | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by modules-unit |
+| modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
 | names | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by names-unit |
 | types | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by types-unit |
 
@@ -273,6 +273,16 @@ Pending: parent's saved style child summary and rendered style line.
   recorded start otherwise (no style branch, unresolvable, or unrelated
   history). The ledger's recorded base is unchanged, and the ticket's own edits
   are still judged.
+- **Fix K — the parent's hand-off merge records itself in the style ledger** (commit `b5bf8336`):
+  hand-offs `8d6e25d1` (merged as `28db0785`) and `f091ed48` (merged as
+  `ac95d94d`) both left their handoffs rows `sent` with no merge commit. The
+  row became merged only when the style showrunner acted on the parent's
+  acknowledgment message. The first acknowledgment reached a stale session, and
+  the second has no delivery record. The parent's merge now runs
+  `style_ledger.py handoff merged` with the merge commit before it
+  acknowledges, both on the fresh merge and on a repeated notice. The
+  acknowledgment is now a notice only. A ledger failure prints one `hand-off
+  ledger:` line, and the merge and acknowledgment still go through.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`.
