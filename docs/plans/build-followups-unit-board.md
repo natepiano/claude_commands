@@ -143,31 +143,23 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 **Ruled out:** a scratch HOME for the live check (refused as credential exploration); a watcher process or timer outside the mod.
 
 ### Phase 5 — Shorter terminal report  · status: done
-**Depends on:** 4
 
-#### Work Order
+#### As-built
 
-**Goal:** `/unit:report` and its notifier ticks print a short text report — phase and stage, one ETA line, the workers, the summary — and the two recorder tables only on `/unit:report tables`.
-
-**Spec:**
-- The ETA line, printed by `progress_history.py progress` and by `_print_last_recorded`: `ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)`; on its first ETA `ETA 16:10 (on its first ETA, 1 fix round)`; gated `gated until Wed 22 Oct 11:47` or `gated by G3: <Waits on>`. From the phase record and chain of Phase "Predictions chain from the stated ETA" and the `fix_done`/`fix_running` split of Phase "Board data": `ETA` is the latest promise, never the schedule end an overdue phase is advanced to; an overdue phase reads `ETA 18:30 (passed, first 17:15, …)`.
-- The clocks table and round table (`_summary_table`, `_phase_section`) print only with a new `progress --tables` flag; `commands/unit/report.md` passes it only for `/unit:report tables`.
-- **Report inputs stay.** `_phase_section` also supplies the worker narration and stage the report's worker table is built from. Without `--tables`, `progress` still prints the stage line and the workers (slot, role, state, model, what each is doing), from the same sources as today, so `commands/unit/report.md` can build its worker table with the tables hidden.
-- `commands/unit/report.md`: the report's sections become phase and stage, the ETA line, the worker table, the summary sentences, and one line naming `/unit-board` as the place to see the board.
-- The vault note keeps the full phase list.
+- `progress` (and `_print_last_recorded` between windows) prints the short report by default: the phase heading, one ETA line from `_phase_eta_line`, the stage line and one `- **Agent N**` line per worker (slot, role, elapsed, state, model, last board line). The ETA line forms are `ETA HH:MM (first HH:MM, +H:MM, moved N×, …)`, `ETA HH:MM (on its first ETA, …)`, a leading `passed` when an open phase is overdue, fix rounds as `N fix rounds`, `+ 1 running` or `1 fix round running`, `gated until Wed 22 Oct 11:47`, `gated by <gate>: <Waits on>`, and `ETA unavailable` when no plan, state, row or promise exists. A promise on another local day shows weekday and date.
+- `ETA` is the latest promise in `eta_trail`, never the schedule end an overdue phase is advanced to, and the line reads only the reported phase's own row and gate.
+- Worker lines come from `_current_worker_windows` / `_current_worker_cells`: per slot, the live window, else the most recent finished one, independent of the director's own activity.
+- `progress --tables` adds the clocks table (`_summary_table`) and the round table, `Earlier:` and verification gate lines; `/unit:report tables` passes it, ordinary reports and notifier ticks do not.
+- The legacy (non-dual) layout keeps its old form plus one ETA line after the phase line. The vault phase note keeps the full phase list.
+- `/unit:report` sections run phase and stage, ETA line, worker table, summary sentences, `See /unit-board for the board.`; `/unit:direct`'s `<DelegationResultFormat/>` closes every result and launch with this short report.
 
 **Files:**
-- `scripts/delegate/progress_history.py` — the ETA line and `progress --tables`.
-- `scripts/delegate/test_progress_history.py` — the line forms and the tables flag.
-- `commands/unit/report.md` — tables only on request; names `/unit-board`.
+- `scripts/delegate/progress_history.py` — `_phase_eta_line`, `_current_worker_windows`, `_current_worker_cells`, `_phase_section(tables=…)`, `_print_last_recorded(tables=…)`, `progress --tables`.
+- `scripts/delegate/test_progress_history.py` — ETA line forms, worker lines, the tables flag, between-window output.
+- `commands/unit/report.md` — short report contract; tables only on `tables`; names `/unit-board`.
+- `commands/unit/direct.md` — `<DelegationResultFormat/>` closes with the short report.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `progress_history.py`, `commands/unit/report.md`; hub: `scripts/delegate/progress_history.py`.
-- `test` — `progress` prints the ETA line forms above, the stage and worker lines, and no tables; `progress --tables` prints both tables as before; between windows (`_print_last_recorded`) the same short form prints; an activity still open after its phase finished still shows as the stage; an overdue unchanged promise prints `passed`, never a new time.
-
-**Constraints from prior phases:** the phase record (`first_eta`, `moves`, `eta_trail`, `delta_minutes`, `fix_done`, `fix_running`) and the gate text come from `phase_table` (`build_plan`, gates `NoGate`/`TimedGate`/`UntimedGate`); plan readers from `plan_history`, and tests patch `plan_history.now_epoch`. An overdue open phase's `StatedEta.time` is the schedule end, not a promise; `OpenPhase.schedule_end` holds the chain's end for the open phase, also from a duration estimate, and `OpenPhase.instance_id` names the open instance. `PhaseHistory.fix_running` is 0 or 1, `fix_open_passes` counts open fix passes, and `fix_rounds` is `fix_done + fix_open_passes`. The board command is `/unit-board`.
-
-**Acceptance gate:** the Test and Lint lines of Delegation Context green.
+**Gotchas:** taking worker cells from the round table's last row blanks them once the director opens an activity; reading the next gated phase instead of the reported one gives the wrong ETA line.
 
 ### Phase 6 — Accounts view  · status: done
 
