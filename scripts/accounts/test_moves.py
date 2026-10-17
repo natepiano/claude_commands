@@ -246,6 +246,19 @@ class MoveJournalTests(unittest.TestCase):
         moves.append_move(requested)
         self.assertEqual(moves.read_moves(), [requested])
 
+    def test_automatic_requests_preserve_rule_reason_and_cause_alongside_older_causes(self) -> None:
+        legacy = self.requested()
+        _ = legacy.pop("cause")
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(legacy) + "\n")
+        automatic = cast(moves.RequestedMove, cast(object, {
+            **self.requested(), "move_id": "automatic-transition", "cause": "auto", "why": "auto: units-low"}))
+        moves.append_move(automatic)
+        self.assertEqual([(entry.get("cause"), entry.get("why")) for entry in moves.read_moves()],
+                         [("refusal", "quota refusal"), ("auto", "auto: units-low")])
+        self.assertEqual(json.loads(path.read_text().splitlines()[1])["cause"], "auto")
+
     def test_invalid_move_cause_is_refused_by_writer_and_skipped_by_reader(self) -> None:
         valid = self.requested()
         moves.append_move(valid)

@@ -669,7 +669,7 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(watch.call_count, 1)
             self.assertEqual(watch.call_args.args[0], [workers_report])
 
-    def test_failed_selected_codex_read_preserves_activity_and_alert_acknowledgement(self) -> None:
+    def test_failed_selected_codex_read_preserves_activity_and_alert_episode(self) -> None:
         default = self.root / ".codex"
         selected = self.root / ".codex1"
         self.codex_login(default, "spare@example.com")
@@ -681,7 +681,7 @@ class AgentNotesTests(unittest.TestCase):
         self.select_workers("codex1")
         _ = agent_notes.write_note(workers, {"role": ("worker",)}, stamp={"date_modified": "fixture"})
         stamp = self.now.isoformat(timespec="seconds")
-        episode: quota_alert.Episode = {"since": stamp, "acknowledged": stamp, "last": {}}
+        episode: quota_alert.Episode = {"since": stamp, "last": {}}
         state: quota_alert.State = {"episodes": {"codex1": episode.copy()},
                                     "fallback": quota_alert.NoCodexQuotaFallback()}
         workers_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))

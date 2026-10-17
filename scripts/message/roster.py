@@ -9,7 +9,6 @@ import io
 import json
 import os
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -666,10 +665,10 @@ def _production_rows(
     return [row for row in production_units.unit_table(lines) if not production_units.unit_is_retired(row, marks)]
 
 
-def _every_marked_unit(*, include_tmux: bool) -> unit_lookup.MarkedProductions | OSError:
+def _every_marked_unit() -> unit_lookup.MarkedProductions | OSError:
     """Every production's marked units, or why the included hosts could not answer."""
     try:
-        return unit_lookup.every_marked_unit(include_tmux=include_tmux)
+        return unit_lookup.every_marked_unit()
     except OSError as error:
         return error
 
@@ -682,9 +681,8 @@ def _production_places(
 ) -> dict[str, _ProductionPlace]:
     addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
     places: dict[str, _ProductionPlace] = {}
-    has_tmux = shutil.which(os.environ.get("UNIT_LOOKUP_TMUX") or "tmux") is not None
     # One read of every production's marks serves every showrunner below.
-    every = _every_marked_unit(include_tmux=has_tmux) if registered else unit_lookup.MarkedProductions({}, {})
+    every = _every_marked_unit() if registered else unit_lookup.MarkedProductions({}, {})
     for runner in registered:
         doc = Path(runner["doc"])
         runner_address = addresses.get(runner["slug"], "")
@@ -714,11 +712,7 @@ def _production_places(
                     continue
                 # A socketless director is still identified by its marked pane.
                 for record in records:
-                    same_place = (
-                        record["tmux"].rpartition(".")[2] == marked.place.pane
-                        if isinstance(marked.place, unit_lookup.TmuxPlace)
-                        else herdr.herdr_place_of(record["pid"]) == marked.place
-                    )
+                    same_place = herdr.herdr_place_of(record["pid"]) == marked.place
                     if record["sessionId"] not in ledger_workers and same_place:
                         _ = places.setdefault(record["sessionId"], place)
                         break

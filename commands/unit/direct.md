@@ -161,7 +161,7 @@ that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/
 in full at <PrepareSession/> and after every compaction, and apply it
 throughout. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
-  branch into this branch;
+  branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
 - it runs independent phases in parallel, mapped at plan start and at each
@@ -373,13 +373,15 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex workers running: the mover ends them with this session.
+   Leave Codex workers running: the mover pauses them with this session.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.
 
 The session is resumed with that line, on the account the message names; continue
-from it. A forced stop without this message is a separate command the user gives.
+from it. Before any dispatch, run the resume commands in the shutdown message;
+never open a new seat for a role a paused seat holds. A forced stop without this
+message is a separate command the user gives.
 </PauseForMove>
 
 <CompactionContract>
@@ -584,6 +586,14 @@ launcher writes its files to that phase's `${PHASE_DIR}`.
 </PassOwnership>
 
 <ProgressContract>
+Before stating any ETA in a message, reply or notice, record it with
+`progress_history.py eta --session-dir "${SESSION_DIR}" --time <HH:MM> --basis stated`
+(`--basis checkpoint` for checkpoint notices, `--basis eta-command` for
+`/unit:eta` and `/unit:eta_breakdown`). Add `--phase-id <id>` when it names a
+phase other than the active one. `<HH:MM>` means today in the user's zone; an
+ETA on a later day takes `<YYYY-MM-DDTHH:MM>`. State the time the recorder
+printed.
+
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
 The key sets the Codex poll timeout and a Claude unit's notifier interval.
@@ -1056,19 +1066,14 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-**Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
-current pass or activity. This is unconditional: the numbered items say what
-happened, and the tables say how far into the phase and the plan it happened,
-which is the half the user cannot reconstruct. Emit it after any launch,
-printed below the sections above exactly as the recorder emits it. With the
-phase active and no pass or activity open, the recorder prints the same tables
-from the phase's last recorded values under an `as of` line: paste them like any
-tick. When the last phase is closed but an activity is still open, the recorder
-prints both tables from that phase's last recorded values with the activity as
-the running row: paste them like any tick. `No active phase to report` remains
-only when no phase is active and no activity is open; then continue without the
-tables rather than stalling the turn.
+**Close every delegation result and launch with the short progress report**
+from <ProgressReport/>: phase and stage, ETA line, workers, summary, board link,
+and wall clock. Copy the recorder's phase, stage, ETA and clock exactly. Include
+both recorder tables only for `/unit:report tables`.
+
+Between windows, keep the recorder's `as of` and no-open-window lines. An
+activity still open after its phase closes remains the stage. If the recorder
+reports `No active phase to report`, continue without the progress report.
 </DelegationResultFormat>
 
 <FixDispatch>

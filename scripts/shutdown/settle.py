@@ -22,12 +22,13 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
+for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import Account
 import conversation_pause
 import detached
+import herdr
 import note_file
 from inventory import Inventory, Session, inventory
 from launch_permission import shutdown_state_root
@@ -35,8 +36,8 @@ import record as store
 from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunner_footer
-import sessions
 import showrunners
+import sessions
 import stop as stop_work
 from user_zone import user_zone
 from scripts.accounts.accounts import HAND_ORIGIN
@@ -136,7 +137,7 @@ class ScreenText:
 
 @dataclass(frozen=True)
 class ScreenUnreadable:
-    reason: Literal["no pane host", "no pane id", "capture failed"]
+    reason: Literal["no pane host", "no pane id", "capture failed", "session registry identity changed"]
 
 
 @dataclass(frozen=True)
@@ -484,37 +485,25 @@ def blocker(session: Session) -> ReadinessCheck:
     return {"kind": "clear"}
 
 def _screen(session: Session) -> ScreenText | ScreenUnreadable:
+    from session_pane import read_place
+    from herdr import HerdrFailure, HerdrPlace
+
     host = session["host"]
     if host["kind"] == "herdr":
-        from session_pane import read_place
-        from herdr import HerdrFailure, HerdrPlace
-
-        try:
-            return ScreenText(read_place(HerdrPlace(host["herdr_session"], host["pane_id"]), 60))
-        except HerdrFailure:
-            return ScreenUnreadable("capture failed")
-    if host["kind"] != "tmux" and host["kind"] != "unit":
+        place = HerdrPlace(host["herdr_session"], host["pane_id"])
+    elif host["kind"] == "unit":
+        registered = sessions.read_session(sessions.sessions_dir() / f"{session['pid']}.json")
+        if isinstance(registered, sessions.UnreadableSessionRecord) or registered["sessionId"] != session["session_id"]:
+            return ScreenUnreadable("session registry identity changed")
+        place = herdr.herdr_place_of(session["pid"])
+        if not isinstance(place, HerdrPlace):
+            return ScreenUnreadable("no pane id")
+    else:
         return ScreenUnreadable("no pane host")
-    entry = sessions.read_session(sessions.sessions_dir() / f"{session['pid']}.json")
-    if isinstance(entry, sessions.UnreadableSessionRecord) or entry["sessionId"] != session["session_id"]:
-        return ScreenUnreadable("no pane id")
-    pane_id = entry["tmux"].rsplit(".", 1)[-1]
-    if re.fullmatch(r"%[0-9]+", pane_id) is None or "." not in entry["tmux"]:
-        return ScreenUnreadable("no pane id")
-    tmux = os.environ.get("SHUTDOWN_TMUX", "tmux")
     try:
-        result = subprocess.run(
-            [tmux, "capture-pane", "-p", "-t", pane_id],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        return ScreenText(read_place(place, 60))
+    except HerdrFailure:
         return ScreenUnreadable("capture failed")
-    if result.returncode != 0:
-        return ScreenUnreadable("capture failed")
-    return ScreenText(result.stdout)
 
 
 def _showing_form(session: Session) -> bool:
@@ -729,6 +718,9 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
     else:
         message = ""
     lines = [f"  {record['session']['name']}: {progress}{message}"]
+    if record["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(record):
+        from restart import legacy_resume_command
+        lines.append(f"    manual restart: {legacy_resume_command(record)}")
     for step in record.get("trail", []):
         at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
         lines.append(f"    {at} {step['kind']} {located_detail(record, step['detail'])}".rstrip())
@@ -1002,6 +994,9 @@ def stop_issue_text(issue: SessionStopIssue) -> str:
             return "not stopped: account unreadable"
         case "codex server left running":
             return f"Codex server {issue['run_dir']} left running: {issue['cause']}"
+        case "legacy tmux session left running":
+            command = shlex.join(["tmux", "kill-session", "-t", "=" + issue["session_name"]])
+            return f"legacy tmux session {issue['session_name']} left running: {issue['cause']}; {command}"
         case "unit session left running":
             return f"{issue['host']} session {issue['session_name']} left running: {issue['cause']}"
 
@@ -1125,7 +1120,17 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     for saved in records:
         if ids and saved["session"]["session_id"] not in ids:
             continue
-        if not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"} and not store.stop_incomplete(saved):
+        if (not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"}
+                and not store.stop_incomplete(saved)
+                and saved["session"]["host"]["kind"] not in {"legacy tmux", "legacy tmux unit"}
+                and not store.legacy_tmux_leftovers(saved)):
+            continue
+        if saved["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(saved):
+            from restart import legacy_resume_command
+            print(f"manual restart {saved['session']['name']}: {legacy_resume_command(saved)}")
+            for issue in store.legacy_tmux_leftovers(saved):
+                print(f"  {stop_issue_text(issue)}")
+            refused = True
             continue
         forced = False
         def force(current: SessionShutdown) -> None:
@@ -1303,6 +1308,11 @@ def _done(saved: SessionShutdown) -> bool:
         progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop")
 
 
+def shutdown_in_progress(saved: SessionShutdown) -> bool:
+    """Exclude retained terminal outcomes from current shutdown work."""
+    return not _done(saved)
+
+
 def _action_failed(saved: SessionShutdown, error: Exception, *, stopping: bool) -> None:
     reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
     if not stopping:
@@ -1332,12 +1342,14 @@ def report_stop(records: list[SessionShutdown]) -> None:
     records = checked.remaining + checked.finished
     first = records[0]
     status, output = run_remote(["records", "--json", "--here"])
+    request_ids = {saved["request_id"] for saved in records}
     lines = [f"{saved['machine']} {saved['session']['name']}: {saved['progress']['kind']}" for saved in records]
     if status == 0:
         try:
             peer = store.parse_session_records(output)
             lines.extend(f"{saved['machine']} {saved['session']['name']}: {saved['progress']['kind']}"
-                         for saved in peer if saved["login"].casefold() == first["login"].casefold())
+                         for saved in peer if saved["login"].casefold() == first["login"].casefold()
+                         and saved["request_id"] in request_ids)
         except store.InvalidRecord:
             lines.append(f"{other_machine()}: shutdown state unreadable")
     else:
@@ -1557,9 +1569,8 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
 
 def _holdout_host(saved: SessionShutdown) -> str:
     host = saved["session"]["host"]
-    if host["kind"] == "tmux":
-        pane = host["pane"]
-        return f"tmux {host['tmux_session']}" + (f" pane {pane['pane_id']}" if pane["kind"] == "pane" else " pane")
+    if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
+        return f"legacy host {host['session_name']}; manual recovery required"
     if host["kind"] == "unit":
         return f"unit {host['production']}/{host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":
@@ -1729,14 +1740,22 @@ def conduct(login: str) -> int:
     fingerprint = _module_fingerprint()
     for line in store.migrate(login):
         print(line)
+    session_kind = herdr.security_session()
     archived: dict[str, SessionShutdown] = {}
+    handled_requests: set[str] = set()
     while True:
         with store.conductor_lock(login) as ownership:
             if isinstance(ownership, store.ConductorAlreadyRunning):
                 return 0
             archived.update(_read_conduct_archive(login))
-            outcome = _conduct_owned(login, archived, fingerprint)
+            handled_requests.update(saved["request_id"] for saved in archived.values())
+            handled_requests.update(saved["request_id"] for saved in store.session_records(login) if not _done(saved))
+            outcome = _conduct_owned(login, archived, fingerprint, session_kind, handled_requests)
+            handled_requests.update(saved["request_id"] for saved in archived.values())
             if isinstance(outcome, _ReloadRequested):
+                archived.update({saved["session"]["session_id"]: saved
+                                 for saved in store.session_records(login)
+                                 if saved["request_id"] in handled_requests and _done(saved)})
                 _write_conduct_archive(login, archived)
         if isinstance(outcome, _ReloadRequested):
             os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
@@ -1744,12 +1763,13 @@ def conduct(login: str) -> int:
         if any(not _done(saved) for saved in records):
             continue
         outcomes = {**archived, **{saved["session"]["session_id"]: saved for saved in records}}
-        report_stop(list(outcomes.values()))
+        report_stop([saved for saved in outcomes.values() if saved["request_id"] in handled_requests])
         return 0
 
 
 def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
-                   fingerprint: _ModuleFingerprint) -> _ConductorFinished | _ReloadRequested:
+                   fingerprint: _ModuleFingerprint, session_kind: herdr.SecuritySession,
+                   handled_requests: set[str]) -> _ConductorFinished | _ReloadRequested:
     """Advance one locked account while long actions run independently."""
     import restart as restart_work
 
@@ -1757,7 +1777,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
         if _archive_finished(saved):
             archived[saved["session"]["session_id"]] = saved
 
-    desktop = restart_work.DesktopLaunchState()
+    desktop = restart_work.DesktopLaunchState(session_kind=session_kind)
     pending: dict[str, PendingSessionAction] = {}
     confirmations: list[PendingRegistryConfirmation] = []
     launched: list[SessionShutdown] = []
@@ -1853,6 +1873,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                             print(f"shutdown notification failed: {error}", file=sys.stderr)
 
                 records = store.session_records(login)
+                handled_requests.update(saved["request_id"] for saved in records if not _done(saved))
                 _clear_finished_hold(login, archived)
                 drained = not pending and not confirmations and not launched and not messages and not sends
                 if drained and (isinstance(reload_state, _ReloadRequested) or not records or all(_done(saved) for saved in records)):
