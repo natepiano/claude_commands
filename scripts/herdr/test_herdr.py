@@ -1960,16 +1960,6 @@ class HerdrTests(unittest.TestCase):
         unreadable.joinpath("environ").mkdir()
         self.assertEqual(herdr.herdr_processes(), [herdr.HerdrProcess(12, herdr.HerdrPlace("fixture", "pane-1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "claude", str(self.root))])
 
-    def test_marks_a_server_inherited_from_its_shell_are_not_the_pane_marks(self) -> None:
-        marks = {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}
-        server = self.process(10, 1, ["/fixture/herdr", "--session", "probe", "server"], marks)
-        self.unix_socket(self.root / "config/herdr/sessions/probe/herdr.sock", 100)
-        self.socket_fd(server, 100)
-        _ = self.process(12, 10, ["/bin/zsh"], {"HERDR_PANE_ID": "pane-1", **marks})
-        _ = self.process(13, 10, ["/bin/claude"], {"HERDR_PANE_ID": "pane-2", "SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "other"})
-        self.assertEqual({process.pid: process.marks for process in herdr.herdr_processes()},
-                         {12: {}, 13: {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "other"}})
-
     def test_ancestry_loop_and_vanished_cwd_are_skipped(self) -> None:
         _ = self.process(10, 11, ["/bin/sh"], {"HERDR_PANE_ID": "pane-1"})
         _ = self.process(11, 10, ["/bin/sh"], {})

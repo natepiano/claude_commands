@@ -1819,16 +1819,7 @@ def herdr_processes() -> list[HerdrProcess]:
         candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return processes
-    servers = _live_server_processes(candidates)
-    sessions = _process_sessions(candidates, servers)
-    # A server started from a marked shell hands that shell's marks to every pane; they name the shell's unit, not this one.
-    inherited: dict[str, dict[str, str]] = {}
-    for server_pid, server_session in servers.items():
-        try:
-            server_environment = _process_environment(_proc_root() / str(server_pid))
-        except (OSError, ValueError):
-            continue
-        inherited[server_session] = {key: server_environment[key] for key in MARK_KEYS if key in server_environment}
+    sessions = _process_sessions(candidates, _live_server_processes(candidates))
     for pid, session in sessions.items():
         process = _proc_root() / str(pid)
         try:
@@ -1843,8 +1834,6 @@ def herdr_processes() -> list[HerdrProcess]:
                 continue
             cwd = str(process.joinpath("cwd").resolve(strict=True))
             marks = {key: environment[key] for key in MARK_KEYS if key in environment}
-            if marks and marks == inherited.get(session):
-                marks = {}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue
