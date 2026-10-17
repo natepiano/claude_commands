@@ -394,6 +394,17 @@ class UnitRenameTests(unittest.TestCase):
         self.mark_live("gamma-unit", "sid-gamma")
         self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
 
+    def test_an_older_run_keeps_the_old_path_as_history(self) -> None:
+        old = self.rust / "claude-demo-alpha"
+        older = self.root / "history/runs/run-0.jsonl"
+        self.write(older, json.dumps({"event_type": "run_started", "run_started_at": 0, "working_dir": str(old)})
+                   + "\n" + json.dumps({"event_type": "run_finished"}) + "\n")
+        self.assert_ok(self.rename("apply"))
+        self.assertIn(str(old), older.read_text())
+        newest = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
+        self.assertEqual(newest["working_dir"], str(self.rust / "claude-demo-gamma"))
+        self.assert_ok(self.rename("verify"))
+
     def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
         for name in ("demo-log.md", "demo-log-recovered.md"):
             self.write(self.checkout / "docs/plans" / name, "alpha-unit merged phase 2\n")
