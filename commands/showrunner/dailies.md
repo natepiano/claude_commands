@@ -311,7 +311,14 @@ unless it names another plan's document. User, 2026-10-02.
   in their own lists and are printed nowhere here. A production that has saved
   no report reads `?  no report yet`. A row from `expand` is
   `<child>/<row>`, with no plan bar. The label column widens to the longest
-  name. A showrunner with nothing below it gets none of this.
+  name. A style production's row is followed by one line from the summary its
+  saved report carries (`style_ledger.py summary`): `<child>  rules done
+  <done>/<total> · cells <floor>% · stale <n> · proposals <n> · synced <time>`,
+  with `· unclassified <n> — pull nate_style` when rules are unclassified and
+  `· hand-off waiting <h>h` once its oldest hand-off has waited more than four
+  hours; `<child>  style summary unavailable: <reason>` when the summary could
+  not be read. A row from `expand` carries no style line. A showrunner with
+  nothing below it gets none of this.
 - **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude1: 40%; runs out about Tue 07:10 EDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
 - **Footer:** the reply footer (`/showrunner:produce` → Footer), from
   `next_run`, the build-holder files, the Mac block file, `OUTSTANDING` and whether

@@ -66,6 +66,15 @@ if name == "ps":
     raise SystemExit(0)
 if name == "suite-python":
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+if name == "style_sync.py":
+    import subprocess
+    args = sys.argv[1:]
+    repo = args[args.index("--repo-dir") + 1]
+    branch = args[args.index("--branch") + 1]
+    observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
+                              capture_output=True, text=True, check=True).stdout.split()[0]
+    (state / "notified-tip").write_text(observed)
+    raise SystemExit(1 if (state / "notify-fails").exists() else 0)
 raise SystemExit("unexpected tool: " + name)
 '''
 
@@ -187,6 +196,7 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
+            "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
         }
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         self.environment["PYTHONPATH"] = self.environment["MERGE_GATE_TEST_PYTHONPATH"]
@@ -211,7 +221,7 @@ class MergeGateTests(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "ssh", "ps", "suite-python"):
+        for name in ("basedpyright", "ssh", "ps", "suite-python", "style_sync.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -409,6 +419,9 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
+        notifications = [call["args"] for call in self.calls() if call["tool"] == "style_sync.py"]
+        self.assertEqual(notifications, [["notify", "--repo-dir", str(self.checkout), "--branch", "integration", "--tip", head]])
+        self.assertEqual((self.state / "notified-tip").read_text(), head)
         self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                          [head, self.base, self.checkpoint])
         message = self.git(self.checkout, "log", "-1", "--format=%B")
@@ -438,6 +451,44 @@ class MergeGateTests(unittest.TestCase):
             self.assertEqual(call["cwd"], str(self.checkout))
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_rejected_push_never_notifies_style(self) -> None:
+        self.write(self.origin / "hooks/pre-receive", "#!/bin/sh\nexit 1\n")
+        (self.origin / "hooks/pre-receive").chmod(0o755)
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_not_pushed()
+        self.assertFalse(any(call["tool"] == "style_sync.py" for call in self.calls()))
+
+    def test_style_notification_failure_keeps_the_green_merge_successful(self) -> None:
+        self.write(self.state / "notify-fails", "fail")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("style sync: exit 1", result.stdout)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
+
+    def test_notification_value_error_keeps_the_completed_merge_successful(self) -> None:
+        original_notify = merge_gate.notify_style
+
+        def malformed_notification(repo: Path, branch: str, tip: str) -> None:
+            with mock.patch("scripts.production.merge_gate.subprocess.run",
+                            side_effect=ValueError("invalid production")):
+                original_notify(repo, branch, tip)
+
+        arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
+                     "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
+                     "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
+                     "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+                     "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
+                     "--ssh", str(self.bin / "ssh")]
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+            merge_gate, "notify_style", side_effect=malformed_notification,
+        ), redirect_stdout(output):
+            code = merge_gate.main(arguments)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("style sync: invalid production", output.getvalue())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
 
     def test_memory_cap_admits_two_overlapping_module_processes(self) -> None:
         self.write(self.state / "barrier", "two")

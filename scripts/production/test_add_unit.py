@@ -1802,6 +1802,55 @@ class AddUnitTests(ShutdownTestCase):
         with patch.dict(os.environ, self.env):
             self.assertEqual(autocompact.recorded("session-compact"), "")
 
+    def set_unit_autocompact(self, value: str, *flags: str) -> subprocess.CompletedProcess[str]:
+        """A running unit's window, set as live: its row off the naming pattern and its plan since changed."""
+        prior = self.root / "prior-session"
+        prior.mkdir(exist_ok=True)
+        return self.successful("trunk", "--plan", "docs/plans/other.md", "--resume", "session-trunk",
+                               "--cwd", str(prior), "--autocompact", value, *flags)
+
+    def test_registered_unit_autocompact_records_without_new_work_checks(self) -> None:
+        _ = self.commit_row_off_the_naming_pattern()
+        before = self.repository_state()
+        result = self.set_unit_autocompact("200k")
+        self.assertEqual(result.stdout.strip(),
+                         "trunk-unit: auto-compact 200k applies to session session-trunk at its next restart")
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(autocompact.recorded("session-trunk"), "200k")
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_registered_unit_autocompact_auto_deletes_the_record(self) -> None:
+        _ = self.commit_row_off_the_naming_pattern()
+        with patch.dict(os.environ, self.env):
+            autocompact.record("session-trunk", "200k")
+        result = self.set_unit_autocompact("auto")
+        self.assertIn("the saved setting applies", result.stdout)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(autocompact.recorded("session-trunk"), "")
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_registered_unit_autocompact_check_writes_nothing(self) -> None:
+        _ = self.commit_row_off_the_naming_pattern()
+        before = self.repository_state()
+        result = self.set_unit_autocompact("300k", "--check")
+        self.assertEqual(result.stdout.strip(),
+                         "trunk-unit: auto-compact 300k would apply to session session-trunk at its next restart")
+        self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_registered_unit_autocompact_reaches_its_restore_launch(self) -> None:
+        worktree = self.commit_row_off_the_naming_pattern()
+        _ = self.set_unit_autocompact("200k")
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        _ = self.successful("trunk", "--plan", "docs/plans/given.md", "--resume", "session-trunk",
+                            "--cwd", str(worktree), "--restart-note", str(note), "--session-name", "trunk",
+                            "--host-session", "build-followups-trunk")
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--autocompact") + 1], "200k")
+
     def test_autocompact_refusals_launch_nothing_and_record_nothing(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()

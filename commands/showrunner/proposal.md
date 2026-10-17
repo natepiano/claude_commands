@@ -62,7 +62,12 @@ and replies with the plan path and phases. Then:
   (`trunk-unit`).
 
 The stage stays backlog until the work starts. A proposal the user declines
-closes through `/close_issue` with its reason.
+closes through `/close_issue` with its reason, except an issue tagged `style`:
+decline it only through the command below, never `/close_issue`.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_proposals.py decline --repo <style checkout> --issue <issue> --words '<the user’s words>'
+```
 
 ## Start and close
 

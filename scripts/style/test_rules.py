@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import rules
 import style_rules
 from candidate_generators import CandidatesSpecError, read_candidates_spec
@@ -263,6 +265,45 @@ class RuleTests(unittest.TestCase):
         self.assertEqual([rule.name for rule in loaded], ["clippy", "mend", "rustfmt"])
         self.assertEqual([rule.tier for rule in loaded], ["A", "A", "A"])
 
+    def test_global_tier_d_rule_rejects_the_types_family(self) -> None:
+        path = self.write_rule("structure", "tier: D\nfamily: types\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(None)
+
+        self.assertEqual(str(raised.exception), f"{path}: tier D requires the modules family")
+
+    def test_local_tier_d_rule_rejects_the_types_family(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "structure.md"
+        _ = path.write_text("---\ntier: D\nfamily: types\n---\n# Structure rule\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+
+        self.assertEqual(str(raised.exception), f"{path}: tier D requires the modules family")
+
+    def test_modules_family_loads_for_tiers_b_c_and_d_from_both_origins(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        for tier in ("B", "C", "D"):
+            metadata = f"tier: {tier}\nfamily: modules\n"
+            if tier == "B":
+                metadata += "pre_filter: item\n"
+            _ = self.write_rule(f"modules-{tier}", metadata)
+            _ = (local_dir / f"modules-{tier}.md").write_text(f"---\n{metadata}---\n# Modules rule\n")
+
+        loaded = rules.load_rules(repo)
+
+        self.assertEqual(
+            {(rule.origin, rule.tier, rule.family) for rule in loaded},
+            {(origin, tier, "modules") for origin in ("global", "local") for tier in ("B", "C", "D")},
+        )
+        self.assertEqual(len(loaded), 6)
+
     def test_discovers_root_and_member_rules_without_filtering_tool_or_bevy_rules(self) -> None:
         global_path = self.write_rule("same-name", "tier: A\nmechanism: mend\ntags:\n  - bevy\nmode: auto\n")
         repo = self.member_repo()
@@ -369,14 +410,63 @@ class RuleTests(unittest.TestCase):
         self.assertIn(str(path), str(raised.exception))
         self.assertIn("member-local rule names no workspace member excluded", str(raised.exception))
 
-    def test_local_rules_must_declare_tier_and_family(self) -> None:
+    def test_local_tier_e_rule_loads_without_a_family(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "process.md"
+        _ = path.write_text("---\ntier: E\n---\n# Process rule\n")
+
+        rule, = rules.load_rules(repo)
+
+        self.assertEqual((rule.path, rule.origin, rule.tier), (path, "local", "E"))
+        self.assertIsNone(rule.family)
+
+    def test_local_clippy_rule_loads_as_tier_a_without_a_family(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "member" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "tool.md"
+        _ = path.write_text("---\ntier: A\nmechanism: clippy\n---\n# Tool rule\n")
+
+        rule, = rules.load_rules(repo)
+
+        self.assertEqual((rule.path, rule.origin, rule.tier), (path, "local", "A"))
+        self.assertEqual(rule.reach, rules.MemberReach("member", Path("crates/member")))
+        self.assertIsNone(rule.family)
+
+    def test_local_tier_c_rule_requires_a_family(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "read.md"
+        _ = path.write_text("---\ntier: C\n---\n# Read rule\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+
+        self.assertEqual(str(raised.exception), f"{path}: family is required for tier B, C and D")
+
+    def test_local_tier_e_rule_forbids_a_family(self) -> None:
+        repo = self.member_repo()
+        local_dir = repo / "docs" / "style"
+        local_dir.mkdir(parents=True)
+        path = local_dir / "process.md"
+        _ = path.write_text("---\ntier: E\nfamily: names\n---\n# Process rule\n")
+
+        with self.assertRaises(rules.RuleValidationError) as raised:
+            _ = rules.load_rules(repo)
+
+        self.assertIn(str(path), str(raised.exception))
+        self.assertIn("forbidden", str(raised.exception))
+
+    def test_local_rules_must_declare_a_tier(self) -> None:
         repo = self.member_repo()
         local_dir = repo / "docs" / "member" / "style"
         local_dir.mkdir(parents=True)
         path = local_dir / "local.md"
         declarations = (
             ("family: names", "tier"),
-            ("tier: C", "family"),
             ("mechanism: llm\ncandidates:\n  kind: regex\n  pattern: item", "tier"),
         )
         for declaration, reason in declarations:

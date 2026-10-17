@@ -201,6 +201,8 @@ class DailiesInputTests(unittest.TestCase):
                     "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
+                    "STYLE_LEDGER_STATE_DIR": str(self.root / "style-state"),
+                    "STYLE_HISTORY_NATE_STYLE_DIR": str(self.root / "nate_style"),
                     **fake_unit_host.environment(self.root),
                     "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
         (self.root / "sessions").mkdir()
@@ -1303,6 +1305,20 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.report()["next_run"], "00:30+1")
 
+    def test_newest_child_handoff_labels_the_merge_topic_without_a_unit_phase(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 (aaaaaaa) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit phase 2 shrink (bbbbbbb) into production")
+        _ = self.git("commit", "--allow-empty", "-m", "chore(example): rename unit alpha-unit to renamed-unit")
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (ccccccc) into production")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        merge_topics = [topic for topic in topics if topic["title"] == "Merge branch"]
+        self.assertEqual(len(merge_topics), 1)
+        self.assertIn("last merge: alpha-unit style hand-off (ccccccc)", str(merge_topics[0]["update"]))
+        self.assertNotIn("alpha-unit phase", str(merge_topics[0]["update"]))
+        self.assertNotIn("renamed-unit", str(merge_topics[0]["update"]))
+
     def test_unpushed_merge_appears_as_merge_branch_topic_until_pushed(self) -> None:
         _ = self.git("checkout", "-b", "alpha")
         _ = (self.checkout / "alpha.txt").write_text("panel change\n", encoding="utf-8")
@@ -1942,6 +1958,131 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(self.run_builder().returncode, 0)
         saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
         self.assertIsNone(saved["interval"])
+
+    def style_ledger_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        ledger = SCRIPT.parent.parent / "style/style_ledger.py"
+        result = subprocess.run([sys.executable, str(ledger), *arguments, "--repo", str(self.checkout)],
+                                env=self.env, capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def prepare_style_ledger(self) -> dict[str, object]:
+        rules = Path(self.env["STYLE_HISTORY_NATE_STYLE_DIR"]) / "rust"
+        rules.mkdir(parents=True)
+        _ = (rules / "names.md").write_text(
+            "---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\n", encoding="utf-8")
+        _ = (self.checkout / "Cargo.toml").write_text(
+            '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+        (self.checkout / "src").mkdir()
+        _ = (self.checkout / "src/lib.rs").write_text("pub fn value() {}\n", encoding="utf-8")
+        _ = self.git("add", "Cargo.toml", "src/lib.rs")
+        _ = self.git("-c", "commit.gpgsign=false", "commit", "-m", "Add sample crate")
+        _ = self.style_ledger_cli("set-tip", "--tip", self.git("rev-parse", "HEAD"))
+        return cast(dict[str, object], json.loads(self.style_ledger_cli("summary", "--json").stdout))
+
+    def mark_style_production(self) -> None:
+        content = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(content.replace("## Production Context", "## Production Context\n\n- **Kind:** style"),
+                                encoding="utf-8")
+
+    def test_style_summary_is_saved_only_for_a_style_production_and_keeps_every_ledger_key(self) -> None:
+        summary = self.prepare_style_ledger()
+        original_doc = self.doc.read_text(encoding="utf-8")
+        for kind_line in ("", "- **Kind:** product\n"):
+            with self.subTest(kind_line=kind_line):
+                _ = self.doc.write_text(original_doc.replace("## Production Context",
+                                       "## Production Context\n\n" + kind_line), encoding="utf-8")
+                product = self.run_builder()
+                self.assertEqual(product.returncode, 0, product.stdout + product.stderr)
+                product_saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+                self.assertNotIn("style", product_saved)
+        _ = self.doc.write_text(original_doc, encoding="utf-8")
+        self.mark_style_production()
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertEqual(saved["style"], summary)
+        self.assertEqual(summary["rules_total"], 1)
+        parsed = dailies_render.parse_child_report(saved, "saved", ZoneInfo("America/Los_Angeles")).style
+        self.assertIsInstance(parsed, dailies_render.StyleSummary)
+        assert isinstance(parsed, dailies_render.StyleSummary)
+        self.assertIsInstance(parsed.waiting, dailies_render.NoPendingHandoffs)
+        self.assertIsNone(parsed.synced_at.tzinfo)
+        # Domain times are local datetimes; compare their UTC instants to the ledger's JSON.
+        parsed_keys: dict[str, object] = {
+            "rules_done": parsed.rules_done, "rules_total": parsed.rules_total,
+            "unclassified_rules": parsed.unclassified_rules, "cells_current_pct": parsed.cells_current_pct,
+            "stale": parsed.stale, "proposals": parsed.proposals,
+            "waiting_to_merge_back": 0, "oldest_waiting": None,
+            "synced_at": parsed.synced_at.replace(tzinfo=ZoneInfo("America/Los_Angeles")).astimezone(ZoneInfo("UTC")),
+            "synced_tip": parsed.synced_tip,
+        }
+        expected = {**summary, "synced_at": datetime.fromisoformat(cast(str, summary["synced_at"]))}
+        self.assertEqual(parsed_keys, expected)
+        _ = self.output.write_text(json.dumps({
+            "length": "simple", "zone": "America/Los_Angeles", "units": [],
+            "children": [{"name": "hana-style", "open": 0, "report": saved}],
+        }), encoding="utf-8")
+        rendered = self.run_renderer(AT)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("hana-style  rules done 0/1 · cells 0% · stale 0 · proposals 0 · synced ", rendered.stdout)
+        self.assertNotIn("hand-off waiting", rendered.stdout)
+
+    def test_unsent_handoff_age_from_the_ledger_flags_the_saved_style_report(self) -> None:
+        _ = self.prepare_style_ledger()
+        tip = self.git("rev-parse", "HEAD")
+        _ = self.style_ledger_cli("handoff", "add", "--checkpoint", tip)
+        pending = cast(dict[str, object], json.loads(self.style_ledger_cli("handoff", "pending").stdout))
+        self.assertEqual(pending["state"], "pending")
+        summary = cast(dict[str, object], json.loads(self.style_ledger_cli("summary", "--json").stdout))
+        self.mark_style_production()
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+        self.assertEqual(saved["style"], summary)
+        parsed = dailies_render.parse_child_report(saved, "saved", ZoneInfo("America/Los_Angeles")).style
+        assert isinstance(parsed, dailies_render.StyleSummary)
+        self.assertIsInstance(parsed.waiting, dailies_render.PendingHandoffs)
+        assert isinstance(parsed.waiting, dailies_render.PendingHandoffs)
+        self.assertEqual(parsed.waiting.count, 1)
+        created = datetime.fromisoformat(cast(str, summary["oldest_waiting"]))
+        local_created = created.astimezone(ZoneInfo("America/Los_Angeles"))
+        self.assertEqual(parsed.waiting.oldest_pending_since, local_created)
+        _ = self.output.write_text(json.dumps({
+            "length": "simple", "zone": "America/Los_Angeles", "units": [],
+            "children": [{"name": "hana-style", "open": 0, "report": saved}],
+        }), encoding="utf-8")
+        render_at = (created + timedelta(hours=5, minutes=1)).astimezone(ZoneInfo("America/Los_Angeles"))
+        rendered = self.run_renderer(render_at.strftime("%Y-%m-%dT%H:%M"))
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn(" · hand-off waiting 5h", rendered.stdout)
+
+    def test_failed_or_invalid_summary_saves_unavailable_and_the_report_still_succeeds(self) -> None:
+        self.mark_style_production()
+        original_command = dailies_input.command
+        for code, output, error in ((2, "", "ledger database is locked"),
+                                    (0, "not JSON", ""),
+                                    (0, "[]", ""),
+                                    (0, '{"rules_done": 1}', "")):
+            with self.subTest(code=code, output=output):
+                def command(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+                    if path.name == "style_ledger.py":
+                        self.assertEqual(arguments, ("summary", "--repo", str(self.checkout), "--json"))
+                        return subprocess.CompletedProcess([str(path), *arguments], code, output, error)
+                    return original_command(path, *arguments)
+
+                with mock.patch.object(dailies_input, "command", side_effect=command):
+                    result = self.run_builder()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
+                unavailable = cast(dict[str, object], saved["style"])
+                self.assertEqual(set(unavailable), {"unavailable"})
+                self.assertIsInstance(unavailable["unavailable"], str)
+                self.assertTrue(unavailable["unavailable"])
+                if error:
+                    self.assertEqual(unavailable, {"unavailable": error})
+                parsed = dailies_render.parse_child_report(saved, "saved", ZoneInfo("America/Los_Angeles"))
+                self.assertIsInstance(parsed.style, dailies_render.StyleSummaryUnavailable)
 
     def test_a_production_below_is_read_into_the_input_with_what_waits_on_the_user(self) -> None:
         self.attach("kid", "example")

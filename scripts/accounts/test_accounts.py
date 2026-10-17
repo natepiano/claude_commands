@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -124,6 +125,7 @@ class AccountsTests(unittest.TestCase):
         self.main_dir = Path()
         # The live reading the status table gets for a folder; a folder without one cannot be read.
         self.live: dict[Path, agent_accounts.Report] = {}
+        self.read_claude_live = agent_accounts.claude_live
         self.live_reads = MagicMock()
         self.codex_reads = AsyncMock()
 
@@ -3337,6 +3339,95 @@ class AccountsTests(unittest.TestCase):
         # claude3 is logged in and has never been read.
         self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 2, "—", "—", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
+
+    def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 90, read + timedelta(days=1)))], read)
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            quota_problem="wording is deliberately unrelated to the skip reason",
+            weekly_read_skip=agent_accounts.StaleTokenSkip())], read + timedelta(days=2))
+        before = usage_store.store_file().read_bytes()
+        with (patch.object(subprocess, "run", side_effect=AssertionError("display launched a process")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("display launched Claude"))):
+            code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| claude2 " in line)
+        self.assertEqual(row.split("|")[5].strip(),
+                         "not read since 05:29: no session to refresh its login")
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        self.live_reads.assert_not_called()
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_after_weekly_reset_with_another_read_failure_shows_only_last_read_time(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 90, read + timedelta(days=1)))], read)
+        # Text alone must never classify a failure as a stale-token skip.
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
+            quota_problem="Weekly quota: not read (stale token; a Claude session on this account refreshes it)")
+        row = self.status_rows()[0]
+        self.assertEqual(row[4], "not read since 05:29")
+        self.assertEqual(row[5], "unavailable")
+        self.assertEqual(row[8], "05:29 PST")
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+
+    def test_status_auth_failure_after_stale_login_skip_clears_its_reason_and_keeps_last_good_reading(self) -> None:
+        login = "idle@example.invalid"
+        self.login_directory("claude2", login)
+        directory = accounts.account_dir("claude2")
+        read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading(login, None,
+            agent_accounts.Quota("Weekly", 90, read + timedelta(days=1)))], read)
+        before = usage_store.load()[login].copy()
+        credentials = directory / ".credentials.json"
+        _ = credentials.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture-stale", "expiresAt": 1}}))
+        credential_bytes = credentials.read_bytes()
+        with (patch.object(agent_accounts, "claude_live", side_effect=self.read_claude_live) as reads,
+              patch.object(agent_accounts, "command_json", side_effect=[
+                  {"loggedIn": True, "email": login, "authMethod": "claude.ai"},
+                  RuntimeError("fixture auth failed")]) as auth,
+              patch.object(subprocess, "run", side_effect=AssertionError("read launched a process")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("token refresh launched")),
+              patch.object(urllib.request, "urlopen",
+                  side_effect=AssertionError("stale token used for a read"))):
+            skipped = self.status_rows()[0]
+            self.assertEqual(skipped[4], "not read since 05:29: no session to refresh its login")
+            self.assertIsInstance(usage_store.weekly_read_skip(usage_store.load()[login]),
+                                  agent_accounts.StaleTokenSkip)
+            failed = self.status_rows()[0]
+        self.assertEqual(failed[4], "not read since 05:29")
+        self.assertEqual((failed[5], failed[8]), ("unavailable", "05:29 PST"))
+        self.assertEqual(usage_store.load()[login], before)
+        self.assertEqual(credentials.read_bytes(), credential_bytes)
+        self.assertEqual(auth.call_count, 2)
+        self.assertEqual(reads.call_args_list, [call(directory), call(directory)])
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_stale_token_skip_keeps_a_current_weekly_window_unchanged(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        read = datetime.now(timezone.utc) - timedelta(minutes=45)
+        reset = read + timedelta(days=2)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 25, reset))], read)
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
+            weekly_read_skip=agent_accounts.StaleTokenSkip())
+        row = self.status_rows()[0]
+        self.assertEqual(row[4], "75%")
+        self.assertEqual(row[5], reset.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"))
+        self.assertEqual(row[8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+
+    def test_status_stale_token_skip_without_any_stored_reading_stays_unavailable(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
+            weekly_read_skip=agent_accounts.StaleTokenSkip())
+        row = self.status_rows()[0]
+        self.assertEqual((row[4], row[5], row[8]), ("unavailable", "unavailable", "—"))
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
 
     def test_status_times_use_the_users_zone_setting_when_no_production_runs_or_none_can_be_read(self) -> None:
         self.write_main_config()

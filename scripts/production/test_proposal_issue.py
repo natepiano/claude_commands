@@ -63,6 +63,42 @@ class ProposalIssueTests(unittest.TestCase):
     def text(self) -> str:
         return self.issue.read_text(encoding="utf-8")
 
+    def test_create_fills_template_and_protects_the_finding_batch(self) -> None:
+        template = self.root / "issue.yaml"
+        _ = template.write_text("---\narea: \"[[{{AREA}}]]\"\nproject: \"[[{{PROJECT}}]]\"\n"
+                                + "category: [\"[[issue structure#{{CATEGORY}}|{{CATEGORY}}]]\"]\n"
+                                + "proposed_by: \"{{PROPOSED_BY}}\"\nbacklog_goal: \"{{BACKLOG_GOAL}}\"\n"
+                                + "date_created: \"[[{{DATE}}]]\"\nstatus: open\ntags: [issue]\n---\n")
+        body = self.root / "body.md"
+        _ = body.write_text("# Findings\nBefore and after.\n")
+        issue = self.root / "new style issue.md"
+        arguments = ["create", str(issue), "--project", "alpha", "--short", "alpha", "--proposed-by", "sample-style",
+                     "--extra-tags", "style", "--findings", "b,a,a", "--body-file", str(body), "--template", str(template)]
+        code, _, err = self.run_cli(*arguments)
+        self.assertEqual(code, 0, err)
+        from issues import frontmatter
+        fields = frontmatter(issue)
+        self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
+        self.assertEqual(fields["style_findings"], ["a", "b"])
+        self.assertEqual(fields["area"], ["unfiled"])
+        self.assertEqual(fields["category"], ["refactor"])
+        self.assertEqual(fields["backlog_goal"], [])
+        self.assertEqual(fields["project"], ["alpha"])
+        self.assertTrue(issue.read_text().split("---", 2)[2].lstrip().startswith("Proposed ranking:"))
+        original, stamp = issue.read_bytes(), issue.stat().st_mtime_ns
+        self.assertEqual(self.run_cli(*arguments)[0], 0)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        arguments[arguments.index("--findings") + 1] = "c"
+        self.assertEqual(self.run_cli(*arguments)[0], 2)
+        self.assertEqual(issue.read_bytes(), original)
+
+    def test_close_accepts_a_reason_instead_of_an_as_built_path(self) -> None:
+        code, _, err = self.run_cli("close", str(self.issue), "--reason", "declined: keep the API")
+        self.assertEqual(code, 0, err)
+        self.assertIn('reason: "declined: keep the API"', self.text())
+        self.assertIn("status: closed", self.text())
+        self.assertNotIn("as_built:", self.text())
+
     def test_approve_sets_three_fields_and_keeps_stage(self) -> None:
         code, out, _ = self.run_cli(
             "approve", str(self.issue), "--showrunner", "hana", "--unit", "build-report",
