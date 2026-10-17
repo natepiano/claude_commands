@@ -702,6 +702,39 @@ exit "$status"
                                  errors.splitlines())
             self.assertIn("+ emit\n", (root / "outer-complete.log").read_text(encoding="utf-8"))
 
+    def test_concurrent_json_and_stderr_keep_complete_lines_in_both_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = self.command_stubs() + self.function_body("run_json_stdout") + "\n"
+            script += self.function_body("run_once") + r'''
+buildlog_end() { cp "$2" inner-complete.log; }
+emit() {
+    local i
+    for ((i=0; i<1000; i++)); do
+        printf '{"diagnostic":%s,"message":"concurrent output"}\n' "$i"
+        printf 'cargo stderr %s\n' "$i" >&2
+    done
+    return 101
+}
+LINT_JSON_STDOUT=1
+if run_json_stdout outer.log run_once emit; then status=0; else status=$?; fi
+cp outer.log outer-complete.log
+exit "$status"
+'''
+            result = self.shell(script, root)
+            self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+            messages = [f'{{"diagnostic":{index},"message":"concurrent output"}}'
+                        for index in range(1000)]
+            errors = [f"cargo stderr {index}" for index in range(1000)]
+            self.assertEqual(result.stdout.splitlines(), messages)
+            self.assertEqual(result.stderr.splitlines(), ["+ emit", *errors])
+            for name, count in (("inner-complete.log", 2000), ("outer-complete.log", 2001)):
+                with self.subTest(log=name):
+                    lines = (root / name).read_text(encoding="utf-8").splitlines()
+                    self.assertEqual([line for line in lines if line.startswith("{")], messages)
+                    self.assertEqual([line for line in lines if line.startswith("cargo stderr")], errors)
+                    self.assertEqual(len(lines), count)
+
     def test_shell_libraries_use_no_named_descriptor_redirections(self) -> None:
         for path in (SCRIPTS / "lint" / "invoke.sh", VERIFY):
             with self.subTest(path=path):
