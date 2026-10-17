@@ -214,6 +214,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         *arguments: str,
         at: int,
         claude_session: str = "",
+        codex_session: str = "",
         zone: str = "UTC",
     ) -> str:
         environment = os.environ.copy()
@@ -235,6 +236,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.isolate_identity(environment)
         if claude_session:
             environment["CLAUDE_CODE_SESSION_ID"] = claude_session
+        if codex_session:
+            environment["CODEX_THREAD_ID"] = codex_session
         result = invoke_recorder(arguments, environment, Path.cwd(), check=True)
         self.last_recorder_stderr = result.stderr
         return result.stdout.strip()
@@ -4111,26 +4114,33 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(missing.returncode, 1)
         self.assertIn("recorded no phase 9", missing.stderr)
 
-    def test_a_window_picks_up_the_main_agent_changing_mid_run(self) -> None:
-        """`start-run` detects the unit director once, and it can change after."""
-        started_at = 90_000
-        session_dir = self.start_run("switched", started_at)
-        transcript = self.root / ".claude" / "projects" / "demo" / "session-9.jsonl"
-        transcript.parent.mkdir(parents=True)
+    def write_claude_transcript(self, session_id: str, model: str, effort: str) -> None:
+        transcript = self.root / ".claude" / "projects" / "demo" / f"{session_id}.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
         _ = transcript.write_text(
-            "\n".join(
-                (
-                    json.dumps(
-                        {"type": "assistant", "message": {"model": "opus-5"}, "effort": "high"}
-                    ),
-                    json.dumps(
-                        {"type": "assistant", "message": {"model": "sonnet-5"}, "effort": "low"}
-                    ),
-                    "",
-                )
-            ),
+            json.dumps({"type": "assistant", "message": {"model": model}, "effort": effort}) + "\n",
             encoding="utf-8",
         )
+
+    def write_codex_transcript(self, thread_id: str, model: str, effort: str) -> None:
+        transcript = self.root / ".codex" / "sessions" / f"rollout-{thread_id}.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        _ = transcript.write_text(
+            json.dumps({"type": "turn_context", "payload": {"model": model, "effort": effort}}) + "\n",
+            encoding="utf-8",
+        )
+
+    def open_pass_and_activity(
+        self,
+        session_dir: Path,
+        started_at: int,
+        claude_session: str,
+        codex_session: str = "",
+    ) -> list[dict[str, object]]:
+        """Open a phase, then a pass and an activity as the given session.
+
+        Returns the stored `main_agent` after the pass and after the activity.
+        """
         _ = self.run_command(
             "start-phase",
             "--session-dir",
@@ -4158,8 +4168,35 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--called-effort",
             "high",
             at=started_at + 10,
-            claude_session="session-9",
+            claude_session=claude_session,
+            codex_session=codex_session,
         )
+        after_pass = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Style",
+            "--activity",
+            "style-only review of the phase diff",
+            at=started_at + 20,
+            claude_session=claude_session,
+            codex_session=codex_session,
+        )
+        after_activity = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        return [after_pass, after_activity]
+
+    def test_a_window_picks_up_the_main_agent_changing_mid_run(self) -> None:
+        """`start-run` detects the unit director once, and it can change after."""
+        started_at = 90_000
+        session_dir = self.start_run("switched", started_at)
+        self.write_claude_transcript("main-switched", "sonnet-5", "low")
+        for identity in self.open_pass_and_activity(session_dir, started_at, "main-switched"):
+            self.assertEqual(
+                (identity["model"], identity["effort"], identity["session_id"]),
+                ("sonnet-5", "low", "main-switched"),
+            )
         rendered = self.run_command(
             "timeline",
             "--session-dir",
@@ -4168,6 +4205,43 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         self.assertIn("| sonnet-5 low |", rendered)
         self.assertNotIn("gpt-main xhigh", rendered)
+
+    def test_a_window_opened_in_a_codex_worker_keeps_the_director(self) -> None:
+        """A Codex worker inherits the director's Claude session but has its own thread."""
+        started_at = 91_000
+        session_dir = self.start_run("codexworker", started_at)
+        self.write_claude_transcript("main-codexworker", "sonnet-5", "low")
+        self.write_codex_transcript("worker-thread", "gpt-worker", "medium")
+        director = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        for identity in self.open_pass_and_activity(
+            session_dir, started_at, "main-codexworker", codex_session="worker-thread"
+        ):
+            self.assertEqual(identity, director)
+
+    def test_a_window_opened_by_a_claude_worker_keeps_the_director(self) -> None:
+        """A Claude worker is a Claude Code session of its own."""
+        started_at = 92_000
+        session_dir = self.start_run("claudeworker", started_at)
+        self.write_claude_transcript("claude-worker", "sonnet-5", "low")
+        director = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        for identity in self.open_pass_and_activity(session_dir, started_at, "claude-worker"):
+            self.assertEqual(identity, director)
+
+    def test_the_directors_window_repairs_a_main_agent_a_worker_overwrote(self) -> None:
+        """Runs started before the check carry a worker's thread; the run folder names the director."""
+        started_at = 93_000
+        session_dir = self.start_run("repaired", started_at)
+        state = self.read_state(session_dir)
+        state["main_agent"] = {
+            "family": "codex", "model": "gpt-worker", "effort": "medium", "session_id": "worker-thread"}
+        _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
+        _ = (session_dir / "director").write_text("main-repaired\n", encoding="utf-8")
+        self.write_claude_transcript("main-repaired", "sonnet-5", "low")
+        for identity in self.open_pass_and_activity(session_dir, started_at, "main-repaired"):
+            self.assertEqual(
+                (identity["model"], identity["effort"], identity["session_id"]),
+                ("sonnet-5", "low", "main-repaired"),
+            )
 
     def test_identity_detection_prefers_codex_falls_back_to_claude_and_refuses_unknown(self) -> None:
         codex = self.root / ".codex/sessions/turn-codex-session.jsonl"
