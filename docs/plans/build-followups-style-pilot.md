@@ -392,6 +392,14 @@ Pending: parent's saved style child summary and rendered style line.
   public outside the crate. A crate with a library, and a workspace root
   with no package of its own, get no line.
 
+- **Fix R — a name-bindings ticket says a conversion passes through**
+  (commit `8dab0170`): the dedicated name-bindings pass stopped at a `From`
+  impl's own parameter name. A ticket that pins the name-bindings rule now
+  states that a conversion between the binding and the call (`map_or`,
+  `From::from`, `.into()`) passes through, so the binding is named after
+  the parameter the converted value fills. Tickets without that rule are
+  unchanged.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`.
