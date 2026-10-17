@@ -100,10 +100,11 @@ refill; a checkpointed ticket waits for the style showrunner to merge it.
 Refill writes plans and pinned texts atomically. Resume checks every pin's blob
 and rebuilds a damaged ticket phase from its recorded instructions. Before
 publishing a phase, it records the unit branch's starting commit once in the
-ledger ticket's `base` field. The footprint gate uses that literal commit id as
-`--base` and `--worktree`, including after an interruption. The gate judges
-the uncommitted tree the checkpoint will stage, using a temporary index; it
-never changes the real index. No private Git ref
+ledger ticket's `base` field. The footprint gate uses `--worktree` and measures
+from the later of that commit and the unit's merge-base with the style merge
+branch, so style-branch work the unit took in is never judged as ticket work.
+The gate judges the uncommitted tree the checkpoint will stage, using a temporary
+index; it never changes the real index. No private Git ref
 keeps a dropped ticket's abandoned commits reachable.
 
 ## Pilot scope
@@ -336,7 +337,8 @@ is one finding. An optional JSON map assigns finding ids to file lists, or to
 objects with `files` and `hunks` lists. A hunk is identified by its `path`,
 `old_start` and `new_start` from a zero-context diff; every changed hunk must
 have one owner. The gate folds merged-in parents into the comparison base so
-their changes are not judged as ticket work. A conflicting fold requires review.
+their changes, like work the unit took in from the style merge branch, are not
+judged as ticket work. A conflicting fold requires review.
 Each finding must preserve behavior using only its own edits; another finding's
 call-site changes cannot complete its rename. Changed documented usage, including
 block documentation, requires review. Glob imports prevent proving a rename's
