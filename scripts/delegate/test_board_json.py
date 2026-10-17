@@ -726,6 +726,120 @@ class BoardJsonTests(unittest.TestCase):
         self.assertNotIn("obsolete", doing)
         self.assertEqual(workers["test"]["doing"], "checking the delivery")
 
+    def test_workers_shorten_mesh_names_using_the_worktree_prefix(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory = self.session_files()
+        _ = (directory / "impl_worker_test.json").write_text(json.dumps({
+            "name": "claude-build-followups-style-test", "slot": "test",
+            "family": "codex", "model": "fixture-model",
+        }), encoding="utf-8")
+        _ = (directory / "mesh_roster.json").write_text(json.dumps({
+            "claude-build-followups-style-impl": {
+                "slot": "claude-build-followups-style-impl", "role": "", "status": "running",
+            },
+            "claude-build-followups-style-test": {"role": "test", "status": "paused"},
+        }), encoding="utf-8")
+        _ = (directory / "board.log").write_text(
+            "2026-10-16T17:02:00Z [claude-build-followups-style-impl] status: building the current phase\n",
+            encoding="utf-8",
+        )
+
+        _, unit = self.unit(fixture)
+
+        rows = [object_fields(row) for row in array_items(unit["workers"])]
+        self.assertEqual({str(row["slot"]) for row in rows}, {"impl", "test"})
+        worker = next(row for row in rows if row["slot"] == "impl")
+        self.assertEqual(worker["state"], "running")
+        self.assertEqual(worker["doing"], "building the current phase")
+
+    def test_worker_metadata_selects_state_while_latest_slot_activity_is_retained(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory = self.session_files()
+        _ = (directory / "impl_worker_impl.json").write_text(json.dumps({
+            "name": "claude-build-followups-style-impl", "slot": "impl",
+            "family": "codex", "model": "fixture-model",
+        }), encoding="utf-8")
+        aliases = [
+            ("claude-build-followups-style-impl", {"role": "impl", "status": "paused"}),
+            ("impl", {"slot": "impl", "role": "fix", "status": "running"}),
+        ]
+        _ = (directory / "board.log").write_text(
+            "2026-10-16T17:01:00Z [claude-build-followups-style-impl] status: old assignment\n"
+            + "2026-10-16T17:02:00Z [impl] status: repairing the latest phase\n",
+            encoding="utf-8",
+        )
+
+        for entries in (aliases, list(reversed(aliases))):
+            with self.subTest(roster_order=[name for name, _ in entries]):
+                _ = (directory / "mesh_roster.json").write_text(
+                    json.dumps(dict(entries)), encoding="utf-8",
+                )
+
+                _, unit = self.unit(fixture)
+
+                rows = [object_fields(row) for row in array_items(unit["workers"])]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["slot"], "impl")
+                self.assertEqual(rows[0]["state"], "paused")
+                self.assertEqual(rows[0]["role"], "impl")
+                self.assertEqual(rows[0]["doing"], "repairing the latest phase")
+
+    def test_current_worker_metadata_overrides_obsolete_alias_revisions_and_roster_order(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory = self.session_files()
+        current = "claude-build-followups-style-fix"
+        obsolete = "claude-build-followups-style-impl"
+        _ = (directory / "impl_worker_impl.json").write_text(json.dumps({
+            "name": current, "slot": "impl", "family": "codex", "model": "fixture-model",
+        }), encoding="utf-8")
+        aliases = [
+            (current, {"role": "fix", "status": "done", "revision": 438}),
+            (obsolete, {"role": "review", "status": "paused", "revision": 547}),
+        ]
+        _ = (directory / "board.log").write_text(
+            f"2026-10-16T17:01:00Z [{current}] status: repair completed\n"
+            + f"2026-10-16T17:02:00Z [{obsolete}] status: latest slot activity\n",
+            encoding="utf-8",
+        )
+        for entries in (aliases, list(reversed(aliases))):
+            with self.subTest(roster_order=[name for name, _ in entries]):
+                _ = (directory / "mesh_roster.json").write_text(json.dumps(dict(entries)), encoding="utf-8")
+
+                rows = board_json.workers(directory, set(), "claude-build-followups-style")
+
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["slot"], "impl")
+                self.assertEqual(rows[0]["state"], "idle")
+                self.assertEqual(rows[0]["role"], "fix")
+                self.assertEqual(rows[0]["doing"], "latest slot activity")
+
+    def test_worker_aliases_without_metadata_use_the_last_roster_entry(self) -> None:
+        fixture = self.production()
+        _ = self.write_run(fixture, self.delivery_events())
+        directory = self.session_files()
+        aliases = [
+            ("old-name", {"slot": "impl", "role": "review", "status": "paused", "revision": 547}),
+            ("new-name", {"slot": "impl", "role": "fix", "status": "running", "revision": 1}),
+        ]
+        _ = (directory / "board.log").write_text(
+            "2026-10-16T17:01:00Z [new-name] status: initial repair\n"
+            + "2026-10-16T17:02:00Z [old-name] status: newest activity on this slot\n",
+            encoding="utf-8",
+        )
+        for entries in (aliases, list(reversed(aliases))):
+            with self.subTest(roster_order=[name for name, _ in entries]):
+                _ = (directory / "mesh_roster.json").write_text(json.dumps(dict(entries)), encoding="utf-8")
+
+                rows = board_json.workers(directory, set())
+
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["role"], entries[-1][1]["role"])
+                self.assertEqual(rows[0]["state"], entries[-1][1]["status"])
+                self.assertEqual(rows[0]["doing"], "newest activity on this slot")
+
     def test_worker_states_distinguish_a_finished_turn_from_a_closed_thread(self) -> None:
         fixture = self.production()
         _ = self.write_run(fixture, self.delivery_events())

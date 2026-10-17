@@ -154,24 +154,24 @@ class LeftAtMost:
 
 @dataclass(frozen=True)
 class AutoMoveRule:
-    name: str
+    entry_id: str
     group: accounts.ClaudeGroup
     to: str
     when: LeftAtMost
 
 
 @dataclass(frozen=True)
-class MalformedAutoMoveRule:
+class UnreadableNextMoveLog:
     reason: str
 
 
-def read_auto_move_rules() -> tuple[AutoMoveRule | MalformedAutoMoveRule, ...]:
+def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
     try:
         return tuple(AutoMoveRule(entry.id, entry.group, entry.to,
                                   LeftAtMost(entry.at_percent, entry.hold_minutes))
-                     for entry in next_moves.read_next_moves())
+                     for entry in next_moves.read_next_moves() if isinstance(entry, next_moves.ClaudeGroupMove))
     except next_moves.NextMoveError as error:
-        return (MalformedAutoMoveRule(str(error)),)
+        return (UnreadableNextMoveLog(str(error)),)
 
 
 def state_root() -> Path:
@@ -801,35 +801,17 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     return lines
 
 
-@dataclass(frozen=True)
-class UnreadableAutoMoveHistory:
-    """Replay protection is unavailable, so no log entry may run this pass."""
+# Preserve the watcher API while sharing replay evidence with quota_alert.
+RecordedAutoMoves = role_map.RecordedAutoMoves
+UnreadableAutoMoveHistory = role_map.UnreadableAutoMoveHistory
 
 
-def _recorded_auto_move_ids() -> frozenset[str] | UnreadableAutoMoveHistory:
-    """Recorded choices consume their entries even if log removal was interrupted."""
-    try:
-        lines = accounts.roles_history_file().read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return frozenset()
-    except (OSError, ValueError) as error:
-        print(f"next moves: cannot read recorded auto moves: {error}")
-        return UnreadableAutoMoveHistory()
-    consumed: set[str] = set()
-    try:
-        for line in lines:
-            raw = cast(object, json.loads(line))
-            if not isinstance(raw, dict):
-                continue
-            fields = cast(dict[str, object], raw)
-            why = fields.get("why")
-            if (fields.get("cause") == "auto" and fields.get("group") in accounts.CLAUDE_GROUPS
-                    and isinstance(why, str) and why.startswith("auto: ")):
-                consumed.add(why.removeprefix("auto: "))
-    except ValueError as error:
-        print(f"next moves: cannot read recorded auto moves: {error}")
-        return UnreadableAutoMoveHistory()
-    return frozenset(consumed)
+def recorded_auto_moves() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    return role_map.recorded_auto_moves(accounts.roles_history_file())
+
+
+def _recorded_auto_move_ids() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    return recorded_auto_moves()
 
 
 def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
@@ -839,7 +821,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         return []
     configured = read_auto_move_rules()
     rules = [rule for rule in configured if isinstance(rule, AutoMoveRule)]
-    lines = [rule.reason for rule in configured if isinstance(rule, MalformedAutoMoveRule)]
+    lines = [rule.reason for rule in configured if isinstance(rule, UnreadableNextMoveLog)]
     if not rules:
         return lines
     recorded = _recorded_auto_move_ids()
@@ -848,9 +830,9 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
     state = _load_state()
     original = deepcopy(state)
     holds = state.get("auto_move_holds", {})
-    consumed = recorded & {rule.name for rule in rules}
+    consumed = recorded.entry_ids & {rule.entry_id for rule in rules}
     if consumed:
-        rules = [rule for rule in rules if rule.name not in consumed]
+        rules = [rule for rule in rules if rule.entry_id not in consumed]
         for entry_id in consumed:
             _ = holds.pop(entry_id, None)
         if not dry_run:
@@ -872,10 +854,10 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         source_label = accounts.group_label(selected, rule.group)
         transition = accounts.group_transition(rule.group)
         selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
-        hold = holds.get(rule.name)
+        hold = holds.get(rule.entry_id)
         if hold is not None and (hold.account != source_label or hold.move_id != selection_id
                                  or hold.percent != rule.when.percent):
-            del holds[rule.name]
+            del holds[rule.entry_id]
         if rule.when.hold_minutes > 0:
             if (isinstance(source_label, accounts.GroupNotConfigured) or source_label == rule.to
                     or rule.group in moved):
@@ -890,20 +872,20 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             if not isinstance(source, refusals.FreshReading):
                 continue
             if source.weekly.left > rule.when.percent:
-                _ = holds.pop(rule.name, None)
+                _ = holds.pop(rule.entry_id, None)
                 continue
-            if rule.name not in holds:
-                holds[rule.name] = HoldStarted(source_label, now, selection_id, rule.when.percent)
+            if rule.entry_id not in holds:
+                holds[rule.entry_id] = HoldStarted(source_label, now, selection_id, rule.when.percent)
                 state["auto_move_holds"] = holds
-            if (now - holds[rule.name].at).total_seconds() / 60 < rule.when.hold_minutes:
+            if (now - holds[rule.entry_id].at).total_seconds() / 60 < rule.when.hold_minutes:
                 continue
         try:
             target_identity = accounts.account_identity(accounts.claude_account_dir(rule.to))
         except accounts.AccountsError as error:
-            lines.append(f"auto: {rule.name}: target {rule.to} unavailable: {error}")
+            lines.append(f"auto: {rule.entry_id}: target {rule.to} unavailable: {error}")
             continue
         if not isinstance(target_identity, agent_accounts.NumberedAccount):
-            lines.append(f"auto: {rule.name}: target {rule.to} is not logged in")
+            lines.append(f"auto: {rule.entry_id}: target {rule.to} is not logged in")
             continue
         target = refusals.stored_reading("claude", target_identity.login, now)
         if not isinstance(target, refusals.FreshReading):
@@ -926,9 +908,9 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         prepared = (accounts.prepared_account_preview(rule.to, resume=True) if dry_run
                     else accounts.prepared_account(rule.to, resume=True))
         if isinstance(prepared, accounts.AccountRefused):
-            lines.append(f"auto: {rule.name}: move refused: {prepared.reason}")
+            lines.append(f"auto: {rule.entry_id}: move refused: {prepared.reason}")
             continue
-        why = f"auto: {rule.name}"
+        why = f"auto: {rule.entry_id}"
         lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {source_label} to {rule.to}")
         moved.add(rule.group)
         if dry_run:
@@ -937,10 +919,10 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         selected[rule.group] = rule.to
         for group_rule in rules:
             if group_rule.group == rule.group:
-                _ = holds.pop(group_rule.name, None)
+                _ = holds.pop(group_rule.entry_id, None)
         # Consume only after the group selection and its reason are recorded.
         next_moves.write_next_moves(tuple(entry for entry in next_moves.read_next_moves()
-                                          if entry.id != rule.name))
+                                          if entry.id != rule.entry_id))
         _save_state(state)
         ids = tuple(member.session_id for member in members[rule.group]
                     if not accounts.session_on_account(member, rule.to))

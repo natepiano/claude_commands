@@ -77,13 +77,13 @@ function foldLabel(unit: BoardUnit): string {
 
 function unitBlock(unit: BoardUnit, now: number): UnitBlock {
   const strip = stripCells(unit.phases);
-  const eta = etaText(unit, now);
-  const gate = gateText(unit);
-  const finish = unit.state === 'run-finished' || unit.phase || unit.phases.some(row => row.status === 'todo' || row.status === 'gated')
+  const showsDetails = unit.state === 'running' || Boolean(unit.phase);
+  const eta = showsDetails ? etaText(unit, now) : '';
+  const gate = showsDetails ? gateText(unit) : '';
+  const finish = showsDetails && (unit.state === 'run-finished' || unit.phase || unit.phases.some(row => row.status === 'todo' || row.status === 'gated'))
     ? finishText(unit, now) : '';
-  const workers = workersText(unit);
-  const headerOnly = unit.state !== 'running' && !unit.phase;
-  const detailRows = headerOnly ? 0 : Number(strip.length > 0 || Boolean(unit.phase))
+  const workers = showsDetails ? workersText(unit) : '';
+  const detailRows = Number(strip.length > 0 || Boolean(unit.phase))
     + Number(Boolean(eta)) + Number(Boolean(gate)) + Number(Boolean(finish))
     + (unit.phase ? 2 : 0) + Number(Boolean(workers));
   return { unit, strip, eta, gate, finish, workers, detailRows, compact: false };
@@ -115,7 +115,7 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
     const block = blocks[index]!;
     if (block.unit.state !== 'running' || block.detailRows <= 1) continue;
     block.compact = true;
-    rows -= block.detailRows - 1;
+    rows -= block.detailRows - Number(Boolean(block.unit.phase) || block.strip.length > 0);
   }
   if (rows > bodyRows) {
     rows -= blocks.length * gap;
@@ -126,7 +126,7 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
     const board = boards[index]!;
     while (board.blocks.length && rows > bodyRows) {
       const block = board.blocks.pop()!;
-      rows -= 1 + (block.compact ? 1 : block.detailRows);
+      rows -= 1 + (block.compact ? Number(Boolean(block.unit.phase) || block.strip.length > 0) : block.detailRows);
       if (!board.hidden.length) rows++;
       board.hidden.unshift(block.unit);
     }
@@ -165,7 +165,7 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
             </Text>
             <Button key={`open-${data.production}-${unit.key}`} label="open" plain onPress={() => select(data.production, unit.key)} />
           </Box>
-          {compact ? <Text wrap="truncate-end">{'  '}{unit.stage}{unit.eta?.at ? `  ETA ${unit.eta.at.text}${unit.phase ? overdueText(unit.eta.at.at, now) : ''}` : ''}{strip.length ? '  ' : ''}{runsOf(strip).map(run => <Text color={run.tone}>{run.text}</Text>)}</Text>
+          {compact ? (unit.phase || strip.length > 0) && <Text wrap="truncate-end">{'  '}{unit.phase && <Text>{unit.stage}{unit.eta?.at ? `  ETA ${unit.eta.at.text}${overdueText(unit.eta.at.at, now)}` : ''}{strip.length ? '  ' : ''}</Text>}{runsOf(strip).map(run => <Text color={run.tone}>{run.text}</Text>)}</Text>
             : detailRows > 0 && <Box flexDirection="column" paddingLeft={2}>
               {(strip.length > 0 || unit.phase) && <Text wrap="truncate-end">{runsOf(strip).map(run => <Text color={run.tone}>{run.text}</Text>)}{unit.phase && <Text color="subtle">{strip.length > 0 ? '  ' : ''}{unit.stage}</Text>}</Text>}
               {eta.length > 0 && <Text wrap="truncate-end">{eta}</Text>}

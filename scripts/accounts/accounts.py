@@ -433,7 +433,7 @@ class CodexStatus:
 
 class CommandLine(argparse.Namespace):
     next_action: str = ""
-    group: ClaudeGroup = "units"
+    group: next_moves.NextMoveGroup = "units"
     percent: float = 0
     hold_minutes: float = 0
     entry_id: str = ""
@@ -2721,12 +2721,13 @@ def _roles_lock() -> Generator[None]:
         yield
 
 
-def _write_role(role: str, label: str) -> None:
+def _write_role(role: str, label: str, *, why: str = "by hand",
+                cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> None:
     _validate_role(role)
     if role != "workers":
         raise AccountsError(UNIT_ROLE_GONE)
-    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), "by hand",
-                               datetime.now(timezone.utc).isoformat()))
+    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), why,
+                               datetime.now(timezone.utc).isoformat(), cause=cause))
 
 
 def set_role(role: str, label: str) -> None:
@@ -3260,7 +3261,8 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
     return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
 
 
-def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
+def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
+                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> WorkersSwapOutcome:
     refuse_default(label)
     try:
         workers_home = _workers_home()
@@ -3290,7 +3292,7 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
         switches = _retire_workers_servers(target_home, account_label, dry_run=True)
         return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
     try:
-        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label)
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, why=why, cause=cause)
     except OSError as error:
         raise AccountsError(f"accounts: could not move the workers role: {error}") from error
     try:
@@ -3302,11 +3304,12 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     return WorkersSwapStarted(lines)
 
 
-def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:
+def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
+         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> SwapOutcome | WorkersSwapOutcome:
     """Select the new unit account only after every old-account session can move."""
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -3999,7 +4002,7 @@ def _parser() -> argparse.ArgumentParser:
     next_command = commands.add_parser("next")
     next_verbs = next_command.add_subparsers(dest="next_action", required=True)
     next_add = next_verbs.add_parser("add")
-    _ = next_add.add_argument("group", choices=CLAUDE_GROUPS)
+    _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
     _ = next_add.add_argument("--hold-minutes", type=float, default=0)
@@ -4054,6 +4057,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_next_move_target(entry: next_moves.NextMove) -> None:
+    if isinstance(entry, next_moves.ClaudeGroupMove):
+        _ = claude_account_dir(entry.to)
+    elif isinstance(entry.to, next_moves.CodexWorkersTarget):
+        _ = check_codex_target(entry.to.label, accounts_home() / ".codex", repair=False)
+
+
 @role_map.role_map_command
 def main(argv: list[str]) -> int:
     parser = _parser()
@@ -4075,7 +4085,7 @@ def main(argv: list[str]) -> int:
                 if len(entries) != 1:
                     raise AccountsError("accounts: next-write requires one entry")
                 entry = entries[0]
-                _ = claude_account_dir(entry.to)
+                validate_next_move_target(entry)
                 with next_moves.next_moves_lock():
                     current = next_moves.read_next_moves()
                     if any(saved.id == entry.id for saved in current):
@@ -4086,7 +4096,10 @@ def main(argv: list[str]) -> int:
         if options.action == "next":
             if options.next_action == "add":
                 if role_map.is_role_map_host():
-                    _ = claude_account_dir(options.label)
+                    candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
+                        at_percent=options.percent, hold_minutes=options.hold_minutes, to=options.label,
+                        added_at=datetime.now(timezone.utc).isoformat())]))[0]
+                    validate_next_move_target(candidate)
                 entry = next_moves.add_next_move(options.group, options.percent, options.label,
                                                  options.hold_minutes)
                 print(next_moves.render_next_move(entry))
