@@ -245,7 +245,7 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 **Ruled out:** unit-board's merge as the cause — the race is in this runner; that merge only changed timing.
 
-### Phase 8 — Re-measure the lint-step rewrite  · status: todo
+### Phase 8 — Re-measure the lint-step rewrite  · status: done
 
 **Depends on:** Phase 6
 **Blocked by:** G3, G4
