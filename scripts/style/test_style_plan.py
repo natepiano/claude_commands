@@ -1147,6 +1147,42 @@ class StylePlanTests(unittest.TestCase):
         self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
         self.assertEqual(next(cell.state for cell in self.ledger().cells() if cell.path == path), "stale")
 
+    def test_read_tickets_separate_name_bindings_from_other_names_rules_on_each_pending_file(self) -> None:
+        bindings = self.rule("name-bindings-to-match-parameters")
+        other = self.rule("other-names")
+        self.sync()
+        self.record(bindings, self.sources[2], self.tip)
+        self.record(other, self.sources[3], self.tip)
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (bindings,)),
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (other,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", (self.sources[3],), (bindings,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", (self.sources[2],), (other,)),
+        ))
+
+    def test_read_tickets_separate_uncovered_name_bindings_from_other_names_rules(self) -> None:
+        bindings = self.rule("name-bindings-to-match-parameters", "tier: B\nfamily: names\ncandidates:\n"
+                             + "  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read every binding.\n")
+        other = self.rule("other-names")
+        self.sync()
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (bindings + "#uncovered",)),
+            style_plan.TicketSelection("read", "names", "crates/alpha", self.sources[:2], (other,)),
+            style_plan.TicketSelection("read", "names", "crates/beta", self.sources[2:], (bindings + "#uncovered",)),
+            style_plan.TicketSelection("read", "names", "crates/beta", self.sources[2:], (other,)),
+        ))
+
+    def test_read_tickets_without_name_bindings_keep_rules_grouped_on_their_pending_files(self) -> None:
+        first = self.rule("first-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        second = self.rule("second-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        self.record(second, self.sources[0], self.tip)
+        self.assertEqual(self.candidates("types"), (
+            style_plan.TicketSelection("read", "types", "crates/alpha", (self.sources[0],), (first,)),
+            style_plan.TicketSelection("read", "types", "crates/alpha", (self.sources[1],), (first, second)),
+            style_plan.TicketSelection("read", "types", "crates/beta", self.sources[2:], (first, second)),
+        ))
+
     def test_partial_b_reads_uncovered_and_zero_sites_has_no_listed_ticket(self) -> None:
         rule = self.rule("partial", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read everything else.\n")
         self.sync()
