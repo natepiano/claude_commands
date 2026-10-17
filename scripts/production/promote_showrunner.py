@@ -120,7 +120,7 @@ def checked(name: str, child_doc: Path) -> Promotion:
     unit = name if name.replace("_", "-").endswith("-unit") else f"{name}-unit"
     try:
         cells = _unit_row(parent.doc.read_text(encoding="utf-8").splitlines(), unit)
-        marked = unit_lookup.marked_units(parent.slug).get(unit)
+        marked = unit_lookup.marked_unit(parent.slug, unit)
     except (OSError, UnicodeError) as error:
         raise Refusal(str(error)) from error
     if marked is None or not isinstance(marked.claude, unit_lookup.LiveClaude):
@@ -164,7 +164,7 @@ def stop(promotion: Promotion) -> bool:
             return False
         time.sleep(POLL_S)
     try:
-        herdr.stop_session(place.session)
+        herdr.close_agent(place.session, place.pane)
     except HerdrFailure as error:
         raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
     return True

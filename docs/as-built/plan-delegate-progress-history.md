@@ -470,9 +470,18 @@ activity's name is its `--label`, and its `Delegate` cell is empty: the unit
 director ran that window itself. Both identity columns are read per window rather
 than per run, and `start-pass` and `start-activity` re-detect the unit director
 as they open, so a unit director that changes model or effort part way through
-shows the change on the rows after it. Detection that comes back unknown leaves
-the stored identity alone, because a window that cannot answer must not erase
-the answer already recorded.
+shows the change on the rows after it. Windows are also opened from inside
+workers: a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but
+detects as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
+of its own. So `_refresh_main_identity` replaces `main_agent` only when the
+detected session is the run's director (`unit_runs.director`, the run folder's
+`director` file, else the `run_started` event's session), else the stored
+identity's session; with neither known it takes any detection. The director is
+read from the run folder rather than from `main_agent` because until 2026-10-17
+every window rewrote it, and three live runs then carried a worker's thread there;
+the director's next window repairs such a run. Detection that comes back unknown
+leaves the stored identity alone, because a window that cannot answer must not
+erase the answer already recorded.
 
 A round's result is every finding the ledger stamped with that round: verdicts
 make it `N fixed` plus `M open` where those apply, findings opened make it

@@ -1258,7 +1258,11 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
     if probe:
+        from scripts.herdr.herdr import UNIT_MARKS
+
         environment[PROBE_ENV] = "1"
+        for name in UNIT_MARKS:
+            _ = environment.pop(name, None)
     try:
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
@@ -3613,6 +3617,14 @@ class StatusUnavailable:
 
 
 @dataclass(frozen=True)
+class WeeklyNotReadSince:
+    """The last reading predates a weekly reset; it cannot describe this week's allowance."""
+
+    read_at: datetime
+    reason: agent_accounts.StaleTokenSkip | agent_accounts.NoWeeklyReadSkip
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -3621,7 +3633,7 @@ class StatusRow:
     login: str
     login_cell: str
     roles: tuple[str, ...]
-    weekly_left_percent: float | StatusUnavailable
+    weekly_left_percent: float | StatusUnavailable | WeeklyNotReadSince
     resets_at: datetime | StatusUnavailable
     credits: float | Literal["unlimited"] | StatusUnavailable
     on_credits: str
@@ -3683,7 +3695,7 @@ def _status_row(
     tool = "codex" if isinstance(status, CodexStatus) else "claude"
     login_cell = ("not set up" if not status.is_set_up else "unavailable" if not status.account_is_safe_to_inspect
                   else status.login or "not logged in")
-    weekly: float | StatusUnavailable = StatusUnavailable()
+    weekly: float | StatusUnavailable | WeeklyNotReadSince = StatusUnavailable()
     resets: datetime | StatusUnavailable = StatusUnavailable()
     credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
     read_at: datetime | StatusUnavailable = StatusUnavailable()
@@ -3702,6 +3714,9 @@ def _status_row(
                 weekly = StatusUnavailable("unavailable")
                 resets = StatusUnavailable("unavailable")
             read_at = _read_at(usage) or StatusUnavailable()
+            if (window is not None and isinstance(read_at, datetime)
+                    and (reset := _stored_time(window["resets"])) is not None and reset <= now):
+                weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now)
     return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
@@ -3716,8 +3731,14 @@ def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
     credits = row.credits
     read = row.read_at
     role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    if isinstance(weekly, WeeklyNotReadSince):
+        weekly_cell = f"not read since {weekly.read_at.astimezone(zone):%H:%M}"
+        if isinstance(weekly.reason, agent_accounts.StaleTokenSkip):
+            weekly_cell += ": no session to refresh its login"
+    else:
+        weekly_cell = weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%"
     return (row.folder, row.label, row.login_cell, role_cell,
-        weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%",
+        weekly_cell,
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
@@ -3728,7 +3749,7 @@ def render_status_json(reading: StatusReading, *, with_login: bool = False) -> s
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
-            weekly_left_percent=None if isinstance(row.weekly_left_percent, StatusUnavailable) else row.weekly_left_percent,
+            weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,

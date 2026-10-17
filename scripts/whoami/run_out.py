@@ -155,18 +155,32 @@ def weighted_rate(readings: list[Reading], end: float) -> float | None:
 
     Only time the log watched counts. A drop in used percent (a weekly refill or a
     redeemed reset), time at 100% and a gap longer than `MAX_GAP` are skipped; the
-    readings on either side of one still count, weighted by age. None until the
-    counted time, weighted, reaches `MIN_SPAN`.
+    readings on either side of one still count, weighted by age. Time before an
+    account's first rise after a refill, or after the log began, is skipped too: an
+    account untouched since then is waiting its turn, not quietly in use, and one
+    still waiting after `MIN_SPAN` of watched time has a pace of 0. Otherwise None
+    until the counted time, weighted, reaches `MIN_SPAN`.
     """
-    used = seconds = 0.0
+    used = seconds = waited = 0.0
+    waiting = True
     for before, after in zip(readings, readings[1:]):
         at = after.at.timestamp()
         if at > end:
             break
         span = at - before.at.timestamp()
-        if after.used_percent < before.used_percent or before.used_percent >= 100 or span > MAX_GAP.total_seconds():
+        if after.used_percent < before.used_percent:
+            waiting, waited = True, 0.0
+            continue
+        if after.used_percent > before.used_percent:
+            waiting = False
+        if before.used_percent >= 100 or span > MAX_GAP.total_seconds():
+            continue
+        if waiting:
+            waited += span
             continue
         weight = math.pow(0.5, (end - at) / HALF_LIFE.total_seconds())
         used += weight * (after.used_percent - before.used_percent)
         seconds += weight * span
+    if waiting and waited >= MIN_SPAN.total_seconds():
+        return 0.0
     return used / seconds if seconds >= MIN_SPAN.total_seconds() else None

@@ -128,6 +128,24 @@ def common_session(
     }
 
 
+class LeftSessionClient:
+    """The herdr session a moved session left: its panes, the ones running a program, and the panes closed."""
+
+    def __init__(self, rows: list[str], activity: dict[str, herdr.PaneRunning]) -> None:
+        self.rows: list[str] = rows
+        self.activity: dict[str, herdr.PaneRunning] = activity
+        self.closed: list[str] = []
+
+    def panes(self) -> list[dict[str, str]]:
+        return [{"pane_id": pane} for pane in self.rows]
+
+    def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
+        return self.activity.get(pane, herdr.PaneAtShell())
+
+    def close_pane(self, pane: str) -> None:
+        self.closed.append(pane)
+
+
 def top_level(
     session_id: str,
     *,
@@ -706,6 +724,41 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(parts.account, restart.MoveResumeAccount("claude2"))
         self.assertEqual(launch.call_args.args[1], restart.RecordedHerdrPane("old-target", "w1:p1"))
         self.assertEqual(restart._target_config_dir(saved), restart.RecordedConfigDir(self.root / ".claude2"))  # pyright: ignore[reportPrivateUsage]
+
+    def test_herdr_host_restarts_into_the_shared_session_and_leaves_its_recorded_one(self) -> None:
+        saved = entry(top_level("natedev", host=inventory.HerdrHost(kind="herdr", herdr_session="natedev", pane_id="w1:p1", presentation="detached")))
+        for shared, destination, left in (
+            ("agents", restart.SharedHerdrTab("agents"), 1),
+            ("natedev", restart.RecordedHerdrPane("natedev", "w1:p1"), 0),
+            ("", restart.RecordedHerdrPane("natedev", "w1:p1"), 0),
+        ):
+            with self.subTest(shared=shared), patch.object(herdr, "shared_session", return_value=shared), \
+                    patch.object(restart, "_herdr_launch", return_value=herdr.ServerAdopted()) as launch, \
+                    patch.object(restart, "_leave_recorded_session") as leave:
+                result = restart._launch_session(saved, "continue", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                self.assertEqual(launch.call_args.args[1], destination)
+                self.assertEqual(leave.call_count, left)
+                if left:
+                    self.assertEqual(leave.call_args.args[1:], ("natedev", "w1:p1"))
+
+    def test_leaving_a_recorded_session_stops_it_when_emptied_and_closes_only_a_shell_pane(self) -> None:
+        vim = herdr.PaneRunning(commands=("vim",))
+        for rows, activity, stopped, closed in (
+            (["w1:p1"], {}, True, []),
+            (["w1:p1", "w2:p1"], {}, True, []),
+            (["w1:p1", "w1:p2"], {"w1:p2": vim}, False, ["w1:p1"]),
+            (["w1:p2"], {"w1:p2": vim}, False, []),
+            (["w1:p1"], {"w1:p1": vim}, False, []),
+        ):
+            client = LeftSessionClient(rows, activity)
+            output = io.StringIO()
+            with self.subTest(rows=rows, activity=activity), patch.object(herdr, "Herdr", return_value=client), \
+                    patch.object(herdr, "stop_session") as stop, redirect_stdout(output):
+                restart._leave_recorded_session("natedev", "natedev", "w1:p1")  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(stop.called, stopped)
+                self.assertEqual(client.closed, closed)
+                self.assertEqual("still runs a program" in output.getvalue(), "w1:p1" in activity)
 
     def test_legacy_default_record_restarts_on_the_numbered_home_without_rewriting_it_on_read(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()

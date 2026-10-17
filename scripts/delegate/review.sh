@@ -213,6 +213,9 @@ TURN_RAISED=0
 TURN_COUNT_READY=0
 TURN_RECORD_STATUS="error"
 mkdir -p "${ARTIFACT_DIR}"
+# Every dispatch names the run's director in the run folder (unit_runs.py), which the
+# production tree reads: a marker names one run per director, and a director runs phases side by side.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"

@@ -95,6 +95,7 @@ class CargoPackageMetadata(TypedDict):
     id: str
     features: dict[str, list[str]]
     manifest_path: str
+    dependencies: list[dict[str, str]]
     targets: list[CargoTargetMetadata]
 
 
@@ -171,7 +172,7 @@ if has "$@"; then
     wanted=--short
     if has "$@"; then printf 'abc1234\n'; exit 0; fi
 fi
-for wanted in status diff ls-files; do if has "$@"; then exit 0; fi; done
+for wanted in status diff ls-files ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
 
@@ -218,7 +219,9 @@ if "--copy" in arguments:
 
     def stop_copy(signal_number: int, _frame: object) -> None:
         release_copy_claim()
-        (root / "copy-signal").write_text(str(signal_number), encoding="utf-8")
+        # Renamed into place, so the test never reads it half written.
+        (root / "copy-signal.tmp").write_text(str(signal_number), encoding="utf-8")
+        os.replace(root / "copy-signal.tmp", root / "copy-signal")
         raise SystemExit(128 + signal_number)
 
     signal.signal(signal.SIGTERM, stop_copy)
@@ -526,6 +529,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     "id": "sample-id",
                     "features": {"default": [], "extra": []},
                     "manifest_path": str(self.root / "Cargo.toml"),
+                    "dependencies": [],
                     "targets": [
                         {
                             "name": "sample",
@@ -1918,6 +1922,8 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.addCleanup(claim, "release")
         self.assertEqual(new_test.returncode, 0, new_test.stdout + new_test.stderr)
         self.assertIn("claimed", new_test.stdout)
+        # The claim signals the copy; its handler records the signal some time later on a loaded machine.
+        self.wait_for_path(self.runner_state / "copy-signal", (process,))
         self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
         self.wait_for_reaped(copy, (process,))
         self.assertIsNone(process.poll())

@@ -178,7 +178,7 @@ class MergeRequest(NamedTuple):
     kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit
     push: ValidateAndPush | GitPush
     promotion: NoPromotion | PromoteTo
-    merge_tests: tuple[str, ...]
+    merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
     units: tuple[Unit, ...]
     lines: tuple[str, ...]
@@ -272,7 +272,13 @@ def parse_units(lines: list[str]) -> tuple[Unit, ...]:
     return tuple(result)
 
 
-def parse_merge_tests(lines: list[str]) -> tuple[str, ...]:
+def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...], ...]:
+    """Each command the Merge tests line names, split and expanded, checked before any merge starts.
+
+    The commands run with no shell, so `~` and `$VAR` are expanded here. A command must start with a
+    program on PATH or an executable file in the showrunner checkout: a package name or a directory
+    written there by mistake is refused by name.
+    """
     field = optional_field(lines, "Merge tests")
     if isinstance(field, FieldAbsent):
         raise Refusal("production doc lacks Merge tests")
@@ -284,7 +290,25 @@ def parse_merge_tests(lines: list[str]) -> tuple[str, ...]:
         elif char == "(" and not in_backticks:
             first_comment = index
             break
-    return tuple(re.findall(r"`([^`]+)`", field.text[:first_comment]))
+    commands: list[tuple[str, ...]] = []
+    for entry in cast(list[str], re.findall(r"`([^`]+)`", field.text[:first_comment])):
+        try:
+            words = [os.path.expandvars(os.path.expanduser(word)) for word in shlex.split(entry)]
+        except ValueError as error:
+            raise Refusal(f"Merge tests entry `{entry}` does not split into words: {error}") from error
+        if not words:
+            raise Refusal(f"Merge tests entry `{entry}` is empty")
+        for word in words:
+            unset = re.search(r"\$\{?([A-Za-z_]\w*)", word)
+            if unset:
+                raise Refusal(f"Merge tests entry `{entry}` names ${unset[1]}, which is not set")
+        program = words[0]
+        located = checkout / program if "/" in program else shutil.which(program)
+        if located is None or not (Path(located).is_file() and os.access(located, os.X_OK)):
+            raise Refusal(f"Merge tests entry `{entry}` is not a command: {program} is neither on PATH "
+                          + f"nor an executable file in {checkout}")
+        commands.append(tuple(words))
+    return tuple(commands)
 
 
 def request_from(args: argparse.Namespace) -> MergeRequest:
@@ -335,7 +359,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
                    or tempfile.gettempdir()).expanduser()
     return MergeRequest(production, unit, cast(str, args.phase), cast(str, args.hash),
                         tuple(cast(list[str], args.also)), kind, push, promotion,
-                        parse_merge_tests(lines), flakes, units, tuple(lines), scratch,
+                        parse_merge_tests(lines, production.checkout), flakes, units, tuple(lines), scratch,
                         tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
                         cast(bool, args.cancel_prior), cast(str, args.started),
                         cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
@@ -614,7 +638,7 @@ def tool(name: str, fallback: Path, override: str) -> str:
 
 
 def test_steps(production: Production, paths: tuple[str, ...],
-               merge_tests: tuple[str, ...]) -> list[tuple[str, list[str]]]:
+               merge_tests: tuple[tuple[str, ...], ...]) -> list[tuple[str, list[str]]]:
     checkout = production.checkout
     packages: set[str] = set()
     examples: set[tuple[str, str]] = set()
@@ -634,8 +658,7 @@ def test_steps(production: Production, paths: tuple[str, ...],
     steps = [(f"package {package}", [*verify_command, "test", package]) for package in sorted(packages)]
     steps.extend((f"example {package}/{name}", [*verify_command, "example", package, name])
                  for package, name in sorted(examples))
-    steps.extend((f"merge test {index}", shlex.split(command))
-                 for index, command in enumerate(merge_tests, 1))
+    steps.extend((f"merge test {index}", list(command)) for index, command in enumerate(merge_tests, 1))
     return steps
 
 
@@ -668,7 +691,8 @@ def tests(request: MergeRequest, paths: tuple[str, ...], merge_head: str) -> str
 
 
 def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint: str,
-                     merge_tests: tuple[str, ...], flakes: frozenset[str], scratch: Path, merge_head: str) -> str:
+                     merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
+                     merge_head: str) -> str:
     steps = test_steps(production, paths, merge_tests)
     scratch.mkdir(parents=True, exist_ok=True)
     log = scratch / f"merge_{checkpoint[:7]}_test.log"
@@ -990,7 +1014,7 @@ class ChildHandoffRequest(NamedTuple):
     child: Production
     checkpoint: str
     push: ValidateAndPush | GitPush
-    merge_tests: tuple[str, ...]
+    merge_tests: tuple[tuple[str, ...], ...]
     started: str
     delivery: NotMerged | MergedNotPushed | MergedAndPushed
     promotion: NoPromotion | PromoteTo
@@ -1070,7 +1094,7 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
         flakes = frozenset(name.strip() for name in names if name.strip())
     scratch = Path(os.environ.get("MERGE_CHECKPOINT_SCRATCH") or tempfile.gettempdir()).expanduser()
     return ChildHandoffRequest(production, child, checkpoint, GitPush() if raw == "git" else ValidateAndPush(),
-                               parse_merge_tests(parent_lines), cast(str, args.started), delivery, promotion,
+                               parse_merge_tests(parent_lines, production.checkout), cast(str, args.started), delivery, promotion,
                                root_self, flakes, scratch)
 
 

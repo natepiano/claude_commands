@@ -50,8 +50,11 @@
 # environment. A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
 # that differs from HEAD, so one lint record answers for each package. A
-# `test --filter` key holds its names sorted, each once, so one set of names
-# finds one record whatever order a call gives them in. The same call on the
+# `test` key holds only the part of the tree its package is built from
+# (TREE_KEY_PY), so a second phase editing another member in the same worktree
+# neither drops the pass nor misses it. A `test --filter` key holds its names
+# sorted, each once, so one set of names finds one record whatever order a call
+# gives them in. The same call on the
 # same tree then prints that record and its log and exits 0 without the cargo
 # token: workers re-ran unchanged trees 416 times in the week to 2026-10-01. A
 # `test --filter` reuse prints one line instead, since iteration feedback needs
@@ -61,8 +64,9 @@
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. The judged tree is the tree when the run
 # starts, or for `lint` the tree its last rewrite and formatting leave
-# for taplo, clippy and rustdoc. A run that ends on any other tree records
-# nothing: an edit landed while it ran, and its verdict belongs to neither tree.
+# for taplo, clippy and rustdoc. A run that ends on any other tree (for `test`,
+# any other part of it the package is built from) records nothing: an edit
+# landed while it ran, and its verdict belongs to neither tree.
 # A run outside a delegate session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
@@ -420,8 +424,19 @@ print("\n".join(sorted(changed)))
 # of every path that differs from it, staged, unstaged, deleted, or new and not
 # ignored; it writes no git objects. Any failure prints nothing, and an empty
 # key turns the record off for that run.
+#
+# A `test` key (argv starting `--package <name>`, cargo metadata on stdin)
+# holds only the paths that package's tests are built from: its own folder and
+# those of the members it depends on by path, transitively; every member's
+# Cargo.toml, since workspace feature resolution reads them all; and every path
+# outside the members (the root manifest, Cargo.lock, .cargo/). Each counts by
+# its git mode and blob id, from HEAD or from the file when it differs, so a
+# phase that edits or commits another member in the same worktree leaves the
+# key alone (two phases side by side, 2026-10-17). A test that reads a file in
+# an unrelated member's folder is not keyed on it.
 TREE_KEY_PY='
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -443,17 +458,84 @@ def content(path: bytes) -> bytes:
     return b"absent"
 
 
+# The ls-tree entry git would record for the file, so committing it unchanged
+# keeps the key; None when the file is gone.
+def blob(path: bytes) -> bytes | None:
+    if os.path.islink(path):
+        data, mode = os.readlink(path), b"120000"
+    elif os.path.isfile(path):
+        with open(path, "rb") as handle:
+            data = handle.read()
+        mode = b"100755" if os.access(path, os.X_OK) else b"100644"
+    else:
+        return None
+    return mode + b" blob " + hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()
+
+
+# The member folders the tests of `name` are built from, and every member
+# folder, deepest first.
+def package_roots(name: str) -> tuple[set[bytes], list[bytes]]:
+    meta = json.load(sys.stdin)
+    members = {
+        os.path.realpath(os.path.dirname(package["manifest_path"])).encode(): package
+        for package in meta["packages"]
+        if package["id"] in set(meta["workspace_members"])
+    }
+    pending = [root for root, package in members.items() if package["name"] == name]
+    if not pending:
+        sys.exit(1)
+    built = set()
+    while pending:
+        root = pending.pop()
+        if root in built:
+            continue
+        built.add(root)
+        for dependency in members[root]["dependencies"]:
+            if dependency.get("path"):
+                pending += [path for path in [os.path.realpath(dependency["path"]).encode()] if path in members]
+    return built, sorted(members, key=len, reverse=True)
+
+
 split = sys.argv.index("--")
+files = sys.argv[1:split]
+package = files[1] if files[:1] == ["--package"] else ""
+if package:
+    files = files[2:]
 # --no-optional-locks and git status, not git diff: diff rewrites a stat-dirty
 # index even with the flag (git 2.54), and the index of this worktree belongs to the
 # session working in it. Same paths: staged, unstaged, deleted, untracked.
 top = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
-key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
 status = run("git", "--no-optional-locks", "-C", top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
-for path in sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3}):
-    key.update(path + b"\0" + content(os.path.join(top, path)))
+changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3})
+if package:
+    built, members = package_roots(package)
+    real_top = os.path.realpath(top)
+
+    def counts(path: bytes) -> bool:
+        full = os.path.join(real_top, path)
+        owner = next((root for root in members if full.startswith(root + b"/")), None)
+        return owner is None or owner in built or full == os.path.join(owner, b"Cargo.toml")
+
+    entries = {}
+    for line in run("git", "--no-optional-locks", "-C", top, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split(b"\0"):
+        if b"\t" in line:
+            entry, path = line.split(b"\t", 1)
+            entries[path] = entry
+    for path in changed:
+        entry = blob(os.path.join(top, path))
+        if entry is None:
+            _ = entries.pop(path, None)
+        else:
+            entries[path] = entry
+    key = hashlib.sha256(top + b"\0")
+    for path in sorted(filter(counts, entries)):
+        key.update(path + b"\0" + entries[path] + b"\0")
+else:
+    key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
+    for path in changed:
+        key.update(path + b"\0" + content(os.path.join(top, path)))
 key.update(run("rustc", "-vV"))
-for name in sys.argv[1:split]:
+for name in files:
     key.update(content(name.encode()))
 for word in sys.argv[split + 1 :]:
     key.update(b"\0" + word.encode())
@@ -759,7 +841,7 @@ if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
 fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}") names=() name
+    local words=("$CMD" "${ARGS[@]}") names=() name scope=()
     if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
         words=(lint)
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
@@ -779,9 +861,13 @@ tree_key() {
             words+=(--filter "$name")
         done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
-    "$PY" -c "$TREE_KEY_PY" "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+    if [[ "$CMD" == test ]]; then
+        # Keyed on the package's own build, read from the call's metadata.
+        scope=(--package "${ARGS[0]}")
+    fi
+    "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" "$MUL_ADD_APPLIER" -- "${words[@]}" \
-        2>/dev/null || true
+        <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
@@ -1373,6 +1459,10 @@ if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
         exit 2
     fi
 fi
+# A test record's key reads the package's dependencies from it (tree_key).
+if [[ "$CMD" == test && -n "${CACHE_DIR}" && -z "${GATE_METADATA}" ]]; then
+    GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
+fi
 
 if cache_lookup; then
     exit "${LOOKUP_STATUS}"
@@ -1796,7 +1886,7 @@ case "$CMD" in
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
             CLIPPY_LOG="$(mktemp)"
             # pipefail preserves clippy's status while tee captures diagnostics.
-            if invoke_clippy --workspace --all-targets --all-features 2>&1 | tee "$CLIPPY_LOG"; then
+            if invoke_clippy --workspace --all-targets --all-features --keep-going 2>&1 | tee "$CLIPPY_LOG"; then
                 rm -f "$CLIPPY_LOG"
                 CLIPPY_LOG=""
             else
@@ -1804,34 +1894,45 @@ case "$CMD" in
                 if ! grep -Fq '#suboptimal_flops' "$CLIPPY_LOG"; then
                     exit "$clippy_status"
                 fi
-                json_status=0
-                invoke_clippy_mul_add_json --workspace --all-targets --all-features > "$CLIPPY_LOG" || json_status=$?
-                # -D warnings also makes a useful diagnostic replay exit 101.
-                if [[ "$json_status" != 0 && "$json_status" != 101 ]]; then
-                    echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
-                    exit "$clippy_status"
-                fi
-                apply_status=0
-                mul_add_report="$("$PY" "$MUL_ADD_APPLIER" --workspace-root "$WORKSPACE_ROOT" "$CLIPPY_LOG")" || apply_status=$?
-                case "$apply_status" in
-                    0) echo "$mul_add_report" ;;
-                    3) # NOTHING_APPLIED from apply_mul_add.py.
-                        echo "$mul_add_report"
-                        echo "verify.sh: clippy's multiply-add rewrite changed nothing"
-                        exit "$clippy_status"
-                        ;;
-                    *)
+                mul_add_reports=""
+                for ((rewrite_round=1; rewrite_round<=5; rewrite_round++)); do
+                    json_status=0
+                    invoke_clippy_mul_add_json --workspace --all-targets --all-features --keep-going > "$CLIPPY_LOG" || json_status=$?
+                    # -D warnings also makes a useful diagnostic replay exit 101.
+                    if [[ "$json_status" != 0 && "$json_status" != 101 ]]; then
                         echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
-                        exit "$clippy_status"
-                        ;;
-                esac
+                        break
+                    fi
+                    apply_status=0
+                    mul_add_report="$("$PY" "$MUL_ADD_APPLIER" --workspace-root "$WORKSPACE_ROOT" "$CLIPPY_LOG")" || apply_status=$?
+                    case "$apply_status" in
+                        0)
+                            echo "$mul_add_report"
+                            mul_add_reports="${mul_add_reports}${mul_add_report}"$'\n'
+                            ;;
+                        3) # NOTHING_APPLIED from apply_mul_add.py.
+                            break
+                            ;;
+                        *)
+                            echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
+                            break
+                            ;;
+                    esac
+                done
+                if (( rewrite_round > 5 )); then
+                    echo 'verify.sh: stopped the multiply-add rewrite after 5 rounds'
+                fi
                 rm -f "$CLIPPY_LOG"
                 CLIPPY_LOG=""
+                if [[ -z "$mul_add_reports" ]]; then
+                    echo "verify.sh: clippy's multiply-add rewrite changed nothing"
+                    exit "$clippy_status"
+                fi
                 # The JSON step's buildlog output has diagnostics, not the count.
                 # Keep the applied count separately for first-fire measurement.
                 if [[ "${BUILDLOG_OFF:-0}" != 1 ]]; then
                     rewrite_logs="${MUL_ADD_REWRITE_LOG_DIR:-${MUL_ADD_HOOK_STATE:-$HOME/.local/state/mul-add-hook}/lint-rewrite}"
-                    if ! { mkdir -p "$rewrite_logs" && printf '%s\n' "$mul_add_report" > "$rewrite_logs/$BUILDLOG_CALL_ID.log"; }; then
+                    if ! { mkdir -p "$rewrite_logs" && printf '%s' "$mul_add_reports" > "$rewrite_logs/$BUILDLOG_CALL_ID.log"; }; then
                         echo "verify.sh: could not retain multiply-add rewrite output" >&2
                     fi
                 fi
@@ -1839,7 +1940,7 @@ case "$CMD" in
                 if [[ -n "${RUN_LOG}" ]]; then
                     VERDICT_KEY="$(tree_key)"
                 fi
-                invoke_clippy --workspace --all-targets --all-features
+                invoke_clippy --workspace --all-targets --all-features --keep-going
             fi
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

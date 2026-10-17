@@ -231,6 +231,9 @@ DETACHED_RUNS_DIR = "mesh_runs"
 # A run record written before its supervisor's pid counts as live for this long.
 DETACHED_RUN_START_GRACE_SECS = 60.0
 BOARD_HELPER = Path(__file__).resolve().parent.parent / "delegate" / "board.sh"
+# The folders that hold unit run folders. An app-server whose session directory is one of their
+# children serves that run alone, so its seats get the run as PLAN_DELEGATE_BOARD_DIR.
+RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
 # peer delegate's turn, and the end of the run is the only moment that knows
@@ -1833,6 +1836,22 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
         return _start_server(session_dir, selected_home), True
 
 
+def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
+    """The app-server's environment: the caller's, with the workers home and, for a unit run, the run.
+
+    A seat's hooks and verify.sh runs read the run from PLAN_DELEGATE_BOARD_DIR. The caller's copy
+    cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
+    already have started this server. A run folder is known here, so the server names it itself. A
+    review pool's mesh directory, or any other mesh directory, is not a run: one pool server
+    serves the turns of many units, so it keeps the caller's environment unchanged.
+    """
+    environment = {**os.environ, "CODEX_HOME": str(workers_home)}
+    run = Path(session_dir).absolute()
+    if run.resolve().parent in {root.resolve() for root in RUN_ROOTS}:
+        environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
+    return environment
+
+
 def _start_server(session_dir: str, workers_home: Path) -> int:
     """Start this session's app-server and record it. The caller holds the server lock."""
     chosen = _free_port()
@@ -1845,7 +1864,7 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
             stdout=subprocess.DEVNULL,
             stderr=log_handle,
             start_new_session=True,
-            env={**os.environ, "CODEX_HOME": str(workers_home)},
+            env=_server_environment(session_dir, workers_home),
         )
     served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
                             "auto_compact_tokens": AUTO_COMPACT_TOKENS}
