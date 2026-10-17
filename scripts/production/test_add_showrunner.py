@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""add_showrunner.py through its CLI, with fake herdr, legacy tmux, the session records and the
+"""add_showrunner.py through its CLI, with fake herdr, the session records and the
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
@@ -38,30 +38,7 @@ args = sys.argv[1:]
 with (state / "events.jsonl").open("a") as events:
     events.write(json.dumps({"command": name, "args": args,
                              "claude_env": sorted(key for key in os.environ if key.startswith("CLAUDE_"))}) + "\\n")
-if name == "tmux":
-    # A session is a `live-<name>` file.
-    target = args[args.index("-t") + 1] if "-t" in args else ""
-    if args[:1] == ["has-session"] and not (state / f"live-{target.removeprefix('=')}").exists():
-        raise SystemExit(1)
-    # Like tmux 3.6, an option command takes a pane target: a bare `=name` names no session.
-    if args[:1] in (["show-options"], ["set-option"]) and target.startswith("=") and not target.endswith(":"):
-        print(f"no such session: {target}", file=sys.stderr)
-        raise SystemExit(1)
-    target = target.removesuffix(":")
-    if args[:1] == ["show-options"]:
-        option = state / (target.removeprefix('=') + args[-1])
-        if not option.exists():
-            raise SystemExit(1)
-        print(option.read_text())
-    if args[:1] == ["set-option"]:
-        (state / (target.removeprefix('=') + args[-2])).write_text(args[-1])
-    if args[:1] == ["new-session"]:
-        (state / f"live-{args[args.index('-s') + 1]}").touch()
-        # What the started session does once it is up: STUB_ON_START maps each file it writes to its text.
-        for path, text in json.loads(os.environ.get("STUB_ON_START", "{}")).items():
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_text(text)
-elif name == "systemd-run":
+if name == "systemd-run":
     raise SystemExit(subprocess.run(args[3:], check=False).returncode)
 '''
 SESSIONS = '''import json, os, pathlib, sys
@@ -94,7 +71,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.state.mkdir()
         bin_path = self.root / "bin"
         bin_path.mkdir()
-        for name in ("tmux", "systemd-run"):
+        for name in ("systemd-run",):
             stub = bin_path / name
             _ = stub.write_text(STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
             stub.chmod(0o755)
@@ -109,7 +86,6 @@ class AddShowrunnerTests(unittest.TestCase):
         self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")},
                     "HOME": str(self.root / "home"), "STUB_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    "UNIT_LOOKUP_TMUX": str(bin_path / "tmux"),
                     "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
                     "SYSTEMD_RUN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
                     "SYSTEMCTL": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -296,7 +272,6 @@ class AddShowrunnerTests(unittest.TestCase):
             "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]], [[
             "--session", "kid", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
-        self.assertEqual(self.events("tmux"), [])
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
         self.starts("abc-123", registers="kid")
@@ -468,7 +443,6 @@ class AddShowrunnerTests(unittest.TestCase):
                                   "--config-dir", ".claude3", cwd=home)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
-        self.assertEqual(self.events("tmux"), [])
 
     def test_showrunner_config_directory_requires_resume_and_excludes_account(self) -> None:
         directory = Path(self.env["HOME"]) / "retained"
@@ -483,7 +457,7 @@ class AddShowrunnerTests(unittest.TestCase):
                 self.assertEqual(self.events("systemd-run"), [])
 
     def test_showrunner_resume_uses_configured_account_instead_of_recorded_default(self) -> None:
-        """F004: resume selection ignores the previous tmux account."""
+        """F004: resume selection ignores the previous account."""
         directory = self.named_account()
         _ = (self.state / "kid@claude_config_dir").write_text(str(Path(self.env["HOME"]) / ".claude"))
         self.starts("abc-123", registers="kid")
@@ -491,29 +465,25 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def resume_record(self, *, tmux: str = "") -> None:
+    def resume_record(self) -> None:
         _ = (self.root / "sessions/resume.json").write_text(json.dumps({
             "pid": 991001,
             "sessionId": "abc-123",
             "name": "kid",
             "messagingSocketPath": "",
             "updatedAt": 1,
-            "tmux": tmux,
+            "tmux": "",
         }))
 
-    def test_resume_uses_configured_showrunners_account_for_either_host(self) -> None:
+    def test_resume_uses_the_configured_showrunners_account(self) -> None:
         directory = self.named_account()
         child = add_unit.read_production(self.doc("kid"))
-        for tmux in ("", "kid:@1.%1"):
-            with self.subTest(tmux=tmux):
-                self.resume_record(tmux=tmux)
-                _ = (self.state / "kid@claude_config_dir").write_text("/wrong-account")
-                with patch.dict(os.environ, self.env, clear=True), \
-                        patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
-                    selected = add_showrunner.account_for_launch(child, "abc-123")
-                self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
-                role.assert_called_once_with("showrunner")
-                self.assertEqual(self.events("tmux"), [])
+        self.resume_record()
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
+            selected = add_showrunner.account_for_launch(child, "abc-123")
+        self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
+        role.assert_called_once_with("showrunner")
 
     def test_check_validates_the_destination_without_returning_a_binary(self) -> None:
         child = add_unit.read_production(self.doc("kid"))
@@ -541,7 +511,6 @@ class AddShowrunnerTests(unittest.TestCase):
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check: ok", result.stdout)
-        self.assertEqual(self.events("tmux"), [])
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_showrunner_refuses_explicit_account_different_from_configured_group(self) -> None:
@@ -574,7 +543,6 @@ class AddShowrunnerTests(unittest.TestCase):
             "--env", f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}",
             "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
         self.assertNotIn("caller-token", json.dumps(self.herdr_calls()))
-        self.assertEqual(self.events("tmux"), [])
 
     def test_showrunner_start_not_ready_returns_a_distinct_status_and_sends_no_prompt_or_key(self) -> None:
         start = ("--session kid agent start kid --kind claude --pane w1:p1 --timeout 90000 -- "
@@ -613,12 +581,6 @@ class AddShowrunnerTests(unittest.TestCase):
         self.refused(result, "herdr session list: fixture cannot list herdr sessions")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
-    def test_child_herdr_launch_does_not_require_a_tmux_binary(self) -> None:
-        self.env["UNIT_LOOKUP_TMUX"] = str(self.root / "missing-tmux")
-        self.starts("kid-session", registers="kid")
-        result = self.run_command("kid")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.events("tmux"), [])
 
     def test_child_refuses_a_server_that_appears_after_preflight(self) -> None:
         self.herdr_overrides["--session kid status server"] = CommandResponse(

@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from typing import cast
 
-from style_history import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
+from style_rules import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
 
 RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
 

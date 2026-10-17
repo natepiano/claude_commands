@@ -9,7 +9,6 @@ import io
 from contextlib import redirect_stdout
 import os
 import json
-import subprocess
 import sys
 import time
 from collections.abc import Iterable
@@ -41,7 +40,6 @@ from inventory import (
     parse_inventory,
 )
 import inventory as inventory_work
-import herdr
 import record as recovery_store
 from launch_permission import (
     LaunchPurpose,
@@ -96,6 +94,7 @@ class CommandLine(argparse.Namespace):
     why: str = ""
     move_id: str = ""
     refused: str = ""
+    auto: bool = False
     reset: datetime | None = None
     session_id: str = ""
     pid: int = 0
@@ -190,11 +189,9 @@ def _selected_account(requested: str | None) -> Account:
 def _host_text(host: Host) -> str:
     match host["kind"]:
         case "unit":
-            if host["session_host"] == "herdr":
-                return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
-            return f"unit {host['production']}/{host['unit']}"
-        case "tmux":
-            return f"tmux {host['tmux_session']}"
+            return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
+        case "legacy tmux" | "legacy tmux unit":
+            return f"{host['kind']} {host['session_name']} (manual recovery)"
         case "herdr":
             return f"herdr {host['herdr_session']}"
         case "ghostty" | "zed":
@@ -222,10 +219,18 @@ def _checkout_text(checkout: CheckoutState) -> str:
     return f"{name} {tracking}, {len(checkout['dirty'])} dirty"
 
 
-def _session_lines(session: Session) -> list[str]:
+def _session_lines(session: Session, report: Inventory) -> list[str]:
     summary = f"  {session['kind']} {session['name']} · {_host_text(session['host'])}"
     summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
     lines = [summary]
+    if session["host"]["kind"] in {"legacy tmux", "legacy tmux unit"}:
+        at = settle.record_time()
+        snapshot = recovery_store.RecoverySnapshot(machine=report["machine"], login=report["login"],
+            label=report["label"], taken_at=at, sessions=[])
+        entry = recovery_store.SnapshotClaudeSession(agent="claude", session=session, workers=[],
+            timers=[], last_seen=at, state="unresolved")
+        saved = recovery_store.snapshot_restore_record(snapshot, entry)
+        lines.append(f"    manual restart: {restart_work.legacy_resume_command(saved)}")
     for server in session["codex_servers"]:
         activity = (
             "busy: " + ", ".join(server["busy_workers"])
@@ -240,7 +245,7 @@ def _session_lines(session: Session) -> list[str]:
 def _inventory_lines(report: Inventory) -> list[str]:
     lines = [f"{report['machine']}:"]
     for session in report["sessions"]:
-        lines.extend(_session_lines(session))
+        lines.extend(_session_lines(session, report))
     lines.extend(
         f"  unknown account · {item['pid']} {item['name']} · {item['reason']}"
         for item in report["unattributed"]
@@ -506,56 +511,6 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     return ResolvedSessions(tuple(result), report)
 
 
-def _tmux_free() -> int:
-    causes: list[str] = []
-    try:
-        result = subprocess.run(
-            [os.environ.get("SHUTDOWN_TMUX", "tmux"), "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        names = result.stdout.splitlines()
-        detail = result.stderr.strip()
-        no_server = (not names and len(detail.splitlines()) == 1
-                     and (detail == "no server running" or detail.startswith("no server running on ")))
-        if result.returncode != 0 and not (result.returncode == 1 and no_server):
-            causes.append(f"tmux sessions unreadable: {detail or f'exit {result.returncode}'}")
-        for name in names:
-            causes.append(f"tmux session {name!r} is still registered; close it after moving its agents")
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        causes.append(f"tmux sessions unreadable: {error}")
-    try:
-        _ = herdr.live_sessions()
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-        causes.append(f"herdr sessions unreadable: {error}")
-    try:
-        observed = inventory_work.snapshot_inventory()
-        if isinstance(observed, inventory_work.PartialInventory):
-            causes.extend(f"inventory incomplete: {failure}" for failure in observed.failures)
-            if not observed.failures:
-                causes.append("inventory incomplete: no failure details were returned")
-        else:
-            for login, entries in observed.sessions.items():
-                for entry in entries:
-                    for owner in (entry["session"], *entry["workers"]):
-                        host = owner["host"]
-                        location = ""
-                        if host["kind"] == "tmux":
-                            location = f"tmux session {host['tmux_session']!r}"
-                        elif host["kind"] == "unit" and host["session_host"] == "tmux":
-                            location = f"tmux unit {host['production']}/{host['unit']} in session {host['session_name']!r}"
-                        elif host["kind"] == "unknown":
-                            location = "an unknown host; prove its host before removing tmux"
-                        if location:
-                            causes.append(f"{login}: {owner['name']} ({owner['session_id']}) uses {location}")
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        causes.append(f"inventory unreadable: {error}")
-    if causes:
-        print("\n".join(causes))
-        return 1
-    print("nothing needs tmux")
-    return 0
-
-
 def _snapshot() -> int:
     observed = inventory_work.snapshot_inventory()
     at = settle.record_time()
@@ -664,8 +619,23 @@ def _forget(text: str, account: str = "") -> int:
 
 
 def _unresolved_snapshot_lines(login: str, only: tuple[str, ...] = ()) -> list[str]:
-    return [f"  {item['name']}: unresolved; last seen {_local_time(item['last_seen'])}"
-            for item in _unresolved_snapshot_status(login, only)]
+    snapshot = recovery_store.read_snapshot(login)
+    if isinstance(snapshot, recovery_store.NoRecoverySnapshot):
+        return []
+    lines: list[str] = []
+    for item in snapshot["sessions"]:
+        owner = item["session"]
+        if item["state"] != "unresolved" or (only and owner["session_id"] not in only):
+            continue
+        lines.append(f"  {owner['name']}: unresolved; last seen {_local_time(item['last_seen'])}")
+        if owner["host"]["kind"] in {"legacy tmux", "legacy tmux unit"}:
+            if item["agent"] == "codex":
+                command = restart_work.legacy_codex_command(item)
+            else:
+                saved = recovery_store.snapshot_restore_record(snapshot, item)
+                command = restart_work.legacy_resume_command(saved)
+            lines.append(f"    manual restart: {command}")
+    return lines
 
 
 def _unresolved_snapshot_status(login: str, only: tuple[str, ...] = ()) -> list[UnresolvedRecoverySession]:
@@ -902,10 +872,9 @@ def main(arguments: list[str] | None = None) -> int:
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{down,status,follow,now,cancel,restart,snapshot,tmux-free,forget,remote-control,launch-blocked}",
+        metavar="{down,status,follow,now,cancel,restart,snapshot,forget,remote-control,launch-blocked}",
     )
     _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
-    _ = commands.add_parser("tmux-free", help="check whether anything local still needs tmux")
     forget = commands.add_parser("forget", help="forget one local recovery entry or stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
     _ = forget.add_argument("--account", help="account login or label containing this session")
@@ -943,7 +912,9 @@ def main(arguments: list[str] | None = None) -> int:
                 raise argparse.ArgumentError(self, "--reset requires an aware ISO time") from error
             namespace.reset = reset
 
-    _ = down.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    origin = down.add_mutually_exclusive_group()
+    _ = origin.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    _ = origin.add_argument("--auto", action="store_true", help="move requested by an automatic account rule")
     _ = down.add_argument("--reset", action=AwareReset)
     _ = down.add_argument("--move-id", default="", help=argparse.SUPPRESS)
     _ = down.add_argument("--why", default="", help="reason for the account move")
@@ -1158,8 +1129,6 @@ def _all_accounts(options: CommandLine) -> int:
 
 
 def _dispatch(options: CommandLine) -> int:
-    if options.command == "tmux-free":
-        return _tmux_free()
     if options.command in {"snapshot", "forget"}:
         try:
             return _snapshot() if options.command == "snapshot" else _forget(options.forget_name, options.account or "")
@@ -1301,7 +1270,9 @@ def _dispatch(options: CommandLine) -> int:
             from scripts.accounts import accounts
             from scripts.accounts.refusals import KnownReset, NoResetKnown
             move_origin: accounts.MoveOrigin = accounts.HandOrigin()
-            if options.refused:
+            if options.auto:
+                move_origin = accounts.AutoOrigin()
+            elif options.refused:
                 move_origin = accounts.RefusalOrigin(cast(Literal["weekly", "five_hour", "unknown"], options.refused),
                     KnownReset(options.reset) if options.reset is not None else NoResetKnown())
             return settle.down(

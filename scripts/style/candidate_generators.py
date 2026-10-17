@@ -24,12 +24,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from typing import Literal
 from typing import cast
-
-# A generator returning more candidates than this is a mis-tuned spec, not a
-# dirty project — refuse loudly instead of flooding the agent prompt.
-MAX_CANDIDATES = 150
-
 
 @dataclass(frozen=True)
 class Candidate:
@@ -49,6 +45,12 @@ class CandidatesSpec:
     paths_exempt: tuple[str, ...] = ()
     structs: tuple[str, ...] = ()
     field_type_pattern: str = ""
+    surface: Literal["whole", "partial", "unclassified"] = "unclassified"
+    uncovered: str = ""
+
+
+class CandidatesSpecError(ValueError):
+    """A rule's candidate declaration cannot describe a valid enumeration."""
 
 
 @dataclass(frozen=True)
@@ -84,17 +86,20 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
     """Extract the `candidates:` block from a guideline's frontmatter.
 
     Sub-keys sit one indent level under `candidates:`; list values are inline
-    (`[a, b]`). Returns None when the guideline has no block.
+    (`[a, b]`). Returns None when the guideline has no block. Legacy blocks
+    without a surface declaration remain unclassified.
     """
     lines = style_path.read_text().splitlines()
     if not lines or lines[0].strip() != "---":
         return None
     in_block = False
+    has_candidates = False
     values: dict[str, str | tuple[str, ...]] = {}
     for line in lines[1:]:
         if line.strip() == "---":
             break
         if line.rstrip() == "candidates:":
+            has_candidates = True
             in_block = True
             continue
         if not in_block:
@@ -104,7 +109,7 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
             in_block = False
             continue
         values[match.group(1)] = _parse_spec_value(match.group(2))
-    if "kind" not in values:
+    if not has_candidates:
         return None
 
     def str_value(key: str) -> str:
@@ -117,8 +122,21 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
             return value
         return (value,) if value else ()
 
+    kind = str_value("kind")
+    if not kind:
+        raise CandidatesSpecError(f"{style_path}: candidates.kind is required")
+    surface: Literal["whole", "partial", "unclassified"] = "unclassified"
+    declared_surface = str_value("surface")
+    if "surface" in values and declared_surface not in ("whole", "partial"):
+        raise CandidatesSpecError(f"{style_path}: candidates.surface must be whole or partial")
+    if declared_surface in ("whole", "partial"):
+        surface = declared_surface
+    uncovered = str_value("uncovered")
+    if surface == "partial" and not uncovered.strip():
+        raise CandidatesSpecError(f"{style_path}: partial candidates.surface requires uncovered")
+
     return CandidatesSpec(
-        kind=str_value("kind"),
+        kind=kind,
         origin=str(style_path),
         pattern=str_value("pattern"),
         exclude_pattern=str_value("exclude_pattern"),
@@ -127,6 +145,8 @@ def read_candidates_spec(style_path: Path) -> CandidatesSpec | None:
         paths_exempt=tuple_value("paths_exempt"),
         structs=tuple_value("structs"),
         field_type_pattern=str_value("field_type_pattern"),
+        surface=surface,
+        uncovered=uncovered,
     )
 
 
@@ -1175,11 +1195,4 @@ def enumerate_candidates(spec: CandidatesSpec, project_root: Path) -> Enumeratio
         raise SystemExit(
             f"candidates kind '{spec.kind}' in {spec.origin} has no generator in candidate_generators.py"
         )
-    enumeration = generator(spec, project_root)
-    if len(enumeration.candidates) > MAX_CANDIDATES:
-        raise SystemExit(
-            f"candidates generator '{spec.kind}' for {spec.origin} produced"
-            + f" {len(enumeration.candidates)} candidates (cap {MAX_CANDIDATES});"
-            + " tune the spec's excludes before this unit can be evaluated"
-        )
-    return enumeration
+    return generator(spec, project_root)

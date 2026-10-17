@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import fake_unit_host
 import os
 import re
 import shlex
@@ -126,7 +127,7 @@ def refusing_run(command, *args, **kwargs):
     operation = os.environ["RENAME_TEST_REFUSE"]
     arguments = command[3:] if command[:1] == ["git"] else []
     blocked = ((operation == "repair" and arguments[:2] == ["worktree", "repair"])
-               or (operation == "finish-delete" and arguments == ["branch", "-D", "--", "old"])
+               or (operation == "finish-delete" and arguments[:3] == ["update-ref", "-d", "refs/heads/old"])
                or (operation == "unit-push" and "push" in arguments
                    and "new-alpha-unit:refs/heads/new-alpha-unit" in arguments)
                or (operation == "unit-doc" and arguments == ["diff", "--name-only", "-z", "HEAD"])
@@ -182,7 +183,7 @@ class ProductionRenameTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home"
         self.checkout = self.root / "checkout"
         self.origin = self.root / "origin.git"
@@ -209,10 +210,9 @@ class ProductionRenameTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
-            "UNIT_LOOKUP_TMUX": str(SCRIPT.with_name("fake_tmux.py")),
-            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC",
@@ -334,11 +334,11 @@ class ProductionRenameTests(unittest.TestCase):
                               capture_output=True, text=True, check=False, timeout=60)
 
     def marked_unit(self, unit: str) -> None:
-        self.write(self.root / "tmux.json", json.dumps({"$1": {
-            "label": "unit-before-rename", "panes": ["%4"],
-            "env": {"SHOWRUNNER_UNIT": OLD, "SHOWRUNNER_UNIT_ID": unit}}}))
+        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
+            "unit-before-rename", "w4:p1", {"SHOWRUNNER_UNIT": OLD, "SHOWRUNNER_UNIT_ID": unit})])
 
     def live_unit(self) -> None:
+        fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
         path = self.root / "live.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
@@ -346,7 +346,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.write(self.root / "state/sessions/live.json", json.dumps({
             "pid": os.getpid(), "sessionId": "live-unit", "name": "unit-before-rename",
             "messagingSocketPath": str(path), "updatedAt": 1,
-            "tmux": "unit-before-rename:@1.%4"}))
+            "tmux": ""}))
 
     def seed_unit_config(self, directory: Path, unit: str) -> Path:
         old = self.unit_worktree(OLD, unit)
@@ -685,7 +685,7 @@ class ProductionRenameTests(unittest.TestCase):
         base = self.git("rev-parse", NEW)
         moved = self.run_command("unit", NEW, "alpha-unit")
         self.assert_success(moved)
-        self.assertIn("tmux mark", moved.stdout)
+        self.assertIn("herdr mark", moved.stdout)
         self.assertIn("next launch", moved.stdout)
         self.assert_unit_moved("alpha-unit")
         old, new = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
@@ -707,22 +707,22 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"),
                          f"{self.git('rev-parse', NEW)}\trefs/heads/new")
         self.assertTrue(self.unit_worktree(OLD, "beta-unit").exists())
-        tmux = cast(dict[str, dict[str, object]], json.loads((self.root / "tmux.json").read_text()))
-        self.assertEqual(tmux["$1"]["env"], {"SHOWRUNNER_UNIT": OLD, "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        marks = (self.root / "proc/991001/environ").read_text().split("\0")
+        self.assertIn(f"SHOWRUNNER_UNIT={OLD}", marks)
+        self.assertIn("SHOWRUNNER_UNIT_ID=alpha-unit", marks)
         self.assertIs(self.journal()["done"], False)
         self.assertFalse((self.home / ".claude/.claude.json").exists())
 
-    def test_unit_refuses_when_tmux_discovery_fails_even_if_herdr_answers(self) -> None:
+    def test_unit_refuses_when_herdr_discovery_is_unreadable(self) -> None:
         self.prepare_unit_moves()
         self.marked_unit("alpha-unit")
         self.live_unit()
         self.assert_success(self.run_rename("apply"))
         before = self.snapshot()
-        refused = self.run_command("unit", NEW, "alpha-unit",
-                                   UNIT_LOOKUP_TMUX=str(self.root / "missing-tmux"))
+        refused = self.run_command("unit", NEW, "alpha-unit", HERDR_BIN=str(self.root / "missing-herdr"))
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
         self.assertIn("cannot tell", refused.stderr)
-        self.assertIn("tmux", refused.stderr)
+        self.assertIn("herdr", refused.stderr)
         self.assertEqual(self.snapshot(), before)
 
     def test_unit_resume_uses_current_merge_tip_after_an_unrelated_commit(self) -> None:

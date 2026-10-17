@@ -11,7 +11,8 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from datetime import time as clock
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -21,6 +22,8 @@ import production_units
 import showrunners
 import unit_lookup
 from session_pane import HerdrFailure, read_place
+
+import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -34,6 +37,10 @@ PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
 TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*$", re.MULTILINE)
+# A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
+# not in the production's zone.
+HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
+                       + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 
 
@@ -102,11 +109,18 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
 
 def unit_marks(pid: int) -> tuple[str, str] | None:
     """The production and unit a process's environment marks it with, inherited from its unit's session."""
-    try:
-        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return None
-    values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+    if sys.platform == "darwin":
+        # The Mac has no /proc; herdr reads the environment from ps.
+        try:
+            values = herdr.darwin_process_environment(pid)
+        except (HerdrFailure, subprocess.SubprocessError, OSError):
+            return None
+    else:
+        try:
+            environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            return None
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
     slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
     return (slug, unit) if slug and unit else None
 
@@ -204,6 +218,39 @@ def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     return None
 
 
+def hold_days(match: re.Match[str], today: date) -> list[date]:
+    """The days a hold's time can fall on: the one it names, or each near today when it names no year or no date."""
+    if not match["day"]:
+        return [today + timedelta(days=offset) for offset in (-1, 0, 1)]
+    years = [int(match["year"])] if match["year"] else [today.year + offset for offset in (-1, 0, 1)]
+    days: list[date] = []
+    for year in years:
+        try:
+            days.append(date(year, int(match["month"]), int(match["day"])))
+        except ValueError:
+            continue
+    return days
+
+
+def stated_hold_end(line: str, now: float, zone: ZoneInfo) -> float | None:
+    """The latest time a holding line names, so a hold that states when it ends is not bumped before then.
+
+    A time without a date, or a date without a year, is the occurrence nearest now: "until 01:00" read at
+    23:00 is tomorrow, "since 23:50" read at 00:10 is yesterday, and "10-22 11:47" is the nearest 22 October.
+    """
+    instants: list[float] = []
+    for match in HOLD_TIME.finditer(line):
+        hour, minute = int(match["hour"]), int(match["minute"])
+        if hour > 23 or minute > 59:
+            continue
+        place = ZoneInfo("UTC") if match["utc"] else zone
+        candidates = [datetime.combine(day, clock(hour, minute), place).timestamp()
+                      for day in hold_days(match, datetime.fromtimestamp(now, place).date())]
+        if candidates:
+            instants.append(min(candidates, key=lambda instant: abs(instant - now)))
+    return max(instants, default=None)
+
+
 def stretch_path(slug: str, unit: str) -> Path:
     name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
     return STATE_DIR / f"{name}.json"
@@ -276,7 +323,7 @@ def tick(now: float) -> None:
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
-        # The units are the doc's live rows; each is found by the mark on its tmux session.
+        # The units are the doc's live rows; each is found by the mark on its herdr pane.
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
@@ -316,7 +363,10 @@ def tick(now: float) -> None:
             turns = list(TURN_END.finditer(pane))
             turn = turns[-1] if turns else transcript_turn_end(session_id)
             last = turn.group(0).strip() if turn else "none on screen"
-            if turn and turn.group("kind") in WAITING_KINDS:
+            # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
+            held_until = (stated_hold_end(turn.group(0), now, zone)
+                          if turn and turn.group("kind") == HOLDING_KIND else None)
+            if turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now)):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

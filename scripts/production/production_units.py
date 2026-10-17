@@ -109,3 +109,14 @@ def retired_units(lines: list[str], slug: str) -> set[str]:
     marks = SessionMarks(slug)
     retired = {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)}
     return retired - {""}
+
+
+def production_field(lines: list[str], field: str) -> str:
+    """Read a Production Context field without interpreting its commentary."""
+    prefix = f"- **{field}:** "
+    for line in lines:
+        if line.startswith(prefix):
+            result = cell_value(line[len(prefix):])
+            if result:
+                return result
+    raise Refusal(f"production doc lacks {field}")

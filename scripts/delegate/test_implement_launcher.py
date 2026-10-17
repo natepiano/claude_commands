@@ -83,6 +83,9 @@ elif verb == 'compact':
     else:
         print(f'compacted {name}: {before} -> {after} tokens')
 elif verb == 'can-follow':
+    status_file = session / 'impl_status_impl'
+    if status_file.exists():
+        (session / 'status_before_claim.txt').write_text(status_file.read_text())
     name = option('--to')
     entry = roster.get(name, {})
     status = entry.get('status')
@@ -94,7 +97,7 @@ elif verb == 'can-follow':
             alive = True
         except ProcessLookupError:
             pass
-    if status not in ('done', 'failed') and not (
+    if status not in ('done', 'failed', 'paused') and not (
         status in ('running', 'starting') and pid and not alive
     ):
         sys.exit(2)
@@ -321,7 +324,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "phase_reservation.py", "findings.py", "board.sh"):
+        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         launcher = delegate / "implement.sh"
         _ = launcher.write_text(
@@ -1182,6 +1185,19 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    def test_a_repair_pass_leaves_the_impl_worker_followable(self) -> None:
+        session_dir = self.start_phase("repair-keeps-impl")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        impl = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
+        repair = self.mesh_launch(session_dir, kind="fix")
+        self.assertEqual(repair.returncode, 0, repair.stderr)
+        self.assertEqual(json.loads((session_dir / "impl_worker_impl.json").read_text()), impl)
+        fix = cast("dict[str, object]", json.loads((session_dir / "impl_worker_fix.json").read_text()))
+        self.assertTrue(str(fix["name"]).endswith("-fix"))
+        result = self.mesh_launch(session_dir, to=str(impl["name"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_follow_up_reads_an_old_identity_and_leaves_only_worker_names(self) -> None:
         session_dir = self.start_phase("old-run-follow")
         first = self.mesh_launch(session_dir)
@@ -1271,6 +1287,40 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         changed_model = self.mesh_launch(session_dir, to=name)
         self.assertEqual(changed_model.returncode, 2, changed_model.stderr)
         self.assertEqual(self.open_passes(session_dir), before)
+
+    def test_follow_recovers_missing_claim_unless_the_roster_launcher_is_alive(self) -> None:
+        for launcher_pid in (None, 99999999, os.getpid()):
+            live = launcher_pid == os.getpid()
+            with self.subTest(launcher_pid=launcher_pid):
+                session_dir = self.start_phase(f"missing-claim-{launcher_pid}")
+                first = self.mesh_launch(session_dir)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                roster_path = session_dir / "mesh_roster.json"
+                roster = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+                name = next(iter(roster))
+                roster[name].update(status="paused", paused_from="running", paused_turn=True)
+                if launcher_pid is not None:
+                    roster[name]["launcher_pid"] = launcher_pid
+                _ = roster_path.write_text(json.dumps(roster))
+                status = session_dir / "impl_status_impl"
+                _ = status.write_text("implementing\n")
+                self.assertFalse((session_dir / "impl_claim_impl.json").exists())
+                before = self.open_passes(session_dir)
+
+                result = self.mesh_launch(session_dir, to=name)
+
+                if live:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(status.read_text(), "implementing\n")
+                    self.assertEqual(self.open_passes(session_dir), before)
+                    self.assertFalse((session_dir / "follow_message.txt").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((session_dir / "status_before_claim.txt").read_text(), "error\n")
+                    self.assertEqual(status.read_text(), "implemented\n")
+                    followed = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+                    self.assertEqual(followed[name]["thread_id"], roster[name]["thread_id"])
+                    self.assertTrue((session_dir / "follow_message.txt").exists())
 
     def test_live_claim_refuses_a_second_launcher_without_a_pass(self) -> None:
         session_dir = self.start_phase("claimed")

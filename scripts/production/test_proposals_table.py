@@ -13,13 +13,14 @@ from typing import final, override
 from unittest import mock
 
 import issues
+import proposals_folder
 import proposals_table
 import showrunners
 from proposals_table import ADD_ON_STATE, REVIEW_STATE, Row
 
 # Importable once proposals_table has put scripts/delegate on the path.
 import phase_table
-import progress_history
+from scripts.delegate import plan_history
 
 
 @final
@@ -37,7 +38,7 @@ class ProposalsTableTests(unittest.TestCase):
         """Give each plan path the run files named for it, and every other path none."""
         def plan_runs(plan: Path) -> list[Path]:
             return runs.get(plan, [])
-        with mock.patch.object(progress_history, "plan_runs", side_effect=plan_runs):
+        with mock.patch.object(plan_history, "plan_runs", side_effect=plan_runs):
             yield
 
     def write(self, relative: str, text: str) -> Path:
@@ -109,9 +110,9 @@ class ProposalsTableTests(unittest.TestCase):
         home = self.write("trunk/docs/plans/home-production.md", "## Production Context\n\n- **Proposals:** `~/notes/issues` — tagged proposal\n")
         inside = self.write("trunk/docs/plans/inside-production.md", "- **Proposals:** docs/issues\n")
         none = self.write("trunk/docs/plans/none-production.md", "- **UX guide:** `~/notes/ux`\n")
-        self.assertEqual(proposals_table.issues_folder(home), Path.home() / "notes/issues")
-        self.assertEqual(proposals_table.issues_folder(inside), self.root / "trunk/docs/issues")
-        self.assertIsNone(proposals_table.issues_folder(none))
+        self.assertEqual(proposals_folder.issues_folder(home), Path.home() / "notes/issues")
+        self.assertEqual(proposals_folder.issues_folder(inside), self.root / "trunk/docs/issues")
+        self.assertIsNone(proposals_folder.issues_folder(none))
 
     def test_an_add_on_title_is_read_in_each_way_units_write_it(self) -> None:
         pending = self.write("run/next_items_pending.md", "\n".join([

@@ -40,7 +40,9 @@
 #                                            reviewer that is still working from
 #                                            one that was killed
 #   <session_dir>/review_findings_<N>.txt  — review findings for pass N
-#   <session_dir>/review_agent_<N>.log     — full agent log for pass N
+#   <session_dir>/review_agent_<N>.log     — full agent log for pass N; a worker's
+#                                            pass adds `-<slot>`, a pool's `-pool`, so
+#                                            two seats on one pass keep separate logs
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
 #   <session_dir>/review_agent         — resolved task, family, agent, and effort
@@ -217,7 +219,16 @@ mkdir -p "${ARTIFACT_DIR}"
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
-LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
+# Each seat logs on its own: a second seat taking the same pass and lens would
+# otherwise truncate the first one's log, and with it the reason that seat failed.
+if [[ -n "${REVIEW_WORKER}" ]]; then
+  SEAT_SUFFIX="-${TEAM_SLOT}"
+elif [[ -n "${POOL_TYPE}" ]]; then
+  SEAT_SUFFIX="-pool"
+else
+  SEAT_SUFFIX=""
+fi
+LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
 REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
 if [[ -n "${POOL_TYPE}" ]]; then
   rm -f "${SLOT_FILE}"
@@ -236,7 +247,7 @@ initialize_review_artifacts() {
   # preemption read, the heartbeat digest — keeps working while the per-pass
   # history is kept.
   ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${ARTIFACT_DIR}/review_findings${SUFFIX}.txt"
-  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
+  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
   rm -f "${REPLY_FILE}"
   if [[ -n "${REVIEW_WORKER}" ]]; then
     : > "${FINDINGS_FILE}"
@@ -415,7 +426,7 @@ from pathlib import Path
 
 root_text, slot, name, family, model, helper_dir = sys.argv[1:]
 sys.path.insert(0, helper_dir)
-from worker_state import worker_claim_lock
+from worker_state import worker_claim_lock, worker_record_path
 root = Path(root_text)
 with worker_claim_lock(root):
     try:
@@ -433,7 +444,7 @@ with worker_claim_lock(root):
         "model": model,
         "worker_id": worker_id,
     }
-    (root / f"impl_worker_{slot}.json").write_text(json.dumps(identity))
+    worker_record_path(root, name, slot).write_text(json.dumps(identity))
 PY
 }
 
@@ -656,7 +667,8 @@ if [[ -n "${POOL_TYPE}" ]]; then
     --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
     --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
     "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
-    echo "ERROR: pool allocation failed; see ${LOG_FILE}." >&2
+    # The pool's last line is its reason (`no primed code template`); the director acts on it.
+    echo "ERROR: pool allocation failed: $(tail -n 1 "${LOG_FILE}"); see ${LOG_FILE}." >&2
     exit 1
   fi
   allocation_field() {

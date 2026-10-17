@@ -60,7 +60,7 @@
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. The judged tree is the tree when the run
-# starts, or for `lint` the tree its last rewrite (mend --fix, then fmt) leaves
+# starts, or for `lint` the tree its last rewrite and formatting leave
 # for taplo, clippy and rustdoc. A run that ends on any other tree records
 # nothing: an edit landed while it ran, and its verdict belongs to neither tree.
 # A run outside a delegate session is never cached.
@@ -102,6 +102,10 @@
 #                                          rustdoc on the members that differ
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
+#   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
+#                                          emits style-lint tool boundaries for records
+#                                          --check reports mend findings and checks
+#                                          formatting without applying fixes
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
 #                                          it. For lint, the list reaches mend and
@@ -151,6 +155,7 @@ PY="${HOME}/.claude/scripts/lib/py"
 source "$HOME/.claude/scripts/lint/invoke.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
+MUL_ADD_APPLIER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lint" && pwd)/apply_mul_add.py"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -179,7 +184,14 @@ run() {
         set -m
         (
             set +m
-            if run_once "$@" 2>&1 | tee "$step_log"; then
+            if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
+                # Keep Cargo JSON separate through this wrapper too.
+                if run_json_stdout "$step_log" run_once "$@"; then
+                    exit 0
+                else
+                    exit "$?"
+                fi
+            elif run_once "$@" 2>&1 | tee "$step_log"; then
                 exit 0
             else
                 exit "${PIPESTATUS[0]}"
@@ -768,7 +780,7 @@ tree_key() {
         done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
     "$PY" -c "$TREE_KEY_PY" "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
+        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" "$MUL_ADD_APPLIER" -- "${words[@]}" \
         2>/dev/null || true
 }
 
@@ -1591,6 +1603,7 @@ fi
 # wait out the hold.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
+    [[ -z "${CLIPPY_LOG:-}" ]] || rm -f "$CLIPPY_LOG"
     stop_copy_watch || true
     if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
     finish_run "${status}" || true
@@ -1645,9 +1658,61 @@ case "$CMD" in
     lint)
         PKG="${1:?verify.sh lint <package>}"
         shift
+        CHECK_LINT=0
+        if [[ "${1:-}" == --check ]]; then
+            if [[ "$PKG" != --workspace ]]; then
+                echo 'verify.sh: lint --check requires --workspace' >&2
+                exit 2
+            fi
+            CHECK_LINT=1
+            shift
+        fi
         take_features "$@"
-        require_member "$PKG"
+        if [[ "$PKG" != --workspace ]]; then
+            require_member "$PKG"
+        fi
         require_taplo
+        if (( CHECK_LINT )); then
+            # Judge all three tools even when an earlier one reports findings.
+            # Report mode never enters the rewrite paths of the package gate.
+            lint_status=0
+            if lint_config_enabled mend; then
+                echo 'style-lint: mend start'
+                if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
+                    echo 'style-lint: mend passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
+            fi
+            if lint_config_enabled fmt; then
+                echo 'style-lint: rustfmt start'
+                if fmt_cargo --all --check; then
+                    echo 'style-lint: rustfmt passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
+            fi
+            WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+            if ! (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
+                lint_status=1
+            fi
+            if lint_config_enabled clippy; then
+                echo 'style-lint: clippy start'
+                if invoke_clippy --workspace --all-targets --all-features; then
+                    echo 'style-lint: clippy passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
+            fi
+            exit "$lint_status"
+        fi
         # Order: mend rewrites first, fmt formats what mend wrote, then taplo
         # checks TOML before clippy and rustdoc read the settled tree.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
@@ -1657,6 +1722,7 @@ case "$CMD" in
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
             MEND_LOG="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
@@ -1677,6 +1743,7 @@ case "$CMD" in
                 exit 1
             fi
             rm -f "$MEND_LOG"
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
         else
             lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
         fi
@@ -1684,24 +1751,34 @@ case "$CMD" in
         # package and every member that differs from HEAD once mend has run.
         # Covering them all is what lets one lint record answer for each
         # package (tree_key).
-        FMT_SCOPE=(-p "$PKG")
-        FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+        if [[ "$PKG" == --workspace ]]; then
+            FMT_SCOPE=(--all)
+        else
+            FMT_SCOPE=(-p "$PKG")
+            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
             | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
-        while IFS= read -r member; do
-            if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                FMT_SCOPE+=(-p "$member")
-            fi
-        done <<< "$FMT_MEMBERS"
+            while IFS= read -r member; do
+                if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                    FMT_SCOPE+=(-p "$member")
+                fi
+            done <<< "$FMT_MEMBERS"
+        fi
+        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt start'
+        fi
         fmt_cargo "${FMT_SCOPE[@]}"
-        # The last rewrite is done: taplo, clippy and rustdoc judge this tree.
+        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt passed'
+        fi
+        # Record the tree the first judgment reads; a clippy rewrite rekeys it.
         if [[ -n "${RUN_LOG}" ]]; then
             VERDICT_KEY="$(tree_key)"
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
-        TAPLO_WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+        WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
             | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
-        if (cd "$TAPLO_WORKSPACE_ROOT" && run taplo fmt --check); then
+        if (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
             :
         else
             taplo_status=$?
@@ -1715,7 +1792,59 @@ case "$CMD" in
             fi
             exit "$taplo_status"
         fi
-        invoke_clippy --workspace --all-targets --all-features
+        if lint_config_enabled clippy; then
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
+            CLIPPY_LOG="$(mktemp)"
+            # pipefail preserves clippy's status while tee captures diagnostics.
+            if invoke_clippy --workspace --all-targets --all-features 2>&1 | tee "$CLIPPY_LOG"; then
+                rm -f "$CLIPPY_LOG"
+                CLIPPY_LOG=""
+            else
+                clippy_status=$?
+                if ! grep -Fq '#suboptimal_flops' "$CLIPPY_LOG"; then
+                    exit "$clippy_status"
+                fi
+                json_status=0
+                invoke_clippy_mul_add_json --workspace --all-targets --all-features > "$CLIPPY_LOG" || json_status=$?
+                # -D warnings also makes a useful diagnostic replay exit 101.
+                if [[ "$json_status" != 0 && "$json_status" != 101 ]]; then
+                    echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
+                    exit "$clippy_status"
+                fi
+                apply_status=0
+                mul_add_report="$("$PY" "$MUL_ADD_APPLIER" --workspace-root "$WORKSPACE_ROOT" "$CLIPPY_LOG")" || apply_status=$?
+                case "$apply_status" in
+                    0) echo "$mul_add_report" ;;
+                    3) # NOTHING_APPLIED from apply_mul_add.py.
+                        echo "$mul_add_report"
+                        echo "verify.sh: clippy's multiply-add rewrite changed nothing"
+                        exit "$clippy_status"
+                        ;;
+                    *)
+                        echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
+                        exit "$clippy_status"
+                        ;;
+                esac
+                rm -f "$CLIPPY_LOG"
+                CLIPPY_LOG=""
+                # The JSON step's buildlog output has diagnostics, not the count.
+                # Keep the applied count separately for first-fire measurement.
+                if [[ "${BUILDLOG_OFF:-0}" != 1 ]]; then
+                    rewrite_logs="${MUL_ADD_REWRITE_LOG_DIR:-${MUL_ADD_HOOK_STATE:-$HOME/.local/state/mul-add-hook}/lint-rewrite}"
+                    if ! { mkdir -p "$rewrite_logs" && printf '%s\n' "$mul_add_report" > "$rewrite_logs/$BUILDLOG_CALL_ID.log"; }; then
+                        echo "verify.sh: could not retain multiply-add rewrite output" >&2
+                    fi
+                fi
+                fmt_cargo "${FMT_SCOPE[@]}"
+                if [[ -n "${RUN_LOG}" ]]; then
+                    VERDICT_KEY="$(tree_key)"
+                fi
+                invoke_clippy --workspace --all-targets --all-features
+            fi
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
+        else
+            invoke_clippy --workspace --all-targets --all-features
+        fi
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then

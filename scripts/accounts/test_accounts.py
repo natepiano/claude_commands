@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -28,7 +29,7 @@ from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusals, role_map
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -53,7 +54,7 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 
 
 def setUpModule() -> None:
-    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
@@ -124,12 +125,13 @@ class AccountsTests(unittest.TestCase):
         self.main_dir = Path()
         # The live reading the status table gets for a folder; a folder without one cannot be read.
         self.live: dict[Path, agent_accounts.Report] = {}
+        self.read_claude_live = agent_accounts.claude_live
         self.live_reads = MagicMock()
         self.codex_reads = AsyncMock()
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home with spaces"
         _ = self.home.mkdir()
         self.main_dir = self.home / ".claude"
@@ -2282,6 +2284,14 @@ class AccountsTests(unittest.TestCase):
         login_read.assert_not_called()
 
     def test_status_describes_accounts_without_creating_any(self) -> None:
+        with patch.object(sys, "platform", "linux"):
+            self.assert_status_describes_accounts_without_creating_any("run accounts.py cutover-home")
+
+    def test_mac_status_describes_accounts_without_creating_any(self) -> None:
+        with patch.object(sys, "platform", "darwin"):
+            self.assert_status_describes_accounts_without_creating_any(accounts.MAC_HOME_LOGIN_STEP)
+
+    def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
         self.write_main_config()
         before = set(self.home.iterdir())
@@ -2296,7 +2306,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertNotRegex(stdout, r"\| ~/\.claude +\|")
-        self.assertIn("~/.claude holds a login; run accounts.py cutover-home", stdout)
+        self.assertIn(f"~/.claude holds a login; {home_step}", stdout)
         self.assertNotIn("unit directors", stdout)
         self.assertNotIn("unclassified:", stdout)
         self.assertNotIn("mcpServers:", stdout)
@@ -2703,6 +2713,253 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(second, first)
         self.codex_reads.assert_awaited_once_with(self.home / ".codex")
 
+    def test_next_add_list_and_remove_print_the_stored_plan(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+        self.assertFalse(next_moves.next_moves_file().exists())
+        code, output, error = self.run_cli("next", "add", "units", "1", "claude2", "--hold-minutes", "5")
+        self.assertEqual((code, error), (0, ""))
+        entries = next_moves.read_next_moves()
+        self.assertEqual(len(entries), 1)
+        self.assertIsInstance(entries[0], next_moves.ClaudeGroupMove)
+        assert isinstance(entries[0], next_moves.ClaudeGroupMove)
+        self.assertEqual((entries[0].group, entries[0].at_percent, entries[0].hold_minutes, entries[0].to),
+                         ("units", 1, 5, "claude2"))
+        self.assertIn(entries[0].id, output)
+        self.assertIn("when units reach 1% → claude2", output)
+        code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(listed, output)
+        code, _, error = self.run_cli("next", "remove", entries[0].id)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(next_moves.read_next_moves(), ())
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+
+    def test_next_refuses_unknown_accounts_groups_and_invalid_percent_without_storing_an_entry(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        with redirect_stderr(io.StringIO()) as parser_error:
+            with self.assertRaises(SystemExit) as refused:
+                _ = accounts.main(["next", "add", "unknown-group", "1", "claude2"])
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("unknown-group", parser_error.getvalue())
+        self.assertEqual(next_moves.read_next_moves(), ())
+        for arguments in (("units", "1", "claude99"),
+                          ("units", "-1", "claude2"), ("units", "101", "claude2"),
+                          ("units", "nan", "claude2")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", "add", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                self.assertTrue(error)
+                self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_workers_next_cli_validates_codex_targets_and_lists_and_removes_both_destinations(self) -> None:
+        self.write_note("codex2", "target@example.invalid")
+        self.codex_login("target@example.invalid", self.home / ".codex2")
+        with patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check:
+            code, output, error = self.run_cli("next", "add", "workers", "1", "codex2")
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(check.called)
+        self.assertIs(cast(object, check.call_args.kwargs["repair"]), False)
+        self.assertIn("when workers reach 1% → codex2", output)
+        with patch.object(accounts, "check_codex_target", side_effect=AssertionError("Claude is not a Codex login")):
+            code, output, error = self.run_cli("next", "add", "workers", "0", "claude")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("when workers reach 0% → claude", output)
+        entries = next_moves.read_next_moves()
+        code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("when workers reach 1% → codex2", listed)
+        self.assertIn("when workers reach 0% → claude", listed)
+        for entry in entries:
+            self.assertEqual(self.run_cli("next", "remove", entry.id)[0], 0)
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_workers_next_cli_rejects_hold_unknown_account_and_remote_invalid_entry(self) -> None:
+        for arguments in (("workers", "1", "claude", "--hold-minutes", "5"),
+                          ("workers", "1", "codex99"), ("workers", "1", "claude2")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", "add", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                self.assertTrue(error)
+                self.assertEqual(next_moves.read_next_moves(), ())
+        entry = next_moves.WorkersMove("remote-invalid", 1, next_moves.CodexWorkersTarget("codex99"),
+                                      datetime.now(timezone.utc))
+        code, output, error = self.run_cli("next-write", next_moves.encode_next_moves((entry,)))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertTrue(error)
+        self.assertEqual(next_moves.read_next_moves(), ())
+
+    def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
+        self.login_directory("claude2", "shared@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text('{"showrunners": "claude2", "units": "claude2"}')
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| claude2 " in line)
+        self.assertEqual([cell.strip() for cell in row.split("|")][4], "units, showrunners")
+
+    def json_status_fixture(self) -> tuple[datetime, datetime]:
+        self.login_directory("claude2", "main@example.invalid")
+        self.login_directory("claude3", "unit@example.invalid")
+        self.write_note("claude1", "missing@example.invalid")
+        self.assertEqual(accounts.setup("claude4"), [])
+        for label, login in (("codex1", "workers@example.invalid"),
+                             ("codex2", "startup@example.invalid"),
+                             ("codex3", "unlimited@example.invalid")):
+            self.write_note(label, login)
+            self.codex_login(login, self.home / f".{label}")
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / note_name("codex1")
+        _ = note.write_text("---\nlogin: workers@example.invalid\nuse_credits: off\n---\n")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text('{"units": "claude2", "showrunners": "claude3"}')
+        configuration = accounts.accounts_config_file()
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text('{"workers": "codex1"}')
+        read = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=1)
+        reset = read + timedelta(days=3)
+        usage_store.save([
+            self.reading("main@example.invalid", None, agent_accounts.Quota("Weekly", 29.4, reset)),
+            self.reading("unit@example.invalid", None, agent_accounts.Quota("Weekly", 88, reset)),
+            agent_accounts.Report("Codex", email="workers@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 100, reset)], credit_balance="13446.5"),
+            agent_accounts.Report("Codex", email="unlimited@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 81, reset)], credit_balance="unlimited"),
+        ], read)
+        failed_home = self.home / ".codex2"
+        self.codex_reads.return_value = agent_accounts.Report("Codex", problem="synthetic initialize timeout",
+            codex_startup=agent_accounts.CodexStartupFailure(failed_home, "accounts.py setup codex2"))
+        return read, reset
+
+    def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
+        read, reset = self.json_status_fixture()
+        code, table, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        document = cast(dict[str, object], json.loads(output))
+        self.assertEqual(set(document), {"accounts", "problems"})
+        rows = cast(list[dict[str, object]], document["accounts"])
+        keys = {"label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at"}
+        self.assertTrue(all(set(row) == keys for row in rows))
+        expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
+            ("claude1", "claude", [], None, None, None, False, None),
+            ("claude2", "claude", ["units"], 70.6, reset.isoformat(), None, False, read.isoformat()),
+            ("claude3", "claude", ["showrunners"], 12, reset.isoformat(), None, False, read.isoformat()),
+            ("claude4", "claude", [], None, None, None, False, None),
+            ("codex1", "codex", ["workers"], 0, reset.isoformat(), 13446.5, False, read.isoformat()),
+            ("codex2", "codex", ["spare"], None, None, None, True, None),
+            ("codex3", "codex", ["spare"], 19, reset.isoformat(), "unlimited", True, read.isoformat()),
+        ]
+        fields = ("label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at")
+        self.assertEqual([tuple(row[field] for field in fields) for row in rows], expected)
+        notes = table.split("\n\n", 1)[1].strip().splitlines()
+        self.assertIn("accounts.py setup codex2", "\n".join(notes))
+        self.assertEqual(document["problems"], notes)
+        for row in rows:
+            self.assertNotIn("@", json.dumps(row))
+            self.assertNotIn(str(self.home), json.dumps(row))
+            self.assertNotIn("~/.", json.dumps(row))
+
+        _ = accounts.groups_file().write_text('{"showrunners": "claude3", "units": "claude3"}')
+        code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        changed = cast(list[dict[str, object]], json.loads(output)["accounts"])
+        self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners"], []])
+
+    def test_status_json_adds_login_only_when_requested_without_any_extra_file_reads(self) -> None:
+        _ = self.json_status_fixture()
+        native_read = Path.read_text
+        opened: list[Path] = []
+        def read_text(path: Path, encoding: str | None = None, errors: str | None = None,
+                      newline: str | None = None) -> str:
+            opened.append(path)
+            return native_read(path, encoding=encoding, errors=errors, newline=newline)
+        with patch.object(Path, "read_text", read_text):
+            code, default_output, error = self.run_cli("status", "--json")
+            self.assertEqual((code, error), (0, ""))
+            baseline_reads = list(opened)
+            opened.clear()
+            code, with_login, error = self.run_cli("status", "--json", "--with-login")
+            self.assertEqual((code, error), (0, ""))
+        self.assertEqual(opened, baseline_reads)
+        default_rows = cast(list[dict[str, object]], json.loads(default_output)["accounts"])
+        login_rows = cast(list[dict[str, object]], json.loads(with_login)["accounts"])
+        self.assertEqual([row.pop("login") for row in login_rows], [None, "main@example.invalid",
+            "unit@example.invalid", None, "workers@example.invalid", "startup@example.invalid", "unlimited@example.invalid"])
+        self.assertEqual(login_rows, default_rows)
+
+    def test_json_and_table_refresh_the_same_stale_logins_once_each(self) -> None:
+        self.login_directory("claude2", "stale@example.invalid")
+        self.login_directory("claude3", "fresh@example.invalid")
+        self.write_note("codex1", "codex@example.invalid")
+        codex_home = self.home / ".codex1"
+        self.codex_login("codex@example.invalid", codex_home)
+        now = datetime.now(timezone.utc)
+        reset = now + timedelta(days=3)
+        stale = self.reading("stale@example.invalid", None, agent_accounts.Quota("Weekly", 90, reset))
+        codex = agent_accounts.Report("Codex", email="codex@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 70, reset)], credit_balance="9")
+        usage_store.save([stale, codex], now - timedelta(hours=2))
+        usage_store.save([self.reading("fresh@example.invalid", None, agent_accounts.Quota("Weekly", 20, reset))], now)
+        original = usage_store.store_file().read_bytes()
+        self.live[accounts.account_dir("claude2")] = stale
+        self.codex_reads.return_value = codex
+        for flags in ((), ("--json",)):
+            with self.subTest(flags=flags):
+                _ = usage_store.store_file().write_bytes(original)
+                self.live_reads.reset_mock()
+                self.codex_reads.reset_mock()
+                code, _, error = self.run_cli("status", *flags)
+                self.assertEqual((code, error), (0, ""))
+                self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+                self.codex_reads.assert_awaited_once_with(codex_home)
+
+    def test_stored_status_shows_old_readings_without_live_reads_subprocesses_or_network(self) -> None:
+        self.login_directory("claude2", "old@example.invalid")
+        self.write_note("codex1", "old-codex@example.invalid")
+        self.codex_login("old-codex@example.invalid", self.home / ".codex1")
+        read = datetime(2001, 1, 2, 3, 4, tzinfo=timezone.utc)
+        reset = datetime(2040, 1, 1, tzinfo=timezone.utc)
+        usage_store.save([
+            self.reading("old@example.invalid", None, agent_accounts.Quota("Weekly", 35, reset)),
+            agent_accounts.Report("Codex", email="old-codex@example.invalid",
+                quotas=[agent_accounts.Quota("Weekly", 75, reset)], credit_balance="12"),
+        ], read)
+        before = usage_store.store_file().read_bytes()
+        with (patch.object(agent_accounts, "claude_live", side_effect=AssertionError("stored Claude live read")),
+              patch.object(accounts, "_codex_live", side_effect=AssertionError("stored Codex live read")),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored ssh")),
+              patch.object(subprocess, "run", side_effect=AssertionError("stored subprocess")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("stored Popen"))):
+            code, output, error = self.run_cli("status", "--json", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            rows = cast(list[dict[str, object]], json.loads(output)["accounts"])
+            self.assertEqual([row["weekly_left_percent"] for row in rows], [65, 25])
+            self.assertEqual([row["read_at"] for row in rows], [read.isoformat(), read.isoformat()])
+            code, table, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+        self.assertIn("65%", table)
+        self.assertIn("25%", table)
+        self.assertIn(read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"), table)
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+
+    def test_status_rejects_json_detail_and_login_without_json_as_usage_errors(self) -> None:
+        for flags in (("--json", "--detail"), ("--with-login",)):
+            with (self.subTest(flags=flags), redirect_stdout(io.StringIO()) as output,
+                  redirect_stderr(io.StringIO()) as error):
+                with self.assertRaises(SystemExit) as refused:
+                    _ = accounts.main(["status", *flags])
+            self.assertEqual(refused.exception.code, 2)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("error:", error.getvalue())
+
     def test_codex_setup_requires_its_note_before_creating_a_home(self) -> None:
         result, stdout, stderr = self.run_cli("setup", "codex1")
         self.assertNotEqual(result, 0)
@@ -3083,6 +3340,95 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 2, "—", "—", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
+    def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 90, read + timedelta(days=1)))], read)
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            quota_problem="wording is deliberately unrelated to the skip reason",
+            weekly_read_skip=agent_accounts.StaleTokenSkip())], read + timedelta(days=2))
+        before = usage_store.store_file().read_bytes()
+        with (patch.object(subprocess, "run", side_effect=AssertionError("display launched a process")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("display launched Claude"))):
+            code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| claude2 " in line)
+        self.assertEqual(row.split("|")[5].strip(),
+                         "not read since 05:29: no session to refresh its login")
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        self.live_reads.assert_not_called()
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_after_weekly_reset_with_another_read_failure_shows_only_last_read_time(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 90, read + timedelta(days=1)))], read)
+        # Text alone must never classify a failure as a stale-token skip.
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
+            quota_problem="Weekly quota: not read (stale token; a Claude session on this account refreshes it)")
+        row = self.status_rows()[0]
+        self.assertEqual(row[4], "not read since 05:29")
+        self.assertEqual(row[5], "unavailable")
+        self.assertEqual(row[8], "05:29 PST")
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+
+    def test_status_auth_failure_after_stale_login_skip_clears_its_reason_and_keeps_last_good_reading(self) -> None:
+        login = "idle@example.invalid"
+        self.login_directory("claude2", login)
+        directory = accounts.account_dir("claude2")
+        read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading(login, None,
+            agent_accounts.Quota("Weekly", 90, read + timedelta(days=1)))], read)
+        before = usage_store.load()[login].copy()
+        credentials = directory / ".credentials.json"
+        _ = credentials.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture-stale", "expiresAt": 1}}))
+        credential_bytes = credentials.read_bytes()
+        with (patch.object(agent_accounts, "claude_live", side_effect=self.read_claude_live) as reads,
+              patch.object(agent_accounts, "command_json", side_effect=[
+                  {"loggedIn": True, "email": login, "authMethod": "claude.ai"},
+                  RuntimeError("fixture auth failed")]) as auth,
+              patch.object(subprocess, "run", side_effect=AssertionError("read launched a process")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("token refresh launched")),
+              patch.object(urllib.request, "urlopen",
+                  side_effect=AssertionError("stale token used for a read"))):
+            skipped = self.status_rows()[0]
+            self.assertEqual(skipped[4], "not read since 05:29: no session to refresh its login")
+            self.assertIsInstance(usage_store.weekly_read_skip(usage_store.load()[login]),
+                                  agent_accounts.StaleTokenSkip)
+            failed = self.status_rows()[0]
+        self.assertEqual(failed[4], "not read since 05:29")
+        self.assertEqual((failed[5], failed[8]), ("unavailable", "05:29 PST"))
+        self.assertEqual(usage_store.load()[login], before)
+        self.assertEqual(credentials.read_bytes(), credential_bytes)
+        self.assertEqual(auth.call_count, 2)
+        self.assertEqual(reads.call_args_list, [call(directory), call(directory)])
+        self.codex_reads.assert_not_awaited()
+
+    def test_status_stale_token_skip_keeps_a_current_weekly_window_unchanged(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        read = datetime.now(timezone.utc) - timedelta(minutes=45)
+        reset = read + timedelta(days=2)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 25, reset))], read)
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
+            weekly_read_skip=agent_accounts.StaleTokenSkip())
+        row = self.status_rows()[0]
+        self.assertEqual(row[4], "75%")
+        self.assertEqual(row[5], reset.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"))
+        self.assertEqual(row[8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+
+    def test_status_stale_token_skip_without_any_stored_reading_stays_unavailable(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
+            weekly_read_skip=agent_accounts.StaleTokenSkip())
+        row = self.status_rows()[0]
+        self.assertEqual((row[4], row[5], row[8]), ("unavailable", "unavailable", "—"))
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+
     def test_status_times_use_the_users_zone_setting_when_no_production_runs_or_none_can_be_read(self) -> None:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -3192,6 +3538,15 @@ class AccountsTests(unittest.TestCase):
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"workers": "codex2"}\n')
         return default, target
+
+    def test_workers_swap_records_the_callers_auto_reason_and_cause(self) -> None:
+        _ = self.workers_fixture()
+        with patch.object(accounts, "_retire_workers_servers", return_value=[]):
+            _ = accounts.swap("workers", "codex1", why="auto: workers-entry", cause="auto")
+        rows = [cast(dict[str, object], json.loads(line))
+                for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual((rows[-1]["role"], rows[-1]["cause"], rows[-1]["why"]),
+                         ("workers", "auto", "auto: workers-entry"))
 
     def test_unset_workers_role_refuses_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
@@ -3945,7 +4300,7 @@ class PickerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
         }, clear=True)))
@@ -4030,6 +4385,7 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(accounts.group_transition("units"), accounts.NoGroupTransition)
         self.assertEqual(path.read_bytes(), original)
         transition = accounts.set_group_account("units", "claude2", why="operator choice", now=self.now)
+        self.assertEqual(transition.why, accounts.RecordedTransitionReason("operator choice"))
         stored = cast(dict[str, object], json.loads(path.read_text()))
         selection = cast(dict[str, object], stored["units"])
         self.assertEqual((selection["label"], selection["cause"], selection["window"]), ("claude2", "by hand", "unknown"))
@@ -4038,6 +4394,25 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(stored["showrunners"], "claude3")
         self.assertEqual(accounts.group_transition("units"), transition)
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+
+    def test_historical_transition_reason_is_unavailable_only_when_the_field_is_absent(self) -> None:
+        path = self.groups()
+        selection: dict[str, object] = {"label": "claude1", "move_id": "historical-transition",
+                                      "cause": "by hand", "window": "unknown"}
+        cases: tuple[tuple[dict[str, object], accounts.TransitionReason], ...] = (
+            (selection, accounts.UnavailableTransitionReason()),
+            ({**selection, "why": ""}, accounts.RecordedTransitionReason("")),
+            ({**selection, "why": "operator selection"}, accounts.RecordedTransitionReason("operator selection")),
+        )
+        for stored, expected in cases:
+            with self.subTest(selection=stored):
+                _ = path.write_text(json.dumps({"units": stored, "showrunners": "claude3"}))
+                before = path.read_bytes()
+                transition = accounts.group_transition("units")
+                assert isinstance(transition, accounts.GroupTransition)
+                self.assertEqual(transition.move_id, "historical-transition")
+                self.assertEqual(transition.why, expected)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_mixed_group_writes_keep_every_sibling_field_and_log_only_the_changed_group(self) -> None:
         transition = {"label": "claude1", "move_id": "original-transition", "cause": "refusal",
@@ -4080,7 +4455,7 @@ class PickerTests(unittest.TestCase):
         moves.append_move(request)
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", cause="credits off", moved=["delegate", "fix"]))
+            fallback_at=stamp, owner="codex1", cause="credits off", why="credits off", moved=["delegate", "fix"]))
         with patch.object(accounts, "datetime", PickerTime):
             text = accounts.status_report(detail=True)
         self.assertIn("by hand", text)
@@ -4095,7 +4470,7 @@ class PickerTests(unittest.TestCase):
             fallback_at=stamp, owner="codex1", restored=["delegate"], kept=["fix"]))
         failed_at = (self.now + timedelta(minutes=1)).isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=failed_at, tool="codex",
-            fallback_at=failed_at, owner="unknown", cause="refusal", moved=["delegate"]))
+            fallback_at=failed_at, owner="unknown", cause="refusal", why="Codex refused work for quota", moved=["delegate"]))
         moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=failed_at, tool="codex",
             fallback_at=failed_at, owner="unknown", outcome="failed", restored=[], kept=[], failed=["delegate (unreadable)"]))
         with patch.object(accounts, "datetime", PickerTime):
@@ -4106,6 +4481,19 @@ class PickerTests(unittest.TestCase):
         self.assertIn("delegate (unreadable)", routing)
         self.assertIn("owner unknown", routing)
         self.assertNotIn("— open", routing)
+
+    def test_status_detail_shows_scheduled_claude_routing_as_auto(self) -> None:
+        self.codex("default", "worker@example.invalid")
+        stamp = self.now.isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", cause="auto", why="auto: workers-once", moved=["delegate"]))
+        with patch.object(accounts, "datetime", PickerTime):
+            text = accounts.status_report(detail=True)
+        routing = text.split("Codex work routing:", 1)[1]
+        self.assertIn("auto", routing)
+        self.assertIn("routed to claude", routing)
+        self.assertIn("delegate", routing)
+        self.assertIn("— open", routing)
 
     def test_default_input_is_refused_before_any_session_or_home_matcher(self) -> None:
         self.codex("default", "worker@example.invalid")

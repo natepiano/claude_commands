@@ -22,6 +22,9 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
+At startup or restart, a header `**Standing:** style_plan.py` runs
+<StandingPlanRefill/> before choosing a phase; repeat after compaction.
+
 State:
 
 - `SESSION_DIR`: last path printed by `prepare_session.sh`.
@@ -102,7 +105,9 @@ mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 When the production doc names a review pool, send code reviews with
 `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
-review resumes the unit's own reviewer, which is never reset.
+review resumes the unit's own reviewer, which is never reset. A refusal ending
+`no primed code template` means `review-unit` has not primed the pool yet: send
+that review to an idle worker with `--to`, and tell the showrunner once.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
@@ -161,7 +166,7 @@ that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/
 in full at <PrepareSession/> and after every compaction, and apply it
 throughout. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
-  branch into this branch;
+  branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
 - it runs independent phases in parallel, mapped at plan start and at each
@@ -373,13 +378,15 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex workers running: the mover ends them with this session.
+   Leave Codex workers running: the mover pauses them with this session.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.
 
 The session is resumed with that line, on the account the message names; continue
-from it. A forced stop without this message is a separate command the user gives.
+from it. Before any dispatch, run the resume commands in the shutdown message;
+never open a new seat for a role a paused seat holds. A forced stop without this
+message is a separate command the user gives.
 </PauseForMove>
 
 <CompactionContract>
@@ -584,6 +591,14 @@ launcher writes its files to that phase's `${PHASE_DIR}`.
 </PassOwnership>
 
 <ProgressContract>
+Before stating any ETA in a message, reply or notice, record it with
+`progress_history.py eta --session-dir "${SESSION_DIR}" --time <HH:MM> --basis stated`
+(`--basis checkpoint` for checkpoint notices, `--basis eta-command` for
+`/unit:eta` and `/unit:eta_breakdown`). Add `--phase-id <id>` when it names a
+phase other than the active one. `<HH:MM>` means today in the user's zone; an
+ETA on a later day takes `<YYYY-MM-DDTHH:MM>`. State the time the recorder
+printed.
+
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
 The key sets the Codex poll timeout and a Claude unit's notifier interval.
@@ -889,8 +904,9 @@ An answer is `cargo-berth claim <paths> --reservation <id> --<choice> <holder>
 one step and exits 0. `before` and `after` widen only that phase's reservation,
 with the ordering edge; `defer` records the answer and takes no paths, so the
 phase holds its dispatch on them. An id the ledger does not know is refused.
-A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
-recorded: the answer stands, so do not repeat it. When several holders
+A claim behind a holder you already sequenced against reuses that edge and
+adds the paths; only `cargo-berth sequence` still refuses a duplicate edge
+(exit 2). When several holders
 conflict, name every one in the same claim, one flag each: `--before`,
 `--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
 claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
@@ -1056,19 +1072,14 @@ Use <UserFacingText/> and emit:
 Summary and reference numbers must match. A reader should not need the plan,
 diff, reviews, or finding ids.
 
-**Close every delegation result with the current progress header** — both tables
-and the wall-clock line, produced by <ProgressReport/> steps 3 and 5 with the
-current pass or activity. This is unconditional: the numbered items say what
-happened, and the tables say how far into the phase and the plan it happened,
-which is the half the user cannot reconstruct. Emit it after any launch,
-printed below the sections above exactly as the recorder emits it. With the
-phase active and no pass or activity open, the recorder prints the same tables
-from the phase's last recorded values under an `as of` line: paste them like any
-tick. When the last phase is closed but an activity is still open, the recorder
-prints both tables from that phase's last recorded values with the activity as
-the running row: paste them like any tick. `No active phase to report` remains
-only when no phase is active and no activity is open; then continue without the
-tables rather than stalling the turn.
+**Close every delegation result and launch with the short progress report**
+from <ProgressReport/>: phase and stage, ETA line, workers, summary, board link,
+and wall clock. Copy the recorder's phase, stage, ETA and clock exactly. Include
+both recorder tables only for `/unit:report tables`.
+
+Between windows, keep the recorder's `as of` and no-open-window lines. An
+activity still open after its phase closes remains the stage. If the recorder
+reports `No active phase to report`, continue without the progress report.
 </DelegationResultFormat>
 
 <FixDispatch>
@@ -1383,6 +1394,9 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
+Standing plans skip this tag entirely: their excluded plan and pinned files
+are never staged, and no shrink commit or notice is sent.
+
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -1456,7 +1470,9 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, choose the next phase or close the plan. If no
+At <PhaseEnd/>'s next boundary, a plan whose header carries
+`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
+the next phase or close the plan. If no
 todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
@@ -1473,6 +1489,52 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
+
+<StandingPlanRefill>
+Run at standing-plan startup, after compaction or restart, and at every
+<NextPhase/> boundary, before deciding that the plan is exhausted.
+Before `next-phase`, read every
+`${SESSION_DIR}/phases/*/delegated_phase_reservation_state.json`. For any record
+in `checkpoint_committed_awaiting_release_confirmation`, resume
+<CheckpointCommit/> at step 7 through release confirmation, then push and merge
+request as that procedure requires, before refilling; a new ticket must not
+overtake an unconfirmed release. An unsuccessful recovery stops refill.
+
+Then run:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <unit-worktree>
+```
+
+Use the unit worktree's own plan: `add_unit.py` copies the showrunner template
+only at first launch. Exit 0 continues with the todo phase; a todo repair
+always runs first. The ledger resumes assigned work, rebuilds a missing phase,
+recovers interrupted assignment, and discards merged or dropped ticket phases;
+never take a second ticket while one is open.
+
+| Exit | Unit status and next action |
+| --- | --- |
+| 3 | `waiting for sync` or `waiting for structure: <crates>`; report the printed line once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
+| 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
+| 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
+| Other nonzero | Report the error and retain the ticket; repair it before refill. |
+
+A standing plan never closes its run: skip FinalGate, RunAsBuilt, the final
+PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,
+`docs/style-production/` or its pinned rule files. Workers judge only the pinned
+`docs/style-production/rules/<blob>.md` files named in the ticket Work Order;
+`record --ticket` keeps that pinned blob even after a live rule edit, which
+leaves the new rule's cell stale until a later ticket.
+
+The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
+worktree. Run it again at <CheckpointCommit/> step 6 before staging. The gate and
+`ticket checkpoint` refuse unjudged owned cells, naming each one. Coverage
+selection runs the mechanical filter at the ticket's recorded base; an approved
+proposal permits only files of its approved findings. Exit 1 retains the
+reservation and returns to repair. Exit 0 permits committing exactly that tree,
+then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit>`
+before marking the phase done. Both gates run this one command, so they cannot drift.
+</StandingPlanRefill>
 
 <FinalGate>
 Loop/verbose only after plan exhaustion:

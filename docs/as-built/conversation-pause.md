@@ -89,7 +89,7 @@ For five minutes after automatic return, a late yes reports that updates already
 ReportedPassWindow | ReportedActivityWindow | NoReportedWindow
 ```
 
-When the last phase is closed but an activity remains open, `progress` calls `_print_last_recorded(...)`. It prints the scope table and round table from that phase's last recorded report, then shows the activity as the running row. Command-line percentages, command-line activity text and `pending_calibration` do not revise the closed phase, and this path appends no `progress_reported` event. An older state file missing its project clock is backfilled before the report. `No active phase to report` is reserved for a missing or closed phase with no open activity. As on every `progress` call, the unit notifier is restarted before state is read.
+When the last phase is closed but an activity remains open, `progress` calls `_print_last_recorded(...)`. It prints the short report from that phase's last recorded report (phase heading, ETA line, worker lines), with the clocks and round tables only under `--tables`, then shows the activity as the stage line. Command-line percentages, command-line activity text and `pending_calibration` do not revise the closed phase, and this path appends no `progress_reported` event. An older state file missing its project clock is backfilled before the report. `No active phase to report` is reserved for a missing or closed phase with no open activity. As on every `progress` call, the unit notifier is restarted before state is read.
 
 ### Unit status and stall watch
 
