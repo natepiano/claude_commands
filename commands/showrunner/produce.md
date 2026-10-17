@@ -341,7 +341,7 @@ State:
 Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 --production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
 the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
-last code checkpoint from first-parent merge history, and checks its herdr or tmux
+last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
 again and retargets the instance. A reboot needs nothing.
 
@@ -413,7 +413,7 @@ This session's name is written nowhere: the update timer is addressed to its
 Claude session id, and every tool looks the name up from that when it needs it.
 The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
-stall-watch and tmux-names only when absent, and prints `next_due`. Use the
+stall-watch only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
 When the doc's Updates line reads `on demand`, or there is none, it makes
 `UPDATES` at the default 15 minutes and stops it, prints `on demand: no
@@ -1196,7 +1196,7 @@ outside it too: wrap neither waits on it nor retires its worktree or branch.
    production's links in the showrunner tree, deletes its own footer, pause,
    open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
-   Leave herdr and tmux sessions for the user to close.
+   Leave herdr sessions for the user to close.
 </Wrap>
 
 ---

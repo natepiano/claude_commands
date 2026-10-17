@@ -2,8 +2,7 @@
 
 How the production scripts start and drive Claude sessions under herdr. This
 doc grows as the adoption work lands; today it holds the Claude trust check
-every launcher runs before it starts a session, and the one path that reads and
-types into a session on either host, tmux or herdr.
+every launcher runs before it starts a session, and the shared path for reading and typing into herdr panes.
 
 ## Claude trust before every launch
 
@@ -66,7 +65,7 @@ anything.
 - The survey prints only the key, accepted and kind fields of `.claude.json`,
   never any other field.
 - Tests use temporary folders and fake account files; they never start real
-  herdr, tmux, Claude or Codex, and nothing answers a trust prompt.
+  herdr, Claude or Codex, and nothing answers a trust prompt.
 - New herdr launchers call `claude_trust` and `trust_command`, not a check of
   their own.
 
@@ -88,134 +87,38 @@ anything.
   replaced by `claude_trust`.
 - A Codex trust check: no launcher starts interactive Codex.
 
-## Typing into and reading sessions on either host
+## Session commands and pane access
 
-### What it is
+`herdr_sessions.py` provides `list`, `attach`, `start` and `resume`. A start or
+resume in an untrusted folder refuses with one line to paste: the account's
+trust command, then the same invocation with `--cwd` written out. No server is
+started before trust is checked.
 
-Relays, `/compact`, the go-ahead, effort changes, the stall watch,
-`unit_status.sh`, promotion and the shutdown screen check all read or type into
-a Claude session. `scripts/production/session_pane.py` is the one path they
-use, and it works the same for a session in a tmux pane and one in a herdr
-pane. A relay to a herdr session blocked at a trust, permission or question
-prompt is refused with a line saying so; nothing is typed into the prompt.
+`session_pane.py` reads and types through `HerdrPlace(session, pane)`.
+`MarkedUnit(unit, claude, place)` carries that place; its session name is
+`place.session`. `read_place(place, lines=60, *, joined=False, ansi=False)`
+uses herdr's recent pane text. `type_place` sends an agent prompt, `keys_place`
+sends keys and `where_place` prints `herdr:<session>:<pane>`.
+`record_place(record)` resolves the registry pid through `herdr_place_of`;
+`session_place(id)` first chooses the newest live record. An unreadable cwd
+preserves process placement and unit marks.
 
-### How it works
+The CLI takes `read|type|keys|where` and either `unit <slug> <unit>` or
+`session <id>`. A trust, permission or question prompt refuses typing with
+exit 4 and a plain line; a missing target exits 1, usage 2 and host failure 3.
+Effort changes, promotion, relays, the stall watch, unit status, shutdown
+screen checks and the Remote Control fixer use this path. The fixer confirms
+the registry process identity and idle state before typing.
 
-- A place is `unit_lookup.Place = TmuxPlace(pane) | HerdrPlace(session, pane)`.
-  `MarkedUnit(unit, label, claude, place)` carries it; `label` is the tmux
-  session label or the herdr session name. Every caller dispatches on
-  `unit.place`, never on a pane string.
-- Library, each function branching once on the place's type:
-  - `read_place(place, lines=60, *, joined=False, ansi=False) -> str` — tmux
-    `capture-pane -p [-J] [-e]`; herdr `Herdr.read`
-    (`pane read --source recent|recent-unwrapped --lines N [--format ansi]`).
-    `lines` is the last N lines of output on both hosts; tmux trims its
-    `capture-pane -S -N` output to the last N lines.
-  - `type_place(place, text)` — tmux `send-keys -l <text>` then `send-keys Enter`,
-    two calls; herdr `Herdr.prompt` (`agent prompt`).
-  - `keys_place(place, *keys)` — tmux `send-keys`; herdr `Herdr.send_keys`.
-  - `where_place(place) -> str` — `tmux:<pane>` or `herdr:<session>:<pane>`.
-  - `record_place(record: SessionRecord) -> Place` — the pane of that one
-    registry process. On Linux the pane is `TMUX_PANE` from
-    `/proc/<pid>/environ` (`HERDR_PROC` overrides the root); on Darwin it is the
-    `%N` at the end of the record's `tmux` field. With no tmux pane it is
-    `herdr.herdr_place_of(pid)`; with neither, `NoSuchTarget`.
-  - `session_place(session_id) -> Place` — `record_place` of the newest live
-    session record with that id. Two live processes can share a session id, so
-    a caller holding an observed record uses `record_place`.
-  - Errors: `TmuxFailure(OSError)` for tmux, `HerdrFailure` and its subclass
-    `AgentBlocked` for herdr, `NoSuchTarget` when no live session or marked unit
-    matches.
-- CLI: `session_pane.py read|type|keys|where <target>`, the target being
-  `unit <slug> <unit>` (through `unit_lookup.marked_units`) or `session <id>`.
-  `read` takes `--lines N`, `--joined` and `--ansi`; `type` takes one text
-  argument; `keys` one or more keys; `where` nothing. Exits: 0 done, 1 no such
-  target, 2 usage, 3 host failure, 4 blocked at a prompt
-  (`<target>: blocked at a prompt; nothing typed`, from herdr's `agent_blocked`
-  refusal).
-- Callers:
-  - `commands/showrunner/produce.md`, `dailies.md` and `promote_unit.md` run
-    the CLI for relays, the `/compact` idle check, the go-ahead, pane reads and
-    stopping a session (`type session <id> /exit`).
-  - `unit_effort.py` reads with `ansi=True`, judges the screen with `verdict`,
-    then `type_place`s `/effort <level>`.
-  - `stall_watch.py` hashes `read_place(place, 400, joined=True)`.
-  - `add_unit.wait_for_remote_control` polls `read_place` for
-    `/remote-control is active`. Its resume path stops a tmux unit with
-    `kill-session` and a herdr unit with
-    `herdr.stop_session(place.session)`.
-  - `live_units.py` prints `unit_lookup.place_text(place)`: the bare pane id
-    for tmux, `herdr:<session>:<pane>` for herdr. `adopt.py` refuses a unit not
-    in tmux.
-  - `unit_status.sh` takes each unit's text from
-    `session_pane.py read unit <slug> <unit> --lines 400 --joined`, and its
-    Claude state and session id from `unit_lookup.py list` (column 4 the state,
-    column 6 the session id). An unreadable state prints
-    `CLAUDE STATE UNKNOWN`.
-  - `scripts/shutdown/settle.py` `_screen` reads a herdr host through
-    `read_place` (60 lines), a tmux or unit host by the pane id in its session
-    record, and returns `ScreenUnreadable("no pane host")` for any other host.
-  - `scripts/shutdown/remote_control.py` resolves a restarted session's pane
-    with `record_place` on the registry record it just observed, reads it with
-    `read_place` for `/remote-control is active`, and types `/remote-control`
-    with `type_place` while the registry shows the session idle; herdr
-    `AgentBlocked` uses no attempt. Recovery and failures stay in the service
-    log; no Remote Control message or phone push is sent.
-- `promote_showrunner.py` refuses before anything stops when `read_place`
-  fails or `unit_effort.verdict` skips the screen. `stop` types `/exit` with
-  `type_place`, waits for the pid to exit, then ends the host session: tmux
-  `kill-session`, herdr `herdr.stop_session(label)`. The account directory for
-  the resume is the tmux session's `@claude_config_dir` option for a tmux unit,
-  and `scripts.whoami.account.process_config_dir(pid)` of the live Claude for a
-  herdr unit; no directory refuses with
-  `<unit>: cannot read its live Claude's account environment`.
+Unit marks are written when a herdr pane launches. Existing sessions cannot
+be adopted by attaching marks later. Unit resumes stop their own herdr
+session and launch with the recorded host name. Promotion reads the live
+Claude's account with `account.process_config_dir`; unit model restoration
+uses the transcript's last assistant message.
 
-### Invariants
-
-- Callers read and type only through `session_pane.py`. The exceptions are
-  `settle._screen`'s tmux branch, the one direct `capture-pane` left, and
-  `herdr.py` itself, which reads the visible screen when `agent start` reports
-  `agent_not_ready`.
-- A herdr session blocked at a prompt is never typed into; `type` exits 4. A
-  tmux pane has no such refusal: `type` sends whatever the screen shows, so a
-  caller that must not land in a form (effort, promotion) checks
-  `unit_effort.verdict` first.
-- One account reader: a herdr unit's account comes from
-  `account.process_config_dir`, never a second process-environment reader.
-- A tmux unit's name never exempts a herdr session from promotion's name
-  collision check (`add_showrunner.herdr_session_running`): only a herdr unit
-  passes its label as `ending`.
-
-### Gotchas
-
-- On Darwin the pane id comes only from the session record's `tmux` field; `ps`
-  output is never read for it.
-- `herdr agent start … -- claude` adds the binary to argv itself; callers pass
-  only the extra arguments.
-- A new pane's zsh takes about 2.3 s to start, so `Herdr.start_agent` retries
-  `agent_pane_busy` using herdr's own available-shell check, only while more
-  than 3000 ms remains; the initial call keeps the caller's timeout unchanged.
-  The deadline bounds when the last try begins, and each subprocess retains
-  its ten-second grace because killing an in-flight start could leave a
-  half-started agent.
-- Trust checks go only through `herdr.claude_trust` and `trust_command`, exact
-  keys only (see "Claude trust before every launch").
-- `read --ansi` dimmed-suggestion detection (`\e[2m` after `❯`, which
-  `unit_effort.verdict` treats as no draft) is confirmed live on tmux. Its check
-  on herdr belongs to the live run with a herdr-hosted Claude in the herdr
-  adoption plan's standalone-sessions phase.
-- `add_unit.account_for_launch`, resuming a unit with no shutdown record and
-  no `--account` or `--config-dir`, reads the tmux `@claude_config_dir` option
-  only for a unit in a tmux place; a unit in a herdr place takes
-  `accounts.role_account("unit")`, and `model_for_resume` reads its model from
-  the transcript's last assistant message (`transcript_model`) in place of
-  `@claude_model`. `add_showrunner.account_for_launch` does the same for a
-  herdr resume (`resume_uses_herdr`).
-
-### Ruled out
-
-- Parsing Darwin `ps eww` for `TMUX_PANE`: argv tokens read as environment
-  entries.
-- A second process-environment reader for a unit's account: replaced by
-  `account.process_config_dir`.
-- `MarkedUnit.pane`: replaced by `place`.
+Darwin servers and shutdown helpers start through `scripts/lib/detached.py`.
+Readiness includes a live child and its first sign of life. A herdr server's
+session socket must belong to that child; a competing server is refused by
+exclusive starts and adopted only by adopting starts. Linux uses systemd.
+Mac window restores start from the unlocked desktop session; an unavailable
+desktop refuses the restart with an unlock-and-restart instruction.

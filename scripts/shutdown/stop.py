@@ -141,10 +141,6 @@ def run_codex_mesh(arguments: list[str]) -> int | None:
     return _run([sys.executable, str(CODEX_MESH), *arguments])
 
 
-def run_tmux(arguments: list[str]) -> int | None:
-    return _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), *arguments])
-
-
 def run_systemctl(arguments: list[str]) -> int | None:
     return _run(["systemctl", *arguments])
 
@@ -231,7 +227,8 @@ def _set_stop_outcome(
             current["progress"] = {"kind": "already gone", "at": at}
         else:
             current["progress"] = {"kind": "process identity lost", "at": at}
-        current["stop_issues"] = issues
+        current["stop_issues"] = [*issues, *(issue for issue in current["stop_issues"]
+            if issue["kind"] == "legacy tmux session left running" and issue not in issues)]
 
     return update_session(claim.login, claim.session_id, change)
 
@@ -241,7 +238,8 @@ def _replace_stop_issues(
 ) -> SessionShutdown:
     def replace(current: SessionShutdown) -> None:
         claim.require(current)
-        current["stop_issues"] = issues
+        current["stop_issues"] = [*issues, *(issue for issue in current["stop_issues"]
+            if issue["kind"] == "legacy tmux session left running" and issue not in issues)]
 
     return update_session(claim.login, claim.session_id, replace)
 
@@ -340,41 +338,11 @@ def _stop_codex_servers(
     return issues
 
 
-def _stop_unit_tmux(
-    session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
-) -> list[SessionStopIssue]:
-    if session["kind"] != "unit" or session["host"]["session_host"] != "tmux":
-        return []
-    tmux_session = session["host"]["session_name"]
-    target = f"={tmux_session}"
-    issue: SessionStopIssue = {
-        "kind": "unit session left running",
-        "at": _timestamp(clock),
-        "host": "tmux",
-        "session_name": tmux_session,
-        "cause": "stop not confirmed",
-    }
-    try:
-        claim.check()
-        killed = tmux(["kill-session", "-t", target])
-        if killed is None:
-            return [issue]
-        claim.check()
-        remaining = tmux(["has-session", "-t", target])
-    except (OSError, subprocess.TimeoutExpired):
-        return [issue]
-    if remaining is None or remaining == 0:
-        return [issue]
-    return []
-
-
 def _stop_unit_session(
-    session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
+    session: Session, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit":
+    if session["kind"] != "unit" or session["host"]["kind"] != "unit":
         return []
-    if session["host"]["session_host"] == "tmux":
-        return _stop_unit_tmux(session, tmux, clock, claim)
     name = session["host"]["session_name"]
     issue: SessionStopIssue = {
         "kind": "unit session left running",
@@ -453,7 +421,6 @@ def _stop_owner_resources(
     kill: KillProcess,
     is_alive: LivenessCheck,
     codex_mesh: CommandRunner,
-    tmux: CommandRunner,
     clock: Clock,
     claim: StopClaim,
     retain_window: bool = False,
@@ -466,7 +433,7 @@ def _stop_owner_resources(
     if session["host"]["kind"] == "herdr":
         # Leave the pane and server running; herdr session cleanup is manual for now.
         return issues
-    issues.extend(_stop_unit_session(session, tmux, clock, claim))
+    issues.extend(_stop_unit_session(session, clock, claim))
     return issues
 
 
@@ -482,7 +449,7 @@ def _owner_identity_lost_issues(
         }
         for run_dir in _run_directories(session)
     ]
-    if session["kind"] == "unit":
+    if session["kind"] == "unit" and session["host"]["kind"] == "unit":
         issues.append(
             {
                 "kind": "unit session left running",
@@ -501,7 +468,6 @@ def _retry_owner_cleanup(
     *,
     is_alive: LivenessCheck,
     codex_mesh: CommandRunner,
-    tmux: CommandRunner,
     clock: Clock,
 ) -> None:
     """Retry only unconfirmed resources of an owner already safely stopped."""
@@ -525,7 +491,7 @@ def _retry_owner_cleanup(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     ))
     if any(issue["kind"] == "unit session left running" for issue in pending):
-        issues.extend(_stop_unit_session(session, tmux, clock, claim))
+        issues.extend(_stop_unit_session(session, clock, claim))
     _ = _replace_stop_issues(claim, issues)
 
 
@@ -556,7 +522,6 @@ def _stop_owner(
     fresh_inventory: FreshInventory,
     clock: Clock,
     codex_mesh: CommandRunner,
-    tmux: CommandRunner,
     sleep: Sleeper,
 ) -> None:
     stored = entry["session"]
@@ -589,7 +554,6 @@ def _stop_owner(
             kill=kill,
             is_alive=is_alive,
             codex_mesh=codex_mesh,
-            tmux=tmux,
             clock=clock,
             claim=claim,
             retain_window=retain_window,
@@ -641,7 +605,6 @@ def _stop_owner(
             kill=kill,
             is_alive=is_alive,
             codex_mesh=codex_mesh,
-            tmux=tmux,
             clock=clock,
             claim=claim,
             retain_window=retain_window,
@@ -750,7 +713,6 @@ def _stop_owner(
         kill=kill,
         is_alive=is_alive,
         codex_mesh=codex_mesh,
-        tmux=tmux,
         clock=clock,
         claim=claim,
         retain_window=retain_window,
@@ -770,7 +732,6 @@ def stop_session(
     fresh_inventory: FreshInventory = _fresh_inventory,
     clock: Clock = now_utc,
     codex_mesh: CommandRunner = run_codex_mesh,
-    tmux: CommandRunner = run_tmux,
     sleep: Sleeper = time.sleep,
 ) -> SessionShutdown:
     """Claim and stop one owner, checking identity before each signal."""
@@ -807,7 +768,7 @@ def stop_session(
         if prior["kind"] in {"stopped", "already gone", "process identity lost", "stop failed", "restart failed"}:
             _retry_owner_cleanup(
                 owned, current, is_alive=is_alive,
-                codex_mesh=codex_mesh, tmux=tmux, clock=clock,
+                codex_mesh=codex_mesh, clock=clock,
             )
         if prior["kind"] in {"stopped", "already gone", "process identity lost", "restart failed"}:
             def restore_progress(changing: SessionShutdown) -> None:
@@ -821,7 +782,7 @@ def stop_session(
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,
             fresh_inventory=fresh_inventory, clock=clock,
-            codex_mesh=codex_mesh, tmux=tmux, sleep=sleep,
+            codex_mesh=codex_mesh, sleep=sleep,
         )
     except StopClaimLost:
         pass

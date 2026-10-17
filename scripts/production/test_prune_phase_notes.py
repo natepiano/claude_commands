@@ -32,15 +32,14 @@ class PrunePhaseNotesTests(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(self.root / "home"), "NOTIFIER_STATE_DIR": str(self.notifier),
                     "PHASE_TABLE_VAULT": str(self.vault), "USER_ZONE": "America/New_York",
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
-                    # No test here may ask a real tmux which unit sessions exist.
-                    "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux")}
+                    "HERDR_BIN": "/nonexistent/herdr"}
 
     def production(self, slug: str) -> Path:
         """A production with one live unit, alpha-unit, and its update timer."""
         checkout = self.root / slug
         alpha = self.root / f"{slug}-alpha"
         alpha.mkdir(parents=True)
-        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        # A linked worktree, where `.git` is a file: herdr is never asked whether its unit is gone.
         _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
         doc = checkout / f"docs/{slug}-production.md"
         doc.parent.mkdir(parents=True)

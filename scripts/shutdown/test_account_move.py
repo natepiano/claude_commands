@@ -31,7 +31,7 @@ from importlib import import_module
 import account
 import agent_accounts
 from scripts.accounts import accounts, refusals
-from test_restart import entry, worker_session, showrunner, top_level, tmux_host, unit
+from test_restart import entry, worker_session, showrunner, top_level, unit
 from test_support import ShutdownTestCase
 
 
@@ -64,7 +64,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.named_account("claude2", "default@example.invalid")
         self.named_account("claude1", "current@example.invalid")
         self.named_account("claude3", "target@example.invalid")
-        self.owner = top_level("move-id", name="kept name", host=tmux_host("kept tmux"))
+        self.owner = top_level("move-id", name="kept name", host=inventory.HerdrHost(kind="herdr", herdr_session="kept-host", pane_id="w1:p1", presentation="detached"))
         self.owner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=self.live_registry))
         _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
@@ -394,13 +394,13 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(self.disk_state(), before)
 
     def showrunner_inventory(self) -> inventory.Inventory:
-        first = showrunner("sr-one", host=tmux_host("first-pane"))
+        first = showrunner("sr-one", host=inventory.HerdrHost(kind="herdr", herdr_session="first-pane", pane_id="w1:p1", presentation="detached"))
         first["config_dir"] = str(accounts.account_dir("claude1"))
         first["name"] = "first showrunner"
         first["cwd"] = "/tmp/first workspace"
         first["doc"] = "/tmp/first production.md"
         first["model"] = inventory.ModelName(kind="model", name="opus")
-        second = showrunner("sr-two", host=tmux_host("second-pane"))
+        second = showrunner("sr-two", host=inventory.HerdrHost(kind="herdr", herdr_session="second-pane", pane_id="w1:p1", presentation="detached"))
         second["config_dir"] = str(accounts.account_dir("claude1"))
         second["name"] = "second showrunner"
         second["cwd"] = "/tmp/second workspace"

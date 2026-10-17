@@ -109,14 +109,12 @@ class RegistrationTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
-                    # No test here may ask a real tmux which unit sessions exist.
-                    "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
         self.doc.parent.mkdir(parents=True)
-        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        # A linked worktree, where `.git` is a file: herdr is never asked whether its unit is gone.
         alpha = self.root / "alpha"
         alpha.mkdir()
         _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
@@ -180,7 +178,7 @@ class RegistrationTests(unittest.TestCase):
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
         self.assertEqual(updates[updates.index("--to") + 1], "session:current-session-id")
         self.assertIn("next_due", first.stdout)
-        for instance in ("stall-watch", "tmux-names"):
+        for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
 
         new_env = {**self.env, "CLAUDE_CODE_SESSION_ID": "resume-session-id"}
@@ -197,7 +195,7 @@ class RegistrationTests(unittest.TestCase):
         updates = [call for call in calls if call[:2] == ["new", "showrunner-example"]]
         self.assertEqual([call[call.index("--to") + 1] for call in updates],
                          ["session:current-session-id", "session:resume-session-id", "session:resume-session-id"])
-        for instance in ("stall-watch", "tmux-names"):
+        for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
     def test_register_reports_unexpected_usage_write_failure_and_completes(self) -> None:
@@ -259,7 +257,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["status", "new", "stop", "status", "status"])
+                         ["status", "new", "stop", "status"])
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
     def without_updates_line(self) -> None:

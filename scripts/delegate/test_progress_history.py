@@ -208,7 +208,6 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment["NOTIFIER_SESSIONS_DIR"] = str(
             self.root / "notifier-sessions"
         )
-        environment["UNIT_LOOKUP_TMUX"] = "/bin/false"
 
     def run_command(
         self,
@@ -5057,7 +5056,6 @@ print('two homes isolated; recorder lock retained; caller restored')
             os.environ,
             {
                 "PHASE_TABLE_VAULT": str(vault_root),
-                "UNIT_LOOKUP_TMUX": "/bin/false",
                 "NOTIFIER_STATE_DIR": str(notifier_dir),
                 "NOTIFIER_SESSIONS_DIR": str(sessions_dir),
             },

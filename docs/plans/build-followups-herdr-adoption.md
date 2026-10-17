@@ -332,7 +332,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 - A read-only observation must never resolve tmux through `tmux_binary()`: it runs `nix build nixpkgs#tmux^out` when tmux is not on `PATH`.
 - `test_inventory.py` imports `pane_display` from `test_restart.py`.
 
-### Phase 13 — Remove tmux from productions and sessions on Linux  · status: todo
+### Phase 13 — Remove tmux from productions and sessions on Linux  · status: done
 
 **Depends on:** Phase 12, Phase 16, Phase 19, Phase 21
 

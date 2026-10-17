@@ -686,6 +686,20 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*environment unavailable"):
             _ = herdr.server_environment("fixture")
 
+    def test_darwin_user_tmux_is_never_attributed_to_its_outer_herdr_pane(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(f"70 1 {uid} herdr server\n71 70 {uid} claude\n72 70 {uid} claude\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
+        self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": []}}))
+        self.darwin_environment(71, "claude", "HERDR_PANE_ID=w1:p1 TMUX_PANE=%1")
+        self.darwin_environment(72, "claude", "HERDR_PANE_ID=w1:p2 TMUX_PANE=")
+        for pid in (71, 72):
+            self.configure(["-a", "-p", str(pid), "-d", "cwd", "-Fn"], f"p{pid}\nfcwd\nn{self.root}\n")
+        self.assertEqual(herdr.herdr_place_of(71), herdr.NotInHerdr())
+        self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p2"))
+        self.assertEqual([row.pid for row in herdr.herdr_processes()], [72])
+
     def test_darwin_process_discovery_uses_sockets_uid_cwd_and_real_environment(self) -> None:
         self.darwin()
         uid = os.getuid()
@@ -1765,6 +1779,17 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "pane", "send-keys", "pane-1", "ctrl-c"],
             ["--session", "fixture", "pane", "close", "pane-1"],
         ])
+
+    def test_linux_user_tmux_is_never_attributed_to_its_outer_herdr_pane(self) -> None:
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        _ = self.process(11, 10, ["/bin/tmux"], {"HERDR_PANE_ID": "outer"})
+        _ = self.process(12, 11, ["/bin/claude"], {"HERDR_PANE_ID": "outer", "TMUX_PANE": "%1"})
+        _ = self.process(13, 10, ["/bin/claude"], {"HERDR_PANE_ID": "native", "TMUX_PANE": ""})
+        self.assertEqual(herdr.herdr_place_of(12), herdr.NotInHerdr())
+        self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("fixture", "native"))
+        self.assertEqual([row.pid for row in herdr.herdr_processes() if row.command == "claude"], [13])
 
     def test_process_place_named_default_and_nonherdr(self) -> None:
         server = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})

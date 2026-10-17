@@ -150,14 +150,12 @@ class RefusalWatchTests(unittest.TestCase):
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
             owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=inventory.UnitHost(
-                kind="unit", production="fixture", unit=identity, doc="/fixture.md", session_name=identity, session_host="tmux",
+                kind="unit", production="fixture", unit=identity, doc="/fixture.md", session_name=identity, session_host="herdr",
                 plan=inventory.NoRunRecord(kind="no run record")))
-        elif host == "tmux":
+        elif host == "herdr":
             owner = inventory.ShowrunnerSession(**fields, kind="showrunner", production="fixture", doc="/fixture.md",
-                host=inventory.TmuxHost(kind="tmux", tmux_session=identity,
-                    server=inventory.TmuxServerNotRecorded(kind="not recorded"),
-                    session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
-                    pane=inventory.PaneNotRecorded(kind="not recorded")))
+                host=inventory.HerdrHost(kind="herdr", herdr_session=identity,
+                    pane_id="w1:p1", presentation="detached"))
         else:
             where: inventory.SessionHost = (inventory.TerminalHost(kind="terminal") if host == "terminal" else
                 inventory.WindowHost(kind="ghostty" if host == "ghostty" else "zed", window_shell=2000,
@@ -363,7 +361,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_assumed_refusal_rejects_both_real_group_kinds_without_changing_selections(self) -> None:
         groups = self.groups()
-        for identity, host in (("unit", "unit"), ("runner", "tmux")):
+        for identity, host in (("unit", "unit"), ("runner", "herdr")):
             _ = self.owner(identity, host=host)
             before = self.snapshot()
             with self.subTest(host=host), redirect_stderr(io.StringIO()):
@@ -405,7 +403,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("probe-one")
         _ = self.owner("probe-two", host="ghostty", label="claude3")
         _ = self.owner("unit", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         groups = self.groups()
         before = groups.read_bytes()
         with (patch.object(accounts, "group_accounts", side_effect=AssertionError("proof must not read real groups")),
@@ -518,7 +516,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_units_group_preview_lists_exactly_off_target_members_without_writes(self) -> None:
         off = self.owner("off-target", host="unit")
         _ = self.owner("already-there", host="unit", label="claude3")
-        _ = self.owner("other-group", host="tmux")
+        _ = self.owner("other-group", host="herdr")
         before = self.snapshot()
         output, error = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(error):
@@ -592,7 +590,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_example_groups_move_only_after_their_own_refusals(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        runner = self.owner("runner", host="tmux", label="claude3")
+        runner = self.owner("runner", host="herdr", label="claude3")
         self.reading("main@example.invalid", 0, reset=NOW + timedelta(days=2))
         self.reading(TARGET_LOGIN, 3, reset=NOW + timedelta(days=4))
         self.reading(SOURCE_LOGIN, 53, reset=NOW + timedelta(days=6))
@@ -628,8 +626,8 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_manual_showrunner_group_command_needs_only_destination(self) -> None:
         path = self.groups(showrunners="claude1")
-        _ = self.owner("runner-one", host="tmux")
-        _ = self.owner("runner-two", host="tmux")
+        _ = self.owner("runner-one", host="herdr")
+        _ = self.owner("runner-two", host="herdr")
         _ = self.owner("unit", host="unit")
         output, error = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(error):
@@ -644,7 +642,7 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups()
         _ = self.owner("refused-unit", host="unit")
         _ = self.owner("healthy-unit", host="unit")
-        _ = self.owner("healthy-showrunner", host="tmux", label="claude3")
+        _ = self.owner("healthy-showrunner", host="herdr", label="claude3")
         _ = self.transcript("refused-unit")
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
@@ -659,8 +657,8 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_classified_showrunner_without_update_timer_moves_with_its_group(self) -> None:
         path = self.groups(showrunners="claude1")
-        refused = self.owner("refused-runner", host="tmux")
-        healthy = self.owner("runner-without-timer", host="tmux")
+        refused = self.owner("refused-runner", host="herdr")
+        healthy = self.owner("runner-without-timer", host="herdr")
         _ = self.owner("unit", host="unit")
         self.assertEqual(healthy["kind"], "showrunner")
         self.assertEqual(healthy["timers"], [])
@@ -677,7 +675,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_healthy_groups_stay_on_their_accounts_despite_better_placement(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         before = path.read_bytes()
         _ = self.cli()
         self.assertEqual(self.commands, [])
@@ -843,7 +841,7 @@ class RefusalWatchTests(unittest.TestCase):
     def test_status_without_group_file_does_not_infer_live_members_accounts(self) -> None:
         """F004: read-only status reports missing configuration despite live members."""
         _ = self.owner("unit-one", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         before = self.snapshot()
         self.assertIn("units: not configured", accounts.status_report())
         self.assertIn("showrunners: not configured", accounts.status_report())
@@ -851,7 +849,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_refused_unconfigured_groups_report_setup_and_move_no_members(self) -> None:
         """F004: neither real nor preview ticks infer a missing group's account."""
-        for identity, host in (("unit-one", "unit"), ("unit-two", "unit"), ("runner", "tmux")):
+        for identity, host in (("unit-one", "unit"), ("unit-two", "unit"), ("runner", "herdr")):
             _ = self.owner(identity, host=host)
             _ = self.transcript(identity)
         for arguments in (("--dry-run",), ()):
@@ -881,7 +879,7 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups()
         _ = self.owner("scratch", host="terminal")
         _ = self.owner("unit", host="unit")
-        _ = self.owner("runner", host="tmux", label="claude3")
+        _ = self.owner("runner", host="herdr", label="claude3")
         _ = self.transcript("scratch")
         before = path.read_bytes()
         _ = self.cli()
@@ -929,7 +927,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_dry_run_detects_refusal_on_each_host_and_changes_nothing(self) -> None:
         _ = self.groups(showrunners="claude1")
-        for host in ("tmux", "unit", "ghostty", "zed", "terminal"):
+        for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
             for window, text in (("weekly", "weekly limit"), ("five", "You've hit your session limit")):
                 identity = host + "-" + window
                 _ = self.owner(identity, host=host)
@@ -938,7 +936,7 @@ class RefusalWatchTests(unittest.TestCase):
         code, output, error = self.cli("--dry-run")
         self.assertIn(code, (0, None))
         self.assertEqual(error, "")
-        for host in ("tmux", "unit", "ghostty", "zed", "terminal"):
+        for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
             self.assertIn(host, output)
         self.assertIn("claude3", output)
         self.assertEqual(self.snapshot(), before)
@@ -1046,7 +1044,7 @@ class RefusalWatchTests(unittest.TestCase):
             self.assertIn("é" * 70_000, found.text)
 
     def test_healthy_live_owners_never_invoke_inventory_or_start_a_move(self) -> None:
-        for host in ("tmux", "unit", "ghostty", "zed", "terminal"):
+        for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
             _ = self.owner(host, host=host)
             _ = self.transcript(host, tail={"type": "assistant", "message": {"model": "opus-real", "content": "normal work"}})
         with patch.object(inventory, "inventory") as observe:
@@ -1078,7 +1076,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_refused_sessions_on_one_account_move_by_group_and_scratch_boundary(self) -> None:
         _ = self.groups(showrunners="claude1")
-        for identity, host in (("director", "unit"), ("showrunner", "tmux"), ("desktop", "ghostty")):
+        for identity, host in (("director", "unit"), ("showrunner", "herdr"), ("desktop", "ghostty")):
             _ = self.owner(identity, host=host)
             _ = self.transcript(identity)
         _ = self.cli()
@@ -1462,8 +1460,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_showrunner_batch_uses_the_same_move_sessions_path_as_watcher(self) -> None:
-        _ = self.owner("first", host="tmux")
-        _ = self.owner("second", host="tmux")
+        _ = self.owner("first", host="herdr")
+        _ = self.owner("second", host="herdr")
         _ = self.owner("unit", host="unit")
         requested = (accounts.SessionMoveRequested("first", "batch-id", "claude3", source_login=SOURCE_LOGIN),
                      accounts.SessionMoveRequested("second", "batch-id", "claude3", source_login=SOURCE_LOGIN))
