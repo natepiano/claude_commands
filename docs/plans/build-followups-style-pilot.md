@@ -92,7 +92,8 @@ product merge between checkpoint and integration.
 The other 16 merged tickets record checkpoint `d1ced22c`, already on main before
 the first ticket: they changed no code and carried nothing to hand off. From the
 `style/main` aggregate commit `8d6e25d1` to main took 0.04 h. The ledger's
-`handoffs` row still read `sent` after git showed the merge.
+`handoffs` row still read `sent` after git showed the merge, and so does the
+`f091ed48` row, with no merge commit recorded.
 
 The showrunner counts this as a fail and changes nothing until two more
 hand-offs are measured. For each, record whether a product merge landed between
@@ -102,7 +103,7 @@ criterion is then judged from three points.
 | Hand-off | Ticket checkpoint | Elapsed | Product merge between | `style/main` took it in cleanly |
 | --- | --- | --- | --- | --- |
 | `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
-| second | pending | pending | pending | pending |
+| `ac95d94d` | names-unit-12 `96da4419` at 16:26:13Z, merged to main at 16:31:20Z | 0.09 h | no: main's last product merge, `ec3297e9`, landed at 15:16:13Z, before the checkpoint | yes: `f091ed48` merges the ticket onto `ec3297e9`, and its tree equals the automatic merge |
 | third | pending | pending | pending | pending |
 
 ## Restart
@@ -273,5 +274,6 @@ Pending: parent's saved style child summary and rendered style line.
   history). The ledger's recorded base is unchanged, and the ticket's own edits
   are still judged.
 
-Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`.
+Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
+fix I as `89f24e01`, fix J as `9b71ca5b`.
 Live verification of the fixes and subsequent measurements remain pending.
