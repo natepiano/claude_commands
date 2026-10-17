@@ -1629,3 +1629,35 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A disconnect diagnostic differs between Linux and macOS; tests check failed status and a diagnostic, never its wording.
 
 **Ruled out:** clearing on completion notices alone (a lost notice reran finished work); tracking whichever turn started last (an unrelated turn cleared a failed continuation).
+
+### Phase 57 — A reset account with a stale login says why it was not read  · status: done
+
+**Depends on:** Phase 56
+
+#### Work Order
+
+**Goal:** `accounts.py status` shows why an account went unread after its weekly reset, instead of a bare `unavailable`. An idle Claude account's login token is renewed only by a Claude session on it. Once the token is stale, the 2-minute pass skips the read (`Weekly quota: not read (stale token; …)`), and after the recorded reset the stored weekly reading is no longer current. Showrunner decision 2026-10-17: display only. The pass never wakes the token and never infers 100% from a reset.
+
+**Constraints from prior phases:**
+- `_status_row` (`scripts/accounts/accounts.py` ~:3680) sets weekly and resets to `StatusUnavailable("unavailable")` when the stored weekly window is not current. `read_at` comes from `_read_at(usage)`.
+- `claude_live` (`scripts/whoami/agent_accounts.py` ~:698) returns `quota_problem` "Weekly quota: not read (stale token; a Claude session on this account refreshes it)" when the stored token has expired.
+- `agent_notes.apply` writes `weekly_remaining_usage: null` for an account whose recorded reset has passed. Never infer 100% remaining from a reset.
+- Tests never touch live directories, run ssh, or read a real keychain, process or credential file.
+
+**Spec:**
+1. When the stored weekly window has expired (its reset has passed), the weekly cell reads `not read since <HH:MM>` in the user's zone. The time comes from the last stored reading of the account (`read_at`). When the account's last read was skipped for a stale token, the cell continues `: no session to refresh its login`. Example: `not read since 05:29: no session to refresh its login`. Keep the reason typed; never match the problem text. With no stored reading at all, keep `unavailable`.
+2. The stale-token skip is recorded with the stored usage, or carried another typed way, so `status` can tell it apart from other unread causes.
+3. Regression tests: a past reset with a stale-token skip shows the reason; a past reset with another cause shows only `not read since <HH:MM>`; a current window is unchanged.
+
+**Files:**
+- `scripts/accounts/accounts.py`
+- `scripts/whoami/agent_accounts.py`
+- `scripts/whoami/agent_notes.py`
+- `scripts/whoami/usage_store.py`
+- `scripts/accounts/test_accounts.py`
+- `scripts/whoami/test_agent_notes.py`
+- `scripts/whoami/test_usage_store.py`
+
+**Workers:** `1 writer + 1 tester`. `impl` owns the production files; `test` owns the test files.
+
+**Acceptance gate:** the cell reads as in Spec 1 for each case; no new read, token refresh or Claude call is added; basedpyright 0/0; phase suites and merge gate green on Linux and the Mac.

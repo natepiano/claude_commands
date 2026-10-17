@@ -292,6 +292,16 @@ class CodexStartupFailure:
 CodexStartupStatus = NoCodexStartupFailure | CodexStartupFailure
 
 
+@dataclass(frozen=True)
+class StaleTokenSkip:
+    """The weekly read was skipped because only a Claude session can renew the login."""
+
+
+@dataclass(frozen=True)
+class NoWeeklyReadSkip:
+    """The read was not skipped for an expired login token."""
+
+
 @dataclass
 class Report:
     """One tool's account. `problem` replaces the account lines; `quota_problem` follows them."""
@@ -311,6 +321,7 @@ class Report:
     credit_balance: str | None = None
     source: ClaudeDirectorySource | CodexHomeSource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
     codex_startup: CodexStartupStatus = field(default_factory=NoCodexStartupFailure)
+    weekly_read_skip: StaleTokenSkip | NoWeeklyReadSkip = field(default_factory=NoWeeklyReadSkip)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -698,6 +709,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
             # Only a Claude session refreshes a stored token, so an idle account's goes stale.
             # The service answers a stale one with 429 or 401; asking with it only adds refused calls.
             if token and isinstance(expires, int) and expires / 1000 <= time.time():
+                report.weekly_read_skip = StaleTokenSkip()
                 report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
                 return report
         if not token:
