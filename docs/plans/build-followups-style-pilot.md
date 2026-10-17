@@ -457,9 +457,29 @@ Pending: parent's saved style child summary and rendered style line.
   the renamed binding, so it is no collision. That answers three of the four
   rerun 2 losses; `actions.rs:835` stays a miss, so the best a third rerun
   can reach is 36 of 37 (97.3%). A third rerun on the same files measures it.
+- **Name-bindings rerun 3 — fix T meets the bar**: 36 of the 37 settled
+  findings caught (97.3%), the best fix T allows. The three rerun 2 losses
+  it targeted are caught (`disk_usage.rs:153`, `refresh.rs:403`,
+  `dispatch.rs:803`); `actions.rs:835` stays the one miss, as ruled. The
+  pass raised 375 findings against 346 in rerun 2. That rise is net: 57
+  findings are new at their place and 26 earlier ones dropped out. A blind
+  check of the 57 against the rule decides whether the new ones hold, under
+  the same 10% bar.
+- **Fix U — structure file cells are keyed by their module, not their
+  crate** (commit `07d86ebe`): a structure verdict on a file inside a crate
+  was keyed by the whole crate, so an edit anywhere in it made every such
+  verdict stale and the planner queued them all again. The key now covers
+  the Rust files in the file's own directory and the module file that
+  declares that directory; a crate root keeps the crate key and manifest
+  rules keep theirs. Rows recorded under the old key are not rewritten: a
+  held verdict carries over when the module key at its own commit still
+  matches, so an existing ledger needs no migration. Accepted risk: a
+  structure verdict that depends on a caller outside the module's own
+  directory no longer goes stale when that caller changes. Ticket 19 in the
+  modules pass waits on it.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`.
+`adfa7c47`, fixes S and T as `b2714928`.
 Live verification of the fixes and subsequent measurements remain pending.
