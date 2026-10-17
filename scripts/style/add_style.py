@@ -35,6 +35,29 @@ class StyleBranchPointTaken(Refusal):
 
 
 @dataclass(frozen=True)
+class StandingStyleProduction:
+    repository: Path
+    slug: str
+    checkout: Path
+    doc: Path
+    branch_point: str
+
+
+@dataclass(frozen=True)
+class NoStyleProduction:
+    repository: Path
+    slug: str
+
+    @property
+    def checkout(self) -> Path:
+        return self.repository.parent / self.slug
+
+    @property
+    def doc(self) -> Path:
+        return self.checkout / "docs" / f"{self.slug}-production.md"
+
+
+@dataclass(frozen=True)
 class StyleProduction:
     parent: Production
     repository: Path
@@ -59,31 +82,42 @@ def _git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def standing_style_production(repo_dir: Path) -> StandingStyleProduction | NoStyleProduction:
+    """Locate the repository's standing production without changing any state."""
+    repository = Path(_git(repo_dir, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
+    slug = f"{repository.name}-style"
+    absent = NoStyleProduction(repository, slug)
+    checkout, doc = absent.checkout, absent.doc
+    if not doc.is_file():
+        return absent
+    branch_point = production_field(doc.read_text().splitlines(), "Branch point").removeprefix("refs/heads/")
+    return StandingStyleProduction(repository, slug, checkout, doc, branch_point)
+
+
 def _request(doc: Path) -> StyleProduction:
     parent = read_production(doc)
     lines = parent.doc.read_text().splitlines()
     proposals = production_field(lines, "Proposals")
     declared_repo = Path(production_field(lines, "Repository")).expanduser().resolve()
-    common = Path(_git(declared_repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    repository = common.parent
-    slug = f"{repository.name}-style"
+    standing = standing_style_production(declared_repo)
+    repository, slug = standing.repository, standing.slug
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
-    checkout = repository.parent / slug
     return StyleProduction(
         parent, repository, slug, branch_point, branch_tip,
-        "style/" + branch_point.replace("/", "-"), checkout,
-        checkout / "docs" / f"{slug}-production.md", proposals,
+        "style/" + branch_point.replace("/", "-"), standing.checkout,
+        standing.doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
     )
 
 
 def _check_existing(style: StyleProduction) -> bool:
-    if style.doc.exists():
-        existing = read_production(style.doc)
+    standing = standing_style_production(style.repository)
+    if isinstance(standing, StandingStyleProduction):
+        existing = read_production(standing.doc)
         lines = existing.doc.read_text().splitlines()
-        branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
+        branch_point = standing.branch_point
         if branch_point != style.branch_point:
             raise StyleBranchPointTaken(
                 f"{style.repository.name} already has style production {style.slug} on branch point {branch_point}; "

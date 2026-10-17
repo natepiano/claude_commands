@@ -59,6 +59,10 @@ Contract or its follow-up pointer. Ad hoc work skips this section.
 </RunPhaseReview>
 
 <RunPhaseShrink>
+Standing plans (`**Standing:** style_plan.py`) skip shrink and its structural
+check: refill discards merged or dropped ticket phases. Never commit the plan
+or pinned rule files.
+
 For a phased plan, read `~/.claude/commands/plan/shrink.md` in full and apply it
 with arguments `"${PLAN_DOC}" --phases <current-id> --closeout "${SESSION_DIR}"`
 at the shrink step. Shrink replaces only the completed phase's `Work Order`

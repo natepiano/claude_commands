@@ -349,7 +349,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** a separate persisted state for checker errors (they share the review route by design).
 
-### Phase 10 — Standing-plan refill in /unit:direct and the sync trigger  · status: todo
+### Phase 10 — Standing-plan refill in /unit:direct and the sync trigger  · status: done
 **Depends on:** Phase 7, Phase 8
 
 #### Work Order

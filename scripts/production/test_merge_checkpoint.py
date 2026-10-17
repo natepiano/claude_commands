@@ -16,6 +16,7 @@ from unittest import mock
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
+import merge_checkpoint
 from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
                               check_parallel, merge_branch_history, merge_history, promote, request_from)
 
@@ -58,6 +59,13 @@ with (state / "events.jsonl").open("a") as output:
 if name == "ssh":
     print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
     raise SystemExit(0)
+if name == "style_sync.py":
+    import subprocess
+    repo = args[args.index("--repo-dir") + 1]
+    branch = args[args.index("--branch") + 1]
+    observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
+                              capture_output=True, text=True, check=True).stdout.split()[0]
+    (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
     key = "_".join(args).replace("/", "_")
     if args[:1] == ["test"]:
@@ -152,7 +160,7 @@ class MergeCheckpointTests(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.unit)
         _ = self.git("config", "user.name", "Checkpoint Test", cwd=self.other)
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=self.other)
-        for name in ("verify.sh", "checkpoint-test", "validate_and_push.sh", "review_regime.py", "ssh"):
+        for name in ("verify.sh", "checkpoint-test", "validate_and_push.sh", "review_regime.py", "ssh", "style_sync.py"):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
         for relative, name in ((".claude/scripts/delegate", "verify.sh"),
@@ -162,6 +170,7 @@ class MergeCheckpointTests(unittest.TestCase):
             directory.mkdir(parents=True)
             self.executable(directory / name, STUB)
         self.env = {**os.environ, "HOME": str(home),
+                    "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CHECKPOINT_TEST_STATE": str(self.state)}
         self.production_doc()
@@ -343,8 +352,11 @@ class MergeCheckpointTests(unittest.TestCase):
         sha = self.checkpoint()
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertEqual(self.events("python3"), [["-m", "unittest", "discover", "-s", "scripts/buildlog",
-                                                    "-p", "test_*.py"]])
+        self.assertEqual(self.events("python3"), [
+            ["-m", "unittest", "discover", "-s", "scripts/buildlog", "-p", "test_*.py"],
+            [str(self.bin / "style_sync.py"), "notify", "--repo-dir", str(self.checkout),
+             "--branch", "production", "--tip", self.git("rev-parse", "HEAD")],
+        ])
         self.assertEqual(self.events("basedpyright"), [["scripts/buildlog"]])
         self.assertEqual(self.events("0"), [])
         all_args = [arg for event in (self.events("python3") + self.events("basedpyright")) for arg in event]
@@ -583,6 +595,43 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), result.before)
         self.assertEqual(self.events("review_regime.py"), [])
+        self.assertEqual(self.events("style_sync.py"), [])
+
+    def test_style_notification_observes_the_successfully_pushed_tip(self) -> None:
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        tip = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.events("style_sync.py"), [[
+            "notify", "--repo-dir", str(self.checkout), "--branch", "production", "--tip", tip,
+        ]])
+        self.assertEqual((self.state / "notified-tip").read_text(), tip)
+
+    def test_style_notification_failure_does_not_fail_a_pushed_checkpoint(self) -> None:
+        _ = (self.state / "fail-style_sync.py").touch()
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("style sync: exit 1", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
+
+    def test_notification_value_error_leaves_the_completed_checkpoint_successful(self) -> None:
+        sha = self.checkpoint()
+        original_notify = merge_checkpoint.notify_style
+
+        def malformed_notification(checkout: Path, branch: str, tip: str) -> None:
+            with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
+                original_notify(checkout, branch, tip)
+
+        arguments = [str(SCRIPT), "--production", str(self.doc), "alpha-unit", "2", sha,
+                     "--started", STARTED, "--scratch", str(self.root / "scratch"),
+                     "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
+        output = StringIO()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, "argv", arguments), mock.patch.object(
+            merge_checkpoint, "notify_style", side_effect=malformed_notification,
+        ), redirect_stdout(output):
+            code = merge_checkpoint.main()
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("style sync: invalid production", output.getvalue())
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
 
     def test_diverged_main_conflict_restores_clean_merge_branch(self) -> None:
         sha = self.checkpoint(content="unit side\n")

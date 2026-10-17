@@ -51,7 +51,23 @@ and checkpoint and shrink never commit or shrink them. Keep production
 instructions and plans out of `docs/style/` and `docs/<member>/style/`, which
 `rules.load_rules` reads as local rules.
 `add_unit.py` launches a standing plan from the showrunner checkout and copies
-it into the unit worktree, where the unit's copy is its own.
+it into the unit worktree, where the unit's copy is its own. Refill, ticket
+phases and pinned rule files live in that unit copy; the showrunner copy is
+only the first-launch template. Edit a launched unit's copy for changes meant
+for it. Checkpoint stages only code paths and never the plan or anything under
+`docs/style-production/`; standing plans skip shrink and every closing gate.
+Run refill at startup, after restart or compaction, and after each ticket.
+Report a waiting state once and end the turn blocked until sync, a board retry
+message, or `ticket <id> merged; refill.` wakes the director.
+
+A ticket with no code changes makes no commit: record its cells at HEAD, verify
+`git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
+`style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD>`
+and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Follow
+the checkpoint procedure's atomic committed-awaiting-release record using that
+ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
+report `From <unit>: ticket <id> closed with no code change; <n> held.` and
+refill at once. If ancestry fails, leave the ticket assigned and report it.
 
 Refill only the unit worktree's own plan copy:
 
@@ -77,7 +93,9 @@ Refill writes plans and pinned texts atomically. Resume checks every pin's blob
 and rebuilds a damaged ticket phase from its recorded instructions. Before
 publishing a phase, it records the unit branch's starting commit once in the
 ledger ticket's `base` field. The footprint gate uses that literal commit id as
-`--base` and `--head HEAD`, including after an interruption. No private Git ref
+`--base` and `--worktree`, including after an interruption. The gate judges
+the uncommitted tree the checkpoint will stage, using a temporary index; it
+never changes the real index. No private Git ref
 keeps a dropped ticket's abandoned commits reachable.
 
 ## Ledger
@@ -132,20 +150,48 @@ markers distinguish an empty result from a rule never enumerated.
 
 ## Sync
 
-On a branch-point sync message, skip a tip already marked processed, then:
+Every successful parent merge runs the best-effort notification:
+
+```bash
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py notify --repo-dir <checkout> --branch <branch point> --tip <new tip>
+```
+
+A missing production or another branch point sends nothing. Notification
+failure reports one line and never fails the parent's merge.
+
+On a sync message, run `style_ledger.py tip seen --repo <checkout> --tip <tip>`;
+`seen` skips the following five steps:
 
 1. Merge the new tip into the style merge branch and run its Merge tests.
-2. Record the full tier A lint run for the synced tip.
-3. Set the ledger tip to the branch-point tip with the explicit style branch,
-   then read status: changed inputs become stale and new files open. Report a
-   nonzero unclassified count to the parent with **pull nate_style**.
-4. Tell each unit director to merge the style branch at its next pause between
-   tickets, and wake units waiting for sync.
-5. Mark the tip processed.
+2. Run `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py lint --repo <checkout> --checkout <style checkout> --tip <branch-point tip>`.
+   This uses `bash ~/.claude/scripts/delegate/verify.sh lint --workspace --no-cache --check`
+   at the exact requested commit in a disposable checkout, with workspace mend,
+   rustfmt and clippy (`--all-targets --all-features`, workspace lint config).
+   Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
+   It records per-file diagnostics once per tool; disabled or incomplete checks
+   grant no successful coverage. Exit 0 means clean, every tool recorded passing;
+   continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
+   continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
+   `lint-record` or unreadable checkout); stop the sync.
+3. Run `style_ledger.py set-tip --repo <checkout> --tip <branch-point tip> --style-branch <style merge branch>`,
+   then `style_ledger.py status --repo <checkout>`: changed inputs become stale,
+   new files open. Report a nonzero unclassified count to the parent with
+   **pull nate_style**.
+4. Tell every unit director to merge the style branch at its next pause between
+   tickets, and wake those waiting for sync to run `style_plan.py next-phase`
+   against their own plan copies.
+5. Run `style_ledger.py tip done --repo <checkout> --tip <branch-point tip>`.
 
-The processed-tip shortcut never skips the ledger's rule-blob site refresh on
-coverage or site reads. A rule edit needs no branch-point move to refresh sites.
-The sync/refill phase supplies the command lines for these five steps.
+The processed-tip shortcut skips only these five steps, never the ledger's
+rule-blob site refresh before `status`, `cells` or `listed_sites`, including
+reads from `next-phase`. A rule edited in `~/rust/nate_style` gets fresh sites
+on the next read without a branch-point move or sync message.
+
+When merging the synced style branch mid-ticket, recheck each cleanly merged
+file's incoming diff before checkpointing and record its new fingerprint.
+On conflict, drop every finding touching that file with every dependent edit
+in other files; a multi-file rename goes as a whole. Release reservations no
+remaining finding touches, rerun the gate and leave dropped cells stale.
 
 ## Merging back
 
@@ -191,7 +237,7 @@ Record each held finding with `style_ledger.py held add` and its cell with
 Run from the unit worktree, using the ticket's recorded start commit:
 
 ```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base <commit id> --head HEAD
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_footprint.py check --repo . --base <commit id> --worktree
 ```
 
 Exit 0 means every finding is `mechanical`; exit 1 prints `review: <reasons>`
@@ -225,7 +271,7 @@ The report phase supplies the command and its output contract.
 ## Lifetime
 
 The production and its unit plans are standing. An empty queue leaves a unit
-idle, waiting for sync; it never closes its run. A parent's wrap detaches the
+blocked, waiting for sync; it never closes its run. A parent's wrap detaches the
 style production. While a root, it merges its own hand-offs into the branch
 point using `**Parent production:**` as the merge context. Pending hand-offs
 survive detachment; the hand-off and proposal phases supply the root merge and

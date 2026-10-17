@@ -78,7 +78,7 @@ class StylePlanTests(unittest.TestCase):
     def production(self, branch: str, checkout: Path, parent: str) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
-            "- **Log:** docs/log.md", f"- **Parent production:** {parent}", "", "## Units", "",
+            "- **Log:** docs/log.md", "- **Branch point:** main", f"- **Parent production:** {parent}", "", "## Units", "",
             "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
             *([f"| names-unit | docs/style-production/units/names-unit.md | {self.unit} | demo-style-names |",
                f"| modules-unit | docs/style-production/units/modules-unit.md | {self.root / 'modules'} | demo-style-modules |"] if parent else []), "",
@@ -463,9 +463,9 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.run_next()[0], 0)
         gate = next(line.strip("`") for line in self.plan.read_text().splitlines() if "style_footprint.py check" in line)
         arguments = shlex.split(gate)
-        self.assertEqual([argument for argument in arguments if argument.startswith("--")], ["--repo", "--base", "--head"])
+        self.assertEqual([argument for argument in arguments if argument.startswith("--")], ["--repo", "--base", "--worktree"])
         self.assertEqual(arguments[arguments.index("--repo") + 1], ".")
-        self.assertEqual(arguments[arguments.index("--head") + 1], "HEAD")
+        self.assertNotIn("--head", arguments)
         base = arguments[arguments.index("--base") + 1]
         self.assertEqual(base, self.tip)
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], base)

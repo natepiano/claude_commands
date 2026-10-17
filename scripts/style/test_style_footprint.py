@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,105 @@ class StyleFootprintTests(unittest.TestCase):
         for path in ("src/lib.rs", "src/first.rs", "src/second.rs"):
             self.write(path, (self.repo / path).read_text().replace("read_value", "load_value"))
         return self.commit()
+
+    def worktree_check(self, base: str, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "check", "--repo", str(self.repo), "--base", base, "--worktree", *extra],
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_worktree_literal_change_is_judged_even_when_head_equals_base(self) -> None:
+        self.write("src/lib.rs", "fn value() -> usize { 1 }\n")
+        base = self.commit()
+        _ = self.git("config", "core.trustctime", "false")
+        source = self.repo / "src/lib.rs"
+        before = source.stat()
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index"))
+        os.utime(index, ns=(before.st_atime_ns, before.st_mtime_ns))
+        index_before = index.read_bytes()
+        self.write("src/lib.rs", "fn value() -> usize { 2 }\n")
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        result = self.worktree_check(base)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("review: check 6:", result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), base)
+        self.assertEqual(index.read_bytes(), index_before)
+
+    def test_worktree_rename_preserves_staged_paths_and_index_bytes_and_ignores_excluded_files(self) -> None:
+        base = self.rename_fixture()
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index"))
+        self.write(".git/info/exclude", "/docs/style-production/\n")
+        self.write("docs/style-production/units/names-unit.md", "excluded plan\n")
+        self.write("docs/style-production/rules/blob.md", "excluded pin\n")
+        for path in ("src/lib.rs", "src/first.rs", "src/second.rs"):
+            self.write(path, (self.repo / path).read_text().replace("read_value", "load_value"))
+        _ = self.git("add", "src/lib.rs")
+        before = index.read_bytes(), self.git("diff", "--cached", "--name-only")
+        result = self.worktree_check(base)
+        self.assertEqual((result.returncode, result.stdout), (0, "mechanical\n"), result.stderr)
+        self.assertEqual((index.read_bytes(), self.git("diff", "--cached", "--name-only")), before)
+
+    def test_worktree_new_untracked_file_counts_and_failure_preserves_the_real_index(self) -> None:
+        self.write("src/lib.rs", "fn value() {}\n")
+        base = self.commit()
+        self.write("src/new.rs", "fn added() {}\n")
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index"))
+        before = index.read_bytes()
+        result = self.worktree_check(base)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("check 1: file or module layout changes", result.stdout)
+        self.assertEqual(index.read_bytes(), before)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
+
+    def test_scratch_commits_ignore_signing_config_for_worktree_and_merge_folding(self) -> None:
+        base = self.rename_fixture()
+        _ = self.git("checkout", "-qb", "incoming")
+        self.write("incoming.txt", "work merged from the style branch\n")
+        _ = self.commit()
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "--no-edit", "incoming")
+        _ = self.git("config", "commit.gpgsign", "true")
+        _ = self.git("config", "gpg.program", "/nonexistent/style-footprint-signing")
+        for path in ("src/lib.rs", "src/first.rs", "src/second.rs"):
+            self.write(path, (self.repo / path).read_text().replace("read_value", "load_value"))
+        result = self.worktree_check(base)
+        self.assertEqual((result.returncode, result.stdout), (0, "mechanical\n"), result.stderr)
+
+    def test_worktree_snapshot_error_cleans_up_its_temporary_index(self) -> None:
+        self.write("src/lib.rs", "fn value() {}\n")
+        base = self.commit()
+        self.write("src/lib.rs", "fn renamed() {}\n")
+        original_run = subprocess.run
+        indexes: list[Path] = []
+
+        def fail_write_tree(arguments: list[str], *, capture_output: bool, text: bool, check: bool,
+                            env: dict[str, str] | None = None, input: str = "",
+                            errors: str = "strict") -> subprocess.CompletedProcess[str]:
+            environment = env
+            if environment is not None and "GIT_INDEX_FILE" in environment:
+                path = Path(str(environment["GIT_INDEX_FILE"]))
+                indexes.append(path)
+                if "write-tree" in arguments:
+                    return subprocess.CompletedProcess(arguments, 128, "", "snapshot failed")
+            return original_run(arguments, capture_output=capture_output, text=text, check=check,
+                                env=env, input=input, errors=errors)
+
+        with mock.patch("style_footprint.subprocess.run", side_effect=fail_write_tree):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--worktree"])
+        self.assertEqual((code, output.getvalue()), (1, "review: snapshot failed\n"))
+        self.assertTrue(indexes)
+        self.assertTrue(all(not path.exists() for path in indexes))
+
+    def test_head_and_worktree_are_required_mutually_exclusive_options(self) -> None:
+        self.write("src/lib.rs", "fn value() {}\n")
+        base = self.commit()
+        for options in ([], ["--head", "HEAD", "--worktree"]):
+            with self.subTest(options=options):
+                result = subprocess.run([sys.executable, str(SCRIPT), "check", "--repo", str(self.repo),
+                                         "--base", base, *options], capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_complete_private_rename_in_three_files_is_mechanical(self) -> None:
         base = self.rename_fixture()

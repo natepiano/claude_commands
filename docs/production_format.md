@@ -314,6 +314,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
+   Standing style units instead use
+   `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`.
+   Refill waits for the previous ticket's merge, so no unmerged unit work remains
+   at phase start. Report a refused fast-forward to the style showrunner as an
+   error; never create a merge commit to work around it.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
    `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
    Worktrees share refs, so no fetch is needed. Check it yourself; a message
