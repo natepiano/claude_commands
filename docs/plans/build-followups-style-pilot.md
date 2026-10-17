@@ -419,13 +419,23 @@ Pending: parent's saved style child summary and rendered style line.
   `Write::write_all(buf)`), a name already bound in the scope, a conversion
   that ends in a struct field or return value, a value built from the
   binding (a `format!` message, an enum variant holding it), and one element
-  filling a plural collection parameter. Fix R took for `From`, `into` and
+  filling a plural collection parameter. Fix R held for `From`, `into` and
   `map_or`; the four losses are two other gaps. Two are conversions the judge
   did not pass through: an accessor (`temp.path()`) and a method that returns
   the value in another form (`.to_local_def_id()`). Two are bindings dropped
   as filling several parameters when they fill one: a second loop that binds
   the same name, and a value derived from the binding
   (`directory.path().join("config")`). Fix S states both in the ticket.
+
+- **Fix S — a name-bindings ticket names accessors and counts one value per
+  target** (commit `96395dde`): fix R's conversion line now also passes
+  through an accessor (`.path()`, `.as_str()`) and a method that returns the
+  same value in another form (`.to_local_def_id()`). It says a binding fills
+  several parameters only when that same value fills them: a value derived
+  from it, or a later binding of the same name, is another value. Tickets
+  without the name-bindings rule are unchanged. A second rerun of the traced
+  pass on the same 120 files, under the same scope reading, measures it
+  against the 95% bar.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
