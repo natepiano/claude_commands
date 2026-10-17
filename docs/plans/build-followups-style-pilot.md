@@ -301,6 +301,15 @@ Pending: parent's saved style child summary and rendered style line.
   other families wait on each crate's batches; fix M orders the pilot crates
   first.
 
+- **Fix M — modules takes first the crates that block a pilot unit** (commit `22fe6550`):
+  the types unit (pilot scope cargo-port) and the names unit (cargo-handler)
+  both waited on those crates' structure cells while refill handed modules
+  tui_pane, which sits in neither scope but held the most pending cells of
+  other families. A pending cell now counts toward a crate's place in the
+  structure order only when its family has a unit whose pilot scope holds
+  that crate, and a family with no unit counts nothing. Each unit's scope is
+  read from its own plan copy. `queue` shows the same order refill uses.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`.
 Live verification of the fixes and subsequent measurements remain pending.
