@@ -270,7 +270,7 @@ def live_unit(slug: str) -> LiveClaude | None:
     else:
         import unit_lookup
 
-    unit = unit_lookup.marked_units(slug).get(NIGHTLY_UNIT)
+    unit = unit_lookup.marked_unit(slug, NIGHTLY_UNIT)
     return unit.claude if unit is not None and isinstance(unit.claude, unit_lookup.LiveClaude) else None
 
 

@@ -463,10 +463,10 @@ def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_m
     return list(owners.values())
 
 
-def _notify_no_room(text: str, now: datetime) -> None:
+def _notify_no_room(text: str, now: datetime) -> bool:
     import quota_alert
     config = quota_alert.load_config()
-    _ = quota_alert.deliver_and_record([quota_alert.Job("", recipient, text, "refusal")
+    return quota_alert.deliver_notice([quota_alert.Job("", recipient, text, "refusal")
         for recipient in quota_alert.recipients(config)], now.isoformat())
 
 
@@ -476,8 +476,8 @@ def _blocked_head_line(rule: AutoMoveRule, reason: BlockedHeadReason) -> str:
     return blocked_next_move_line(rule.group, rule.to, rule.entry_id, reason)
 
 
-def _notify_blocked_head(rule: AutoMoveRule, reason: BlockedHeadReason, now: datetime) -> None:
-    notify_blocked_next_move(rule.group, rule.to, rule.entry_id, reason, now)
+def _notify_blocked_head(rule: AutoMoveRule, reason: BlockedHeadReason, now: datetime) -> bool:
+    return notify_blocked_next_move(rule.group, rule.to, rule.entry_id, reason, now)
 
 
 def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedHeadReason,
@@ -486,8 +486,9 @@ def _record_blocked_head(state: WatchState, rule: AutoMoveRule, reason: BlockedH
         notices = state.setdefault("auto_move_notices", {})
         fingerprint = blocked_next_move_reason_key(reason)
         if notices.get(rule.entry_id) != fingerprint:
-            _notify_blocked_head(rule, reason, now)
-            notices[rule.entry_id] = fingerprint
+            _ = notices.pop(rule.entry_id, None)
+            if _notify_blocked_head(rule, reason, now):
+                notices[rule.entry_id] = fingerprint
     return _blocked_head_line(rule, reason)
 
 
@@ -743,8 +744,9 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                         _set_transition(state, session["session_id"], refusal.entry_id, "no room", move_id)
                 notice_key = login if isinstance(group[0][1], ProofRefusal) else source_identity.login.casefold()
                 if state["notices"].get(notice_key) != fingerprint:
-                    _notify_no_room(text, now)
-                    state["notices"][notice_key] = fingerprint
+                    _ = state["notices"].pop(notice_key, None)
+                    if _notify_no_room(text, now):
+                        state["notices"][notice_key] = fingerprint
             continue
         if group_name != "ungrouped":
             lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]

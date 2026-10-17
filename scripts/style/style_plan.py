@@ -11,10 +11,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import cast
@@ -27,6 +29,7 @@ import berth_board
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
+import style_footprint
 import style_proposals
 from issues import frontmatter
 from production_units import Refusal, production_field
@@ -291,6 +294,11 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
     return tuple(result)
 
 
+def blocked_by_structure(cell: style_ledger.Cell, structure: tuple[style_ledger.Cell, ...]) -> bool:
+    return any(blocker.crate == cell.crate and blocker.path in (cell.crate, cell.path)
+               for blocker in structure)
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -335,8 +343,9 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                                   if site.path in files)
                     result.append(TicketSelection("structure", family, crate, files, rule_ids, sites=sites,
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
-            continue
-        own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family and not busy.contains(cell.path))
+                continue
+        own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family
+                    and not busy.contains(cell.path) and not blocked_by_structure(cell, structure))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
             files = {cell.path for cell in own if cell.rule == rule_id}
             sites_by_file: dict[str, list[style_ledger.ListedSite]] = defaultdict(list)
@@ -374,8 +383,71 @@ def delegation_context(text: str) -> str:
     return match.group(1).strip()
 
 
+@dataclass(frozen=True)
+class ReadWindow:
+    start: int
+    end: int
+
+
+_NO_READ_WINDOWS: Mapping[str, tuple[ReadWindow, ...]] = MappingProxyType({})
+
+
+def read_windows(text: str) -> tuple[ReadWindow, ...]:
+    """Balance line ranges, keeping a file's top-level test module apart."""
+    lines = len(text.splitlines())
+    cuts = [0, lines]
+    for match in re.finditer(r"(?m)^[ \t]*#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", text):
+        prefix = style_footprint.tokens(text[:match.start()])
+        depth = sum(token.value in ("{", "(", "[") for token in prefix) - sum(
+            token.value in ("}", ")", "]") for token in prefix)
+        if depth or any(token.kind == "unknown" for token in prefix):
+            continue
+        following = [token.value for token in style_footprint.tokens(text[match.end():])]
+        cursor = 0
+        while following[cursor:cursor + 2] == ["#", "["]:
+            cursor += 2
+            brackets = 1
+            while cursor < len(following) and brackets:
+                brackets += int(following[cursor] == "[") - int(following[cursor] == "]")
+                cursor += 1
+        if following[cursor:cursor + 1] == ["pub"]:
+            cursor += 1
+            if following[cursor:cursor + 1] == ["("]:
+                cursor += 1
+                parentheses = 1
+                while cursor < len(following) and parentheses:
+                    parentheses += int(following[cursor] == "(") - int(following[cursor] == ")")
+                    cursor += 1
+        if following[cursor:cursor + 1] != ["mod"]:
+            continue
+        cut = text.count("\n", 0, match.start())
+        if cut:
+            cuts.insert(1, cut)
+        break
+    windows: list[ReadWindow] = []
+    for start, end in zip(cuts, cuts[1:]):
+        length = end - start
+        count = (length + 299) // 300
+        if not count:
+            continue
+        size, extra = divmod(length, count)
+        for index in range(count):
+            finish = start + size + int(index < extra)
+            windows.append(ReadWindow(start + 1, finish))
+            start = finish
+    return tuple(windows)
+
+
+class CrateTargets(Enum):
+    NO_PACKAGE = "no-package"
+    LIBRARY = "library"
+    BINARY_ONLY = "binary-only"
+
+
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
-               context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = ()) -> str:
+               context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
+               file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
+               crate_targets: CrateTargets = CrateTargets.LIBRARY) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -395,6 +467,14 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
                      for finding in held_findings]) if per_file_structure and held_findings else []
     approved = ticket["kind"] == "proposal"
+    files: list[str] = []
+    for path in ticket["files"]:
+        line = f"- `{path}`"
+        if ticket["kind"] == "read":
+            windows = file_windows[path]
+            line += " — " + ("lines " + ", ".join(f"{window.start}-{window.end}" for window in windows)
+                              if windows else "empty file")
+        files.append(line)
     authorization = (
         f"Approved proposal `{ticket['proposal']}` overrides the mechanical-only invariant in the copied context "
         + "and the mechanical-only style Spec for exactly this issue's approved findings. Apply those changes; "
@@ -408,6 +488,12 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "", "**Spec:**", *rule_lines, *sites, *uncovered, *owned_lines,
         authorization,
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
+        *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]
+          if crate_targets is CrateTargets.BINARY_ONLY else []),
+        *(["A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
+           + "name the binding after the parameter the converted value fills."]
+          if any(PurePosixPath(pinned.rule_id.removesuffix("#uncovered")).name
+                 == "name-bindings-to-match-parameters.md" for pinned in texts) else []),
         *([
             "Judge file by file: take each file under **Files** in turn and judge it against every rule above, with that rule's listed sites "
             + "in it and its uncovered surface; read the uncovered instructions in the pinned text.",
@@ -423,12 +509,23 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             *[f"Record `{rule}` once with `--path {ticket['crate']}` after reading the manifests." for rule in manifest_rules],
             *held_lines,
         ] if ticket["kind"] == "structure" else []),
+        *([
+            "Judge window by window: take the files under **Files** in order, and each file's windows in order.",
+            "For each window, read exactly that line range in full and judge it against every rule above, "
+            + "line by line, giving its last line the same attention as its first.",
+            "Start a file's first window with its module docs (the `//!` block and any comment before the first item); "
+            + "judge them against every rule before any code.",
+            "Hold that window's findings before opening the next window. Hold each distinct defect as its own finding; "
+            + "never stop at a window's first finding.",
+            "Record a file's verdict for every rule only after its last window has been judged, "
+            + "with `record --rule <rule> --path <file>` for each rule/file cell.",
+        ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
         f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
-        "", "**Files:**", *(f"- `{path}`" for path in ticket["files"]), "", "**Workers:**", workers, "",
+        "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
         "`bash ~/.claude/scripts/delegate/verify.sh test <package>`",
@@ -458,11 +555,22 @@ def atomic_write(path: Path, data: bytes) -> None:
 def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, plan: Path, text: str) -> None:
     texts = ledger.pinned_rule_texts(ticket["id"])
     ticket["base"] = ledger.ticket_base(ticket["id"])
+    crate = PurePosixPath(ticket["crate"])
+    manifest: dict[str, object] = tomllib.loads(git(ledger.repo, "show", f"{ticket['base']}:{crate / 'Cargo.toml'}"))
+    if not isinstance(manifest.get("package"), dict):
+        crate_targets = CrateTargets.NO_PACKAGE
+    elif isinstance(manifest.get("lib"), dict) or git(
+            ledger.repo, "ls-tree", "--name-only", ticket["base"], "--", str(crate / "src/lib.rs")).strip():
+        crate_targets = CrateTargets.LIBRARY
+    else:
+        crate_targets = CrateTargets.BINARY_ONLY
+    file_windows = ({path: read_windows(git(ledger.repo, "show", f"{ticket['base']}:{path}"))
+                     for path in ticket["files"]} if ticket["kind"] == "read" else {})
     held = (tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
                   if finding.path in ticket["files"] and finding.rule in ticket["rules"]
                   and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
             if ticket["kind"] == "structure" and ticket["cells"] else ())
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held)
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
@@ -555,9 +663,11 @@ def _select_phase(
         if family != "modules":
             pending = tuple(cell for cell in ledger.cells()
                             if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
-            structure = {cell.crate for cell in pending if cell.tier == "D"}
-            own = {cell.crate for cell in pending if cell.family == family}
-            blocked = tuple(sorted(structure & own))
+            structure = tuple(cell for cell in pending if cell.tier == "D")
+            own = tuple(cell for cell in pending if cell.family == family)
+            blocked = tuple(sorted(crate for crate in {cell.crate for cell in own}
+                                   if all(blocked_by_structure(cell, structure)
+                                          for cell in own if cell.crate == crate)))
             if blocked:
                 return WaitingForStructure(blocked, len(ledger.unclassified_rules()))
         return NoAvailableWork()

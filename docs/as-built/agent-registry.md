@@ -231,8 +231,8 @@ interrupts any live turn. Any other status, `ended` included, prints `<worker> i
 `stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
 non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
 after `REAP_WAIT_SECS`, 5 s, checked every `REAP_POLL_SECS`, 0.2 s) and removes the
-server file. `scripts/delegate/end_session.sh` calls it, reading the session directory
-out of the run-active marker: the server is detached on purpose so it outlives
+server file. `scripts/delegate/end_session.sh` calls it for every run folder the director
+holds (`unit_runs.py held`: the marker's run and each folder that records the director): the server is detached on purpose so it outlives
 each delegate, so the end of the run is the only point that knows nobody needs
 it. That is also why it reaps `mesh_retired.json` as well as the live record —
 a server the retry below abandoned is left running, since it may still be

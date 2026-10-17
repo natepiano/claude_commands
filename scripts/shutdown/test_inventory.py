@@ -1787,7 +1787,7 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     def test_faulted_production_marks_cannot_turn_a_unit_into_a_standalone(self) -> None:
         self.claude()
-        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {"show": "duplicate unit marks"})) as marks:
+        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {"show": {"one-unit": "duplicate unit marks"}})) as marks:
             found = inventory.snapshot_inventory()
         self.assertIsInstance(found, inventory.PartialInventory)
         assert isinstance(found, inventory.PartialInventory)

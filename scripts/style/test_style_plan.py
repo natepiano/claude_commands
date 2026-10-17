@@ -151,6 +151,200 @@ class StylePlanTests(unittest.TestCase):
             rows = cast(list[tuple[int]], connection.execute("SELECT COUNT(*) FROM tickets").fetchall())
         return rows[0][0]
 
+    def test_long_read_windows_balance_each_part_and_cover_the_test_module_separately(self) -> None:
+        text = "//! Module docs\n" + "// production\n" * 759 + "#[cfg(test)]\nmod tests {\n" + "// test\n" * 599 + "}\n"
+        windows = style_plan.read_windows(text)
+        self.assertEqual(windows, (
+            style_plan.ReadWindow(1, 254), style_plan.ReadWindow(255, 507), style_plan.ReadWindow(508, 760),
+            style_plan.ReadWindow(761, 961), style_plan.ReadWindow(962, 1162), style_plan.ReadWindow(1163, 1362),
+        ))
+        self.assertEqual([line for window in windows for line in range(window.start, window.end + 1)],
+                         list(range(1, len(text.splitlines()) + 1)))
+        self.assertTrue(all(window.end - window.start + 1 <= 300 for window in windows))
+
+    def test_short_read_windows_keep_tests_apart_and_leave_files_without_tests_whole(self) -> None:
+        cases = (
+            ("//! Docs\nfn value() {}\n#[cfg(test)]\nmod tests {}\n",
+             (style_plan.ReadWindow(1, 2), style_plan.ReadWindow(3, 4))),
+            ("//! Docs\nfn value() {}", (style_plan.ReadWindow(1, 2),)),
+            ("#[cfg(test)]\nmod tests {}\n", (style_plan.ReadWindow(1, 2),)),
+            ("", ()),
+            ("fn value() {\n#[cfg(test)]\nmod nested {}\n}\n", (style_plan.ReadWindow(1, 4),)),
+            ("/*\n#[cfg(test)]\nmod example {}\n*/\nfn value() {}\n", (style_plan.ReadWindow(1, 5),)),
+            ('const TEXT: &str = r#"\n#[cfg(test)]\nmod example {}\n"#;\n', (style_plan.ReadWindow(1, 4),)),
+            ("#[cfg(test)]\nfn helper() {}\n#[cfg(test)]\nmod tests {}\n",
+             (style_plan.ReadWindow(1, 2), style_plan.ReadWindow(3, 4))),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(style_plan.read_windows(text), expected)
+
+    def test_read_windows_find_test_modules_past_outer_attributes_and_visibility(self) -> None:
+        items = (
+            ("#[allow(\n    clippy::expect_used,\n    clippy::unwrap_used\n)]\nmod tests {}", True),
+            ('#[expect(clippy::panic, reason = "tests may panic")]\nmod tests {}', True),
+            ("pub(crate) mod tests {}", True),
+            ("pub mod tests {}", True),
+            ("pub(super) mod tests {}", True),
+            ("pub(in crate::helpers) mod tests {}", True),
+            ('#[allow(dead_code)]\n#[example([nested], reason = "]")]\npub(crate) mod tests {}', True),
+            ("#[allow(dead_code)]\nfn helper() {}", False),
+            ("#![allow(dead_code)]\nmod tests {}", False),
+        )
+        for item, is_module in items:
+            with self.subTest(item=item):
+                text = "//! Docs\nfn value() {}\n#[cfg(test)]\n" + item + "\n"
+                end = len(text.splitlines())
+                expected = ((style_plan.ReadWindow(1, 2), style_plan.ReadWindow(3, end))
+                            if is_module else (style_plan.ReadWindow(1, end),))
+                self.assertEqual(style_plan.read_windows(text), expected)
+
+    def test_written_read_phase_lists_base_commit_windows_and_requires_module_docs_before_code(self) -> None:
+        _ = self.rule("read")
+        self.write(self.sources[0], "//! Module docs\n" + "// production\n" * 599
+                   + "#[cfg(test)]\nmod tests {\n" + "// tests\n" * 298 + "}\n")
+        self.tip = self.commit()
+        for checkout in (self.style, self.unit):
+            _ = self.git("merge", "--ff-only", "main", cwd=checkout)
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn(f"- `{self.sources[0]}` — lines 1-300, 301-600, 601-751, 752-901\n", text)
+        self.assertIn(f"- `{self.sources[1]}` — lines 1-1\n", text)
+        instructions = (
+            "Judge window by window: take the files under **Files** in order, and each file's windows in order.",
+            "read exactly that line range in full", "against every rule above, line by line",
+            "giving its last line the same attention as its first",
+            "module docs (the `//!` block and any comment before the first item)",
+            "judge them against every rule before any code",
+            "Hold that window's findings before opening the next window.",
+            "Hold each distinct defect as its own finding; never stop at a window's first finding.",
+            "Record a file's verdict for every rule only after its last window has been judged",
+            "`record --rule <rule> --path <file>` for each rule/file cell.",
+        )
+        for instruction in instructions:
+            self.assertIn(instruction, text)
+        _ = (self.unit / self.sources[0]).write_text("// Working tree now differs from the ticket base.\n")
+        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.plan.read_text(), text)
+
+    def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("modules-unit-1"))
+        text = plan.read_text()
+        self.assertEqual(text.split("**Files:**\n", 1)[1].split("\n**Workers:**", 1)[0],
+                         "\n".join(f"- `{path}`" for path in self.sources[:2]) + "\n")
+        self.assertEqual(text.split("Read only these pinned rule texts.", 1)[1].split("\nProduct work wins.", 1)[0],
+                         " A #uncovered rule is the parent rule's uncovered read.\n"
+                         + "Judge file by file: take each file under **Files** in turn and judge it against every rule above, "
+                         + "with that rule's listed sites in it and its uncovered surface; read the uncovered instructions in the pinned text.\n"
+                         + "Before judging a file, read its sibling files in the same module and its direct callers "
+                         + "(search the crate for its types and functions), so placement and ownership are judged against the code around it.\n"
+                         + "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
+                         + "and never stop at a file's first finding.\n"
+                         + "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
+                         + "under the rule it breaks most directly, naming the others in its text.\n"
+                         + "Record each file's verdict for every rule above as soon as that file has been judged against it, "
+                         + "with `record --path <file>`; the gate refuses this ticket while any file lacks one.")
+        self.assertNotIn("window", text)
+        self.assertEqual(self.ledger().ticket_open("modules-unit")[0]["rules"], [rule])
+
+    def test_written_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
+        rule = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["rules"], [rule])
+        self.assertIn(
+            "uncovered read.\n"
+            + "A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
+            + "name the binding after the parameter the converted value fills.\nJudge window by window:",
+            self.plan.read_text())
+
+    def test_written_uncovered_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
+        rule = self.rule("name-bindings-to-match-parameters", "tier: B\nfamily: names\ncandidates:\n"
+                         + "  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read every binding.\n")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["rules"], [rule + "#uncovered"])
+        self.assertIn(
+            "uncovered read.\n"
+            + "A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
+            + "name the binding after the parameter the converted value fills.\nJudge window by window:",
+            self.plan.read_text())
+
+    def test_written_names_phase_for_other_rules_keeps_the_existing_spec_without_conversion_guidance(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters-extra")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn("uncovered read.\nJudge window by window:", text)
+        self.assertNotIn("A conversion between the binding and the call", text)
+
+    def prepare_binary_crate(self) -> None:
+        (self.repo / self.sources[0]).unlink()
+        self.write("crates/alpha/src/main.rs", "fn main() {}\n")
+        self.tip = self.commit()
+        for checkout in (self.style, self.unit):
+            _ = self.git("merge", "--ff-only", "main", cwd=checkout)
+        self.sync()
+
+    def test_written_read_phase_explains_binary_only_items_are_not_public_outside_the_crate(self) -> None:
+        _ = self.rule("read")
+        self.prepare_binary_crate()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.\n"
+            + "`crates/alpha` is binary-only (no library target): none of its items, `pub` or not, "
+            + "is public outside the crate.\nJudge window by window:", self.plan.read_text())
+
+    def test_written_read_phase_for_a_default_library_keeps_the_existing_spec(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn(
+            "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.\n"
+            + "Judge window by window:", self.plan.read_text())
+        self.assertNotIn("binary-only", self.plan.read_text())
+
+    def test_written_read_phase_for_a_virtual_root_does_not_claim_a_binary_crate(self) -> None:
+        _ = self.rule("read")
+        self.write("root.rs", "pub fn root_helper() {}\n")
+        self.tip = self.commit()
+        for checkout in (self.style, self.unit):
+            _ = self.git("merge", "--ff-only", "main", cwd=checkout)
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["crate"], ticket["files"]), (".", ["root.rs"]))
+        self.assertIn("- `root.rs` — lines 1-1\n", self.plan.read_text())
+        self.assertNotIn("binary-only", self.plan.read_text())
+
+    def test_written_read_phase_recognizes_a_custom_library_target_without_src_lib(self) -> None:
+        _ = self.rule("read")
+        self.write("crates/alpha/Cargo.toml", '[package]\nname = "alpha"\nversion = "0.1.0"\n'
+                   + '[lib]\npath = "library.rs"\n')
+        self.write("crates/alpha/library.rs", "pub fn library() {}\n")
+        self.prepare_binary_crate()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertNotIn("binary-only", self.plan.read_text())
+        self.assertIn("uncovered read.\nJudge window by window:", self.plan.read_text())
+
+    def test_written_read_phase_uses_base_targets_when_a_library_is_added_to_the_worktree(self) -> None:
+        _ = self.rule("read")
+        self.prepare_binary_crate()
+        _ = (self.unit / "crates/alpha/src/lib.rs").write_text("pub fn new_library() {}\n")
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertIn("`crates/alpha` is binary-only (no library target)", self.plan.read_text())
+        text = self.plan.read_text()
+        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
+        self.assertEqual(self.plan.read_text(), text)
+
 
     def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -461,6 +655,87 @@ class StylePlanTests(unittest.TestCase):
             self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo)]), 0)
         self.assertIn("names-unit: read", output.getvalue())
 
+    def test_names_read_refill_takes_only_files_without_pending_structure_cells(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        read = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
+                         ("read", [read], [self.sources[1]]))
+        self.assertIn(f"- `{self.sources[1]}` — lines 1-1\n", self.plan.read_text())
+        self.assertNotIn(f"- `{self.sources[0]}`", self.plan.read_text())
+
+    def test_names_listed_refill_packs_only_sites_on_files_without_pending_structure_cells(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        listed = self.rule("listed", "tier: B\nfamily: names\npre_filter: value\n")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]),
+                         ("listed", [listed], [self.sources[1]]))
+        self.assertEqual([(site["path"], site["line"]) for site in ticket["sites"]], [(self.sources[1], 1)])
+
+    def test_pending_manifest_structure_cell_keeps_names_crate_closed_after_file_judgments(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        _ = self.rule("read")
+        self.sync()
+        for path in self.sources:
+            self.record(structure, path, self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        self.record(manifest, "crates/alpha", self.tip)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+
+    def test_names_waits_for_structure_when_every_pending_names_file_is_closed(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        read = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        self.record(read, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        before = self.plan.read_bytes()
+
+        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_names_waits_for_sync_when_an_open_names_file_is_busy_despite_other_closed_files(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[1], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])):
+            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_modules_still_selects_only_pending_structure_files_when_names_can_refill(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(structure, path, self.tip)
+        before = self.candidates("modules")
+        self.assertEqual([(ticket.kind, ticket.crate, ticket.files, ticket.cells) for ticket in before], [
+            ("structure", "crates/alpha", (self.sources[0],), ((structure, self.sources[0]),)),
+        ])
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.candidates("modules"), before)
+
     def test_structure_first_unblocks_more_other_family_cells_before_staler_crates(self) -> None:
         read = self.rule("read")
         own = self.rule("module-read", "tier: C\nfamily: modules\ninput_scope: file\n")
@@ -670,7 +945,8 @@ class StylePlanTests(unittest.TestCase):
                                   proposal=str(issue) if kind == "proposal" else "")
                 ticket = ledger.queued_tickets("names-unit")[-1]
                 phase = style_plan.phase_text(ticket, ledger.pinned_rule_texts(ticket_id), self.plan,
-                                              style_plan.delegation_context(self.plan.read_text()))
+                                              style_plan.delegation_context(self.plan.read_text()),
+                                              file_windows={self.sources[0]: (style_plan.ReadWindow(1, 1),)})
                 self.assertIn("Read only these pinned rule texts.", phase)
                 self.assertIn("#uncovered rule is the parent rule's uncovered read.", phase)
                 self.assertNotIn("For a structure ticket, judge", phase)

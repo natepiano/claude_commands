@@ -35,6 +35,8 @@ Every partial B rule also has a C read in its own family.
 One ticket per phase:
 
 - **Read:** one family, about 5,000 lines in one module subtree, 10–25 files.
+  The Work Order lists each file's line windows (at most 300 lines, test module
+  apart); judge and hold window by window, module docs first.
 - **Listed:** one rule and crate; pack whole files in path order into tickets of
   at most 150 sites. A file with more than 150 sites gets one ticket by itself.
   Never split a file's sites between tickets.
@@ -91,8 +93,9 @@ Refill only the unit worktree's own plan copy:
 
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
 reporting `repair first`; 3 means `waiting for sync`, or
-`waiting for structure: <crates>` when pending structure cells in those in-scope
-crates hold the unit back until the modules unit's structure tickets merge
+`waiting for structure: <crates>` when every pending family cell in those
+in-scope crates is blocked by a structure cell on its file or crate, until the
+modules unit's structure tickets merge
 (an unclassified catalog also says `pull nate_style`); 4 means
 `board unavailable: <reason>`; 5 means
 `waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation

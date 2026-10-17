@@ -701,7 +701,21 @@ class RecordedHerdrPane:
     pane_id: str
 
 
-HerdrDestination = NewHerdrSession | RecordedHerdrPane
+@dataclass(frozen=True)
+class SharedHerdrTab:
+    """A new tab in the shared session, in the workspace named for the session's production."""
+    name: str
+
+
+HerdrDestination = NewHerdrSession | RecordedHerdrPane | SharedHerdrTab
+
+
+def herdr_space(session: Session) -> str:
+    """The shared session's workspace for a Claude session: its production, else `sessions`."""
+    if session["kind"] == "showrunner":
+        from showrunners import production_slug
+        return production_slug(session["doc"])
+    return "sessions"
 
 
 class HerdrDestinationTaken(OSError):
@@ -1012,6 +1026,7 @@ def _herdr_launch(
     name = destination.name
     if dry_run:
         location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
+                    else f"a new tab in {herdr_space(session)}" if isinstance(destination, SharedHerdrTab)
                     else "a new pane")
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return herdr.ServerAdopted()
@@ -1038,7 +1053,8 @@ def _herdr_launch(
                 )
         client = herdr.Herdr(name)
         agents = client.agents()
-        if any((isinstance(destination, NewHerdrSession) or row["pane_id"] == destination.pane_id)
+        if any((isinstance(destination, NewHerdrSession)
+                or (isinstance(destination, RecordedHerdrPane) and row["pane_id"] == destination.pane_id))
                and row.get("agent")
                and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
             location = (f"{name}:{destination.pane_id}" if isinstance(destination, RecordedHerdrPane)
@@ -1053,12 +1069,18 @@ def _herdr_launch(
             else:
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
-        pane = herdr.open_pane(name, name, parts.cwd, environment)
+        if name == herdr.shared_session():
+            pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
+        else:
+            pane = herdr.open_pane(name, name, parts.cwd, environment)
         try:
             client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
                                opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
         except herdr.AgentExited:
-            herdr.stop_created_server(name, server)
+            if name == herdr.shared_session():
+                herdr.close_agent(name, pane)
+            else:
+                herdr.stop_created_server(name, server)
             raise
         if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
             focused = _focus_restored_pane(client, pane, session["name"])
@@ -1073,6 +1095,23 @@ def _herdr_launch(
         raise HerdrDestinationTaken(str(error)) from error
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+
+
+def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
+    """Close the pane a session left behind when it moved into the shared session; stop the server it emptied."""
+    client = herdr.Herdr(recorded)
+    try:
+        rows = client.panes()
+        left = [row for row in rows if row["pane_id"] == pane]
+        if left and not isinstance(client.pane_activity(pane), herdr.PaneAtShell):
+            print(f"{name} restart issue: herdr {recorded}:{pane} still runs a program; left open")
+            return
+        if len(rows) == len(left):
+            herdr.stop_session(recorded)
+        elif left:
+            client.close_pane(pane)
+    except herdr.HerdrFailure as error:
+        print(f"{name} restart issue: herdr session {recorded} left open: {error}")
 
 
 def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> bool:
@@ -1180,9 +1219,13 @@ def _launch_session(
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
                           at=record["requested_at"], probe=record.get("probe", False))
     if host["kind"] == "herdr":
-        server = _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
-                      session, dry_run=dry_run, session_kind=desktop_state.session_kind)
-        name = host["herdr_session"]
+        shared = herdr.shared_session()
+        moving = bool(shared) and host["herdr_session"] != shared
+        destination = SharedHerdrTab(shared) if moving else RecordedHerdrPane(host["herdr_session"], host["pane_id"])
+        server = _herdr_launch(parts, destination, session, dry_run=dry_run, session_kind=desktop_state.session_kind)
+        if moving and not dry_run:
+            _leave_recorded_session(session["name"], host["herdr_session"], host["pane_id"])
+        name = destination.name
         if isinstance(server, herdr.WindowServerCreated):
             return SessionLaunched()
         if herdr_presentation(host) == "attached window":
@@ -1198,9 +1241,10 @@ def _launch_session(
             print(shlex.join(["herdr", "session", "attach", name]))
         return SessionLaunched()
     if host["kind"] == "ghostty" or host["kind"] == "zed" or (host["kind"] == "terminal" and sys.platform == "darwin"):
-        name = herdr.generated_session_name(session["name"])
-        server = _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run,
-                    session_kind=desktop_state.session_kind)
+        shared = herdr.shared_session()
+        name = shared or herdr.generated_session_name(session["name"])
+        server = _herdr_launch(parts, SharedHerdrTab(name) if shared else NewHerdrSession(name), session,
+                    dry_run=dry_run, session_kind=desktop_state.session_kind)
         if isinstance(server, herdr.WindowServerCreated):
             return SessionLaunched()
         if host["kind"] == "ghostty" or host["kind"] == "terminal":
@@ -1216,6 +1260,8 @@ def _launch_session(
                 else:
                     relaunch.write_request(supervisor["pid"], request)
                 return SessionLaunched()
+        if shared and not dry_run and isinstance(herdr.attached_clients(name), herdr.ClientsAttached):
+            return SessionLaunched()
         desktop = (DesktopNotInSnapshot(kind="not in snapshot") if host["kind"] == "terminal"
                    else host["desktop"])
         _herdr_window(record, name, parts.cwd, desktop, desktop_state, dry_run=dry_run)

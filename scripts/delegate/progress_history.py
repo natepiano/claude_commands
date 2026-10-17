@@ -596,13 +596,21 @@ def _detect_main_identity(args: argparse.Namespace) -> AgentIdentity:
     )
 
 
-def _refresh_main_identity(state: dict[str, object]) -> None:
-    """Re-read the unit director's identity whenever a window opens.
+def _refresh_main_identity(session_dir: Path, state: dict[str, object]) -> None:
+    """Re-read the unit director's model and effort whenever a window opens.
 
-    `start-run` detects it once, and the unit director's model or effort can change
-    part way through a run. Detection that comes back unknown leaves the stored
-    identity alone: a window that cannot answer must not erase the answer
-    already recorded.
+    `start-run` detects the unit director once, and its model or effort can
+    change part way through a run. Windows are also opened from inside workers:
+    a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but detects
+    as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
+    of its own. So a refresh replaces `main_agent` only when the detected
+    session is the run's director (`unit_runs.director`), else the stored
+    identity's session; with neither known, any detection is taken. The
+    director is read from the run folder, not from `main_agent`, because runs
+    started before this check carry a worker's thread there, and the director's
+    next window repairs it. Detection that comes back unknown leaves
+    `main_agent` alone too: a window that cannot answer must not erase the
+    answer already recorded.
     """
     detected = _detect_main_identity(
         argparse.Namespace(
@@ -613,6 +621,10 @@ def _refresh_main_identity(state: dict[str, object]) -> None:
         )
     )
     if detected["model"] == "unknown":
+        return
+    stored = _object_dict(state.get("main_agent")) or {}
+    owner = unit_runs.director(session_dir) or _string(stored.get("session_id"))
+    if owner and detected["session_id"] != owner:
         return
     state["main_agent"] = detected
 
@@ -1216,7 +1228,7 @@ def _start_activity(args: argparse.Namespace) -> None:
     now = plan_history.now_epoch()
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
-    _refresh_main_identity(state)
+    _refresh_main_identity(session_dir, state)
     activity: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "label": _arg_string(args, "label", "Work") or "Work",
@@ -1403,7 +1415,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     # prevent, not the cleanup it looks like.
     _ = _close_slot_pass(session_dir, state, team_slot, "interrupted", now)
     state = _read_state(session_dir)
-    _refresh_main_identity(state)
+    _refresh_main_identity(session_dir, state)
     current_pass: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "kind": pass_kind,

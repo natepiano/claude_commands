@@ -14,6 +14,10 @@ ids; a Codex worker member is its thread id, since a Codex worker has no Claude 
   id, from the review pool's `pool.json`. It also carries `unit` (the lease's unit), `thread_id`,
   `state` (`busy` while its `busy_pid` runs, else `idle`) and `type`. Templates are left out.
 
+Runs are found by scanning both run roots, not through the session markers: a director runs
+independent phases side by side, each in its own run folder, and its one marker names only one of
+them. A run's director is the one `unit_runs.director` reads from the run folder.
+
 Only local records are read, nothing over ssh. An edge is printed while its member runs on this
 machine; its manager may run on another one, since cargo-handler joins session ids across machines,
 so a showrunner is named by its production's update timer wherever it runs. cargo-handler polls this every 30
@@ -152,17 +156,20 @@ def _codex_edges(director: str, run: Path) -> list[Edge]:
 
 def _claude_workers(run: Path, running: set[str]) -> dict[str, str]:
     """Each running Claude worker's session id to its slot: from its launch record, else from the
-    workers ledger, whose short id prefixes the session id and whose name ends with the slot."""
+    workers ledger, whose short id prefixes the session id and whose name ends with the slot.
+
+    implement.sh puts every Claude worker it launches in the ledger, so a run without one has
+    none, and the scan of every run folder skips its launch records unread."""
+    try:
+        ledger = (run / WORKER_LEDGER).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return {}
     workers: dict[str, str] = {}
     for path in sorted(run.glob("impl_worker_*.json")):
         record = _json_object(path)
         worker, slot = record.get("worker_id"), record.get("slot")
         if record.get("family") == "claude" and isinstance(worker, str) and worker in running and isinstance(slot, str):
             workers[worker] = slot
-    try:
-        ledger = (run / WORKER_LEDGER).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        ledger = []
     for line in ledger:
         short, _, name = line.partition("\t")
         short = short.strip()
@@ -183,9 +190,8 @@ def _board_roles(run: Path) -> dict[str, str]:
     return dict(line.split("\t", 1) for line in shown.stdout.splitlines() if "\t" in line)
 
 
-def _claude_edges(director: str, run: Path, running: set[str]) -> list[Edge]:
+def _claude_edges(director: str, run: Path, workers: dict[str, str]) -> list[Edge]:
     """A Claude-only run has no app-server, so these edges skip the server check."""
-    workers = _claude_workers(run, running)
     if not workers:
         return []
     roles = _board_roles(run)
@@ -237,21 +243,22 @@ def reviewer_edges(running: set[str], marked: unit_lookup.MarkedProductions) -> 
 
 def worker_edges(running: set[str]) -> list[Edge]:
     edges: list[Edge] = []
-    for active in unit_runs.active_dirs():
+    for root in unit_runs.run_roots():
         try:
-            markers = sorted(active.iterdir())
+            runs = sorted(path for path in root.iterdir() if path.is_dir())
         except OSError:
             continue
-        for marker in markers:
-            if marker.name not in running:
+        for run in runs:
+            server = _server_running(run)
+            claude = _claude_workers(run, running)
+            if not server and not claude:
                 continue
-            try:
-                run = Path(marker.read_text(encoding="utf-8").splitlines()[0].strip())
-            except (OSError, UnicodeError, IndexError):
+            director = unit_runs.director(run)
+            if director not in running:
                 continue
-            if _server_running(run):
-                edges.extend(_codex_edges(marker.name, run))
-            edges.extend(_claude_edges(marker.name, run, running))
+            if server:
+                edges.extend(_codex_edges(director, run))
+            edges.extend(_claude_edges(director, run, claude))
     return edges
 
 
