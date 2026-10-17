@@ -364,7 +364,52 @@ Pending: parent's saved style child summary and rendered style line.
   long files, but these findings came from read tickets, so the sample is
   re-judged once fix O's windows land.
 
+- **Dedicated name-bindings pass:** one blind judge, holding only the
+  name-bindings rule, read the 20 cargo-handler files in fix O's windows
+  and traced every argument that comes from a local binding into the
+  parameter it fills. It caught 3 of the 6 one-rule findings (50%), and
+  23 more the one-rule judge missed, mostly test fixtures named for where
+  they came from (`state` filling `natedev`, `root` filling `row`). It
+  traced all three misses and dropped them. Two are a binding that fills
+  several parameters with different names (`text` in settings.rs, `cell`
+  in footer_color_tests.rs), where no one name fits and the one-rule fix
+  adds a new binding the rule does not ask for; read that way the score is
+  3 of 4 (75%). The third is a real miss: a binding passed through a `From`
+  conversion takes the outer parameter's name, as the rule's own example
+  passes through `map_or`, but the judge stopped at the conversion's own
+  parameter name. The showrunner settled the first reading: a binding
+  that fills differently named parameters is out of scope, so the score is
+  3 of 4. Four findings are too few to call pass or fail; the rule text is
+  right and only the judges miss the conversion case, so a names ticket's
+  Work Order states it, and the pass runs again on a sample holding at
+  least 20 in-scope findings.
+
+- **Fix P — a binary crate's Work Order says its `pub` items are not
+  public** (commit `d6818851`): the types sample showed judges reading
+  `pub` as public in a crate with no library target. The planner now reads
+  the crate's manifest and `src/lib.rs` at the ticket's base, and a ticket
+  for a package with no library target states that none of its items is
+  public outside the crate. A crate with a library, and a workspace root
+  with no package of its own, get no line.
+
+- **Fix R — a name-bindings ticket says a conversion passes through**
+  (commit `8dab0170`): the dedicated name-bindings pass stopped at a `From`
+  impl's own parameter name. A ticket that pins the name-bindings rule now
+  states that a conversion between the binding and the call (`map_or`,
+  `From::from`, `.into()`) passes through, so the binding is named after
+  the parameter the converted value fills. Tickets without that rule are
+  unchanged.
+
+- **Fix Q — a file opens to other families once its own structure cells
+  are judged** (commit `0710fb55`): a pending structure cell closed its
+  whole crate to the names and types units, so they waited on the modules
+  unit's slowest file. Now only the files with a pending structure cell
+  stay closed, and a pending crate-wide structure cell still closes the
+  crate. The other families refill from the crate's open files, and wait
+  for structure only when every cell they have left is on a closed file.
+  The modules unit's own selection is unchanged.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
-`a8ae4d2a`, fix N as `5f63b4cf`.
+`a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`.
 Live verification of the fixes and subsequent measurements remain pending.
