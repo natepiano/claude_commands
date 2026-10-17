@@ -18,6 +18,7 @@ from unittest import mock
 import production_tree
 import showrunners
 import unit_lookup
+from herdr import HerdrPlace
 import unit_runs
 
 RUNNER, CHILD_RUNNER, GONE_RUNNER = "sid-runner", "sid-child-runner", "sid-gone-runner"
@@ -31,7 +32,7 @@ def record(session_id: str) -> dict[str, object]:
 
 def unit(session_id: str, name: str) -> unit_lookup.MarkedUnit:
     claude = unit_lookup.LiveClaude(name, session_id, f"/run/{name}.sock", 1)
-    return unit_lookup.MarkedUnit(name, name, claude, unit_lookup.TmuxPlace(f"%{name}"))
+    return unit_lookup.MarkedUnit(name, claude, HerdrPlace(name, "w1:p1"))
 
 
 def server_recorded(run: Path) -> bool:
@@ -146,11 +147,11 @@ class ProductionTreeTests(unittest.TestCase):
 
     def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
-                mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("tmux: gone")), \
+                mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("herdr: gone")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             edges = production_tree.tree()
         self.assertEqual(edges, [{"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}])
-        self.assertIn("unit marks unreadable: tmux: gone", errors.getvalue())
+        self.assertIn("unit marks unreadable: herdr: gone", errors.getvalue())
 
     def test_claude_workers_take_their_slot_role_from_the_board_without_a_server(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {}, server=False)

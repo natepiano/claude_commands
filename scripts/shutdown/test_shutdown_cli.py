@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 from test_support import linux_process_fixture, registry_confirmation, ShutdownTestCase
 import inventory
 import herdr
-from fake_herdr import CommandResponse
 from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
@@ -66,7 +65,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
             unit="alpha-unit",
             doc="/tmp/production.md",
             session_name="alpha",
-            session_host="tmux",
+            session_host="herdr",
             plan=inventory.PlanFromRunRecord(kind="plan", path="/tmp/alpha.md"),
         ),
     )
@@ -171,159 +170,17 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
-    def tmux_free_fixture(self, tmux: CommandResponse, *, native_stdout: str = EMPTY_HERDR_SESSIONS) -> Path:
-        fake = self.root / "observation-tool"
-        _ = shutil.copyfile(Path(__file__).resolve().parents[1] / "herdr/fake_herdr.py", fake)
-        fake.chmod(0o755)
-        responses = self.root / "observations.json"
-        replies: dict[str, CommandResponse] = {
-            "list-sessions -F #{session_name}": tmux,
-            "--session default session list --json": {"stdout": native_stdout, "code": 0},
-            "default": {"stdout": "unexpected command", "code": 99},
-        }
-        _ = responses.write_text(json.dumps(replies))
-        log = self.root / "observation-calls.jsonl"
-        self.enterContext(patch.dict(os.environ, {
-            "SHUTDOWN_TMUX": str(fake), "HERDR_BIN": str(fake),
-            "FAKE_HERDR_RESPONSES": str(responses), "FAKE_HERDR_LOG": str(log),
-        }))
-        return log
 
-    def tmux_free_owner(self, host: inventory.SessionHost) -> inventory.TopLevelSession:
-        return inventory.TopLevelSession(kind="top-level", session_id="writing-id", pid=123,
-            proc_start="456", name="Writing", cwd="/tmp/writing", status="idle", updated_at=0,
-            probe=False, model=inventory.NoReplyYet(kind="no reply yet"),
-            checkout=inventory.NotACheckout(kind="not a checkout"), run_dirs=[], codex_servers=[],
-            timers=[], host=host)
 
-    def test_tmux_free_accepts_empty_or_absent_tmux_without_writing_or_starting_anything(self) -> None:
-        for reply in (CommandResponse(stdout="", code=0), CommandResponse(stdout="", code=1,
-                stderr="no server running on /tmp/fake-tmux")):
-            with self.subTest(reply=reply):
-                log = self.tmux_free_fixture(reply)
-                log.unlink(missing_ok=True)
-                saved = self.recovery("retained")
-                before = {path.relative_to(self.state): path.read_bytes()
-                          for path in self.state.rglob("*") if path.is_file()}
-                with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                        "natedev", {}, {})) as observe, redirect_stdout(io.StringIO()) as output):
-                    self.assertEqual(shutdown.main(["tmux-free"]), 0)
-                self.assertEqual(output.getvalue(), "nothing needs tmux\n")
-                observe.assert_called_once_with()
-                self.assertEqual([cast(list[str], json.loads(line)) for line in log.read_text().splitlines()], [
-                    ["list-sessions", "-F", "#{session_name}"],
-                    ["--session", "default", "session", "list", "--json"],
-                ])
-                self.assertEqual({path.relative_to(self.state): path.read_bytes()
-                    for path in self.state.rglob("*") if path.is_file()}, before)
-                self.assertEqual(record.read_snapshot(LOGIN), saved)
 
-    def test_tmux_free_allows_live_herdr_agents_and_herdr_units(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0), native_stdout=json.dumps(
-            herdr.SessionListResult(sessions=[herdr.SessionEntry(name="writing", running=True, default=False,
-                session_dir="/tmp/writing", socket_path="/tmp/writing/herdr.sock")])))
-        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
-        unit = unit_session("unit-id")
-        unit["host"]["session_host"] = "herdr"
-        entries: list[inventory.SnapshotSession] = [
-            inventory.SnapshotClaudeSession(agent="claude", session=unit, workers=[], timers=[], last_seen=OCTOBER, state="running"),
-            inventory.SnapshotCodexSession(agent="codex", session=owner, workers=[], timers=[], last_seen=OCTOBER,
-                state="running", codex=inventory.CodexLaunch(home="/tmp/codex", resume=inventory.CodexResumePicker(kind="picker"))),
-        ]
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                "natedev", {LOGIN: entries}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 0)
-        self.assertEqual(output.getvalue(), "nothing needs tmux\n")
 
-    def test_tmux_free_checks_workers_beside_a_safe_owner(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
-        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
-        worker = inventory.WorkerSession(kind="worker", session_id="worker-id", pid=124, proc_start="457",
-            name="Worker", cwd="/tmp/writing", status="idle", updated_at=0, probe=False,
-            model=inventory.NoReplyYet(kind="no reply yet"), checkout=inventory.NotACheckout(kind="not a checkout"),
-            run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
-            owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))
-        entry = inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[worker], timers=[],
-            last_seen=OCTOBER, state="running")
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 1)
-        self.assertIn("Worker (worker-id) uses an unknown host", output.getvalue())
-        self.assertNotIn("Writing (writing-id)", output.getvalue())
 
-    def test_tmux_free_refuses_a_shell_only_tmux_session_after_its_claude_migrated(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="old writing room\n", code=0))
-        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
-        entry = inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
-            last_seen=OCTOBER, state="running")
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 1)
-        self.assertEqual(output.getvalue(),
-            "tmux session 'old writing room' is still registered; close it after moving its agents\n")
 
-    def test_tmux_free_reports_every_partial_source_including_a_config_only_home(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
-        failures = ("session writing-id: bare ~/.claude is config-only; account cannot be attributed",
-                    "production alpha: unit marks unreadable")
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory(failures)) as observe,
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 1)
-        observe.assert_called_once_with()
-        self.assertEqual(output.getvalue().splitlines(), [f"inventory incomplete: {reason}" for reason in failures])
 
-    def test_tmux_free_refuses_unknown_tmux_and_tmux_unit_hosts_for_both_agents(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
-        for agent in ("claude", "codex"):
-            for host in (inventory.UnknownHost(kind="unknown"), inventory.TmuxHost(kind="tmux",
-                    tmux_session="writing", session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
-                    server=inventory.TmuxServerNotRecorded(kind="not recorded"),
-                    pane=inventory.PaneNotRecorded(kind="not recorded"))):
-                with self.subTest(agent=agent, host=host):
-                    owner = self.tmux_free_owner(host)
-                    entry: inventory.SnapshotSession = (
-                        inventory.SnapshotCodexSession(agent="codex", session=owner, workers=[], timers=[],
-                            last_seen=OCTOBER, state="running", codex=inventory.CodexLaunch(
-                                home="/tmp/codex", resume=inventory.CodexResumePicker(kind="picker"))) if agent == "codex" else
-                        inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
-                            last_seen=OCTOBER, state="running"))
-                    with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                            "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
-                        self.assertEqual(shutdown.main(["tmux-free"]), 1)
-                    self.assertIn(f"{LOGIN}: Writing (writing-id) uses ", output.getvalue())
-                    self.assertIn("unknown host" if host["kind"] == "unknown" else "tmux session 'writing'", output.getvalue())
-        unit = inventory.SnapshotClaudeSession(agent="claude", session=unit_session("unit-id"),
-            workers=[], timers=[], last_seen=OCTOBER, state="running")
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
-                "natedev", {LOGIN: [unit]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 1)
-        self.assertIn("alpha (unit-id) uses tmux unit demo/alpha-unit in session 'alpha'", output.getvalue())
 
-    def test_tmux_free_collects_unreadable_tmux_herdr_and_inventory_causes(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=1, stderr="permission denied on /tmp/tmux"),
-            native_stdout="not json")
-        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory((
-                "session registry unreadable",))) as observe, redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 1)
-        observe.assert_called_once_with()
-        lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 3)
-        self.assertEqual(lines[0], "tmux sessions unreadable: permission denied on /tmp/tmux")
-        self.assertTrue(lines[1].startswith("herdr sessions unreadable:"), lines)
-        self.assertEqual(lines[2], "inventory incomplete: session registry unreadable")
 
-    def test_tmux_free_refuses_missing_tmux_and_inventory_read_errors(self) -> None:
-        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
-        with (patch.dict(os.environ, {"SHUTDOWN_TMUX": str(self.root / "missing-tmux")}),
-              patch.object(inventory, "snapshot_inventory", side_effect=OSError("proc unavailable")) as observe,
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(shutdown.main(["tmux-free"]), 1)
-        observe.assert_called_once_with()
-        self.assertIn("tmux sessions unreadable:", output.getvalue())
-        self.assertIn("missing-tmux", output.getvalue())
-        self.assertIn("inventory unreadable: proc unavailable", output.getvalue())
 
-    def test_missing_tmux_never_builds_during_tmux_free_or_recovery_observation(self) -> None:
+    def test_snapshot_without_tmux_never_builds_a_host_binary(self) -> None:
         linux_process_fixture(self)
         proc = self.root / "proc"
         boot = proc / "sys/kernel/random/boot_id"
@@ -342,24 +199,14 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
         with (patch.dict(os.environ, {
                   "HERDR_PROC": str(proc), "HERDR_BIN": "/missing/herdr",
-                  "UNIT_LOOKUP_TMUX": "", "SHUTDOWN_TMUX": "/missing/tmux",
+
                   "NOTIFIER_SESSIONS_DIR": str(registry),
                   "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
               }), patch.object(shutil, "which", return_value=None),
               patch.object(subprocess, "run", side_effect=run)):
-            with redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(shutdown.main(["tmux-free"]), 1)
-            self.assertIn("tmux sessions unreadable:", output.getvalue())
-            self.assertIn("inventory incomplete: shared observations: tmux is not installed", output.getvalue())
-            self.assertFalse(any(Path(argv[0]).name == "nix" for argv in calls), calls)
-            self.assertTrue(any(argv[1:] == ["--session", "default", "session", "list", "--json"]
-                                for argv in calls), calls)
-            calls.clear()
             observed = inventory.snapshot_inventory()
-        self.assertIsInstance(observed, inventory.PartialInventory)
-        if isinstance(observed, inventory.PartialInventory):
-            self.assertTrue(any("tmux is not installed" in failure for failure in observed.failures), observed)
-        self.assertFalse(any(Path(argv[0]).name == "nix" for argv in calls), calls)
+        self.assertIsInstance(observed, inventory.CompleteInventory)
+        self.assertFalse(any(Path(argv[0]).name in {"tmux", "nix"} for argv in calls), calls)
 
     def test_elapsed_text_uses_seconds_minutes_hours_and_days(self) -> None:
         cases = ((-1, "0s"), (0, "0s"), (59, "59s"), (60, "1m"),

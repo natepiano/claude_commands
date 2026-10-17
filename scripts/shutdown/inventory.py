@@ -56,13 +56,8 @@ from session_types import (
     NoRunRecord as NoRunRecord,
     UnitPlan as UnitPlan,
     UnitHost as UnitHost,
-    TmuxPane as TmuxPane,
-    PaneNotRecorded as PaneNotRecorded,
-    TmuxSessionId as TmuxSessionId,
-    TmuxSessionIdNotRecorded as TmuxSessionIdNotRecorded,
-    TmuxServer as TmuxServer,
-    TmuxServerNotRecorded as TmuxServerNotRecorded,
-    TmuxHost as TmuxHost,
+    LegacyTmuxUnitHost as LegacyTmuxUnitHost,
+    LegacyTmuxHost as LegacyTmuxHost,
     HerdrHost as HerdrHost,
     NamedDesktop as NamedDesktop,
     DesktopNotInSnapshot as DesktopNotInSnapshot,
@@ -201,7 +196,7 @@ class UnitMarks:
     unit: str
     doc: str
     session_name: str
-    session_host: Literal["tmux", "herdr"]
+    session_host: Literal["herdr"]
 
 
 DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
@@ -441,8 +436,8 @@ def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, Uni
                 production=slug,
                 unit=unit_id,
                 doc=docs[slug],
-                session_name=marked_unit.label,
-                session_host="tmux" if isinstance(marked_unit.place, unit_lookup.TmuxPlace) else "herdr",
+                session_name=marked_unit.place.session,
+                session_host="herdr",
             )
     return found
 
@@ -526,60 +521,6 @@ def _process_environment(pid: int) -> dict[str, str]:
         return {}
     entries = (os.fsdecode(entry).split("=", 1) for entry in raw.split(b"\0") if b"=" in entry)
     return {name: value for name, value in entries}
-
-
-def _tmux_session(pane: str) -> tuple[
-    str, TmuxSessionId | TmuxSessionIdNotRecorded,
-    TmuxServer | TmuxServerNotRecorded, TmuxPane | PaneNotRecorded,
-]:
-    not_recorded: PaneNotRecorded = {"kind": "not recorded"}
-    no_session_id: TmuxSessionIdNotRecorded = {"kind": "not recorded"}
-    no_server: TmuxServerNotRecorded = {"kind": "not recorded"}
-    if not pane:
-        return "", no_session_id, no_server, not_recorded
-    try:
-        result = subprocess.run(
-            (
-                unit_lookup.installed_tmux_binary(),
-                "display",
-                "-p",
-                "-t",
-                pane,
-                "#{session_name}\t#{session_id}\t#{pane_pid}\t#{start_time}\t#{pid}",
-            ),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return "", no_session_id, no_server, not_recorded
-    if result.returncode != 0:
-        return "", no_session_id, no_server, not_recorded
-    fields = result.stdout.rstrip("\r\n").split("\t")
-    session_name = fields[0]
-    if not session_name:
-        return "", no_session_id, no_server, not_recorded
-    if len(fields) < 3:
-        return session_name, no_session_id, no_server, not_recorded
-    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded = no_session_id
-    if re.fullmatch(r"\$[0-9]+", fields[1]) is not None:
-        session_ref = {"kind": "session id", "session_id": fields[1]}
-    server: TmuxServer | TmuxServerNotRecorded = no_server
-    if len(fields) == 5:
-        try:
-            server = {"kind": "server", "pid": int(fields[4]), "started_at": int(fields[3])}
-        except ValueError:
-            pass
-    try:
-        pane_pid = int(fields[2])
-    except ValueError:
-        return session_name, session_ref, server, not_recorded
-    if pane_pid <= 0:
-        return session_name, session_ref, server, not_recorded
-    return session_name, session_ref, server, {
-        "kind": "pane", "pane_id": pane, "pane_pid": pane_pid,
-    }
 
 
 def terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknown"]:
@@ -721,6 +662,9 @@ def _host(
     desktops: dict[str, str],
 ) -> Host:
     session_id = _string(session.get("sessionId"))
+    environment = _process_environment(session.get("pid", 0))
+    if environment.get("TMUX_PANE"):
+        return {"kind": "unknown"}
     if unit is not None:
         plan = plans.get(session_id)
         return {
@@ -728,10 +672,7 @@ def _host(
             "production": unit.production,
             "unit": unit.unit,
             "doc": unit.doc,
-            "session_name": (
-                unit.session_name
-                or (_string(session.get("tmux")).partition(":")[0] if unit.session_host == "tmux" else "")
-            ),
+            "session_name": unit.session_name,
             "session_host": unit.session_host,
             "plan": (
                 {"kind": "plan", "path": plan}
@@ -740,21 +681,6 @@ def _host(
             ),
         }
 
-    environment = _process_environment(session.get("pid", 0))
-    pane = environment.get("TMUX_PANE", "")
-    tmux_session, session_ref, server, tmux_pane = _tmux_session(pane)
-    if pane:
-        return (
-            {
-                "kind": "tmux",
-                "tmux_session": tmux_session,
-                "pane": tmux_pane,
-                "session_ref": session_ref,
-                "server": server,
-            }
-            if tmux_session
-            else {"kind": "unknown"}
-        )
     place = herdr.herdr_place_of(session.get("pid", 0))
     if isinstance(place, herdr.HerdrPlace):
         clients = herdr.attached_clients(place.session)
@@ -1097,7 +1023,7 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
         "model": _model(entry.session_id, entry.config_dir), "checkout": _checkout(cwd),
         "run_dirs": [str(directory) for directory in directories],
         "codex_servers": _codex_servers(directories), "timers": timers, "host": host,
-        "kind": entry.kind,
+        "kind": "top-level" if entry.kind == "unit" and host["kind"] == "unknown" else entry.kind,
     }
     if entry.kind == "showrunner":
         common.update(production=entry.production, doc=entry.doc)
@@ -1394,27 +1320,8 @@ def _snapshot_processes() -> _SnapshotProcesses:
     return _DarwinSnapshotProcesses() if sys.platform == "darwin" else _SnapshotProcesses()
 
 
-def _snapshot_reads_tmux() -> bool:
-    return sys.platform != "darwin" or bool(os.environ.get("UNIT_LOOKUP_TMUX") or shutil.which("tmux"))
-
-
-def _snapshot_tmux_hosts() -> dict[str, TmuxHost]:
-    if not _snapshot_reads_tmux():
-        return {}
-    found: dict[str, TmuxHost] = {}
-    for _, panes in unit_lookup.tmux_sessions().values():
-        for pane in panes:
-            name, session_ref, server, identity = _tmux_session(pane)
-            if not name:
-                raise ObservationFailure(f"tmux host {pane}: pane could not be resolved")
-            found[pane] = TmuxHost(kind="tmux", tmux_session=name, session_ref=session_ref,
-                                   server=server, pane=identity)
-    return found
-
-
 @dataclass(frozen=True)
 class _SnapshotHosts:
-    tmux: dict[str, TmuxHost]
     native: dict[int, herdr.HerdrPlace]
     presentation: dict[str, Literal["attached window", "detached"]]
     desktops: dict[str, str]
@@ -1435,11 +1342,8 @@ def _snapshot_native_hosts() -> tuple[dict[int, herdr.HerdrPlace], dict[str, Lit
 
 
 def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts: _SnapshotHosts) -> SessionHost:
-    pane = environment.get("TMUX_PANE", "")
-    if pane:
-        if pane not in hosts.tmux:
-            raise ObservationFailure(f"tmux host for pid {pid}: {pane} is missing")
-        return hosts.tmux[pane]
+    if environment.get("TMUX_PANE"):
+        return UnknownHost(kind="unknown")
     if environment.get("HERDR_PANE_ID"):
         place = hosts.native.get(pid)
         if place is None or place.session not in hosts.presentation:
@@ -1454,8 +1358,7 @@ def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts
 
 
 def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
-    every = (unit_lookup.every_marked_unit(every_host=True) if _snapshot_reads_tmux() else
-             unit_lookup.every_marked_unit(every_host=True, include_tmux=False))
+    every = unit_lookup.every_marked_unit()
     if every.faults:
         raise ObservationFailure("production unit marks: " + "; ".join(f"{slug}: {detail}" for slug, detail in every.faults.items()))
     docs = {runner.slug: runner.doc for runner in timers.registrations}
@@ -1468,8 +1371,7 @@ def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
                 raise ObservationFailure(f"production {slug}/{unit}: marked host has no independently confirmed Claude identity")
             if slug not in docs:
                 raise ObservationFailure(f"production {slug}: live unit has no registered production doc")
-            units[row.claude.session_id] = UnitMarks(slug, unit, docs[slug], row.label,
-                "tmux" if isinstance(row.place, unit_lookup.TmuxPlace) else "herdr")
+            units[row.claude.session_id] = UnitMarks(slug, unit, docs[slug], row.place.session, "herdr")
     return units
 
 
@@ -1637,15 +1539,6 @@ def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHos
         return hosts.servers.get(host["herdr_session"], RecoveryHostUnrecorded(kind="not recorded"))
     if host["kind"] == "unit" and host["session_host"] == "herdr":
         return hosts.servers.get(host["session_name"], RecoveryHostUnrecorded(kind="not recorded"))
-    if host["kind"] == "unit" and host["session_host"] == "tmux":
-        name = host["session_name"]
-        matching = next((place for place in hosts.tmux.values() if place["tmux_session"] == name), None)
-        if matching is not None:
-            host = matching
-    if host["kind"] == "tmux" and host["server"]["kind"] == "server":
-        pid = host["server"]["pid"]
-        started, _ = reader.identity(reader.path(pid))
-        return RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
     if host["kind"] not in {"ghostty", "zed", "terminal"}:
         return RecoveryHostUnrecorded(kind="not recorded")
     if isinstance(reader, _DarwinSnapshotProcesses):
@@ -1713,7 +1606,6 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
         home_state = account.home_account_state()
         timers = _snapshot_timers()
         units = _snapshot_units(timers)
-        tmux = _snapshot_tmux_hosts()
         native, presentation = _snapshot_native_hosts()
         desktops = _snapshot_desktops(refresh=False)
         processes = reader.paths()
@@ -1723,7 +1615,7 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
             missing = set(presentation) - servers.keys()
             if missing:
                 raise ObservationFailure("herdr socket owners missing: " + ", ".join(sorted(missing)))
-        hosts = _SnapshotHosts(tmux, native, presentation, desktops, servers, reader)
+        hosts = _SnapshotHosts(native, presentation, desktops, servers, reader)
         run_directories = _active_run_directories()
         ids = {item.record["sessionId"] for item in registry.entries}
         worker_owners = _worker_owners(run_directories, ids)

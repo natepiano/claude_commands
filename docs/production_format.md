@@ -141,7 +141,7 @@ one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr or tmux session carries the production's
+a session at any time. The unit's herdr session carries the production's
 slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its

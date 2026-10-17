@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.delegate import phase_table
 from scripts.delegate.recorder_fixture import invoke_recorder
-from scripts.production import fake_showrunner, fake_tmux, showrunners
+from scripts.production import fake_showrunner, fake_unit_host, showrunners
 
 
 SCRIPT = Path(__file__).with_name("phase_table.py")
@@ -43,7 +43,6 @@ class PhaseTableTests(unittest.TestCase):
     session_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     plan: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     vault_root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    tmux_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     sessions_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     notifier_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     live_record_number: int = 0
@@ -62,7 +61,6 @@ class PhaseTableTests(unittest.TestCase):
         self.session_dir.mkdir()
         self.vault_root = self.root / "vault" / "showrunners"
         self.vault_root.parent.mkdir()
-        self.tmux_state = self.root / "tmux.json"
         self.sessions_dir = self.root / "sessions"
         self.sessions_dir.mkdir()
         self.notifier_dir = self.root / "notifier"
@@ -138,15 +136,12 @@ class PhaseTableTests(unittest.TestCase):
     def environment(self, at: int = 1_200) -> dict[str, str]:
         return {
             **os.environ,
-            "FAKE_TMUX_STATE": str(self.tmux_state),
             "NOTIFIER_STATE_DIR": str(self.notifier_dir),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
             "PHASE_TABLE_VAULT": str(self.vault_root),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
             "PLAN_DELEGATE_NOW_EPOCH": str(at),
-            "UNIT_LOOKUP_TMUX": str(
-                Path(__file__).parents[1] / "production" / "fake_tmux.py"
-            ),
+            **fake_unit_host.environment(self.root),
         }
 
     def write_production(self) -> Path:
@@ -362,20 +357,12 @@ class PhaseTableTests(unittest.TestCase):
             self.write_showrunner()
 
     def mark_unit(self, live_name: str = "") -> None:
-        marked: fake_tmux.FakeSession = {
-            "label": "table-tmux",
-            "panes": ["%1"],
-            "env": {
-                "SHOWRUNNER_UNIT": "show",
-                "SHOWRUNNER_UNIT_ID": "table-unit",
-            },
-        }
-        fake_tmux.write(
-            self.tmux_state,
-            {"$1": marked},
-        )
+        fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         if not live_name:
             return
+        pid = fake_unit_host.live_pid(self)
+        fake_unit_host.place_process(self.environment(), pid, "w1:p1")
         self.live_record_number += 1
         socket_path = self.root / f"live-{self.live_record_number}.sock"
         held = socket.socket(socket.AF_UNIX)
@@ -384,12 +371,12 @@ class PhaseTableTests(unittest.TestCase):
         _ = (self.sessions_dir / f"record-{self.live_record_number}.json").write_text(
             json.dumps(
                 {
-                    "pid": os.getpid(),
+                    "pid": pid,
                     "sessionId": f"live-{self.live_record_number}",
                     "name": live_name,
                     "messagingSocketPath": str(socket_path),
                     "updatedAt": self.live_record_number,
-                    "tmux": "table-tmux:@1.%1",
+                    "tmux": "",
                 }
             ),
             encoding="utf-8",
@@ -3373,15 +3360,8 @@ class PhaseTableTests(unittest.TestCase):
                 "### Phase 1 — Current delivery  · status: todo",
             )
         )
-        marked: fake_tmux.FakeSession = {
-            "label": "table-tmux",
-            "panes": ["%1"],
-            "env": {
-                "SHOWRUNNER_UNIT": "other",
-                "SHOWRUNNER_UNIT_ID": "table-unit",
-            },
-        }
-        fake_tmux.write(self.tmux_state, {"$1": marked})
+        fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
+            "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         session_id = "other-showrunner"
         _ = fake_showrunner.write_timer(
             self.notifier_dir,

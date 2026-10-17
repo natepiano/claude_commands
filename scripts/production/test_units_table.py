@@ -13,6 +13,7 @@ from unittest.mock import patch
 import live_units
 import showrunners
 import unit_lookup
+from herdr import HerdrPlace
 import units_table
 
 # Importable once units_table has put scripts/delegate on the path.
@@ -23,7 +24,7 @@ from scripts.delegate import plan_history
 def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
     if claude is None:
         return live_units.LiveUnit(name, None)
-    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, f"label-of-{name}", claude, unit_lookup.TmuxPlace("%1")))
+    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")))
 
 
 def live(name: str) -> unit_lookup.LiveClaude:
