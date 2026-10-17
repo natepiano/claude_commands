@@ -238,7 +238,7 @@ WAITING_CAPACITY = "waiting_capacity"
 CAPACITY_EXHAUSTED = "capacity_exhausted"
 LAUNCHER_ATTACHED_STATUSES = frozenset(("running", WAITING_CAPACITY))
 ENDABLE_STATUSES = frozenset((
-    "starting", "running", "done", "failed", WAITING_CAPACITY, CAPACITY_EXHAUSTED,
+    "starting", "running", "done", "failed", "paused", WAITING_CAPACITY, CAPACITY_EXHAUSTED,
 ))
 
 
@@ -292,8 +292,10 @@ RosterRole = AssignedDelegateRole | RolelessThread
 
 
 class FollowableRecord(TypedDict):
+    paused_from: NotRequired[str]
+    paused_turn: NotRequired[bool]
     thread_id: str
-    status: Literal["done", "failed"]
+    status: Literal["done", "failed", "paused"]
     revision: NotRequired[int]
     role: NotRequired[WorkerRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
@@ -320,7 +322,7 @@ class StartingRecord(TypedDict):
     thread_id: str
     status: Literal["starting"]
     previous_role: NotRequired[WorkerRole]
-    previous_status: NotRequired[Literal["done", "failed"]]
+    previous_status: NotRequired[Literal["done", "failed", "paused"]]
     revision: NotRequired[int]
     launcher_pid: NotRequired[int]
     port: NotRequired[int]
@@ -366,13 +368,13 @@ ThreadRecord = (FollowableRecord | ActiveRecord | StartingRecord |
                 WaitingCapacityRecord | ExhaustedRecord | EndedRecord)
 
 
-FOLLOWABLE_STATES = frozenset(("done", "failed"))
+FOLLOWABLE_STATES = frozenset(("done", "failed", "paused"))
 
 
 @dataclass(frozen=True)
 class FollowableThread:
     thread_id: str
-    status: Literal["done", "failed"]
+    status: Literal["done", "failed", "paused"]
 
 
 @dataclass(frozen=True)
@@ -450,6 +452,8 @@ def _roster_thread(value: object) -> RosterThread:
         return FollowableThread(thread_id, "done")
     if status == "failed":
         return FollowableThread(thread_id, "failed")
+    if status == "paused":
+        return FollowableThread(thread_id, "paused")
     if status == "running":
         return ActiveThread(thread_id, turn_id, launcher_pid) if turn_id else InvalidThread("running thread has no turn id")
     if status == WAITING_CAPACITY:
@@ -1002,6 +1006,8 @@ def _claim_follow(
         previous_role = _roster_role(entry.get("role"))
         claimed = dict(entry)
         _ = claimed.pop("turn_id", None)
+        _ = claimed.pop("paused_from", None)
+        _ = claimed.pop("paused_turn", None)
         _ = claimed.pop("previous_role", None)
         if isinstance(previous_role, AssignedDelegateRole):
             claimed["previous_role"] = previous_role.role
@@ -2747,6 +2753,10 @@ def _stream_turn(
                             continue
                         quota_owed = _continuation_is_owed(session_dir, name)
                         if not resume_owed and _ended_unseen(client, thread_id):
+                            # A move can write its marker and interrupt after the first marker read.
+                            if (isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker)
+                                    and not end_marker.exists()):
+                                continue
                             moved = _move_resident(args, session_dir, name, thread_id, client)
                             if isinstance(moved, WorkerThreadStateUnknown):
                                 if isinstance(moved.cleanup, WorkerTurnCleanup):
@@ -3918,6 +3928,46 @@ def command_list(args: argparse.Namespace) -> int:
             continue
         record = cast("ThreadRecord", cast("object", entry))
         print(f"{name}\t{record.get('status', '?')}\t{record.get('thread_id', '')}")
+    return 0
+
+
+def command_reopen(args: argparse.Namespace) -> int:
+    """Recover an ended or abandoned seat without creating a new thread."""
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "to"))
+    path = _session_path(session_dir, ROSTER_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        status = _as_str(entry.get("status"))
+        port = _as_int(entry.get("port"))
+        reason = ""
+        if status not in ("ended", "running", "starting"):
+            reason = "seat is not ended, running or starting"
+        elif not _as_str(entry.get("thread_id")):
+            reason = "missing thread id"
+        elif _pid_alive(_as_int(entry.get("launcher_pid"))):
+            reason = "launcher is alive"
+        elif status != "ended" and any(
+            _pid_alive(_as_int(server.get("pid")))
+            for server in _recorded_run_servers(session_dir)
+            if port <= 0 or server.get("port") == port
+        ):
+            reason = "app-server is alive"
+        if reason:
+            print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+            return 2
+        _end_marker_path(session_dir, name).unlink(missing_ok=True)
+        entry.update({"status": "paused", "paused_from": status, "paused_turn": status != "ended"})
+        _advance_roster_revision(entry)
+        roster[name] = entry
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+    print(f"reopened {name}; send its next turn with --to {name}")
     return 0
 
 
@@ -6145,6 +6195,11 @@ def main(argv: list[str] | None = None) -> int:
     stop = subparsers.add_parser("stop", help="stop the session app-server")
     _ = stop.add_argument("--session-dir", required=True)
     stop.set_defaults(handler=command_stop)
+
+    reopen = subparsers.add_parser("reopen", help="recover an ended or abandoned seat on its recorded thread")
+    _ = reopen.add_argument("--session-dir", required=True)
+    _ = reopen.add_argument("--to", required=True)
+    reopen.set_defaults(handler=command_reopen)
 
     idle_stop = subparsers.add_parser("idle-stop", help="stop this session's app-server if nothing uses it")
     _ = idle_stop.add_argument("--session-dir", required=True)

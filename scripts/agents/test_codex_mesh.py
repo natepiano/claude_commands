@@ -1883,6 +1883,146 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(ports, [self.server.port])
 
+    def test_paused_seat_can_be_claimed_and_followed_on_its_original_thread(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "paused", "role": "impl",
+            "paused_from": "running", "paused_turn": True,
+        }})
+        code, _output, errors = self.run_mesh(["can-follow", "--to", "worker", "--role", "impl"])
+        self.assertEqual((code, errors), (0, ""))
+        code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        record = self.worker_record()
+        self.assertEqual(record["thread_id"], THREAD_ID)
+        self.assertEqual(record["status"], "done")
+        self.assertNotIn("paused_from", record)
+        self.assertNotIn("paused_turn", record)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual([request["params"] for request in self.methods("thread/resume")],
+                         [{"threadId": THREAD_ID}])
+
+    def test_reopen_recovers_an_ended_thread_and_follow_resumes_it(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "ended", "role": "impl",
+            "launcher_pid": 99999999,
+        }})
+        marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+        marker.touch()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertEqual(self.worker_record()["paused_from"], "ended")
+        self.assertIs(self.worker_record()["paused_turn"], False)
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)):
+            code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(len(self.methods("thread/resume")), 1)
+
+    def test_reopen_refuses_missing_thread_or_live_launcher_without_mutation(self) -> None:
+        for fields in ({"launcher_pid": os.getpid(), "thread_id": THREAD_ID},
+                       {"launcher_pid": 99999999}):
+            with self.subTest(fields=fields):
+                self.write_pool_roster({"worker": {"status": "ended", **fields}})
+                marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+                marker.touch()
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertIn("worker", errors)
+                self.assertEqual(self.roster(), before)
+                self.assertTrue(marker.exists())
+
+    def test_reopen_recovers_orphaned_active_seats_only_after_the_server_is_gone(self) -> None:
+        for status in ("running", "starting"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": status, "role": "impl",
+                    "turn_id": "interrupted-turn", "launcher_pid": 99999999,
+                }})
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertEqual(self.roster(), before)
+
+                server_record = self.session_dir / codex_mesh.SERVER_FILE
+                saved_server = server_record.read_text()
+                server_record.unlink()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+                self.assertEqual(self.worker_record()["status"], "paused")
+                self.assertEqual(self.worker_record()["paused_from"], status)
+                self.assertIs(self.worker_record()["paused_turn"], True)
+                resumes_before = len(self.methods("thread/resume"))
+                with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)):
+                    code, errors = self.run_follow()
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+                self.assertEqual(len(self.methods("thread/resume")), resumes_before + 1)
+                self.assertEqual(self.methods("thread/start"), [])
+                _ = server_record.write_text(saved_server)
+
+    def test_reopen_accepts_ended_seat_without_launcher_and_refuses_live_orphans(self) -> None:
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "ended"}})
+        code, _output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "paused")
+        for status in ("running", "starting"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": status,
+                    "turn_id": "live-turn", "launcher_pid": os.getpid(),
+                }})
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertEqual(self.roster(), before)
+
+    def test_reopen_checks_the_seats_server_port_when_another_server_is_alive(self) -> None:
+        old_port = self.server.port + 1
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "running", "role": "impl",
+            "turn_id": "interrupted-turn", "launcher_pid": 99999999, "port": old_port,
+        }})
+        _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({
+            "servers": [{"pid": 99999999, "port": old_port}],
+        }))
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertIs(self.worker_record()["paused_turn"], True)
+        self.assertTrue((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_reopen_refuses_a_live_retired_server_on_the_workers_port(self) -> None:
+        retired_path = self.session_dir / codex_mesh.RETIRED_FILE
+        _ = retired_path.write_text(json.dumps({
+            "servers": [{"pid": os.getpid(), "port": self.server.port}],
+        }))
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        for status in ("running", "starting"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": status,
+                    "turn_id": "interrupted-turn", "launcher_pid": 99999999,
+                    "port": self.server.port,
+                }})
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertEqual(self.roster(), before)
+                self.assertTrue(retired_path.exists())
+
     def test_follow_reuses_a_done_thread_and_records_its_new_turn(self) -> None:
         code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
@@ -3059,6 +3199,38 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_swap_resumes_socketless_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=False, ended_run=True)
+
+    def test_account_move_between_marker_read_and_idle_check_resumes_same_thread(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.server.hold_turn_completion = False
+        interrupted = False
+
+        def interrupt_after_marker_read(session_dir: str, name: str, thread_id: str) -> bool:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                self.assertEqual(thread_id, THREAD_ID)
+                self.assertEqual(self.live_turn, "turn-1")
+                self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+                self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+                self.assertEqual(agent_accounts.workers_home(), target)
+                move = codex_mesh._interrupt_worker_for_account_move(  # pyright: ignore[reportPrivateUsage]
+                    session_dir, name, self.worker_record(), self.server.port, "codex1")
+                self.assertIsInstance(move, codex_mesh.InterruptedWorkerMove)
+                self.assertEqual(self.live_turn, "")
+            return False
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", side_effect=interrupt_after_marker_read),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            code, errors = self.run_start()
+
+        self.assertTrue(interrupted)
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertNotIn("idle with no completion notice", output.getvalue() + errors)
+        self.assertNotIn("no completion notice arrived", (self.session_dir / "worker.log").read_text())
 
     def test_sign_in_change_resumes_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=True, ended_run=True)
@@ -7065,6 +7237,48 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(reaped, [8])
         self.assertIn("8\t4008\tstopped\tno current or retired server record", printed.getvalue())
+
+    def test_sweep_preserves_paused_threads_but_plain_stop_ends_them(self) -> None:
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "paused-run"
+            run.mkdir()
+            server_path = run / codex_mesh.SERVER_FILE
+            _ = server_path.write_text(json.dumps({"pid": 9, "port": 4009}))
+            roster_path = run / codex_mesh.ROSTER_FILE
+            roster = {
+                "impl": {"thread_id": "paused-thread", "status": "paused", "role": "impl",
+                         "paused_from": "running", "paused_turn": True},
+                "review": {"thread_id": "done-thread", "status": "done", "role": "review"},
+            }
+            _ = roster_path.write_text(json.dumps(roster))
+            stale = time.time() - old
+            for activity in (server_path, roster_path):
+                os.utime(activity, (stale, stale))
+            with (
+                patch.object(codex_mesh, "_running_servers", return_value=[(9, 4009, old)]),
+                patch.object(codex_mesh, "_client_counts", return_value={}),
+                patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(run)),
+                patch.object(codex_mesh, "_busy_threads", return_value=()),
+                patch.object(codex_mesh, "_reap", return_value=True) as reap,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                code = codex_mesh.main(["sweep", "--root", directory, "--stop"])
+            self.assertEqual(code, 0)
+            self.assertIn("1 stopped", output.getvalue())
+            reap.assert_called_once_with(9)
+            self.assertFalse(server_path.exists())
+            remaining = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+            self.assertEqual(remaining, roster)
+            self.assertFalse(codex_mesh._end_marker_path(str(run), "impl").exists())  # pyright: ignore[reportPrivateUsage]
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = codex_mesh.main(["stop", "--session-dir", str(run)])
+            self.assertEqual(code, 0)
+            ended = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+            self.assertEqual({seat: entry["status"] for seat, entry in ended.items()},
+                             {"impl": "ended", "review": "ended"})
+            self.assertEqual(ended["impl"]["thread_id"], "paused-thread")
 
     def test_recorded_server_stops_when_ended_and_stays_for_each_live_signal(self) -> None:
         old = codex_mesh.SERVER_IDLE_SECS + 60
