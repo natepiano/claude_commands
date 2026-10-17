@@ -1526,13 +1526,13 @@ PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,
 `record --ticket` keeps that pinned blob even after a live rule edit, which
 leaves the new rule's cell stale until a later ticket.
 
-The ticket gate is `style_footprint.py check --repo . --base <tickets.base>
---worktree`, from the unit worktree. It checks the uncommitted checkpoint tree;
-run it again at <CheckpointCommit/> step 6 before staging. Exit 1, including
-errors, retains the reservation and returns the phase to repair. Exit 0 permits
-committing exactly that tree, then `style_ledger.py ticket checkpoint --id
-<ticket> --commit <code commit>` before marking the phase done. Proposal tickets
-use Phase 14's approved-file gate when available.
+The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
+worktree. Run it again at <CheckpointCommit/> step 6 before staging. Coverage
+selection runs the mechanical filter at the ticket's recorded base; an approved
+proposal permits only files of its approved findings. Exit 1 retains the
+reservation and returns to repair. Exit 0 permits committing exactly that tree,
+then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit>`
+before marking the phase done. Both gates run this one command, so they cannot drift.
 </StandingPlanRefill>
 
 <FinalGate>

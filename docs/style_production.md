@@ -256,7 +256,7 @@ This also clears hand-offs a departing parent had not merged.
 
 On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
 nothing and send neither a hand-off nor a refill message: the unit refills
-itself. When `<n>` is positive, run proposal filing (Phase 14).
+itself. When `<n>` is positive, run `style_proposals.py file`.
 
 ## Yielding
 
@@ -318,7 +318,29 @@ required `**Proposals:**` folder: one issue per rule and crate for renames or
 type changes, one per crate for restructuring. Include sites, before and after,
 live units holding those files, and a recommended answer. Show the count in
 reports; present proposals only when asked through `/showrunner:proposals` or
-`/adhoc_review`. The proposal phase supplies filing and approval commands.
+`/adhoc_review`. Run `style_proposals.py file --repo <style checkout> --proposals <folder> --parent <slug>`
+after every ticket checkpoint with held cells and every no-change ticket notice
+with a positive held count. Read the folder from the current production doc's
+`**Proposals:**` line and the parent from `showrunners.py parent <style slug>`
+each time. Filing recovers issues created before a crash and skips findings
+judged against an older rule blob.
+
+Record approval with `proposal_issue.py approve <issue> --showrunner <parent>
+--unit <unit> --plan <plan phase>`. Refill selects the oldest approved style issue
+for that unit before coverage work and marks it active. Its Work Order overrides
+the copied mechanical-only invariant for exactly the approved findings;
+`style_plan.py gate --repo . --ticket <id>` permits only their files at refill
+and checkpoint. Other findings remain held; package verification still runs.
+When approved changes touch a live unit's files, the parent schedules them
+through `produce.md`'s `<CrossUnitChange>`.
+
+After each `ticket merge` and at startup run `style_proposals.py complete --repo
+<style checkout>`: merged proposal findings become built, their issues close,
+and the backlog is renumbered. Decline with `style_proposals.py decline --repo
+<style checkout> --issue <issue> --words '<the user’s words>'`. It waives each
+finding and only waives the still-current held cell after all of its findings
+are waived; changed inputs stay stale. The issue closes with the user's words.
+A general reason becomes a repo-local rule through `/local_style`.
 
 ## Lifetime
 
@@ -326,8 +348,12 @@ The production and its unit plans are standing. An empty queue leaves a unit
 blocked, waiting for sync; it never closes its run. A parent's wrap detaches the
 style production. While a root, it merges its own hand-offs into the branch
 point using `**Parent production:**` as the merge context. Pending hand-offs
-survive detachment; the hand-off and proposal phases supply the root merge and
-detach procedures.
+survive detachment. The parent detaches a running style child and tells it:
+`<parent> wrapped, so you are a root now: run style_sync.py resume and merge your
+own hand-offs (docs/style_production.md, Merging back).` Product children still
+hold the wrap. The style checkout, unit worktrees with their own plan copies
+and pinned rule files, and ledger remain in place. A later `/showrunner:add_style`
+from a new parent attaches through `resume`, which handles pending hand-offs.
 
 ## Report
 

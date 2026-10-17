@@ -13,9 +13,11 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 from typing import cast, final, override
 
 import style_ledger
+import style_rules
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -129,14 +131,46 @@ class StandingCheckpointTests(unittest.TestCase):
         return cast(style_ledger.TicketRecord, json.loads(result.stdout))
 
     def gate(self) -> subprocess.CompletedProcess[str]:
-        match = re.search(r"`([^`]*style_footprint\.py check[^`]*)`", self.plan.read_text())
+        match = re.search(r"`([^`]*style_plan\.py gate[^`]*)`", self.plan.read_text())
         self.assertIsNotNone(match)
         if match is None:
-            self.fail("ticket has no footprint gate")
+            self.fail("ticket has no origin gate")
         command = shlex.split(match[1])
-        self.assertIn("--worktree", command)
-        self.assertNotIn("--head", command)
-        return self.cli("style_footprint.py", *command[2:])
+        return self.cli("style_plan.py", *command[2:])
+
+    def test_approved_non_mechanical_work_passes_both_gates_and_reaches_checkpoint(self) -> None:
+        # The ordinary case below exercises the same literal edit through the coverage gate.
+        issue = self.root / "issues/approved.md"
+        issue.parent.mkdir()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent):
+            with style_ledger.open_ledger(self.repo) as ledger:
+                rule_blob = self.git(self.repo, "hash-object", str(self.catalog / "names.md"))
+                path = "alpha/src/lib.rs"
+                finding = ledger.hold(self.rule, path, 2, "1", "type", "1", "2", rule_blob, "outside")
+                ledger.file_held(finding.finding_id, issue)
+        _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
+                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_findings: [{finding.finding_id}]\n---\n')
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {issue.parent}\n\n## Units"))
+        result = self.refill()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ticket = self.open_ticket()
+        self.assertEqual(ticket["kind"], "proposal")
+        source = self.unit / path
+        _ = source.write_text(source.read_text().replace("    1\n", "    2\n"))
+        work_order = self.gate()
+        self.assertEqual(work_order.returncode, 0, work_order.stdout + work_order.stderr)
+        checkpoint_gate = self.cli("style_plan.py", "gate", "--repo", ".", "--ticket", ticket["id"])
+        self.assertEqual(checkpoint_gate.returncode, 0, checkpoint_gate.stdout + checkpoint_gate.stderr)
+        outside = self.unit / "unexpected.rs"
+        _ = outside.write_text("fn outside() {}\n")
+        self.assertEqual(self.cli("style_plan.py", "gate", "--repo", ".", "--ticket", ticket["id"]).returncode, 1)
+        outside.unlink()
+        _ = self.git(self.unit, "add", "--", path)
+        _ = self.git(self.unit, "commit", "-qm", "Approved code checkpoint")
+        commit = self.git(self.unit, "rev-parse", "HEAD")
+        recorded = self.cli("style_ledger.py", "ticket", "checkpoint", "--repo", ".", "--id", ticket["id"], "--commit", commit)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertEqual(self.open_ticket()["checkpoint"], commit)
 
     def test_code_checkpoint_stages_only_status_code_paths_and_keeps_the_template_unchanged(self) -> None:
         self.assertEqual(self.refill().returncode, 0)
@@ -215,6 +249,9 @@ class StandingCheckpointTests(unittest.TestCase):
         result = self.gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("review: check 6:", result.stdout)
+        checkpoint_gate = self.cli("style_plan.py", "gate", "--repo", ".", "--ticket", ticket["id"])
+        self.assertEqual(checkpoint_gate.returncode, 1)
+        self.assertIn("review: check 6:", checkpoint_gate.stdout)
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), ticket["base"])
         self.assertEqual(self.open_ticket()["state"], "assigned")
         self.assertEqual(self.git(self.unit, "diff", "--cached", "--name-only"), "")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -14,12 +13,15 @@ import showrunners
 import tidy_wrapped
 import unit_lookup
 from add_unit import Production, read_production
-from production_units import Refusal, cell_value, unit_table
+from production_units import Refusal, cell_value, production_field, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               PromoteTo, Stop,
                               git, good, merge_branch_history, promote_local_checkout,
                               promotion_from_doc, pull_mac_checkout, report)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "delegate" / "phase_table.py"
 
@@ -57,6 +59,10 @@ class UnitRow(NamedTuple):
     plan: Path
     worktree: Path
     branch: str
+
+
+class RunningStyleChildren(NamedTuple):
+    slugs: tuple[str, ...]
 
 
 class LifecycleStop(Exception):
@@ -314,41 +320,49 @@ def archived_doc(production: Production) -> Path | None:
 
 
 def retire_reservations(worktree: Path) -> None:
-    board = subprocess.run(["cargo-berth", "board", "--json"], capture_output=True,
-                           text=True, check=False)
-    if board.returncode == 4 or not board.stdout.strip():
+    board = berth_board.read_board(worktree)
+    if isinstance(board, berth_board.BoardUnavailable):
+        report("retire", "skipped", f"board unavailable ({board.reason})")
         return
-    if board.returncode:
-        raise LifecycleStop("retire", "failed", board.stderr.strip() or board.stdout.strip())
-    data = cast(object, json.loads(board.stdout))
-    if not isinstance(data, dict):
-        raise LifecycleStop("retire", "failed", "cargo-berth board has no reservation list")
-    fields = cast(dict[str, object], data)
-    reservations = fields.get("reservations")
-    if not isinstance(reservations, list):
-        raise LifecycleStop("retire", "failed", "cargo-berth board has no reservation list")
-    for raw in cast(list[object], reservations):
-        if not isinstance(raw, dict):
-            continue
-        reservation = cast(dict[str, object], raw)
-        held_at = reservation.get("worktree") or reservation.get("worktree_path")
-        reservation_id = reservation.get("reservation_id") or reservation.get("id")
-        if isinstance(held_at, str) and Path(held_at).resolve() == worktree.resolve():
-            if not isinstance(reservation_id, str):
-                raise LifecycleStop("retire", "failed", f"reservation for {worktree} has no id")
-            _ = command("retire", worktree, "cargo-berth", "release", reservation_id, "--json")
-            report("retire", "ok", f"released reservation {reservation_id} for {worktree}")
+    for reservation in board.reservations():
+        if reservation.holder_worktree_root.resolve() == worktree.resolve():
+            _ = command("retire", worktree, "cargo-berth", "release", reservation.reservation_id, "--json")
+            report("retire", "ok", f"released reservation {reservation.reservation_id} for {worktree}")
 
 
-def refuse_running_children(slug: str) -> None:
-    """Hold a wrap while a lower production's showrunner still runs: it would be left reporting to nothing."""
+def refuse_running_children(slug: str) -> RunningStyleChildren:
+    """Hold a wrap for running product children; keep style children attached until retirement."""
     try:
-        running = [child for child in showrunners.stored_children(slug) if showrunners.current_address(child)]
-    except OSError as error:
+        children = showrunners.stored_children(slug)
+        styles: list[str] = []
+        running: list[str] = []
+        for child in showrunners.registered_showrunners():
+            if child["slug"] not in children or not child["socket"]:
+                continue
+            lines = Path(child["doc"]).read_text(encoding="utf-8").splitlines()
+            try:
+                is_style = production_field(lines, "Kind") == "style"
+            except Refusal:
+                is_style = False
+            (styles if is_style else running).append(child["slug"])
+    except (OSError, UnicodeError) as error:
         raise LifecycleStop("children", "failed", str(error)) from error
     if running:
         raise LifecycleStop("children", "held", f"{', '.join(running)} still report{'s' if len(running) == 1 else ''} "
                             + f"to {slug}; wrap each first, or detach it with `showrunners.py detach <child>`")
+    return RunningStyleChildren(tuple(styles))
+
+
+def detach_style_children(slug: str, children: RunningStyleChildren) -> None:
+    for child in children.slugs:
+        try:
+            _ = showrunners.detach(child)
+        except (OSError, ValueError) as error:
+            raise LifecycleStop("children", "failed", str(error)) from error
+        text = (f"{slug} wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs "
+                + "(docs/style_production.md, Merging back).")
+        told = showrunners.tell_others({child: text}, f"showrunner-tree:{child}")
+        report("children", "ok", "; ".join([f"detached {child}; now root", *told]))
 
 
 def release_edges(slug: str) -> None:
@@ -387,8 +401,9 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
+    style_children = RunningStyleChildren(())
     if isinstance(status, ProductionRunning):
-        refuse_running_children(production.slug)
+        style_children = refuse_running_children(production.slug)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
@@ -447,6 +462,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
+        detach_style_children(production.slug, style_children)
         release_edges(production.slug)
         tidy_state(production.slug)
         archived = command(

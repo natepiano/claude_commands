@@ -265,7 +265,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(summary.unclassified_rules, 1)
         self.assertIsInstance(summary.waiting, style_ledger.PendingHandoffs)
 
-    def test_status_crate_counts_keep_repository_wide_done_false(self) -> None:
+    def test_status_crate_counts_answer_for_each_crate(self) -> None:
         read = self.rule("read")
         self.set_tip(self.initial_tip)
         for path in self.sources[:2]:
@@ -275,7 +275,11 @@ class StyleLedgerTests(unittest.TestCase):
 
         self.assertEqual(output,
                          "rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone\n"
-                         + "global:rust/read.md\t2\t0\t0\t0\t0\tfalse\n")
+                         + "global:rust/read.md\t2\t0\t0\t0\t0\ttrue\n")
+        beta = self.cli("status", "--crate", "crates/beta").stdout
+        self.assertIn(read + "\t0\t0\t2\t0\t0\tfalse\n", beta)
+        whole = self.cli("status", "--rule", read).stdout
+        self.assertIn(read + "\t2\t0\t2\t0\t0\tfalse\n", whole)
 
     def test_status_reuses_repository_counts_and_scans_again_only_for_a_selector(self) -> None:
         read = self.rule("read")
@@ -667,7 +671,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(5,)])
+        self.assertEqual(versions, [(6,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -1522,7 +1526,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(5,)])
+        self.assertEqual(versions, [(6,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -1534,9 +1538,9 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertRegex(first, r"^[0-9a-f]{16}$")
         self.assertEqual(self.hold_finding(rule_id, 1), first)
         ledger = self.ledger()
-        self.assertEqual({finding.finding_id for finding in ledger.held_findings()}, {first, second})
-        self.assertTrue(all(isinstance(finding.state, style_ledger.Unfiled) for finding in ledger.held_findings()))
-        original = next(finding for finding in ledger.held_findings() if finding.finding_id == first)
+        self.assertEqual({finding.finding_id for finding in ledger.held_findings(style_ledger.AllHeldFindings())}, {first, second})
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Unfiled) for finding in ledger.held_findings(style_ledger.AllHeldFindings())))
+        original = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == first)
         duplicate = ledger.hold(rule_id, self.sources[0], 1, "pub fn old_name_1() {}", "type",
                                 "different before", "different after", self.blob(rule_id), "another-ticket")
         self.assertEqual(duplicate, original)
@@ -1546,7 +1550,7 @@ class StyleLedgerTests(unittest.TestCase):
                 _ = self.cli("held", "file", "--id", finding, "--proposal", str(proposal))
         self.assertEqual(self.summary_report()["proposals"], 1)
         self.assertEqual(self.hold_finding(rule_id, 1), first)
-        filed = ledger.held_findings()
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())
         self.assertTrue(all(isinstance(finding.state, style_ledger.Filed) for finding in filed))
         for finding in filed:
             if isinstance(finding.state, style_ledger.Filed):
@@ -1560,7 +1564,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(refused.returncode, 2)
         self.assertIn("waived", refused.stderr)
         self.assertEqual(self.hold_finding(rule_id, 1), first)
-        self.assertEqual(sum(isinstance(finding.state, style_ledger.Waived) for finding in ledger.held_findings()), 1)
+        self.assertEqual(sum(isinstance(finding.state, style_ledger.Waived) for finding in ledger.held_findings(style_ledger.AllHeldFindings())), 1)
         filtered = cast(list[dict[str, object]], json.loads(self.cli("held", "list", "--state", "waived", "--json").stdout))
         self.assertEqual([finding["finding_id"] for finding in filtered], [first])
 
@@ -1573,7 +1577,7 @@ class StyleLedgerTests(unittest.TestCase):
         finding = self.hold_finding(rule_id, 1, ticket="read-1")
         for _ in range(2):
             _ = self.cli("held", "waive", "--id", finding)
-        self.assertIsInstance(self.ledger().held_findings()[0].state, style_ledger.Waived)
+        self.assertIsInstance(self.ledger().held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Waived)
         for invalid, supplied in ((legacy, self.blob(legacy)), ("global:rust/missing.md", blob), (rule_id, "wrong-blob")):
             with self.subTest(rule=invalid, blob=supplied):
                 refused = self.cli(
@@ -1583,7 +1587,7 @@ class StyleLedgerTests(unittest.TestCase):
                 )
                 self.assertEqual(refused.returncode, 2)
                 self.assertIn(invalid, refused.stderr)
-        self.assertEqual(len(self.ledger().held_findings()), 1)
+        self.assertEqual(len(self.ledger().held_findings(style_ledger.AllHeldFindings())), 1)
 
 
     def test_pinned_rule_bytes_survive_edits_reopen_and_pseudo_rules_share_the_parent(self) -> None:
@@ -1644,12 +1648,14 @@ class StyleLedgerTests(unittest.TestCase):
                 _ = ledger.ticket_base("names-unit-1")
             ledger.ticket_assign("names-unit-1", "demo-style-names")
             self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
+            self.assertEqual(ledger.ticket_origin("names-unit-1"), style_ledger.SelectedByCoverage(self.initial_tip))
 
         self.write(self.sources[0], "pub fn changed() {}\n")
         advanced = self.commit("Advance unit branch")
         _ = self.git("branch", "-f", "demo-style-names", advanced)
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
+            self.assertEqual(ledger.ticket_origin("names-unit-1"), style_ledger.SelectedByCoverage(self.initial_tip))
             self.assertEqual(ledger.ticket_open("names-unit")[0]["base"], self.initial_tip)
             ledger.ticket_drop("names-unit-1")
         _ = self.git("branch", "-D", "demo-style-names")
@@ -1756,7 +1762,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(5,)])
+        self.assertEqual(versions, [(6,)])
 
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:

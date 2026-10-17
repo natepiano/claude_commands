@@ -491,7 +491,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** a `family: Family | None` field on `RuleCounts` — an unnamed absence state with no consumer; `status(crate: str | None)` as the public API — the scope type carries the choice; a second public reader beside `rule_counts` (`rules()`/`RuleProgress`) — two readers of one fact.
 
-### Phase 15 — Proposal batching and wrap detaching a style child  · status: todo
+### Phase 15 — Proposal batching and wrap detaching a style child  · status: done
 **Depends on:** Phase 4, Phase 7, Phase 8, Phase 11, Phase 12, Phase 13, Phase 14
 
 #### Work Order
