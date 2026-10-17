@@ -395,6 +395,38 @@ class AddStyleTests(unittest.TestCase):
             ledger.set_tip(self.initial_tip, "style/main")
             self.assertIn("local:docs/style/local.md", {row.rule_id for row in ledger.rule_counts(style_ledger.WholeRepository())})
 
+    def test_create_refreshes_an_older_ledger_before_pinning_its_style_branch(self) -> None:
+        _ = (self.repo / "src/new.rs").write_text("pub fn new_input() {}\n")
+        _ = self.git("add", "--all")
+        _ = self.git("commit", "-qm", "Advance branch point before creating style production")
+        branch_tip = self.git("rev-parse", "main")
+        for previous_branch in ("", "style/previous"):
+            with self.subTest(previous_branch=previous_branch):
+                with style_ledger.open_ledger(self.repo) as ledger:
+                    if previous_branch:
+                        ledger.set_tip(self.initial_tip, previous_branch)
+                    else:
+                        ledger.set_tip(self.initial_tip)
+                timer = self.root / "notifier/showrunner-sample-style/conf"
+                if timer.exists():
+                    timer.unlink()
+                _ = self.run_bootstrap()
+                self.assertEqual(self.sync()[:2], (branch_tip, "refs/heads/style/main"))
+                with style_ledger.open_ledger(self.checkout) as ledger:
+                    self.assertIn("src/new.rs", {cell.path for cell in ledger.cells()})
+
+    def test_create_retry_with_the_exact_sync_pair_does_not_refresh_its_timestamp(self) -> None:
+        self.env["TEST_FAIL_LAUNCH"] = "1"
+        failed = self.run_bootstrap(success=False)
+        self.assertEqual(failed.returncode, 2)
+        before = self.sync()
+        self.assertEqual(before[:2], (self.initial_tip, "refs/heads/style/main"))
+        del self.env["TEST_FAIL_LAUNCH"]
+
+        _ = self.run_bootstrap()
+
+        self.assertEqual(self.sync(), before)
+
     def test_rerun_keeps_plans_ledger_and_excludes_and_does_not_launch_twice(self) -> None:
         _ = self.run_bootstrap()
         plan = self.checkout / "docs/style-production/units/names-unit.md"
@@ -586,7 +618,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/init-catalyst"))
         self.assertFalse((self.root / "product-checkout-style").exists())
 
-    def test_retry_after_failed_launch_preserves_open_plan_and_synced_tip(self) -> None:
+    def test_retry_after_failed_launch_preserves_open_plan_and_keeps_ledger_at_style_branch_commit(self) -> None:
         self.env["TEST_FAIL_LAUNCH"] = "1"
         refused = self.run_bootstrap(success=False)
         self.assertEqual(refused.returncode, 2)
@@ -594,13 +626,21 @@ class AddStyleTests(unittest.TestCase):
         plan = self.checkout / "docs/style-production/units/values-unit.md"
         _ = plan.write_text(plan.read_text() + "\n### Phase 1 — resumed work\n")
         original_plan = plan.read_text()
-        _ = self.git("commit", "--allow-empty", "-q", "-m", "Advance branch point before retry")
+        _ = (self.repo / "src/new.rs").write_text("pub fn added_after_launch() {}\n")
+        _ = self.git("add", "src/new.rs")
+        _ = self.git("commit", "-q", "-m", "Advance branch point before retry")
+        branch_tip = self.git("rev-parse", "main")
         del self.env["TEST_FAIL_LAUNCH"]
 
         _ = self.run_bootstrap()
 
         self.assertEqual(plan.read_text(), original_plan)
-        self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))
+        style_tip = self.git("rev-parse", "refs/heads/style/main")
+        self.assertEqual(style_tip, self.initial_tip)
+        self.assertNotEqual(style_tip, branch_tip)
+        self.assertEqual(self.sync()[:2], (style_tip, "refs/heads/style/main"))
+        with style_ledger.open_ledger(self.checkout) as ledger:
+            self.assertNotIn("src/new.rs", {cell.path for cell in ledger.cells()})
         self.assertEqual([call["command"] for call in self.calls()], ["launch.py", "launch.py"])
         self.assertEqual(self.git("worktree", "list", "--porcelain").count(f"worktree {self.checkout}"), 1)
 

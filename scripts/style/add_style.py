@@ -412,11 +412,9 @@ def main(argv: list[str]) -> int:
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
         _exclude(style)
+        style_tip = _git(style.repository, "rev-parse", "--verify", f"refs/heads/{style.merge_branch}^{{commit}}")
         with style_ledger.open_ledger(style.checkout) as ledger:
-            try:
-                _ = ledger.synced_at()
-            except style_ledger.LedgerError:
-                ledger.set_tip(style.branch_tip, style.merge_branch)
+            ledger.ensure_synced_tip(style_tip, style.merge_branch)
         result = subprocess.run([
             str(SCRIPTS / "lib/py"), str(LAUNCHER), "--production", str(style.doc),
             "--model", cast(str, args.model), "--effort", cast(str, args.effort),

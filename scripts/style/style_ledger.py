@@ -570,6 +570,13 @@ class Ledger:
             self._catalog = rule_catalog.load_rules(self.repo)
             self._refresh_sites(self._tip(commit))
 
+    def ensure_synced_tip(self, tip: str, style_branch: str) -> None:
+        """Initialize a production at its style branch tip without rewriting an exact match."""
+        style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
+        sync = cast(list[tuple[str, str]], self._connection.execute("SELECT tip,style_branch FROM sync WHERE id=1").fetchall())
+        if not sync or sync[0] != (tip, style_branch):
+            self.set_tip(tip, style_branch)
+
     def synced_at(self) -> datetime:
         rows = cast(list[tuple[str]], self._connection.execute("SELECT synced_at FROM sync WHERE id=1").fetchall())
         if not rows:
@@ -985,11 +992,20 @@ class Ledger:
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
         branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
         style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
-        style_tip = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
+        present = subprocess.run(
+            ["git", "-C", str(self.repo), "show-ref", "--verify", "--quiet", style_branch],
+            capture_output=True, text=True, check=False,
+        )
+        if present.returncode == 1:
+            style_tip = branch_tip
+        elif present.returncode:
+            raise LedgerError(present.stderr.strip())
+        else:
+            style_tip = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
         changes: list[str] = []
         sync = cast(list[tuple[str, str]], self._connection.execute("SELECT tip,style_branch FROM sync WHERE id=1").fetchall())
         if not sync or sync[0][1] != style_branch:
-            self.set_tip(sync[0][0] if sync else branch_tip, style_branch)
+            self.set_tip(style_tip, style_branch)
             changes.append(f"style branch {style_branch}")
         with self._connection:
             _ = self._connection.execute("INSERT INTO reconciliation VALUES (1,?) ON CONFLICT(id) DO UPDATE SET branch_point=excluded.branch_point", (branch_point,))

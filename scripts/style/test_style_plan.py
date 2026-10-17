@@ -331,6 +331,76 @@ class StylePlanTests(unittest.TestCase):
             self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo)]), 0)
         self.assertIn("names-unit: read", output.getvalue())
 
+    def test_structure_first_unblocks_more_other_family_cells_before_staler_crates(self) -> None:
+        read = self.rule("read")
+        own = self.rule("module-read", "tier: C\nfamily: modules\ninput_scope: file\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        self.record(read, self.sources[0], self.tip)
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.record(read, self.sources[1], self.tip)
+        for path in self.sources[2:]:
+            self.record(own, path, self.tip)
+
+        tickets = self.candidates("modules")
+
+        self.assertEqual([(ticket.crate, ticket.kind, ticket.rules) for ticket in tickets], [
+            ("crates/beta", "structure", (structure,)), ("crates/alpha", "structure", (structure,)),
+        ])
+        ledger = self.ledger()
+        scoped = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
+                                             "modules", style_plan.PilotCrates(frozenset({"crates/alpha"})))
+        self.assertEqual([(ticket.crate, ticket.kind) for ticket in scoped], [("crates/alpha", "structure")])
+
+    def test_equal_blocked_structure_counts_use_staleness_then_crate_name(self) -> None:
+        read = self.rule("read")
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        original_tip = self.tip
+        self.record(read, self.sources[2], original_tip)
+        self.write(self.sources[2], "pub fn changed_beta() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual([ticket.crate for ticket in self.candidates("modules")], ["crates/beta", "crates/alpha"])
+
+        self.record(read, self.sources[0], original_tip)
+        self.write(self.sources[0], "pub fn changed_alpha() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual([ticket.crate for ticket in self.candidates("modules")], ["crates/alpha", "crates/beta"])
+
+    def test_current_other_family_cells_do_not_raise_structure_priority(self) -> None:
+        read = self.rule("read")
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        for path in self.sources[:2]:
+            self.record(read, path, self.tip)
+
+        self.assertEqual([ticket.crate for ticket in self.candidates("modules")], ["crates/beta", "crates/alpha"])
+
+    def test_other_family_keeps_stale_order_and_skips_pending_structure(self) -> None:
+        self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta", "crates/gamma"]\n')
+        self.write("crates/gamma/Cargo.toml", '[package]\nname = "gamma"\nversion = "0.1.0"\n')
+        gamma = "crates/gamma/src/lib.rs"
+        self.write(gamma, "pub fn value() {}\n")
+        self.write("docs/alpha/style/structure.md", "---\ntier: D\nfamily: modules\n---\n# Structure\n")
+        self.tip = self.commit()
+        read = self.rule("read")
+        _ = self.rule("types", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        self.record(read, gamma, self.tip)
+        self.write(gamma, "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+
+        tickets = self.candidates("names")
+
+        self.assertEqual([ticket.crate for ticket in tickets], ["crates/gamma", "crates/beta"])
+        self.assertEqual({ticket.kind for ticket in tickets}, {"read"})
+        self.assertEqual({rule for ticket in tickets for rule in ticket.rules}, {read})
+
     def test_structure_phase_contains_its_pinned_uncovered_instructions_and_sites(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: Read the crate layout.\n")
         self.sync()
