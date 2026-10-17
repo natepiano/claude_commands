@@ -277,7 +277,7 @@ export const register: Register = on => {
       if (data && unit) return UnitView(elements, e.props.bodyColumns, data, unit, state.now,
         () => { void select($, opened, PANE, { kind: 'board' }); });
     }
-    return BoardView(elements, e.props.bodyColumns, state.data, state.now,
+    return BoardView(elements, e.props.bodyColumns, e.props.scroll.bodyRows, state.data, state.now,
       (production, unit) => { void select($, opened, PANE, { kind: 'unit', production, unit }); });
   });
 };
