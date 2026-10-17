@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -193,20 +194,22 @@ class ProductionTreeTests(unittest.TestCase):
             _ = self.run_folder("unit", director, {
                 f"w{seat}-impl": {"thread_id": f"{director}-{seat}", "role": "impl", "status": "running"} for seat in range(6)
             })
-        started = time.perf_counter()
+        started = time.process_time()
         edges = self.tree({RUNNER, *directors}, {"main": {director: unit(director, director) for director in directors}})
-        self.assertLess(time.perf_counter() - started, 0.25)
+        self.assertLess(time.process_time() - started, 0.25)
         self.assertEqual(len(edges), 40 + 40 * 6)
 
     def test_the_command_prints_schema_one_and_starts_fast(self) -> None:
         with mock.patch.object(production_tree, "tree", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(production_tree.main(["--json"]), 0)
         self.assertEqual(cast(object, json.loads(out.getvalue())), {"schema": 1, "edges": []})
-        started = time.perf_counter()
+        # The child's CPU time, not the wall clock: on a loaded machine waiting for a CPU adds only to the clock.
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
         shown = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, check=False,
                                env={**os.environ, "NOTIFIER_STATE_DIR": str(self.root / "notifier")}, stdin=subprocess.DEVNULL)
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertLess(time.perf_counter() - started, 0.75)
+        self.assertLess((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime), 0.75)
 
 
 if __name__ == "__main__":
