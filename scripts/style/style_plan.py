@@ -149,8 +149,9 @@ def gate(repo: Path, ticket_id: str) -> int:
                     for cell in missing:
                         print(f"unjudged: {cell.rule} {cell.path}")
                     return 1
+                base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
-                                         "--repo", str(repo), "--base", origin.base, "--worktree"], check=False)
+                                         "--repo", str(repo), "--base", base, "--worktree"], check=False)
                 return 0 if result.returncode == 0 else 1
             fields = frontmatter(origin.issue)
             findings = style_proposals.issue_findings(ledger, origin.issue)
@@ -176,6 +177,39 @@ def synced_tip(ledger: style_ledger.Ledger) -> str:
     if not rows:
         raise style_ledger.LedgerError("no synced tip; run set-tip first")
     return rows[0][0]
+
+
+def synced_style_branch(ledger: style_ledger.Ledger) -> str:
+    with closing(sqlite3.connect(ledger.database)) as connection:
+        rows = cast(list[tuple[str]], connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+    return rows[0][0] if rows else ""
+
+
+def coverage_footprint_base(repo: Path, ledger: style_ledger.Ledger, recorded_base: str) -> str:
+    """Exclude style-branch work taken in since the ticket's recorded start."""
+    branch = synced_style_branch(ledger)
+    if not branch:
+        return recorded_base
+    resolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"],
+                              capture_output=True, text=True, check=False)
+    if resolved.returncode == 1:
+        return recorded_base
+    if resolved.returncode:
+        raise style_ledger.LedgerError(resolved.stderr.strip() or "git rev-parse failed")
+    merged = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD", resolved.stdout.strip()],
+                            capture_output=True, text=True, check=False)
+    if merged.returncode == 1:
+        return recorded_base
+    if merged.returncode:
+        raise style_ledger.LedgerError(merged.stderr.strip() or "git merge-base failed")
+    base = merged.stdout.strip()
+    ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", recorded_base, base],
+                              capture_output=True, text=True, check=False)
+    if ancestry.returncode == 1:
+        return recorded_base
+    if ancestry.returncode:
+        raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
+    return base
 
 
 def read_slices(repo: Path, tip: str, files: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:

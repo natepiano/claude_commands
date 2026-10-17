@@ -146,6 +146,14 @@ class RunOutTests(unittest.TestCase):
         weight = math.pow(0.5, 7 * STEP / HALF_LIFE.total_seconds())
         self.assertAlmostEqual(weighted_rate(readings, step(13)) or 0, (2 * weight + 1) / ((weight + 1) * STEP))
 
+    def test_an_account_waiting_its_turn_is_not_quiet_use(self) -> None:
+        # A refill, eight steps untouched while another account is in use, then an hour at 2 points a step.
+        waited = climb([60, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 6, 8, 10, 12, 14])
+        self.assertAlmostEqual(weighted_rate(waited, step(15)) or 0, 2 / STEP)
+        # Once the account has risen, a flat stretch is quiet use and still counts.
+        paused = climb([0, 2, 4, 6, 8, 10, 12, 12, 12, 14])
+        self.assertLess(weighted_rate(paused, step(9)) or 0, 2 / STEP)
+
     def test_time_at_full_is_skipped(self) -> None:
         readings = climb([88, 90, 92, 94, 96, 98, 100, 100, 100, 100, 0, 2, 4, 6, 8, 10, 12])
         self.assertAlmostEqual(weighted_rate(readings, step(16)) or 0, 2 / STEP)
@@ -173,7 +181,9 @@ class RunOutTests(unittest.TestCase):
         # Six ten-minute steps weigh a little under an hour; the seventh carries it over.
         self.assertIsNone(weighted_rate(climb([0, 3, 6, 9, 12, 15, 18]), step(6)))
         self.assertAlmostEqual(weighted_rate(climb([0, 3, 6, 9, 12, 15, 18, 21]), step(7)) or 0, 3 / STEP)
+        # An account that has not moved for an hour since the log began is waiting its turn: no use, so a pace of 0.
         self.assertEqual(weighted_rate(climb([40.0] * 8), step(7)), 0)
+        self.assertIsNone(weighted_rate(climb([40.0] * 6), step(5)))
 
 
 if __name__ == "__main__":

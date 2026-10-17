@@ -62,7 +62,7 @@ against the union of one-rule findings using the same model.
 
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
-| modules | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by modules-unit |
+| modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
 | names | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by names-unit |
 | types | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by types-unit |
 
@@ -92,7 +92,8 @@ product merge between checkpoint and integration.
 The other 16 merged tickets record checkpoint `d1ced22c`, already on main before
 the first ticket: they changed no code and carried nothing to hand off. From the
 `style/main` aggregate commit `8d6e25d1` to main took 0.04 h. The ledger's
-`handoffs` row still read `sent` after git showed the merge.
+`handoffs` row still read `sent` after git showed the merge, and so does the
+`f091ed48` row, with no merge commit recorded.
 
 The showrunner counts this as a fail and changes nothing until two more
 hand-offs are measured. For each, record whether a product merge landed between
@@ -102,7 +103,7 @@ criterion is then judged from three points.
 | Hand-off | Ticket checkpoint | Elapsed | Product merge between | `style/main` took it in cleanly |
 | --- | --- | --- | --- | --- |
 | `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
-| second | pending | pending | pending | pending |
+| `ac95d94d` | names-unit-12 `96da4419` at 16:26:13Z, merged to main at 16:31:20Z | 0.09 h | no: main's last product merge, `ec3297e9`, landed at 15:16:13Z, before the checkpoint | yes: `f091ed48` merges the ticket onto `ec3297e9`, and its tree equals the automatic merge |
 | third | pending | pending | pending | pending |
 
 ## Restart
@@ -262,6 +263,27 @@ Pending: parent's saved style child summary and rendered style line.
   checkpointed ticket unfiled, prints `held for open ticket <id>: <count>
   findings` for each such ticket, and files them on the first run after the
   ticket closes.
+- **Fix J — the ticket gate measures from the style branch the ticket absorbed** (commit `fb08135a`):
+  modules-unit-8 was assigned at `d1ced22c` and fast-forwarded to style/main
+  `8d6e25d1` with no edit of its own. Its gate still exited 1 with `non-Rust
+  change requires review`: the four docs commits pushed straight to main sit on
+  the first-parent chain, and the footprint fold removes only merged-in side
+  parents. The coverage gate now measures from the unit's merge-base with the
+  style merge branch when the recorded start is its ancestor, and from the
+  recorded start otherwise (no style branch, unresolvable, or unrelated
+  history). The ledger's recorded base is unchanged, and the ticket's own edits
+  are still judged.
+- **Fix K — the parent's hand-off merge records itself in the style ledger** (commit `b5bf8336`):
+  hand-offs `8d6e25d1` (merged as `28db0785`) and `f091ed48` (merged as
+  `ac95d94d`) both left their handoffs rows `sent` with no merge commit. The
+  row became merged only when the style showrunner acted on the parent's
+  acknowledgment message. The first acknowledgment reached a stale session, and
+  the second has no delivery record. The parent's merge now runs
+  `style_ledger.py handoff merged` with the merge commit before it
+  acknowledges, both on the fresh merge and on a repeated notice. The
+  acknowledgment is now a notice only. A ledger failure prints one `hand-off
+  ledger:` line, and the merge and acknowledgment still go through.
 
-Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
+Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
+fix I as `89f24e01`, fix J as `9b71ca5b`.
 Live verification of the fixes and subsequent measurements remain pending.
