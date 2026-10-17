@@ -20,6 +20,7 @@ from user_zone import user_zone_name  # noqa: E402
 
 if TYPE_CHECKING:
     from showrunners import Place
+    from turn_input import TurnInput
 
 
 STAMP_WINDOW = timedelta(minutes=5)
@@ -46,6 +47,10 @@ QUOTA_LEAD = "quota: "
 # User, 2026-10-12: "your messages should just say 'there are {n} open questions for you' - that's it".
 ASK_ONCE = ("A question for the user is asked once, in full, when it first comes up. After that the Waiting on "
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
+
+
+# A turn the user did not start passes with exactly this reply when nothing needs the user.
+NOTHING_FOR_USER = "nothing needs the user: reply with -"
 
 
 # The switch file's content when a conversation pause turned the footer off. A switch turned off
@@ -210,6 +215,43 @@ def key_values(path: Path) -> dict[str, str]:
 
 def outstanding_path(slug: str) -> Path:
     return state_root() / "outstanding" / f"{slug}.json"
+
+
+class ReportItem(TypedDict):
+    """Something the user asked to be told about, such as "tell me when hanadocs is back"."""
+    text: str
+    until: str
+
+
+def reports_path(slug: str) -> Path:
+    return state_root() / "reports" / f"{slug}.json"
+
+
+def live_reports(slug: str, now: datetime) -> list[ReportItem]:
+    """The production's reports whose `until` has not passed; a naive `until` is in the user's zone."""
+    try:
+        raw = cast(object, json.loads(reports_path(slug).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        raise FooterError(f"{slug}: reports unreadable: {error}") from error
+    if not isinstance(raw, list):
+        raise FooterError(f"{slug}: expected a reports list")
+    live: list[ReportItem] = []
+    for entry in cast(list[object], raw):
+        fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
+        text, until = fields.get("text"), fields.get("until")
+        if not isinstance(text, str) or not isinstance(until, str):
+            raise FooterError(f"{slug}: a report needs text and until")
+        try:
+            ends = datetime.fromisoformat(until)
+        except ValueError as error:
+            raise FooterError(f"{slug}: report until {until!r} is not ISO") from error
+        if ends.tzinfo is None:
+            ends = ends.replace(tzinfo=ZoneInfo(user_zone_name()))
+        if ends > now:
+            live.append(ReportItem(text=text, until=until))
+    return live
 
 
 def state_root() -> Path:
@@ -483,6 +525,45 @@ def pending_question_text(item: PendingQuestion) -> str:
     return item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
 
 
+def instance_slugs(instance_dirs: list[str]) -> set[str]:
+    return {Path(instance).name.removeprefix("showrunner-") for instance in instance_dirs}
+
+
+def with_below(slugs: set[str]) -> set[str]:
+    """These productions and every one below them, as a root's count covers them."""
+    return slugs.union(*(place_of(slug).below for slug in slugs))
+
+
+def outstanding_texts(slugs: set[str]) -> list[str]:
+    """Every text, question and reviewed question in these productions' open_for_user lists."""
+    texts: list[str] = []
+    for slug in sorted(slugs):
+        try:
+            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            continue
+        if not isinstance(raw, list):
+            raise FooterError(f"{slug}: expected outstanding list")
+        for entry in cast(list[object], raw):
+            if isinstance(entry, dict):
+                fields = cast(dict[str, object], entry)
+                texts.extend(value for key in ("text", "question", "reviewed")
+                             if isinstance(value := fields.get(key), str))
+    return texts
+
+
+def carries_registered(instance_dirs: list[str], reply: str) -> bool:
+    """Whether the reply names an item registered for the user: an open item or a report."""
+    slugs = with_below(instance_slugs(instance_dirs))
+    now = datetime.now(ZoneInfo(user_zone_name()))
+    texts = [*(pending_question_text(item) for instance in instance_dirs
+               for item in read_pending_reviewed(Path(instance))),
+             *outstanding_texts(slugs),
+             *(report["text"] for slug in sorted(slugs) for report in live_reports(slug, now))]
+    compared = normalised(reply)
+    return any(text.strip() and normalised(text) in compared for text in texts)
+
+
 def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyReady | QuestionReplyBlocked:
     accepted: list[str] = []
     slugs: set[str] = set()
@@ -503,20 +584,7 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
     asks = reply_asks.user_reply_questions(reply)
     if not asks.sentences and not asks.has_choices:
         return QuestionReplyReady()
-    for slug in tuple(slugs):
-        slugs.update(place_of(slug).below)
-    for slug in slugs:
-        try:
-            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            continue
-        if not isinstance(raw, list):
-            raise FooterError(f"{slug}: expected outstanding list")
-        for entry in cast(list[object], raw):
-            if isinstance(entry, dict):
-                fields = cast(dict[str, object], entry)
-                accepted.extend(value for key in ("text", "question", "reviewed")
-                                if isinstance(value := fields.get(key), str))
+    accepted.extend(outstanding_texts(with_below(slugs)))
     registered = [reply_asks.question_prose(choice_comparison_text(question)) for question in accepted]
     for sentence in (*asks.sentences, *asks.choice_lines):
         compared = reply_asks.question_prose(choice_comparison_text(sentence))
@@ -528,12 +596,20 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
 
 
 def block_reason(instance_dirs: list[str], reply: str,
-                 states: dict[str, FooterState], *, skip_footer: bool = False) -> str | None:
+                 states: dict[str, FooterState], *, skip_footer: bool = False,
+                 turn: TurnInput | None = None) -> str | None:
     if not instance_dirs:
         return None
     checked = check_reviewed_text(instance_dirs, reply)
     if isinstance(checked, QuestionReplyBlocked):
         return checked.reason
+    # A turn the user did not start reaches the user only with an auto-mode denial or a registered
+    # item; otherwise the reply is exactly "-", which carries no footer.
+    if turn is not None and turn.machine_only:
+        if reply.strip() == "-":
+            return None
+        if not turn.denied and not carries_registered(instance_dirs, reply):
+            return NOTHING_FOR_USER
     reason = footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
     if reason is None:
         for instance in instance_dirs:
