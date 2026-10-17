@@ -503,9 +503,23 @@ Pending: parent's saved style child summary and rendered style line.
   structure verdict that depends on a caller outside the module's own
   directory no longer goes stale when that caller changes. Ticket 19 in the
   modules pass waits on it.
+- **Name-bindings rerun 4 — recall holds, new findings fail the 10% bar**:
+  36 of the 37 settled findings caught (97.3%). The pair that moved cancel:
+  `actions.rs:835` is caught for the first time, and `overview.rs:72` is
+  lost because its judge read `lines.join("\n")` under fix V's accessor
+  sentence as a method that takes arguments. The pass raised 331 findings;
+  52 sit where rerun 2 had none. Three blind judges called none of a random
+  30 of the 279 older findings false (0%), so fix V removed the shape that
+  may have predated fix S. Of the 52 new ones they called 8 false (15%):
+  four rename `column` and `row` after `Position::new(x, y)`, whose
+  parameters are single letters that give no name to match; two name one
+  element of an array literal (`&[item]`, `[path.as_path()]`) after the
+  collection parameter it sits in; one renames `key` after
+  `CFString::from_static_str(string)`; one binding fills two parameters
+  with different names.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`.
 Live verification of the fixes and subsequent measurements remain pending.
