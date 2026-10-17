@@ -100,6 +100,8 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
             if declared_family not in ("names", "values", "types", "modules"):
                 raise RuleValidationError(path, "family must be names, values, types or modules")
             family = declared_family
+        if tier == "D" and family != "modules":
+            raise RuleValidationError(path, "tier D requires the modules family")
 
         declared_scope = _scalar(metadata, "input_scope", path, "crate")
         if declared_scope not in ("file", "crate", "manifest"):

@@ -184,7 +184,7 @@ Pending: parent's saved style child summary and rendered style line.
   Review found two wake races: a merge between refill's look and its wait, and
   an older wake clearing a newer wait. Refill now looks again after recording
   its wait, and each wake acknowledges only its per-wait token.
-- **Fix D — a ticket closes only when every cell it owns is judged** (commit `pending`):
+- **Fix D — a ticket closes only when every cell it owns is judged** (commit `452c5aec`):
   modules-unit-4 (cargo-port structure, 10 rules) recorded verdicts for seven;
   `ticket merge` accepted it and refill reissued the other three as
   modules-unit-5 at 13:42:52Z. Cargo-port stayed closed to types-unit, which
@@ -198,8 +198,9 @@ Pending: parent's saved style child summary and rendered style line.
   while A and E forbid one. A types-family tier D rule was also classified,
   though tier D belongs to modules alone. Settled with cargo-liner's style
   showrunner: E1 requires a family for B, C and D and forbids it for A and E,
-  whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules;
-  it is held until cargo-liner re-tiers trait-tutorial-format as E.
+  whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules,
+  after cargo-liner re-tiered trait-tutorial-format as E (`a351f6be`) and moved
+  readme-diagnostic-section to the modules family (`707bb4c6`).
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
 Live verification of the fixes and subsequent measurements remain pending.
