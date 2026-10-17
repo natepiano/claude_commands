@@ -225,7 +225,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - Such a question is held in `~/.local/state/notify/questions/<sha256(slug+text)[:16]>.json` (`QuestionHoldRecord`). Running the same item again counts as its revision. Question holds never reach the post path.
 - **Stored fields:** an outstanding item carries `question` plus either `reviewed` or `review_unavailable`. Items that were already outstanding keep their fields and are not reviewed again. Accepted text is printed as `reviewed question: <text>`, and the reply must carry that text. `commands/showrunner/produce.md` (under `open_for_user`) tells the showrunner to register before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices.
 - **Pending records:** `<notifier state>/showrunner-<slug>/pending_reviewed.json` holds `{items: [{kind: "reviewed", text, reviewed} | {kind: "review unavailable", text, question, reason}]}`:
-  - It is read and written only through `showrunner_footer.read_pending_reviewed`, `add_pending_reviewed` and `delete_pending_reviewed`.
+  - It is read and written only through `showrunner_footer.read_pending_reviewed`, `add_pending_reviewed`, `write_pending_reviewed` and `delete_pending_reviewed`.
   - It is written only when the instance has a `conf`.
   - Replacing the outstanding list drops pending items whose text closed.
 - **History:** `record_question_history()` appends each newly outstanding item's `text`, `question` and `reviewed` to `~/.local/state/showrunner/outstanding/<slug>.history.jsonl`. History is kept for 48 h.
@@ -234,7 +234,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - `check_reviewed_text` runs first, before the footer check, the footers-off return and the `stop_hook_active` skip:
     1. Each pending item's reviewed (or unavailable) text must appear in the reply, whitespace-normalised. Otherwise the reply is blocked with `Question '<text>': paste its reviewed question into this reply:`.
     2. The reply's asks come from `review.user_reply_questions(reply)`. These are question and request sentences plus `(recommended` choice lines. The registered texts are the pending texts plus `text`, `question` and `reviewed` from every current outstanding item for the instance's slug and every slug below it. Both sides go through `choice_comparison_text` and `review.question_prose`. A match means either string contains the other. Any ask without a match blocks the reply with `Unregistered ask '<sentence>': record the item with update_registration.py footer --state and paste its reviewed question into this reply.`
-  - The pending file is deleted only when the whole reply passes, footer check included.
+  - A pending item leaves the file as soon as a reply carries its text, whatever else the hook says of that reply (user, 2026-10-17): a question is shown in full once, when it opens, and no later reply, a hook retry included, is made to repeat it. After that the status line's counts row counts it.
 - **Question detection** (in `review.py`):
   - `question_prose(text)` removes inline code and collapses whitespace.
   - `reply_questions(text) -> ReplyAsks(sentences, has_choices, choice_lines)` skips fenced code and `>` quotes. It finds sentences ending in `?`, and requests that start with reply, choose, pick, confirm, decide, approve, tell me, let me know, say, would you, do you want, shall I or should I. `(recommended` lines are counted as choices.
