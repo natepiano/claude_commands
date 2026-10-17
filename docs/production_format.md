@@ -101,8 +101,12 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   update timer reads N from this line, `on demand` runs no timer and a dailies runs only
   when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
   timer and no footer unless asked)
-- **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
-  app crate>; omit if none
+- **Merge tests:** <backticked commands run in the showrunner checkout on every merge,
+  besides the changed packages' tests, e.g. `./verify.sh test -p app`; text after the
+  first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
+  `~` and `$VAR` expand. Its first word must be on PATH or an executable file in the
+  checkout: a package name, a directory or an unset variable is refused before the merge
+  starts
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
