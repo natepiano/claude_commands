@@ -136,16 +136,18 @@ class UnitLookupTests(unittest.TestCase):
         self.hosts({"$1": marked("before", "w4:p1", "trunk-unit", slug="old"),
                                      "$2": marked("after", "w5:p1", "trunk-unit", slug="new")})
         found = unit_lookup.every_marked_unit()
-        self.assertEqual(found.units, {})
-        self.assertIn("both carry the mark of trunk-unit", found.faults["new"])
+        self.assertEqual(found.units, {"new": {}})
+        self.assertEqual(found.faults["new"]["trunk-unit"], "trunk-unit: its mark is on herdr sessions after and before")
         for slug in ("old", "new"):
             with self.subTest(slug=slug):
-                with self.assertRaisesRegex(OSError, "both carry the mark of trunk-unit"):
+                with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on herdr sessions"):
                     _ = unit_lookup.marked_units(slug)
+                with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on herdr sessions"):
+                    _ = unit_lookup.marked_unit(slug, "trunk-unit")
                 for arguments in (("list", slug), ("pane", slug, "trunk-unit")):
                     result = self.run_script(*arguments)
                     self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
-                    self.assertIn("both carry the mark of trunk-unit", result.stderr)
+                    self.assertIn("trunk-unit: its mark is on herdr sessions", result.stderr)
 
     def test_sessions_sharing_a_production_read_its_timer_once_per_discovery(self) -> None:
         self.renamed_production()
@@ -246,7 +248,7 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_two_sessions_carrying_one_units_mark_are_an_error(self) -> None:
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit"), "$2": marked("copy", "w5:p1", "trunk-unit")})
-        with self.assertRaisesRegex(OSError, "both carry the mark of trunk-unit"):
+        with self.assertRaisesRegex(OSError, "trunk-unit: its mark is on herdr sessions"):
             _ = unit_lookup.marked_units("show")
 
 
@@ -331,15 +333,26 @@ class UnitLookupTests(unittest.TestCase):
         self.hosts({})
         self.assertEqual(unit_lookup.every_marked_unit(), unit_lookup.MarkedProductions({}, {}))
 
-    def test_one_duplicate_production_does_not_hide_other_productions(self) -> None:
+    def test_one_duplicate_mark_leaves_out_only_its_own_unit(self) -> None:
         self.hosts({
             "first": marked("first", "w1:p1", "one-unit"),
             "copy": marked("copy", "w2:p1", "one-unit"),
+            "third": marked("third", "w4:p1", "one-unit"),
+            "two": marked("two", "w5:p1", "two-unit"),
             "other": marked("other", "w3:p1", "other-unit", slug="other"),
         })
         found = unit_lookup.every_marked_unit()
-        self.assertEqual(list(found.units), ["other"])
-        self.assertIn("herdr sessions first and copy both carry the mark of one-unit", found.faults["show"])
+        self.assertEqual({slug: list(units) for slug, units in found.units.items()},
+                         {"show": ["two-unit"], "other": ["other-unit"]})
+        self.assertEqual(found.faults, {"show": {"one-unit": "one-unit: its mark is on herdr sessions copy and first and third"}})
+        self.assertEqual(found.production_fault("other"), "")
+        two = unit_lookup.marked_unit("show", "two-unit")
+        self.assertEqual(two.place if two else None, herdr.HerdrPlace("two", "w5:p1"))
+        self.assertIsNone(unit_lookup.marked_unit("show", "absent-unit"))
+        with self.assertRaisesRegex(OSError, "one-unit: its mark is on"):
+            _ = unit_lookup.marked_unit("show", "one-unit")
+        with self.assertRaisesRegex(OSError, "one-unit: its mark is on"):
+            _ = unit_lookup.marked_units("show")
 
     def record(self, name: str, worktree: Path, started: float, *later: str) -> Path:
         """Write the record of a /unit:direct run in `worktree`, as the recorder would."""

@@ -790,9 +790,8 @@ def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
 
 def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound | NoMarkedUnit:
     """The unit's session, found by its mark."""
-    unit = unit_lookup.marked_units(request.production.slug).get(
-        request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit
-    )
+    unit = unit_lookup.marked_unit(
+        request.production.slug, request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit)
     return NoMarkedUnit() if unit is None else MarkedUnitFound(unit)
 
 
