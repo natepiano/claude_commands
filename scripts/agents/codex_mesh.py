@@ -2747,6 +2747,50 @@ def _resume_account_move(
         raise
 
 
+@dataclass
+class TurnStream:
+    """What one `_stream_turn` call carries from frame to frame."""
+
+    args: argparse.Namespace
+    session_dir: str
+    name: str
+    follow: bool
+    resident: bool
+    timeout: float
+    opened: float
+    deadline: float
+    log_path: Path
+    summary_path: Path
+    reply_path: Path | None
+    end_marker: Path
+    director: KnownWorkerDirector | UnknownWorkerDirector
+    client: Client
+    port: int
+    thread_id: str
+    failure_serving: CodexServingState
+    turn_id: str = ""
+    # The turn a follow watches; empty between its turns.
+    followed_turn: str = ""
+    final_answer: str = ""
+    failure: str = ""
+    followed_failure: str = ""
+    replies: int = 0
+    capacity_waited: float = 0.0
+    capacity_retries: int = 0
+    resume_owed: bool = False
+    waiting_for_progress_after_overflow: bool = False
+    run_outcome: RunOutcome = field(default_factory=RunCompleted)
+    pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(default_factory=NoPendingQuotaRefusal)
+    reported_turns: set[tuple[CodexServingState, str, str]] = field(default_factory=set)
+
+
+class StreamStep(Enum):
+    """What the frame loop does after one step."""
+
+    NEXT_FRAME = "next_frame"
+    FINISH = "finish"
+
+
 def _stream_turn(
     args: argparse.Namespace,
     client: Client,
@@ -2762,507 +2806,604 @@ def _stream_turn(
 ) -> RunOutcome:
     """Stream a new or resumed thread's turn through the same lifecycle."""
     client.session_dir = session_dir
-    port: int = initial_port
-    thread_id: str = initial_thread_id
     log_path = Path(_as_str(_attr(args, "log_file")))
     summary_path = Path(_as_str(_attr(args, "summary_file")))
     reply_file = _as_str(_attr(args, "reply_file"))
-    reply_path = Path(reply_file) if reply_file else None
-
-    turn_id = ""
     resident = getattr(args, "resident", False) is True
     end_marker = _end_marker_path(session_dir, name)
     end_marker.unlink(missing_ok=True)
-    final_answer = ""
-    failure = ""
-    followed_failure = ""
-    replies = 0
-    capacity_waited = 0.0
-    capacity_retries = 0
-    resume_owed = False
-    retry_waited = False
-    waiting_for_progress_after_overflow = False
-    run_outcome: RunOutcome = RunCompleted()
-    pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = NoPendingQuotaRefusal()
     director = UnknownWorkerDirector() if follow else _worker_director(Path(session_dir))
     failure_serving = client.serving
-    reported_turns: set[tuple[CodexServingState, str, str]] = set()
-    changed: bool
-    moved: WorkerMoveResult = WorkerWaitingOnLiveTurn()
-    started: MovedWorker
-    deadline = time.time() + timeout
+    stream = TurnStream(
+        args=args, session_dir=session_dir, name=name, follow=follow, resident=resident,
+        timeout=timeout, opened=opened, deadline=time.time() + timeout,
+        log_path=log_path, summary_path=summary_path,
+        reply_path=Path(reply_file) if reply_file else None,
+        end_marker=end_marker, director=director,
+        client=client, port=initial_port, thread_id=initial_thread_id, failure_serving=failure_serving,
+    )
     with _pending_file(session_dir, name) as handle:
-        _write_pending(handle, thread_id, _pending_for_thread(handle, thread_id))
+        _write_pending(handle, initial_thread_id, _pending_for_thread(handle, initial_thread_id))
     try:
-        # The roster is written before this call: a disconnect after thread
-        # creation must still leave its id reachable.
-        if not follow:
-            _ = client.call("thread/name/set", {"threadId": thread_id, "name": name})
-        initial_move = (_read_account_move(session_dir, name, thread_id)
-                        if _attr(args, "account_move") is True else NoAccountMove())
-        started = _start_workers_turn(args, session_dir, name, thread_id, client, prompt)
-        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
-        if not turn_id:
-            raise SystemExit("codex_mesh: turn/start returned no turn id")
-        if isinstance(initial_move, AccountMoveMarker):
-            _finish_account_move(session_dir, name, initial_move)
-        followed_turn = turn_id if follow else ""
-        _ = _update_roster_if_expected(
-            session_dir,
-            name,
-            {
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "status": "running",
-                "port": port,
-            },
-            RosterOnThread(thread_id),
-        )
+        _start_streamed_turn(stream, prompt)
         with log_path.open("a", encoding="utf-8") as log:
-            def hold_messages_for_next_launch(reason: str) -> None:
-                if end_marker.exists():
-                    return
-                kept = _close_messages_and_keep_pending(session_dir, name, thread_id)
-                if kept:
-                    messages = "1 message" if kept == 1 else f"{kept} messages"
-                    held = f"{messages} held for the next launch"
-                    _post_board_status(session_dir, name, f"launcher: {held}: {reason}")
-                    _ = log.write(f"[{_now_stamp()}] mesh: {name} cannot move: {reason}; {held}\n")
-                    log.flush()
-
-            _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {thread_id}\n")
+            _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {stream.thread_id}\n")
             log.flush()
-            while time.time() < deadline:
-                # A resident thread must wake to see `end` between turns. Any other
-                # wakes to check that its turn has not ended without the notice.
-                # Account-move intent can arrive while a completion notice is lost.
-                # Wake on the resident cadence so moves and held detached-run results
-                # open their continuation promptly, including one-turn launchers.
-                poll = min(RESIDENT_POLL_SECS, UNSEEN_END_CHECK_SECS)
-                frame = client.next_frame(min(deadline, time.time() + poll))
-                if frame is None:
-                    account_move = _read_account_move(session_dir, name, thread_id)
-                    if (isinstance(account_move, AccountMoveMarker) and not end_marker.exists()
-                            and _ended_unseen(client, thread_id)):
-                        started = _resume_account_move(args, session_dir, name, thread_id, client, account_move)
-                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
-                        if follow:
-                            followed_turn = turn_id
-                        failure = followed_failure = final_answer = ""
-                        continue
-                    if not resident and time.time() < deadline:
-                        if _waiting_on_detached_run(session_dir, name, thread_id):
-                            continue
-                        quota_owed = _continuation_is_owed(session_dir, name)
-                        if not resume_owed and _ended_unseen(client, thread_id):
-                            # A move can write its marker and interrupt after the first marker read.
-                            if (isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker)
-                                    and not end_marker.exists()):
-                                continue
-                            moved = _move_resident(args, session_dir, name, thread_id, client)
-                            if isinstance(moved, WorkerAwaitingQuotaRecovery):
-                                pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
-                            if isinstance(moved, WorkerThreadStateUnknown):
-                                if isinstance(moved.cleanup, WorkerTurnCleanup):
-                                    raise WorkerMoveUncertain(thread_id, moved)
-                                hold_messages_for_next_launch(moved.reason)
-                            else:
-                                if quota_owed and isinstance(moved, WorkerWaitingOnLiveTurn):
-                                    continue
-                                if isinstance(moved, MovedWorker):
-                                    client, port, thread_id = moved.client, moved.port, moved.thread_id
-                                    if moved.turn_id or _continuation_is_owed(session_dir, name):
-                                        turn_id = moved.turn_id or turn_id
-                                        if follow:
-                                            followed_turn = turn_id
-                                        continue
-                                if not _close_messages_if_empty(session_dir, name, thread_id):
-                                    continue
-                            if quota_owed:
-                                continue
-                            _ = log.write(f"[{_now_stamp()}] mesh: {name} thread is idle and no "
-                                          + "completion notice arrived; finishing\n")
-                            log.flush()
-                            failure = followed_failure or (
-                                "" if final_answer
-                                else "the thread went idle with no completion notice and no answer")
-                            break
-                        continue
-                    if end_marker.exists():
-                        break
-                    if resident:
-                        selected_home = workers_home()
-                        record = _read_json_object(_session_path(session_dir, SERVER_FILE))
-                        with _pending_file(session_dir, name) as handle:
-                            held_messages = bool(_pending_for_thread(handle, thread_id))
-                        if (server_record_home(record) == selected_home
-                                and record.get("port") == port and not held_messages
-                                and not _continuation_is_owed(session_dir, name)):
-                            continue
-                        moved = _move_resident(args, session_dir, name, thread_id, client)
-                        if isinstance(moved, WorkerAwaitingQuotaRecovery):
-                            pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
-                        if isinstance(moved, WorkerThreadStateUnknown):
-                            if isinstance(moved.cleanup, WorkerTurnCleanup):
-                                raise WorkerMoveUncertain(thread_id, moved)
-                            _ = log.write(f"[{_now_stamp()}] mesh: {name} cannot move: {moved.reason}; waiting\n")
-                            log.flush()
-                        elif isinstance(moved, MovedWorker):
-                            changed = bool(moved.port != port or moved.thread_id != thread_id)
-                            client, port, thread_id = moved.client, moved.port, moved.thread_id
-                            turn_id = moved.turn_id or turn_id
-                            if changed:
-                                _ = log.write(f"[{_now_stamp()}] mesh: {name} moved to the workers app-server on port {port}\n")
-                                log.flush()
-                    continue
-                method = frame.get("method")
-                params = _as_dict(frame.get("params"))
-                if _as_str(params.get("threadId")) not in ("", thread_id):
-                    continue
-                if method == "turn/started":
-                    live = _as_str(_as_dict(params.get("turn")).get("id"))
-                    if live and (not follow or not followed_turn or live == followed_turn):
-                        turn_id = live
-                        if follow:
-                            followed_turn = live
-                        _ = _update_roster_if_expected(
-                            session_dir,
-                            name,
-                            {"thread_id": thread_id, "turn_id": live, "status": "running"},
-                            RosterOnThread(thread_id),
-                        )
-                elif method == "thread/tokenUsage/updated":
-                    context_size = _context_size_from_usage(params)
-                    if isinstance(context_size, KnownContextSize):
-                        _ = _update_roster_if_expected(
-                            session_dir,
-                            name,
-                            {
-                                "thread_id": thread_id,
-                                "turn_id": turn_id,
-                                "status": "running",
-                                "context_tokens": context_size.tokens,
-                            },
-                            RosterOnThread(thread_id),
-                        )
-                elif method == "item/completed":
-                    item = _as_dict(params.get("item"))
-                    _ = log.write(f"[{_now_stamp()}] {_describe_item(item)}\n")
-                    log.flush()
-                    if _as_str(item.get("type")) not in ("userMessage", "contextCompaction"):
-                        waiting_for_progress_after_overflow = False
-                    if _as_str(item.get("type")) == "agentMessage":
-                        text = _as_str(item.get("text"))
-                        if text:
-                            final_answer = text
-                elif method in ("turn/completed", "turn/failed"):
-                    notice_turn = _as_str(_as_dict(params.get("turn")).get("id"))
-                    account_move = _read_account_move(session_dir, name, thread_id)
-                    moved_turn = isinstance(account_move, AccountMoveMarker) and notice_turn == account_move.turn_id
-                    if follow and notice_turn and followed_turn and notice_turn != followed_turn and not moved_turn:
-                        continue
-                    # The followed turn has ended. A later turn names itself in its own
-                    # `turn/started`; a thread read at this moment can still name this one.
-                    if follow:
-                        followed_turn = ""
-                    turn_outcome = _turn_outcome(method, params)
-                    if (isinstance(account_move, AccountMoveMarker) and not end_marker.exists()
-                            and (not notice_turn or notice_turn == account_move.turn_id)):
-                        started = _resume_account_move(args, session_dir, name, thread_id, client, account_move)
-                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
-                        if follow:
-                            followed_turn = turn_id
-                        failure = followed_failure = final_answer = ""
-                        continue
-                    if _interrupted_for_held_work(method, params, session_dir, name, thread_id):
-                        turn_outcome = TurnCompleted()
-                    if isinstance(turn_outcome, TurnFailed):
-                        serving = client.serving
-                        identity = (serving, thread_id, notice_turn or turn_id)
-                        failed = FailedWithThread(thread_id, turn_outcome.detail,
-                            time.time() - client.turn_submitted_at, serving)
-                        if identity not in reported_turns:
-                            reported_turns.add(identity)
-                            if _quota_refused(failed, serving.started_here, False):
-                                _owe_quota_continuation(client, thread_id)
-                                _report_quota_refusal(name, serving, turn_outcome.detail)
-                                pending_refusal = PendingQuotaRefusal(serving, turn_outcome.detail)
-                        if not followed_failure:
-                            failure_serving = serving
-                    if isinstance(turn_outcome, TurnContextWindowExceeded):
-                        if waiting_for_progress_after_overflow:
-                            failure = (
-                                "context window filled twice in a row without progress; "
-                                "automatic continuation stopped"
-                            )
-                            _ = log.write(f"[{_now_stamp()}] {failure}\n")
-                            log.flush()
-                            break
-                        continuation = "Continue where you stopped."
-                        _post_board_status(
-                            session_dir,
-                            name,
-                            f'context window filled; sent "{continuation}"',
-                        )
-                        _ = log.write(
-                            f"[{_now_stamp()}] context window filled; starting one continuation turn\n"
-                        )
-                        log.flush()
-                        started = _start_workers_turn(args, session_dir, name, thread_id, client, continuation)
-                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
-                        if follow:
-                            followed_turn = turn_id
-                        _ = _update_roster_if_expected(
-                            session_dir,
-                            name,
-                            {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
-                            RosterOnThread(thread_id),
-                        )
-                        waiting_for_progress_after_overflow = True
-                        continue
-                    if isinstance(turn_outcome, TurnRefusedForCapacity):
-                        resume_owed = True
-                        retry_waited = False
-                        _move_queue_to_pending(
-                            client, thread_id, lambda message: _add_pending(session_dir, name, thread_id, message))
-                        remaining = CAPACITY_BUDGET_SECS - capacity_waited
-                        if remaining <= 0:
-                            run_outcome = CapacityRetriesExhausted(
-                                thread_id, capacity_retries, int(CAPACITY_BUDGET_SECS / 60)
-                            )
-                            failure = run_outcome.message(name)
-                            _ = _update_roster_if_expected(
-                                session_dir,
-                                name,
-                                {
-                                    "thread_id": thread_id,
-                                    "status": CAPACITY_EXHAUSTED,
-                                },
-                                RosterOnThread(thread_id),
-                            )
-                            break
-                        # A queued peer message may already have opened a turn.
-                        # Stream it, then return here with the task still owed.
-                        with _pending_file(session_dir, name):
-                            if end_marker.exists() or not _roster_still_on_thread(session_dir, name, thread_id):
-                                reason = "ended" if end_marker.exists() else "replaced"
-                                _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
-                                log.flush()
-                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened,
-                                    pending_refusal=pending_refusal, director=director)
-                        live = _read_live_turn(client, thread_id)
-                        if isinstance(live, ThreadStateUnknown):
-                            raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
-                        if not isinstance(live, ThreadIdle):
-                            continue
-                    else:
-                        capacity_waited = 0.0
-                        capacity_retries = 0
-                        waiting_for_progress_after_overflow = False
-                    if resume_owed:
-                        if isinstance(turn_outcome, TurnRefusedForCapacity) and not retry_waited:
-                            remaining = CAPACITY_BUDGET_SECS - capacity_waited
-                            wait = min(CAPACITY_WAIT_SECS * 2.0 ** capacity_retries,
-                                       CAPACITY_MAX_WAIT_SECS, remaining)
-                            capacity_retries += 1
-                            with _pending_file(session_dir, name):
-                                _ = _update_roster_if_expected(
-                                    session_dir,
-                                    name,
-                                    {
-                                        "thread_id": thread_id,
-                                        "status": WAITING_CAPACITY,
-                                        "launcher_pid": os.getpid(),
-                                    },
-                                    RosterOnThread(thread_id),
-                                )
-                            live = _read_live_turn(client, thread_id)
-                            if isinstance(live, ThreadStateUnknown):
-                                raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
-                            if not isinstance(live, ThreadIdle):
-                                continue
-                            next_at = datetime.now().astimezone().timestamp() + wait
-                            next_stamp = datetime.fromtimestamp(next_at).astimezone().isoformat(timespec="seconds")
-                            _ = log.write(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] capacity retry {capacity_retries}: next turn at {next_stamp}\n")
-                            log.flush()
-                            wait_started = _capacity_clock()
-                            _capacity_sleep(wait)
-                            capacity_waited += max(wait, _capacity_clock() - wait_started)
-                            retry_waited = True
-                        live = _read_live_turn(client, thread_id)
-                        if isinstance(live, ThreadStateUnknown):
-                            raise SystemExit(f"thread {thread_id}: thread/read failed: {live.reason}")
-                        if not isinstance(live, ThreadIdle):
-                            if isinstance(live, ThreadLive):
-                                turn_id = live.turn_id
-                            else:
-                                turn_id = ""
-                            with _pending_file(session_dir, name):
-                                if end_marker.exists() or not _roster_still_on_thread(session_dir, name, thread_id):
-                                    reason = "ended" if end_marker.exists() else "replaced"
-                                    _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
-                                    log.flush()
-                                    return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened,
-                                        pending_refusal=pending_refusal, director=director)
-                                if turn_id:
-                                    _ = _update_roster_if_expected(
-                                        session_dir,
-                                        name,
-                                        {
-                                            "thread_id": thread_id,
-                                            "turn_id": turn_id,
-                                            "status": "running",
-                                        },
-                                        RosterOnThread(thread_id),
-                                    )
-                                else:
-                                    _ = _update_roster_if_expected(
-                                        session_dir,
-                                        name,
-                                        {
-                                            "thread_id": thread_id,
-                                            "status": "starting",
-                                            "launcher_pid": os.getpid(),
-                                        },
-                                        RosterOnThread(thread_id),
-                                    )
-                            continue
-                        with _pending_file(session_dir, name):
-                            if end_marker.exists() or not _roster_still_on_thread(session_dir, name, thread_id):
-                                reason = "ended" if end_marker.exists() else "replaced"
-                                _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
-                                log.flush()
-                                return FailedWithThread(thread_id, f"capacity launcher {reason}", time.time() - opened,
-                                    pending_refusal=pending_refusal, director=director)
-                        started = _start_workers_turn(
-                            args, session_dir, name, thread_id, client,
-                            "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
-                        )
-                        client, port, thread_id, turn_id = started.client, started.port, started.thread_id, started.turn_id
-                        if follow:
-                            followed_turn = turn_id
-                        resume_owed = False
-                        continue
-                    quota_owed = _continuation_is_owed(session_dir, name)
-                    if follow and not resident and isinstance(turn_outcome, TurnFailed) and not followed_failure and not quota_owed:
-                        followed_failure = turn_outcome.detail
-                    failure = followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
-                    if resident:
-                        replies += 1
-                        _deliver_reply(name, replies, final_answer, failure, summary_path, reply_path, log)
-                        final_answer = ""
-                        failure = ""
-                        if end_marker.exists():
-                            break
-                    with _pending_file(session_dir, name) as handle:
-                        held_messages = bool(_pending_for_thread(handle, thread_id))
-                    owed = _continuation_is_owed(session_dir, name)
-                    if resident or held_messages or owed:
-                        thread_id = _as_str(cast(object, thread_id))
-                        moved = _move_resident(args, session_dir, name, thread_id, client)
-                        if isinstance(moved, WorkerAwaitingQuotaRecovery):
-                            pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
-                        if isinstance(moved, WorkerThreadStateUnknown):
-                            if isinstance(moved.cleanup, WorkerTurnCleanup):
-                                raise WorkerMoveUncertain(thread_id, moved)
-                            if resident:
-                                _ = log.write(f"[{_now_stamp()}] mesh: {name} cannot move: {moved.reason}; waiting\n")
-                                log.flush()
-                                continue
-                            hold_messages_for_next_launch(moved.reason)
-                            break
-                        if isinstance(moved, MovedWorker):
-                            client, port, thread_id = moved.client, moved.port, moved.thread_id
-                            if moved.turn_id or _continuation_is_owed(session_dir, name):
-                                turn_id = moved.turn_id or turn_id
-                                if follow:
-                                    followed_turn = turn_id
-                                continue
-                    if owed and isinstance(moved, WorkerWaitingOnLiveTurn):
-                        time.sleep(RESIDENT_POLL_SECS)
-                        continue
-                    # A finished turn may have a peer turn opening behind it.
-                    if not resident and _more_work_coming(client, thread_id, deadline):
-                        continue
-                    if not resident:
-                        if _close_messages_if_empty(session_dir, name, thread_id):
-                            break
-                        # The turn ended on a run still going: stay attached until its result is held.
-                        if _waiting_on_detached_run(session_dir, name, thread_id):
-                            continue
-                        moved = _move_resident(args, session_dir, name, thread_id, client)
-                        if isinstance(moved, WorkerAwaitingQuotaRecovery):
-                            pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
-                        if isinstance(moved, WorkerThreadStateUnknown):
-                            if isinstance(moved.cleanup, WorkerTurnCleanup):
-                                raise WorkerMoveUncertain(thread_id, moved)
-                            hold_messages_for_next_launch(moved.reason)
-                            break
-                        if isinstance(moved, MovedWorker):
-                            client, port, thread_id = moved.client, moved.port, moved.thread_id
-                            if moved.turn_id or _continuation_is_owed(session_dir, name):
-                                turn_id = moved.turn_id or turn_id
-                                if follow:
-                                    followed_turn = turn_id
-                        continue
-                    _ = _update_roster_if_expected(
-                        session_dir,
-                        name,
-                        {"thread_id": thread_id, "turn_id": turn_id, "status": "running"},
-                        RosterOnThread(thread_id),
-                    )
-                    if end_marker.exists():
-                        break
-            else:
-                failure = f"no turn/completed within {timeout:.0f}s"
-        if not failure and isinstance(pending_refusal, PendingQuotaRefusal) and _continuation_is_owed(session_dir, name):
-            failure = pending_refusal.detail
-        # A queued peer message can open a turn after the last completion
-        # notification. Check once more before this launcher stops watching.
-        if not resident or failure or end_marker.exists():
-            _ = _end_unwatched_turn(port, thread_id, log_path)
-        if not resident or replies == 0:
-            _finish_summary(summary_path, reply_path, name, replies + 1, final_answer or failure or f"The delegate {name} produced no summary.")
-        if not isinstance(run_outcome, CapacityRetriesExhausted):
-            _ = _update_roster_if_expected(
-                session_dir,
-                name,
-                {"thread_id": thread_id, "status": "failed" if failure else "done"},
-                RosterOnThread(thread_id),
-            )
-        if isinstance(run_outcome, CapacityRetriesExhausted):
-            return replace(run_outcome, pending_refusal=pending_refusal, director=director)
-        return FailedWithThread(thread_id, failure, time.time() - opened, failure_serving,
-                                isinstance(pending_refusal, PendingQuotaRefusal), True,
-                                pending_refusal=pending_refusal, director=director) if failure else RunCompleted()
+            stopped = _stream_frames(stream, log)
+        if stopped is not None:
+            return stopped
+        return _finish_stream(stream)
     except (ConnectionError, OSError, SystemExit) as exc:
-        # Once thread/start returned, even a disconnected turn/start may have
-        # begun work. Keep its id and never resubmit the original prompt.
-        if isinstance(exc, WorkerQuotaRecoveryStopped):
-            port, thread_id = exc.port, exc.thread_id
-        elif isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
-            port = exc.cleanup.port
-            thread_id = exc.cleanup.thread_id
-        _ = _end_unwatched_turn(port, thread_id, log_path)
-        failure = str(exc) or exc.__class__.__name__
-        _ = _update_roster_if_expected(
-            session_dir,
-            name,
-            {"thread_id": thread_id, "status": "failed"},
-            RosterOnThread(thread_id),
-        )
-        serving = exc.serving if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else client.serving
-        reported = exc.reported if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else False
-        if reported:
-            pending_refusal = PendingQuotaRefusal(serving, failure)
-        return FailedWithThread(thread_id, failure, time.time() - opened, serving,
-                                isinstance(pending_refusal, PendingQuotaRefusal), True,
-                                pending_refusal=pending_refusal, director=director)
+        return _fail_stream(stream, exc)
     finally:
         if not end_marker.exists():
             with _pending_file(session_dir, name) as handle:
-                _write_pending(handle, thread_id, _pending_for_thread(handle, thread_id), accepting_messages=False)
-        client.close()
+                _write_pending(handle, stream.thread_id, _pending_for_thread(handle, stream.thread_id),
+                               accepting_messages=False)
+        stream.client.close()
+
+
+def _start_streamed_turn(stream: TurnStream, prompt: str) -> None:
+    """Name the thread, submit its first turn and mark it running on the roster."""
+    # The roster is written before this call: a disconnect after thread
+    # creation must still leave its id reachable.
+    if not stream.follow:
+        _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id, "name": stream.name})
+    initial_move = (_read_account_move(stream.session_dir, stream.name, stream.thread_id)
+                    if _attr(stream.args, "account_move") is True else NoAccountMove())
+    _adopt_started_turn(stream, _start_workers_turn(
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, prompt))
+    if not stream.turn_id:
+        raise SystemExit("codex_mesh: turn/start returned no turn id")
+    if isinstance(initial_move, AccountMoveMarker):
+        _finish_account_move(stream.session_dir, stream.name, initial_move)
+    _ = _update_roster_if_expected(
+        stream.session_dir,
+        stream.name,
+        {
+            "thread_id": stream.thread_id,
+            "turn_id": stream.turn_id,
+            "status": "running",
+            "port": stream.port,
+        },
+        RosterOnThread(stream.thread_id),
+    )
+
+
+def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
+    """Handle frames until the run finishes or its deadline passes.
+
+    Returns the outcome of a capacity launcher that stopped without a resume turn.
+    """
+    while time.time() < stream.deadline:
+        # A resident thread must wake to see `end` between turns. Any other
+        # wakes to check that its turn has not ended without the notice.
+        # Account-move intent can arrive while a completion notice is lost.
+        # Wake on the resident cadence so moves and held detached-run results
+        # open their continuation promptly, including one-turn launchers.
+        poll = min(RESIDENT_POLL_SECS, UNSEEN_END_CHECK_SECS)
+        frame = stream.client.next_frame(min(stream.deadline, time.time() + poll))
+        step = _on_quiet_poll(stream, log) if frame is None else _on_frame(stream, log, frame)
+        if isinstance(step, FailedWithThread):
+            return step
+        if step is StreamStep.FINISH:
+            break
+    else:
+        stream.failure = f"no turn/completed within {stream.timeout:.0f}s"
+    return None
+
+
+def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
+    """Watch the server, thread and turn a submission landed on."""
+    stream.client, stream.port = started.client, started.port
+    stream.thread_id, stream.turn_id = started.thread_id, started.turn_id
+    if stream.follow:
+        stream.followed_turn = stream.turn_id
+
+
+def _adopt_moved_worker(stream: TurnStream, moved: MovedWorker) -> bool:
+    """Watch the server a move landed on; true when it left a turn or a continuation to watch."""
+    stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
+    if not (moved.turn_id or _continuation_is_owed(stream.session_dir, stream.name)):
+        return False
+    stream.turn_id = moved.turn_id or stream.turn_id
+    if stream.follow:
+        stream.followed_turn = stream.turn_id
+    return True
+
+
+def _move_worker(stream: TurnStream) -> WorkerMoveResult:
+    """Move the worker to the selected workers home and keep any quota refusal it reports.
+
+    A move that may have started a turn it cannot account for stops the run.
+    """
+    moved = _move_resident(stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client)
+    if isinstance(moved, WorkerAwaitingQuotaRecovery):
+        stream.pending_refusal = PendingQuotaRefusal(moved.refusal.serving, str(moved.refusal))
+    if isinstance(moved, WorkerThreadStateUnknown) and isinstance(moved.cleanup, WorkerTurnCleanup):
+        raise WorkerMoveUncertain(stream.thread_id, moved)
+    return moved
+
+
+def _resume_marked_account_move(stream: TurnStream, marker: AccountMoveMarker) -> None:
+    """Open the marked move's continuation and forget the answer of the turn it replaced."""
+    _adopt_started_turn(stream, _resume_account_move(
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, marker))
+    stream.failure = stream.followed_failure = stream.final_answer = ""
+
+
+def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str) -> None:
+    """Close the thread to messages and keep the held ones for the next launch."""
+    if stream.end_marker.exists():
+        return
+    kept = _close_messages_and_keep_pending(stream.session_dir, stream.name, stream.thread_id)
+    if kept:
+        messages = "1 message" if kept == 1 else f"{kept} messages"
+        held = f"{messages} held for the next launch"
+        _post_board_status(stream.session_dir, stream.name, f"launcher: {held}: {reason}")
+        _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} cannot move: {reason}; {held}\n")
+        log.flush()
+
+
+def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep:
+    """No frame arrived within one poll: catch a move, an unseen end or a resident off its server."""
+    account_move = _read_account_move(stream.session_dir, stream.name, stream.thread_id)
+    if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
+            and _ended_unseen(stream.client, stream.thread_id)):
+        _resume_marked_account_move(stream, account_move)
+        return StreamStep.NEXT_FRAME
+    if not stream.resident and time.time() < stream.deadline:
+        return _finish_if_ended_unseen(stream, log)
+    if stream.end_marker.exists():
+        return StreamStep.FINISH
+    if stream.resident:
+        _keep_resident_on_selected_server(stream, log)
+    return StreamStep.NEXT_FRAME
+
+
+def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
+    """Finish a one-turn launcher whose thread went idle without a completion notice."""
+    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id):
+        return StreamStep.NEXT_FRAME
+    quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
+    if stream.resume_owed or not _ended_unseen(stream.client, stream.thread_id):
+        return StreamStep.NEXT_FRAME
+    # A move can write its marker and interrupt after the first marker read.
+    if (isinstance(_read_account_move(stream.session_dir, stream.name, stream.thread_id), AccountMoveMarker)
+            and not stream.end_marker.exists()):
+        return StreamStep.NEXT_FRAME
+    moved = _move_worker(stream)
+    if isinstance(moved, WorkerThreadStateUnknown):
+        _hold_messages_for_next_launch(stream, log, moved.reason)
+    else:
+        if quota_owed and isinstance(moved, WorkerWaitingOnLiveTurn):
+            return StreamStep.NEXT_FRAME
+        if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
+            return StreamStep.NEXT_FRAME
+        if not _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id):
+            return StreamStep.NEXT_FRAME
+    if quota_owed:
+        return StreamStep.NEXT_FRAME
+    _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} thread is idle and no "
+                  + "completion notice arrived; finishing\n")
+    log.flush()
+    stream.failure = stream.followed_failure or (
+        "" if stream.final_answer
+        else "the thread went idle with no completion notice and no answer")
+    return StreamStep.FINISH
+
+
+def _keep_resident_on_selected_server(stream: TurnStream, log: TextIO) -> None:
+    """Move an idle resident that sits off the selected server or owes work."""
+    selected_home = workers_home()
+    record = _read_json_object(_session_path(stream.session_dir, SERVER_FILE))
+    with _pending_file(stream.session_dir, stream.name) as handle:
+        held_messages = bool(_pending_for_thread(handle, stream.thread_id))
+    if (server_record_home(record) == selected_home
+            and record.get("port") == stream.port and not held_messages
+            and not _continuation_is_owed(stream.session_dir, stream.name)):
+        return
+    moved = _move_worker(stream)
+    if isinstance(moved, WorkerThreadStateUnknown):
+        _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} cannot move: {moved.reason}; waiting\n")
+        log.flush()
+    elif isinstance(moved, MovedWorker):
+        changed = moved.port != stream.port or moved.thread_id != stream.thread_id
+        stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
+        stream.turn_id = moved.turn_id or stream.turn_id
+        if changed:
+            _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} moved to the workers app-server on port {stream.port}\n")
+            log.flush()
+
+
+def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep | FailedWithThread:
+    """Handle one frame for the watched thread; frames for other threads are skipped."""
+    method = frame.get("method")
+    params = _as_dict(frame.get("params"))
+    if _as_str(params.get("threadId")) not in ("", stream.thread_id):
+        return StreamStep.NEXT_FRAME
+    if method == "turn/started":
+        _on_turn_started(stream, params)
+    elif method == "thread/tokenUsage/updated":
+        _record_context_size(stream, params)
+    elif method == "item/completed":
+        _log_completed_item(stream, log, params)
+    elif method in ("turn/completed", "turn/failed"):
+        return _on_turn_end(stream, log, method, params)
+    return StreamStep.NEXT_FRAME
+
+
+def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
+    live = _as_str(_as_dict(params.get("turn")).get("id"))
+    if live and (not stream.follow or not stream.followed_turn or live == stream.followed_turn):
+        stream.turn_id = live
+        if stream.follow:
+            stream.followed_turn = live
+        _ = _update_roster_if_expected(
+            stream.session_dir,
+            stream.name,
+            {"thread_id": stream.thread_id, "turn_id": live, "status": "running"},
+            RosterOnThread(stream.thread_id),
+        )
+
+
+def _record_context_size(stream: TurnStream, params: dict[str, object]) -> None:
+    context_size = _context_size_from_usage(params)
+    if isinstance(context_size, KnownContextSize):
+        _ = _update_roster_if_expected(
+            stream.session_dir,
+            stream.name,
+            {
+                "thread_id": stream.thread_id,
+                "turn_id": stream.turn_id,
+                "status": "running",
+                "context_tokens": context_size.tokens,
+            },
+            RosterOnThread(stream.thread_id),
+        )
+
+
+def _log_completed_item(stream: TurnStream, log: TextIO, params: dict[str, object]) -> None:
+    item = _as_dict(params.get("item"))
+    _ = log.write(f"[{_now_stamp()}] {_describe_item(item)}\n")
+    log.flush()
+    if _as_str(item.get("type")) not in ("userMessage", "contextCompaction"):
+        stream.waiting_for_progress_after_overflow = False
+    if _as_str(item.get("type")) == "agentMessage":
+        text = _as_str(item.get("text"))
+        if text:
+            stream.final_answer = text
+
+
+def _on_turn_end(
+    stream: TurnStream, log: TextIO, method: str, params: dict[str, object],
+) -> StreamStep | FailedWithThread:
+    """Handle a completed or failed turn: resume, continue, retry, reply or finish."""
+    notice_turn = _as_str(_as_dict(params.get("turn")).get("id"))
+    account_move = _read_account_move(stream.session_dir, stream.name, stream.thread_id)
+    moved_turn = isinstance(account_move, AccountMoveMarker) and notice_turn == account_move.turn_id
+    if (stream.follow and notice_turn and stream.followed_turn and notice_turn != stream.followed_turn
+            and not moved_turn):
+        return StreamStep.NEXT_FRAME
+    # The followed turn has ended. A later turn names itself in its own
+    # `turn/started`; a thread read at this moment can still name this one.
+    if stream.follow:
+        stream.followed_turn = ""
+    turn_outcome = _turn_outcome(method, params)
+    if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
+            and (not notice_turn or notice_turn == account_move.turn_id)):
+        _resume_marked_account_move(stream, account_move)
+        return StreamStep.NEXT_FRAME
+    if _interrupted_for_held_work(method, params, stream.session_dir, stream.name, stream.thread_id):
+        turn_outcome = TurnCompleted()
+    if isinstance(turn_outcome, TurnFailed):
+        _record_turn_failure(stream, notice_turn, turn_outcome)
+    if isinstance(turn_outcome, TurnContextWindowExceeded):
+        return _continue_after_context_overflow(stream, log)
+    if isinstance(turn_outcome, TurnRefusedForCapacity):
+        return _on_capacity_refusal(stream, log)
+    stream.capacity_waited = 0.0
+    stream.capacity_retries = 0
+    stream.waiting_for_progress_after_overflow = False
+    if stream.resume_owed:
+        return _resume_owed_turn(stream, log, refused_for_capacity=False)
+    return _after_turn_end(stream, log, turn_outcome)
+
+
+def _record_turn_failure(stream: TurnStream, notice_turn: str, turn_outcome: TurnFailed) -> None:
+    """Report a quota refusal once per turn and keep the server a failure came from."""
+    serving = stream.client.serving
+    identity = (serving, stream.thread_id, notice_turn or stream.turn_id)
+    failed = FailedWithThread(stream.thread_id, turn_outcome.detail,
+        time.time() - stream.client.turn_submitted_at, serving)
+    if identity not in stream.reported_turns:
+        stream.reported_turns.add(identity)
+        if _quota_refused(failed, serving.started_here, False):
+            _owe_quota_continuation(stream.client, stream.thread_id)
+            _report_quota_refusal(stream.name, serving, turn_outcome.detail)
+            stream.pending_refusal = PendingQuotaRefusal(serving, turn_outcome.detail)
+    if not stream.followed_failure:
+        stream.failure_serving = serving
+
+
+def _continue_after_context_overflow(stream: TurnStream, log: TextIO) -> StreamStep:
+    """Start one continuation turn, or finish when the last one made no progress."""
+    if stream.waiting_for_progress_after_overflow:
+        stream.failure = (
+            "context window filled twice in a row without progress; "
+            "automatic continuation stopped"
+        )
+        _ = log.write(f"[{_now_stamp()}] {stream.failure}\n")
+        log.flush()
+        return StreamStep.FINISH
+    continuation = "Continue where you stopped."
+    _post_board_status(
+        stream.session_dir,
+        stream.name,
+        f'context window filled; sent "{continuation}"',
+    )
+    _ = log.write(
+        f"[{_now_stamp()}] context window filled; starting one continuation turn\n"
+    )
+    log.flush()
+    _adopt_started_turn(stream, _start_workers_turn(
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, continuation))
+    _ = _update_roster_if_expected(
+        stream.session_dir,
+        stream.name,
+        {"thread_id": stream.thread_id, "turn_id": stream.turn_id, "status": "running"},
+        RosterOnThread(stream.thread_id),
+    )
+    stream.waiting_for_progress_after_overflow = True
+    return StreamStep.NEXT_FRAME
+
+
+def _on_capacity_refusal(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithThread:
+    """Park queued messages and owe the task a resume turn, or stop once the budget is spent."""
+    stream.resume_owed = True
+    thread_id = stream.thread_id
+    _move_queue_to_pending(
+        stream.client, thread_id, lambda message: _add_pending(stream.session_dir, stream.name, thread_id, message))
+    remaining = CAPACITY_BUDGET_SECS - stream.capacity_waited
+    if remaining <= 0:
+        exhausted = CapacityRetriesExhausted(
+            stream.thread_id, stream.capacity_retries, int(CAPACITY_BUDGET_SECS / 60)
+        )
+        stream.run_outcome = exhausted
+        stream.failure = exhausted.message(stream.name)
+        _ = _update_roster_if_expected(
+            stream.session_dir,
+            stream.name,
+            {
+                "thread_id": stream.thread_id,
+                "status": CAPACITY_EXHAUSTED,
+            },
+            RosterOnThread(stream.thread_id),
+        )
+        return StreamStep.FINISH
+    # A queued peer message may already have opened a turn.
+    # Stream it, then return here with the task still owed.
+    with _pending_file(stream.session_dir, stream.name):
+        stopped = _capacity_launcher_stopped(stream, log)
+        if stopped is not None:
+            return stopped
+    if not isinstance(_read_known_turn(stream), ThreadIdle):
+        return StreamStep.NEXT_FRAME
+    return _resume_owed_turn(stream, log, refused_for_capacity=True)
+
+
+def _capacity_launcher_stopped(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
+    """The outcome when the run ended or another launcher took the thread; the caller holds the pending lock."""
+    if stream.end_marker.exists() or not _roster_still_on_thread(stream.session_dir, stream.name, stream.thread_id):
+        reason = "ended" if stream.end_marker.exists() else "replaced"
+        _ = log.write(f"[{_now_stamp()}] capacity launcher {reason}; no resume turn started\n")
+        log.flush()
+        return FailedWithThread(stream.thread_id, f"capacity launcher {reason}", time.time() - stream.opened,
+            pending_refusal=stream.pending_refusal, director=stream.director)
+    return None
+
+
+def _read_known_turn(stream: TurnStream) -> ThreadIdle | ThreadLive | ThreadActiveWithoutTurn:
+    """Read the thread's live turn; an unreadable thread stops the run."""
+    live = _read_live_turn(stream.client, stream.thread_id)
+    if isinstance(live, ThreadStateUnknown):
+        raise SystemExit(f"thread {stream.thread_id}: thread/read failed: {live.reason}")
+    return live
+
+
+def _resume_owed_turn(stream: TurnStream, log: TextIO, *, refused_for_capacity: bool) -> StreamStep | FailedWithThread:
+    """Start the turn a capacity refusal owes, after a backoff wait when a refusal just arrived."""
+    if refused_for_capacity and not _wait_out_capacity(stream, log):
+        return StreamStep.NEXT_FRAME
+    live = _read_known_turn(stream)
+    if not isinstance(live, ThreadIdle):
+        return _watch_turn_opened_while_owed(stream, log, live)
+    with _pending_file(stream.session_dir, stream.name):
+        stopped = _capacity_launcher_stopped(stream, log)
+        if stopped is not None:
+            return stopped
+    _adopt_started_turn(stream, _start_workers_turn(
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client,
+        "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
+    ))
+    stream.resume_owed = False
+    return StreamStep.NEXT_FRAME
+
+
+def _wait_out_capacity(stream: TurnStream, log: TextIO) -> bool:
+    """Mark the thread waiting and sleep one backoff; false when a turn opened meanwhile."""
+    remaining = CAPACITY_BUDGET_SECS - stream.capacity_waited
+    wait = min(CAPACITY_WAIT_SECS * 2.0 ** stream.capacity_retries,
+               CAPACITY_MAX_WAIT_SECS, remaining)
+    stream.capacity_retries += 1
+    with _pending_file(stream.session_dir, stream.name):
+        _ = _update_roster_if_expected(
+            stream.session_dir,
+            stream.name,
+            {
+                "thread_id": stream.thread_id,
+                "status": WAITING_CAPACITY,
+                "launcher_pid": os.getpid(),
+            },
+            RosterOnThread(stream.thread_id),
+        )
+    if not isinstance(_read_known_turn(stream), ThreadIdle):
+        return False
+    next_at = datetime.now().astimezone().timestamp() + wait
+    next_stamp = datetime.fromtimestamp(next_at).astimezone().isoformat(timespec="seconds")
+    _ = log.write(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] capacity retry {stream.capacity_retries}: next turn at {next_stamp}\n")
+    log.flush()
+    wait_started = _capacity_clock()
+    _capacity_sleep(wait)
+    stream.capacity_waited += max(wait, _capacity_clock() - wait_started)
+    return True
+
+
+def _watch_turn_opened_while_owed(
+    stream: TurnStream, log: TextIO, live: ThreadLive | ThreadActiveWithoutTurn,
+) -> StreamStep | FailedWithThread:
+    """Watch a turn a queued message opened, keeping the resume turn owed."""
+    stream.turn_id = live.turn_id if isinstance(live, ThreadLive) else ""
+    with _pending_file(stream.session_dir, stream.name):
+        stopped = _capacity_launcher_stopped(stream, log)
+        if stopped is not None:
+            return stopped
+        if stream.turn_id:
+            _ = _update_roster_if_expected(
+                stream.session_dir,
+                stream.name,
+                {
+                    "thread_id": stream.thread_id,
+                    "turn_id": stream.turn_id,
+                    "status": "running",
+                },
+                RosterOnThread(stream.thread_id),
+            )
+        else:
+            _ = _update_roster_if_expected(
+                stream.session_dir,
+                stream.name,
+                {
+                    "thread_id": stream.thread_id,
+                    "status": "starting",
+                    "launcher_pid": os.getpid(),
+                },
+                RosterOnThread(stream.thread_id),
+            )
+    return StreamStep.NEXT_FRAME
+
+
+def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) -> StreamStep:
+    """Deliver a resident's reply, then move the worker or wait for the work still owed."""
+    quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
+    if (stream.follow and not stream.resident and isinstance(turn_outcome, TurnFailed)
+            and not stream.followed_failure and not quota_owed):
+        stream.followed_failure = turn_outcome.detail
+    stream.failure = stream.followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
+    if stream.resident:
+        stream.replies += 1
+        _deliver_reply(stream.name, stream.replies, stream.final_answer, stream.failure,
+                       stream.summary_path, stream.reply_path, log)
+        stream.final_answer = ""
+        stream.failure = ""
+        if stream.end_marker.exists():
+            return StreamStep.FINISH
+    with _pending_file(stream.session_dir, stream.name) as handle:
+        held_messages = bool(_pending_for_thread(handle, stream.thread_id))
+    owed = _continuation_is_owed(stream.session_dir, stream.name)
+    if stream.resident or held_messages or owed:
+        moved = _move_worker(stream)
+        if isinstance(moved, WorkerThreadStateUnknown):
+            if stream.resident:
+                _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} cannot move: {moved.reason}; waiting\n")
+                log.flush()
+                return StreamStep.NEXT_FRAME
+            _hold_messages_for_next_launch(stream, log, moved.reason)
+            return StreamStep.FINISH
+        if isinstance(moved, MovedWorker) and _adopt_moved_worker(stream, moved):
+            return StreamStep.NEXT_FRAME
+        if owed and isinstance(moved, WorkerWaitingOnLiveTurn):
+            time.sleep(RESIDENT_POLL_SECS)
+            return StreamStep.NEXT_FRAME
+    if not stream.resident:
+        return _finish_one_turn_launch(stream, log)
+    _ = _update_roster_if_expected(
+        stream.session_dir,
+        stream.name,
+        {"thread_id": stream.thread_id, "turn_id": stream.turn_id, "status": "running"},
+        RosterOnThread(stream.thread_id),
+    )
+    return StreamStep.FINISH if stream.end_marker.exists() else StreamStep.NEXT_FRAME
+
+
+def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
+    """Finish a one-turn launcher unless more work is coming to its thread."""
+    # A finished turn may have a peer turn opening behind it.
+    if _more_work_coming(stream.client, stream.thread_id, stream.deadline):
+        return StreamStep.NEXT_FRAME
+    if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id):
+        return StreamStep.FINISH
+    # The turn ended on a run still going: stay attached until its result is held.
+    if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id):
+        return StreamStep.NEXT_FRAME
+    moved = _move_worker(stream)
+    if isinstance(moved, WorkerThreadStateUnknown):
+        _hold_messages_for_next_launch(stream, log, moved.reason)
+        return StreamStep.FINISH
+    if isinstance(moved, MovedWorker):
+        _ = _adopt_moved_worker(stream, moved)
+    return StreamStep.NEXT_FRAME
+
+
+def _finish_stream(stream: TurnStream) -> RunOutcome:
+    """End the watch: close an unwatched turn, write the summary and settle the roster."""
+    if (not stream.failure and isinstance(stream.pending_refusal, PendingQuotaRefusal)
+            and _continuation_is_owed(stream.session_dir, stream.name)):
+        stream.failure = stream.pending_refusal.detail
+    # A queued peer message can open a turn after the last completion
+    # notification. Check once more before this launcher stops watching.
+    if not stream.resident or stream.failure or stream.end_marker.exists():
+        _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
+    if not stream.resident or stream.replies == 0:
+        _finish_summary(stream.summary_path, stream.reply_path, stream.name, stream.replies + 1,
+                        stream.final_answer or stream.failure or f"The delegate {stream.name} produced no summary.")
+    if isinstance(stream.run_outcome, CapacityRetriesExhausted):
+        return replace(stream.run_outcome, pending_refusal=stream.pending_refusal, director=stream.director)
+    _ = _update_roster_if_expected(
+        stream.session_dir,
+        stream.name,
+        {"thread_id": stream.thread_id, "status": "failed" if stream.failure else "done"},
+        RosterOnThread(stream.thread_id),
+    )
+    return FailedWithThread(stream.thread_id, stream.failure, time.time() - stream.opened, stream.failure_serving,
+                            isinstance(stream.pending_refusal, PendingQuotaRefusal), True,
+                            pending_refusal=stream.pending_refusal, director=stream.director) if stream.failure else RunCompleted()
+
+
+def _fail_stream(stream: TurnStream, exc: ConnectionError | OSError | SystemExit) -> FailedWithThread:
+    """Record a run that stopped on an error after its thread existed."""
+    # Once thread/start returned, even a disconnected turn/start may have
+    # begun work. Keep its id and never resubmit the original prompt.
+    if isinstance(exc, WorkerQuotaRecoveryStopped):
+        stream.port, stream.thread_id = exc.port, exc.thread_id
+    elif isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
+        stream.port = exc.cleanup.port
+        stream.thread_id = exc.cleanup.thread_id
+    _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
+    failure = str(exc) or exc.__class__.__name__
+    _ = _update_roster_if_expected(
+        stream.session_dir,
+        stream.name,
+        {"thread_id": stream.thread_id, "status": "failed"},
+        RosterOnThread(stream.thread_id),
+    )
+    serving = exc.serving if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else stream.client.serving
+    reported = exc.reported if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else False
+    if reported:
+        stream.pending_refusal = PendingQuotaRefusal(serving, failure)
+    return FailedWithThread(stream.thread_id, failure, time.time() - stream.opened, serving,
+                            isinstance(stream.pending_refusal, PendingQuotaRefusal), True,
+                            pending_refusal=stream.pending_refusal, director=stream.director)
 
 
 @dataclass(frozen=True)
