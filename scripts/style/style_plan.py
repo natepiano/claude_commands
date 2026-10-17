@@ -502,6 +502,10 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
            + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
            + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
            + "binding; it is no collision unless that inner block also reads the renamed binding. "
+           + "A parameter with a single-letter name, such as `x` and `y` in `Position::new(x, y)`, "
+           + "gives no name to match: report no finding for it. "
+           + "A binding placed as one element of an array or slice literal (`&[item]`) "
+           + "does not fill the collection parameter: its name names one element. "
            + "The rule renames a binding that already exists: report no finding whose fix only adds a binding, "
            + "whether it names an inline expression, literal, array or field projection, "
            + "or adds a scoped alias that keeps the old name."]
