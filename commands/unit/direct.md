@@ -1527,7 +1527,8 @@ PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,
 leaves the new rule's cell stale until a later ticket.
 
 The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
-worktree. Run it again at <CheckpointCommit/> step 6 before staging. Coverage
+worktree. Run it again at <CheckpointCommit/> step 6 before staging. The gate and
+`ticket checkpoint` refuse unjudged owned cells, naming each one. Coverage
 selection runs the mechanical filter at the ticket's recorded base; an approved
 proposal permits only files of its approved findings. Exit 1 retains the
 reservation and returns to repair. Exit 0 permits committing exactly that tree,

@@ -171,7 +171,7 @@ Pending: parent's saved style child summary and rendered style line.
   count descending and crate name. No-structure crates follow in their previous
   order; other families and pilot scope filtering keep their behavior. Counts
   come from the existing cells traversal, without another ledger read.
-- **Fix C — ticket merges wake units waiting for sync** (commit `pending`):
+- **Fix C — ticket merges wake units waiting for sync** (commit `87a22ef5`):
   names-unit stayed blocked after cargo-handler's structure ticket merged and
   needed the hand wake recorded above; types-unit also needed a hand wake
   about two minutes after modules-unit-4 merged, after waiting about 73 minutes.
@@ -188,15 +188,18 @@ Pending: parent's saved style child summary and rendered style line.
   modules-unit-4 (cargo-port structure, 10 rules) recorded verdicts for seven;
   `ticket merge` accepted it and refill reissued the other three as
   modules-unit-5 at 13:42:52Z. Cargo-port stayed closed to types-unit, which
-  returned exit 3 again after its 09:44 EDT wake. The gate and checkpoint will
-  refuse a ticket with unjudged cells and name them.
+  returned exit 3 again after its 09:44 EDT wake. The ledger now lists a ticket's
+  owned cells with no verdict under it; the gate and `ticket checkpoint` refuse
+  while any remain, naming each one. A ticket that drops a file on a conflict
+  records it with `ticket yield`, which clears its verdicts and unfiled held
+  findings there and leaves the file's cells for later work.
 - **Fix E — tier and family** (commit `pending`):
   `rules.py` makes a local tier A or E rule impossible: local requires a family,
   while A and E forbid one. A types-family tier D rule was also classified,
   though tier D belongs to modules alone. Settled with cargo-liner's style
   showrunner: E1 requires a family for B, C and D and forbids it for A and E,
-  whatever the origin. E2 refuses tier D outside modules; it is held until
-  cargo-liner re-tiers trait-tutorial-format as E.
+  whatever the origin (E1 commit `202614d8`). E2 refuses tier D outside modules;
+  it is held until cargo-liner re-tiers trait-tutorial-format as E.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`.
 Live verification of the fixes and subsequent measurements remain pending.

@@ -138,6 +138,14 @@ class StandingCheckpointTests(unittest.TestCase):
         command = shlex.split(match[1])
         return self.cli("style_plan.py", *command[2:])
 
+    def record_ticket_verdicts(self, ticket: style_ledger.TicketRecord) -> None:
+        head = self.git(self.unit, "rev-parse", "HEAD")
+        for rule in ticket["rules"]:
+            for path in ticket["files"]:
+                result = self.cli("style_ledger.py", "record", "--repo", str(self.unit), "--rule", rule,
+                                  "--path", path, "--commit", head, "--verdict", "clean", "--ticket", ticket["id"], "--worker", "test")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_approved_non_mechanical_work_passes_both_gates_and_reaches_checkpoint(self) -> None:
         # The ordinary case below exercises the same literal edit through the coverage gate.
         issue = self.root / "issues/approved.md"
@@ -178,6 +186,7 @@ class StandingCheckpointTests(unittest.TestCase):
         path = ticket["files"][0]
         source = self.unit / path
         _ = source.write_text(source.read_text().replace("value", "count"))
+        self.record_ticket_verdicts(ticket)
         gate = self.gate()
         self.assertEqual((gate.returncode, gate.stdout), (0, "mechanical\n"), gate.stderr)
         # Retain the status columns while extracting the code paths to stage.
@@ -246,6 +255,7 @@ class StandingCheckpointTests(unittest.TestCase):
         self.assertEqual(self.git(self.unit, "rev-parse", "HEAD"), ticket["base"])
         path = self.unit / ticket["files"][0]
         _ = path.write_text(path.read_text().replace("    1\n", "    2\n"))
+        self.record_ticket_verdicts(ticket)
         result = self.gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("review: check 6:", result.stdout)

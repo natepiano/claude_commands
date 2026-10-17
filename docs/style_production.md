@@ -72,6 +72,7 @@ the checkpoint procedure's atomic committed-awaiting-release record using that
 ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
 refill at once. If ancestry fails, leave the ticket assigned and report it.
+The gate and `ticket checkpoint` refuse any ticket with owned cells unjudged and name each one.
 
 Refill only the unit worktree's own plan copy:
 
@@ -295,6 +296,9 @@ checkpointing and record the new fingerprint. On a conflict or berth overlap,
 drop every finding touching that file, including all its edits in other files;
 a multi-file rename is dropped as a whole. Release reservations no remaining
 finding touches, rerun the gate, and leave dropped cells stale for later work.
+Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
+--id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
+findings on it, leaving its cells for later work.
 Style units obey build holds and memory admission like any unit.
 
 ## Big changes
