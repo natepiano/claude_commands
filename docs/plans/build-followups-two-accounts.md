@@ -1654,3 +1654,86 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - The reason is typed; nothing matches the `quota_problem` text.
 
 **Ruled out:** waking or refreshing the token from the pass; inferring 100% remaining from a passed reset; detecting the skip from its problem text.
+
+### Phase 58 — Only the head of a group's next list runs  · status: done
+
+**Depends on:** Phase 57
+
+#### Work Order
+
+**Goal:** the next-moves runner follows the user's design: "if there is something to do next, that's all you do and doing it removes it from the list". On 2026-10-17 at 11:49 EDT the showrunners moved claude1 → claude2, skipping the queued claude4 step: claude4 had no fresh reading (last read 23:43 EDT 10-16), its entry hit a silent `continue` in `_run_auto_moves_locked`, and the next entry for the same group fired. Fallback rules apply only when a group has nothing next.
+
+**Constraints from prior phases:** `refusal_watch._run_auto_moves_locked` (`scripts/accounts/refusal_watch.py`, ~817–935) applies Claude group entries (`next_moves.ClaudeGroupMove`, read as `AutoMoveRule` by `read_auto_move_rules`) after the refusal pass in `_run` (~493–800); `_run`'s refusal pass moves a refused group through `accounts.placement` and `accounts.set_group_account` (~650–735). Holds live in `refusal_watch.json` `auto_move_holds[entry id]` (`HoldStarted(account, at, move_id, percent)`). A recorded group choice consumes its entry under the log lock; recorded `auto: <id>` history guards a second move. Workers entries (`WorkersMove`) run in `quota_alert.py` and are outside this phase. The no-room notice goes through `_notify_no_room` → `quota_alert.deliver_and_record(... quota_alert.recipients(config))`, deduplicated by a fingerprint in watch state `notices`. Tests never touch live directories, never run ssh, and never read a real keychain, process or credential file.
+
+**Spec:** settled by the showrunner on 2026-10-17:
+
+1. **Only the head is eligible.** Per group, only the first entry for that group in `next list` order is considered. A later entry for the same group starts no hold, is never tried, and any hold already stored for it is dropped, until the head has run and its entry is removed. After the head's move is recorded and its entry removed, the next entry becomes the head and starts its own hold on a later pass.
+2. **A pending head blocks fallbacks.** While a group has a next entry, no fallback moves that group: the refusal pass in `_run` does not choose or select an account for it (no `placement`, no `set_group_account`, no member move, no `no room` record for that group). Completing off-target members onto the group's already-selected account is not a fallback and still runs. A group with no next entry keeps today's refusal behavior.
+3. **A due head that cannot run is reported, and nothing moves.** The head is due when its source reading is fresh and at or below its percent and its hold has elapsed (or its hold is 0). When it is due but cannot run — target has no fresh reading (stale or missing), target not logged in or unreadable, target at or below the threshold, target holds an unresolved refusal, or `prepared_account` refuses — nothing moves for that group, and the runner tells the showrunners once through the existing delivery (`quota_alert.deliver_and_record` to `quota_alert.recipients(config)`, as `_notify_no_room` does) with the entry and its typed reason, e.g. `showrunners → claude4 due, claude4 has no fresh reading since 23:43` (time in the user zone; `no reading` when none was ever stored). It repeats only when the reason changes (dedupe key per entry id in watch state; a reason change or the entry's removal clears it). A shutdown in progress for the group is a wait, not a report. The reason is a typed value (one variant per cause above), rendered to text only at delivery. `--dry-run` sends nothing and writes no state; it prints the line it would send.
+5. **The workers queue follows the same rule** (showrunner, 2026-10-17: "the user's rule covers every next list"). In `quota_alert.py`'s workers next-move pass (~1016), only the first `WorkersMove` in list order is eligible; a later one is never tried until the head has run and been removed. A due head (owner's fresh weekly at or below its percent) that cannot run — target not set up or not logged in, no fresh reading, no room above the threshold, an unresolved refusal, or a refused swap — moves nothing, and the showrunners are told once per reason as in rule 3. While a workers entry is queued, the low-quota default move does not move the workers; the provider-refusal and credits-off moves are fallbacks under rule 2 and wait too.
+4. **Leave live state alone.** The showrunners' live queue still holds `→ claude4 (hold 40)`; the phase changes no live file.
+
+Update `docs/accounts.md` (the next-moves and refusal paragraphs that say "A refusal or a next-move entry moves the group" and "tries entries in list order") and `commands/next_moves.md` line 15 to state rules 1–3 in one or two sentences each.
+
+**Files:**
+- `scripts/accounts/refusal_watch.py` — head-only selection, fallback block in the refusal pass, typed blocked-head reason and its once-per-reason notice.
+- `scripts/accounts/test_refusal_watch.py` — regressions below.
+- `scripts/whoami/quota_alert.py` — head-only workers pass, workers fallback block, blocked-head notice.
+- `scripts/whoami/test_quota_alert.py` — workers regressions: a stale head target leaves a later workers entry untried; a refusal with a queued workers entry makes no fallback swap; the head runs, is removed, then the next becomes eligible.
+- `docs/accounts.md`, `commands/next_moves.md` — rules 1–3 and 5.
+
+**Workers:** impl owns `scripts/accounts/refusal_watch.py`, `scripts/whoami/quota_alert.py`, `docs/accounts.md`, `commands/next_moves.md`; test owns `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`.
+
+**Tests (each fails on the pre-phase tree):**
+- today's case: showrunners on claude1 at or below the head's percent with its hold elapsed, head `→ claude4` whose reading is stale, second entry `→ claude2` with fresh room: no move, the second entry still in the log, no hold stored for it, and one notice naming claude4 and its last read time; a second pass with the same reason sends no second notice, a changed reason sends one;
+- a refused source with a pending head: the refusal pass moves nothing for that group (no `set_group_account`, no member move, no `no room`), while a group with no entry still moves on refusal;
+- the head runs and is removed, and only then does the second entry start its hold (on the next pass, from that pass's time).
+
+**Verification:** from the worktree root, in a scratch HOME: `python3 -m unittest scripts.accounts.test_refusal_watch scripts.accounts.test_next_moves scripts.accounts.test_refusals scripts.whoami.test_quota_alert`; basedpyright on every changed Python file reports 0 errors and 0 warnings.
+
+**Acceptance gate:** the three regressions pass and fail on the pre-phase tree; the phase suites and the merge gate (`merge_gate --tests-only`) pass on natedev; the Mac suites pass.
+
+### Phase 59 — The next list is numbered per group  · status: todo
+
+**Depends on:** Phase 58
+
+#### Work Order
+
+**Goal:** the user changes the next list by position, never by id (user, 2026-10-17, via the showrunner).
+
+**Spec:** `accounts.py next list` prints one section per group, in the order showrunners, units, workers; each entry carries its position in that group's sequence, 1 being the step that runs next (Phase 58's head), e.g. `showrunners 1: at 1% on claude4 → claude2, hold 40 min`. `next move <group> <n> <m>` moves entry n to position m; `next remove <group> <n>` drops entry n; `next add <group> … --at <n>` inserts at position n (default: last). Positions are per group; the stored log keeps one ordered list, and a change in one group never reorders another. Ids stay internal and are never printed or accepted. Out-of-range positions are refused with one line naming the group's size. Changes on the Mac go to natedev as today. `/next_moves` (`commands/next_moves.md`) translates "swap showrunners 1 and 2", "drop units 2" and similar into these forms and prints the list after every change; `docs/accounts.md` states the forms.
+
+**Files:**
+- `scripts/accounts/next_moves.py` — positional move, remove and insert per group.
+- `scripts/accounts/accounts.py` — `next list|move|remove|add --at` CLI.
+- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_accounts.py` — tests.
+- `commands/next_moves.md`, `docs/accounts.md` — the forms.
+
+**Workers:** impl owns `next_moves.py`, `accounts.py` and the docs; test owns the two test files.
+
+**Verification:** in a scratch HOME, `python3 -m unittest scripts.accounts.test_next_moves scripts.accounts.test_accounts scripts.accounts.test_refusal_watch`; basedpyright 0 errors, 0 warnings on changed Python files.
+
+**Acceptance gate:** grouped numbered listing; move, remove and insert by position, each leaving other groups' order unchanged; ids never printed; merge gate and Mac suites pass.
+
+### Phase 60 — A half-point hold from pace history  · status: todo · gated by G4
+
+**Depends on:** Phase 59
+
+**Blocked by:** G4 — model-study's run-out pace fix (a8ff96e8, "run-out pace skips an account waiting its turn") merged into build-followups.
+
+#### Work Order
+
+**Goal:** the user's rule is to stay on an account at 1% until about half a point more is used, judged by pace history, not a typed minute count (user, 2026-10-17, via the showrunner).
+
+**Spec:** `next add <group> … --hold half-point` stores a typed hold mode (`FixedHold(minutes) | HalfPointHold`); `--hold-minutes N` still stores a fixed hold. When a `HalfPointHold` head's hold starts (Phase 58), the runner computes its minutes once from `scripts/whoami/run_out.py`'s weighted pace for that group on that account (minutes to use 0.5 point) and stores them with the hold; later readings never change a started hold. With no usable pace history it falls back to a stated default and says so in the list. `next list` shows a half-point entry's minutes as it would compute them now (`hold half a point (≈40 min)`). After this lands and is promoted, convert the live entries the showrunner named (showrunners claude4 → claude2, claude2 → claude3; units claude2 → claude3) to `--hold half-point`, in place, keeping their order.
+
+**Files:**
+- `scripts/accounts/next_moves.py`, `scripts/accounts/accounts.py`, `scripts/accounts/refusal_watch.py` — hold mode, CLI, hold start.
+- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_accounts.py` — tests.
+- `commands/next_moves.md`, `docs/accounts.md` — the hold mode.
+
+**Workers:** impl owns production and docs; test owns test files.
+
+**Verification:** scratch-HOME suites `scripts.accounts.test_next_moves scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.whoami.test_run_out`; basedpyright clean.
+
+**Acceptance gate:** a half-point hold's minutes come from the pace at hold start and stay fixed; fixed holds unchanged; the list shows the would-be minutes; merge gate and Mac suites pass.
