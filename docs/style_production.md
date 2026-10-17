@@ -249,9 +249,10 @@ as for a unit checkpoint, then runs
 The child must be attached, the checkpoint on its merge branch and descended
 from its last merged hand-off. The subject is
 `Merge <style slug> hand-off (<hash7>) into <branch point>`.
-After pushing, notifying sync and promoting, the attached receiver sends
+After pushing, notifying sync and promoting, the attached receiver records the
+hand-off as merged in the style ledger with its merge commit, then sends
 `From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
-On acknowledgment run
+The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
 ancestry on the branch point is the evidence. The receiver decides delivery
 state once. A local merge missing from origin is pushed, notified and promoted
