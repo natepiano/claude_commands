@@ -110,6 +110,10 @@ class StyleSyncTests(unittest.TestCase):
         return code, output.getvalue()
 
     def checkpoint_for_wake(self, *, on_style_branch: bool = True) -> None:
+        rule = "global:rust/read-modules.md"
+        _ = (self.root / "nate_style/rust/read-modules.md").write_text(
+            "---\ntier: C\nfamily: modules\ninput_scope: file\n---\n# Modules\nReview module names.\n"
+        )
         _ = self.git("branch", "style/main")
         if not on_style_branch:
             _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
@@ -118,8 +122,10 @@ class StyleSyncTests(unittest.TestCase):
         with style_ledger.open_ledger(self.repo) as ledger:
             ledger.set_tip(self.tip, "style/main")
             ledger.ticket_add("modules-unit-1", "modules-unit", "read", "modules", ".",
-                              ["src/lib.rs"], ["global:rust/clippy.md"])
+                              ["src/lib.rs"], [rule])
             ledger.ticket_assign("modules-unit-1", "main")
+            blob = ledger.pinned_rule_texts("modules-unit-1")[0].blob
+            ledger.record(rule, "src/lib.rs", checkpoint, blob, "clean", ticket="modules-unit-1", worker="test")
             ledger.ticket_checkpoint("modules-unit-1", checkpoint)
 
     def waiting_units(self, *units: str) -> None:

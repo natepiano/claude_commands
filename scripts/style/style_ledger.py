@@ -262,6 +262,12 @@ class TicketRecord(TypedDict):
 
 
 @dataclass(frozen=True)
+class UnjudgedTicketCell:
+    rule: str
+    path: str
+
+
+@dataclass(frozen=True)
 class PinnedRuleText:
     rule_id: str
     blob: str
@@ -498,6 +504,12 @@ MIGRATIONS = {
     7: """
         CREATE TABLE sync_waits (unit TEXT PRIMARY KEY, since TEXT NOT NULL, token TEXT NOT NULL);
     """,
+    8: """
+        CREATE TABLE ticket_yields (
+            ticket TEXT NOT NULL, path TEXT NOT NULL, recorded_at TEXT NOT NULL,
+            PRIMARY KEY(ticket, path)
+        );
+    """,
 }
 
 
@@ -710,6 +722,40 @@ class Ledger:
         highest = max((int(row[0].removeprefix(unit + "-")) for row in rows), default=0)
         return f"{unit}-{highest + 1}"
 
+    def unjudged_ticket_cells(self, id: str) -> tuple[UnjudgedTicketCell, ...]:
+        ticket = self._ticket(id)
+        if ticket["kind"] == "proposal":
+            return ()
+        paths = [ticket["crate"]] if ticket["kind"] == "structure" else ticket["files"]
+        rules = [ticket["rule"]] if ticket["kind"] == "listed" else ticket["rules"]
+        judged = set(cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT rule,path FROM judgments WHERE ticket=?", (id,),
+        ).fetchall()))
+        yielded = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
+            "SELECT path FROM ticket_yields WHERE ticket=?", (id,),
+        ).fetchall())}
+        owned = {(rule, path) for rule in rules for path in paths if path not in yielded}
+        return tuple(UnjudgedTicketCell(rule, path) for rule, path in sorted(owned - judged))
+
+    def ticket_yield(self, id: str, path: str) -> None:
+        path = self._path(path)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["state"] != "assigned":
+                raise LedgerError(f"{id}: cannot yield from {ticket['state']}")
+            if ticket["kind"] in ("structure", "proposal"):
+                raise LedgerError(f"{id}: cannot yield a {ticket['kind']} ticket")
+            if path not in ticket["files"]:
+                raise LedgerError(f"{id}: {path} is not in ticket files")
+            if self._connection.execute("SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (id, path)).fetchone():
+                return
+            _ = self._connection.execute("DELETE FROM judgments WHERE ticket=? AND path=?", (id, path))
+            _ = self._connection.execute(
+                "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
+            )
+            _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
+
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> None:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -724,6 +770,10 @@ class Ledger:
             predecessor = {"assigned": "queued", "checkpointed": "assigned", "merged": "checkpointed"}
             if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
                 raise LedgerError(f"{id}: cannot become {target} from {state}")
+            if target == "checkpointed":
+                missing = self.unjudged_ticket_cells(id)
+                if missing:
+                    raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
             if target == "assigned":
                 active = self.ticket_open(ticket["unit"])
                 if active:
@@ -1222,6 +1272,11 @@ class Ledger:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
         fingerprint = self._fingerprint(tip, scope, path)
         with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            if ticket and self._connection.execute(
+                "SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket, path),
+            ).fetchone():
+                raise LedgerError(f"{ticket}: {path} was yielded")
             _ = self._connection.execute(
                 'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
                 + 'VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
@@ -1507,7 +1562,7 @@ def main() -> None:
     for command in (record, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
-        ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open")),
+        ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "file", "waive", "list")),
@@ -1534,6 +1589,8 @@ def main() -> None:
                     _ = command.add_argument("--branch", required=True)
                 elif action == "checkpoint":
                     _ = command.add_argument("--commit", required=True)
+                elif action == "yield":
+                    _ = command.add_argument("--path", required=True)
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
@@ -1597,6 +1654,8 @@ def main() -> None:
                         _wake_sync_waiters(ledger.repo, args.id)
                 elif args.action == "drop":
                     ledger.ticket_drop(args.id)
+                elif args.action == "yield":
+                    ledger.ticket_yield(args.id, args.path)
                 else:
                     for ticket in ledger.ticket_open(args.unit):
                         print(json.dumps(ticket, sort_keys=True))

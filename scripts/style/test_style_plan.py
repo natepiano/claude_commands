@@ -588,6 +588,9 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.sync_wait_rows(), expected)
         self.assertEqual(self.run_next()[0], 0)
         ticket = self.ledger().ticket_open("names-unit")[0]
+        for rule in ticket["rules"]:
+            for path in ticket["files"]:
+                self.record(rule, path, self.tip, ticket["id"])
         self.ledger().ticket_checkpoint(ticket["id"], self.tip)
         self.seed_sync_wait()
         self.assertEqual(self.run_next()[0], 5)
@@ -850,10 +853,64 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"]), ("proposal", str(issue), [self.sources[0]]))
         self.assertEqual(frontmatter(issue)["stage"], ["active"])
 
+    def test_structure_gate_names_unjudged_cells_before_running_the_footprint_check(self) -> None:
+        first = self.rule("structure-first", "tier: D\nfamily: modules\n")
+        last = self.rule("structure-last", "tier: D\nfamily: modules\n")
+        self.sync()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha", [], [last, first])
+            ledger.ticket_assign("modules-unit-1", "style/main")
+            _ = ledger.ticket_base("modules-unit-1")
+        self.record(first, "crates/alpha", self.tip, "modules-unit-1")
+        output = io.StringIO()
+        with (style_ledger.open_ledger(self.repo) as ledger,
+              mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint,
+              redirect_stdout(output)):
+            self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 1)
+            footprint.assert_not_called()
+        self.assertEqual(output.getvalue(), f"unjudged: {last} crates/alpha\n")
+
+        self.record(last, "crates/alpha", self.tip, "modules-unit-1")
+        with (style_ledger.open_ledger(self.repo) as ledger,
+              mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
+            self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 0)
+            footprint.assert_called_once()
+        arguments = cast(list[str], footprint.call_args.args[0])
+        self.assertIn("style_footprint.py", arguments[1])
+        self.assertEqual(arguments[arguments.index("--base") + 1], self.tip)
+
+    def test_read_gate_allows_a_yielded_file_while_checking_the_remaining_owned_cells(self) -> None:
+        first, last = self.rule("read-first"), self.rule("read-last")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [first, last])
+        ledger.ticket_assign("names-unit-1", "style/main")
+        _ = ledger.ticket_base("names-unit-1")
+        before = {(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}
+        for rule in (first, last):
+            for path in self.sources[:2]:
+                self.record(rule, path, self.tip, "names-unit-1")
+        ledger.ticket_yield("names-unit-1", self.sources[0])
+        self.assertEqual({(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}, before)
+        with (mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
+            self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
+            footprint.assert_called_once()
+        with style_ledger.open_ledger(self.repo) as reopened:
+            reopened.ticket_checkpoint("names-unit-1", self.tip)
+            self.assertEqual(reopened.ticket_open("names-unit")[0]["state"], "checkpointed")
+
     def test_coverage_gate_uses_the_base_exposed_by_ticket_origin(self) -> None:
         _ = self.rule("read")
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        for rule in ticket["rules"]:
+            for path in ticket["files"]:
+                self.record(rule, path, self.tip, ticket["id"])
         origin = style_ledger.SelectedByCoverage("base-from-origin")
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
@@ -907,6 +964,10 @@ class StylePlanTests(unittest.TestCase):
             with self.subTest(state=state):
                 _ = self.plan.write_text(current.replace("### Phase 2", finished + "### Phase 2"))
                 if state == "checkpointed":
+                    ticket = ledger.ticket_open("names-unit")[0]
+                    for rule in ticket["rules"]:
+                        for path in ticket["files"]:
+                            self.record(rule, path, self.tip, ticket["id"])
                     ledger.ticket_checkpoint("names-unit-2", self.tip)
                 with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
                     code, output, errors = self.run_next()
@@ -951,13 +1012,14 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.run_next()[0], 0)
         ledger = self.ledger()
         ticket = ledger.ticket_open("names-unit")[0]
+        for rule in ticket["rules"]:
+            for path in ticket["files"]:
+                self.record(rule, path, self.tip, ticket["id"])
         ledger.ticket_checkpoint(ticket["id"], self.tip)
         before = self.plan.read_bytes()
         with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
             self.assertEqual(self.run_next(), (5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
-        for path in ticket["files"]:
-            self.record(ticket["rules"][0], path, self.tip, ticket["id"])
         ledger.ticket_merge(ticket["id"])
         code, output, errors = self.run_next()
         self.assertEqual((code, errors), (0, ""))

@@ -137,6 +137,11 @@ def gate(repo: Path, ticket_id: str) -> int:
         with style_ledger.open_ledger(repo) as ledger:
             origin = ledger.ticket_origin(ticket_id)
             if isinstance(origin, style_ledger.SelectedByCoverage):
+                missing = ledger.unjudged_ticket_cells(ticket_id)
+                if missing:
+                    for cell in missing:
+                        print(f"unjudged: {cell.rule} {cell.path}")
+                    return 1
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", origin.base, "--worktree"], check=False)
                 return 0 if result.returncode == 0 else 1
