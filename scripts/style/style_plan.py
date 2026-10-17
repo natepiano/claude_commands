@@ -493,13 +493,18 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *(["A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
            + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
            + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
+           + "A method that takes arguments or looks up another value (`target.local_upstream(root)`) "
+           + "is no accessor: its result is another value. "
            + "A binding fills several parameters only when that same value fills them: "
            + "a value derived from it (`dir.join(\"config\")`) is another value, "
            + "and a later binding of the same name, as in a second loop, is another binding. "
            + "A call inside a macro's arguments counts, and an enum tuple variant wrapping the binding "
            + "(`Pane::App(id)`) passes through like a conversion. A binding of the same name declared "
            + "later in an inner block, such as a loop or closure body, would only shadow the renamed "
-           + "binding; it is no collision."]
+           + "binding; it is no collision unless that inner block also reads the renamed binding. "
+           + "The rule renames a binding that already exists: report no finding whose fix only adds a binding, "
+           + "whether it names an inline expression, literal, array or field projection, "
+           + "or adds a scoped alias that keeps the old name."]
           if any(PurePosixPath(pinned.rule_id.removesuffix("#uncovered")).name
                  == "name-bindings-to-match-parameters.md" for pinned in texts) else []),
         *([
