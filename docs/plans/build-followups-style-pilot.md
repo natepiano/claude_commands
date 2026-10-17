@@ -409,6 +409,24 @@ Pending: parent's saved style child summary and rendered style line.
   for structure only when every cell they have left is on a closed file.
   The modules unit's own selection is unchanged.
 
+- **Name-bindings rerun:** 120 cargo-liner files in six groups of 20, read
+  in fix O's windows. For each group, one blind judge held the rule alone and
+  another held the rule, fix R's conversion line and the trace. The traced
+  pass caught 34 of the 38 in-scope one-rule findings (89.5%), under the 95%
+  bar, and found many sites the one-rule pass missed. Out of scope, as for
+  the first pass: a binding that fills differently named parameters, a
+  general-purpose library parameter (`Path::join(path)`, `fs::write(path)`,
+  `Write::write_all(buf)`), a name already bound in the scope, a conversion
+  that ends in a struct field or return value, a value built from the
+  binding (a `format!` message, an enum variant holding it), and one element
+  filling a plural collection parameter. Fix R took for `From`, `into` and
+  `map_or`; the four losses are two other gaps. Two are conversions the judge
+  did not pass through: an accessor (`temp.path()`) and a method that returns
+  the value in another form (`.to_local_def_id()`). Two are bindings dropped
+  as filling several parameters when they fill one: a second loop that binds
+  the same name, and a value derived from the binding
+  (`directory.path().join("config")`). Fix S states both in the ticket.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
