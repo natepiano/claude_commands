@@ -204,8 +204,32 @@ buildlog_finish_memory() {
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
 
+# Record both streams without putting stderr into a JSON consumer's stdout.
+run_json_stdout() (
+    local log=$1 stream_dir stderr_pid status=0
+    shift
+    : > "$log" || return $?
+    stream_dir="$(mktemp -d)" || return $?
+    trap 'rm -rf "$stream_dir"' EXIT
+    mkfifo "$stream_dir/stderr" || return $?
+    # An ordinary background process can be waited for on Bash 3.2 too.
+    tee -a "$log" < "$stream_dir/stderr" >&2 &
+    stderr_pid=$!
+    # Two tee writers can insert stdout chunks inside stderr lines in the log.
+    # Stream stdout to its caller now, then append its copy after stderr drains.
+    "$@" 2> "$stream_dir/stderr" | tee "$stream_dir/stdout" || status=${PIPESTATUS[0]}
+    # Drain stderr before callers inspect or remove the completed step's log.
+    wait "$stderr_pid" || true
+    cat "$stream_dir/stdout" >> "$log" || true
+    return "$status"
+)
+
 run_once() {
-    printf '+ %s\n' "$*"
+    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
+        printf '+ %s\n' "$*" >&2
+    else
+        printf '+ %s\n' "$*"
+    fi
     if buildlog_step_compiles "$@"; then
         build_hold_wait_local || return $?
     fi
@@ -274,8 +298,13 @@ run_once() {
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
-    buildlog_exec "$@" 2>&1 | tee "$log"
-    status=${PIPESTATUS[0]}
+    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
+        run_json_stdout "$log" buildlog_exec "$@"
+        status=$?
+    else
+        buildlog_exec "$@" 2>&1 | tee "$log"
+        status=${PIPESTATUS[0]}
+    fi
     set -e
     buildlog_finish_memory "$status" "$sampler_pid"
     if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
@@ -511,6 +540,13 @@ invoke_clippy() {
     done
     run cargo clippy ${cargo_args[@]+"${cargo_args[@]}"} -- -D warnings \
         ${clippy_args[@]+"${clippy_args[@]}"}
+}
+
+# Replay the judging diagnostics as JSON; only apply_mul_add.py selects fixes.
+invoke_clippy_mul_add_json() {
+    lint_config_enabled clippy || return 0
+    local LINT_JSON_STDOUT=1
+    invoke_clippy "$@" --message-format=json
 }
 
 invoke_mend() {

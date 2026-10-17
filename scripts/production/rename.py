@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 import re
 import shlex
-import subprocess
 import sys
-import time
 from contextlib import contextmanager
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit  # noqa: E402
@@ -23,14 +20,12 @@ import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
-from rename_state import RenameRefused, _read_json, _write_json, _write_lines  # pyright: ignore[reportPrivateUsage]
+import unit_move  # noqa: E402
+from unit_move import PathMove  # noqa: E402
+import rename_state  # noqa: E402
+from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 
 REVIEW_POOL_STATE = Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool")
-
-
-class PathMove(NamedTuple):
-    source: Path
-    destination: Path
 
 
 @dataclass(frozen=True)
@@ -58,16 +53,27 @@ class RenamePlan:
         return f"chore({self.new}): rename production from {self.old}"
 
 
-def _git(checkout: Path, *arguments: str) -> str:
-    result = subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True,
-                            text=True, check=False)
-    if result.returncode:
-        raise RenameRefused(f"git {' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
-    return result.stdout.rstrip("\n")
+def _check_unit_tip(plan: RenamePlan, record: dict[str, object]) -> None:
+    unit_move.check_tip(plan.checkout, _string(record, "old_branch"), _string(record, "tip"))
 
 
-def _exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
+def _push_unit_branch(plan: RenamePlan, record: dict[str, object]) -> None:
+    unit_move.push_branch(plan.checkout, _string(record, "old_branch"), _string(record, "new_branch"),
+                          _string(record, "tip"), (plan.merge_branch, plan.new))
+
+
+def _move_unit_worktree(plan: RenamePlan, record: dict[str, object]) -> None:
+    unit_move.move_worktree(plan.checkout, _string(record, "old_branch"), _string(record, "new_branch"),
+                            Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
+                            _string(record, "tip"))
+
+
+def _move_unit_configs(record: dict[str, object]) -> None:
+    old, new = Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree"))
+    unit_move.move_configs(str(old), str(new))
+    run = unit_move.newest_run(old) or unit_move.newest_run(new)
+    if run is not None:
+        unit_move.move_run(run, old, new, _string(record, "new_branch"))
 
 
 def _validate_slug(slug: str) -> None:
@@ -141,27 +147,6 @@ def _relative(plan: RenamePlan, path: Path) -> str:
         raise RenameRefused(f"{path} is outside the showrunner checkout {plan.checkout}") from error
 
 
-def _plan_paths(cell: str, checkout: Path) -> tuple[Path, ...]:
-    names = [match[1] for match in re.finditer(r"`([^`]+)`", cell)]
-    if not names:
-        if re.search(r"\s", cell.strip()):
-            return ()
-        names = [cell.strip()]
-    paths: list[Path] = []
-    for name in names:
-        path = Path(name).expanduser()
-        path = (path if path.is_absolute() else checkout / path).resolve()
-        try:
-            relative = path.relative_to(checkout)
-        except ValueError:
-            continue
-        if relative.parts[:2] != ("docs", "plans") or path.suffix != ".md" or not path.is_file():
-            continue
-        if _git(checkout, "ls-files", "-z", "--", f":(literal){relative}"):
-            paths.append(path)
-    return tuple(paths)
-
-
 def _build(old: str, new: str) -> RenamePlan:
     _validate_slug(new)
     old = showrunners.canonical_slug(old)
@@ -169,7 +154,7 @@ def _build(old: str, new: str) -> RenamePlan:
     if old == new:
         raise RenameRefused(f"{new} is already the production's name")
     known = showrunners.timer_slugs()
-    if (_exists(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}")
+    if (unit_move.exists(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{new}")
             or new in known or showrunners.canonical_slug(new) != new):
         raise RenameRefused(f"{new} is already a current or former production slug")
     if old not in known:
@@ -179,7 +164,7 @@ def _build(old: str, new: str) -> RenamePlan:
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{old} has no readable update timer: {checked.reason}")
     production = add_unit.read_production(checked.path)
-    _ = _git(production.checkout, "check-ref-format", "--branch", new)
+    _ = unit_move.git(production.checkout, "check-ref-format", "--branch", new)
     if showrunners.production_slug(str(production.doc)) != old:
         raise RenameRefused(f"{old}'s timer names a different production doc: {production.doc}")
     lines = production.doc.read_text(encoding="utf-8").splitlines()
@@ -195,19 +180,19 @@ def _build(old: str, new: str) -> RenamePlan:
             continue
         if raw.strip() in ("", "—", "-", "permanent"):
             continue
-        for path in _plan_paths(raw, production.checkout):
+        for path in unit_move.plan_paths(raw, production.checkout):
             if path not in plans:
                 plans.append(path)
     result = RenamePlan(
         old, new, production.doc, production.doc.with_name(f"{new}-production.md"), production.checkout,
-        production.merge_branch, _git(production.checkout, "rev-parse", f"refs/heads/{production.merge_branch}"),
+        production.merge_branch, unit_move.git(production.checkout, "rev-parse", f"refs/heads/{production.merge_branch}"),
         tuple(units), tuple(plans), PathMove(instance, instance.with_name(f"showrunner-{new}")),
         tuple(PathMove(source, destination) for source, destination in
               zip(tidy_wrapped.owned_paths(old), tidy_wrapped.owned_paths(new), strict=True)),
         tuple(PathMove(stall_watch.stretch_path(old, unit), stall_watch.stretch_path(new, unit)) for unit in units),
         PathMove(REVIEW_POOL_STATE.expanduser() / old, REVIEW_POOL_STATE.expanduser() / new))
     for path in (result.old_doc, *result.plans):
-        _ = _git(result.checkout, "ls-files", "--error-unmatch", "--", _relative(result, path))
+        _ = unit_move.git(result.checkout, "ls-files", "--error-unmatch", "--", _relative(result, path))
         _ = path.read_text(encoding="utf-8")
     return result
 
@@ -217,7 +202,7 @@ def _move_record(move: PathMove) -> dict[str, str]:
 
 
 def _save(plan: RenamePlan, step: int) -> None:
-    _write_json(plan.journal, {
+    write_json(plan.journal, {
         "version": 1, "old": plan.old, "new": plan.new, "old_doc": str(plan.old_doc),
         "new_doc": str(plan.new_doc), "checkout": str(plan.checkout), "merge_branch": plan.merge_branch,
         "base": plan.base, "units": list(plan.units), "plans": [str(path) for path in plan.plans],
@@ -262,7 +247,7 @@ def _read_moves(value: object) -> tuple[PathMove, ...]:
 
 
 def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
-    fields = _object(_read_json(path))
+    fields = _object(read_json(path))
     if fields.get("version") != 1 or fields.get("new") != new:
         raise RenameRefused(f"{path}: incompatible rename journal")
     recorded_old = _string(fields, "old")
@@ -285,7 +270,7 @@ def _load(path: Path, old: str, new: str) -> tuple[RenamePlan, int]:
 def plan(old: str, new: str) -> RenamePlan:
     """Read the production and list its moves, without creating or rewriting anything."""
     _validate_slug(new)
-    journal = tidy_wrapped.owned_paths(new)[-1] / "rename.json"
+    journal = rename_state.production_journal(new)
     if journal.exists():
         return _load(journal, old, new)[0]
     return _build(old, new)
@@ -313,46 +298,37 @@ def _describe(plan: RenamePlan) -> list[str]:
 
 
 def _preflight(plan: RenamePlan) -> None:
-    branch = _git(plan.checkout, "branch", "--show-current")
+    branch = unit_move.git(plan.checkout, "branch", "--show-current")
     if branch != plan.merge_branch:
         raise RenameRefused(f"showrunner checkout is on {branch or 'detached HEAD'}, not {plan.merge_branch}")
-    if _git(plan.checkout, "status", "--porcelain"):
+    if unit_move.git(plan.checkout, "status", "--porcelain"):
         raise RenameRefused(f"{plan.checkout}: checkout must be clean before rename")
-    if _git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
+    if unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
         raise RenameRefused(f"branch {plan.new} already exists")
-    if _git(plan.checkout, "ls-remote", "--heads", "origin", f"refs/heads/{plan.new}"):
+    if unit_move.git(plan.checkout, "ls-remote", "--heads", "origin", f"refs/heads/{plan.new}"):
         raise RenameRefused(f"origin branch {plan.new} already exists")
     for move in (PathMove(plan.old_doc, plan.new_doc), plan.timer, *plan.state[:-1], *plan.stall, plan.review_pool):
-        if _exists(move.destination):
+        if unit_move.exists(move.destination):
             raise RenameRefused(f"destination already exists: {move.destination}")
     destination = plan.state[-1].destination
-    if _exists(destination) and (destination.is_symlink() or not destination.is_dir()
+    if unit_move.exists(destination) and (destination.is_symlink() or not destination.is_dir()
                                  or any(path.name != "rename.lock" for path in destination.iterdir())):
         raise RenameRefused(f"destination already exists: {destination}")
     prior = plan.state[-1].source / "rename.json"
-    if prior.exists() and _object(_read_json(prior)).get("done") is not True:
+    if prior.exists() and _object(read_json(prior)).get("done") is not True:
         raise RenameRefused(f"{prior}: finish the previous rename first")
-
-
-def _move(move: PathMove) -> None:
-    if not _exists(move.source):
-        return
-    if _exists(move.destination):
-        raise RenameRefused(f"destination already exists: {move.destination}")
-    move.destination.parent.mkdir(parents=True, exist_ok=True)
-    _ = move.source.rename(move.destination)
 
 
 def _rename_doc(plan: RenamePlan) -> None:
     if plan.old_doc.exists():
         text = _formerly(plan.old_doc.read_text(encoding="utf-8"), plan.old)
-        if _exists(plan.new_doc) and plan.new_doc.read_text(encoding="utf-8") != text:
+        if unit_move.exists(plan.new_doc) and plan.new_doc.read_text(encoding="utf-8") != text:
             raise RenameRefused(f"destination already exists: {plan.new_doc}")
-        _write_lines(plan.old_doc, [text])
+        write_text(plan.old_doc, text)
         # CHECK always names a readable doc, including while git mv removes the old path.
-        _write_lines(plan.new_doc, [text])
+        write_text(plan.new_doc, text)
         _rewrite_check(plan.timer.source, plan)
-        _ = _git(plan.checkout, "mv", "-f", "--", _relative(plan, plan.old_doc), _relative(plan, plan.new_doc))
+        _ = unit_move.git(plan.checkout, "mv", "-f", "--", _relative(plan, plan.old_doc), _relative(plan, plan.new_doc))
     elif not plan.new_doc.exists():
         raise RenameRefused(f"production doc is missing: {plan.old_doc}")
 
@@ -362,7 +338,7 @@ def _rewrite_plans(plan: RenamePlan) -> None:
         text = path.read_text(encoding="utf-8")
         updated = _production_header(text, plan.old, plan.new)
         if updated != text:
-            _write_lines(path, [updated])
+            write_text(path, updated)
 
 
 def _rewrite_check(instance: Path, plan: RenamePlan) -> None:
@@ -387,7 +363,7 @@ def _rewrite_check(instance: Path, plan: RenamePlan) -> None:
                 follows_script = Path(value).name == "production_check.sh"
     updated = "".join(lines)
     if updated != text:
-        _write_lines(conf, [updated])
+        write_text(conf, updated)
     checked = showrunners.checked_doc(instance)
     if not isinstance(checked, showrunners.CheckedDoc) or checked.path != plan.new_doc:
         raise RenameRefused(f"{conf}: CHECK does not name {plan.new_doc}")
@@ -396,12 +372,12 @@ def _rewrite_check(instance: Path, plan: RenamePlan) -> None:
 def _rename_timer(plan: RenamePlan) -> None:
     instance = plan.timer.source if plan.timer.source.exists() else plan.timer.destination
     _rewrite_check(instance, plan)
-    _move(plan.timer)
+    unit_move.move(plan.timer)
 
 
 def _rename_showrunner_state(plan: RenamePlan) -> None:
     for move in plan.state[:-1]:
-        _move(move)
+        unit_move.move(move)
     directory = plan.state[-1]
     if directory.source.exists():
         for path in sorted(directory.source.iterdir()):
@@ -411,57 +387,57 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
             destination = directory.destination / path.name
             if path.name == "rename.json":
                 destination = directory.destination / "rename-history" / f"{plan.old}.json"
-            _move(PathMove(path, destination))
+            unit_move.move(PathMove(path, destination))
         directory.source.rmdir()
     for path in sorted(directory.destination.parent.glob("*/parent")):
         if path.read_text(encoding="utf-8").strip() == plan.old:
-            _write_lines(path, [plan.new + "\n"])
+            write_text(path, plan.new + "\n")
 
 
 def _rename_stall_watch(plan: RenamePlan) -> None:
     for move in plan.stall:
-        _move(move)
+        unit_move.move(move)
 
 
 def _rename_review_pool(plan: RenamePlan) -> None:
-    _move(plan.review_pool)
+    unit_move.move(plan.review_pool)
 
 
 def _check_edits(plan: RenamePlan) -> None:
     allowed = {_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)}
-    changed = set(_git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
-    changed.update(set(_git(plan.checkout, "ls-files", "--others", "--exclude-standard", "-z").split("\0")) - {""})
+    changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
+    changed.update(set(unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard", "-z").split("\0")) - {""})
     if changed - allowed:
         raise RenameRefused("unrelated checkout changes: " + ", ".join(sorted(changed - allowed)))
 
 
 def _rename_branch(plan: RenamePlan) -> None:
-    if _git(plan.checkout, "rev-parse", f"refs/heads/{plan.merge_branch}") != plan.base:
+    if unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.merge_branch}") != plan.base:
         raise RenameRefused(f"{plan.merge_branch} moved during the rename")
-    branch = _git(plan.checkout, "branch", "--show-current")
+    branch = unit_move.git(plan.checkout, "branch", "--show-current")
     if branch not in (plan.merge_branch, plan.new):
         raise RenameRefused(f"showrunner checkout switched to {branch}")
     _check_edits(plan)
-    if not _git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
-        _ = _git(plan.checkout, "branch", plan.new, plan.base)
-    tip = _git(plan.checkout, "rev-parse", f"refs/heads/{plan.new}")
-    committed = (tip != plan.base and _git(plan.checkout, "show", "-s", "--format=%s", tip) == plan.message
-                 and _git(plan.checkout, "rev-parse", f"{tip}^") == plan.base)
+    if not unit_move.git(plan.checkout, "for-each-ref", "--format=%(refname)", f"refs/heads/{plan.new}"):
+        _ = unit_move.git(plan.checkout, "branch", plan.new, plan.base)
+    tip = unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.new}")
+    committed = (tip != plan.base and unit_move.git(plan.checkout, "show", "-s", "--format=%s", tip) == plan.message
+                 and unit_move.git(plan.checkout, "rev-parse", f"{tip}^") == plan.base)
     if tip != plan.base and not committed:
         raise RenameRefused(f"branch {plan.new} moved during the rename")
     if branch != plan.new:
-        _ = _git(plan.checkout, "switch", plan.new)
+        _ = unit_move.git(plan.checkout, "switch", plan.new)
     if not committed:
-        _write_lines(plan.new_doc, [_merge_line(plan.new_doc.read_text(encoding="utf-8"), plan.new)])
+        write_text(plan.new_doc, _merge_line(plan.new_doc.read_text(encoding="utf-8"), plan.new))
         paths = list(dict.fromkeys(_relative(plan, path) for path in (plan.old_doc, plan.new_doc, *plan.plans)))
         old_path = _relative(plan, plan.old_doc)
-        if not _exists(plan.old_doc) and _git(plan.checkout, "ls-files", "-z", "--", old_path):
-            _ = _git(plan.checkout, "rm", "--cached", "--quiet", "--", old_path)
-        _ = _git(plan.checkout, "add", "--", *[path for path in paths if (plan.checkout / path).exists()])
-        _ = _git(plan.checkout, "commit", "-m", plan.message)
-    elif _git(plan.checkout, "status", "--porcelain"):
+        if not unit_move.exists(plan.old_doc) and unit_move.git(plan.checkout, "ls-files", "-z", "--", old_path):
+            _ = unit_move.git(plan.checkout, "rm", "--cached", "--quiet", "--", old_path)
+        _ = unit_move.git(plan.checkout, "add", "--", *[path for path in paths if (plan.checkout / path).exists()])
+        _ = unit_move.git(plan.checkout, "commit", "-m", plan.message)
+    elif unit_move.git(plan.checkout, "status", "--porcelain"):
         raise RenameRefused("checkout changed after the rename commit")
-    _ = _git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.new}:refs/heads/{plan.new}")
+    _ = unit_move.git(plan.checkout, "push", "--set-upstream", "origin", f"{plan.new}:refs/heads/{plan.new}")
 
 
 def apply(old: str, new: str) -> RenamePlan:
@@ -470,8 +446,10 @@ def apply(old: str, new: str) -> RenamePlan:
     if not result.journal.exists():
         _preflight(result)
     result.journal.parent.mkdir(parents=True, exist_ok=True)
-    with (result.journal.parent / "rename.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with unit_move.production_lock():
+        for slug in {result.old, result.new}:
+            if rename_state.unfinished(rename_state.unit_journal(slug)):
+                raise RenameRefused(f"{slug}: a unit rename is unfinished; finish it first")
         if result.journal.exists():
             result, completed = _load(result.journal, old, new)
         else:
@@ -492,15 +470,14 @@ def apply(old: str, new: str) -> RenamePlan:
 def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]:
     new = showrunners.canonical_slug(new)
     _validate_slug(new)
-    path = tidy_wrapped.owned_paths(new)[-1] / "rename.json"
+    path = rename_state.production_journal(new)
     if not path.exists():
         raise RenameRefused(f"{new} has no rename journal")
-    with (path.parent / "rename.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with unit_move.production_lock():
         result, completed = _load(path, new, new)
         if completed != 7:
             raise RenameRefused(f"{new}: apply must complete step 7 first")
-        yield result, _object(_read_json(path))
+        yield result, _object(read_json(path))
 
 
 def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
@@ -515,7 +492,7 @@ def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
 
 def _stopped_unit(plan: RenamePlan, name: str) -> None:
     try:
-        found = unit_lookup.marked_units(plan.new, every_host=True).get(name)
+        found = unit_lookup.marked_units(plan.new).get(name)
     except OSError as error:
         raise RenameRefused(f"{name}: cannot tell whether Claude is running: {error}") from error
     state = found.claude if found else unit_lookup.ClaudeNotRunning()
@@ -523,39 +500,6 @@ def _stopped_unit(plan: RenamePlan, name: str) -> None:
         raise RenameRefused(f"{name} has a live Claude; wait until its run stops")
     if isinstance(state, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{name}: cannot tell whether Claude is running: {state.reason}")
-
-
-def _branch_tip(checkout: Path, branch: str) -> str:
-    return _git(checkout, "for-each-ref", "--format=%(objectname)", f"refs/heads/{branch}")
-
-
-def _remote_tip(checkout: Path, branch: str) -> str:
-    listed = _git(checkout, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
-    return listed.split("\t", 1)[0] if listed else ""
-
-
-def _delete_remote_branch(plan: RenamePlan, branch: str, tip: str) -> None:
-    remote = _remote_tip(plan.checkout, branch)
-    if remote:
-        if remote != tip:
-            try:
-                _ = _git(plan.checkout, "merge-base", "--is-ancestor", remote, tip)
-            except RenameRefused as error:
-                raise RenameRefused(f"origin branch {branch} has history outside the preserved tip") from error
-        _ = _git(plan.checkout, "push", "origin", "--delete", branch)
-
-
-def _delete_local_branch(plan: RenamePlan, branch: str, tip: str) -> None:
-    local = _branch_tip(plan.checkout, branch)
-    if local:
-        if local != tip:
-            raise RenameRefused(f"branch {branch} moved during the rename")
-        _ = _git(plan.checkout, "branch", "-D", "--", branch)
-
-
-def _delete_branch(plan: RenamePlan, branch: str, tip: str) -> None:
-    _delete_remote_branch(plan, branch, tip)
-    _delete_local_branch(plan, branch, tip)
 
 
 def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str, object]:
@@ -570,99 +514,21 @@ def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str,
     if not (worktree / ".git").is_file():
         raise RenameRefused(f"{name}: no linked worktree at {worktree}")
     new_branch = f"{plan.new}-{stem}"
-    if _branch_tip(plan.checkout, new_branch) or _remote_tip(plan.checkout, new_branch):
+    if unit_move.branch_tip(plan.checkout, new_branch) or unit_move.remote_tip(plan.checkout, new_branch):
         raise RenameRefused(f"branch {new_branch} already exists")
     suffix = f"-{plan.old}-{stem}"
     repository = (worktree.name[:-len(suffix)] if worktree.name.endswith(suffix) else plan.checkout.name)
     basename = f"{repository}-{plan.new}-{stem}"
     destination = worktree.with_name(basename)
-    if _exists(destination):
+    if unit_move.exists(destination):
         raise RenameRefused(f"destination already exists: {destination}")
-    if _git(worktree, "branch", "--show-current") != branch:
+    if unit_move.git(worktree, "branch", "--show-current") != branch:
         raise RenameRefused(f"{worktree} is not on {branch}")
-    if _git(plan.checkout, "branch", "--show-current") != plan.new or _git(plan.checkout, "status", "--porcelain"):
+    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.new or unit_move.git(plan.checkout, "status", "--porcelain"):
         raise RenameRefused("showrunner checkout must be clean and on the new merge branch")
     return {"old_branch": branch, "new_branch": new_branch, "old_worktree": str(worktree),
-            "new_worktree": str(destination), "tip": _git(worktree, "rev-parse", "HEAD"),
-            "base": _git(plan.checkout, "rev-parse", "HEAD"), "step": 0}
-
-
-def _check_unit_tip(plan: RenamePlan, record: dict[str, object]) -> None:
-    branch = _string(record, "old_branch")
-    tip = _branch_tip(plan.checkout, branch)
-    if tip and tip != _string(record, "tip"):
-        raise RenameRefused(f"branch {branch} moved during the rename")
-
-
-def _push_unit_branch(plan: RenamePlan, record: dict[str, object]) -> None:
-    _check_unit_tip(plan, record)
-    branch, tip = _string(record, "new_branch"), _string(record, "tip")
-    local, remote = _branch_tip(plan.checkout, branch), _remote_tip(plan.checkout, branch)
-    if (local and local != tip) or (remote and remote != tip):
-        raise RenameRefused(f"branch {branch} moved during the rename")
-    if not local:
-        _ = _git(plan.checkout, "branch", branch, tip)
-    _ = _git(plan.checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
-
-
-def _move_unit_worktree(plan: RenamePlan, record: dict[str, object]) -> None:
-    _check_unit_tip(plan, record)
-    old = Path(_string(record, "old_worktree"))
-    new = Path(_string(record, "new_worktree"))
-    branch = _string(record, "new_branch")
-    if old.exists():
-        if _exists(new):
-            raise RenameRefused(f"destination already exists: {new}")
-        _ = _git(plan.checkout, "worktree", "move", str(old), str(new))
-    if not (new / ".git").is_file():
-        raise RenameRefused(f"unit worktree missing: {new}")
-    _ = _git(plan.checkout, "worktree", "repair", str(new))
-    current = _git(new, "branch", "--show-current")
-    if current not in (_string(record, "old_branch"), branch):
-        raise RenameRefused(f"{new} switched to {current}")
-    _check_unit_tip(plan, record)
-    _ = _git(new, "switch", branch)
-
-
-def _config_dirs() -> list[Path]:
-    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
-    override = os.environ.get("CLAUDE_CONFIG_DIR")
-    if override:
-        directories.add(Path(override).expanduser())
-    return sorted(directories)
-
-
-def _copy_trust(path: Path, old: str, new: str) -> None:
-    config = _object(_read_json(path))
-    projects = _object(config.get("projects", {}))
-    if old not in projects:
-        return
-    trust = projects[old]
-    for attempt in range(3):
-        if attempt:
-            config = _object(_read_json(path))
-            projects = _object(config.get("projects", {}))
-        _ = projects.setdefault(old, trust)
-        projects[new] = trust
-        config["projects"] = projects
-        _write_json(path, config)
-        time.sleep(2)
-        verified = _object(_read_json(path))
-        if new in _object(verified.get("projects", {})):
-            return
-    raise RenameRefused(f"{path}: new worktree trust entry did not persist; next launch needs a trust prompt")
-
-
-def _move_unit_configs(record: dict[str, object]) -> None:
-    old, new = _string(record, "old_worktree"), _string(record, "new_worktree")
-    old_project = re.sub(r"[^A-Za-z0-9]", "-", old)
-    new_project = re.sub(r"[^A-Za-z0-9]", "-", new)
-    for directory in _config_dirs():
-        _move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
-        config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
-                  else directory / ".claude.json")
-        if config.exists():
-            _copy_trust(config, old, new)
+            "new_worktree": str(destination), "tip": unit_move.git(worktree, "rev-parse", "HEAD"),
+            "base": unit_move.git(plan.checkout, "rev-parse", "HEAD"), "step": 0}
 
 
 def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
@@ -684,7 +550,7 @@ def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
                 column = headings.index(field)
                 cells[column] = f"`{value}`"
             lines[index] = "| " + " | ".join(cells) + " |\n"
-            _write_lines(plan.new_doc, lines)
+            write_text(plan.new_doc, "".join(lines))
             return
     raise RenameRefused(f"{name}: Units row disappeared")
 
@@ -692,25 +558,25 @@ def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
 def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
     _check_unit_tip(plan, record)
     message = f"chore({plan.new}): rename unit {name} from {plan.old}"
-    if _git(plan.checkout, "branch", "--show-current") != plan.new:
+    if unit_move.git(plan.checkout, "branch", "--show-current") != plan.new:
         raise RenameRefused("showrunner checkout switched away from the new merge branch")
     path = _relative(plan, plan.new_doc)
-    rows = production_units.unit_table(_git(plan.checkout, "show", f"HEAD:{path}").splitlines())
+    rows = production_units.unit_table(unit_move.git(plan.checkout, "show", f"HEAD:{path}").splitlines())
     matching = [row for row in rows if production_units.cell_value(row.get("Unit", "")) == name]
     committed = (len(matching) == 1
                  and production_units.cell_value(matching[0].get("Worktree", "")) == _string(record, "new_worktree")
                  and production_units.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
-    changed = set(_git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
-    changed.update(set(_git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
-    untracked = _git(plan.checkout, "ls-files", "--others", "--exclude-standard")
+    changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
+    changed.update(set(unit_move.git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
+    untracked = unit_move.git(plan.checkout, "ls-files", "--others", "--exclude-standard")
     if changed - {path} or untracked or (committed and changed):
         raise RenameRefused("unrelated checkout changes during unit rename")
     if not committed:
         _unit_doc(plan, name, record)
-        _ = _git(plan.checkout, "add", "--", path)
-        _ = _git(plan.checkout, "commit", "-m", message)
+        _ = unit_move.git(plan.checkout, "add", "--", path)
+        _ = unit_move.git(plan.checkout, "commit", "-m", message)
     _check_unit_tip(plan, record)
-    _ = _git(plan.checkout, "push", "origin", f"{plan.new}:refs/heads/{plan.new}")
+    _ = unit_move.git(plan.checkout, "push", "origin", f"{plan.new}:refs/heads/{plan.new}")
 
 
 def unit(new: str, name: str) -> None:
@@ -729,7 +595,7 @@ def unit(new: str, name: str) -> None:
             record = _prepare_unit(result, name, row)
             records[name] = record
             journal["unit_moves"] = records
-            _write_json(result.journal, journal)
+            write_json(result.journal, journal)
         completed = record.get("step")
         if type(completed) is not int or not 0 <= completed <= 5:
             raise RenameRefused(f"{name}: invalid unit rename progress")
@@ -739,28 +605,28 @@ def unit(new: str, name: str) -> None:
         if completed < 1:
             _push_unit_branch(result, record)
             record["step"] = 1
-            _write_json(result.journal, journal)
+            write_json(result.journal, journal)
         if completed < 2:
             _stopped_unit(result, name)
             _move_unit_worktree(result, record)
             record["step"] = 2
-            _write_json(result.journal, journal)
+            write_json(result.journal, journal)
         if completed < 3:
             _move_unit_configs(record)
             record["step"] = 3
-            _write_json(result.journal, journal)
+            write_json(result.journal, journal)
         if completed < 4:
             _commit_unit(result, name, record)
             record["step"] = 4
-            _write_json(result.journal, journal)
+            write_json(result.journal, journal)
         if completed < 5:
             _check_unit_tip(result, record)
-            if _remote_tip(result.checkout, _string(record, "new_branch")) != _string(record, "tip"):
+            if unit_move.remote_tip(result.checkout, _string(record, "new_branch")) != _string(record, "tip"):
                 raise RenameRefused("new unit branch changed before old branch retirement")
-            _delete_branch(result, _string(record, "old_branch"), _string(record, "tip"))
+            unit_move.delete_branch(result.checkout, _string(record, "old_branch"), _string(record, "tip"))
             record["step"] = 5
-            _write_json(result.journal, journal)
-        print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit rewrites the tmux mark at next launch")
+            write_json(result.journal, journal)
+        print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit writes the herdr mark at next launch")
 
 
 def finish(new: str) -> None:
@@ -777,15 +643,15 @@ def finish(new: str) -> None:
         records = _object(journal.get("unit_moves", {}))
         if any(_object(value).get("step") != 5 for value in records.values()):
             raise RenameRefused("complete interrupted unit moves before finish")
-        if _git(result.checkout, "branch", "--show-current") != result.new:
+        if unit_move.git(result.checkout, "branch", "--show-current") != result.new:
             raise RenameRefused("showrunner checkout must be on the new merge branch before finish")
-        _delete_remote_branch(result, result.merge_branch, result.base)
+        unit_move.delete_remote_branch(result.checkout, result.merge_branch, result.base)
         journal["finish_step"] = 1
-        _write_json(result.journal, journal)
-        _delete_local_branch(result, result.merge_branch, result.base)
+        write_json(result.journal, journal)
+        unit_move.delete_local_branch(result.checkout, result.merge_branch, result.base)
         journal["finish_step"] = 2
         journal["done"] = True
-        _write_json(result.journal, journal)
+        write_json(result.journal, journal)
         print(f"{result.new} rename finished; retired {result.merge_branch}")
 
 

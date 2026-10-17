@@ -31,7 +31,8 @@ class HomeCutoverTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(patch.object(sys, "platform", "linux"))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         (self.home / ".claude").mkdir()
@@ -264,7 +265,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
@@ -765,7 +766,7 @@ class MacHomeCutoverTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         self.keychain = CutoverKeychain()
@@ -1013,8 +1014,8 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.assertGreaterEqual(mutations.count("write"), 3)
         for stop_after in range(1, len(mutations) + 1):
             with self.subTest(step=stop_after), tempfile.TemporaryDirectory() as directory:
-                self.home = Path(directory)
-                with patch.dict(os.environ, {"HOME": directory, "AGENT_NOTES_DIR": str(self.home / "notes")}):
+                self.home = Path(directory).resolve()
+                with patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}):
                     self.keychain.entries.clear()
                     self.keychain.calls.clear()
                     self.initialize_home()

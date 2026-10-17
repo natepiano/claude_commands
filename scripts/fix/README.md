@@ -30,7 +30,8 @@ agent on macOS (`org.nixos.style-fix`, logging to
 | File | Purpose |
 |------|---------|
 | `style-eval-all.sh` | Runs `/style_eval` on every `[projects]` entry in parallel using the `[style_eval]` assignment. Stores pending evaluation markdown in `.history/.pending/<project>.json`. Skips projects with pending findings or a real `_style_fix` worktree so pending JSON cannot be replaced while fixes are awaiting review. |
-| `candidate_generators.py` | Deterministic candidate enumeration for style-eval units. A guideline's `candidates:` frontmatter names a generator kind (regex / toml / Rust-source parse); `next-unit` hands the agent the enumerated sites as a closed list, `record-unit` refuses records that don't disposition every candidate, and zero-candidate units record free like pre_filter skips. Design + audit: `docs/candidate-enumeration-design.md`. Debug via `style_history.py enumerate-candidates`. |
+| [`../style/candidate_generators.py`](../style/candidate_generators.py) | Deterministic candidate enumeration for style-eval units. A guideline's `candidates:` frontmatter names a generator kind (regex / toml / Rust-source parse); `next-unit` hands the agent the enumerated sites as a closed list, `record-unit` refuses records that don't disposition every candidate, and zero-candidate units record free like pre_filter skips. Design + audit: `docs/candidate-enumeration-design.md`. Debug via `style_history.py enumerate-candidates`. |
+| [`../style/style_admin.py`](../style/style_admin.py) | Rename or delete style rules and update history and wikilinks. |
 | `rg-shim.sh` | Retired timeout shim for `ripgrep`. Kept for reference, but not activated on PATH. See **Reliability guards** below. |
 
 ### Style-Fix Worktrees

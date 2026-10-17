@@ -154,18 +154,21 @@ class PushTextTests(unittest.TestCase):
             for example in entry.examples:
                 with self.subTest(id=entry.id, example=example.name):
                     push = push_texts.render_entry(entry, example.values)
-                    instruction = (f"Or stop it instead, and the {example.values['operation']} goes on without it." if entry.id == "shutdown.holdout"
-                        else f"Stopping ends only that session, and the {example.values['operation']} goes on.")
-                    self.assertEqual(push.body.split("\n\n")[1:],
-                        [f"{instruction} In a terminal on {example.values['machine']}: {example.values['command']}"])
+                    expected = ([f"Or stop it instead, and the {example.values['operation']} goes on without it. "
+                                 + f"In a terminal on {example.values['machine']}: {example.values['command']}"]
+                                if entry.id == "shutdown.holdout"
+                                else ["Stopping it ends only that session and keeps its uncommitted work. "
+                                      + f"Then the {example.values['operation']} goes on.", example.values["command"]])
+                    self.assertEqual(push.body.split("\n\n")[1:], expected)
+                    self.assertIn(f"In a terminal on {example.values['machine']}", push.message)
 
     def test_unanswered_holdout_asks_to_stop_the_session_without_a_form(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout_unanswered")
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title + "\n" + push.message.split("\n\n", 1)[0],
-            "pm-move-ghostty restart is blocked\nSession: pm-move-ghostty\n"
-            + "Action: in a terminal on natedev, stop pm-move-ghostty with the command below\n"
-            + "Reason: restart is blocked because pm-move-ghostty's claude session has not paused for it and it can't proceed.")
+            "Your Claude restart is stuck\nSession: pm-move-ghostty\n"
+            + "Action: In a terminal on natedev, stop pm-move-ghostty with the command below\n"
+            + "Your Claude restart waits for each session to pause. The session pm-move-ghostty has not paused, so the restart is stuck.")
         self.assertNotIn("form", push.title + "\n" + push.message)
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:

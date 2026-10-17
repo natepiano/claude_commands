@@ -1021,7 +1021,7 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.events(), [])
 
     def test_running_units_counts_a_unit_of_unknown_state_as_running(self) -> None:
-        # A stand-in module keeps tmux, herdr and the top-level showrunners module out of this suite.
+        # A stand-in module keeps herdr and the top-level showrunners module out of this suite.
         class ClaudeNotRunning:
             pass
 
@@ -1038,7 +1038,7 @@ class ReviewPoolTests(unittest.TestCase):
         stand_in.__dict__.update(ClaudeNotRunning=ClaudeNotRunning, marked_units=lookup)
         with patch.dict(sys.modules, {"unit_lookup": stand_in}):
             self.assertEqual(review_pool.running_units("production"), {"live-unit", "unknown-unit"})
-        lookup.assert_called_once_with("production", every_host=True)
+        lookup.assert_called_once_with("production")
 
 class UIStandingPromptTests(unittest.TestCase):
     def test_ui_standing_prompt_defines_report_and_measurement_without_rule_reads(self) -> None:

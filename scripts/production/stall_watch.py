@@ -276,7 +276,7 @@ def tick(now: float) -> None:
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
-        # The units are the doc's live rows; each is found by the mark on its tmux session.
+        # The units are the doc's live rows; each is found by the mark on its herdr pane.
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()

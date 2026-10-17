@@ -87,7 +87,7 @@ elif verb == 'compact':
     else:
         print(f'compacted {name}: {before} -> 12000 tokens')
 elif verb == 'can-follow':
-    if entry.get('status') not in ('done', 'failed'):
+    if entry.get('status') not in ('done', 'failed', 'paused'):
         print(f'codex_mesh: {name}: worker is busy or not followable; follow refused',
               file=sys.stderr)
         sys.exit(2)
@@ -369,7 +369,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
-            "review.sh", "implement.sh", "progress_history.py", "phase_reservation.py", "findings.py",
+            "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py",
             "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
@@ -1415,6 +1415,18 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                 ("pass_finished", "review"),
             ],
         )
+
+    def test_paused_reviewer_receives_followup_on_its_recorded_thread(self) -> None:
+        session_dir = self.start_implementation("paused-review")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir, status="paused")
+        result = self.run_assigned_review(session_dir, worker)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["can-follow", "follow"])
+        roster = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
+        self.assertEqual(roster[worker]["thread_id"], "thread-fixture")
+        self.assertEqual((session_dir / "follow_message.txt").read_text(), "Review the diff.\n")
+        self.assertEqual((session_dir / "review_status").read_text(), "reviewed\n")
 
     def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
         session_dir = self.start_implementation("assigned")

@@ -88,6 +88,12 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
+- **Kind:** style — optional; absent means a product production. A style production
+  reads `~/.claude/docs/style_production.md`
+- **Branch point:** `<branch>` — style productions only: the parent's merge branch
+  to sync from and hand back to
+- **Parent production:** <path to parent production doc> — style productions only:
+  the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
@@ -113,7 +119,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <the issues folder the production files its proposals in, e.g.
   `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
-  `proposal`; omit when the production keeps none
+  `proposal`; required for a style production, which files held changes there;
+  otherwise omit when the production keeps none
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
@@ -134,13 +141,20 @@ one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's herdr or tmux session carries the production's
+a session at any time. The unit's herdr session carries the production's
 slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
 session name now. `<slug>` is this doc's file name without `-production.md`; a former
 slug from the Formerly line also works, and a mark set before a rename is found under
 the current slug.
+
+To rename a unit, run `/showrunner:rename_unit <old> <new>` from the showrunner session,
+between phases. Never edit the Unit, Worktree or Branch cell by hand. The rename stops the unit,
+moves its branch, worktree and state, and commits `chore(<slug>): rename unit <old> to <new>` on
+the merge branch. Merge history follows that commit, so the unit's past merges still count under
+the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
+`review-unit` and `nightly-review-unit` keep their names.
 
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
@@ -231,6 +245,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
+   Before sending a checkpoint notice, record its next-phase ETA:
+   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
+   `<HH:MM>` means today in the user's zone; an ETA on a later day takes
+   `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed.
+
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
@@ -290,9 +309,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
-5. **One more commit kind.** Besides checkpoints, a unit director may merge the
-   merge branch into the unit's branch, when a gate clears or the showrunner asks:
-   `git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" <merge branch>`.
+5. **One more commit kind.** Besides checkpoints, a unit director merges the
+   merge branch into the unit's branch at the start of every phase, before
+   dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
+   `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
    `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
