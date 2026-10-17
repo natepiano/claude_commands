@@ -765,14 +765,15 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
         stored = self.run_command("footer", "--state", str(state))
         self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
-        self.assertEqual(stored.stdout.strip(), "footer: ok — footers off")
+        # The deferred item is not counted until its `after` time.
+        self.assertEqual(stored.stdout.strip(), "For you: 1 question\nfooter: ok — footers off")
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
         self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
         before = outstanding.read_bytes()
         _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
         kept = self.run_command("footer", "--state", str(state))
-        self.assertEqual(kept.stdout.strip(), "footer: ok — footers off")
+        self.assertEqual(kept.stdout.strip(), "For you: 1 question\nfooter: ok — footers off")
         self.assertEqual(outstanding.read_bytes(), before)
         _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
                              encoding="utf-8")

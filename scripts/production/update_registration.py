@@ -19,12 +19,14 @@ from merge_checkpoint import NoMerge, merge_branch_history, report
 if TYPE_CHECKING:
     from ..hooks.showrunner_footer import (FooterState, footer_state, set_footer_state,
         PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
-        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path)
+        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
+        NoDailiesSchedule, Production as FooterProduction)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import (FooterState, footer_state, set_footer_state,
         PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, add_pending_reviewed,
-        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path)
+        read_pending_reviewed, delete_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
+        NoDailiesSchedule, Production as FooterProduction)
 import showrunners
 from dailies_render import (UNREADABLE_LIST, InputError, footer_main, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
@@ -549,7 +551,15 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
         _ = reports.write_text(json.dumps(list(state.reports.items)) + "\n", encoding="utf-8")
     # The switch hides the printed footer only. What waits on the user is stored above either way,
     # so the dailies and the open-questions count still see it.
+    place = showrunners.place_of(production.slug)
     if footer_state(production.slug) is FooterState.OFF:
+        # The reply ends with the counts line instead, the open questions counted in it.
+        counted = FooterProduction(production.slug, production.doc, str(production.zone),
+                                   NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
+        questions = open_questions([counted], {production.slug: place.below})
+        line = counts_line([counted], questions or 0)
+        if line is not None:
+            print(line)
         report("footer", "ok", "footers off")
         return
     schedule = instance(f"showrunner-{production.slug}")
@@ -560,9 +570,8 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
             due = datetime.fromtimestamp(int(match.group(1)), production.zone)
             days = (due.date() - datetime.now(production.zone).date()).days
             next_run = due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
-    place = showrunners.place_of(production.slug)
     if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed,
-                   below=[outstanding_file(slug) for slug in place.below], root=place.root):
+                   below=[outstanding_file(slug) for slug in place.below], root=place.root, doc=production.doc):
         raise RegistrationFailure("footer", "renderer refused the footer")
     report("footer", "ok", "rendered")
 
