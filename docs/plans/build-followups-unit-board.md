@@ -183,73 +183,28 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ### Phase 7 — The board opens at once  · status: done
 
-The live check on 2026-10-16 found `/unit-board` in the trunk failing with "process.run … still running after 30000ms". `board_json.py` took 35 s for three productions under load. 90% of that was `unit_run.local_run`, which parsed every line of all 184 run files once per unit (1.16M JSON parses for 22 units).
+#### As-built
 
-#### Work Order
-
-**Goal:** `board_json.py --cwd ~/.claude` finishes in a few seconds, so the trunk board opens within the mod's 30 s process limit even under load.
-
-**Spec:** `scripts/production/unit_run.py` `local_run` stops reading a run file at its `run_started` event, matching or not; a run file holds exactly one, on line 1 (checked across all 184 files). Lines that do not contain `"run_started"` are skipped before `json.loads`. Results are unchanged.
-
-**Files:**
-- `scripts/production/unit_run.py` — `local_run`.
-
-**Workers:** none. The showrunner approved a director-written fix (2026-10-16), already in the tree.
-
-**Constraints from prior phases:** none beyond Delegation Context.
-
-**Acceptance gate:** `scripts.production.test_unit_run` and `scripts.delegate.test_board_json` green; `merge_gate --tests-only` green; basedpyright clean on `unit_run.py`; `board_json.py --cwd ~/.claude` 35 s → under 5 s.
+- `unit_run.local_run` reads each run file only up to its `run_started` line, which every run file holds once, on line 1. It skips lines without `"run_started"` before parsing. Board generation for three productions fell from 35 s to 4.5 s, so the trunk board opens inside the mod's 30 s process limit.
 
 ### Phase 8 — Board layout fixes  · status: done
 
-The design check of the live board (fresh reviewer, 2026-10-16) said "ship after these fixes". The showrunner made them a phase of this run.
+#### As-built
 
-#### Work Order
-
-**Goal:** the production board shows every unit at a glance, with one style and no empty or repeated lines. The unit view lines up and shows a finished unit's phases.
-
-**Spec:**
-
-Board (`mods/unit-board/hooks/board.tsx` `BoardView`):
-
-1. Order and size. Units sort as running, then standing by (any other state), then run done, keeping the JSON order within each group. A unit whose `state` is `run-finished` draws one line: dot, key, then `Run done` and its `finishText` when non-empty, right-aligned `open` button. It has no strip, stage, ETA, ruler or workers lines. With 22 units, mostly done, the whole production then fits a 50-row pane.
-2. No phase, no repetition. When `unit.phase` is null, the header line reads `● <key>  <stage>` (no `no phase running`), and no separate stage line is drawn. With a phase, the header stays `● <key>  Phase i/n  <title>` and the strip line carries the stage.
-3. Strip separator. The two spaces before the stage on the strip line print only when the strip has cells. No line starts with 4 spaces of indent.
-4. Empty roles. `workersText` joins `[count, role, state]` with single spaces, skipping empty parts: `2 paused`, never `2  paused`.
-5. Predicted finish with no phase running. `done by HH:MM` under a unit with no phase running keeps its text only when a later phase is predicted. Otherwise `finishText` is not drawn for that unit. The JSON already says which: a `todo` or `gated` row in `phases`.
-
-Worker states (`scripts/delegate/board_json.py` `workers`):
-
-6. One word per state. Map the roster `status` to `running`, `paused`, `idle` (roster `done`: the turn finished, the thread is open) and `ended` (the thread is closed). Any other value passes through. Units with all workers `ended` draw no workers line on the board.
-
-Unit view (`mods/unit-board/hooks/unit.tsx` `UnitView`):
-
-7. No blank block. The ETA/gate/finish/ruler/trail box and the strip box render only when at least one child has content, so a finished unit shows no blank lines under `as of`.
-8. Aligned workers. Pad `slot` to the widest slot in the list plus one space, the role to the widest role plus one, and the state to the widest state plus one.
-9. Worker activity text. `doing` (`board_json.py` `workers`, from the newest `board.log` line) drops a leading `launcher: ` and any trailing `; summary at …` / `; findings in …` clause, so the row reads `adversary review finished`.
-10. Phase record of a finished unit. When the plan doc resolves to no phases, `board_json.py` `unit` builds `phases` from the found run's own events (`units_table.run_events`). There is one `done` row per `phase_finished` (id `phase_id`, title `phase_title`, took `phase_elapsed_seconds`). `fix_done` counts that instance's repair passes, `findings` counts its `finding_opened` by severity, and `eta` comes from its `eta_stated` events by `eta_phase_id` (first, trail, finished = `phase_finished` time, delta). An instance with `phase_started` and no `phase_finished` is `open`. Rows keep the `BoardPhase` contract in `mods/unit-board/types/board.d.ts`, so the mod needs no change for it. `phase.of` and the strip follow from those rows. A unit with no plan phases and no run phases draws `Phase record` with one subtle line, `no phases recorded`.
-
-Keep every Delegation Context invariant: nothing opens by itself, no work while closed, the mod never computes ETAs.
-
-**Files:**
-- `mods/unit-board/hooks/board.tsx` — items 1–5.
-- `mods/unit-board/hooks/unit.tsx` — items 7, 8, 10 (empty record line).
-- `scripts/delegate/board_json.py` — items 6, 9, 10.
-- `scripts/delegate/test_board_json.py` — tests for 6, 9, 10.
-- `mods/unit-board/tests/board.test.tsx` — new: render tests for 1–5, 7, 8 using the kit in `tests/kit.ts`.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` — `board.tsx`, `unit.tsx`, `board_json.py`.
-- `test` — `test_board_json.py` and `tests/board.test.tsx`, written from this Spec alone.
-
-**Constraints from prior phases:**
-- Phase 7: `unit_run.local_run` reads each run file only to its `run_started` line.
-- The JSON contract is `types/board.d.ts` field for field, and `test_board_json.py` checks every output key against it. A changed field changes both.
-- Board JSON times are `BoardTime {at, text}` in the production zone; Python writes them with `astimezone(user_zone())`.
-
-**Acceptance gate:**
-- `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/unit-board` clean.
-- `command claude plugin test mods/unit-board` and `command claude plugin validate --strict mods/unit-board` green.
-- `basedpyright scripts/delegate` reports 0 errors, 0 warnings.
-- `merge_gate --tests-only` green.
-- Live (director): trunk `/unit-board` shows all of build-followups' units in one 50-row pane at 170 columns. `/unit-board` in this worktree shows phases 1–8 under `Phase record`. A fresh design reviewer passes both captures.
+- Board (`board.tsx`):
+  - Units sort running, then standing by, then run done.
+  - A finished unit is one line: `Run done` plus its finish.
+  - With no phase running, the stage moves to the header line.
+  - The strip separator prints only with cells.
+  - `workersText` skips empty parts.
+  - A predicted finish shows only with a later phase predicted.
+  - The workers line hides when every worker has ended.
+- `board_json.py` `workers`: roster `done` reads `idle`, and `doing` drops `launcher: ` and the trailing summary or findings path, stripped.
+- Unit view (`unit.tsx`):
+  - Empty blocks are not drawn.
+  - Worker columns pad to the widest entry.
+  - An empty record reads `no phases recorded`.
+- `geometry.ts`: the ruler takes the open row of the current phase id.
+- `phase_table.build_run(plan, events)` builds the record from one run's events when the plan has no phases. `build_plan` and `build_run` share `_build_phase_record`, `_open_instance`, `_with_history` and `_plan_finish`.
+  - Every `phase_finished` is a done row, titled from the finish event.
+  - The open row is matched by instance id regardless of the title filter.
