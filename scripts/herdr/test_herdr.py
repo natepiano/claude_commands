@@ -6,6 +6,7 @@ import json
 import io
 from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 import os
 import signal
 import subprocess
@@ -16,10 +17,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast, override
+from typing import cast, final, override
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import herdr
 import fake_herdr
@@ -84,6 +86,173 @@ class WaitingAgentCLI:
         self.returncode = -9
 
 
+@final
+class PromptSubmissionTests(unittest.TestCase):
+    """Real scratch transcripts, with every pane command and elapsed second faked."""
+
+    root: Path = Path()
+    transcript: herdr.SessionTranscript = herdr.SessionTranscript(Path(), "fixture")
+    path: Path = Path()
+    launched_at: datetime = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    elapsed: float = 0
+    ready_at: float = 0
+    typed: list[tuple[str, str, float]] = []
+    enters: list[tuple[str, tuple[str, ...]]] = []
+    ready_panes: list[str] = []
+    screen: str = ""
+    submit_on_type: bool = False
+    submit_on_enter: int = 0
+    client: herdr.Herdr = herdr.Herdr("fixture")
+    start: Mock = Mock()
+    read: Mock = Mock()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
+        self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
+        self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
+        self.path.parent.mkdir(parents=True)
+        self.launched_at = datetime.now(timezone.utc)
+        self.elapsed = 0.0
+        self.ready_at = 0.0
+        self.typed = []
+        self.enters = []
+        self.ready_panes = []
+        self.screen = "────────\n❯ resume the saved work\n────────"
+        self.submit_on_type = False
+        self.submit_on_enter = 0
+        self.client = herdr.Herdr("agents")
+        _ = self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.elapsed))
+        _ = self.enterContext(patch.object(time, "sleep", side_effect=self.advance))
+        self.start = cast(Mock, self.enterContext(patch.object(self.client, "start_command",
+            return_value=subprocess.CompletedProcess(["fixture agent start"], 0, "", ""))))
+        _ = self.enterContext(patch.object(self.client, "readiness", side_effect=self.readiness))
+        self.read = cast(Mock, self.enterContext(patch.object(self.client, "run", side_effect=self.read_screen)))
+        _ = self.enterContext(patch.object(self.client, "prompt", side_effect=self.type_prompt))
+        _ = self.enterContext(patch.object(self.client, "send_keys", side_effect=self.enter_prompt))
+
+    def advance(self, seconds: float) -> None:
+        self.assertGreater(seconds, 0)
+        self.elapsed += seconds
+
+    def readiness(self, pane: str) -> herdr.WorkerReadiness:
+        self.ready_panes.append(pane)
+        return {"agent_status": "idle" if pane == "sibling:p1" or self.elapsed >= self.ready_at else "starting",
+                "interactive_ready": pane == "sibling:p1" or self.elapsed >= self.ready_at}
+
+    def read_screen(self, *arguments: str) -> str:
+        self.assertEqual(arguments, ("pane", "read", "destination:p1", "--source", "visible"))
+        return self.screen
+
+    def write_turn(self, text: str, *, kind: str = "user", meta: bool = False,
+                   seconds_after_launch: float = 1, blocks: bool = False) -> None:
+        content: object = [{"type": "text", "text": text}] if blocks else text
+        row = {"type": kind, "isMeta": meta,
+               "timestamp": (self.launched_at + timedelta(seconds=seconds_after_launch)).isoformat(),
+               "message": {"role": kind, "content": content}}
+        with self.path.open("a") as stream:
+            _ = stream.write(json.dumps(row) + "\n")
+
+    def type_prompt(self, pane: str, text: str) -> None:
+        self.typed.append((pane, text, self.elapsed))
+        if self.submit_on_type:
+            self.write_turn(text, seconds_after_launch=self.elapsed + 1)
+
+    def enter_prompt(self, pane: str, *keys: str) -> None:
+        self.enters.append((pane, keys))
+        if len(self.enters) == self.submit_on_enter:
+            self.write_turn("resume the saved work", seconds_after_launch=self.elapsed + 1)
+
+    def submit(self, timeout_ms: int = 30_000) -> herdr.PromptSubmitOutcome:
+        return self.client.submit_opening_prompt("destination:p1",
+            herdr.OpeningPrompt("resume the saved work", self.transcript), self.launched_at, timeout_ms)
+
+    def test_shared_tab_lost_enter_is_retried_once_without_typing_the_prompt_twice(self) -> None:
+        self.submit_on_enter = 1
+        outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+            ["--resume", "moved-session"], herdr.OpeningPrompt("resume the saved work", self.transcript), 30_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                         [("destination:p1", "resume the saved work")])
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+        cast(Mock, self.start).assert_called_once()
+        self.assertEqual(set(self.ready_panes), {"destination:p1"})
+        cast(Mock, self.read).assert_called_once()
+
+    def test_no_user_turn_and_no_prompt_in_the_input_reports_not_submitted(self) -> None:
+        self.screen = "────────\n❯ \n────────"
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_prompt_is_typed_only_after_the_destination_becomes_ready_ten_seconds_later(self) -> None:
+        self.ready_at = 10
+        self.submit_on_type = True
+        self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertGreaterEqual(self.typed[0][2], 10)
+        self.assertEqual(self.enters, [])
+
+    def test_meta_peer_turn_and_old_user_turn_cannot_prove_the_opening_prompt(self) -> None:
+        self.write_turn("resume the saved work", meta=True)
+        self.write_turn("resume the saved work", seconds_after_launch=-1)
+        self.write_turn("resume the saved work", kind="assistant")
+        self.write_turn("another task")
+        self.screen = "────────\n❯ \n────────"
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(self.enters, [])
+
+    def test_only_a_matching_new_user_turn_in_the_destination_transcript_proves_submit(self) -> None:
+        sibling = self.path.with_name("sibling.jsonl")
+        self.write_turn("resume the saved work", blocks=True)
+        _ = self.path.rename(sibling)
+        self.assertIsInstance(herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at),
+                              herdr.PromptNotSubmitted)
+        self.write_turn("context before\nresume the saved work\ncontext after", blocks=True)
+        proof = herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at)
+        self.assertEqual(proof, herdr.PromptSubmitted(self.launched_at + timedelta(seconds=1)))
+
+    def test_a_ready_sibling_tab_never_makes_the_destination_ready(self) -> None:
+        self.ready_at = 60
+        outcome = self.submit(timeout_ms=1_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(set(self.ready_panes), {"destination:p1"})
+        self.assertEqual((self.typed, self.enters), ([], []))
+        self.assertLessEqual(self.elapsed, 1)
+
+    def test_prompt_only_in_scrollback_is_never_flushed_with_enter(self) -> None:
+        self.screen = "❯ resume the saved work\nPrevious response\n────────\n❯ \n────────"
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_an_old_bordered_prompt_above_a_new_unbordered_input_is_scrollback(self) -> None:
+        self.screen = "────────\n❯ resume the saved work\n────────\nPrevious response\n❯ "
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_an_unsubmitted_input_gets_at_most_three_enter_retries(self) -> None:
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))] * 3)
+        self.assertLessEqual(self.elapsed, 30)
+
+    def test_destination_transcript_ready_signal_allows_input_while_process_observation_is_loading(self) -> None:
+        self.ready_at = 60
+        self.write_turn("/remote-control is active", kind="system")
+        self.submit_on_type = True
+        self.assertIsInstance(self.submit(timeout_ms=1_000), herdr.PromptSubmitted)
+        self.assertEqual(self.typed[0][2], 0)
+
+    def test_promptless_codex_restart_needs_no_transcript_or_submit(self) -> None:
+        outcome = self.client.start_agent("codex-worker", "destination:p1", "codex", [],
+                                          herdr.NoOpeningPrompt(), 1_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
+        self.assertEqual((self.typed, self.enters, self.ready_panes), ([], [], []))
+
+
 class HerdrTests(unittest.TestCase):
     root: Path = Path()
     fake: Path = Path()
@@ -98,6 +267,13 @@ class HerdrTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
+        # These fixtures specify process startup and argv; PromptSubmissionTests
+        # exercises the real transcript/readiness path without this substitute.
+        def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
+                      _launched_at: datetime, _timeout_ms: int) -> herdr.PromptSubmitOutcome:
+            client.prompt(pane, opening.text)
+            return herdr.PromptSubmitted(datetime.now(timezone.utc))
+        _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.fake = self.root / "fake-herdr"
         source = Path(__file__).with_name("fake_herdr.py").read_text()
@@ -1202,7 +1378,7 @@ class HerdrTests(unittest.TestCase):
                     ["--session", "fixture", "pane", "list"]])
 
     def test_promptless_start_never_sends_input(self) -> None:
-        self.herdr.start_agent("worker", "pane-1", "claude", ["-n", "solo"], herdr.NoOpeningPrompt(), 90_000)
+        _ = self.herdr.start_agent("worker", "pane-1", "claude", ["-n", "solo"], herdr.NoOpeningPrompt(), 90_000)
         self.assertEqual(self.start_commands(), [["--session", "fixture", "agent", "start", "worker", "--kind",
                                            "claude", "--pane", "pane-1", "--timeout", "90000", "--", "-n", "solo"]])
 
@@ -1406,7 +1582,7 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(arguments, code=1, stderr=json.dumps({"error": {"code": "agent_not_ready", "message": "trust dialog"}}))
         self.configure_herdr(["pane", "read", "pane-1", "--source", "visible"], "Trust this folder?")
         with self.assertRaises(herdr.AgentNotReady) as raised:
-            self.herdr.start_agent("worker", "pane-1", "claude", ["--model", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 100)
+            _ = self.herdr.start_agent("worker", "pane-1", "claude", ["--model", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 100)
         self.assertEqual(raised.exception.screen, "Trust this folder?")
         self.assertEqual(self.start_commands(), [["--session", "fixture", *arguments], ["--session", "fixture", "pane", "read", "pane-1", "--source", "visible"]])
 
@@ -1458,7 +1634,7 @@ class HerdrTests(unittest.TestCase):
 
         process, calls = self.startup_watch(clock, 90, advance, lambda: self.startup_observation(["zsh"]))
         with self.assertRaisesRegex(herdr.AgentExited, "fixture:pane-1.*exited"):
-            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+            _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertLess(clock.elapsed, 1)
         self.assertTrue(process.killed)
         self.assertEqual(len(calls), 1)
@@ -1478,7 +1654,7 @@ class HerdrTests(unittest.TestCase):
                 _ = (self.proc / "11/stat").write_text(stat)
 
         process, calls = self.startup_watch(clock, 4.3, advance, lambda: self.startup_observation(["zsh"]))
-        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertEqual(process.returncode, 0)
         self.assertFalse(process.killed)
         self.assertEqual(len(calls), 1)
@@ -1500,7 +1676,7 @@ class HerdrTests(unittest.TestCase):
                 _ = stat.write_text(stat.read_text().replace("S 11 ", "S 1 "))
 
         process, calls = self.startup_watch(clock, 4.3, advance, lambda: self.startup_observation(["zsh"]))
-        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertEqual(process.returncode, 0)
         self.assertFalse(process.killed)
         self.assertEqual(len(calls), 1)
@@ -1520,7 +1696,7 @@ class HerdrTests(unittest.TestCase):
 
         process, calls = self.startup_watch(clock, 90, advance, lambda: self.startup_observation(["zsh"]))
         with self.assertRaises(herdr.AgentExited):
-            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+            _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertLess(clock.elapsed, 1)
         self.assertTrue(process.killed)
         self.assertEqual(len(calls), 1)
@@ -1541,7 +1717,7 @@ class HerdrTests(unittest.TestCase):
                         _ = (self.proc / "11/cmdline").write_bytes(b"claude\0")
 
                 process, calls = self.startup_watch(clock, 1.5, advance, lambda: self.startup_observation(["zsh"]))
-                self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+                _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
                 self.assertFalse(process.killed)
                 self.assertEqual(process.returncode, 0)
                 self.assertEqual(len(calls), 1)
@@ -1553,7 +1729,7 @@ class HerdrTests(unittest.TestCase):
             return self.startup_observation(["claude"] if clock.elapsed >= 0.4 else ["zsh"])
 
         process, calls = self.startup_watch(clock, 4.3, lambda: None, observation)
-        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+        _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertFalse(process.killed)
         self.assertLessEqual(len(calls), 1 + int(clock.elapsed * 2))
         self.assertTrue(all(later[0] - earlier[0] >= 0.5 for earlier, later in zip(calls, calls[1:])))
@@ -1566,7 +1742,7 @@ class HerdrTests(unittest.TestCase):
 
         process, calls = self.startup_watch(clock, 90, lambda: None, observation)
         with self.assertRaises(herdr.AgentExited):
-            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+            _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertLess(clock.elapsed, 2)
         self.assertTrue(process.killed)
         self.assertGreaterEqual(len(calls), 3)
@@ -1597,7 +1773,7 @@ class HerdrTests(unittest.TestCase):
         )
         _ = self.fake.write_text(source)
         self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], code=1, stderr="unreadable")
-        self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.OpeningPrompt("continue"), 90_000)
+        _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.OpeningPrompt("continue"), 90_000)
         self.assertTrue(any(command[2:4] == ["pane", "process-info"] for command in self.commands()))
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "agent", "prompt", "pane-1", "continue"])
 
@@ -1607,11 +1783,11 @@ class HerdrTests(unittest.TestCase):
             code=1, stderr=json.dumps({"error": {"code": "agent_start_failed",
                                               "message": "agent process exited before becoming interactive"}}))
         with self.assertRaises(herdr.AgentExited):
-            self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
+            _ = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.NoOpeningPrompt(), 90_000)
         self.assertEqual(len(self.start_commands()), 1)
 
     def test_start_sends_exactly_one_multiline_prompt(self) -> None:
-        self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 200)
+        _ = self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 200)
         self.assertEqual(self.start_commands(), [
             ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "200", "--", "-m", "fixture-model"],
             ["--session", "fixture", "agent", "prompt", "pane-1", "opening\nprompt"],
@@ -1646,7 +1822,7 @@ class HerdrTests(unittest.TestCase):
         arguments = self.start_responses(10_000, [busy, busy, {"stdout": "", "code": 0}])
         pause = Mock()
         with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
-            self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue\nworking"), 10_000)
+            _ = self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue\nworking"), 10_000)
         self.assertEqual(self.start_commands(), [arguments, arguments, arguments,
                                           ["--session", "fixture", "agent", "prompt", "pane-1", "continue\nworking"]])
         self.assertEqual([call.args for call in pause.call_args_list], [(0.1,), (0.1,)])
@@ -1665,7 +1841,7 @@ class HerdrTests(unittest.TestCase):
 
         with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: elapsed[0], sleep=advance)):
             with self.assertRaisesRegex(herdr.HerdrFailure, "last busy") as raised:
-                self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), 3200)
+                _ = self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), 3200)
         self.assertEqual(raised.exception.code, "agent_pane_busy")
         self.assertEqual(self.start_commands(), attempts)
 
@@ -1678,7 +1854,7 @@ class HerdrTests(unittest.TestCase):
                 pause = Mock()
                 with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
                     with self.assertRaises(herdr.HerdrFailure) as raised:
-                        self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), timeout_ms)
+                        _ = self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), timeout_ms)
                 self.assertEqual(raised.exception.code, "invalid_agent_timeout")
                 self.assertEqual(self.start_commands(), [arguments])
                 pause.assert_not_called()
@@ -1693,13 +1869,13 @@ class HerdrTests(unittest.TestCase):
                 pause = Mock()
                 with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
                     with self.assertRaisesRegex(herdr.HerdrFailure, "start refused") as raised:
-                        self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), 10_000)
+                        _ = self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], herdr.OpeningPrompt("continue"), 10_000)
                 self.assertEqual(raised.exception.code, code)
                 self.assertEqual(self.start_commands(), [arguments])
                 pause.assert_not_called()
 
     def test_claude_start_passes_only_extra_arguments_after_separator(self) -> None:
-        self.herdr.start_agent(
+        _ = self.herdr.start_agent(
             "worker", "pane-1", kind="claude",
             agent_arguments=["--resume", "conversation", "--model", "fixture-model"],
             opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
@@ -1718,7 +1894,7 @@ class HerdrTests(unittest.TestCase):
         for kind in ("claude", "codex"):
             with self.subTest(kind=kind):
                 with self.assertRaisesRegex(ValueError, "agent_arguments must omit"):
-                    self.herdr.start_agent(
+                    _ = self.herdr.start_agent(
                         "worker", "pane-1", kind=kind, agent_arguments=[kind, "--resume", "conversation"],
                         opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
                     )
@@ -1726,7 +1902,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_module_start_refuses_executable_before_pane_lookup(self) -> None:
         with self.assertRaisesRegex(ValueError, "agent_arguments must omit"):
-            herdr.start_agent(
+            _ = herdr.start_agent(
                 "fixture", "pane-1", kind="claude", agent_arguments=["claude", "--resume", "conversation"],
                 opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
             )
@@ -1734,7 +1910,7 @@ class HerdrTests(unittest.TestCase):
 
     def test_module_start_passes_extra_arguments_and_uses_pane_label(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{"pane_id": "pane-1", "label": "worker"}]}}))
-        herdr.start_agent(
+        _ = herdr.start_agent(
             "fixture", "pane-1", kind="claude", agent_arguments=["--resume", "conversation"],
             opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
         )
@@ -1755,9 +1931,9 @@ class HerdrTests(unittest.TestCase):
                         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
                             {"pane_id": "7pane-1", "label": label},
                         ]}}))
-                        herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
+                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
                     else:
-                        self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
+                        _ = self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
                     start, prompt = self.start_commands()[-2:]
                     self.assertEqual(start, [
                         "--session", "fixture", "agent", "start", expected, "--kind", "claude",

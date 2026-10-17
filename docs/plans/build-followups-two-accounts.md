@@ -1711,7 +1711,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** saving the queued wording in the episode notice (it outlives the queue); counting a recipient line that ends in `: sent` as delivered (an error text can end that way).
 
-### Phase 60 — A moved session's first prompt is proven sent  · status: todo
+### Phase 60 — A moved session's first prompt is proven sent  · status: done
 
 **Depends on:** Phase 59
 
@@ -1813,3 +1813,30 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Verification:** scratch-HOME suites `scripts.accounts.test_next_moves scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.whoami.test_run_out`; basedpyright clean.
 
 **Acceptance gate:** a half-point hold's minutes come from the pace at hold start and stay fixed; fixed holds unchanged; the list shows natedev's would-be minutes on both machines; the in-place update keeps ids and order and restarts that entry's hold; the Mac forwards the hold verbs and never loses the hold mode; merge gate and Mac suites pass.
+
+### Phase 63 — Submit proof holds at its edges  · status: todo
+
+**Depends on:** Phase 60
+
+#### Work Order
+
+**Goal:** close the four edges Phase 60's first review found and the hard landing rule moved here (repair round 3; none was a regression the phase caused): an old attempt's proof never confirms a later launch, Enter retries reach only the live input, a wrapped prompt is still recognised, and every failed-restart push names its sessions.
+
+**Constraints from prior phases:** Phase 60 saves each launch's typed outcome beside the move note (`restart._save_prompt_outcome` / `_prompt_outcome`, `scripts/shutdown/restart.py` ~891–916, keyed by request id, session id, target and attempt); `_require_submitted_prompt` (~919) sends a missing or mismatched proof through `mark_restart_failed(record, "restart prompt not submitted")`. The attempt is compared only while `progress.kind == "restarting"`. `herdr.py` reads the destination pane for the input line (~925, bordered composer; ~936, joins wrapped screen lines with spaces) before each Enter-only retry, at most 3. `restart_push(label, names, *, machine)` (~2832) renders the names and falls back to the count when they exceed 400 characters; `settle.report_stop` uses the same function. Push texts live in the notify catalog (`scripts/notify`), with its examples.
+
+**Spec:**
+
+1. **Proof belongs to one launch.** A saved outcome confirms only the launch that typed its prompt, whatever the record's progress kind: an attempt that submitted, then failed, followed by a process on the target with no new proof reconciles to `failed`, never `confirmed`.
+2. **Retries reach only live input.** The input line is the composer below the newest assistant output; a bordered prompt above later assistant output is scrollback, and gets no Enter.
+3. **Wrapped input matches.** The text check compares the prompt with the composer's wrapped lines rejoined as the screen wrapped them (no inserted spaces at a wrap inside a word or path); a visible wrapped prompt gets its Enter retries.
+4. **Every failed session is named.** A failed-restart push whose names exceed the push limit splits into as many pushes as needed, each naming its sessions; the count-only text is not used while names are known. Catalog examples match.
+
+**Files:** `scripts/shutdown/restart.py`, `scripts/herdr/herdr.py`, `scripts/notify/` catalog and examples if a text changes; tests `scripts/shutdown/test_restart.py`, `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_settle.py`, `scripts/notify/test_push_texts.py`.
+
+**Workers:** 1 writer + 1 tester.
+
+**Tests (each fails on the pre-phase tree):** an earlier attempt's `PromptSubmitted` with a later manual process and no new proof reconciles to `failed`, driven through the real outcome file, not the success mock; a fake pane with an old bordered prompt above assistant output and no newer marker gets no Enter; a prompt wrapped mid-word in the composer gets an Enter retry and then `PromptSubmitted`; six failed sessions produce pushes naming all six, none count-only.
+
+**Verification:** scratch-HOME suites `scripts.herdr.test_herdr scripts.shutdown.test_restart scripts.shutdown.test_settle scripts.shutdown.test_account_move scripts.notify.test_push_texts`; basedpyright on every changed Python file reports 0 errors and 0 warnings.
+
+**Acceptance gate:** the four cases above pass; Phase 60's tests stay green; merge gate on natedev and the Mac suites pass.

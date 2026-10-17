@@ -13,6 +13,7 @@ import unittest
 from contextlib import chdir, nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import MagicMock, Mock, patch
 
@@ -552,6 +553,20 @@ class StandaloneLaunchTests(unittest.TestCase):
         prompt = self.root / "prompt"
         _ = prompt.write_text("first line\nsecond line\n")
         self.destination("solo")
+        transcript = directory / "projects/fixture/recorded-id.jsonl"
+        self.responses["--session solo agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
+            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        # This fixture turn is written by the fake command, after launch, not before it.
+        original_prompt = herdr.Herdr.prompt
+
+        def submitted(client: herdr.Herdr, pane: str, text: str) -> None:
+            original_prompt(client, pane, text)
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            _ = transcript.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": {"role": "user", "content": text}}) + "\n")
+
+        self.save()
+        _ = self.enterContext(patch.object(herdr.Herdr, "prompt", submitted))
         arguments = ("resume", "solo", "--session-id", "recorded-id", "--cwd", str(self.root),
                      "--config-dir", str(directory), "--prompt-file", str(prompt), "--attach", "--",
                      "--model", "opus", "--remote-control", "kept name", "--settings", '{"x":true}')
@@ -573,6 +588,22 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
         self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={self.root / 'home/.claude'}", workspace)
         self.assertIn("HERDR_AGENT_PANE=1", workspace)
+
+    def test_resume_with_unsubmitted_prompt_reports_failure_without_attaching(self) -> None:
+        directory = self.numbered_account()
+        prompt = self.root / "prompt"
+        _ = prompt.write_text("first prompt")
+        self.destination("solo")
+        for outcome in (herdr.PromptNotSubmitted("fixture absent user turn"), herdr.PromptSubmissionNotRequired()):
+            with (self.subTest(outcome=outcome), patch.object(herdr, "start_new_server"),
+                  patch.object(herdr, "start_agent", return_value=outcome) as start):
+                code, error = self.call("resume", "solo", "--session-id", "recorded-id", "--cwd", str(self.root),
+                    "--config-dir", str(directory), "--prompt-file", str(prompt), "--attach")
+            self.assertEqual(code, 1)
+            self.assertIn("solo: opening prompt not submitted", error)
+            self.assertEqual(start.call_args.kwargs["opening"], herdr.OpeningPrompt("first prompt",
+                herdr.SessionTranscript(directory, "recorded-id")))
+        self.assertEqual(self.attachments, [])
 
     def test_resume_without_prompt_or_attach_leaves_user_input_untouched(self) -> None:
         self.destination("solo")
