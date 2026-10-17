@@ -1,6 +1,7 @@
 """A unit director's own Claude auto-compact window, kept per session across relaunches.
 
-`add_unit.py --resume <id> --autocompact <tokens>` records it; every later `add_unit.py --resume <id>`,
+`add_unit.py --resume <id> --autocompact <tokens>` records it (for a unit already in the Units table it
+only records, launching nothing); every later `add_unit.py --resume <id>`,
 which /shutdown restarts, account moves and renames all run, passes `--autocompact <tokens>` to Claude.
 `--autocompact auto` removes the record, so the session falls back to the saved setting.
 """
