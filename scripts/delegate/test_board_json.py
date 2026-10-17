@@ -261,6 +261,7 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual(response["files"], [str(self.output / "show.json")])
         self.assertEqual(response["focus"], "alpha")
+        self.assertEqual(response["watch"], [str(self.notifier.resolve())])
         self.assertEqual(documents[0]["production"], fixture.slug)
         unit = object_fields(array_items(documents[0]["units"])[0])
         self.assertEqual(unit["key"], "alpha")
@@ -289,7 +290,17 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_no_registered_production_resolves_without_output_files(self) -> None:
         response, documents = self.generate("--cwd", "/")
-        self.assertEqual(response, {"files": [], "focus": None})
+        self.assertEqual(response, {
+            "files": [], "focus": None, "watch": [str(self.notifier.resolve())],
+        })
+        self.assertEqual(documents, [])
+
+    def test_missing_registry_produces_no_discovery_watch_paths(self) -> None:
+        self.notifier.rmdir()
+
+        response, documents = self.generate("--cwd", "/")
+
+        self.assertEqual(response, {"files": [], "focus": None, "watch": []})
         self.assertEqual(documents, [])
 
     def test_output_directory_uses_xdg_then_home_when_no_override_is_set(self) -> None:

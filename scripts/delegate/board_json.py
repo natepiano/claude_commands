@@ -303,7 +303,8 @@ def main(arguments: list[str]) -> int:
         path = root / f"{runner['slug']}.json"
         write_board(path, build(runner))
         files.append(str(path))
-    print(json.dumps({"files": files, "focus": focus}))
+    watch = existing_sources({showrunners.NOTIFIER_STATE_DIR})
+    print(json.dumps({"files": files, "focus": focus, "watch": watch}))
     return 0
 
 

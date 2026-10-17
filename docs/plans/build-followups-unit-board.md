@@ -117,7 +117,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 **Ruled out:** `unit_lookup.run_state` for `state`, which reads every history run file per unit.
 
-### Phase 4 — The board mod  · status: todo
+### Phase 4 — The board mod  · status: done
 **Depends on:** 3
 
 #### Work Order
