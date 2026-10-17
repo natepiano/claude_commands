@@ -39,8 +39,9 @@ One ticket per phase:
   Never split a file's sites between tickets.
 - **Structure:** one crate.
 
-Run tier D first. A repair phase always precedes a new ticket. After an
-interruption, resume the assigned or checkpointed ticket from
+Run tier D first. Structure crates are taken in order of the other-family
+pending cells they block, most first. A repair phase always precedes a new ticket.
+After an interruption, resume the assigned or checkpointed ticket from
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`; never take a second
 one. A checkpointed ticket waits for its merge into the style branch before
 refill. Clear the cargo-liner backlog before hana.

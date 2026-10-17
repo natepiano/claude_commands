@@ -208,13 +208,26 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES) -> tuple[TicketSelection, ...]:
-    cells = tuple(ledger.cells())
-    pending = tuple(cell for cell in cells if cell.state in ("open", "stale"))
-    stale = {crate: sum(cell.state == "stale" for cell in cells if cell.crate == crate)
-             for crate in {cell.crate for cell in cells}}
+    pending: list[style_ledger.Cell] = []
+    stale: dict[str, int] = defaultdict(int)
+    blocked: dict[str, int] = defaultdict(int)
+    structure_crates: set[str] = set()
+    for cell in ledger.cells():
+        stale[cell.crate] += cell.state == "stale"
+        if cell.state in ("open", "stale"):
+            pending.append(cell)
+            if cell.tier == "D":
+                structure_crates.add(cell.crate)
+            elif cell.family != "modules":
+                blocked[cell.crate] += 1
+    crates = sorted(stale, key=lambda crate: (-stale[crate], crate))
+    if family == "modules":
+        crates = sorted(structure_crates, key=lambda crate: (-blocked[crate], -stale[crate], crate)) + [
+            crate for crate in crates if crate not in structure_crates
+        ]
     tip = synced_tip(ledger)
     result: list[TicketSelection] = []
-    for crate in sorted(stale, key=lambda crate: (-stale[crate], crate)):
+    for crate in crates:
         if not crate_in_scope(scope, crate):
             continue
         structure = tuple(cell for cell in pending if cell.crate == crate and cell.tier == "D")
