@@ -449,6 +449,37 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
 
+    def test_a_hold_that_states_its_end_is_not_bumped_before_then(self) -> None:
+        """START is 12:00 PDT: a hold ending at 14:00, dated or not, bumps only once 14:00 is past."""
+        for status in ("— holding: waiting on the re-measure window, which ends 2026-10-06 14:00 PDT",
+                       "— holding: waiting on the re-measure window until 14:00 PDT",
+                       "— holding: waiting on the window until 21:00 UTC"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                for at in (START, START + 300, START + 7199):
+                    self.assertEqual(self.tick(at).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 7199 + 300).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_a_hold_naming_a_past_time_still_bumps(self) -> None:
+        """A time without a date is the nearest one: 11:50 read at 12:00 is this morning, not tonight."""
+        for status in ("— holding: waiting on the tests since 11:50 PDT",
+                       "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                self.assertEqual(len(self.sent()), 2)
+
     def test_shell_seen_then_gone_starts_a_new_idle_stretch(self) -> None:
         _ = self.tick(START)
         _ = self.tick(START + 300)
