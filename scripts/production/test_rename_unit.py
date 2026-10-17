@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
+import fake_showrunner
+
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
 
@@ -364,6 +366,33 @@ class UnitRenameTests(unittest.TestCase):
             with self.subTest(old=old, new=new):
                 self.assert_refused(self.rename("apply", old, new), text)
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
+
+    def mark_live(self, unit: str, session_id: str) -> None:
+        """A live Claude in a tmux session marked as `unit` of this production."""
+        held = fake_showrunner.write_session(self.root / "state/sessions", unit.removesuffix("-unit"), session_id)
+        self.addCleanup(held.close)
+        record = self.root / "state/sessions" / f"{os.getpid()}.json"
+        _ = record.write_text(json.dumps({**json.loads(record.read_text()), "tmux": f"demo-{unit}:@1.%1"}))
+        self.write(self.root / "tmux.json", json.dumps({"$1": {"label": f"demo-{unit}", "panes": ["%1"], "env": {
+            "SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}}}))
+
+    def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
+        log = self.seed_record()
+        (self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json").unlink()
+        self.mark_live("alpha-unit", "sid-alpha")
+        planned = self.rename("plan")
+        self.assert_ok(planned)
+        self.assertIn("1. stop alpha-unit through the shutdown path", planned.stdout)
+        applied = self.rename("apply")
+        self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
+        self.assertIn("alpha-unit is stopping; rerun apply once it has stopped", applied.stderr)
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["down", "--only", "sid-alpha", "--here"]])
+        self.assertEqual(self.journal()["step"], 0)
+
+    def test_a_running_new_id_is_refused(self) -> None:
+        self.mark_live("gamma-unit", "sid-gamma")
+        self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
 
     def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
         for name in ("demo-log.md", "demo-log-recovered.md"):
