@@ -146,7 +146,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     history = merge_branch_history(production.checkout, production.merge_branch)
-    last_code = next((entry for entry in history.entries if isinstance(entry.kind, CodeCheckpoint)), None)
+    last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
     argv = ("bash", str(script), "--to", production.merge_branch, "--fix-commit",
@@ -268,7 +268,7 @@ def notice(production: Production, gate_id: str, kind: str, log: Path | None) ->
         message = f"From the showrunner: {gate_id} lifted — your tests pass without {target} phase {phase} ({log}). Continue."
     else:
         history = merge_branch_history(production.checkout, production.merge_branch)
-        landed = next((entry for entry in history.entries if entry.unit == target and entry.phase == phase
+        landed = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and entry.unit == target and entry.phase == phase
                        and isinstance(entry.kind, CodeCheckpoint)), None)
         if not isinstance(landed, MergeEntry):
             raise PointFailure("notice clear", f"{target} phase {phase} has no code merge on {production.merge_branch}")

@@ -77,6 +77,7 @@ class UnitRenameTests(unittest.TestCase):
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "PLAN_DELEGATE_SYNC_WRITES": "0",

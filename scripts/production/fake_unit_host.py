@@ -30,6 +30,7 @@ def environment(root: Path) -> dict[str, str]:
     return {
         "HERDR_BIN": str(Path(__file__).resolve().parents[1] / "herdr/fake_herdr.py"),
         "HERDR_PROC": str(root / "proc"),
+        "HERDR_PLATFORM": "linux",
         "FAKE_HERDR_LOG": str(root / "herdr.jsonl"),
         "FAKE_HERDR_RESPONSES": str(responses),
     }

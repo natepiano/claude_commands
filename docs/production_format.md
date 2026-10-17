@@ -314,6 +314,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
+   Standing style units instead use
+   `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`.
+   Refill waits for the previous ticket's merge, so no unmerged unit work remains
+   at phase start. Report a refused fast-forward to the style showrunner as an
+   error; never create a merge commit to work around it.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
    `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
    Worktrees share refs, so no fetch is needed. Check it yourself; a message
@@ -431,7 +436,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     positional arguments. The unit's reviewer is permanent: each review
     resumes its thread, and the pool forks a second one only while two reviews
     run at once. `<slug>` is the production doc's file name without
-    `-production.md`.
+    `-production.md`. Until `review-unit` primes the pool, the launcher
+    refuses with `no primed code template`: send that review to an idle
+    worker with `--to`, and tell the showrunner once.
 
 17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
     through `/issue` with tag `proposal`, `proposed_by` your unit's name, and

@@ -344,7 +344,9 @@ def _rewrite_plans(plan: RenamePlan) -> None:
 def _rewrite_check(instance: Path, plan: RenamePlan) -> None:
     conf = instance / "conf"
     checked = showrunners.checked_doc(instance)
-    if not isinstance(checked, showrunners.CheckedDoc) or checked.path not in (plan.old_doc, plan.new_doc):
+    # Compared resolved: a doc under /tmp is /private/tmp on the Mac, and either spelling may be the one recorded.
+    docs = (plan.old_doc.resolve(), plan.new_doc.resolve())
+    if not isinstance(checked, showrunners.CheckedDoc) or checked.path.resolve() not in docs:
         raise RenameRefused(f"{conf}: CHECK no longer names this production")
     text = conf.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
@@ -356,7 +358,7 @@ def _rewrite_check(instance: Path, plan: RenamePlan) -> None:
             for token in tokens:
                 value = shlex.split(token[0])[0]
                 if follows_script:
-                    if value == str(plan.old_doc):
+                    if Path(value).resolve() == docs[0]:
                         updated_command = command[:token.start()] + shlex.quote(str(plan.new_doc)) + command[token.end():]
                         lines[index] = "CHECK=" + updated_command
                     break

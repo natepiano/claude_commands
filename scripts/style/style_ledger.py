@@ -13,7 +13,8 @@ import sqlite3
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -54,18 +55,45 @@ class ListedSite:
 
 
 @dataclass(frozen=True)
-class RuleProgress:
+class RuleCounts:
     rule_id: str
     tier: Tier
-    family: Family | None
-    cells_current: int
-    cells_total: int
-    done: bool
+    current: int
+    stale: int
+    open: int
+    awaiting_merge: int
+    held: int
+
+    @property
+    def total(self) -> int:
+        return self.current + self.stale + self.open + self.awaiting_merge
+
+    @property
+    def complete(self) -> bool:
+        return self.current == self.total
+
+
+@dataclass(frozen=True)
+class WholeRepository:
+    """Coverage across every crate in the repository."""
+
+
+@dataclass(frozen=True)
+class CrateCoverage:
+    crate: str
+
+
+CoverageScope = WholeRepository | CrateCoverage
+_WHOLE_REPOSITORY = WholeRepository()
+
+
+def _crate_filter(scope: CoverageScope) -> str | None:
+    return scope.crate if isinstance(scope, CrateCoverage) else None
 
 
 FindingKind = Literal["rename", "type", "restructure"]
-HeldStateName = Literal["unfiled", "filed", "waived"]
-TicketKind = Literal["read", "listed", "structure"]
+HeldStateName = Literal["unfiled", "filed", "waived", "built"]
+TicketKind = Literal["read", "listed", "structure", "proposal"]
 TicketState = Literal["queued", "assigned", "checkpointed", "merged", "dropped"]
 
 
@@ -85,6 +113,65 @@ class Waived:
 
 
 @dataclass(frozen=True)
+class Built:
+    """The approved finding has merged into the style branch."""
+
+
+@dataclass(frozen=True)
+class AllHeldFindings:
+    """Findings in every state."""
+
+
+@dataclass(frozen=True)
+class HeldFindingsInState:
+    state: HeldStateName
+
+
+@dataclass(frozen=True)
+class ApprovedProposal:
+    issue: Path
+    unit: str
+    finding_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SelectedByCoverage:
+    """The ticket requires the mechanical change filter against its saved base."""
+
+    base: str
+
+
+@dataclass(frozen=True)
+class HeldJudgment:
+    rule: str
+    path: str
+    commit: str
+    ticket: str
+    worker: str
+    rule_blob: str
+
+
+@dataclass(frozen=True)
+class CellWaived:
+    judgment: HeldJudgment
+
+
+@dataclass(frozen=True)
+class CellStillHeld:
+    judgment: HeldJudgment
+
+
+@dataclass(frozen=True)
+class InputChangedSinceJudged:
+    """The held judgment no longer describes the current input."""
+
+
+@dataclass(frozen=True)
+class NoHeldJudgment:
+    """There is no held judgment for this finding's cell."""
+
+
+@dataclass(frozen=True)
 class HeldFinding:
     finding_id: str
     rule: str
@@ -96,7 +183,7 @@ class HeldFinding:
     after: str
     rule_blob: str
     ticket: str
-    state: Unfiled | Filed | Waived
+    state: Unfiled | Filed | Waived | Built
 
 
 @dataclass(frozen=True)
@@ -160,6 +247,7 @@ class TicketRecord(TypedDict):
     state: TicketState
     branch: str
     base: str
+    proposal: str
     checkpoint: str
     created_at: str
     updated_at: str
@@ -396,6 +484,9 @@ MIGRATIONS = {
         CREATE TABLE rule_texts (blob TEXT PRIMARY KEY, text BLOB NOT NULL);
         ALTER TABLE tickets ADD COLUMN base TEXT NOT NULL DEFAULT '';
     """,
+    6: """
+        ALTER TABLE tickets ADD COLUMN proposal TEXT NOT NULL DEFAULT '';
+    """,
 }
 
 
@@ -486,8 +577,8 @@ class Ledger:
         return datetime.fromisoformat(rows[0][0])
 
     def _ticket(self, ticket_id: str) -> TicketRecord:
-        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str]],
-                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base FROM tickets WHERE id=?", (ticket_id,)).fetchall())
+        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str, str]],
+                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base,proposal FROM tickets WHERE id=?", (ticket_id,)).fetchall())
         if not rows:
             raise LedgerError(f"unknown ticket {ticket_id}")
         row = rows[0]
@@ -496,7 +587,7 @@ class Ledger:
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
             "rules": cast(list[str], json.loads(row[8])), "rule_blobs": cast(dict[str, str], json.loads(row[9])),
             "state": row[10], "branch": row[11], "checkpoint": row[12], "created_at": row[13], "updated_at": row[14],
-            "base": row[15],
+            "base": row[15], "proposal": row[16],
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -515,6 +606,7 @@ class Ledger:
     def ticket_add(
         self, id: str, unit: str, kind: TicketKind, family: str, crate: str,
         files: list[str], rules: list[str], rule: str = "", sites: list[dict[str, object]] | None = None,
+        proposal: str = "",
     ) -> None:
         if not re.fullmatch(re.escape(unit) + r"-\d+", id):
             raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
@@ -533,18 +625,34 @@ class Ledger:
             exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
             if exists:
                 previous = self._ticket(id)
-                if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"]) != (unit, kind, family, crate, files, rules, rule, sites or []):
+                if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return
+            if kind == "proposal":
+                proposal_rows = cast(list[tuple[str, str]], self._connection.execute(
+                    "SELECT finding_id,state FROM held_findings WHERE proposal=?", (proposal,),
+                ).fetchall())
+                if any(state != "filed" for _, state in proposal_rows):
+                    raise LedgerError(f"{id}: proposal requires every finding filed")
+                findings = tuple(self._held(row[0]) for row in proposal_rows)
+                if not proposal or not findings:
+                    raise LedgerError(f"{id}: proposal requires filed findings")
+                if set(files) != {finding.path for finding in findings} or set(rules) != {finding.rule for finding in findings}:
+                    raise LedgerError(f"{id}: proposal files and rules must match its filed findings")
+            elif proposal:
+                raise LedgerError(f"{id}: proposal is for proposal tickets only")
             self._catalog = rule_catalog.load_rules(self.repo)
             definitions = {rule_id: self._component_rule(rule_id) for rule_id in rules}
             pins = {rule_id: definition.blob for rule_id, definition in definitions.items()}
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                hashed = subprocess.run(
+                result = subprocess.run(
                     ["git", "-C", str(self.repo), "hash-object", "--stdin"],
-                    input=text, capture_output=True, check=True,
-                ).stdout.decode().strip()
+                    input=text, capture_output=True, check=False,
+                )
+                if result.returncode:
+                    raise LedgerError(result.stderr.decode(errors="replace").strip() or "git hash-object failed")
+                hashed = result.stdout.decode().strip()
                 if hashed != pins[rule_id]:
                     raise LedgerError(f"{rule_id}: rule changed while pinning; rerun")
                 _ = self._connection.execute(
@@ -552,10 +660,10 @@ class Ledger:
                 )
             now = _now()
             _ = self._connection.execute(
-                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at) "
-                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?)",
+                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,proposal) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?,?)",
                 (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
-                 json.dumps(rules), json.dumps(pins, sort_keys=True), now, now),
+                 json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal),
             )
 
     def pinned_rule_texts(self, ticket_id: str) -> tuple[PinnedRuleText, ...]:
@@ -602,6 +710,11 @@ class Ledger:
                 active = self.ticket_open(ticket["unit"])
                 if active:
                     raise LedgerError(f"{id}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
+            if target == "merged" and ticket["kind"] == "proposal":
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET state='built',updated_at=? WHERE proposal=? AND state='filed'",
+                    (_now(), ticket["proposal"]),
+                )
             _ = self._connection.execute(
                 "UPDATE tickets SET state=?,branch=?,checkpoint=?,updated_at=? WHERE id=?",
                 (target, branch if target == "assigned" else ticket["branch"],
@@ -630,7 +743,32 @@ class Ledger:
         self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
 
     def ticket_merge(self, id: str) -> None:
+        ticket = self._ticket(id)
+        if ticket["state"] == "merged":
+            return
+        if ticket["state"] != "checkpointed":
+            raise LedgerError(f"{id}: cannot become merged from {ticket['state']}")
+        rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+        branch = rows[0][0] if rows else ""
+        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
+        if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
+            raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         self._ticket_transition(id, "merged")
+
+    def ticket_origin(self, id: str) -> ApprovedProposal | SelectedByCoverage:
+        ticket = self._ticket(id)
+        if ticket["kind"] != "proposal":
+            return SelectedByCoverage(ticket["base"])
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT finding_id FROM held_findings WHERE proposal=? ORDER BY finding_id", (ticket["proposal"],),
+        ).fetchall())
+        return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(row[0] for row in rows))
+
+    def proposal_tickets(self) -> tuple[TicketRecord, ...]:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE kind='proposal' ORDER BY created_at,id",
+        ).fetchall())
+        return tuple(self._ticket(row[0]) for row in rows)
 
     def ticket_drop(self, id: str) -> None:
         self._ticket_transition(id, "dropped")
@@ -662,6 +800,26 @@ class Ledger:
             if not to:
                 raise LedgerError("hand-off send requires --to")
             _ = self._connection.execute("UPDATE handoffs SET state='sent',sent_to=?,updated_at=? WHERE checkpoint=?", (to, _now(), checkpoint))
+
+    def handoff_reroute(self, checkpoint: str, to: str) -> None:
+        checkpoint = _git(self.repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
+        if not to:
+            raise LedgerError("hand-off reroute requires --to")
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            rows = cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT state,sent_to FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchall())
+            if not rows:
+                raise LedgerError(f"unknown hand-off {checkpoint}")
+            state, sent_to = rows[0]
+            if state != "sent":
+                hint = "; use handoff send" if state == "pending" else ""
+                raise LedgerError(f"{checkpoint}: cannot reroute hand-off in state {state}{hint}")
+            if sent_to != to:
+                _ = self._connection.execute(
+                    "UPDATE handoffs SET sent_to=?,updated_at=? WHERE checkpoint=?", (to, _now(), checkpoint),
+                )
 
     def _first_merge(self, checkpoint: str, branch_point: str) -> str:
         for commit in _git(self.repo, "rev-list", "--first-parent", "--reverse", "--merges", branch_point).splitlines():
@@ -746,14 +904,64 @@ class Ledger:
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
         row = rows[0]
-        state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Unfiled()
+        state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Built() if row[10] == "built" else Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state)
 
-    def held_findings(self, state: HeldStateName | None = None) -> tuple[HeldFinding, ...]:
-        rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT finding_id FROM held_findings WHERE (? IS NULL OR state=?) ORDER BY created_at,finding_id", (state, state),
-        ).fetchall())
+    def held_findings(self, selection: AllHeldFindings | HeldFindingsInState) -> tuple[HeldFinding, ...]:
+        if isinstance(selection, HeldFindingsInState):
+            query = self._connection.execute(
+                "SELECT finding_id FROM held_findings WHERE state=? ORDER BY created_at,finding_id", (selection.state,),
+            )
+        else:
+            query = self._connection.execute("SELECT finding_id FROM held_findings ORDER BY created_at,finding_id")
+        rows = cast(list[tuple[str]], query.fetchall())
         return tuple(self._held(row[0]) for row in rows)
+
+    def decline_held(self, finding_id: str, words: str) -> CellWaived | CellStillHeld | InputChangedSinceJudged | NoHeldJudgment:
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            finding = self._held(finding_id)
+            if isinstance(finding.state, Built):
+                raise LedgerError(f"{finding_id}: finding already built")
+            tip = self._synced_tip()
+            self._catalog = rule_catalog.load_rules(self.repo)
+            try:
+                definition = self._component_rule(finding.rule)
+            except LedgerError:
+                _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+                return InputChangedSinceJudged()
+            path = tip.crate(finding.path) if definition.tier == "D" else finding.path
+            rows = cast(list[tuple[int, str, str, str, str, str, str, str, str]], self._connection.execute(
+                'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint FROM judgments '
+                + "WHERE rule=? AND path=? AND verdict='held' ORDER BY recorded_at DESC,id DESC",
+                (finding.rule, path),
+            ).fetchall())
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+            if not rows:
+                return NoHeldJudgment()
+            row = rows[0]
+            judgment = HeldJudgment(*row[1:7])
+            newest = cast(tuple[int], self._connection.execute(
+                "SELECT id FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
+                (finding.rule, path),
+            ).fetchone())[0]
+            try:
+                unchanged = row[8] == self._fingerprint(tip, cast(InputScope, row[7]), path)
+            except LedgerError:
+                unchanged = False
+            if (newest != row[0] or definition.blob != finding.rule_blob or row[6] != finding.rule_blob
+                    or not self._is_ancestor(row[3], tip.commit)
+                    or not unchanged):
+                return InputChangedSinceJudged()
+            others = tuple(other for other in self.held_findings(AllHeldFindings())
+                           if other.rule == finding.rule and not isinstance(other.state, Waived)
+                           and (tip.crate(other.path) if definition.tier == "D" else other.path) == path)
+            if others:
+                return CellStillHeld(judgment)
+            _ = self._connection.execute(
+                "UPDATE judgments SET verdict='waived',verdict_detail=?,recorded_at=? WHERE id=?", (words, _now(), row[0]),
+            )
+            return CellWaived(judgment)
 
     def file_held(self, finding_id: str, proposal: Path) -> None:
         with self._connection:
@@ -762,7 +970,7 @@ class Ledger:
             if isinstance(finding.state, Filed) and finding.state.proposal == proposal:
                 return
             if not isinstance(finding.state, Unfiled):
-                state = "filed" if isinstance(finding.state, Filed) else "waived"
+                state = "filed" if isinstance(finding.state, Filed) else "built" if isinstance(finding.state, Built) else "waived"
                 raise LedgerError(f"{finding_id}: cannot file finding in state {state}")
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
@@ -807,15 +1015,18 @@ class Ledger:
         return tuple(changes)
 
     def summary(self) -> StyleLedgerSummary:
-        cells = tuple(self.cells())
-        progress = tuple(rule for rule in self._rule_progress(cells) if rule.tier in ("A", "B", "C", "D"))
+        return self.summary_of(self.rule_counts(WholeRepository()))
+
+    def summary_of(self, repository_counts: tuple[RuleCounts, ...]) -> StyleLedgerSummary:
+        progress = tuple(rule for rule in repository_counts if rule.tier in ("A", "B", "C", "D"))
+        total = sum(rule.total for rule in repository_counts)
         waiting_rows = self.pending_handoffs()
         waiting = PendingHandoffs(len(waiting_rows), datetime.fromisoformat(waiting_rows[0]["created_at"])) if waiting_rows else NoPendingHandoffs()
         proposals = cast(tuple[int], self._connection.execute("SELECT COUNT(DISTINCT proposal) FROM held_findings WHERE state='filed'").fetchone())[0]
         return StyleLedgerSummary(
-            sum(rule.done for rule in progress), len(progress), sum(rule.tier == "unclassified" for rule in self._catalog),
-            100.0 * sum(cell.state == "current" for cell in cells) / len(cells) if cells else 0.0,
-            sum(cell.state == "stale" for cell in cells), proposals, waiting, self.synced_at(), self._synced_tip().commit,
+            sum(rule.complete for rule in progress), len(progress), sum(rule.tier == "unclassified" for rule in self._catalog),
+            100.0 * sum(rule.current for rule in repository_counts) / total if total else 0.0,
+            sum(rule.stale for rule in repository_counts), proposals, waiting, self.synced_at(), self._synced_tip().commit,
         )
 
     def _refresh_sites(self, tip: RepositoryTip) -> None:
@@ -1088,35 +1299,47 @@ class Ledger:
         for cell, _ in self._coverage(rule, crate):
             yield cell
 
-    def rules(self) -> Iterator[RuleProgress]:
-        yield from self._rule_progress(tuple(self.cells()))
+    def rule_counts(self, scope: CoverageScope) -> tuple[RuleCounts, ...]:
+        return self._count_rows(self._coverage(None, _crate_filter(scope)))
 
-    def _rule_progress(self, cells: tuple[Cell, ...]) -> Iterator[RuleProgress]:
+    def _count_rows(self, coverage: Iterable[tuple[Cell, str]]) -> tuple[RuleCounts, ...]:
+        states: dict[str, Counter[CellState]] = {}
+        held: Counter[str] = Counter()
+        for cell, verdict in coverage:
+            rule_id = cell.rule.removesuffix("#uncovered")
+            if rule_id not in states:
+                states[rule_id] = Counter()
+            states[rule_id][cell.state] += 1
+            if cell.state == "current" and verdict == "held":
+                held[rule_id] += 1
+        rows: list[RuleCounts] = []
         for definition in self._catalog:
             if definition.tier == "unclassified":
                 continue
-            own = [cell for cell in cells if cell.rule in (definition.rule_id, definition.rule_id + "#uncovered")]
-            current = sum(cell.state == "current" for cell in own)
-            yield RuleProgress(definition.rule_id, definition.tier, definition.family, current, len(own),
-                               current == len(own))
+            counts = states.get(definition.rule_id, Counter())
+            rows.append(RuleCounts(definition.rule_id, definition.tier,
+                                   counts["current"], counts["stale"], counts["open"], counts["awaiting merge"],
+                                   held[definition.rule_id]))
+        return tuple(rows)
 
-
-    def status(self, rule: str | None = None, crate: str | None = None, as_json: bool = False) -> None:
-        coverage = tuple(self._coverage(rule, crate))
-        unclassified = self.unclassified_rules()
+    def status(self, rule: str | None = None, scope: CoverageScope = _WHOLE_REPOSITORY, as_json: bool = False) -> None:
         if as_json:
+            coverage = tuple(self._coverage(rule, _crate_filter(scope)))
+            unclassified = self.unclassified_rules()
             print(json.dumps({"cells": [asdict(cell) for cell, _ in coverage], "unclassified_rules": unclassified}, sort_keys=True))
         else:
+            rows = self._count_rows(self._coverage(rule, _crate_filter(scope)))
+            repository_rows = self.rule_counts(scope) if rule or isinstance(scope, CrateCoverage) else rows
+            complete = {row.rule_id: row.complete for row in repository_rows}
+            unclassified = self.unclassified_rules()
             if unclassified:
                 print(f"unclassified: {len(unclassified)} rules — pull nate_style")
             print("rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone")
-            for progress in self.rules():
-                if rule and progress.rule_id != rule.removesuffix("#uncovered"):
+            for row in rows:
+                if rule and row.rule_id != rule.removesuffix("#uncovered"):
                     continue
-                own = [(cell, verdict) for cell, verdict in coverage if cell.rule in (progress.rule_id, progress.rule_id + "#uncovered")]
-                counts = [str(sum(cell.state == state for cell, _ in own)) for state in ("current", "stale", "open", "awaiting merge")]
-                held = sum(cell.state == "current" and verdict == "held" for cell, verdict in own)
-                print("\t".join([progress.rule_id, *counts, str(held), str(progress.done).lower()]))
+                counts = [str(count) for count in (row.current, row.stale, row.open, row.awaiting_merge, row.held)]
+                print("\t".join([row.rule_id, *counts, str(complete[row.rule_id]).lower()]))
 
 
 
@@ -1183,7 +1406,7 @@ def _json_sites(serialized: str) -> list[dict[str, object]]:
 
 def _held_json(finding: HeldFinding) -> dict[str, object]:
     result: dict[str, object] = asdict(finding)
-    result["state"] = "filed" if isinstance(finding.state, Filed) else "waived" if isinstance(finding.state, Waived) else "unfiled"
+    result["state"] = "filed" if isinstance(finding.state, Filed) else "waived" if isinstance(finding.state, Waived) else "built" if isinstance(finding.state, Built) else "unfiled"
     if isinstance(finding.state, Filed):
         result["proposal"] = str(finding.state.proposal)
     return result
@@ -1219,7 +1442,7 @@ def main() -> None:
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
         ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open")),
-        ("handoff", ("add", "send", "merged", "pending")),
+        ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "file", "waive", "list")),
     ):
@@ -1237,9 +1460,10 @@ def main() -> None:
                 if action == "add":
                     for field in ("unit", "family", "crate", "files", "rules"):
                         _ = command.add_argument(f"--{field}", required=True)
-                    _ = command.add_argument("--kind", choices=("read", "listed", "structure"), required=True)
+                    _ = command.add_argument("--kind", choices=("read", "listed", "structure", "proposal"), required=True)
                     _ = command.add_argument("--rule", default="")
                     _ = command.add_argument("--sites", default="[]")
+                    _ = command.add_argument("--proposal", default="")
                 elif action == "assign":
                     _ = command.add_argument("--branch", required=True)
                 elif action == "checkpoint":
@@ -1247,7 +1471,7 @@ def main() -> None:
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
-                if action == "send":
+                if action in ("send", "reroute"):
                     _ = command.add_argument("--to", required=True)
                 elif action == "merged":
                     _ = command.add_argument("--merge-commit", default="")
@@ -1259,7 +1483,7 @@ def main() -> None:
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
             elif action == "list":
-                _ = command.add_argument("--state", choices=("unfiled", "filed", "waived"), default=None)
+                _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built"), default=None)
                 _ = command.add_argument("--json", action="store_true")
             else:
                 _ = command.add_argument("--id", required=True)
@@ -1281,7 +1505,8 @@ def main() -> None:
                     raise LedgerError("diagnostics must be an object of file paths to nonnegative counts")
                 ledger.lint_record(args.tip, args.tool, args.passed == "1", cast(dict[str, int], value))
             elif args.command == "status":
-                ledger.status(args.rule or None, args.crate or None, args.json)
+                scope = CrateCoverage(args.crate) if args.crate else WholeRepository()
+                ledger.status(args.rule or None, scope, args.json)
             elif args.command == "summary":
                 result = ledger.summary().to_json()
                 if args.json:
@@ -1295,7 +1520,7 @@ def main() -> None:
             elif args.command == "ticket":
                 if args.action == "add":
                     ledger.ticket_add(args.id, args.unit, cast(TicketKind, args.kind), args.family, args.crate,
-                                      _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites))
+                                      _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites), args.proposal)
                 elif args.action == "assign":
                     ledger.ticket_assign(args.id, args.branch)
                 elif args.action == "checkpoint":
@@ -1312,6 +1537,8 @@ def main() -> None:
                     ledger.handoff_add(args.checkpoint)
                 elif args.action == "send":
                     ledger.handoff_send(args.checkpoint, args.to)
+                elif args.action == "reroute":
+                    ledger.handoff_reroute(args.checkpoint, args.to)
                 elif args.action == "merged":
                     ledger.handoff_merged(args.checkpoint, args.merge_commit)
                 else:
@@ -1335,7 +1562,7 @@ def main() -> None:
                 elif args.action == "waive":
                     ledger.waive_held(args.id)
                 else:
-                    findings = ledger.held_findings(args.state)
+                    findings = ledger.held_findings(HeldFindingsInState(args.state) if args.state else AllHeldFindings())
                     if args.json:
                         print(json.dumps([_held_json(finding) for finding in findings], sort_keys=True))
                     else:
