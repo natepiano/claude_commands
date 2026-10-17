@@ -1,4 +1,4 @@
-"""The ordered, one-shot Claude group moves kept on the role-map host."""
+"""The ordered, one-shot Claude group and Codex workers moves kept on the role-map host."""
 from __future__ import annotations
 
 import fcntl
@@ -29,7 +29,7 @@ class NextMoveHoldRemoval(Protocol):
 
 
 @dataclass(frozen=True)
-class NextMove:
+class ClaudeGroupMove:
     id: str
     group: Literal["units", "showrunners"]
     at_percent: float
@@ -55,14 +55,59 @@ class NextMove:
             raise NextMoveError("next: added_at needs a zone")
 
 
+
+@dataclass(frozen=True)
+class CodexWorkersTarget:
+    label: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"codex[1-9][0-9]*", self.label):
+            raise NextMoveError("next: workers target must be a numbered Codex account")
+
+
+@dataclass(frozen=True)
+class DelegateToClaude:
+    """Route future workers work to Claude until the source weekly reset."""
+
+
+@dataclass(frozen=True)
+class WorkersMove:
+    id: str
+    at_percent: float
+    to: CodexWorkersTarget | DelegateToClaude
+    added_at: datetime
+
+    @property
+    def group(self) -> Literal["workers"]:
+        return "workers"
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise NextMoveError("next: expected an id")
+        if isinstance(self.at_percent, bool) or not 0 <= self.at_percent <= 100 or not math.isfinite(self.at_percent):
+            raise NextMoveError("next: percent must be from 0 to 100")
+        if self.added_at.utcoffset() is None:
+            raise NextMoveError("next: added_at needs a zone")
+
+
+NextMove = ClaudeGroupMove | WorkersMove
+NextMoveGroup = Literal["units", "showrunners", "workers"]
+
+
+def target_label(entry: NextMove) -> str:
+    if isinstance(entry, ClaudeGroupMove):
+        return entry.to
+    return entry.to.label if isinstance(entry.to, CodexWorkersTarget) else "claude"
+
+
 def next_moves_file() -> Path:
     return Path.home() / ".local/state/accounts/next_moves.json"
 
 
 def encode_next_moves(entries: tuple[NextMove, ...]) -> str:
     return json.dumps([dict(id=entry.id, group=entry.group, at_percent=entry.at_percent,
-                            hold_minutes=entry.hold_minutes, to=entry.to,
-                            added_at=entry.added_at.isoformat()) for entry in entries])
+                            **({"hold_minutes": entry.hold_minutes} if isinstance(entry, ClaudeGroupMove) else {}),
+                            to=target_label(entry), added_at=entry.added_at.isoformat()) for entry in entries])
 
 
 def decode_next_moves(text: str) -> tuple[NextMove, ...]:
@@ -78,13 +123,20 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
             fields = cast(dict[str, object], item)
             name, group, target, added = (fields.get(key) for key in ("id", "group", "to", "added_at"))
             percent, hold = fields.get("at_percent"), fields.get("hold_minutes", 0)
-            if (not isinstance(name, str) or group not in ("units", "showrunners")
+            if (not isinstance(name, str) or group not in ("units", "showrunners", "workers")
                     or not isinstance(target, str) or not isinstance(added, str)
                     or not isinstance(percent, (int, float)) or isinstance(percent, bool)
                     or not isinstance(hold, (int, float)) or isinstance(hold, bool)):
                 raise NextMoveError("next: invalid entry fields")
-            entry = NextMove(name, group, float(percent),
-                             float(hold), target, datetime.fromisoformat(added))
+            entry: NextMove
+            if group == "workers":
+                if hold != 0:
+                    raise NextMoveError("next: workers entries cannot hold minutes")
+                destination = DelegateToClaude() if target == "claude" else CodexWorkersTarget(target)
+                entry = WorkersMove(name, float(percent), destination, datetime.fromisoformat(added))
+            else:
+                entry = ClaudeGroupMove(name, group, float(percent),
+                                        float(hold), target, datetime.fromisoformat(added))
             if entry.id in ids:
                 raise NextMoveError("next: duplicate entry id")
             ids.add(entry.id)
@@ -133,9 +185,11 @@ def write_next_moves(entries: tuple[NextMove, ...]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def add_next_move(group: Literal["units", "showrunners"], at_percent: float, to: str,
+def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
                   hold_minutes: float = 0) -> NextMove:
-    entry = NextMove(uuid4().hex, group, at_percent, hold_minutes, to, datetime.now(timezone.utc))
+    # All text-to-domain conversions use the same boundary as file and remote reads.
+    entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
+        hold_minutes=hold_minutes, to=to, added_at=datetime.now(timezone.utc).isoformat())]))[0]
     if not role_map.is_role_map_host():
         try:
             response = role_map.ssh_role_map(("next-write", encode_next_moves((entry,))))
@@ -173,5 +227,6 @@ def remove_next_move(entry_id: str) -> None:
 
 
 def render_next_move(entry: NextMove) -> str:
-    hold = f" (hold {entry.hold_minutes:g} minutes)" if entry.hold_minutes else ""
-    return f"{entry.id}: when {entry.group} reach {entry.at_percent:g}% → {entry.to}{hold}"
+    hold = (f" (hold {entry.hold_minutes:g} minutes)"
+            if isinstance(entry, ClaudeGroupMove) and entry.hold_minutes else "")
+    return f"{entry.id}: when {entry.group} reach {entry.at_percent:g}% → {target_label(entry)}{hold}"
