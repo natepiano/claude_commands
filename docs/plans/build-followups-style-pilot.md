@@ -364,7 +364,23 @@ Pending: parent's saved style child summary and rendered style line.
   long files, but these findings came from read tickets, so the sample is
   re-judged once fix O's windows land.
 
+- **Dedicated name-bindings pass:** one blind judge, holding only the
+  name-bindings rule, read the 20 cargo-handler files in fix O's windows
+  and traced every argument that comes from a local binding into the
+  parameter it fills. It caught 3 of the 6 one-rule findings (50%), and
+  23 more the one-rule judge missed, mostly test fixtures named for where
+  they came from (`state` filling `natedev`, `root` filling `row`). It
+  traced all three misses and dropped them. Two are a binding that fills
+  several parameters with different names (`text` in settings.rs, `cell`
+  in footer_color_tests.rs), where no one name fits and the one-rule fix
+  adds a new binding the rule does not ask for; read that way the score is
+  3 of 4 (75%). The third is a real miss: a binding passed through a `From`
+  conversion takes the outer parameter's name, as the rule's own example
+  passes through `map_or`, but the judge stopped at the conversion's own
+  parameter name. Either reading fails the 95% bar; the reading and any
+  rule-text change go to the showrunner.
+
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
-`a8ae4d2a`, fix N as `5f63b4cf`.
+`a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`.
 Live verification of the fixes and subsequent measurements remain pending.
