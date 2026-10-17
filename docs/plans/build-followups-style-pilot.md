@@ -64,7 +64,7 @@ against the union of one-rule findings using the same model.
 | --- | --- | --- | --- |
 | modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
 | names | FAIL | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
-| types | pending | Sample, family findings and one-rule denominator pending | One-rule reruns on 20 files already checked by types-unit |
+| types | FAIL | types-unit (cargo-port, 20 files) found 50 of 71 one-rule findings: 70.4%; 50 of 61 (82.0%) if `pub` items of a binary crate are not public. By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
 
 Per-rule recall and candidate file-local rules: pending.
 
@@ -332,6 +332,22 @@ Pending: parent's saved style child summary and rendered style line.
   Three of the five comment misses left are module docs at lines 1–3. Fix O
   makes windows the read-ticket procedure; a dedicated name-bindings pass
   follows it.
+
+- **Types recall sample:** seven blind one-rule judges, one per types rule,
+  read 20 cargo-port files the types unit had judged, whole files, no
+  windows. The unit held 50 of their 71 findings (70.4%). Owned booleans
+  hold up (39 of 43), and the unit found sites the judges passed over.
+  If/else chains are the weak rule (7 of 13): half the misses are one
+  decision taken again at several points in a file, the rest short chains
+  over an unnamed set of states. Public failures turns on scope: cargo-port
+  is a binary crate, so none of its `pub` functions is reachable from
+  outside it, and the rule exempts functions not public outside the crate.
+  The judges read `pub` as public and flagged ten send-and-discard sites;
+  the unit read the exemption and held one. Read the binary-crate way,
+  recall is 50 of 61 (82.0%). The rule text does not settle which reading
+  holds; that question went to the showrunner. The misses are not deep in
+  long files, but these findings came from read tickets, so the sample is
+  re-judged once fix O's windows land.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
