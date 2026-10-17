@@ -24,6 +24,7 @@ export function cellWidth(text: string): number {
 
 /** Keep the following column's space even when a title fills its entire cell. */
 export function fitText(text: string, width: number): string {
+  text = text.replace(/\s+/gu, ' ');
   width = Math.max(0, Math.floor(width));
   if (cellWidth(text) <= width) return text;
   if (!width) return '';
@@ -49,7 +50,12 @@ export function doneText(keys: readonly string[], width: number, label = 'Done')
 }
 
 export function overdueText(at: number, now: number): string {
-  return now > at ? ` · overdue ${Math.floor((now - at) / 60)}m` : '';
+  if (now <= at) return '';
+  const minutes = Math.floor((now - at) / 60);
+  const hours = Math.floor(minutes / 60);
+  const elapsed = hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h`
+    : hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+  return ` · overdue ${elapsed}`;
 }
 
 export function runsOf(cells: readonly Cell[]): Run[] {

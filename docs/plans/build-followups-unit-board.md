@@ -233,3 +233,30 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
   - `stage` order: an open pass, then a dispatched batch not yet landed (`Repair round N`), then the open step, then `Phase N running`. It reads `Standing by` only with no phase open.
   - The record is built from the run's own plan (`project_plan_doc`, else `plan_doc`) when that plan differs from the Plan cell. The displayed `plan` stays the Plan cell, and is empty when that file is gone.
 - Install: `mods/.claude-plugin/marketplace.json` (marketplace `nate-local`) lists `unit-board` and `postmaster`. Loading it in user sessions takes a `~/.claude/settings.json` change (`extraKnownMarketplaces` plus `enabledPlugins`), which goes to the user.
+
+### Phase 10 — Unit view fits, and no doubled stage  · status: done
+
+**Goal:** These are the five small defects from the live check of phase 9 (captures `/tmp/claude/ub9-live-trunk.txt`, `/tmp/claude/ub9-live-unit.txt`). The board opens as a side pane about 76 columns wide at a 170x50 terminal, and every fix must hold at that width.
+
+1. **No doubled stage.**
+   - On the board, a unit with no phase running shows its stage once, in the header.
+   - The line under it then shows only the strip, and is not drawn when the strip is empty. Today it reads `● mul_add  Waiting on G3` and then `Waiting on G3  ███████▒`.
+2. **Worker slots are short.**
+   - `board_json.workers` gives a roster entry named with the full mesh name (`claude-build-followups-style-impl`) its slot, with the worktree's mesh prefix removed (`impl`).
+   - Two entries that become the same slot merge into one row, the newer state winning.
+3. **Step rows keep their columns.**
+   - In the unit view's `This phase`, each step label is cut with `fitText` to its column, so at least two spaces stay before the time.
+   - A step row never wraps.
+4. **The unit view fits the pane.**
+   - `UnitView` takes `bodyRows` the way `BoardView` does.
+   - When the content passes the pane, the phase record keeps the open row and the newest rows.
+   - Older done rows fold into one line, `+N earlier: 1–7` (ids in record order).
+   - Todo rows beyond the next three fold into `+N later`.
+   - `This phase` keeps its newest steps and folds older ones into `+N earlier steps`.
+   - Nothing is drawn past `bodyRows`.
+5. **Long overdue reads in hours.**
+   - `overdueText` reads `overdue 50m` under an hour, `overdue 5h 20m` from an hour, and `overdue 2d 3h` from a day.
+
+**Files:** `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`, `mods/unit-board/hooks/geometry.ts`, `mods/unit-board/hooks/register.tsx`, `scripts/delegate/board_json.py`. Tests: `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/geometry.test.ts`, `scripts/delegate/test_board_json.py`.
+
+**Acceptance gate:** mod tsc, mod tests, strict validate, basedpyright 0/0, the full merge gate. After promotion, a live capture of both panes at 170x50.
