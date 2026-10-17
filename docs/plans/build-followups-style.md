@@ -517,7 +517,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green, every Spec test case included; `basedpyright scripts/style` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 - `style_ledger.py report` on a temp mixed-catalog ledger built as in the tests prints the header (with the `awaiting merge` aggregate), the unclassified line and one row per classified rule with an `Awaiting merge` column. The real cargo-liner report runs in the pilot phase.
 
-### Phase 13 — Dailies style line: the style summary states in the parent's dailies  · status: todo
+### Phase 13 — Dailies style line: the style summary states in the parent's dailies  · status: done
 **Depends on:** Phase 6, Phase 7
 
 #### Work Order
