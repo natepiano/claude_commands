@@ -44,9 +44,6 @@ from scripts.accounts.accounts import CodexWorkersAccount
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("waiting.py")
-# A child process reads the fake host as Linux too: herdr is pinned before the script imports it.
-LINUX_HOST = ("import os, runpy, sys; sys.argv = sys.argv[1:]; here = os.path.dirname(sys.argv[0]); sys.path[:0] = [here, os.path.join(here, '..', 'herdr')]; "
-              + "import herdr; herdr._PLATFORM = 'linux'; _ = runpy.run_path(sys.argv[0], run_name='__main__')")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
 ALPHA = "alpha-unit"
 BETA = "beta-unit"
@@ -99,12 +96,8 @@ raise SystemExit(codes[recipient])
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them.
-
-    The fake host is a Linux process tree, so herdr reads it as Linux on the Mac too.
-    """
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
-    _ = unittest.enterModuleContext(mock.patch.object(herdr, "_PLATFORM", "linux"))
 
 
 @final
@@ -187,6 +180,7 @@ class WaitingTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
@@ -1121,7 +1115,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             marked = unit_lookup.marked_units("example")[ALPHA]
         self.assertEqual(marked.place, herdr.HerdrPlace("native", "w1:p1"))
         place = subprocess.run(
-            [sys.executable, "-c", LINUX_HOST, str(SCRIPT.with_name("unit_lookup.py")), "pane", "example", ALPHA],
+            [sys.executable, str(SCRIPT.with_name("unit_lookup.py")), "pane", "example", ALPHA],
             env=self.env, capture_output=True, text=True, check=False,
         )
         self.assertEqual((place.returncode, place.stdout), (0, "herdr:native:w1:p1\n"), place.stderr)

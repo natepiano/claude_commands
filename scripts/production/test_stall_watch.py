@@ -141,6 +141,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }

@@ -87,6 +87,7 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 "NOTIFIER_SESSIONS_DIR": str(records),
                 "HERDR_BIN": str(SCRIPT.parent.parent / "herdr" / "fake_herdr.py"),
                 "HERDR_PROC": str(root / "proc"),
+                "HERDR_PLATFORM": "linux",
                 "FAKE_HERDR_LOG": str(root / "herdr.jsonl"),
                 "FAKE_HERDR_RESPONSES": str(responses_file),
             }

@@ -72,7 +72,7 @@ class LifecycleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.origin = self.root / "origin.git"
         self.checkout = self.root / "checkout"
         self.alpha = self.root / "alpha"
