@@ -974,6 +974,7 @@ class StylePlanTests(unittest.TestCase):
         self.record(last, "crates/alpha", self.tip, "modules-unit-1")
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
             self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 0)
             footprint.assert_called_once()
@@ -996,6 +997,7 @@ class StylePlanTests(unittest.TestCase):
         ledger.ticket_yield("names-unit-1", self.sources[0])
         self.assertEqual({(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}, before)
         with (mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
+              mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
             self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
             footprint.assert_called_once()
@@ -1015,10 +1017,48 @@ class StylePlanTests(unittest.TestCase):
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_ledger.Ledger, "ticket_origin", return_value=origin),
+              mock.patch.object(style_plan, "synced_style_branch", return_value=""),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
             self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
         arguments = cast(list[str], run.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--base") + 1], "base-from-origin")
+
+    def take_style_work_into_judged_ticket(self) -> style_ledger.TicketRecord:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next()[0], 0)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        for rule in ticket["rules"]:
+            for path in ticket["files"]:
+                self.record(rule, path, self.tip, ticket["id"])
+        self.write("incoming.md", "Documentation from the branch point.\n")
+        incoming = self.commit()
+        _ = self.git("merge", "--ff-only", "main", cwd=self.style)
+        _ = self.git("merge", "--ff-only", "style/main", cwd=self.unit)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.unit), incoming)
+        return ticket
+
+    def test_coverage_gate_excludes_direct_branch_point_work_taken_in_from_the_style_branch(self) -> None:
+        ticket = self.take_style_work_into_judged_ticket()
+        result = subprocess.run(
+            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], ticket["base"])
+        self.assertEqual(ticket["base"], self.tip)
+
+    def test_coverage_gate_still_reviews_ticket_edits_after_taking_in_style_branch_work(self) -> None:
+        ticket = self.take_style_work_into_judged_ticket()
+        _ = (self.unit / ticket["files"][0]).write_text("pub fn value() { let count = 7; }\n")
+        result = subprocess.run(
+            [sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit), "--ticket", ticket["id"]],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1, result)
+        self.assertIn("review: ", result.stdout)
+        self.assertIn("check 6:", result.stdout)
+        self.assertEqual(result.stderr, "")
 
     def test_slice_remainders_balance_across_small_directories(self) -> None:
         paths: list[str] = []
