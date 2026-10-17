@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import importlib
 import json
 import os
 import sqlite3
@@ -204,6 +205,12 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(len(self.recorded_wakes()), 2)
 
+    def test_a_send_is_given_send_pys_whole_run_before_it_counts_as_timed_out(self) -> None:
+        """A wake delivered late was stopped at 15 s and reported "timed out" (cargo-liner-style, 2026-10-17)."""
+        sys.path.insert(0, str(style_sync.SCRIPTS / "message"))
+        kill_grace = cast(int, getattr(importlib.import_module("send"), "KILL_GRACE"))
+        self.assertGreater(style_sync.SEND_RUN_SECONDS, style_sync.SEND_SECONDS + kill_grace)
+
     def test_an_older_in_flight_wake_cannot_erase_the_units_new_wait(self) -> None:
         self.production()
         self.waiting_units("names-unit")
@@ -215,7 +222,7 @@ class StyleSyncTests(unittest.TestCase):
         def refill_during_send(arguments: list[str], **options: object) -> object:
             nonlocal interleaved
             if (len(arguments) > 1 and arguments[1] == str(style_sync.SEND)
-                    and options.get("timeout") == 15 and not interleaved):
+                    and options.get("timeout") == style_sync.SEND_RUN_SECONDS and not interleaved):
                 interleaved = True
                 style_sync.wake_waiters(self.repo, "modules-unit-2")
                 with style_ledger.open_ledger(self.repo) as ledger:
