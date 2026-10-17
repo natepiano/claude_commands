@@ -30,7 +30,6 @@ AGENT_LINE = "* claude1: week's usage unknown; refill time unknown; resets unkno
 WAITING_BLOCK = "\n\n\nWaiting on:\n\n* no ETA measured - x"
 ONE_OPEN = "There is 1 open question for you."
 TWO_OPEN = "There are 2 open questions for you."
-QUOTA_LINE = "quota: codex at 12% for the week, resets Tue 14:00"
 
 
 # The counts line a footers-off reply ends with while one question is open.
@@ -781,7 +780,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
         tomorrow = (datetime.now(ZoneInfo(ZONE)) + timedelta(days=1)).strftime("%a")
         valid = [
-            "* " + QUOTA_LINE, "* 19:45 (18:20–23:55) - startup Phase 16",
+            "* 19:45 (18:20–23:55) - startup Phase 16",
             "* 23:30 - later", "* 00:15+1 - overnight",
             f"* {tomorrow} 09:00 - tomorrow", "* no ETA measured - awaiting estimate",
         ]
@@ -793,7 +792,6 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             (["* startup 19:45 (18:20–23:55)"], "ETA"),
             (["* 19:45 PDT - startup"], "zone"),
             (["* 21:00 - later", "* 19:45 - earlier"], "order"),
-            (["* 19:45 - startup", "* " + QUOTA_LINE], "order"),
             (["* no ETA measured - one", "* 19:45 - two"], "order"),
             (["* 23:30 - today", "* 00:15 - earlier today"], "order"),
         ]
@@ -817,7 +815,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         merge = {"since": "2026-10-06T09:00", "text": "merge the branch today?"}
         footer = self.write_open(path)
         self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN)))
-        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN, QUOTA_LINE, "19:45 - startup Phase 16")))
+        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN, "19:45 - startup Phase 16")))
         footer = self.write_open(path, merge)
         self.assert_passes(self.run_hook(self.waiting(footer, TWO_OPEN, "no ETA measured - startup")))
         refused = [
@@ -826,7 +824,6 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             ("the wrong count", ["There are 3 open questions for you."]),
             ("the count for one", [ONE_OPEN]),
             ("the count twice", [TWO_OPEN, TWO_OPEN]),
-            ("the count after a quota line", [QUOTA_LINE, TWO_OPEN]),
             ("no count", ["19:45 - startup Phase 16"]),
         ]
         for name, bullets in refused:
@@ -847,12 +844,11 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
 
     def test_with_nothing_open_the_block_takes_no_line_for_the_user(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
-        self.assert_passes(self.run_hook(self.waiting(footer, QUOTA_LINE, "no ETA measured - startup")))
+        self.assert_passes(self.run_hook(self.waiting(footer, "no ETA measured - startup")))
         for bullet in (ONE_OPEN, "you: choose the path"):
             with self.subTest(bullet=bullet):
                 reason = self.reason(self.waiting(footer, bullet, "no ETA measured - startup"))
                 self.assertIn(f"remove `* {bullet}`", reason)
-                self.assertIn("begins `quota: `", reason)
 
     def test_missing_footer_reason_shows_the_count_line(self) -> None:
         reason = self.assert_blocked_with_current_footer("Done.")
@@ -946,8 +942,14 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn(f"`{showrunner_footer.count_sentence(1)}`", produce)
         self.assertIn("`There are {n} open questions for you.`", produce)
         self.assertEqual(showrunner_footer.count_sentence(7), "There are 7 open questions for you.")
-        self.assertIn(f"led by `{showrunner_footer.QUOTA_LEAD}`", produce)
+        self.assertNotIn("led by `quota: `", produce)
         self.assertNotIn("The user's items come first", produce)
+
+    def test_old_quota_hold_bullet_has_no_footer_exemption(self) -> None:
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        bullet = "quota: Codex usage is exhausted"
+        reason = self.reason(self.waiting(footer, bullet))
+        self.assertIn(f"remove `* {bullet}`", reason)
 
     def test_no_eta_items_and_malformed_leading_eta_cannot_hide_times(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))

@@ -1,4 +1,4 @@
-"""Relay five-hour usage warnings to the quota alert list, once per low spell."""
+"""Log Codex five-hour warnings and relay Claude warnings once per low spell."""
 from __future__ import annotations
 
 import sys
@@ -46,7 +46,7 @@ def cancel_outgoing_notices(key: str, names: list[str]) -> None:
 
 def watch(reports: list[Report], *,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
-    """One line per session told and per alert closed."""
+    """One line per Codex warning, Claude session told and alert closed."""
     lines: list[str] = []
     now = datetime.now(timezone.utc)
     readings = (codex_alert_pass(observe_workers_home(), reports, now)
@@ -87,7 +87,6 @@ def watch(reports: list[Report], *,
         swap_line = codex_swap_line(readings, now) if report.tool.lower() == "codex" else ""
         if swap_line:
             news += "\n" + swap_line
-        names = recipients(config)
         STATE.mkdir(parents=True, exist_ok=True)
         try:
             with marker.open("x", encoding="utf-8") as output:
@@ -96,6 +95,10 @@ def watch(reports: list[Report], *,
             continue
         if old_hold_closed:
             continue
+        if report.tool.lower() == "codex":
+            lines.append(f"5-hour limit: {news}")
+            continue
+        names = recipients(config)
         text = (f"5-hour limit: {news}\nTell the user in one line and change nothing else."
                 + f"\nProtocol: {PROTOCOL}")
         with ThreadPoolExecutor() as pool:
