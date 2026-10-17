@@ -8,9 +8,9 @@
 # one process.
 #
 # Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
-#                --arg showrunner "<session JSON>" --slurpfile labels <by-label.json>
-#                --rawfile colors <statusline.conf> -f statusline.jq
-# Input:      the status line JSON on stdin; labels, showrunner, showrunners and
+#                --arg showrunner "<session JSON>" --arg counts "<id> <row> lines"
+#                --slurpfile labels <by-label.json> --rawfile colors <statusline.conf> -f statusline.jq
+# Input:      the status line JSON on stdin; labels, showrunner, showrunners, counts and
 #             colors are optional; /dev/null stands in for missing input files.
 #             Empty or damaged showrunner text leaves the unit director unnamed.
 # Output:     Line 1: "<role> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
@@ -18,6 +18,9 @@
 #             when the live showrunner record has a name.
 #             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
 #             each " until ..." only when its window carries a reset time.
+#             Line 3, when present: this session's "For you: …" counts row, from
+#             the "<session id> <row>" lines in $counts that statusline.sh reads
+#             from each showrunner's counts cache.
 #             ANSI colors wrap the role, account, tokens and percentages only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
@@ -165,4 +168,8 @@ def usage($config; $label; $window; $fmt):
      usage($colors; "5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
-| $first_line + (if $second_line == "" then "" else "\n" + $second_line end)
+| ((.session_id // "") as $id
+   | [$ARGS.named.counts // "" | split("\n")[]
+      | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]]
+   | join("\n")) as $counts_row
+| [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")

@@ -160,10 +160,17 @@ def add_pending_reviewed(instance_dir: Path, items: list[PendingQuestion]) -> No
     for item in items:
         if item not in combined:
             combined.append(item)
-    if not combined:
+    if combined:
+        write_pending_reviewed(instance_dir, combined)
+
+
+def write_pending_reviewed(instance_dir: Path, items: list[PendingQuestion]) -> None:
+    """Store exactly these questions as waiting to be asked; none deletes the file."""
+    if not items:
+        delete_pending_reviewed(instance_dir)
         return
     record: PendingReviewedRecord = {"items": []}
-    for item in combined:
+    for item in items:
         if isinstance(item, PendingReviewedQuestion):
             record["items"].append({"kind": "reviewed", "text": item.text, "reviewed": item.reviewed})
         else:
@@ -318,13 +325,17 @@ def targeted_instances(session_id: str) -> list[Path]:
     return sorted(matches)
 
 
+def production_doc(instance_dir: Path) -> Path | None:
+    """The production doc an update timer checks: the last word of its conf's CHECK line."""
+    check = shlex.split(key_values(instance_dir / "conf").get("CHECK", ""))
+    return Path(check[-1]) if check else None
+
+
 def read_production(instance_dir: Path) -> Production | None:
     try:
-        conf = key_values(instance_dir / "conf")
-        check = shlex.split(conf.get("CHECK", ""))
-        if not check:
+        doc = production_doc(instance_dir)
+        if doc is None:
             return None
-        doc = Path(check[-1])
         lines = doc.read_text().splitlines()
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":
@@ -459,6 +470,27 @@ def open_questions(productions: list[Production], below: dict[str, list[str]]) -
     return count
 
 
+def deferred_until(slugs: list[str], zone: str) -> datetime | None:
+    """When the soonest item the user deferred falls due, so a count kept from now knows when it ends."""
+    now = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%dT%H:%M")
+    afters: list[str] = []
+    for slug in slugs:
+        try:
+            entries = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        for entry in cast(list[object], entries) if isinstance(entries, list) else []:
+            after = cast(dict[str, object], entry).get("after") if isinstance(entry, dict) else None
+            if isinstance(after, str) and after > now:
+                afters.append(after)
+    if not afters:
+        return None
+    try:
+        return datetime.fromisoformat(min(afters)).replace(tzinfo=ZoneInfo(zone))
+    except ValueError:
+        return None
+
+
 def open_questions_error(bullets: list[str], expected: int | None) -> str | None:
     """Why the block's lines for the user break the count-only rule; None when they keep it.
 
@@ -564,11 +596,16 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
     accepted: list[str] = []
     slugs: set[str] = set()
     for instance in instance_dirs:
-        for item in read_pending_reviewed(Path(instance)):
-            question = pending_question_text(item)
-            accepted.append(question)
-            if normalised(question) not in normalised(reply):
-                return QuestionReplyBlocked(f"Question {item.text!r}: paste its reviewed question into this reply:\n{question}")
+        pending = read_pending_reviewed(Path(instance))
+        missing = [item for item in pending if normalised(pending_question_text(item)) not in normalised(reply)]
+        # A question is shown in full once, when it opens: the reply that carries it ends its wait,
+        # whatever else this hook says of that reply, so no later reply is made to repeat it.
+        if len(missing) < len(pending):
+            write_pending_reviewed(Path(instance), missing)
+        if missing:
+            return QuestionReplyBlocked(f"Question {missing[0].text!r}: paste its reviewed question into this reply:\n"
+                                        + pending_question_text(missing[0]))
+        accepted.extend(pending_question_text(item) for item in pending)
         slugs.add(Path(instance).name.removeprefix("showrunner-"))
     notify_scripts = str(Path(__file__).resolve().parent.parent / "notify")
     if notify_scripts not in sys.path:
@@ -606,11 +643,7 @@ def block_reason(instance_dirs: list[str], reply: str,
             return None
         if not turn.denied and not carries_registered(instance_dirs, reply):
             return NOTHING_FOR_USER
-    reason = footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
-    if reason is None:
-        for instance in instance_dirs:
-            delete_pending_reviewed(Path(instance))
-    return reason
+    return footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
 
 
 def counts_line(productions: list[Production], questions: int) -> str | None:

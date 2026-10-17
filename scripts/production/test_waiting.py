@@ -29,6 +29,7 @@ import merge_checkpoint
 import update_registration
 import waiting
 from cli_fixture import invoke_cli
+import herdr
 from fake_herdr import CommandResponse
 import fake_unit_host
 
@@ -79,8 +80,12 @@ raise SystemExit(codes[recipient])
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    """The times these tests expect are Pacific; the user's zone setting must not change them.
+
+    The fake host is a Linux process tree, so herdr reads it as Linux on the Mac too.
+    """
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    _ = unittest.enterModuleContext(mock.patch.object(herdr, "_PLATFORM", "linux"))
 
 
 @final

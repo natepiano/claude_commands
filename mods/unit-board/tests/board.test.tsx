@@ -14,7 +14,7 @@ async function render($: Engine, on: On, surface: RenderSurface, data: BoardData
   on("ui.render", { component: "Pane", requestId: "phase8-layout" }, ($, event) => {
     const elements = $.ui.resolve(event);
     return detail
-      ? UnitView(elements, columns, data, data.units[0]!, NOW / 1000, () => {})
+      ? UnitView(elements, columns, bodyRows, data, data.units[0]!, NOW / 1000, () => {})
       : BoardView(elements, columns, bodyRows, { files: [], watch: [], loadedAt: NOW / 1000,
         boards: [data], focus: null }, NOW / 1000, () => {});
   });
@@ -65,7 +65,7 @@ function occupiedRows(value: unknown): number {
   if (!lines(value).length) return 0;
   if (Array.isArray(value)) return value.reduce((total, child) => total + occupiedRows(child), 0);
   const element = node(value);
-  if (element.type !== "Box") return 1;
+  if (element.type !== "Box") return lines(value).reduce((total, line) => total + line.split(/\r\n|\r|\n/).length, 0);
   const attributes = node(element.props);
   const heights = children(value).map(occupiedRows).filter(height => height > 0);
   const body = attributes.flexDirection === "column"
@@ -99,9 +99,128 @@ function trunk(): BoardData {
   return data;
 }
 
+function longUnit(): BoardData {
+  const data = fixture();
+  const active = data.units[0]!;
+  active.phase = { id: "10", of: 17, title: "Current delivery" };
+  active.phases = Array.from({ length: 17 }, (_, index) => {
+    const id = index + 1;
+    const row = phase(String(id), id < 10 ? "done" : id === 10 ? "open" : "todo");
+    row.title = `Record ${id}`;
+    return row;
+  });
+  active.phases[9]!.start = time(-60, "17:00");
+  active.steps = Array.from({ length: 8 }, (_, index) => [
+    index === 7 ? "running" : "completed", `Step ${index + 1}`,
+    time(-56 + index * 7, `17:${String(4 + index * 7).padStart(2, "0")}`), 420,
+  ]);
+  active.workers = Array.from({ length: 5 }, (_, index) => ({
+    slot: `worker-${index + 1}`, role: "test", state: "running", model: "", doing: `Check ${index + 1}`,
+  }));
+  return data;
+}
+
 // Run the same layout assertions against both engine element surfaces.
 describe("board layout", () => {
   for (const surface of ["terminal", "desktop"] as const) {
+    for (const bodyRows of [4, 50]) {
+      for (const hasStrip of [false, true]) {
+      test(`${surface}: a 76-column no-phase unit shows its stage once with ${hasStrip ? "a strip" : "no strip"} in ${bodyRows} rows`, async ($, on) => {
+        const data = noPhase();
+        const waiting = data.units[0]!;
+        waiting.state = "running";
+        waiting.stage = "Waiting on G3";
+        waiting.phases = hasStrip ? [phase("1", "done"), phase("2", "gated")] : [];
+        // Details force the compact branch in the four-row pane.
+        waiting.eta = fixture().units[0]!.eta;
+        waiting.workers = fixture().units[0]!.workers;
+        const ui = await render($, on, surface, data, false, 76, bodyRows);
+        const tree = await ui.drawn();
+        const rows = lines(tree);
+        const header = rows.findIndex(row => row.includes("alpha"));
+        expect(rows[header]).toMatch(/alpha\s+Waiting on G3/);
+        expect(rows.filter(row => row.includes("Waiting on G3"))).toHaveLength(1);
+        expect(rows.filter(row => /[█▓░▒]/.test(row))).toEqual(hasStrip ? ["  █▒"] : []);
+        expect(emptyBoxes(tree)).toBe(0);
+        expect(occupiedRows(tree)).toBeLessThanOrEqual(bodyRows);
+      });
+      }
+    }
+
+    test(`${surface}: step labels leave two cells before aligned times in a 76-column pane`, async ($, on) => {
+      const data = fixture();
+      data.units[0]!.steps = [
+        ["completed", "Short step", time(-20, "17:40"), 600],
+        ["running", "界".repeat(60), time(-10, "17:50"), 600],
+      ];
+      const ui = await render($, on, surface, data, true, 76, 50);
+      const rows = lines(await ui.drawn()).filter(row => /^[✓▶]/.test(row.trimStart()));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toContain("Short step");
+      expect(rows[1]).toMatch(/… {2,}17:50 · 0:10$/);
+      const offsets = rows.map(row => cellWidth(row.slice(0, row.indexOf("17:"))));
+      expect(new Set(offsets).size).toBe(1);
+      for (const row of rows) {
+        expect(row).toMatch(/ {2,}17:\d{2} · 0:10$/);
+        expect(cellWidth(row)).toBeLessThanOrEqual(76);
+      }
+    });
+
+    test(`${surface}: a 17-phase unit folds history and steps inside 50 rows at 76 columns`, async ($, on) => {
+      const ui = await render($, on, surface, longUnit(), true, 76, 50);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      expect(occupiedRows(tree)).toBeLessThanOrEqual(50);
+      const record = rows.slice(rows.indexOf("Phase record") + 1);
+      expect(record.some(row => /\bopen\b.*Record 10$/.test(row))).toBe(true);
+      expect(record.some(row => /Record 9$/.test(row))).toBe(true);
+      const earlier = record.find(row => /\+\d+ earlier:/.test(row))!;
+      expect(earlier).toMatch(/^\+\d+ earlier: 1[–,]/);
+      const omitted = Number(earlier.match(/\+(\d+) earlier:/)?.[1]);
+      const doneIds = record.filter(row => /Record [1-9]$/.test(row))
+        .map(row => Number(row.match(/Record (\d+)$/)?.[1]));
+      expect(omitted + doneIds.length).toBe(9);
+      expect(doneIds.every(id => id > omitted)).toBe(true);
+      expect(record).toContain("+4 later");
+      for (const id of [11, 12, 13]) expect(record.some(row => row.endsWith(`Record ${id}`))).toBe(true);
+      for (const id of [14, 15, 16, 17]) expect(record.some(row => row.endsWith(`Record ${id}`))).toBe(false);
+      const stepRows = rows.filter(row => /^[✓▶]/.test(row.trimStart()));
+      const earlierSteps = rows.find(row => /\+\d+ earlier steps/.test(row))!;
+      expect(earlierSteps).toMatch(/^\+\d+ earlier steps$/);
+      expect(Number(earlierSteps.match(/\+(\d+)/)?.[1]) + stepRows.length).toBe(8);
+      expect(stepRows.at(-1)).toContain("Step 8");
+      const stepIds = stepRows.map(row => Number(row.match(/Step (\d+)/)?.[1]));
+      expect(stepIds).toEqual(Array.from({ length: stepIds.length }, (_, index) => 9 - stepIds.length + index));
+      for (let id = 1; id <= 5; id++) expect(rows.some(row => row.includes(`worker-${id}`))).toBe(true);
+    });
+
+    test(`${surface}: multiline step labels stay on one physical row within a 50-row unit pane`, async ($, on) => {
+      const data = longUnit();
+      data.units[0]!.steps.forEach(step => { step[1] += "\n  detailed\r\n\tstep\tprogress"; });
+      const ui = await render($, on, surface, data, true, 76, 50);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      const steps = rows.filter(row => /^[✓▶]/.test(row.trimStart()));
+      expect(steps.length).toBeGreaterThan(0);
+      for (const step of steps) {
+        expect(step).not.toMatch(/[\r\n\t]/);
+        expect(step).toContain("detailed step progress");
+        expect(cellWidth(step)).toBeLessThanOrEqual(76);
+      }
+      expect(occupiedRows(tree)).toBeLessThanOrEqual(50);
+      expect(rows.some(row => /\bopen\b.*Record 10$/.test(row))).toBe(true);
+      expect(fitText("  one\n\t two\r\nthree  ", 30)).toBe("  one two three  ");
+    });
+
+    for (const bodyRows of [0, 1, 12, 30]) {
+      test(`${surface}: unit content respects a ${bodyRows}-row body at 76 columns`, async ($, on) => {
+        const ui = await render($, on, surface, longUnit(), true, 76, bodyRows);
+        const tree = await ui.drawn();
+        expect(occupiedRows(tree)).toBeLessThanOrEqual(bodyRows);
+        if (bodyRows >= 12) expect(lines(tree).some(row => /\bopen\b.*Record 10$/.test(row))).toBe(true);
+      });
+    }
+
     test(`${surface}: excess running units share one whole-key more line inside the body budget`, async ($, on) => {
       const data = trunk();
       const running = Array.from({ length: 25 }, (_, index) => unit(`r${String(index + 1).padStart(2, "0")}`, "running"));

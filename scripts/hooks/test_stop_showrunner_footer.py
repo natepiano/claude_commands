@@ -352,7 +352,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertEqual(saved["items"][1]["kind"], "review unavailable")
         self.assertNotIn("reviewed", saved["items"][1])
 
-    def test_pending_questions_block_with_footers_off_until_the_whole_reply_contains_both(self) -> None:
+    def test_each_pending_question_is_needed_with_footers_off_until_one_reply_carries_it(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
         first = showrunner_footer.PendingReviewedQuestion("merge", "Merge now (recommended), or wait?")
         second = showrunner_footer.PendingReviewUnavailableQuestion(
@@ -360,9 +360,9 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         showrunner_footer.add_pending_reviewed(self.instance, [first])
         showrunner_footer.add_pending_reviewed(self.instance, [second])
         self.assertIn("merge", self.reason("Done."))
-        self.assertIn("path", self.reason(first.reviewed))
-        self.assertTrue(showrunner_footer.pending_reviewed_path(self.instance).exists())
-        self.assert_passes(self.run_hook("Merge now  (recommended),\n or wait?\n" + second.question))
+        self.assertIn("path", self.reason("Merge now  (recommended),\n or wait?"))
+        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [second])
+        self.assert_passes(self.run_hook(second.question))
         self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
         self.assert_passes(self.run_hook("Later reply with no repeated questions."))
 
@@ -378,14 +378,13 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assert_passes(self.run_hook(item.reviewed, session_id="replacement", stop_hook_active=True))
         self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
 
-    def test_unrelated_footer_rejection_preserves_pending_text_until_a_valid_reply(self) -> None:
+    def test_a_footer_rejection_after_the_question_was_shown_never_asks_for_it_again(self) -> None:
         item = showrunner_footer.PendingReviewedQuestion("path", "Which path should we use?")
         showrunner_footer.add_pending_reviewed(self.instance, [item])
         self.assertIn("footer", self.reason(item.reviewed))
-        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [item])
-        self.assertIn("path", self.reason("A later turn.\n" + self.footer() + WAITING_BLOCK))
-        self.assert_passes(self.run_hook(item.reviewed + "\n" + self.footer() + WAITING_BLOCK))
         self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+        self.assert_passes(self.run_hook("A later turn.\n" + self.footer() + WAITING_BLOCK, stop_hook_active=True))
+        self.assert_passes(self.run_hook("-", transcript_path=self.transcript(tick())))
 
     def test_unregistered_choices_are_blocked_but_code_and_quotes_are_not(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -470,18 +469,16 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = self.outstanding.write_text(json.dumps([stranger]))
         self.assert_passes(self.run_hook(question + ONE_QUESTION))
 
-    def test_new_ask_preserves_pending_text_until_the_entire_reply_is_registered(self) -> None:
+    def test_a_new_ask_beside_a_shown_question_is_registered_without_repeating_the_question(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
         pending = showrunner_footer.PendingReviewedQuestion("route", "Which path should we use?")
         showrunner_footer.add_pending_reviewed(self.instance, [pending])
         request = "Say go and I'll run the diagnostic."
-        reply = pending.reviewed + "\n" + request
-        self.assertIn(request, self.reason(reply, stop_hook_active=True))
-        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [pending])
+        self.assertIn(request, self.reason(pending.reviewed + "\n" + request, stop_hook_active=True))
+        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
         item: OutstandingUserQuestion = {"since": "2026-10-16T08:00", "text": "diagnostics", "question": request}
         _ = self.outstanding.write_text(json.dumps([item]))
-        self.assert_passes(self.run_hook(reply, stop_hook_active=True))
-        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+        self.assert_passes(self.run_hook(request, stop_hook_active=True))
 
     def test_relayed_peer_question_and_attributed_unit_choice_pass_unregistered(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -513,15 +510,17 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertEqual(self.run_switch("off").returncode, 0)
         question = "Run now (recommended), or wait?"
         item = showrunner_footer.PendingReviewedQuestion("run", question)
+        # Registration stores the question in OUTSTANDING beside the pending copy the hook checks.
+        _ = self.outstanding.write_text(json.dumps([{
+            "since": "2026-10-06T08:00", "text": "run", "question": question, "reviewed": question}]))
         for marker in ("-", "*", "+", "1.", "1)"):
             with self.subTest(marker=marker):
                 showrunner_footer.add_pending_reviewed(self.instance, [item])
                 reply = f"{marker} Run  now (recommended), or wait?"
                 self.assertIn("record the item", self.reason(
                     reply + f"\n{marker} Delete the work (recommended), or keep it?"))
-                self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [item])
-                self.assert_passes(self.run_hook(reply))
                 self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+                self.assert_passes(self.run_hook(reply + ONE_QUESTION))
 
     def test_recorded_list_choices_can_be_recalled_without_their_markers(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)

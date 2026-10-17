@@ -51,7 +51,7 @@ State:
   (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
-  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply carries the printed `reviewed question` text.
+  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The footer hook asks for it only until one reply has carried it.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -235,6 +235,9 @@ State:
   When the user's answer needs research before they can finish it, remove the
   item from `open_for_user` in that turn; it returns, in full, when the
   research reports (user, 2026-10-15).
+  The user sees the count at all times in the Claude Code status line's
+  `For you: …` row, under the quota row, with the changes, proposals and
+  projects.
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led

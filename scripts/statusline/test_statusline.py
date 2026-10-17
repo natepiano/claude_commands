@@ -547,5 +547,95 @@ class RoleTests(unittest.TestCase):
         self.assertTrue(self.first_line(CLAUDE_CONFIG_DIR=str(config)).startswith("unassigned | claude4 | "))
 
 
+
+class OutstandingItem(TypedDict):
+    since: str
+    text: str
+    after: NotRequired[str]
+
+
+@final
+class CountsRowTests(unittest.TestCase):
+    """The third line: the `For you: …` counts row of a session a production targets, kept in a cache."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.home = Path()
+        self.ledger = Path()
+        self.cache = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        doc = self.home / "docs/plans/show-production.md"
+        doc.parent.mkdir(parents=True)
+        self.ledger = self.home / "ledger.md"
+        _ = doc.write_text("# show\n\n> **Status: PRODUCTION — running**\n"
+                           + f"- **Improvement queue:** {self.ledger}\n", encoding="utf-8")
+        instance = self.home / ".local/state/notifier/showrunner-show"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(f"TARGET=session:aaaa-1111\nCHECK=zsh /x/production_check.sh {doc}\n",
+                                           encoding="utf-8")
+        self.cache = self.home / ".local/state/showrunner/counts/show"
+
+    def questions(self, *items: OutstandingItem) -> None:
+        path = self.home / ".local/state/showrunner/outstanding/show.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(list(items)), encoding="utf-8")
+
+    def lines(self, session_id: str = "aaaa-1111", shell: str = "/bin/sh") -> list[str]:
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.home)}
+        result = subprocess.run([shell, "-c", COMMAND], input=json.dumps({"session_id": session_id}),
+                                capture_output=True, text=True, check=True, env=env, cwd=self.home)
+        return [ANSI.sub("", line) for line in result.stdout.splitlines()]
+
+    def test_the_session_a_production_targets_shows_its_counts_under_the_other_rows(self) -> None:
+        _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
+        self.questions({"since": "2026-10-16T19:00", "text": "Vault promotion"})
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                lines = self.lines(shell=shell)
+                self.assertTrue(lines[0].startswith("showrunner | "), lines)
+                self.assertEqual(lines[-1], "For you: 1 project, 1 question")
+                self.assertNotIn("For you: 1 project, 1 question", self.lines("bbbb-2222", shell=shell))
+
+    def test_nothing_counted_shows_no_row(self) -> None:
+        self.assertEqual(len(self.lines()), 1)
+        self.assertEqual(self.cache.read_text(encoding="utf-8").splitlines()[:2], ["", ""])
+
+    def test_the_cache_is_rebuilt_only_when_a_file_it_was_read_from_changes(self) -> None:
+        self.questions({"since": "2026-10-16T19:00", "text": "A"})
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
+                built = self.cache.stat().st_mtime_ns
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
+                self.assertEqual(self.cache.stat().st_mtime_ns, built)
+                self.questions({"since": "2026-10-16T19:00", "text": "A"}, {"since": "2026-10-16T19:00", "text": "B"})
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 questions")
+                # The ledger did not exist, so its folder stands in until it appears.
+                _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 project, 2 questions")
+                self.ledger.unlink()
+                self.questions({"since": "2026-10-16T19:00", "text": "A"})
+
+    def test_a_deferred_question_joins_the_row_when_its_time_comes(self) -> None:
+        later = datetime.now(USER_ZONE) + timedelta(hours=1)
+        outstanding = self.home / ".local/state/showrunner/outstanding/show.json"
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.questions({"since": "2026-10-16T19:00", "text": "A", "after": later.strftime("%Y-%m-%dT%H:%M")})
+                self.assertEqual(len(self.lines(shell=shell)), 1)
+                row, due, *read_from = self.cache.read_text(encoding="utf-8").splitlines()
+                self.assertEqual((row, int(due)), ("", int(later.replace(second=0, microsecond=0).timestamp())))
+                # The hour has passed: the item's time and the cache's due second move back, each file kept older.
+                built = self.cache.stat().st_mtime_ns
+                self.questions({"since": "2026-10-16T19:00", "text": "A", "after": "2026-10-16T19:00"})
+                os.utime(outstanding, ns=(built - 10**9, built - 10**9))
+                _ = self.cache.write_text("\n".join(["", str(int(time.time()) - 1), *read_from]) + "\n",
+                                          encoding="utf-8")
+                os.utime(self.cache, ns=(built, built))
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 question")
+
 if __name__ == "__main__":
     _ = unittest.main()

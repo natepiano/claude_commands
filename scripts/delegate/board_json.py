@@ -121,16 +121,42 @@ def session_directory(run_id: str) -> Path:
     return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
-def workers(session: Path, sources: set[Path]) -> list[dict[str, object]]:
+def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[dict[str, object]]:
     roster = read_object(session / "mesh_roster.json")
     sources.update((session, session / "mesh_roster.json", session / "board.log"))
     metadata = list(session.glob("impl_worker_*.json"))
     sources.update(metadata)
     by_name: dict[str, dict[str, object]] = {}
+    prefixes = {mesh_prefix} if mesh_prefix else set[str]()
     for path in metadata:
         record = read_object(path)
         record["slot"] = text(record.get("slot")) or path.stem.removeprefix("impl_worker_")
         by_name[text(record.get("name"))] = record
+        name, slot = text(record.get("name")), text(record.get("slot"))
+        if name.endswith(f"-{slot}"):
+            prefixes.add(name[: -len(slot) - 1])
+
+    def short_slot(name: str) -> str:
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            if name.startswith(f"{prefix}-"):
+                return name[len(prefix) + 1:]
+        return name
+
+    by_slot = {short_slot(text(record.get("slot"))): record for record in by_name.values()}
+
+    def slot_for(name: str) -> str:
+        meta = by_name.get(name, {})
+        record = fields(roster.get(name))
+        return short_slot(text(meta.get("slot")) or text(record.get("slot")) or name)
+
+    selected: dict[str, str] = {}
+    for name in roster:
+        slot = slot_for(name)
+        current_name = text(by_slot.get(slot, {}).get("name"))
+        if current_name and selected.get(slot) == current_name:
+            continue
+        selected[slot] = name
+
     newest: dict[str, str] = {}
     try:
         lines = (session / "board.log").read_text(encoding="utf-8").splitlines()
@@ -140,17 +166,16 @@ def workers(session: Path, sources: set[Path]) -> list[dict[str, object]]:
         match = re.match(r"\S+ \[([^]]+)\] [^:]+: (.*)", line)
         if match:
             activity = match[2].removeprefix("launcher: ")
-            newest[match[1]] = re.split(r"; (?:summary at|findings in)\s", activity, maxsplit=1)[0].strip()[:80]
+            newest[slot_for(match[1])] = re.split(r"; (?:summary at|findings in)\s", activity, maxsplit=1)[0].strip()[:80]
     result: list[dict[str, object]] = []
-    for name, value in roster.items():
-        record = fields(value)
-        meta = by_name.get(name, {})
-        slot = text(meta.get("slot")) or text(record.get("slot")) or name
+    for slot, name in selected.items():
+        record = fields(roster[name])
+        meta = by_name.get(name, {}) or by_slot.get(slot, {})
         status = text(record.get("status"))
         state = {"done": "idle"}.get(status, status)
         result.append({"slot": slot, "role": text(record.get("role")), "state": state,
                        "model": "/".join(part for part in (text(meta.get("family")), text(meta.get("model"))) if part),
-                       "doing": newest.get(name, newest.get(slot, ""))})
+                       "doing": newest.get(slot, "")})
     return result
 
 
@@ -241,7 +266,8 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
         path = plan_history.history_root() / "runs" / f"{found.run_id}.jsonl"
         sources.add(path)
         events = units_table.run_events(path)
-        worker_rows = workers(session_directory(found.run_id), sources)
+        worker_rows = workers(session_directory(found.run_id), sources,
+                              re.sub(r"[^a-zA-Z0-9._-]", "-", worktree.name)[:40])
     header = events[0] if events else {}
     run_plan = text(header.get("project_plan_doc")) or text(header.get("plan_doc"))
     record_plan = plan_history.resolve_plan_path(worktree, run_plan) if run_plan else plan
