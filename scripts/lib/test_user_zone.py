@@ -34,6 +34,7 @@ USES_THE_MACHINE_ZONE = {
     "notify/review.py": "a log stamp written with its offset",
     "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
+    "shutdown/inventory.py": "Codex names its session folders by the machine's date",
     "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
     "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",

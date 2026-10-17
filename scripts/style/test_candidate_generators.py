@@ -25,7 +25,7 @@ class CandidateGeneratorTests(unittest.TestCase):
     def test_regex_rule_filters_paths_and_lines_and_sorts_sites(self) -> None:
         rule = self.root / "rule.md"
         _ = rule.write_text(
-            "---\ncandidates:\n  kind: regex\n"
+            "---\ncandidates:\n  kind: regex\n  surface: whole\n"
             + "  pattern: 'unwrap\\('\n  exclude_pattern: 'approved'\n"
             + "  globs: ['*.rs']\n  paths: [src]\n"
             + "  paths_exempt: [src/generated]\n---\n"
@@ -53,7 +53,7 @@ class CandidateGeneratorTests(unittest.TestCase):
     def test_struct_field_rule_limits_structs_and_field_types(self) -> None:
         rule = self.root / "rule.md"
         _ = rule.write_text(
-            "---\ncandidates:\n  kind: struct_fields\n  structs: [Settings]\n"
+            "---\ncandidates:\n  kind: struct_fields\n  surface: whole\n  structs: [Settings]\n"
             + "  field_type_pattern: '\\bbool\\b'\n---\n"
         )
         _ = (self.root / "src" / "lib.rs").write_text(
@@ -85,6 +85,37 @@ class CandidateGeneratorTests(unittest.TestCase):
         self.assertEqual([site.line for site in result.candidates], list(range(1, 201)))
         self.assertEqual({site.file for site in result.candidates}, {"src/lib.rs"})
         self.assertEqual(result.candidates[-1].text, "fn site_199() { value.unwrap(); }")
+
+    def test_legacy_surface_preserves_enumeration_and_rule_constraints(self) -> None:
+        rule = self.root / "rule.md"
+        _ = (self.root / "src" / "lib.rs").write_text(
+            "fn run() {\n    first.unwrap();\n    second.unwrap(); // approved\n}\n"
+        )
+        _ = (self.root / "outside.rs").write_text("outside.unwrap();\n")
+        declarations = (
+            ("", "unclassified"),
+            ("  surface: whole\n", "whole"),
+            ("  surface: partial\n  uncovered: 'other methods'\n", "partial"),
+        )
+        for declaration, expected_surface in declarations:
+            with self.subTest(surface=expected_surface):
+                _ = rule.write_text(
+                    "---\nmechanism: llm\ncandidates:\n  kind: regex\n"
+                    + declaration
+                    + "  pattern: 'unwrap\\('\n  exclude_pattern: approved\n  paths: [src]\n---\n"
+                )
+                spec = candidate_generators.read_candidates_spec(rule)
+                if spec is None:
+                    self.fail("The legacy candidates block was not read")
+
+                result = candidate_generators.enumerate_candidates(spec, self.root)
+
+                self.assertEqual(spec.surface, expected_surface)
+                self.assertEqual(
+                    [(site.file, site.line, site.text) for site in result.candidates],
+                    [("src/lib.rs", 2, "first.unwrap();")],
+                )
+                self.assertEqual(result.source, r"regex:unwrap\(")
 
 
 if __name__ == "__main__":

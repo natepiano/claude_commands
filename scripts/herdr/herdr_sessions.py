@@ -114,6 +114,10 @@ def _launch(verb: str, arguments: list[str]) -> int:
     separator = arguments.index("--") if "--" in arguments else len(arguments)
     options = parser.parse_args(arguments[:separator], namespace=LaunchOptions())
     claude_arguments = arguments[separator + 1:]
+    session_kind = herdr.security_session()
+    if not isinstance(session_kind, (herdr.DesktopSession, herdr.NotMacSession)):
+        print(herdr.MAC_DESKTOP_TERMINAL_REQUIRED)
+        return 1
     folder = Path(options.cwd).expanduser().resolve(strict=True)
     if not folder.is_dir():
         raise ValueError(f"{folder}: not a directory")
@@ -175,7 +179,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         while True:
             name = options.name or herdr.generated_session_name(folder.name, str(suffix))
             try:
-                herdr.start_new_server(name, 90_000)
+                herdr.start_new_server(name, 90_000, session_kind=session_kind)
                 break
             except herdr.SessionTaken:
                 if options.name:

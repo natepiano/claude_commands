@@ -454,6 +454,16 @@ class ProgressStep(TypedDict):
     detail: str
 
 
+class PausedSeat(TypedDict):
+    """A director's worker thread and the launcher needed to continue its task."""
+    run_dir: str
+    seat: str
+    role: str
+    thread_id: str
+    turn_live: bool
+    launcher_command: list[str]
+
+
 class SessionShutdown(TypedDict):
     move_id: NotRequired[str]
     login: str
@@ -469,6 +479,7 @@ class SessionShutdown(TypedDict):
     probe: bool
     session: Session
     workers: list[Session]
+    codex_seats: NotRequired[list[PausedSeat]]
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
@@ -490,6 +501,8 @@ class SessionShutdown(TypedDict):
     target: NotRequired[str]
     source_label: NotRequired[str]
     why: NotRequired[str]
+    # Set by rename_unit while the unit is stopped: the restart note tells the session its new names.
+    renamed: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -1118,6 +1131,18 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
         raise InvalidRecord(f"{place}.then is invalid")
 
 
+def _paused_seat(value: object, place: str) -> PausedSeat:
+    fields = _mapping(value, place)
+    return PausedSeat(
+        run_dir=_string(_required(fields, "run_dir", place), f"{place}.run_dir"),
+        seat=_string(_required(fields, "seat", place), f"{place}.seat"),
+        role=_string(_required(fields, "role", place), f"{place}.role"),
+        thread_id=_string(_required(fields, "thread_id", place), f"{place}.thread_id"),
+        turn_live=_boolean(_required(fields, "turn_live", place), f"{place}.turn_live"),
+        launcher_command=_strings(fields.get("launcher_command", []), f"{place}.launcher_command"),
+    )
+
+
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
@@ -1134,7 +1159,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
-    for field in ("source_label", "why"):
+    for field in ("source_label", "why", "renamed"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (
@@ -1149,6 +1174,11 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     if not isinstance(probe, bool):
         raise InvalidRecord(f"{place}.probe must be a boolean")
     values["probe"] = probe
+    if "codex_seats" in values:
+        values["codex_seats"] = [
+            _paused_seat(seat, f"{place}.codex_seats[{index}]")
+            for index, seat in enumerate(_items(values["codex_seats"], f"{place}.codex_seats"))
+        ]
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
@@ -2212,15 +2242,26 @@ def snapshot_restore_record(snapshot: RecoverySnapshot, entry: SnapshotClaudeSes
     return _session_shutdown(saved, "recovery record")
 
 
+def snapshot_supersedes_record(snapshot: RecoverySnapshot, existing: SessionShutdown) -> bool:
+    """A later snapshot replaces older restore intent, including an earlier recovery."""
+    origin = existing["requested_by"]
+    requested_at = origin["taken_at"] if origin["kind"] == "snapshot" else existing["requested_at"]
+    return datetime.fromisoformat(snapshot["taken_at"]) > datetime.fromisoformat(requested_at)
+
+
 def materialize_snapshot(snapshot: RecoverySnapshot, entry: SnapshotClaudeSession) -> SessionShutdown:
-    """Persist a recovery request before launch; an existing request takes precedence."""
+    """Persist recovery before launch, retaining an equally recent or newer request."""
     saved = snapshot_restore_record(snapshot, entry)
     login, identity = saved["login"], saved["session"]["session_id"]
     with launch_barrier():
         with _session_store_lock(login, create=True) as directory:
             for existing in _session_records_in_directory(directory, login):
                 if existing["session"]["session_id"] == identity:
-                    return existing
+                    if not snapshot_supersedes_record(snapshot, existing):
+                        return existing
+                    _ = _record_directory(directory / "sessions", create=True)
+                    _write_record(directory / "sessions" / _session_filename(identity), saved)
+                    return saved
             target = directory / "sessions" / _session_filename(identity)
             _ = _record_directory(target.parent, create=True)
             if _regular_record(target):
