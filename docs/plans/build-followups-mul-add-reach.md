@@ -233,33 +233,19 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 ### Phase 7 — Complete step logs under load  · status: done
 
-**Depends on:** Phase 6
+#### As-built
 
-#### Work Order
-
-**Goal:** a step run through `run_json_stdout` returns only once its log holds every line the command wrote, also on a machine at load 400.
-
-**Spec:**
-
-The showrunner, 2026-10-16 23:43 EDT: `test_verify_lint_scope.InvokeOutputTests.test_json_stdout_stays_separate_and_both_logs_are_complete_on_return` failed in a merge gate at one-minute load 400. The log was missing one of its 1000 `cargo stderr` lines (line 488 absent, the rest shifted), so under load a log is not complete when the call returns. "That makes it a real race in the stderr tee, not just a flaky test. Please fix it in a follow-up."
-
-First reproduce: run the test (or a loop of the nested call it makes) many times in parallel under heavy CPU load until a line is lost, and name which log loses it (inner step log, outer log) and why — a short write, a FIFO open or close race, the two `tee -a` writers sharing one file, or the subshell trap removing the FIFO. Fix the cause in `run_json_stdout`; keep bash 3.2 constructs (no named descriptors), JSON alone on stdout, every step returning its command's own status (also when `tee` fails), and the existing tests passing. Add a regression test that fails on the old code under the reproduction's load, if one can be made reliable in a few seconds; otherwise state the reproduction and its result in the summary.
+- Cause: `run_json_stdout`'s stdout and stderr each had their own `tee -a` on one log; their chunks are not line-aligned, so under load a JSON record landed inside a stderr line, which the completeness test read as a missing line. No bytes were lost.
+- Fix: stdout streams to the caller at once through `tee` into a temporary file, appended to the log after the stderr `tee` is joined. The log holds stderr, then stdout. Reproduction (2,048 nested calls, 64 at a time, 512 CPU workers): 28 damaged logs at load 100–270 before, 0 at load 208–382 after.
+- `test_concurrent_json_and_stderr_keep_complete_lines_in_both_logs` sends 1,000 lines on each stream through the nested call and checks both logs on return; it catches the old runner often but not on every run.
 
 **Files:**
 - `scripts/lint/invoke.sh` — `run_json_stdout`
 - `scripts/delegate/test_verify_lint_scope.py` — the regression test
 
-**Workers:** 1 writer; the test lives beside the fix.
-- `impl` — reproduction, fix and test
+**Ruled out:** unit-board's merge as the cause — the race is in this runner; that merge only changed timing.
 
-**Constraints from prior phases:**
-- `run_json_stdout` (Phase 5) runs the command with stderr into a temporary FIFO read by a background `tee -a "$log" >&2`, stdout through `tee -a "$log"`, then `wait`s for the stderr `tee`. `run_once` nests it when `LINT_JSON_STDOUT=1`, so a JSON replay passes through two levels.
-- Named descriptor redirections (`{fd}>`) break the Mac's bash 3.2; `test_shell_libraries_use_no_named_descriptor_redirections` guards it. `PIPESTATUS[0]` (not `$?`) carries the command status under pipefail.
-- Saved run output stays under a few GB; delete reproduction logs after reading them.
-
-**Acceptance gate:** the reproduction no longer loses a line under the load that made it fail; `python3 -m unittest discover -s scripts/delegate -p 'test_verify_lint_scope.py'` and `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` pass; `bash -n scripts/lint/invoke.sh` passes.
-
-### Phase 8 — Re-measure the lint-step rewrite  · status: todo
+### Phase 8 — Re-measure the lint-step rewrite  · status: done
 
 **Depends on:** Phase 6
 **Blocked by:** G3, G4
