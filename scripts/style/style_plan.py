@@ -484,6 +484,10 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]
           if crate_targets is CrateTargets.BINARY_ONLY else []),
+        *(["A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
+           + "name the binding after the parameter the converted value fills."]
+          if any(PurePosixPath(pinned.rule_id.removesuffix("#uncovered")).name
+                 == "name-bindings-to-match-parameters.md" for pinned in texts) else []),
         *([
             "Judge file by file: take each file under **Files** in turn and judge it against every rule above, with that rule's listed sites "
             + "in it and its uncovered surface; read the uncovered instructions in the pinned text.",

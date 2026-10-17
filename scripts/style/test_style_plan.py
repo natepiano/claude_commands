@@ -255,6 +255,37 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn("window", text)
         self.assertEqual(self.ledger().ticket_open("modules-unit")[0]["rules"], [rule])
 
+    def test_written_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
+        rule = self.rule("name-bindings-to-match-parameters")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["rules"], [rule])
+        self.assertIn(
+            "uncovered read.\n"
+            + "A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
+            + "name the binding after the parameter the converted value fills.\nJudge window by window:",
+            self.plan.read_text())
+
+    def test_written_uncovered_names_phase_explains_conversions_pass_through_to_the_call_parameter(self) -> None:
+        rule = self.rule("name-bindings-to-match-parameters", "tier: B\nfamily: names\ncandidates:\n"
+                         + "  kind: regex\n  pattern: absent\n  surface: partial\n  uncovered: Read every binding.\n")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["rules"], [rule + "#uncovered"])
+        self.assertIn(
+            "uncovered read.\n"
+            + "A conversion between the binding and the call (`map_or`, `From::from`, `.into()`) passes through: "
+            + "name the binding after the parameter the converted value fills.\nJudge window by window:",
+            self.plan.read_text())
+
+    def test_written_names_phase_for_other_rules_keeps_the_existing_spec_without_conversion_guidance(self) -> None:
+        _ = self.rule("name-bindings-to-match-parameters-extra")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        text = self.plan.read_text()
+        self.assertIn("uncovered read.\nJudge window by window:", text)
+        self.assertNotIn("A conversion between the binding and the call", text)
+
     def prepare_binary_crate(self) -> None:
         (self.repo / self.sources[0]).unlink()
         self.write("crates/alpha/src/main.rs", "fn main() {}\n")
