@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +33,9 @@ def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
     path.chmod(0o755)
 
+
+# A marked worker is python, not sleep: the Mac hides a system binary's environment from ps.
+MARKED_SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
@@ -141,6 +145,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
+            # herdr reads a Mac process's marks with the real ps; the fake one answers only the watcher's list.
+            "HERDR_PS": shutil.which("ps") or "ps",
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }
@@ -517,7 +524,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.send_log.unlink(missing_ok=True)
                 _ = self.tick(START)
                 marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
-                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           env={**os.environ, **marks})
                 self.children.append(worker)
                 self.process_rows.append(f"{worker.pid} 1 sleep 60")
@@ -529,7 +536,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         doc = self.root / "showrunner-production.md"
         _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
         self.panes["unit-one"]["slug"] = "old-showrunner"
-        worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
                                        "SHOWRUNNER_UNIT_ID": "unit-one"})
         self.children.append(worker)

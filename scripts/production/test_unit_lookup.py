@@ -47,6 +47,7 @@ class UnitLookupTests(unittest.TestCase):
                             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
                             "HERDR_PROC": str(self.root / "proc"),
+                            "HERDR_PLATFORM": "linux",
                             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
                             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json")}
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"stdout": "", "code": 1}}))
