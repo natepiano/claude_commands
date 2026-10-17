@@ -90,8 +90,11 @@ Refill only the unit worktree's own plan copy:
 ```
 
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
-reporting `repair first`; 3 means `waiting for sync` (an unclassified catalog
-also says `pull nate_style`); 4 means `board unavailable: <reason>`; 5 means
+reporting `repair first`; 3 means `waiting for sync`, or
+`waiting for structure: <crates>` when pending structure cells in those in-scope
+crates hold the unit back until the modules unit's structure tickets merge
+(an unclassified catalog also says `pull nate_style`); 4 means
+`board unavailable: <reason>`; 5 means
 `waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
 availability stops selection without recording work. `queue` is a read-only
 preview and also returns 4 when the board is unavailable.

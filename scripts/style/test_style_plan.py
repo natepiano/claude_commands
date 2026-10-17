@@ -814,7 +814,7 @@ class StylePlanTests(unittest.TestCase):
         _ = self.rule("read")
         self.sync()
         with mock.patch.object(style_ledger, "_now", return_value="2026-01-02T03:04:05+00:00"):
-            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+            self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha, crates/beta\n", ""))
         self.assertEqual(self.sync_wait_rows(), [("names-unit", "2026-01-02T03:04:05+00:00")])
         with mock.patch.object(style_ledger, "_now", return_value="2026-01-03T03:04:05+00:00"):
             self.assertEqual(self.run_next()[0], 3)
@@ -824,6 +824,80 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_names_refill_names_pending_structure_crates_and_preserves_unclassified_warning(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
+        _ = self.rule("legacy", "")
+        self.sync()
+        before = self.plan.read_bytes()
+
+        self.assertEqual(self.run_next(), (
+            3, "waiting for structure: crates/alpha, crates/beta\n",
+            "unclassified: 1 rules — pull nate_style\n"))
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_names_refill_waits_for_sync_when_only_structure_cells_are_pending_in_scope(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        read = self.rule("read")
+        self.sync()
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        for path in self.sources[:2]:
+            self.record(read, path, self.tip)
+
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
+    def test_names_structure_wait_excludes_crates_outside_its_pilot_scope(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
+        self.sync()
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
+
+        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/beta\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_modules_refill_with_completed_structure_waits_for_sync_despite_pending_names_cells(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        _ = self.rule("read")
+        self.sync()
+        for path in self.sources:
+            self.record(structure, path, self.tip)
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_plan.main(["next-phase", "--unit", "modules-unit", "--plan", str(plan), "--repo", str(worktree)])
+
+        self.assertEqual((code, output.getvalue()), (3, "waiting for sync\n"))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["modules-unit"])
+
+    def test_structure_wait_uses_pending_crates_from_the_second_selection_pass(self) -> None:
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        read = self.rule("read")
+        self.sync()
+        reads = 0
+
+        def board_after_judgment(repo: Path) -> berth_board.Board:
+            nonlocal reads
+            self.assertEqual(repo, self.repo)
+            reads += 1
+            if reads == 2:
+                self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+                for path in self.sources[:2]:
+                    self.record(read, path, self.tip)
+            return self.board()
+
+        with mock.patch.object(berth_board, "read_board", side_effect=board_after_judgment):
+            self.assertEqual(self.run_next(), (3, "waiting for structure: crates/beta\n", ""))
+        self.assertEqual(reads, 2)
 
     def test_refill_rechecks_after_registering_a_wait_and_finds_the_just_merged_crate(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -858,7 +932,7 @@ class StylePlanTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])) as board, redirect_stdout(output):
             result = style_plan.next_phase("names-unit", self.plan, self.repo)
-        self.assertEqual(result, style_plan.WaitingForSync(0))
+        self.assertEqual(result, style_plan.WaitingForStructure(("crates/alpha", "crates/beta"), 0))
         self.assertEqual(board.call_count, 2)
         self.assertEqual(output.getvalue(), "dropped names-unit-1: files busy\n")
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
