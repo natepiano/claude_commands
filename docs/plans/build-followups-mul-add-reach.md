@@ -262,7 +262,7 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 **Ruled out:** retiring the edit hook, since both limits fail.
 
-### Phase 9 — Rewrite until nothing is left  · status: todo
+### Phase 9 — Rewrite until nothing is left  · status: done
 
 **Depends on:** Phase 8
 
