@@ -222,6 +222,10 @@ QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
 # wakes this often to look for the end marker.
 RESIDENT_POLL_SECS = 1.0
+# The SandboxMode strings a thread starts with: workers write, standing reviewers only read.
+WORKER_SANDBOX = "danger-full-access"
+READ_ONLY_SANDBOX = "read-only"
+SANDBOX_MODES = (WORKER_SANDBOX, READ_ONLY_SANDBOX)
 # Production gives a server five seconds to stop; disposable child processes need no long grace.
 REAP_WAIT_SECS = 5.0
 REAP_POLL_SECS = 0.2
@@ -975,6 +979,25 @@ def _lookup(session_dir: str, name: str) -> ThreadRecord:
 
 def _lookup_state(session_dir: str, name: str) -> RosterThread:
     return _roster_thread(_lookup(session_dir, name))
+
+
+def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
+    """The SandboxMode a delegate's thread normally runs in.
+
+    A seat with standing instructions is a reviewer template or its fork, started read-only;
+    any other seat runs in the sandbox `start` gave it.
+    """
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    if _as_str(record.get("instructions_file")):
+        return READ_ONLY_SANDBOX
+    return _as_str(_attr(args, "sandbox")) or WORKER_SANDBOX
+
+
+def _turn_sandbox_policy(mode: str) -> dict[str, object]:
+    """The turn-level SandboxPolicy object for a SandboxMode string."""
+    if mode == READ_ONLY_SANDBOX:
+        return {"type": "readOnly", "networkAccess": False}
+    return {"type": "dangerFullAccess"}
 
 
 def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, object]:
@@ -3382,10 +3405,10 @@ def _resume_worker_thread(
     if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
         _ = _require(resumed, "thread/resume")
     start_params = _thread_start_params(args)
+    start_params["sandbox"] = _seat_sandbox(args, session_dir, name)
     if "developerInstructions" in params:
         start_params.update({
-            "developerInstructions": params["developerInstructions"],
-            "sandbox": "read-only", "approvalPolicy": "never",
+            "developerInstructions": params["developerInstructions"], "approvalPolicy": "never",
         })
     started = _serving_request(client, "thread/start", start_params, submits_work=True)
     replacement = _as_str(_as_dict(started.get("thread")).get("id"))
@@ -3623,7 +3646,8 @@ def _move_idle_worker(
                 inputs = (["Continue where you stopped.", *([message] if message else []), *messages] if owes_continuation
                           else [message, *messages] if message else messages)
                 cleanup = WorkerTurnCleanup(port, thread_id)
-                turn_id = _start_turn(moved, args, thread_id, inputs[0], tuple(inputs[1:]))
+                turn_id = _start_turn(moved, args, thread_id, _seat_sandbox(args, session_dir, name),
+                                      inputs[0], tuple(inputs[1:]))
                 if owes_continuation and not turn_id:
                     raise SystemExit("quota continuation was not confirmed by turn/start; task is still owed")
                 _write_pending(handle, thread_id, [])
@@ -3685,7 +3709,7 @@ def _start_workers_turn(
 
 
 def _start_turn(
-    client: Client, args: argparse.Namespace, thread_id: str, message: str,
+    client: Client, args: argparse.Namespace, thread_id: str, seat_sandbox: str, message: str,
     pending: tuple[str, ...] = (),
 ) -> str:
     inputs: list[dict[str, str]] = [{"type": "text", "text": message}]
@@ -3700,8 +3724,10 @@ def _start_turn(
     cwd = _as_str(_attr(args, "turn_cwd"))
     if cwd:
         params["cwd"] = cwd
-    if _attr(args, "read_only") is True:
-        params["sandboxPolicy"] = {"type": "readOnly", "networkAccess": False}
+    # Every turn names its policy: the app-server keeps a thread's last turn policy, so a
+    # turn that leaves it out would inherit a previous `--read-only` turn's sandbox.
+    params["sandboxPolicy"] = _turn_sandbox_policy(
+        READ_ONLY_SANDBOX if _attr(args, "read_only") is True else seat_sandbox)
     model = _as_str(_attr(args, "model"))
     if model:
         params["model"] = model
@@ -6035,7 +6061,7 @@ def command_prime(args: argparse.Namespace) -> int:
         params: dict[str, object] = {
             "developerInstructions": instructions,
             "cwd": _as_str(_attr(args, "cwd")),
-            "sandbox": "read-only",
+            "sandbox": READ_ONLY_SANDBOX,
             "approvalPolicy": "never",
         }
         model = _as_str(_attr(args, "model"))
@@ -6097,7 +6123,7 @@ def command_fork(args: argparse.Namespace) -> int:
         params = _resume_params(session_dir, source_name, source.thread_id)
         _ = _serving_request(client, "thread/resume", params)
         fork_params = dict(params)
-        fork_params.update({"sandbox": "read-only", "approvalPolicy": "never"})
+        fork_params.update({"sandbox": READ_ONLY_SANDBOX, "approvalPolicy": "never"})
         result = _serving_request(client, "thread/fork", fork_params)
         thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
         if not thread_id:
@@ -6284,7 +6310,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--model", default="")
     _ = start.add_argument("--effort", default="")
     _ = start.add_argument("--service-tier", default="")
-    _ = start.add_argument("--sandbox", default="danger-full-access")
+    _ = start.add_argument("--sandbox", choices=SANDBOX_MODES, default=WORKER_SANDBOX)
     _ = start.add_argument("--timeout", type=float, default=86400.0)
     _ = start.add_argument(
         "--resident",

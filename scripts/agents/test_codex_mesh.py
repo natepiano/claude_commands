@@ -147,6 +147,8 @@ CAPACITY = "Selected model is at capacity. Please try a different model."
 STALE_SIGN_IN = ("Your access token could not be refreshed because you have since logged out or signed in to "
                  "another account. Please sign in again.")
 THREAD_ID = "thread-capacity-test"
+WRITE_POLICY: dict[str, object] = {"type": "dangerFullAccess"}
+READ_ONLY_POLICY: dict[str, object] = {"type": "readOnly", "networkAccess": False}
 
 
 def running_holder(session_id: str) -> sessions.SessionRecord:
@@ -1644,7 +1646,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.methods("turn/start")[0]["params"], {
             "threadId": THREAD_ID,
             "input": [{"type": "text", "text": "Original delegate task"}],
-            "model": "gpt-test", "effort": "high",
+            "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY,
         })
 
     def test_follow_cwd_is_parsed_into_the_turn_cwd_destination(self) -> None:
@@ -1805,7 +1807,7 @@ class MeshCommandTests(unittest.TestCase):
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
         })
 
-    def test_follow_cli_without_new_flags_keeps_the_original_turn_request(self) -> None:
+    def test_follow_cli_without_new_flags_sends_the_seat_write_policy(self) -> None:
         cases: list[tuple[list[str], dict[str, object]]] = [
             ([], {}),
             (["--model", "gpt-test", "--effort", "high"], {"model": "gpt-test", "effort": "high"}),
@@ -1823,6 +1825,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(starts[0]["params"], {
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
+                    "sandboxPolicy": WRITE_POLICY,
                     **overrides,
                 })
 
@@ -1850,8 +1853,38 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(starts[0]["params"], {
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
+                    "sandboxPolicy": WRITE_POLICY,
                     **overrides,
                 })
+
+    def test_follow_after_a_read_only_follow_restores_the_write_policy(self) -> None:
+        policies: list[object] = []
+        for options in (["--read-only"], []):
+            self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "test"}})
+            self.server.requests.clear()
+
+            code, _output, errors = self.run_mesh(self.follow_cli(*options))
+
+            self.assertEqual((code, errors), (0, ""))
+            starts = self.methods("turn/start")
+            self.assertEqual(len(starts), 1)
+            policies.append(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"))
+        self.assertEqual(policies, [READ_ONLY_POLICY, WRITE_POLICY])
+
+    def test_follow_without_read_only_keeps_a_standing_reviewer_read_only(self) -> None:
+        instructions = self.session_dir / "standing.txt"
+        _ = instructions.write_text("Review only.", encoding="utf-8")
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review",
+            "instructions_file": str(instructions),
+        }})
+
+        code, _output, errors = self.run_mesh(self.follow_cli())
+
+        self.assertEqual((code, errors), (0, ""))
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"), READ_ONLY_POLICY)
 
     def test_pool_verbs_report_server_failures_with_the_destination_name(self) -> None:
         cases = [

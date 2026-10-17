@@ -919,6 +919,24 @@ def autocompact_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> 
         raise Refusal(f"auto-compact record: {error}") from error
 
 
+def registered_unit(request: RequestedUnitLaunch) -> bool:
+    lines = request.production.doc.read_text(encoding="utf-8").splitlines()
+    return any(cell_value(cells.get("Unit", "")) == request.unit for cells in unit_table(lines))
+
+
+def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, check: bool) -> None:
+    """Record a registered unit's window for its next restart; a running unit is not relaunched."""
+    try:
+        value = autocompact.checked(value)
+        if not check:
+            autocompact.record(session_id, value)
+    except (autocompact.BadAutocompact, OSError, UnicodeError) as error:
+        raise Refusal(f"auto-compact record: {error}") from error
+    verb = "would apply" if check else "applies"
+    setting = "the saved setting" if value == autocompact.AUTO else f"auto-compact {value}"
+    print(f"{request.unit}: {setting} {verb} to session {session_id} at its next restart")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
@@ -933,7 +951,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--account", default="")
     _ = parser.add_argument("--model", default="")
-    _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume")
+    _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
@@ -945,6 +963,12 @@ def main(argv: list[str]) -> int:
     import herdr
     try:
         request = launch_request(args)
+        explicit_autocompact = cast(str, args.autocompact)
+        if (explicit_autocompact and isinstance(request.session, ResumedSession)
+                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)):
+            # Setting a registered unit's window is not new work: no new-work check or launch applies.
+            set_autocompact(request, request.session.session_id, explicit_autocompact, cast(bool, args.check))
+            return 0
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
