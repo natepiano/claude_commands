@@ -139,13 +139,16 @@ def workers(session: Path, sources: set[Path]) -> list[dict[str, object]]:
     for line in lines:
         match = re.match(r"\S+ \[([^]]+)\] [^:]+: (.*)", line)
         if match:
-            newest[match[1]] = match[2][:80]
+            activity = match[2].removeprefix("launcher: ")
+            newest[match[1]] = re.split(r"; (?:summary at|findings in)\s", activity, maxsplit=1)[0].strip()[:80]
     result: list[dict[str, object]] = []
     for name, value in roster.items():
         record = fields(value)
         meta = by_name.get(name, {})
         slot = text(meta.get("slot")) or text(record.get("slot")) or name
-        result.append({"slot": slot, "role": text(record.get("role")), "state": text(record.get("status")),
+        status = text(record.get("status"))
+        state = {"done": "idle"}.get(status, status)
+        result.append({"slot": slot, "role": text(record.get("role")), "state": state,
                        "model": "/".join(part for part in (text(meta.get("family")), text(meta.get("model"))) if part),
                        "doing": newest.get(name, newest.get(slot, ""))})
     return result
@@ -232,6 +235,8 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
         record = phase_table.build_plan(plan)
     except phase_table.NoPlan:
         record = phase_table.PhaseRecord(plan, datetime.fromtimestamp(clock.now, clock.zone), phase_table.NoOpenPhase(), [], phase_table.UnknownFinish(), phase_table.NothingToStart("no plan"))
+    if not record.phases:
+        record = phase_table.build_run(plan, events)
     state = "standing-by"
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"

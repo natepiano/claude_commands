@@ -21,6 +21,24 @@ describe("board geometry", () => {
     expect(late.track.length).toBe(100);
   });
 
+  test("ruler starts at the open retry when an earlier attempt has the same phase id", () => {
+    const unit = fixture().units[0]!;
+    const completed = phase("2", "done");
+    completed.start = time(-120, "16:00");
+    completed.finish = time(-90, "16:30");
+    const retry = phase("2", "open");
+    retry.start = time(-10, "17:50");
+    unit.phases = [completed, retry];
+    unit.eta!.trail = [];
+
+    const ruler = rulerCells(unit, NOW / 1000, 100, -240);
+
+    expect(ruler.from).toBe(retry.start.at);
+    expect(ruler.to).toBe(NOW / 1000 + 1800 + 240);
+    expect(ruler.labels).toContain("17:50");
+    expect(ruler.labels).not.toContain("16:00");
+  });
+
   test("late ruler draws the original promise and moves now independently of schedule end", () => {
     const unit = fixture().units[0]!;
     unit.eta!.schedule_end = time(120, "20:00");

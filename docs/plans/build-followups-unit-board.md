@@ -200,7 +200,7 @@ The live check on 2026-10-16 found `/unit-board` in the trunk failing with "proc
 
 **Acceptance gate:** `scripts.production.test_unit_run` and `scripts.delegate.test_board_json` green; `merge_gate --tests-only` green; basedpyright clean on `unit_run.py`; `board_json.py --cwd ~/.claude` 35 s → under 5 s.
 
-### Phase 8 — Board layout fixes
+### Phase 8 — Board layout fixes  · status: done
 
 The design check of the live board (fresh reviewer, 2026-10-16) said "ship after these fixes". The showrunner made them a phase of this run.
 

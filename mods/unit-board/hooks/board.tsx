@@ -51,7 +51,7 @@ export function workersText(unit: BoardUnit): string {
     if (group) group.count++;
     else groups.set(key, { role: worker.role, state: worker.state, count: 1 });
   }
-  return [...groups.values()].map(group => `${group.count} ${group.role} ${group.state}`).join(' · ');
+  return [...groups.values()].map(group => [group.count, group.role, group.state].filter(Boolean).join(' ')).join(' · ');
 }
 
 export function BoardView(elements: PaneElements, columns: number, snapshot: BoardSnapshot<BoardData>, now: number, select: (production: string, unit: string) => void) {
@@ -64,22 +64,36 @@ export function BoardView(elements: PaneElements, columns: number, snapshot: Boa
         <Text bold>{data.production}</Text>
         <Text color="subtle">{data.units.length} units · as of {data.as_of.text}</Text>
       </Box>
-      {data.units.map(unit => <Box flexDirection="column" marginTop={1}>
-        <Box justifyContent="space-between">
-          <Text wrap="truncate-end"><Text color={unit.state === 'running' ? 'suggestion' : 'inactive'}>● </Text>
-            <Text bold>{unit.key}</Text>{unit.phase ? `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}` : '  no phase running'}
-          </Text>
-          <Button key={`open-${data.production}-${unit.key}`} label="open" plain onPress={() => select(data.production, unit.key)} />
-        </Box>
-        <Box flexDirection="column" paddingLeft={2}>
-          <Text wrap="truncate-end">{runsOf(stripCells(unit.phases)).map(run => <Text color={run.tone}>{run.text}</Text>)}<Text color="subtle">  {unit.stage}</Text></Text>
-          {etaText(unit) && <Text wrap="truncate-end">{etaText(unit)}</Text>}
-          {gateText(unit) && <Text color="warning" wrap="wrap">{gateText(unit)}</Text>}
-          {finishText(unit) && <Text color="subtle">{finishText(unit)}</Text>}
-          {RulerView(elements, unit, data, now, width)}
-          {unit.workers.length > 0 && <Text color="subtle" wrap="truncate-end">workers  {workersText(unit)}</Text>}
-        </Box>
-      </Box>)}
+      {[...data.units].sort((left, right) => {
+        const order = (unit: BoardUnit) => unit.state === 'running' ? 0 : unit.state === 'run-finished' ? 2 : 1;
+        return order(left) - order(right);
+      }).map(unit => {
+        const done = unit.state === 'run-finished';
+        const strip = stripCells(unit.phases);
+        const eta = etaText(unit);
+        const gate = gateText(unit);
+        const finish = done || unit.phase || unit.phases.some(row => row.status === 'todo' || row.status === 'gated')
+          ? finishText(unit) : '';
+        const workers = unit.workers.some(worker => worker.state !== 'ended') ? workersText(unit) : '';
+        const details = Boolean(strip.length > 0 || eta || gate || finish || unit.phase || workers);
+        return <Box flexDirection="column" marginTop={done ? 0 : 1}>
+          <Box justifyContent="space-between">
+            <Text wrap="truncate-end"><Text color={unit.state === 'running' ? 'suggestion' : 'inactive'}>● </Text>
+              <Text bold>{unit.key}</Text>{done ? `  Run done${finish ? `  ${finish}` : ''}`
+                : unit.phase ? `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}` : `  ${unit.stage}`}
+            </Text>
+            <Button key={`open-${data.production}-${unit.key}`} label="open" plain onPress={() => select(data.production, unit.key)} />
+          </Box>
+          {!done && details && <Box flexDirection="column" paddingLeft={2}>
+            {(strip.length > 0 || unit.phase) && <Text wrap="truncate-end">{runsOf(strip).map(run => <Text color={run.tone}>{run.text}</Text>)}{unit.phase && <Text color="subtle">{strip.length > 0 ? '  ' : ''}{unit.stage}</Text>}</Text>}
+            {eta.length > 0 && <Text wrap="truncate-end">{eta}</Text>}
+            {gate.length > 0 && <Text color="warning" wrap="wrap">{gate}</Text>}
+            {finish.length > 0 && <Text color="subtle">{finish}</Text>}
+            {unit.phase && RulerView(elements, unit, data, now, width)}
+            {workers.length > 0 && <Text color="subtle" wrap="truncate-end">workers  {workers}</Text>}
+          </Box>}
+        </Box>;
+      })}
     </Box>)}
   </Box>;
 }

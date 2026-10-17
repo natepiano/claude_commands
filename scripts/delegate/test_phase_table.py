@@ -1936,6 +1936,140 @@ class PhaseTableTests(unittest.TestCase):
         assert isinstance(row, phase_table.OpenPhase)
         self.assertEqual(row.phase, "7")
 
+    def test_run_phase_records_match_plan_rows_with_repairs_findings_and_moved_etas(self) -> None:
+        headings = plan_text(
+            "### Phase 1 — Repair delivery  · status: done", "",
+            "### Phase 2 — Moved delivery  · status: done", "",
+            "### Phase 3 — Current delivery  · status: todo",
+        )
+        for target in (2_200, 1_900, None):
+            with self.subTest(open_eta=target):
+                self.write_plan(headings)
+                events = [
+                    self.phase_event("eta_stated", "", "", 850, eta_phase_id="1", eta_at=1_200),
+                    self.phase_event("phase_started", "1", "one", 900, phase_title="Repair delivery"),
+                    self.phase_event("pass_started", "1", "one", 950,
+                                     pass_kind="fix", pass_instance_id="repair", fix_pass=1),
+                    self.phase_event("finding_opened", "1", "one", 1_000, severity="minor"),
+                    self.phase_event("pass_finished", "1", "one", 1_100, pass_instance_id="repair"),
+                    self.phase_event("phase_finished", "1", "one", 1_200,
+                                     status="completed", phase_elapsed_seconds=300),
+                    self.phase_event("phase_started", "2", "two", 1_300, phase_title="Moved delivery"),
+                    self.phase_event("eta_stated", "2", "two", 1_350, eta_phase_id="2", eta_at=1_500),
+                    self.phase_event("eta_stated", "2", "two", 1_400, eta_phase_id="2", eta_at=1_600),
+                    self.phase_event("phase_finished", "2", "two", 1_700,
+                                     status="completed", phase_elapsed_seconds=400),
+                ]
+                if target is not None:
+                    events.append(self.phase_event("eta_stated", "2", "two", 1_750,
+                                                   eta_phase_id="3", eta_at=target))
+                events.append(self.phase_event("phase_started", "3", "three", 1_800,
+                                               phase_title="Current delivery"))
+                _ = self.write_run("current", 800, *events)
+                with patch.dict(os.environ, {
+                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                    "PLAN_DELEGATE_NOW_EPOCH": "2000",
+                }):
+                    planned = phase_table.build_plan(self.plan)
+                    self.write_plan("# As built\n")
+                    recorded = phase_table.build_run(self.plan, events)
+
+                self.assertEqual(recorded.phases, planned.phases)
+                self.assertEqual(recorded.current, planned.current)
+                self.assertEqual(recorded.plan_finish, planned.plan_finish)
+                self.assertEqual(len(recorded.phases), 3)
+                first, second, current = recorded.phases
+                self.assertIsInstance(first, phase_table.DonePhase)
+                self.assertEqual(first.fix_done, 1)
+                self.assertEqual(first.findings, {"blocker": 0, "minor": 1, "nit": 0})
+                self.assertEqual(second.moves, 1)
+                self.assertEqual(second.delta_minutes, 100 / 60)
+                self.assertIsInstance(current, phase_table.OpenPhase)
+
+    def test_open_phase_survives_a_title_supplied_by_a_later_progress_event(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Delivery  · status: todo"))
+        events = [
+            self.phase_event("phase_started", "1", "one", 100),
+            self.phase_event("progress_reported", "1", "one", 150,
+                             phase_percent=50, phase_elapsed_seconds=50),
+        ]
+        with patch.dict(os.environ, {
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+            "PLAN_DELEGATE_NOW_EPOCH": "150",
+        }):
+            _ = self.write_run("current", 50, *events)
+            without_title = phase_table.build_plan(self.plan)
+            events[1]["phase_title"] = "Delivery"
+            _ = self.write_run("current", 50, *events)
+            with_title = phase_table.build_plan(self.plan)
+
+        self.assertEqual(with_title, without_title)
+        self.assertIsInstance(with_title.current, phase_table.OpenPhase)
+        self.assertEqual(with_title.phases, [with_title.current])
+        assert isinstance(with_title.current, phase_table.OpenPhase)
+        self.assert_epoch(with_title.current.started, 100)
+        self.assertEqual(with_title.current.progress, phase_table.ReportedPhaseProgress(50))
+        assert isinstance(with_title.current.eta, phase_table.ProjectedEta)
+        self.assert_epoch(with_title.current.eta.time, 200)
+        self.assert_epoch(with_title.current.schedule_end, 200)
+        self.assertEqual(with_title.plan_finish, phase_table.PredictedFinish(
+            datetime.fromtimestamp(200, ZoneInfo("UTC")),
+        ))
+
+    def test_run_records_keep_completions_without_start_or_elapsed_time(self) -> None:
+        for has_start in (False, True):
+            for elapsed in (None, 300):
+                with self.subTest(has_start=has_start, elapsed=elapsed):
+                    events: list[dict[str, object]] = []
+                    if has_start:
+                        events.append(self.phase_event("phase_started", "7", "one", 100,
+                                                       phase_title="Delivery"))
+                    events.append(self.phase_event("eta_stated", "7", "one", 150,
+                                                   eta_phase_id="7", eta_at=800))
+                    finished = self.phase_event("phase_finished", "7", "one", 1_000,
+                                                phase_title="Delivery", status="completed")
+                    if elapsed is not None:
+                        finished["phase_elapsed_seconds"] = elapsed
+                    events.extend([finished, {"event_type": "run_finished", "timestamp_epoch": 1_100}])
+
+                    record = phase_table.build_run(self.plan, events)
+
+                    self.assertEqual(len(record.phases), 1)
+                    row = record.phases[0]
+                    assert isinstance(row, phase_table.DonePhase)
+                    self.assertEqual((row.phase, row.title), ("7", "Delivery"))
+                    assert isinstance(row.times, phase_table.CompletedPhaseTiming)
+                    self.assert_epoch(row.times.start, 100 if has_start else 1_000 - (elapsed or 0))
+                    self.assert_epoch(row.times.finish, 1_000)
+                    self.assertEqual(row.times.seconds, elapsed or 0)
+                    self.assertEqual(row.eta_trail, [(
+                        datetime.fromtimestamp(800, ZoneInfo("UTC")),
+                        datetime.fromtimestamp(150, ZoneInfo("UTC")),
+                    )])
+                    self.assertEqual(row.delta_minutes, 200 / 60)
+                    self.assertIsInstance(record.current, phase_table.NoOpenPhase)
+                    self.assertEqual(record.plan_finish, phase_table.FinishedAt(row.times.finish))
+
+    def test_run_records_use_completion_titles_instead_of_start_titles(self) -> None:
+        for completion_title in ("Final delivery", ""):
+            with self.subTest(completion_title=completion_title):
+                events = [
+                    self.phase_event("phase_started", "7", "one", 100,
+                                     phase_title="Original delivery"),
+                    self.phase_event("finding_opened", "7", "one", 150, severity="minor"),
+                    self.phase_event("phase_finished", "7", "one", 200,
+                                     phase_title=completion_title, phase_elapsed_seconds=100,
+                                     status="completed"),
+                ]
+
+                record = phase_table.build_run(self.plan, events)
+
+                self.assertEqual(len(record.phases), 1)
+                row = record.phases[0]
+                self.assertIsInstance(row, phase_table.DonePhase)
+                self.assertEqual(row.title, completion_title or "Original delivery")
+                self.assertEqual(row.findings, {"blocker": 0, "minor": 1, "nit": 0})
+
     def test_build_plan_needs_no_session_state(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Delivery  · status: todo"))
 
