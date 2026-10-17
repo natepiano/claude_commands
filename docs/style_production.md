@@ -120,7 +120,12 @@ One style production and one synced branch point per repository. The ledger is
 `~/.local/state/style/<repo>/ledger.sqlite`; only `style_ledger.py` writes it.
 Startup runs `style_ledger.py reconcile --repo <checkout> --branch-point <branch>
 --style-branch <style branch>` and logs its change lines. Reconcile recovers work
-state from Git without advancing an existing synced tip.
+state from Git without advancing a tip already associated with that style branch.
+When initializing or changing the style branch, reconcile syncs the ledger at
+that branch's commit, falling back to the branch-point tip only if the style
+branch does not exist. Creating a production likewise syncs at the style branch's
+commit; a fresh branch takes that commit from the branch point. An interrupted
+bootstrap already synced at that tip and branch leaves the row untouched.
 
 Rule ids are `global:rust/<rule>.md` and
 `local:docs/<member>/style/<rule>.md`. A member-local rule governs its member

@@ -1126,6 +1126,79 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(dropped_final.returncode, 2)
         self.assertIn("merged", dropped_final.stderr)
 
+    def test_ensuring_the_exact_tip_and_style_branch_never_calls_set_tip(self) -> None:
+        _ = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "style/main")
+        before = ledger.synced_at()
+
+        with mock.patch.object(ledger, "set_tip", side_effect=AssertionError("rewrote an exact sync match")):
+            ledger.ensure_synced_tip(self.initial_tip, "style/main")
+            ledger.ensure_synced_tip(self.initial_tip, "refs/heads/style/main")
+
+        self.assertEqual(ledger.summary().synced_tip, self.initial_tip)
+        self.assertEqual(ledger.synced_at(), before)
+
+    def test_reconcile_new_style_branch_syncs_at_its_commit_before_the_branch_point(self) -> None:
+        _ = self.rule("read")
+        self.write("crates/beta/src/style.rs", "pub fn style_input() {}\n")
+        style_tip = self.commit("Create the style branch input")
+        _ = self.git("branch", "style/main")
+        self.write("crates/beta/src/new.rs", "pub fn new_input() {}\n")
+        branch_tip = self.commit("Advance branch point before style reconciliation")
+        ledger = self.ledger()
+        for previous_branch in ("", "style/previous"):
+            with self.subTest(previous_branch=previous_branch):
+                if previous_branch:
+                    ledger.set_tip(self.initial_tip, previous_branch)
+                else:
+                    ledger.set_tip(self.initial_tip)
+
+                changes = ledger.reconcile("main", "style/main")
+
+                self.assertEqual(changes, ("style branch refs/heads/style/main",))
+                self.assertEqual(ledger.summary().synced_tip, style_tip)
+                paths = {cell.path for cell in ledger.cells()}
+                self.assertIn("crates/beta/src/style.rs", paths)
+                self.assertNotIn("crates/beta/src/new.rs", paths)
+                self.assertEqual(self.git("rev-parse", "refs/heads/style/main"), style_tip)
+                self.assertEqual(self.git("rev-parse", "main"), branch_tip)
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    stored = cast(tuple[str, str], connection.execute("SELECT tip,style_branch FROM sync").fetchone())
+                self.assertEqual(stored, (style_tip, "refs/heads/style/main"))
+
+    def test_reconcile_missing_style_branch_uses_the_branch_point_commit(self) -> None:
+        _ = self.rule("read")
+        self.write("crates/beta/src/new.rs", "pub fn new_input() {}\n")
+        branch_tip = self.commit("Advance branch point without a style branch")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "style/previous")
+
+        changes = ledger.reconcile("main", "style/main")
+
+        self.assertEqual(changes, ("style branch refs/heads/style/main",))
+        self.assertEqual(ledger.summary().synced_tip, branch_tip)
+        self.assertIn("crates/beta/src/new.rs", {cell.path for cell in ledger.cells()})
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            stored = cast(tuple[str, str], connection.execute("SELECT tip,style_branch FROM sync").fetchone())
+        self.assertEqual(stored, (branch_tip, "refs/heads/style/main"))
+        self.assertNotIn("refs/heads/style/main", self.git("for-each-ref", "--format=%(refname)"))
+
+    def test_reconcile_matching_style_branch_preserves_an_older_synced_tip(self) -> None:
+        _ = self.rule("read")
+        _ = self.git("branch", "style/main")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "style/main")
+        before = ledger.synced_at()
+        self.write("crates/beta/src/new.rs", "pub fn new_input() {}\n")
+        _ = self.commit("Advance branch point after the existing sync")
+
+        self.assertEqual(ledger.reconcile("main", "refs/heads/style/main"), ())
+
+        self.assertEqual(ledger.summary().synced_tip, self.initial_tip)
+        self.assertEqual(ledger.synced_at(), before)
+        self.assertNotIn("crates/beta/src/new.rs", {cell.path for cell in ledger.cells()})
+
     def test_assigned_ticket_resumes_until_its_recorded_branch_is_deleted(self) -> None:
         rule_id = self.rule("read")
         self.set_tip(self.initial_tip)
@@ -1367,7 +1440,7 @@ class StyleLedgerTests(unittest.TestCase):
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
         self.assertEqual(tickets, [("live-1", "assigned"), ("vanished-1", "dropped"), ("worker-1", "merged")])
         self.assertEqual(handoffs, [(merged_checkpoint, "merged", first_merge)])
-        self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
+        self.assertEqual(sync, [(unmerged_checkpoint, "refs/heads/style/main")])
         self.assertEqual(self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main").stdout.strip(), "")
 
     def test_reconcile_bootstraps_an_unsynced_ledger_and_preserves_stored_tip(self) -> None:
