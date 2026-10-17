@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 import change_review
-from add_unit import production_field
-from production_units import Refusal
+import issues
+import proposals_folder
+from production_units import Refusal, production_field
 
 IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
 COUNTS_HEAD = "For you: "
@@ -42,14 +43,8 @@ def changes(doc: Path) -> int:
 
 
 def proposals(doc: Path) -> int:
-    # The proposals module brings the phase and run readers along, so only a doc with a folder pays for it.
-    if "- **Proposals:** " not in doc.read_text(encoding="utf-8"):
-        return 0
-    import issues
-    import proposals_table
-
-    folder = proposals_table.issues_folder(doc)
-    return 0 if folder is None or not folder.is_dir() else len(issues.open_issues(folder, proposals_table.PROPOSAL_TAG))
+    folder = proposals_folder.issues_folder(doc)
+    return 0 if folder is None or not folder.is_dir() else len(issues.open_issues(folder, proposals_folder.PROPOSAL_TAG))
 
 
 def open_project(line: str) -> bool:

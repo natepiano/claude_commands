@@ -23,7 +23,7 @@ sys.path.insert(0, str(SCRIPTS / "shutdown"))
 import rename_state
 import unit_lookup
 import unit_names
-from production_units import Refusal, cell_value, unit_rows, unit_headings, unit_table
+from production_units import Refusal, cell_value, production_field, unit_rows, unit_headings, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
@@ -242,17 +242,6 @@ def is_review_unit(unit: str, lines: list[str]) -> bool:
     The review unit runs `/review:direct` and is idle by design between reviews.
     """
     return unit == "review-unit" and any(line.startswith("- **Review pool:** ") for line in lines)
-
-
-def production_field(lines: list[str], field: str) -> str:
-    """Read a Production Context field without interpreting its commentary."""
-    prefix = f"- **{field}:** "
-    for line in lines:
-        if line.startswith(prefix):
-            result = cell_value(line[len(prefix):])
-            if result:
-                return result
-    raise Refusal(f"production doc lacks {field}")
 
 
 def read_production(path: Path) -> Production:
