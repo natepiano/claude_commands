@@ -211,20 +211,25 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ### Phase 9 — Every unit fits, and the stage is right  · status: done
 
-**Goal:** The trunk board at 50 rows shows all 22 units. The stage names what a running unit is really doing. The seven layout defects from the live check are fixed. `/unit-board` is installable in the user's own sessions.
+#### As-built
 
-The live check of b9e0cfa9 (captures `/tmp/claude/ub-live-trunk.txt`, `/tmp/claude/ub-live-unit.txt`) found these. The fixes:
-
-1. **Finished units fold.** Every unit in `run-finished` or standing-by state with no phase running goes on one compact line under the running units. It reads `Done: <key>, <key>, …`, with keys in board order. When that line passes the pane width, it ends `+N more`. Every running unit always shows in full, and a unit is never cut by the pane height. At 170x50, the trunk board (22 units) shows every unit.
-2. **Header.** The unit header never reads `No phase running · Run done`. With no phase running, it shows only the stage (`Run done`, `Standing by`, `Waiting on …`).
-3. **Phase record alignment.** In the unit view's phase record, the fix-dot column has a fixed width. Every row's title, times and status columns start at the same offset, whether or not the row has fix dots.
-4. **Worker labels.** A worker with no role falls back to its slot name. `workers 2 paused` names them: `impl paused · test paused`, or the role text the line uses for working workers.
-5. **Title gap.** A long phase title is cut with `…` so at least two spaces stay before the status word (`open`, `done`, …).
-6. **Stage at its source.** `board_json.stage` returns `Standing by` for running units whose workers are working. Find the cause in `board_json.py` and fix it there, not in the renderer. Likely causes: `current` being `NoOpenPhase` empties the event filter, or passes that a launcher starts without `pass_started` events. Use the real run files under the history root to see which. A running unit with an open phase reports the open pass (`Build`, `Tests`, `Review`, `Repair round N`), else the open step, else `Phase N running`. It reads `Standing by` only when no phase is open.
-7. **Overdue.** An ETA whose time has passed while the phase is still open reads `overdue` (for example `ETA 14:05 · overdue 12m`). The same goes for a predicted finish already in the past.
-8. **Plan path.** The unit pane names the Plan cell's plan. When that path no longer exists, it names the as-built doc the production row now points to, or omits the line. It never names a deleted file.
-9. **Install route.** `/unit-board` must load in the user's sessions without `--plugin-dir`. Add a local marketplace manifest, `mods/.claude-plugin/marketplace.json`, listing `unit-board` (source `./unit-board`) so `claude plugin marketplace add ~/.claude/mods` plus `claude plugin install unit-board@<name>` works. Do not edit `~/.claude/settings.json` or run either command; the unit director reports the exact settings change. `claude plugin validate --strict` must pass on the manifest.
-
-**Files:** `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`, `mods/unit-board/hooks/geometry.ts`, `scripts/delegate/board_json.py`, `mods/.claude-plugin/marketplace.json` — new. Tests: `scripts/delegate/test_board_json.py`, `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/geometry.test.ts`.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate of the mod and of the marketplace manifest, basedpyright 0/0, the full merge gate. After promotion, a live check at 170x50 shows all 22 trunk units, with running stages matching their runs, and fresh captures of both panes go to the showrunner.
+- Board (`board.tsx`):
+  - `run-finished` units with no phase fold into `Done: …`, and plain standing-by units into `Standing by: …`. Each line ends `+N more` past the width, via `doneText(keys, width, label)`.
+  - A gate waiter keeps its one-line header.
+  - `BoardView` takes the pane's `bodyRows`, passed in from `register.tsx`, and reserves the fold lines first.
+  - When the running blocks don't fit, they go compact from the last one up: header, then stage, ETA and overdue, then the strip.
+  - Then the gaps between blocks drop.
+  - Then one `+N more running: …` line takes the rest.
+  - Nothing draws past `bodyRows`.
+  - A passed ETA or predicted finish reads `overdue Nm`.
+  - Worker groups fall back to their slot.
+  - Titles are cut with `…` to keep two spaces before `open`.
+- `geometry.ts`: `cellWidth` counts terminal cells (wide, emoji and combining characters). `fitText`, `doneText` and `overdueText` use it.
+- Unit view (`unit.tsx`):
+  - With no phase running, the header shows only the stage.
+  - The id, timing, fix-dot and ETA columns are each one width across the record.
+  - A deleted plan path is not shown.
+- `board_json.py`:
+  - `stage` order: an open pass, then a dispatched batch not yet landed (`Repair round N`), then the open step, then `Phase N running`. It reads `Standing by` only with no phase open.
+  - The record is built from the run's own plan (`project_plan_doc`, else `plan_doc`) when that plan differs from the Plan cell. The displayed `plan` stays the Plan cell, and is empty when that file is gone.
+- Install: `mods/.claude-plugin/marketplace.json` (marketplace `nate-local`) lists `unit-board` and `postmaster`. Loading it in user sessions takes a `~/.claude/settings.json` change (`extraKnownMarketplaces` plus `enabledPlugins`), which goes to the user.
