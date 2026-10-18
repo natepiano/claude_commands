@@ -19,6 +19,8 @@ except ImportError:  # pragma: no cover - non-Unix fallback
 STYLE_GUIDE = Path.home() / "rust" / "nate_style" / "rust" / "forbidden-words.md"
 COUNTER_STATE = Path.home() / ".claude" / "state" / "forbidden-word-counts.json"
 COUNTER_LOCK = COUNTER_STATE.with_suffix(".lock")
+# The Stop hook appends one tab-separated line here per banned word it finds.
+PROSE_LOG = Path.home() / ".claude" / "state" / "forbidden-word-prose.log"
 # Snapshot of the counter file as it was *before* the most recent write. Each
 # write copies the live file here first, so `revert_to_backup()` undoes exactly
 # the last bump — used when a hit is deemed not to count (e.g. quoting a stem).
