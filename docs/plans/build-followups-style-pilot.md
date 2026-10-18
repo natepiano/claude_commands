@@ -785,8 +785,8 @@ demand.
   issues in the vault and skipped none. Only the empty `Proposed ranking:`
   lines changed, and one empty root title became `# Style restructure:
   cargo-liner`. No vault commit was made: no style issue was ever committed,
-  so a commit would add all 279 files for the first time. That choice went
-  to the showrunner.
+  so a commit would add all 279 files for the first time. The showrunner
+  chose to leave them untracked, as the rest of the folder is.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
