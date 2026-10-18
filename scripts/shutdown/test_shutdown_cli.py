@@ -1038,6 +1038,60 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(history_reads, 1)
         self.assertTrue(text.rstrip().endswith("all 1 stopped"), text)
 
+    def test_failed_restart_status_and_follow_recheck_liveness_before_offering_a_command(self) -> None:
+        saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="restart prompt not submitted"))
+        self.assertTrue(record.create_session(saved))
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        for liveness in (restart_work.SessionLive(), restart_work.SessionNotLive(),
+                         restart_work.SessionLivenessUnknown("scratch registry unreadable")):
+            with self.subTest(liveness=liveness):
+                with (patch.object(restart_work, "_session_liveness", return_value=liveness),
+                      patch.object(restart_work, "_owner_liveness", return_value=liveness),
+                      patch.object(shutdown, "inventory", return_value=report),
+                      patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+                status_text = output.getvalue()
+                with (patch.object(restart_work, "_session_liveness", return_value=liveness),
+                      patch.object(restart_work, "_owner_liveness", return_value=liveness),
+                      patch.object(time, "sleep", side_effect=AssertionError("follow must return its action"))):
+                    code, follow_text = self.follow_request()
+                self.assertEqual(code, 1)
+                for text in (status_text, follow_text):
+                    if isinstance(liveness, restart_work.SessionLive):
+                        self.assertIn("restart prompt not confirmed; session is running — check it", text)
+                        self.assertNotIn("shutdown.py restart", text)
+                        self.assertNotIn("bring back:", text)
+                    else:
+                        self.assertIn(f"restart {LOGIN} --here --only session-123", text)
+                        if isinstance(liveness, restart_work.SessionLivenessUnknown):
+                            self.assertIn("scratch registry unreadable", text)
+                self.assertEqual(record.find_session(LOGIN, "session-123"), saved)
+
+    def test_bring_back_command_keeps_dead_sibling_and_excludes_live_failed_session(self) -> None:
+        live = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="restart prompt not submitted"), "live-failed")
+        dead = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="agent exited"), "dead-failed")
+        self.assertTrue(record.create_session(live))
+        self.assertTrue(record.create_session(dead))
+        def liveness(identity: str) -> restart_work.SessionLive | restart_work.SessionNotLive:
+            return restart_work.SessionLive() if identity == "live-failed" else restart_work.SessionNotLive()
+        def owner_liveness(owner: inventory.Session) -> restart_work.SessionLive | restart_work.SessionNotLive:
+            return liveness(owner["session_id"])
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(restart_work, "_session_liveness", side_effect=liveness),
+              patch.object(restart_work, "_owner_liveness", side_effect=owner_liveness),
+              patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        actions = [line for line in output.getvalue().splitlines() if "bring back:" in line]
+        self.assertEqual(len(actions), 1)
+        self.assertIn("--only dead-failed", actions[0])
+        self.assertNotIn("live-failed", actions[0])
+
     def test_follow_needing_user_names_account_session_and_terminal(self) -> None:
         for progress in (
             record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="still alive"),

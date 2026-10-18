@@ -1962,3 +1962,46 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - Any launcher test fake must render an empty composer row, or submit never becomes ready.
 - A glob error or any transcript open, read, stat or seek error makes the whole read unreadable; no matching file is a readable, empty read.
+
+### Phase 70 — A slow restart is never marked failed while its session runs  · status: done
+
+#### Work Order
+
+**Goal:** a restart whose resume prompt Claude accepted is recorded as submitted, a slash-command resume prompt included, and a session whose process is live is never offered a restart command or relaunched as a second copy.
+
+**Constraints from prior phases:** field report 2026-10-18 00:40 EDT (showrunner, from herdr-trial). The cargo-liner-style showrunner (session `294cac84`) was moved at 04:38:39Z. Its resume prompt was `/showrunner:produce /home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-production.md resume`. Claude accepted it at 04:38:44Z and finished the turn by 04:39. Claude Code records a slash command as a non-meta user row whose content is the string `<command-message>showrunner:produce</command-message>\n<command-name>/showrunner:produce</command-name>\n<command-args>/home/…/cargo-liner-style-production.md resume</command-args>`, so the typed text is never a substring of it. At 04:40:10Z the outcome read `opening prompt deadline elapsed; prompt typed 1 times`, and the record went to `restart failed: restart prompt not submitted`. The other two unsent prompts herdr-trial saw (tool-based-ui trunk at 22:53 EDT, nightly-review at 15:40 EDT on 10-17) came before Phase 69 reached natedev at 00:08 EDT. The code today:
+- `TranscriptCursor.submitted_prompt(text)` (`scripts/herdr/herdr.py` ~312) matches a non-meta `user` row whose `_turn_text` (~319) contains `text`. The same check runs before every re-type (Phase 69 Spec 3), so a slash-command prompt can also be typed a second time.
+- `submit_opening_prompt` (~1097) returns `PromptNotSubmitted` at its deadline and on its other give-up paths.
+- `relaunch_session` (`scripts/shutdown/restart.py` ~1770–1830) checks liveness for a `timers pending` record (~1792) and, only for a snapshot request, for `already gone`/`restart failed` (~1812, printing `already running; skipped`). A move's `restart failed` record is relaunched with no liveness check.
+- `_session_liveness(session_id)` (~534) returns `SessionLive`/`SessionNotLive`/`SessionLivenessUnknown`; `_owner_liveness` (~560) also checks the saved process identity.
+- Restart commands print in `shutdown status`'s `bring back` line (`scripts/shutdown/shutdown.py` ~686–704) and in `_follow_action` (~745), which `follow` prints for a `restart failed` record (~790).
+- The not-back push text is `settle.not_back_text` (`scripts/shutdown/settle.py` ~1414); `_not_back_records` (restart.py ~2830) picks `restart failed` and `manual restart` records.
+
+**Spec:**
+1. **A slash command matches its recorded row.** When the opening prompt starts with `/`, split it into a command name (the first word, without the `/`) and its arguments (the rest, outer white space removed). A non-meta `user` row matches when its text holds `<command-name>/<name></command-name>` and, when the arguments are not empty, `<command-args><arguments></command-args>`. Any other prompt matches as today. The one match function serves the submit wait, the re-type guard and the final check, so a slash-command prompt Claude accepted is never typed again.
+2. **Read once more before failing.** Every path in `submit_opening_prompt` that would return not submitted after the prompt was typed first reads the transcript one last time. A match returns `PromptSubmitted` with that turn's time.
+3. **A live session is never relaunched.** `relaunch_session` checks liveness for every `restart failed` record, from a move or a snapshot alike. Live: print `<name>: already running; skipped`, start nothing, and leave the record as it is. Unknown: refuse with the reason, as the snapshot path does today. Not live: relaunch as today.
+4. **No restart command for a live session.** `shutdown status`'s `bring back` line and `follow`'s action line leave out any `restart failed` record whose session is live. In its place the record's line reads `restart prompt not confirmed; session is running — check it`, with no command. Liveness is read when the line is drawn, so a session that later exits gets its restart command back. When liveness is unknown, show the command, with the unknown reason beside it.
+5. **No not-back push for a live session.** A `restart failed` record whose session is live sends no not-back push, since the user has nothing to do.
+
+**Files:**
+- `scripts/herdr/herdr.py` — the slash-command match and the final read.
+- `scripts/shutdown/restart.py` — the liveness check in `relaunch_session` and the not-back push filter.
+- `scripts/shutdown/shutdown.py` — the status and follow lines.
+- `scripts/herdr/test_herdr.py` — regressions for Specs 1–2.
+- `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_shutdown_cli.py` — regressions for Specs 3–5.
+
+**Workers:** 1 writer + 1 tester. impl owns `herdr.py`, `restart.py` and `shutdown.py`; test owns the three test files.
+
+**Verification:** scratch-HOME suites `scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions scripts.shutdown.test_restart scripts.shutdown.test_account_move scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle scripts.production.test_add_unit scripts.production.test_add_showrunner scripts.notify.test_push_texts`; basedpyright 0/0 on the changed files.
+
+**Acceptance gate:**
+- **Slash command (field case):** the typed prompt `/showrunner:produce /x/doc.md resume` and a transcript row in the recorded `<command-message>…<command-name>/showrunner:produce</command-name>\n<command-args>/x/doc.md resume</command-args>` form give `PromptSubmitted` with one typing. On today's code this test returns not submitted.
+- **Real recorded row (showrunner):** one test writes this row, copied from the live transcript of session `294cac84` (its other keys dropped), with `content` byte for byte and the timestamp moved after launch. Typing `/showrunner:produce /home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-production.md resume` gives `PromptSubmitted` with one typing:
+  `{"type": "user", "timestamp": "2026-10-18T04:38:44.088Z", "message": {"role": "user", "content": "<command-message>showrunner:produce</command-message>\n<command-name>/showrunner:produce</command-name>\n<command-args>/home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-production.md resume</command-args>"}}`
+- **No second typing:** an accepted slash command whose box empties and whose session goes idle is never typed again.
+- **Final read:** a turn that lands after the last poll and before the deadline return gives `PromptSubmitted`.
+- **Live session:** `relaunch_session` on a move's `restart failed` record with a live session starts nothing and prints `already running; skipped`. Unknown liveness refuses. Not live relaunches.
+- **Status and follow:** for a live session, `shutdown status` and `follow` print no restart command for it. Once the session is not live, the command shows again.
+- **Push:** a live session's `restart failed` record sends no not-back push.
+- **Suites:** they pass, basedpyright reports 0/0, and the merge gate on natedev passes.
