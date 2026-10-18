@@ -27,9 +27,9 @@
 #                <showrunner state>/counts/<slug>. A cache is rebuilt only when a
 #                file it names is newer than it, or its deferred question's time
 #                has come; SHOWRUNNER_STATE_DIR overrides the state folder.
-# jq renders the role, account, directory, tokens and model, then quota windows,
-# then the session's counts row;
-# a unit director with a live showrunner name reads "unit director for <name>".
+# jq renders the session name, role, directory, tokens and model, then the account
+# and quota windows, then the session's counts row;
+# a unit director with a live showrunner name reads "<session> - unit director for <name>".
 
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 account=
@@ -116,8 +116,19 @@ if [ -n "${SHOWRUNNER_UNIT:-}" ] && [ -z "${PLAN_DELEGATE_TEAM_ROLE:-}" ]; then
   esac
 fi
 
+# This session's own record names it: Claude Code runs the status line command, so its pid is $PPID.
+# jq checks the record's session id against the session's own, so a reused pid names nobody.
+own=
+{
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    own=$(<"${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}/$PPID.json")
+  else
+    IFS= read -r own < "${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}/$PPID.json"
+  fi
+} 2>/dev/null
+
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
 exec jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "$showrunners" \
   --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
-  --arg showrunner "$showrunner" --arg counts "$counts" --slurpfile labels "$labels" \
+  --arg showrunner "$showrunner" --arg own "$own" --arg counts "$counts" --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"
