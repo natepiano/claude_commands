@@ -309,6 +309,37 @@ def _save_state(state: WatchState) -> None:
     _atomic_json(state_root() / "refusal_watch.json", _state_document(state))
 
 
+def started_next_move_holds(entries: tuple[next_moves.NextMove, ...]) -> dict[str, next_moves.StartedHold] | next_moves.WatchStateUnreadable:
+    """Read current heads' resolved holds without reacquiring the editor's watch lock."""
+    if not entries:
+        return {}
+    try:
+        state = _load_state()
+    except (OSError, ValueError, OverflowError):
+        return next_moves.WatchStateUnreadable()
+    holds = state.get("auto_move_holds", {})
+    if not holds:
+        return {}
+    selected = accounts.group_accounts()
+    heads: set[accounts.ClaudeGroup] = set()
+    started: dict[str, next_moves.StartedHold] = {}
+    for entry in entries:
+        if not isinstance(entry, next_moves.ClaudeGroupMove) or entry.group in heads:
+            continue
+        heads.add(entry.group)
+        if isinstance(entry.hold_mode, next_moves.FixedHold) and entry.hold_mode.minutes == 0:
+            continue
+        hold = holds.get(entry.id)
+        if hold is None or not isinstance(hold.duration, next_moves.ResolvedHold):
+            continue
+        transition = accounts.group_transition(entry.group)
+        selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
+        if (hold.account == accounts.group_label(selected, entry.group)
+                and hold.move_id == selection_id and hold.percent == entry.at_percent):
+            started[entry.id] = next_moves.StartedHold(hold.at, hold.duration)
+    return started
+
+
 @contextmanager
 def _watch_lock() -> Generator[None]:
     # The synchronization file does not initialize account state during a refused preparation.

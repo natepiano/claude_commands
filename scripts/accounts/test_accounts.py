@@ -29,7 +29,7 @@ from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts, next_moves, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -2822,6 +2822,123 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((entries[0], entries[2].id), (first, second.id))
         self.assertIn("hold half a point", next_moves.render_next_move(entries[1]))
         self.assertIn("hold half a point", next_moves.render_next_move(entries[2]))
+
+    def test_empty_list_does_not_read_corrupt_watch_state_locally_or_through_the_mac(self) -> None:
+        state_path = refusal_watch.state_root() / "refusal_watch.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        _ = state_path.write_text("{")
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            return output
+
+        for mac_client in (False, True):
+            with (self.subTest(mac_client=mac_client),
+                  patch.object(role_map, "is_role_map_host", return_value=not mac_client),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote),
+                  patch.object(refusal_watch, "_load_state", side_effect=AssertionError("empty list read watch state")) as read):
+                self.assertEqual(self.run_cli("next", "list"), (0, "nothing set up\n", ""))
+                read.assert_not_called()
+        self.assertEqual(requests, [("next", "list")])
+        self.assertEqual(state_path.read_text(), "{")
+
+    def test_corrupt_started_hold_state_lists_estimates_and_one_notice_on_both_machines(self) -> None:
+        self.login_directory("claude1", "source@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude1"}))
+        at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        head = next_moves.add_next_move("units", 1, "claude2", next_moves.HalfPointHold())
+        _ = next_moves.add_next_move("units", 2, "claude3", next_moves.HalfPointHold())
+        held = refusal_watch.HoldStarted("claude1", at, accounts.NoGroupTransition(), 1,
+            next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.9)))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={head.id: held}))
+        notice = "started holds not shown: watch state unreadable"
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            return output
+
+        with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22)),
+              patch.object(accounts, "group_half_point_hold",
+                           return_value=next_moves.ResolvedHold(5, next_moves.PaceEstimate(6)))):
+            code, started, error = self.run_cli("next", "list")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("34 min at 0.9 points/hour, 12 min left", started)
+            state_path = refusal_watch.state_root() / "refusal_watch.json"
+            _ = state_path.write_text("{")
+            before_log = next_moves.next_moves_file().read_bytes()
+            expected = ("units 1: at 1% → claude2, hold half a point (≈5 min)\n"
+                        + "units 2: at 2% → claude3, hold half a point (≈5 min)\n"
+                        + notice + "\n")
+            for mac_client in (False, True):
+                with (self.subTest(mac_client=mac_client),
+                      patch.object(role_map, "is_role_map_host", return_value=not mac_client),
+                      patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                    code, listed, error = self.run_cli("next", "list")
+                    self.assertEqual((code, listed, error), (0, expected, ""))
+                    self.assertEqual(listed.count(notice), 1)
+                    self.assertEqual(state_path.read_text(), "{")
+                    self.assertEqual(next_moves.next_moves_file().read_bytes(), before_log)
+        self.assertEqual(requests, [("next", "list")])
+
+    def test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac(self) -> None:
+        self.login_directory("claude1", "source@example.invalid")
+        self.login_directory("claude2", "target@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude1"}))
+        at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        entry = next_moves.add_next_move("units", 1.234567, "claude2", next_moves.HalfPointHold())
+        held = refusal_watch.HoldStarted("claude1", at, accounts.NoGroupTransition(), entry.at_percent,
+            next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.9)))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={entry.id: held}))
+        before = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        expected = "units 1: at 1.234567% → claude2, hold half a point (34 min at 0.9 points/hour, 12 min left)\n"
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            if code:
+                raise role_map.RemoteCommandRefused(error.strip())
+            self.assertEqual(error, "")
+            return output
+
+        with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22, seconds=1)),
+              patch.object(run_out, "weighted_rate", side_effect=AssertionError("started row read fresh pace"))):
+            code, listed, error = self.run_cli("next", "list")
+            self.assertEqual((code, listed, error), (0, expected, ""))
+            code, added, error = self.run_cli("next", "add", "workers", "1", "claude")
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(added, expected + "\nworkers 1: at 1% → claude\n")
+            code, reply, error = self.run_cli("next", "hold", "units", "1", "half-point",
+                                              "--expect", "1.234567", "claude2")
+            self.assertEqual((code, reply, error), (0, expected, ""))
+            with (patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                code, mac_listed, error = self.run_cli("next", "list")
+                self.assertEqual((code, mac_listed, error), (0, added, ""))
+                code, mac_reply, error = self.run_cli("next", "hold", "units", "1", "half-point",
+                                                      "--expect", "1.234567", "claude2")
+                self.assertEqual((code, mac_reply, error), (0, expected, ""))
+            self.assertEqual(refusal_watch._load_state(), before)  # pyright: ignore[reportPrivateUsage]
+            code, changed, error = self.run_cli("next", "hold", "units", "1", "10")
+            self.assertEqual((code, changed, error), (0, "units 1: at 1.234567% → claude2, hold 10 min\n", ""))
+        self.assertEqual(requests, [("next", "list"),
+            ("next", "hold", "units", "1", "half-point", "--expect", "1.234567", "claude2")])
+        self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
 
     def test_listed_percent_guards_its_hold_update_locally_and_through_the_mac(self) -> None:
         entry = next_moves.add_next_move("units", 1.234567, "claude2", 5)

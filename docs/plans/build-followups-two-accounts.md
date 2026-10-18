@@ -1897,7 +1897,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Live Claude panes put the composer marker at column 0 and indent input continuation rows; a screen that indents the marker no longer reads as a composer.
 - `push_texts.fingerprint(entry)` hashes every example name, so renaming any catalog example key invalidates every approval of that entry; re-record with `review.py texts --id <id> --approve --user-spec "<source>"`, never by hand.
 
-### Phase 67 — A started hold shows its own minutes  · status: todo
+### Phase 67 — A started hold shows its own minutes  · status: done
 
 **Depends on:** Phase 66
 
