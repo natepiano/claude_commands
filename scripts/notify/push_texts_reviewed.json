@@ -459,14 +459,16 @@
   },
   "shutdown.restart_failed": {
     "many_long_names": {
-      "reviewer": "opus",
-      "sha256": "9907644376f89f8308d043bdabdfabfc561846e95cc47bf9ce89c600a4f4a827",
-      "time": "2026-10-14T17:14:54.384371-04:00"
+      "objections": [],
+      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 60 Spec 4 and Phase 63 Spec 4: a failed-restart push names each session (user report via the showrunner, 2026-10-17); reviewer: opus",
+      "sha256": "1957c94c28f01190d4200c14074336b3e56838e63ac3a31b6219b954819aa39b",
+      "time": "2026-10-17T19:25:50.277221-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "9907644376f89f8308d043bdabdfabfc561846e95cc47bf9ce89c600a4f4a827",
-      "time": "2026-10-14T17:14:42.537350-04:00"
+      "objections": [],
+      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 60 Spec 4 and Phase 63 Spec 4: a failed-restart push names each session (user report via the showrunner, 2026-10-17); reviewer: opus",
+      "sha256": "1957c94c28f01190d4200c14074336b3e56838e63ac3a31b6219b954819aa39b",
+      "time": "2026-10-17T19:25:40.013021-04:00"
     }
   },
   "shutdown.restart_incomplete": {

@@ -123,6 +123,8 @@ class PromptSubmissionTests(unittest.TestCase):
         self.submit_on_type = False
         self.submit_on_enter = 0
         self.client = herdr.Herdr("agents")
+        _ = self.enterContext(patch.object(herdr, "prompt_recipient_process",
+            return_value=herdr.PromptRecipientProcess(23456, "fixture-prompt-recipient")))
         _ = self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.elapsed))
         _ = self.enterContext(patch.object(time, "sleep", side_effect=self.advance))
         self.start = cast(Mock, self.enterContext(patch.object(self.client, "start_command",
@@ -173,6 +175,8 @@ class PromptSubmissionTests(unittest.TestCase):
         outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
             ["--resume", "moved-session"], herdr.OpeningPrompt("resume the saved work", self.transcript), 30_000)
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(cast(herdr.PromptSubmitted, outcome).process,
+                         herdr.PromptRecipientProcess(23456, "fixture-prompt-recipient"))
         self.assertEqual([(pane, text) for pane, text, _at in self.typed],
                          [("destination:p1", "resume the saved work")])
         self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
@@ -183,6 +187,16 @@ class PromptSubmissionTests(unittest.TestCase):
     def test_no_user_turn_and_no_prompt_in_the_input_reports_not_submitted(self) -> None:
         self.screen = "────────\n❯ \n────────"
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_a_replacement_process_cannot_inherit_the_turn_written_during_submission(self) -> None:
+        self.submit_on_type = True
+        with patch.object(herdr, "prompt_recipient_process", side_effect=[
+                herdr.PromptRecipientProcess(23456, "first-recipient"),
+                herdr.PromptRecipientProcess(34567, "replacement-process")]):
+            outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 
@@ -232,6 +246,37 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
+
+    def test_old_bordered_prompt_above_assistant_output_without_a_new_marker_gets_no_enter(self) -> None:
+        self.screen = "────────\n❯ resume the saved work\n────────\nAssistant response is streaming"
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_assistant_output_with_a_footer_prefix_does_not_make_scrollback_live_input(self) -> None:
+        self.screen = ("────────\n❯ resume the saved work\n────────\n"
+                       "ctrl+c cancels the operation described above")
+        self.assertFalse(self.client.prompt_in_input("destination:p1", "resume the saved work"))
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_bottom_composer_with_complete_footer_rows_still_gets_its_enter_retry(self) -> None:
+        self.screen = ("Assistant response above the composer\n────────\n❯ resume the saved work\n────────\n"
+                       "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+                       "  ? for shortcuts · ctrl+c to interrupt\n")
+        self.submit_on_enter = 1
+        self.assertTrue(self.client.prompt_in_input("destination:p1", "resume the saved work"))
+        self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+
+    def test_prompt_wrapped_inside_a_word_gets_one_enter_then_submission(self) -> None:
+        self.screen = "────────\n❯ resume the sav\ned work\n────────"
+        self.submit_on_enter = 1
+        self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                         [("destination:p1", "resume the saved work")])
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
 
     def test_an_unsubmitted_input_gets_at_most_three_enter_retries(self) -> None:
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)

@@ -591,13 +591,17 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_peer_up_json_restores_snapshot_and_keeps_the_result_protocol(self) -> None:
         _ = self.recovery("crashed")
+        launched = sessions.SessionRecord(pid=23456, sessionId="crashed", name="crashed-name",
+            procStart="fixture-recovered-process", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         def confirmed(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
-            return registry_confirmation(ids)
+            return restart_work.RegistryConfirmation((launched,) if launched["sessionId"] in ids else ())
         # Unit recovery uses its normal launcher; confirmation and launch are isolated here.
         with (patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionNotLive()),
               patch.object(restart_work, "_live_session_ids", return_value=frozenset()),
+              patch.object(sessions, "running_sessions", return_value=[launched]),
               patch.object(restart_work, "_retire"),
-              patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(herdr.PromptSubmitted(datetime.fromisoformat(OCTOBER)))),
+              patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(herdr.PromptSubmitted(
+                  datetime.fromisoformat(OCTOBER), herdr.PromptRecipientProcess(launched["pid"], launched.get("procStart", ""))))),
               patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed),
               patch.object(restart_work, "remote_control_missing"),
               redirect_stdout(io.StringIO()) as output):

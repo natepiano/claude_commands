@@ -697,13 +697,114 @@ class RestartTests(ShutdownTestCase):
             with self.subTest(field=field):
                 saved = self.moved_record("proof-" + field)
                 saved["progress"] = record.SessionRestarting(kind="restarting", at=RESTARTED, prior=record.SessionStopped(kind="stopped", at=STOPPED))
-                restart._save_prompt_outcome(saved, SUBMITTED_PROMPT)  # pyright: ignore[reportPrivateUsage]
-                self.assertEqual(READ_PROMPT_OUTCOME(saved), SUBMITTED_PROMPT)
+                live = self.running_on(saved, self.root / ".claude3")
+                live[0]["procStart"] = "fixture-submitted-process"
+                submitted = herdr.PromptSubmitted(SUBMITTED_PROMPT.at,
+                    herdr.PromptRecipientProcess(live[0]["pid"], live[0]["procStart"]))
+                _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=live))
+                restart._save_prompt_outcome(saved, submitted)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(READ_PROMPT_OUTCOME(saved), submitted)
                 path = restart._prompt_outcome_path(saved)  # pyright: ignore[reportPrivateUsage]
                 proof = cast(dict[str, object], json.loads(path.read_text()))
                 proof[field] = "another-attempt"
                 _ = path.write_text(json.dumps(proof))
                 self.assertIsInstance(READ_PROMPT_OUTCOME(saved), herdr.PromptNotSubmitted)
+
+    @patch.object(restart, "_prompt_outcome", READ_PROMPT_OUTCOME)
+    def test_receipt_keeps_the_prompt_recipient_when_the_process_changes_before_save(self) -> None:
+        for replacement_time in ("before save", "after save", "same process"):
+            with self.subTest(replacement_time=replacement_time):
+                saved = self.moved_record("recipient-" + replacement_time.replace(" ", "-"))
+                restart.mark_restart_failed(saved, "session exited after submission")
+                current = record.find_session(LOGIN, saved["session"]["session_id"])
+                assert current is not None
+                saved = current
+                original = self.running_on(saved, self.root / ".claude3")
+                original[0]["procStart"] = "process-that-received-prompt"
+                submitted = herdr.PromptSubmitted(SUBMITTED_PROMPT.at,
+                    herdr.PromptRecipientProcess(original[0]["pid"], original[0]["procStart"]))
+                replacement = original[0].copy()
+                replacement["pid"] += 1
+                replacement["procStart"] = "later-process-without-prompt"
+                at_save = [replacement] if replacement_time == "before save" else original
+                with patch.object(sessions, "running_sessions", return_value=at_save):
+                    restart._save_prompt_outcome(saved, submitted)  # pyright: ignore[reportPrivateUsage]
+                at_read = original if replacement_time == "same process" else [replacement]
+                with (patch.object(sessions, "running_sessions", return_value=at_read),
+                      patch.object(sessions, "live_sessions", return_value=at_read),
+                      patch.object(restart, "_restore_timers", return_value=()) as timers,
+                      patch.object(restart, "_launch_session") as launch):
+                    if replacement_time == "same process":
+                        self.assertEqual(READ_PROMPT_OUTCOME(saved), submitted)
+                        result = restart.clear_running_on_target([saved])
+                        self.assertEqual(len(result.finished), 1)
+                        self.assertIn("confirmed", [row["kind"] for row in moves.read_moves()])
+                        timers.assert_called_once()
+                    else:
+                        self.assertIsInstance(READ_PROMPT_OUTCOME(saved), herdr.PromptNotSubmitted)
+                        result = restart.clear_running_on_target([saved])
+                        self.assertEqual(result.finished, [])
+                        current = record.find_session(LOGIN, saved["session"]["session_id"])
+                        assert current is not None
+                        self.assertEqual(current["progress"]["kind"], "restart failed")
+                        self.assertNotIn("confirmed", [row["kind"] for row in moves.read_moves()])
+                        timers.assert_not_called()
+                    launch.assert_not_called()
+
+    @patch.object(restart, "_prompt_outcome", READ_PROMPT_OUTCOME)
+    def test_previous_submitted_process_cannot_confirm_a_later_manual_process(self) -> None:
+        for progress_kind, changed_identity in (
+                (kind, field) for kind in ("restart failed", "manual restart", "timers pending")
+                for field in ("pid", "procStart")):
+            with self.subTest(progress=progress_kind, changed_identity=changed_identity):
+                saved = self.moved_record("old-proof-" + progress_kind.replace(" ", "-") + changed_identity)
+                saved["progress"] = record.SessionRestarting(kind="restarting", at=RESTARTED,
+                    prior=record.SessionStopped(kind="stopped", at=STOPPED))
+                _ = record.update_session(LOGIN, saved["session"]["session_id"],
+                    lambda current: current.update(progress=saved["progress"]))
+                def current_record() -> SessionShutdown:
+                    current = record.find_session(LOGIN, saved["session"]["session_id"])
+                    assert current is not None
+                    return current
+
+                live = self.running_on(saved, self.root / ".claude3")
+                live[0]["procStart"] = "first-launch"
+                submitted = herdr.PromptSubmitted(SUBMITTED_PROMPT.at,
+                    herdr.PromptRecipientProcess(live[0]["pid"], live[0]["procStart"]))
+                with patch.object(sessions, "running_sessions", return_value=live):
+                    restart._save_prompt_outcome(saved, submitted)  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(READ_PROMPT_OUTCOME(saved), submitted)
+                restart.mark_restart_failed(saved, "session not live after launch")
+                if progress_kind == "manual restart":
+                    progress: record.SessionProgress = record.SessionNeedsManualRestart(
+                        kind="manual restart", command="fixture manual restart")
+                elif progress_kind == "timers pending":
+                    progress = record.SessionRestoredTimersPending(kind="timers pending", at=RESTARTED, timers=[])
+                else:
+                    progress = current_record()["progress"]
+                _ = record.update_session(LOGIN, saved["session"]["session_id"],
+                    lambda current: current.update(progress=progress))
+                saved = current_record()
+                later_process = live[0].copy()
+                if changed_identity == "pid":
+                    later_process["pid"] += 1
+                else:
+                    later_process["procStart"] = "later-manual-launch"
+                later = [later_process]
+                with (patch.object(sessions, "running_sessions", return_value=later),
+                      patch.object(sessions, "live_sessions", return_value=later),
+                      patch.object(restart, "_restore_timers") as timers,
+                      patch.object(restart, "_launch_session") as launch):
+                    if progress_kind == "timers pending":
+                        restart.confirm_entry(saved, RESTARTED, True)
+                    else:
+                        result = restart.clear_running_on_target([saved])
+                        self.assertEqual(result.finished, [])
+                        self.assertEqual(len(result.remaining), 1)
+                self.assertEqual(current_record()["progress"]["kind"], "restart failed")
+                self.assertNotIn("confirmed", [row["kind"] for row in moves.read_moves()])
+                timers.assert_not_called()
+                launch.assert_not_called()
 
     @patch.object(restart, "_prompt_outcome", READ_PROMPT_OUTCOME)
     def test_unit_child_not_submitted_outcome_fails_the_restart_without_waiting_for_liveness(self) -> None:
@@ -3525,20 +3626,52 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
 
     def test_restart_failure_push_names_the_failed_session_and_machine(self) -> None:
-        push = restart.restart_push("claude2", ["Beta"], machine="natedev")
+        push, = restart.restart_push("claude2", ["Beta"], machine="natedev")
         self.assertEqual(push.id, "shutdown.restart_failed")
         self.assertEqual(push.values, {"account": '"claude2"', "stopped": "One session (Beta)", "machine": "natedev"})
         self.assertIn('/shutdown restart "claude2"', cast(ActionRequired, push.action).text)
-        unknown = restart.restart_push("claude2", [], machine="Mac")
+        unknown, = restart.restart_push("claude2", [], machine="Mac")
         self.assertEqual(unknown.id, "shutdown.restart_incomplete")
         self.assertEqual(unknown.values, {"account": '"claude2"', "machine": "Mac"})
 
-    def test_large_restart_failure_group_keeps_count_without_exceeding_phone_limit(self) -> None:
-        names = ["Session" + str(index) + "x" * 80 for index in range(100)]
-        push = restart.restart_push(LABEL, names, machine="Mac")
-        self.assertNotIn("sessions", push.values)
-        self.assertEqual(push.values["stopped"], "100 sessions")
-        self.assertLess(len("Action: " + cast(ActionRequired, push.action).text + "\n" + push.body), 1024)
+    def test_restart_sends_every_named_failure_push_within_phone_limits(self) -> None:
+        batches = [[f"Owner{index}-" + "x" * suffix_length for index in range(6)]
+                   for suffix_length in (80, 40)]
+        batches.append(["Short owner", "Oversize-" + "x" * 201, "Another owner"])
+        for names in batches:
+            with self.subTest(names=names):
+                result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=len(names),
+                    failed_sessions=tuple(restart.FailedSessionRestart(name, "restart prompt not submitted")
+                                          for name in names))
+                with (patch.object(restart, "named_claude_account", return_value=self.account),
+                      patch.object(restart, "_up", return_value=result),
+                      patch.object(restart, "_restart_alerts_enabled", return_value=True),
+                      patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+                    code = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                           alerts=restart.AlertWhenNotBack(), here=True)
+                self.assertEqual(code, 1)
+                pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
+                self.assertGreater(len(pushes), 1)
+                for push in pushes:
+                    self.assertEqual(push.id, "shutdown.restart_failed")
+                    self.assertLessEqual(len(push.values["stopped"]), 400)
+                    self.assertLess(len(push.message), 500)
+                    self.assertLess(len(push.title), 45)
+                    self.assertTrue(any(name in push.message for name in names)
+                                    or "…" in push.values["stopped"])
+                for name in names:
+                    if len(name) == 210:
+                        shortened, = [push for push in pushes if "…" in push.values["stopped"]]
+                        displayed = shortened.values["stopped"].removeprefix("One session (").removesuffix(")")
+                        self.assertTrue(displayed.endswith("…"))
+                        self.assertGreater(len(displayed), 1)
+                        self.assertTrue(name.startswith(displayed[:-1]))
+                        self.assertLess(len(displayed[:-1]), len(name))
+                        self.assertTrue(len(shortened.message) == 499
+                                        or len(shortened.values["stopped"]) == 400)
+                        self.assertFalse(any(other in shortened.message for other in names if other != name))
+                    else:
+                        self.assertEqual(sum(push.message.count(name) for push in pushes), 1)
 
     def test_restart_keeps_pending_job_status_off_phone_and_names_manual_restore(self) -> None:
         pending = restart.MachineRestartResult("natedev", LABEL, "partial", restarted=1,
@@ -4396,16 +4529,20 @@ class RestartTests(ShutdownTestCase):
             footer=record.NoFooter(kind="no footer"))]
         _ = record.update_session(LOGIN, saved["session"]["session_id"],
             lambda current: current.update(progress=saved["progress"], timers=saved["timers"]))
-        restart._save_prompt_outcome(saved, SUBMITTED_PROMPT)  # pyright: ignore[reportPrivateUsage]
+        live = self.running_on(saved, self.root / ".claude3")
+        live[0]["procStart"] = "fixture-submitted-process"
+        submitted = herdr.PromptSubmitted(SUBMITTED_PROMPT.at,
+            herdr.PromptRecipientProcess(live[0]["pid"], live[0]["procStart"]))
+        _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=live))
+        restart._save_prompt_outcome(saved, submitted)  # pyright: ignore[reportPrivateUsage]
         proof_path = restart._prompt_outcome_path(saved)  # pyright: ignore[reportPrivateUsage]
         launch_proof = proof_path.read_bytes()
-        live = self.running_on(saved, self.root / ".claude3")
         with (patch.object(sessions, "live_sessions", return_value=live),
               patch.object(settle, "run_notifier", side_effect=RuntimeError("timer unavailable"))):
             restart.confirm_entry(saved, RESTARTED, True)
         pending = self.stored_record()
         self.assertEqual(pending["progress"]["kind"], "timers pending")
-        self.assertEqual(READ_PROMPT_OUTCOME(pending), SUBMITTED_PROMPT)
+        self.assertEqual(READ_PROMPT_OUTCOME(pending), submitted)
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
               patch.object(sessions, "live_sessions", return_value=live),
               patch.object(settle, "run_notifier") as timers,
@@ -4426,8 +4563,13 @@ class RestartTests(ShutdownTestCase):
             prior=record.SessionStopped(kind="stopped", at=STOPPED))
         _ = record.update_session(LOGIN, saved["session"]["session_id"],
             lambda current: current.update(progress=saved["progress"]))
-        restart._save_prompt_outcome(saved, SUBMITTED_PROMPT)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(READ_PROMPT_OUTCOME(saved), SUBMITTED_PROMPT)
+        live = self.running_on(saved, self.root / ".claude3")
+        live[0]["procStart"] = "fixture-submitted-process"
+        submitted = herdr.PromptSubmitted(SUBMITTED_PROMPT.at,
+            herdr.PromptRecipientProcess(live[0]["pid"], live[0]["procStart"]))
+        _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=live))
+        restart._save_prompt_outcome(saved, submitted)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(READ_PROMPT_OUTCOME(saved), submitted)
         claimed, owned = restart._claim_relaunch(saved)  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(owned)
         assert claimed["progress"]["kind"] == "restarting"

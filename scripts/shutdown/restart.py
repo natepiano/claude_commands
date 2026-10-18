@@ -920,7 +920,16 @@ def _prompt_outcome(record: SessionShutdown) -> herdr.PromptSubmitOutcome:
                 or progress["kind"] == "restarting" and row.get("attempt") != progress["at"]):
             return herdr.PromptNotSubmitted("submit proof belongs to another relaunch attempt")
         encoded = row.get("outcome")
-        return herdr.decode_prompt_outcome(encoded) if isinstance(encoded, str) else herdr.PromptNotSubmitted("no launch submit proof")
+        outcome = herdr.decode_prompt_outcome(encoded) if isinstance(encoded, str) else herdr.PromptNotSubmitted("no launch submit proof")
+        if isinstance(outcome, herdr.PromptSubmitted):
+            process = herdr.prompt_recipient_process(record["session"]["session_id"])
+            # A progress transition may change the claim time without launching
+            # a process. The process identity survives those transitions; a
+            # receipt without it cannot prove any later process's prompt.
+            if (not isinstance(process, herdr.PromptRecipientProcess)
+                    or outcome.process != process):
+                return herdr.PromptNotSubmitted("submit proof belongs to another launch process")
+        return outcome
     except (OSError, UnicodeError, ValueError):
         return herdr.PromptNotSubmitted("no launch submit proof")
 
@@ -2841,17 +2850,35 @@ def _mark_pushed_not_back(login: str, ids: tuple[str, ...], names: set[str]) -> 
             settle.mark_not_back_pushed(saved)
 
 
-def restart_push(label: str, names: list[str], *, machine: str) -> RenderedPush:
+def restart_push(label: str, names: list[str], *, machine: str) -> tuple[RenderedPush, ...]:
     """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
-    if names:
-        stopped = settle.stopped_sessions_text(len(names))
-        # Preserve the compact summary for groups too large for a phone push.
-        named = stopped + " (" + ", ".join(names) + ")"
-        if len(named) <= 400:
-            stopped = named
-        return render("shutdown.restart_failed", account=json.dumps(label),
-                      stopped=stopped, machine=machine)
-    return render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine)
+    if not names:
+        return (render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine),)
+
+    def named_push(group: list[str]) -> RenderedPush:
+        stopped = settle.stopped_sessions_text(len(group)) + " (" + ", ".join(group) + ")"
+        return render("shutdown.restart_failed", account=json.dumps(label), stopped=stopped, machine=machine)
+
+    def fits(push: RenderedPush) -> bool:
+        return len(push.values["stopped"]) <= 400 and len(push.message) < 500 and len(push.title) < 45
+
+    pushes: list[RenderedPush] = []
+    group: list[str] = []
+    for name in names:
+        candidate = named_push([*group, name])
+        if group and not fits(candidate):
+            pushes.append(named_push(group))
+            group = []
+            candidate = named_push([name])
+        if not fits(candidate):
+            excess = max(len(candidate.values["stopped"]) - 400, len(candidate.message) - 499)
+            shortened = name[:max(0, len(name) - excess - 1)] + "…"
+            pushes.append(named_push([shortened]))
+            continue
+        group.append(name)
+    if group:
+        pushes.append(named_push(group))
+    return tuple(pushes)
 
 
 def restart(
@@ -2958,7 +2985,8 @@ def restart(
                     re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+)", line)
                     for line in peer["lines"]))
                 if names or not_reached or failed or peer_requires_retry:
-                    settle.alert_user(restart_push(selected.label, names, machine=" and ".join(machines)))
+                    for push in restart_push(selected.label, names, machine=" and ".join(machines)):
+                        settle.alert_user(push)
                 for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
                 _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})

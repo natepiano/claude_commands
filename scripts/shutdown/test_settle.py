@@ -3197,6 +3197,52 @@ class SettleTests(ShutdownTestCase):
         assert current is not None
         self.assertEqual(current["progress"], saved["progress"])
 
+    def test_automatic_restart_sends_all_split_pushes_and_marks_every_named_failure(self) -> None:
+        batches = [[f"Owner{index}-" + "x" * suffix_length for index in range(6)]
+                   for suffix_length in (80, 40)]
+        batches.append(["Short owner", "Oversize-" + "x" * 201, "Another owner"])
+        for names in batches:
+            with self.subTest(names=names):
+                records = [session_shutdown(top_level(f"split-{len(names[0])}-{index}", name), then="restart",
+                    progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
+                    for index, name in enumerate(names)]
+                for saved in records:
+                    self.save(saved)
+                with (patch.object(sessions, "live_sessions", return_value=[]),
+                      patch.object(settle, "run_remote", return_value=(0, "[]")),
+                      patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert,
+                      redirect_stdout(io.StringIO())):
+                    settle.report_stop(records)
+                    pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
+                    self.assertGreater(len(pushes), 1)
+                    for push in pushes:
+                        self.assertEqual(push.id, "shutdown.restart_failed")
+                        self.assertLessEqual(len(push.values["stopped"]), 400)
+                        self.assertLess(len(push.message), 500)
+                        self.assertLess(len(push.title), 45)
+                        self.assertTrue(any(name in push.message for name in names)
+                                        or "…" in push.values["stopped"])
+                    for name in names:
+                        if len(name) == 210:
+                            shortened, = [push for push in pushes if "…" in push.values["stopped"]]
+                            displayed = shortened.values["stopped"].removeprefix("One session (").removesuffix(")")
+                            self.assertTrue(displayed.endswith("…"))
+                            self.assertGreater(len(displayed), 1)
+                            self.assertTrue(name.startswith(displayed[:-1]))
+                            self.assertLess(len(displayed[:-1]), len(name))
+                            self.assertTrue(len(shortened.message) == 499
+                                            or len(shortened.values["stopped"]) == 400)
+                            self.assertFalse(any(other in shortened.message for other in names if other != name))
+                        else:
+                            self.assertEqual(sum(push.message.count(name) for push in pushes), 1)
+                    for saved in records:
+                        current = record.find_session(LOGIN, saved["session"]["session_id"])
+                        assert current is not None
+                        self.assertEqual(current.get("restore_alerted"), settle.not_back_text(current))
+                    alert.reset_mock()
+                    settle.report_stop(record.session_records(LOGIN))
+                    alert.assert_not_called()
+
     def test_stop_failure_push_keeps_the_count_without_session_names(self) -> None:
         saved = session_shutdown(top_level("stop-owner", "Stop owner"),
             progress={"kind": "stop failed", "at": NOW, "reason": "process did not exit"})
