@@ -170,7 +170,7 @@ without a lost or doubled ticket; each checkpoint is integrated once.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Started PIDs, ticket id, restart records and merge count pending | `/shutdown` for pilot-started sessions; startup `style_sync.py resume` reconcile lines; `git log main` for `Merge <slug> hand-off (<hash7>)` |
+| pass, one defect | The style showrunner restarted at 15:51Z (modules-unit-8 open), 18:32Z (modules-unit-14 open) and 04:38Z. The units restarted after the account move at 04:33Z. names-unit-15 was open across it, then checkpointed as `82493d60` and merged once as `8f9e8260`. No ticket was lost or doubled. On main's first-parent line, 8 hand-off merges carry 8 distinct checkpoints and match the 8 ledger rows. One checkpoint, `0c01c6c`, was merged twice; see Fix AI | Ledger `tickets` and `handoffs`; `git log main --grep hand-off`; showrunner and unit transcripts |
 
 ## Yielding
 
@@ -201,14 +201,38 @@ how many tickets changed code, not only how many merged.
 
 ## Ticket-gate evidence
 
-Pending: approved proposal non-mechanical edit passes both gates and reaches a
-recorded checkpoint; an equivalent coverage-selected edit returns to repair.
-Record ticket ids, gate output and checkpoint evidence.
+Pass. names-unit-12 is the approved proposal `style cargo-handler 30d569f3.md`.
+Its edit is not mechanical. It passed the candidate gate as `approved proposal`
+at 16:18:26Z on 2026-10-17. The 411 cargo-handler tests passed at 16:23:33Z.
+It passed the final gate at 16:24:04Z, and the scope audit matched the nine
+approved paths. It checkpointed as `96da4419` with 9 `fixed` judgments, and it
+reached main as `ac95d94d` through hand-off `f091ed48`.
+
+A coverage-selected edit went back to repair. names-unit-24 got gate exit 1 at
+09:49:38Z on 2026-10-18 (`review: check 6`). Its director reverted two test
+files and kept the four renames. The rerun passed as `mechanical` at
+09:49:47Z, checkpointed as `4f5b749d`, and reached main as `48d41365`.
+modules-unit-19 exited 1 with `unjudged:` and was dropped. names-unit-21 was
+held, then failed a merge test, then merged as `0c01c6c9`.
 
 ## Phase 10 live evidence
 
-Pending: standing refill, fast-forward synchronization, reservation target,
-checkpoint release confirmation and merge-wait wake-up traces.
+Partial. Seen live:
+
+- Refill exit 3 many times: `waiting for sync`, `waiting for structure:
+  crates/cargo-handler` (17:43:43Z), and `main 5db7f52 is not in the synced tip`.
+- Refill exit 5 (`waiting for merge`) five times in names.
+- The scripted sync notify reached the style showrunner nine times, from
+  12:33Z on 2026-10-17 to 12:18Z on 2026-10-18.
+- Scripted merge wakes (`ticket <id> merged; refill.`) reached names for 161
+  tickets, types for 12 and modules for 3. One wake to names, at 17:58:06Z,
+  did not arrive.
+- One refused `--ff-only`, in names at 06:52:06Z on 2026-10-18. Its director
+  merged with `--no-ff` as `54a9f18d`.
+
+Not seen live: refill exit 4 (board not available), and a lint step that exits
+1 while the run continues. All 39 recorded lint runs passed. The style
+showrunner ran the fast-forward steps by hand, not as a script.
 
 The Fix C dispatch records names-unit returning exit 3 (`waiting for sync`)
 at about 08:31 EDT, then returning exit 3 again after the `d1ced22` sync woke
@@ -240,12 +264,27 @@ nonzero hand-off counts remain pending; the first hand-off, `28db0785`, merged a
 
 ## --from-child trace
 
-Pending: parent receipt, review, merge, push, promotion and acknowledgment;
-record the checkpoint, merge commit and reconcile evidence.
+Pass. All 8 hand-offs went through `--from-child`. The trace of hand-off
+`852380e8` (UTC, 2026-10-18):
+
+| Step | Time | Evidence |
+| --- | --- | --- |
+| Style side merges the checkpoint | 09:54:47Z | `852380e8` on style/main |
+| Parent receives the hand-off | 09:55:03Z | parent transcript |
+| Parent reviews the diff | 09:55:08Z | parent transcript |
+| `merge_checkpoint.py --from-child` starts | 09:55:14Z | log: tests ok, 0 red |
+| Push | before 10:02:42Z | `48d41365` on origin main |
+| Promotion | — | `promote: ok — no promotion configured` |
+| Scripted notify, ledger row merged | 10:02:42Z, 10:02:46Z | ledger `handoffs` |
+| Acknowledgment | 10:02:52Z scripted, 10:03:07Z by hand | style showrunner transcript |
+| Style side fast-forwards, sets the tip | 10:03:36Z | `852380e8..48d41365` |
 
 ## Dailies
 
-Pending: parent's saved style child summary and rendered style line.
+Not run. Both productions registered `on demand: no scheduled dailies`, and no
+dailies run happened during the pilot. The parent's last saved dailies are from
+2026-10-16 and carry no style entry. This criterion needs one dailies run on
+demand.
 
 ## Fixes
 
@@ -719,16 +758,26 @@ Pending: parent's saved style child summary and rendered style line.
   since the verdict is the ticket's own work after its start. An outside
   edit still reissues, and another family's verdict on the same file stays
   stale: a names edit can break forbidden-words. Three tests, one per case.
-- **Fix AH — style issues propose a ranking, and a root-crate issue has a title** (pending):
+- **Fix AH — style issues propose a ranking, and a root-crate issue has a title** (commit `260e4550`):
   all 279 style issues on cargo-liner had an empty `Proposed ranking:` line,
   so the user had no values to confirm at review. A finding in the root crate
   got the title `# Style restructure: ` with no name. The filer now derives
   the five values from each batch, and a root-crate batch takes the
   repository name. After the fix merges, the same writer fills the open
   issues in one vault commit. The showrunner approved the fix and the backfill.
+- **Fix AI — style tools read the pushed branch point, not the local one** (pending):
+  refill, reconcile and the hand-off merge check read the local `main` ref.
+  The checkouts share one repository, so that ref holds the parent's merge
+  while its gate runs. On 2026-10-18 at 07:01Z, the parent merged hand-off
+  `0c01c6c` as `b194ce45`, and its tests failed. While they ran, two units
+  reported `b194ce4` as the tip to sync. The style showrunner fast-forwarded
+  style/main to it at 07:15Z and pushed. The parent's second merge,
+  `a779ebde`, then reached main beside it. The trees are equal, so no code is
+  wrong, but main holds two merges of one hand-off. The showrunner approved the fix and keeps the merge already on
+  main, because the trees are equal.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`, fix AH as `053fa900`.
 Live verification of the fixes and subsequent measurements remain pending.
