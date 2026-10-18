@@ -556,6 +556,8 @@ class StandaloneLaunchTests(unittest.TestCase):
         transcript = directory / "projects/fixture/recorded-id.jsonl"
         self.responses["--session solo agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        self.responses["--session solo pane read w1:p1 --source visible"] = CommandResponse(
+            code=0, stdout="────────\n❯ \n────────")
         # This fixture turn is written by the fake command, after launch, not before it.
         original_prompt = herdr.Herdr.prompt
 

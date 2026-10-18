@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import io
-from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 import os
 import signal
@@ -17,7 +17,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast, final, override
+from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -100,6 +100,12 @@ class PromptSubmissionTests(unittest.TestCase):
     enters: list[tuple[str, tuple[str, ...]]] = []
     ready_panes: list[str] = []
     screen: str = ""
+    typed_screen: str = ""
+    drop_before: float = 0
+    drop_all: bool = False
+    working_until: float = 0
+    turn_delay: float = 0
+    events: list[tuple[float, Callable[[], None]]] = []
     submit_on_type: bool = False
     submit_on_enter: int = 0
     client: herdr.Herdr = herdr.Herdr("fixture")
@@ -119,7 +125,13 @@ class PromptSubmissionTests(unittest.TestCase):
         self.typed = []
         self.enters = []
         self.ready_panes = []
-        self.screen = "────────\n❯ resume the saved work\n────────"
+        self.screen = "────────\n❯ \n────────"
+        self.typed_screen = ""
+        self.drop_before = 0
+        self.drop_all = False
+        self.working_until = 0
+        self.turn_delay = 0
+        self.events = []
         self.submit_on_type = False
         self.submit_on_enter = 0
         self.client = herdr.Herdr("agents")
@@ -137,11 +149,16 @@ class PromptSubmissionTests(unittest.TestCase):
     def advance(self, seconds: float) -> None:
         self.assertGreater(seconds, 0)
         self.elapsed += seconds
+        due = [event for event in self.events if event[0] <= self.elapsed]
+        self.events = [event for event in self.events if event[0] > self.elapsed]
+        for _at, action in due:
+            action()
 
     def readiness(self, pane: str) -> herdr.WorkerReadiness:
         self.ready_panes.append(pane)
-        return {"agent_status": "idle" if pane == "sibling:p1" or self.elapsed >= self.ready_at else "starting",
-                "interactive_ready": pane == "sibling:p1" or self.elapsed >= self.ready_at}
+        ready = pane == "sibling:p1" or self.elapsed >= self.ready_at
+        status = "working" if self.elapsed < self.working_until else "idle"
+        return {"agent_status": status if ready else "starting", "interactive_ready": ready}
 
     def read_screen(self, *arguments: str) -> str:
         self.assertEqual(arguments, ("pane", "read", "destination:p1", "--source", "visible"))
@@ -158,17 +175,43 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def type_prompt(self, pane: str, text: str) -> None:
         self.typed.append((pane, text, self.elapsed))
+        if self.drop_all or self.elapsed < self.drop_before:
+            return
         if self.submit_on_type:
             self.write_turn(text, seconds_after_launch=self.elapsed + 1)
+            self.screen = "────────\n❯ \n────────"
+        elif self.turn_delay:
+            self.events.append((self.elapsed + self.turn_delay,
+                lambda: self.write_turn(text, seconds_after_launch=self.elapsed + 1)))
+            self.screen = "────────\n❯ \n────────"
+        else:
+            self.screen = self.typed_screen or f"────────\n❯ {text}\n────────"
 
     def enter_prompt(self, pane: str, *keys: str) -> None:
         self.enters.append((pane, keys))
         if len(self.enters) == self.submit_on_enter:
             self.write_turn(self.typed[-1][1], seconds_after_launch=self.elapsed + 1)
+            self.screen = "────────\n❯ \n────────"
 
     def submit(self, timeout_ms: int = 30_000, *, text: str = "resume the saved work") -> herdr.PromptSubmitOutcome:
         return self.client.submit_opening_prompt("destination:p1",
             herdr.OpeningPrompt(text, self.transcript), self.launched_at, timeout_ms)
+
+    @contextmanager
+    def unreadable_transcript(self, from_second: float, until_second: float) -> Generator[list[float]]:
+        original_open = Path.open
+        failures: list[float] = []
+
+        @contextmanager
+        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+            if path == self.path and mode == "rb" and from_second <= self.elapsed < until_second:
+                failures.append(self.elapsed)
+                raise PermissionError("scratch transcript temporarily unreadable")
+            with original_open(path, mode) as stream:
+                yield cast(BinaryIO, stream)
+
+        with patch.object(Path, "open", open_transcript):
+            yield failures
 
     def test_shared_tab_lost_enter_is_retried_once_without_typing_the_prompt_twice(self) -> None:
         self.submit_on_enter = 1
@@ -182,13 +225,353 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
         cast(Mock, self.start).assert_called_once()
         self.assertEqual(set(self.ready_panes), {"destination:p1"})
-        cast(Mock, self.read).assert_called_once()
+        self.assertGreaterEqual(cast(Mock, self.read).call_count, 2)
 
     def test_no_user_turn_and_no_prompt_in_the_input_reports_not_submitted(self) -> None:
-        self.screen = "────────\n❯ \n────────"
-        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.drop_all = True
+        outcome = self.submit(timeout_ms=90_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 3)
+        self.assertEqual(self.enters, [])
+        self.assertLessEqual(self.elapsed, 90)
+        self.assertTrue(all(at < 90 for _pane, _text, at in self.typed))
+        self.assertGreaterEqual(self.typed[1][2] - self.typed[0][2], 10)
+        self.assertGreaterEqual(self.typed[2][2] - self.typed[1][2], 10)
+        self.assertIn("prompt typed 3 times", cast(herdr.PromptNotSubmitted, outcome).reason)
+        self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).screen, self.screen)
+
+    def test_lost_prompt_is_typed_again_after_loading_finishes(self) -> None:
+        self.drop_before = 7
+        self.submit_on_type = True
+        outcome = self.submit(timeout_ms=90_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                         [("destination:p1", "resume the saved work")] * 2)
+        self.assertEqual(self.typed[0][2], 0)
+        self.assertGreaterEqual(self.typed[1][2], 10)
+        self.assertEqual(self.enters, [])
+
+    def test_unreadable_accepted_turn_blocks_retyping_until_the_deadline(self) -> None:
+        self.turn_delay = 8
+        with self.unreadable_transcript(8, 20) as failures:
+            outcome = self.submit(timeout_ms=16_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        failure = cast(herdr.PromptNotSubmitted, outcome)
+        self.assertIn("transcript unreadable", failure.reason)
+        self.assertIn("prompt typed 1 times", failure.reason)
+        self.assertEqual(failure.screen, self.screen)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
+        self.assertEqual(self.elapsed, 16)
+        self.assertTrue(any(at >= 10 for at in failures))
+        self.assertIsInstance(herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at),
+                              herdr.PromptSubmitted)
+
+    def test_unreadable_accepted_turn_is_found_after_reads_recover_without_retyping(self) -> None:
+        self.turn_delay = 8
+        with self.unreadable_transcript(8, 13) as failures:
+            outcome = self.submit(timeout_ms=30_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+        self.assertTrue(failures)
+        self.assertGreaterEqual(self.elapsed, 13)
+        self.assertLess(self.elapsed, 30)
+
+    def test_transcript_becoming_unreadable_at_the_final_check_blocks_retyping(self) -> None:
+        self.drop_all = True
+        self.write_turn("older context", kind="assistant", seconds_after_launch=-1)
+        recipient = herdr.PromptRecipientProcess(23456, "same-recipient")
+
+        def observe_recipient(_session: str) -> herdr.PromptRecipientProcess:
+            if self.elapsed >= 10:
+                self.write_turn("resume the saved work", seconds_after_launch=self.elapsed + 1)
+            return recipient
+
+        # Read errors start only after the recipient check at the retry boundary.
+        original_open = Path.open
+        failures: list[float] = []
+        blocked = False
+
+        def recipient_and_block_reads(session: str) -> herdr.PromptRecipientProcess:
+            nonlocal blocked
+            result = observe_recipient(session)
+            blocked = self.elapsed >= 10
+            return result
+
+        @contextmanager
+        def open_transcript(path: Path, mode: str) -> Generator[BinaryIO]:
+            if path == self.path and mode == "rb" and blocked:
+                failures.append(self.elapsed)
+                raise PermissionError("scratch final transcript check unreadable")
+            with original_open(path, mode) as stream:
+                yield cast(BinaryIO, stream)
+
+        with (patch.object(herdr, "prompt_recipient_process", side_effect=recipient_and_block_reads),
+              patch.object(Path, "open", open_transcript)):
+            outcome = self.submit(timeout_ms=16_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIn("transcript unreadable", cast(herdr.PromptNotSubmitted, outcome).reason)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+        self.assertTrue(failures)
+        self.assertEqual(failures[0], 10)
+        self.assertEqual(self.elapsed, 16)
+
+    def test_missing_composer_during_loading_recovers_and_retypes_the_lost_prompt(self) -> None:
+        self.drop_before = 7
+        self.submit_on_type = True
+        self.events.append((1, lambda: setattr(self, "screen", "Restoring conversation")))
+        self.events.append((7, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
+        outcome = self.submit(timeout_ms=90_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 2)
+        self.assertEqual(self.typed[0][2], 0)
+        self.assertGreaterEqual(self.typed[1][2], 10)
+        self.assertEqual(self.enters, [])
+
+    def test_missing_composer_waits_for_the_deadline_and_carries_the_last_screen(self) -> None:
+        self.drop_all = True
+        self.events.append((1, lambda: setattr(self, "screen", "Restoring conversation")))
+        self.events.append((11, lambda: setattr(self, "screen", "Still loading conversation")))
+        outcome = self.submit(timeout_ms=16_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        failure = cast(herdr.PromptNotSubmitted, outcome)
+        self.assertIn("deadline", failure.reason)
+        self.assertEqual(failure.screen, "Still loading conversation")
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+        self.assertEqual(self.elapsed, 16)
+
+    def test_accepted_prompt_with_a_turn_eight_seconds_late_is_never_typed_again(self) -> None:
+        self.turn_delay = 8
+        cursors: list[herdr.TranscriptCursor] = []
+        original_read = herdr.TranscriptCursor.read_turns
+
+        def read_turns(cursor: herdr.TranscriptCursor) -> list[tuple[datetime, dict[str, object]]]:
+            cursors.append(cursor)
+            return original_read(cursor)
+
+        with patch.object(herdr.TranscriptCursor, "read_turns", autospec=True, side_effect=read_turns):
+            outcome = self.submit(timeout_ms=90_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertGreaterEqual(self.elapsed, 8)
+        self.assertEqual(self.enters, [])
+        self.assertGreater(len(cursors), 2)
+        self.assertTrue(all(cursor is cursors[0] for cursor in cursors))
+
+    def test_accepted_enter_with_a_turn_eight_seconds_late_is_not_retyped(self) -> None:
+        def queued_enter(pane: str, *keys: str) -> None:
+            self.enters.append((pane, keys))
+            self.screen = "────────\n❯ \n────────"
+            self.events.append((self.elapsed + 8,
+                lambda: self.write_turn("resume the saved work", seconds_after_launch=self.elapsed + 1)))
+
+        with patch.object(self.client, "send_keys", side_effect=queued_enter):
+            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+        self.assertGreaterEqual(self.elapsed, 13)
+
+    def test_working_session_with_a_queued_prompt_waits_for_its_twenty_second_turn(self) -> None:
+        self.turn_delay = 20
+        self.working_until = 25
+        outcome = self.submit(timeout_ms=90_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertGreaterEqual(self.elapsed, 20)
+        self.assertEqual(self.enters, [])
+
+    def test_visible_empty_composer_is_required_even_when_herdr_reports_ready(self) -> None:
+        self.screen = "Loading the saved conversation"
+        self.events.append((4, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
+        self.submit_on_type = True
+        outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertGreaterEqual(self.typed[0][2], 4)
+
+    def test_other_text_in_the_composer_is_never_overwritten(self) -> None:
+        self.screen = "────────\n❯ the user is editing this\n────────"
+        self.assertIsInstance(self.submit(timeout_ms=1_000), herdr.PromptNotSubmitted)
+        self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_other_text_appearing_after_a_lost_prompt_blocks_retyping(self) -> None:
+        self.drop_all = True
+        self.events.append((3, lambda: setattr(self, "screen", "────────\n❯ another task\n────────")))
+        outcome = self.submit(timeout_ms=30_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_changed_recipient_blocks_retyping_a_lost_prompt(self) -> None:
+        self.drop_all = True
+        original = herdr.PromptRecipientProcess(23456, "first-recipient")
+        replacement = herdr.PromptRecipientProcess(34567, "replacement-process")
+        def observe_recipient(_session: str) -> herdr.PromptRecipientProcess:
+            return original if self.elapsed < 6 else replacement
+
+        with patch.object(herdr, "prompt_recipient_process", side_effect=observe_recipient):
+            outcome = self.submit(timeout_ms=90_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIn("recipient changed", cast(herdr.PromptNotSubmitted, outcome).reason)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_lost_prompt_is_not_retyped_after_a_deadline_inside_the_settle_window(self) -> None:
+        self.drop_all = True
+        outcome = self.submit(timeout_ms=9_000)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertLessEqual(self.elapsed, 9)
+        self.assertEqual(self.enters, [])
+
+    def test_remote_control_signal_still_requires_a_visible_empty_composer(self) -> None:
+        self.ready_at = 60
+        self.write_turn("/remote-control is active", kind="system")
+        self.screen = "Restoring conversation"
+        self.events.append((2, lambda: setattr(self, "screen", "────────\n❯ \n────────")))
+        self.submit_on_type = True
+        self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertGreaterEqual(self.typed[0][2], 2)
+
+    def test_late_turn_during_the_final_recipient_check_prevents_retyping(self) -> None:
+        self.drop_all = True
+        recipient = herdr.PromptRecipientProcess(23456, "same-recipient")
+
+        def observe_recipient(_session: str) -> herdr.PromptRecipientProcess:
+            if self.elapsed >= 10:
+                self.write_turn("resume the saved work", seconds_after_launch=self.elapsed + 1)
+            return recipient
+
+        with patch.object(herdr, "prompt_recipient_process", side_effect=observe_recipient):
+            self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_failure_carries_the_last_screen_without_ansi_and_only_its_last_forty_lines(self) -> None:
+        self.drop_all = True
+        failed_screen = "\n".join(f"\x1b[31mloading row {index}\x1b[0m" for index in range(45))
+        self.events.append((1, lambda: setattr(self, "screen", failed_screen)))
+        outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        failure = cast(herdr.PromptNotSubmitted, outcome)
+        self.assertEqual(failure.screen, "\n".join(f"loading row {index}" for index in range(5, 45)))
+        self.assertIn("1", failure.reason)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(herdr.decode_prompt_outcome(herdr.encode_prompt_outcome(failure)), failure)
+
+    def test_not_submitted_screen_round_trips_and_old_records_keep_the_not_read_state(self) -> None:
+        failure = herdr.PromptNotSubmitted("lost after one typing", "────────\n❯ \n────────")
+        encoded = herdr.encode_prompt_outcome(failure)
+        self.assertEqual(json.loads(encoded), {"kind": "not submitted", "reason": failure.reason,
+                                               "screen": failure.screen})
+        self.assertEqual(herdr.decode_prompt_outcome(encoded), failure)
+        legacy = herdr.PromptNotSubmitted("old failure")
+        self.assertIsInstance(legacy.screen, herdr.PromptScreenNotRead)
+        self.assertNotIn("screen", cast(dict[str, object], json.loads(herdr.encode_prompt_outcome(legacy))))
+        self.assertEqual(herdr.decode_prompt_outcome('{"kind":"not submitted","reason":"old failure"}'), legacy)
+        self.assertEqual(herdr.decode_prompt_outcome(herdr.encode_prompt_outcome(
+            herdr.PromptNotSubmitted("empty visible screen", ""))),
+            herdr.PromptNotSubmitted("empty visible screen", ""))
+
+    def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
+        self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
+        first_size = self.path.stat().st_size
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        positions: list[int] = []
+        original_open = Path.open
+
+        @contextmanager
+        def traced_open(path: Path, mode: str) -> Generator[BinaryIO]:
+            self.assertEqual(mode, "rb")
+            with original_open(path, mode) as raw:
+                stream = cast(BinaryIO, raw)
+                tracked = Mock(wraps=stream)
+
+                def readline() -> bytes:
+                    positions.append(stream.tell())
+                    return stream.readline()
+
+                cast(Mock, tracked.readline).side_effect = readline
+                yield cast(BinaryIO, tracked)
+
+        with patch.object(Path, "open", traced_open):
+            self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptNotSubmitted)
+        self.assertEqual(positions[0], 0)
+        self.write_turn("resume the saved work")
+        positions.clear()
+        with patch.object(Path, "open", traced_open):
+            self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+        self.assertEqual(positions[0], first_size)
+        self.assertTrue(all(position >= first_size for position in positions))
+        positions.clear()
+        with patch.object(Path, "open", traced_open):
+            self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+        self.assertEqual(positions, [self.path.stat().st_size])
+
+    def test_transcript_readability_requires_every_matching_file_and_recovers(self) -> None:
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        self.assertEqual(cursor.read_turns(), [])
+        self.assertIsInstance(cursor.readability, herdr.TranscriptReadable)
+        self.write_turn("older context", kind="assistant", seconds_after_launch=-1)
+        second = self.transcript.config_dir / "projects/other/moved-session.jsonl"
+        second.parent.mkdir()
+        _ = second.write_bytes(b"{}\n")
+        with self.unreadable_transcript(0, 1) as failures:
+            self.assertEqual(cursor.read_turns(), [])
+            self.assertIsInstance(cursor.readability, herdr.TranscriptUnreadable)
+        self.assertTrue(failures)
+        self.assertIn(second, cursor.offsets)
+        self.assertEqual(cursor.read_turns(), [])
+        self.assertIsInstance(cursor.readability, herdr.TranscriptReadable)
+
+    def test_transcript_cursor_waits_for_a_newline_and_a_complete_utf8_row(self) -> None:
+        self.write_turn("resume the saved work – saved context")
+        row = (json.dumps(json.loads(self.path.read_bytes()), ensure_ascii=False) + "\n").encode()
+        split = row.index("–".encode()) + 1
+        _ = self.path.write_bytes(row[:split])
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptNotSubmitted)
+        with self.path.open("ab") as stream:
+            _ = stream.write(row[split:-1])
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptNotSubmitted)
+        with self.path.open("ab") as stream:
+            _ = stream.write(b"\n")
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+        self.assertEqual(len(cursor.read_turns()), 1)
+
+    def test_transcript_cursor_restarts_after_shrink_and_keeps_offsets_per_project(self) -> None:
+        self.write_turn("historical context " * 100, kind="assistant", seconds_after_launch=-1)
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptNotSubmitted)
+        _ = self.path.write_bytes(b"")
+        self.write_turn("resume the saved work")
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+        # A replacement file cannot retain submit proof from rows it no longer contains.
+        _ = self.path.write_bytes(b"{}\n")
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptNotSubmitted)
+        second = self.transcript.config_dir / "projects/other/moved-session.jsonl"
+        second.parent.mkdir()
+        self.write_turn("resume the saved work")
+        _ = second.write_bytes(self.path.read_bytes())
+        _ = self.path.write_bytes(b"{}\n")
+        self.assertIsInstance(cursor.submitted_prompt("resume the saved work"), herdr.PromptSubmitted)
+
+    def test_empty_and_quoted_composers_share_the_readiness_parser(self) -> None:
+        cases = (
+            ("─── named composer ─\n❯ \xa0\n────────\n  footer", True, False),
+            ("─── named composer ─\n❯ resume the saved work\n  ---\n  > quoted line\n────────\n  footer", False, True),
+            ("────────\n  > resume the saved work\n────────", False, False),
+            ("────────\n❯ resume the saved work\n────────\nAssistant output", False, False))
+        for screen, empty, contains in cases:
+            with self.subTest(screen=screen):
+                self.screen = screen
+                self.assertEqual(self.client.prompt_input_empty("destination:p1"), empty)
+                self.assertEqual(self.client.prompt_in_input("destination:p1", "resume the saved work"), contains)
+                state = self.client.prompt_input_state("destination:p1", self.transcript, self.launched_at)
+                self.assertEqual(isinstance(state, herdr.PromptInputReady), empty)
 
     def test_a_replacement_process_cannot_inherit_the_turn_written_during_submission(self) -> None:
         self.submit_on_type = True
@@ -213,7 +596,7 @@ class PromptSubmissionTests(unittest.TestCase):
         self.write_turn("resume the saved work", seconds_after_launch=-1)
         self.write_turn("resume the saved work", kind="assistant")
         self.write_turn("another task")
-        self.screen = "────────\n❯ \n────────"
+        self.drop_all = True
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
         self.assertEqual(self.enters, [])
 
@@ -236,21 +619,22 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertLessEqual(self.elapsed, 1)
 
     def test_prompt_only_in_scrollback_is_never_flushed_with_enter(self) -> None:
+        self.drop_all = True
         self.screen = "❯ resume the saved work\nPrevious response\n────────\n❯ \n────────"
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 1)
+        self.assertTrue(1 <= len(self.typed) <= 3)
         self.assertEqual(self.enters, [])
 
     def test_an_old_bordered_prompt_above_a_new_unbordered_input_is_scrollback(self) -> None:
         self.screen = "────────\n❯ resume the saved work\n────────\nPrevious response\n❯ "
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.typed, [])
         self.assertEqual(self.enters, [])
 
     def test_old_bordered_prompt_above_assistant_output_without_a_new_marker_gets_no_enter(self) -> None:
         self.screen = "────────\n❯ resume the saved work\n────────\nAssistant response is streaming"
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.typed, [])
         self.assertEqual(self.enters, [])
 
     def test_assistant_output_with_a_footer_prefix_does_not_make_scrollback_live_input(self) -> None:
@@ -258,20 +642,19 @@ class PromptSubmissionTests(unittest.TestCase):
                        "ctrl+c cancels the operation described above")
         self.assertFalse(self.client.prompt_in_input("destination:p1", "resume the saved work"))
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.typed, [])
         self.assertEqual(self.enters, [])
 
     def test_bottom_composer_with_complete_footer_rows_still_gets_its_enter_retry(self) -> None:
-        self.screen = ("Assistant response above the composer\n────────\n❯ resume the saved work\n────────\n"
+        self.typed_screen = ("Assistant response above the composer\n────────\n❯ resume the saved work\n────────\n"
                        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
                        "  ? for shortcuts · ctrl+c to interrupt\n")
         self.submit_on_enter = 1
-        self.assertTrue(self.client.prompt_in_input("destination:p1", "resume the saved work"))
         self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
         self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
 
     def test_prompt_wrapped_inside_a_word_gets_one_enter_then_submission(self) -> None:
-        self.screen = "────────\n❯ resume the sav\ned work\n────────"
+        self.typed_screen = "────────\n❯ resume the sav\ned work\n────────"
         self.submit_on_enter = 1
         self.assertIsInstance(self.submit(), herdr.PromptSubmitted)
         self.assertEqual([(pane, text) for pane, text, _at in self.typed],
@@ -303,79 +686,85 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual([(pane, text) for pane, text, _at in self.typed],
                          [("destination:p1", text)])
         self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
-        cast(Mock, self.read).assert_called_once()
+        self.assertGreaterEqual(cast(Mock, self.read).call_count, 2)
 
     def test_named_composer_with_status_mode_and_agent_footer_gets_one_enter_retry(self) -> None:
-        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─")
+        self.typed_screen = self.real_composer_screen("──────────────────────── two-accounts ─")
         self.assert_real_composer_retries_once()
 
     def test_unnamed_composer_with_status_and_auto_cycle_footer_gets_one_enter_retry(self) -> None:
-        self.screen = self.real_composer_screen("────────────────────────────────────────",
+        self.typed_screen = self.real_composer_screen("────────────────────────────────────────",
                                                mode="⏵⏵ auto mode on (shift+tab to cycle)")
         self.assert_real_composer_retries_once()
 
     def test_named_composer_with_remote_control_status_suffix_gets_one_enter_retry(self) -> None:
-        self.screen = self.real_composer_screen("──────────────────────── style ─", status_suffix="        /rc")
+        self.typed_screen = self.real_composer_screen("──────────────────────── style ─", status_suffix="        /rc")
         self.assert_real_composer_retries_once()
 
     def test_named_composer_with_no_break_space_after_marker_gets_one_enter_retry(self) -> None:
-        self.screen = self.real_composer_screen("──────────────────────── ups ─", marker_gap="\xa0")
+        self.typed_screen = self.real_composer_screen("──────────────────────── ups ─", marker_gap="\xa0")
         self.assert_real_composer_retries_once()
 
     def test_multiline_prompt_with_rule_like_rows_gets_one_enter_retry(self) -> None:
         prompt = "resume the saved work\n--- context ---\n──── saved context ─\ncontinue here"
-        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─", input_text=prompt)
+        self.typed_screen = self.real_composer_screen("──────────────────────── two-accounts ─", input_text=prompt)
         self.assert_real_composer_retries_once(prompt)
 
     def test_indented_quote_after_rule_inside_live_prompt_gets_one_enter_retry(self) -> None:
         prompt = "resume the saved work\n---\n> quoted line\ncontinue here"
         visible_input = "resume the saved work\n  ---\n  > quoted line\n  continue here"
-        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─",
+        self.typed_screen = self.real_composer_screen("──────────────────────── two-accounts ─",
                                                input_text=visible_input)
         self.assert_real_composer_retries_once(prompt)
 
     def test_old_quoted_prompt_above_empty_live_composer_gets_no_enter(self) -> None:
         prompt = "resume the saved work\n---\n> quoted line\ncontinue here"
         old_input = "resume the saved work\n  ---\n  > quoted line\n  continue here"
+        self.drop_all = True
         self.screen = ("─── old session ─\n❯ " + old_input + "\n────────\n● Finished that task\n"
                        + self.real_composer_screen("──────────────────────── two-accounts ─", input_text=""))
         self.assertIsInstance(self.submit(text=prompt), herdr.PromptNotSubmitted)
-        self.assertEqual([(pane, text) for pane, text, _at in self.typed], [("destination:p1", prompt)])
+        self.assertTrue(self.typed)
+        self.assertTrue(all((pane, text) == ("destination:p1", prompt) for pane, text, _at in self.typed))
         self.assertEqual(self.enters, [])
 
     def test_named_composer_with_rule_character_in_label_gets_one_enter_retry(self) -> None:
-        self.screen = self.real_composer_screen("─── two─accounts ─")
+        self.typed_screen = self.real_composer_screen("─── two─accounts ─")
         self.assert_real_composer_retries_once()
 
     def test_old_rule_containing_prompt_above_empty_live_composer_gets_no_enter(self) -> None:
         prompt = "resume the saved work\n--- context ---\n──── saved context ─\ncontinue here"
+        self.drop_all = True
         self.screen = ("─── old session ─\n❯ " + prompt + "\n────────\n● Finished that task\n"
                        + self.real_composer_screen("──────────────────────── two-accounts ─", input_text=""))
         self.assertIsInstance(self.submit(text=prompt), herdr.PromptNotSubmitted)
-        self.assertEqual([(pane, text) for pane, text, _at in self.typed], [("destination:p1", prompt)])
+        self.assertTrue(self.typed)
+        self.assertTrue(all((pane, text) == ("destination:p1", prompt) for pane, text, _at in self.typed))
         self.assertEqual(self.enters, [])
 
     def test_named_composer_does_not_retry_prompt_visible_only_above_its_empty_input(self) -> None:
+        self.drop_all = True
         self.screen = ("❯ resume the saved work\n"
                        + self.real_composer_screen("──────────────────────── two-accounts ─", input_text=""))
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 1)
+        self.assertTrue(1 <= len(self.typed) <= 3)
         self.assertEqual(self.enters, [])
 
     def test_named_bordered_prompt_above_column_zero_output_gets_no_enter(self) -> None:
         self.screen = (self.real_composer_screen("──────────────────────── two-accounts ─")
                        + "ctrl+c cancels the operation described above\n")
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
-        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.typed, [])
         self.assertEqual(self.enters, [])
 
     def test_real_composer_retry_still_rechecks_its_recipient_before_enter(self) -> None:
-        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─")
+        self.typed_screen = self.real_composer_screen("──────────────────────── two-accounts ─")
         with patch.object(herdr, "prompt_recipient_process", side_effect=[
                 herdr.PromptRecipientProcess(23456, "first-recipient"),
                 herdr.PromptRecipientProcess(34567, "replacement-process")]):
             outcome = self.submit()
-        self.assertEqual(outcome, herdr.PromptNotSubmitted("prompt recipient changed before Enter retry"))
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIn("recipient changed", cast(herdr.PromptNotSubmitted, outcome).reason)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.enters, [])
 

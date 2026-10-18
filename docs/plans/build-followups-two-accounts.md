@@ -1941,3 +1941,51 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/accounts/test_refusal_watch.py` — an eight-case verdict table (current; account differs; group unconfigured; `move_id` differs; stored `NoGroupTransition` against a recorded move and the reverse; both `NoGroupTransition`; percent differs) run through the accessor and a runner pass over the same state; a forced-predicate test that patches `HoldStarted.is_current` and asserts both callers follow it.
 
 **Gotchas:** a new staleness condition goes into `HoldStarted.is_current` only; the forced-predicate test fails when either caller compares a hold's account, move id or percent inline.
+
+### Phase 69 — A lost resume prompt is typed again  · status: done
+
+#### Work Order
+
+**Goal:** a restart whose resume prompt is typed while Claude is still loading a large conversation, and lost, types it again once the session can take it. A prompt Claude accepted is never typed twice, and a failed submit carries the screen it saw.
+
+**Constraints from prior phases:** field report 2026-10-17 22:53 EDT (showrunner): trunk-unit's restart on natedev resumed a 1.02 GB transcript. herdr reported the pane `idle` with `interactive_ready` 4 s after Claude was detected, so `submit_opening_prompt` typed at 02:53:43Z. Claude's first transcript write came at 02:54:07.9Z. No user turn ever held the prompt, and the outcome was `not submitted: opening prompt is not in the destination input`. The showrunner ruled it a true failure and approved this phase, adding the guard in Spec 3. Code, `scripts/herdr/herdr.py`:
+- `Herdr.submit_opening_prompt(pane, opening, launched_at, timeout_ms)` (~1001) calls `wait_for_prompt_input` (~947), which polls `prompt_input_state` (~933). That accepts herdr `agent_status` in `{working, idle}` with `interactive_ready`, or a system row `/remote-control is active` after launch.
+- It then reads `prompt_recipient_process` once and types with `self.prompt` (~1047).
+- It loops 4 times: `_wait_for_submit` for up to 5 s (~988); on no turn, it returns `opening prompt is not in the destination input` when `prompt_in_input` (~958) is false, else checks the recipient and sends `Enter`.
+- `bound_outcome` rejects a recipient that changed.
+- `_transcript_turns` (~230) re-reads every `projects/*/<session_id>.jsonl` in full on each 0.1 s poll, keeping rows after `launched_at`. On a 1 GB file each 5 s wait overruns.
+- `submitted_prompt` (~276) matches a non-meta `user` row containing the text.
+- `prompt_in_input` parses the composer: the last closing rule, a top rule followed by a column-0 `❯`/`>` row (Phase 65), and no column-0 row below.
+- `PromptNotSubmitted(reason)` (~207) is encoded and decoded by `encode_prompt_outcome`/`decode_prompt_outcome` (~300/~309). `restart.py`, `add_unit.py` and `add_showrunner.py` save and decode it.
+- `restart.py` (~1164) and `add_unit.py` pass `timeout_ms=90_000` through `start_agent` (~791, ~831).
+- Tests: `scripts/herdr/test_herdr.py` ~95–200. The fixture patches `time.monotonic`/`time.sleep` to a fake clock, `readiness` (`ready_at`), `run` (the visible `screen`), `prompt` (`typed`, `submit_on_type`) and `send_keys` (`enters`, `submit_on_enter`). `write_turn` appends transcript rows. `test_no_user_turn_and_no_prompt_in_the_input_reports_not_submitted` pins today's single typing and changes in this phase.
+
+**Spec:**
+1. **Composer read once, shared.** One private parse of the visible screen returns the composer's input region or no composer. `prompt_in_input` and a new empty-composer check both use it, so the two cannot disagree about where the box is. Phase 65's column-0 rules stay.
+2. **Ready means a visible empty box.** `prompt_input_state` returns ready only when today's readiness holds (herdr idle/working plus `interactive_ready`, or the `/remote-control is active` row) **and** the visible screen shows an empty composer.
+3. **Re-type a lost prompt, never an accepted one.** When the prompt is neither in a user turn nor in the input box, `submit_opening_prompt` types it again only when all of these hold:
+   - herdr reads `idle`, not `working`, since a working session may hold the prompt queued;
+   - the visible composer is empty;
+   - no matching user turn has appeared within a settle window of 10 s after the last typing or Enter, with the transcript checked again just before typing;
+   - the recipient process is unchanged.
+   Before re-typing it waits for readiness (Spec 2) again. There are at most 3 typings in all and none past the deadline. Enter retries for text still in the box work as today. A box holding other text returns not submitted without typing. The last not-submitted reason names how many times the prompt was typed.
+4. **Read only new transcript bytes.** A transcript cursor owned by one submit call keeps a byte offset for each `projects/*/<session_id>.jsonl`. Each poll reads only the bytes added since the last read. A trailing partial line stays unread until its newline arrives, and a file that shrank restarts at 0. The `launched_at` filter, the remote-control check and `submitted_prompt`'s matching are unchanged.
+5. **Failure carries its screen.** `PromptNotSubmitted` gains a screen field, either the visible screen read (ANSI-stripped, last 40 lines) or a typed not-read value, which is the default. Every not-submitted outcome returned after the first typing carries the last screen read. `encode_prompt_outcome` writes `screen` only when one was read, and `decode_prompt_outcome` reads it back. Existing callers and records decode unchanged.
+
+**Files:**
+- `scripts/herdr/herdr.py` — the composer parse, the readiness gate, the re-type loop, the transcript cursor and the screen field with its encoding.
+- `scripts/herdr/test_herdr.py` — regressions for Specs 1–5, and the updated single-typing test.
+
+**Workers:** 1 writer + 1 tester. impl owns `herdr.py`; test owns `test_herdr.py`.
+
+**Verification:** scratch-HOME suites `scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions scripts.shutdown.test_restart scripts.shutdown.test_account_move scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle scripts.production.test_add_unit scripts.production.test_add_showrunner scripts.notify.test_push_texts`; basedpyright 0/0 on the changed files.
+
+**Acceptance gate:**
+- **Lost prompt:** the fake reports ready at once, drops every prompt typed before a load time, then shows an empty box. Submit returns `PromptSubmitted` with exactly two typings. On today's code this test fails with `opening prompt is not in the destination input`.
+- **Late turn (showrunner):** the prompt is accepted, the box empties, and the turn lands 8 s after typing. Submit returns `PromptSubmitted` with one typing.
+- **Queued while working:** herdr reads `working` through the settle window, and the turn lands at 20 s. Submit returns `PromptSubmitted` with one typing.
+- **Bounds:** a prompt never accepted is typed at most 3 times and returns not submitted with its screen. A box holding other text is never typed into.
+- **Changed recipient:** a recipient that changes blocks a re-type.
+- **Transcript reads:** a poll after the first reads only appended bytes. A partial line is read once its newline lands.
+- **Encoding:** the screen field encodes and decodes, and an old record without `screen` decodes as before.
+- **Suites:** they pass, basedpyright reports 0/0, and the merge gate on natedev passes.
