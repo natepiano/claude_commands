@@ -5577,6 +5577,19 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.start_slot_pass(session_dir, "fix", "fix", started_at + 50, "gpt-called", 0, "--phase-id", "7")
         self.assertIn("Phase 7 is not open; open phases: 15, 16", cast(str, raised.exception.stderr))
 
+    def test_a_pass_naming_a_finished_phase_names_the_plan_review_order(self) -> None:
+        # A plan review launched after its phase's finish-phase is refused; the refusal says why.
+        started_at = 42_600
+        session_dir = self.start_run("pass-after-finish", started_at)
+        self.start_numbered_phase(session_dir, "13", started_at + 10)
+        self.start_numbered_phase(session_dir, "16", started_at + 20)
+        self.finish_numbered_phase(session_dir, started_at + 30, "--phase-id", "13")
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.start_slot_pass(session_dir, "review", "review", started_at + 40, "gpt-called", 0, "--phase-id", "13")
+        stderr = cast(str, raised.exception.stderr)
+        self.assertIn("Phase 13 is not open; open phases: 16", stderr)
+        self.assertIn("run its plan review before its finish-phase", stderr)
+
     def test_back_filling_an_earlier_phase_leaves_the_open_phase_unchanged(self) -> None:
         started_at = 43_000
         session_dir = self.start_run("back-filled-phase", started_at)

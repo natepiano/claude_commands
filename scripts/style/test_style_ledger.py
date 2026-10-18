@@ -19,7 +19,9 @@ from unittest import mock
 
 import rules
 import style_ledger
+import style_plan
 import style_rules
+import berth_board
 
 
 class StatusCell(TypedDict):
@@ -169,6 +171,28 @@ class StyleLedgerTests(unittest.TestCase):
             "--text", f"pub fn old_name_{line}() {{}}", "--kind", "rename", "--before", "old_name",
             "--after", "new_name", "--rule-blob", rule_blob or self.blob(rule), "--ticket", ticket,
         ).stdout.strip()
+
+    def test_latest_held_judgments_selects_each_cells_latest_commit_and_excludes_later_non_held_verdicts(self) -> None:
+        rule = self.rule("read")
+        other_rule = self.rule("other-read")
+        self.record(rule, self.sources[0], self.initial_tip, "held")
+        self.record(rule, self.sources[1], self.initial_tip, "held")
+        self.record(other_rule, self.sources[0], self.initial_tip, "held")
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        tip = self.commit("Change the held file")
+        self.record(rule, self.sources[0], tip, "held")
+        ledger = self.ledger()
+        self.assertEqual(ledger.latest_held_judgments(), {
+            (rule, self.sources[0]): tip,
+            (rule, self.sources[1]): self.initial_tip,
+            (other_rule, self.sources[0]): self.initial_tip,
+        })
+
+        self.record(rule, self.sources[0], tip, "clean", ticket="later-clean")
+        self.assertEqual(ledger.latest_held_judgments(), {
+            (rule, self.sources[1]): self.initial_tip,
+            (other_rule, self.sources[0]): self.initial_tip,
+        })
 
     def structure_module(self) -> tuple[str, str, str, str]:
         path = "crates/alpha/src/theme/colors.rs"
@@ -1292,6 +1316,102 @@ class StyleLedgerTests(unittest.TestCase):
             (local_id, path) for path in self.sources[:2]
         })
 
+
+    def test_checkpoint_restamps_own_family_verdicts_after_only_ticket_edits_and_refill_does_not_reissue(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
+        self.record(rule, path, self.initial_tip, "fixed", ticket="names-1")
+        self.record(rule, path, self.initial_tip, ticket="another-ticket")
+        self.write(path, "pub fn renamed() -> u32 { 1 }\n")
+        _ = self.commit("Ticket renames the function")
+        self.write(path, "pub fn renamed() -> u32 { 2 }\n")
+        checkpoint = self.commit("Ticket checkpoint")
+
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.ticket_merge("names-1")
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "current")
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "names")
+        self.assertFalse(any(path in ticket.files for ticket in tickets))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            rows = cast(list[tuple[str, str]], connection.execute(
+                'SELECT "commit",verdict FROM judgments WHERE ticket=? ORDER BY id', ("names-1",)).fetchall())
+            other_commits = cast(list[tuple[str]], connection.execute(
+                'SELECT "commit" FROM judgments WHERE ticket=?', ("another-ticket",)).fetchall())
+        self.assertEqual(rows, [(self.initial_tip, "fixed"), (checkpoint, "fixed")])
+        self.assertEqual(other_commits, [(self.initial_tip,)])
+
+    def test_checkpoint_keeps_verdicts_stale_and_reissues_when_an_outside_commit_changed_the_path(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[0]
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, "pub fn outside_change() {}\n")
+        base = self.commit("Outside edit before ticket starts")
+        ledger = self.ledger()
+        ledger.set_tip(base, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), base)
+        self.write(path, "pub fn ticket_change() {}\n")
+        checkpoint = self.commit("Ticket checkpoint")
+
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.ticket_merge("names-1")
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "names")
+        self.assertTrue(any(path in ticket.files for ticket in tickets))
+
+    def test_checkpoint_does_not_restamp_a_path_changed_on_a_merged_outside_branch(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        _ = self.git("checkout", "-q", "-b", "outside")
+        self.write(path, "pub fn outside_change() {}\n")
+        _ = self.commit("Outside branch edit")
+        _ = self.git("checkout", "-q", "main")
+        self.write("README.md", "Ticket work\n")
+        _ = self.commit("Ticket work")
+        _ = self.git("merge", "--no-ff", "-q", "outside", "-m", "Bring in outside work")
+        checkpoint = self.git("rev-parse", "HEAD")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_names_checkpoint_leaves_forbidden_words_judgments_stale_on_the_edited_path(self) -> None:
+        names = self.rule("read")
+        forbidden = self.rule("forbidden-words", "tier: C\nfamily: values\ninput_scope: file\n")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [names, forbidden])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
+        # Even a verdict recorded under this ticket is not its family's judgment.
+        for rule in (names, forbidden):
+            self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, "// A new comment needs its own word check.\npub fn renamed() {}\n")
+        checkpoint = self.commit("Names checkpoint adds a comment")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.ticket_merge("names-1")
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(names)[path], "current")
+        self.assertEqual(self.states(forbidden)[path], "stale")
+        tickets = style_plan.candidate_tickets(
+            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "values")
+        self.assertTrue(any(path in ticket.files and forbidden in ticket.rules for ticket in tickets))
 
     def test_structure_checkpoint_requires_every_rule_and_accepts_any_verdict_at_head(self) -> None:
         first = self.rule("structure-first", "tier: D\nfamily: modules\n")

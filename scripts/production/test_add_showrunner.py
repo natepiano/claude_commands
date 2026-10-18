@@ -3,6 +3,7 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import shlex
@@ -10,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 from scripts.accounts import accounts
@@ -19,6 +22,7 @@ from scripts.production import add_showrunner
 import add_unit
 import showrunners
 import usage_store
+import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
@@ -79,6 +83,31 @@ class AddShowrunnerTests(unittest.TestCase):
             (self.root / name).mkdir()
         _ = (self.root / "sessions.py").write_text(SESSIONS, encoding="utf-8")
         _ = (self.root / "send.py").write_text(SEND, encoding="utf-8")
+        fake = bin_path / "submitting-herdr"
+        source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
+        source = source.replace('responses.get("default", {"stdout": "", "code": 0})',
+            'responses.get(" ".join(argv[2:4]), responses.get("default", {"stdout": "", "code": 0}))')
+        source = source.replace('raise SystemExit(main(sys.argv[1:]))', 'raise SystemExit(submitting_main(sys.argv[1:]))')
+        hook = r'''def submitting_main(argv):
+    result = main(argv)
+    if result == 0 and argv[2:4] == ["agent", "prompt"]:
+        from datetime import datetime, timezone
+        calls = [json.loads(line) for line in Path(os.environ["FAKE_HERDR_LOG"]).read_text().splitlines()]
+        start = next(row for row in reversed(calls) if row[:2] == argv[:2] and row[2:4] == ["agent", "start"])
+        flag = "--resume" if "--resume" in start else "--session-id"
+        session_id = start[start.index(flag) + 1]
+        config = next(value.split("=", 1)[1] for row in reversed(calls) for value in row
+                      if row[:2] == argv[:2] and value.startswith("CLAUDE_CONFIG_DIR="))
+        path = Path(config) / "projects/fixture" / (session_id + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                                   "message": {"role": "user", "content": argv[-1]}}) + "\n")
+    return result
+
+'''
+        source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
+        _ = fake.write_text(source)
+        fake.chmod(0o755)
         self.on_start = {}
         self.herdr_overrides = {}
         self.processes = []
@@ -86,9 +115,9 @@ class AddShowrunnerTests(unittest.TestCase):
         self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")},
                     "HOME": str(self.root / "home"), "STUB_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
-                    "SYSTEMD_RUN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
-                    "SYSTEMCTL": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+                    "HERDR_BIN": str(fake),
+                    "SYSTEMD_RUN": str(fake),
+                    "SYSTEMCTL": str(fake),
                     "HERDR_PROC": str(self.root / "proc"),
                     "FAKE_HERDR_LOG": str(self.state / "herdr.jsonl"),
                     "FAKE_HERDR_RESPONSES": str(self.state / "herdr-responses.json"),
@@ -214,6 +243,10 @@ class AddShowrunnerTests(unittest.TestCase):
                 "result": {"panes": [{"pane_id": "w1:p1", "label": slug}]}})),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {"root_pane": {"pane_id": "w1:p1"}}})),
         }
+        responses[f"--session {slug} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
+            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        responses[f"--session {slug} pane read w1:p1 --source visible"] = CommandResponse(
+            code=0, stdout="────────\n❯ \n────────")
         prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
         responses[f"--session {slug} agent prompt w1:p1 {prompt}"] = CommandResponse(
             code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{slug}"): ""})
@@ -269,7 +302,7 @@ class AddShowrunnerTests(unittest.TestCase):
             "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
         started = self.started()
         self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
-            "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
+            "--session-id", started[started.index("--session-id") + 1], "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]], [[
             "--session", "kid", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
 
@@ -301,6 +334,80 @@ class AddShowrunnerTests(unittest.TestCase):
                              str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
         _ = self.configure_groups(showrunners="claude3")
         return directory
+
+    def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
+        child = add_unit.read_production(self.doc("kid"))
+        selected = accounts.NamedAccount("claude3", self.root / "selected")
+        transcript = selected.dir / "projects/fixture/resumed-id.jsonl"
+        transcript.parent.mkdir(parents=True)
+        text = f"/showrunner:produce {child.doc} resume"
+        elapsed = 0.0
+        screen = "────────\n❯ \n────────"
+
+        def advance(seconds: float) -> None:
+            nonlocal elapsed
+            elapsed += seconds
+
+        def visible(*_args: str) -> str:
+            return screen
+
+        def turn(*, meta: bool) -> None:
+            with transcript.open("a") as output:
+                _ = output.write(json.dumps({"type": "user", "isMeta": meta,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": {"role": "user", "content": text}}) + "\n")
+
+        def typed(_client: herdr.Herdr, pane: str, prompt: str) -> None:
+            nonlocal screen
+            self.assertEqual((pane, prompt), ("destination:p1", text))
+            screen = f"────────\n❯ {text}\n────────"
+            turn(meta=True)
+
+        def enter(_client: herdr.Herdr, pane: str, *keys: str) -> None:
+            nonlocal screen
+            self.assertEqual((pane, keys), ("destination:p1", ("Enter",)))
+            screen = "────────\n❯ \n────────"
+            turn(meta=False)
+
+        with (patch.object(runtime, "shared_session", return_value="agents"),
+              patch.object(runtime, "start_server"),
+              patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
+              patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
+              patch.object(runtime.Herdr, "panes", return_value=[{"pane_id": "destination:p1", "label": "kid"}]),
+              patch.object(runtime.Herdr, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
+              patch.object(runtime.Herdr, "prompt", autospec=True, side_effect=typed) as prompt,
+              patch.object(runtime.Herdr, "run", side_effect=visible),
+              patch.object(runtime.Herdr, "send_keys", autospec=True, side_effect=enter) as keys):
+            outcome = add_showrunner.launch(child, "opus", "high", "resumed-id", self.root, selected)
+        self.assertIsInstance(outcome, runtime.PromptSubmitted)
+        self.assertEqual(prompt.call_count, 1)
+        self.assertEqual(keys.call_count, 1)
+        readiness.assert_called_once_with("destination:p1")
+        self.assertEqual(tab.call_args.args[:4], ("agents", "kid", "kid", "kid"))
+        self.assertGreaterEqual(elapsed, 5)
+
+    def test_unsubmitted_showrunner_is_named_and_never_attached_even_if_live(self) -> None:
+        _ = self.doc("kid")
+        for outcome in (runtime.PromptNotSubmitted("fixture lost input"), runtime.PromptSubmissionNotRequired()):
+            with (self.subTest(outcome=outcome), patch.dict(os.environ, self.env, clear=True),
+                  patch.object(showrunners, "own_slug", return_value="top"),
+                  patch.object(add_showrunner, "checked"),
+                  patch.object(runtime, "shared_session", return_value="agents"),
+                  patch.object(runtime, "start_server"), patch.object(runtime, "open_tab", return_value="destination:p1"),
+                  patch.object(runtime, "start_agent", return_value=outcome) as start,
+                  patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
+                  redirect_stderr(io.StringIO()) as error):
+                code = add_showrunner.main(["--production", str(self.doc("kid")), "--model", "opus", "--effort", "high"])
+            self.assertEqual(code, add_showrunner.SESSION_NOT_READY)
+            self.assertIn("kid: opening prompt not submitted", error.getvalue())
+            appeared.assert_not_called()
+            opening = cast(runtime.OpeningPrompt, start.call_args.kwargs["opening"])
+            assert isinstance(opening.transcript, runtime.SessionTranscript)
+            self.assertEqual(opening.transcript.config_dir, Path(self.env["HOME"]) / ".claude2")
+            arguments = cast(list[str], start.call_args.kwargs["agent_arguments"])
+            self.assertEqual(opening.transcript.session_id, arguments[arguments.index("--session-id") + 1])
+        self.assertEqual(self.parent_of("kid"), "")
 
     def test_new_showrunner_reads_stored_showrunners_account_despite_better_unit_reading(self) -> None:
         directory = self.named_account()
@@ -545,10 +652,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertNotIn("caller-token", json.dumps(self.herdr_calls()))
 
     def test_showrunner_start_not_ready_returns_a_distinct_status_and_sends_no_prompt_or_key(self) -> None:
-        start = ("--session kid agent start kid --kind claude --pane w1:p1 --timeout 90000 -- "
-                 "--model opus --effort high --remote-control kid -n kid --settings "
-                 '{"disableAgentView": true}')
-        self.herdr_overrides[start] = CommandResponse(code=1, stdout=json.dumps({
+        self.herdr_overrides["agent start"] = CommandResponse(code=1, stdout=json.dumps({
             "error": {"code": "agent_not_ready", "message": "permission dialog"}}))
         screen = "Do you trust this folder?\n1. Yes\n2. No"
         self.herdr_overrides["--session kid pane read w1:p1 --source visible"] = CommandResponse(

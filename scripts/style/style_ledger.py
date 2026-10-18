@@ -822,6 +822,9 @@ class Ledger:
                 missing = self.unjudged_ticket_cells(id)
                 if missing:
                     raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
+                self._restamp_checkpoint_judgments(ticket, commit)
+            if target == "merged":
+                self._restamp_checkpoint_judgments(ticket, ticket["checkpoint"])
             if target == "assigned":
                 active = self.ticket_open(ticket["unit"])
                 if active:
@@ -857,6 +860,43 @@ class Ledger:
 
     def ticket_checkpoint(self, id: str, commit: str) -> None:
         self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
+
+    def _restamp_checkpoint_judgments(self, ticket: TicketRecord, checkpoint: str) -> None:
+        """Carry this ticket's verdicts across edits made only by this ticket."""
+        if not ticket["base"] or not self._is_ancestor(ticket["base"], checkpoint):
+            return
+        self._catalog = rule_catalog.load_rules(self.repo)
+        tip = self._tip(checkpoint)
+        # Commits inherited at the start or merged from another branch are not ours.
+        own_commits = set(_git(self.repo, "rev-list", "--first-parent", checkpoint,
+                               "^" + ticket["base"]).splitlines())
+        rows = cast(list[tuple[int, str, str, str]], self._connection.execute(
+            'SELECT j.id,j.rule,j.path,j."commit" FROM judgments j WHERE j.ticket=? '
+            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.ticket=j.ticket '
+            + 'AND latest.rule=j.rule AND latest.path=j.path ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
+            (ticket["id"],),
+        ).fetchall())
+        for judgment_id, rule, path, judged_commit in rows:
+            try:
+                definition = self._component_rule(rule)
+                if definition.family != ticket["family"] or judged_commit == checkpoint:
+                    continue
+                if not self._is_ancestor(judged_commit, checkpoint):
+                    continue
+                changed_commits = set(_git(self.repo, "rev-list", "--full-history", checkpoint,
+                                          "^" + judged_commit, "--", path).splitlines())
+                if not changed_commits <= own_commits:
+                    continue
+                scope = _cell_scope(definition, path, tip)
+                fingerprint = self._fingerprint(tip, scope, path)
+            except LedgerError:
+                continue
+            _ = self._connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
+                + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,? FROM judgments WHERE id=? '
+                + 'ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) DO NOTHING',
+                (scope, fingerprint, checkpoint, datetime.now(timezone.utc).isoformat(), judgment_id),
+            )
 
     def ticket_merge(self, id: str) -> None:
         ticket = self._ticket(id)
@@ -1346,6 +1386,15 @@ class Ledger:
                 (rule, rule_blob, scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
                  datetime.now(timezone.utc).isoformat()),
             )
+
+    def latest_held_judgments(self) -> dict[tuple[str, str], str]:
+        """Return judgment commits for cells whose latest verdict is held."""
+        rows = cast(list[tuple[str, str, str]], self._connection.execute(
+            'SELECT j.rule,j.path,j."commit" FROM judgments j WHERE j.verdict=\'held\' '
+            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.rule=j.rule AND latest.path=j.path '
+            + 'ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
+        ).fetchall())
+        return {(rule, path): commit for rule, path, commit in rows}
 
     def lint_record(self, tip: str, tool: LintTool, passed: bool, diagnostics: dict[str, int]) -> None:
         if any(count < 0 for count in diagnostics.values()):
