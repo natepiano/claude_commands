@@ -661,9 +661,17 @@ Pending: parent's saved style child summary and rendered style line.
   cells no longer hold other families back. Two other reported reissues
   (clean forbidden-word and census cells) trace to crate-scope rules and
   wait on the input_scope change. Seven tests; four fail before the fix.
+- **Fix AG — a ticket's checkpoint re-stamps its own family's verdicts on files only it changed** (commit `ceef89b6`):
+  on cargo-liner names-unit-34 reissued agent_cell.rs cells that
+  names-unit-15 had judged, because names-unit-15's own checkpoint edited
+  one comment in that file after the verdicts. At checkpoint, the ticket's
+  own family's verdicts are now re-stamped when every change to the file
+  since the verdict is the ticket's own work after its start. An outside
+  edit still reissues, and another family's verdict on the same file stays
+  stale: a names edit can break forbidden-words. Three tests, one per case.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`.
 Live verification of the fixes and subsequent measurements remain pending.
