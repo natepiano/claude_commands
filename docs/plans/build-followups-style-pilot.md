@@ -622,9 +622,25 @@ Pending: parent's saved style child summary and rendered style line.
   modules ticket's cycle. A test pins the read count and three exact
   tickets; it fails before the fix. The unit director closed the review on
   their own read of the change.
+- **Fix AC — modules structure tickets ask the when-to-split question of every file** (commit `2c1c3f54`):
+  two blind judge sets on the 20-file modules sample found 33 of the 35
+  reference findings between them. Both misses were files that should
+  split, which no judge asked of a file once other rules held findings on
+  it. When `when-to-split-a-module` is pinned, the ticket now asks it of
+  every file. The reference is corrected to 35: the wire.rs over-split
+  finding is dropped, because `parallel_cases.rs` is shared with an
+  integration test and cannot fold back. The ChildReportFailure finding is
+  credited, because moving the hook suite fixes it. A test pins the line;
+  it fails before the fix. A one-judge re-sample is being scored.
+- **Fix AD — tickets pinning `comments-name-code-constructs` keep every stated reason** (commit `8b0f18b0`):
+  on cargo-liner, names writers replaced reason-giving comments with
+  narration of the code. Neither the rule nor the ticket said to keep the
+  reason. The ticket now does, marked temporary until the rule text
+  carries the same sentence, which waits on the user. A test covers every
+  ticket kind; it fails before the fix.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`.
 Live verification of the fixes and subsequent measurements remain pending.
