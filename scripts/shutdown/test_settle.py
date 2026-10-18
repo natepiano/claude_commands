@@ -1547,6 +1547,7 @@ class SettleTests(ShutdownTestCase):
     def test_unit_showrunner_is_told_once_per_new_failure_and_a_stop_says_it_stays_stopped(self) -> None:
         saved = self.unit_for_showrunner(then="stop")
         with (
+            patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionNotLive()),
             patch.object(settle_showrunners, "current_name", return_value="runner"),
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
         ):
@@ -1571,6 +1572,68 @@ class SettleTests(ShutdownTestCase):
             settle.tell_showrunner_stopping(saved)
         send.assert_not_called()
         self.assertFalse(any("showrunner_told" in current for current in record.session_records(LOGIN)))
+
+    def test_failed_restart_showrunner_outcome_checks_liveness_and_sends_once(self) -> None:
+        saved = self.unit_for_showrunner()
+        cases = (restart_work.SessionLive(), restart_work.SessionNotLive(),
+                 restart_work.SessionLivenessUnknown("scratch registry unreadable"))
+        for observed in cases:
+            with self.subTest(liveness=observed):
+                def failed(current: record.SessionShutdown) -> None:
+                    current["progress"] = {"kind": "restart failed", "at": NOW,
+                                           "reason": "restart prompt not submitted"}
+                    current["showrunner_told"] = settle.SHOWRUNNER_TOLD_STOPPING
+                saved = record.update_session(LOGIN, "unit", failed)
+                with (patch.object(restart_work, "restart_failed_liveness", return_value=observed) as liveness,
+                      patch.object(settle_showrunners, "current_name", return_value="runner"),
+                      patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send):
+                    settle.tell_showrunners_outcome([saved])
+                    liveness.assert_called_once_with(saved)
+                    current = record.find_session(LOGIN, "unit")
+                    assert current is not None
+                    settle.tell_showrunners_outcome([current])
+                    self.assertEqual(liveness.call_count, 2)
+                send.assert_called_once()
+                recipient, summary, text = self.sent(send)
+                self.assertEqual(recipient, "runner")
+                if isinstance(observed, restart_work.SessionLive):
+                    self.assertEqual(summary,
+                        "Unit is back on claude3; its restart prompt was not confirmed — check it")
+                    self.assertEqual(text, summary)
+                    self.assertNotIn("shutdown.py restart", text)
+                    self.assertEqual(current.get("showrunner_told"), settle.SHOWRUNNER_TOLD_BACK)
+                else:
+                    self.assertIn("Unit did not come back: restart prompt not submitted", summary)
+                    self.assertIn(settle.shutdown_command("restart", LOGIN, "--here", "--only", "unit"), text)
+                    self.assertEqual(current.get("showrunner_told"), settle.not_back_text(saved))
+                    if isinstance(observed, restart_work.SessionLivenessUnknown):
+                        self.assertIn("liveness unknown: scratch registry unreadable", summary)
+
+    def test_stop_report_passes_live_failed_unit_to_showrunner_with_one_liveness_read(self) -> None:
+        _ = self.unit_for_showrunner()
+        def failed(current: record.SessionShutdown) -> None:
+            current["progress"] = {"kind": "restart failed", "at": NOW,
+                                   "reason": "restart prompt not submitted"}
+            current["showrunner_told"] = settle.SHOWRUNNER_TOLD_STOPPING
+        saved = record.update_session(LOGIN, "unit", failed)
+        with (patch.object(restart_work, "clear_running_on_target",
+                           return_value=restart_work.TargetCheck([saved], [])),
+              patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive()) as liveness,
+              patch.object(settle_showrunners, "current_name", return_value="runner"),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send,
+              patch.object(settle, "alert_user") as alert):
+            settle.report_stop([saved])
+        liveness.assert_called_once_with(saved)
+        back = [call for call in send.call_args_list if call.args[0] == "runner"]
+        self.assertEqual(len(back), 1)
+        self.assertEqual(back[0].args[1],
+                         "Unit is back on claude3; its restart prompt was not confirmed — check it")
+        self.assertNotIn("shutdown.py restart", cast(str, back[0].args[2]))
+        current = record.find_session(LOGIN, "unit")
+        assert current is not None
+        self.assertEqual(current.get("showrunner_told"), settle.SHOWRUNNER_TOLD_BACK)
+        alert.assert_not_called()
 
     def test_now_stops_a_busy_requester_without_waiting_for_its_request(self) -> None:
         requester = session_shutdown(top_level("requester", "Requester"), requester="requester", then="restart")
@@ -3196,6 +3259,60 @@ class SettleTests(ShutdownTestCase):
         current = record.find_session(LOGIN, "unsent-owner")
         assert current is not None
         self.assertEqual(current["progress"], saved["progress"])
+
+    def test_stop_report_observes_failed_restart_liveness_once_before_commands_and_pushes(self) -> None:
+        cases = (
+            ("live", restart_work.SessionLive()),
+            ("not live", restart_work.SessionNotLive()),
+            ("unknown", restart_work.SessionLivenessUnknown("scratch registry unreadable")),
+        )
+        for state, observed in cases:
+            with self.subTest(liveness=state):
+                failed = session_shutdown(top_level(f"failed-{state}", "Slow owner"), then="restart",
+                    requester="requester",
+                    progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
+                sibling = session_shutdown(top_level(f"restarted-{state}", "Restarted sibling"), then="restart",
+                    requester="requester", progress={"kind": "restarted", "at": NOW})
+                self.save(failed)
+                self.save(sibling)
+                records = [failed, sibling]
+                with (patch.object(restart_work, "clear_running_on_target",
+                                   return_value=restart_work.TargetCheck(records, [])),
+                      patch.object(restart_work, "restart_failed_liveness", return_value=observed) as liveness,
+                      patch.object(settle, "run_remote", return_value=(0, "[]")),
+                      patch.object(settle, "send_message") as sender,
+                      patch.object(settle, "alert_user") as alert,
+                      patch.object(restart_work, "restart_push", wraps=restart_work.restart_push) as pushes,
+                      patch.object(settle, "mark_not_back_pushed", wraps=settle.mark_not_back_pushed) as mark):
+                    settle.report_stop(records)
+                liveness.assert_called_once_with(failed)
+                sender.assert_called_once()
+                summary = cast(str, sender.call_args.args[1])
+                text = cast(str, sender.call_args.args[2])
+                current = record.find_session(LOGIN, failed["session"]["session_id"])
+                assert current is not None
+                if isinstance(observed, restart_work.SessionLive):
+                    self.assertEqual(summary, f"{LABEL} is back")
+                    self.assertIn("  Slow owner: restart prompt not confirmed; session is running — check it", text)
+                    self.assertNotIn("  Slow owner: restart prompt not submitted", text)
+                    self.assertNotIn("shutdown.py restart", text)
+                    self.assertEqual(current, failed)
+                    alert.assert_not_called()
+                    pushes.assert_not_called()
+                    mark.assert_not_called()
+                else:
+                    self.assertEqual(summary, f"{LABEL} is not fully back")
+                    self.assertIn("  Slow owner: restart prompt not submitted", text)
+                    command = settle.shutdown_command("restart", LOGIN, "--here", "--only",
+                                                      failed["session"]["session_id"])
+                    self.assertIn(f"in a terminal on natedev: {command}", text)
+                    self.assertNotIn("session is running", text)
+                    if isinstance(observed, restart_work.SessionLivenessUnknown):
+                        self.assertIn(f"{command}; liveness unknown: {observed.reason}", text)
+                    alert.assert_called_once()
+                    pushes.assert_called_once_with(LABEL, ["Slow owner"], machine="natedev")
+                    mark.assert_called_once_with(failed)
+                    self.assertEqual(current.get("restore_alerted"), settle.not_back_text(failed))
 
     def test_automatic_restart_sends_all_split_pushes_and_marks_every_named_failure(self) -> None:
         batches = [[f"Owner{index}-" + "x" * suffix_length for index in range(6)]

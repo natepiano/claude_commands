@@ -240,6 +240,99 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIn("prompt typed 3 times", cast(herdr.PromptNotSubmitted, outcome).reason)
         self.assertEqual(cast(herdr.PromptNotSubmitted, outcome).screen, self.screen)
 
+    def test_slash_command_recorded_as_command_tags_is_submitted_once(self) -> None:
+        text = "/showrunner:produce /x/doc.md resume"
+        recorded = ("<command-message>showrunner:produce</command-message>\n"
+                    "<command-name>/showrunner:produce</command-name>\n"
+                    "<command-args>/x/doc.md resume</command-args>")
+        self.drop_all = True
+        self.events.append((8, lambda: self.write_turn(recorded, seconds_after_launch=8)))
+        outcome = self.submit(timeout_ms=30_000, text=text)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(cast(herdr.PromptSubmitted, outcome).at, self.launched_at + timedelta(seconds=8))
+        self.assertEqual(self.typed, [("destination:p1", text, 0)])
+        self.assertEqual(self.enters, [])
+
+    def test_slash_command_recorded_as_raw_text_is_submitted_once(self) -> None:
+        text = "/showrunner:produce /x/doc.md resume"
+        self.drop_all = True
+        self.events.append((8, lambda: self.write_turn(text, seconds_after_launch=8)))
+        outcome = self.submit(timeout_ms=30_000, text=text)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(cast(herdr.PromptSubmitted, outcome).at, self.launched_at + timedelta(seconds=8))
+        self.assertEqual(self.typed, [("destination:p1", text, 0)])
+        self.assertEqual(self.enters, [])
+
+    def test_real_recorded_showrunner_resume_row_is_submitted_once(self) -> None:
+        self.launched_at = datetime.fromisoformat("2026-10-18T04:38:39+00:00")
+        text = "/showrunner:produce /home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-production.md resume"
+        row = {"type": "user", "timestamp": "2026-10-18T04:38:44.088Z", "message": {"role": "user", "content": "<command-message>showrunner:produce</command-message>\n<command-name>/showrunner:produce</command-name>\n<command-args>/home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-production.md resume</command-args>"}}
+        self.drop_all = True
+        def record_turn() -> None:
+            _ = self.path.write_text(json.dumps(row) + "\n")
+        self.events.append((5.088, record_turn))
+        outcome = self.submit(timeout_ms=30_000, text=text)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(cast(herdr.PromptSubmitted, outcome).at,
+                         datetime.fromisoformat("2026-10-18T04:38:44.088+00:00"))
+        self.assertEqual(self.typed, [("destination:p1", text, 0)])
+        self.assertEqual(self.enters, [])
+
+    def test_slash_command_matching_requires_the_name_arguments_and_non_meta_user(self) -> None:
+        for text, content, kind, meta, matches in (
+            ("/check", "<command-name>/check</command-name>", "user", False, True),
+            ("/check   /x/doc.md resume  ", "<command-name>/check</command-name>\n<command-args>/x/doc.md resume</command-args>", "user", False, True),
+            ("/check /x/doc.md", "<command-name>/other</command-name>\n<command-args>/x/doc.md</command-args>", "user", False, False),
+            ("/check /x/doc.md", "<command-name>/check</command-name>\n<command-args>/x/other.md</command-args>", "user", False, False),
+            ("/check /x/doc.md", "<command-name>/check</command-name>", "user", False, False),
+            ("/check", "<command-name>/check</command-name>", "user", True, False),
+            ("/check", "<command-name>/check</command-name>", "assistant", False, False),
+        ):
+            with self.subTest(text=text, content=content, kind=kind, meta=meta):
+                _ = self.path.write_text("")
+                self.write_turn(content, kind=kind, meta=meta)
+                outcome = herdr.submitted_prompt(self.transcript, text, self.launched_at)
+                self.assertEqual(isinstance(outcome, herdr.PromptSubmitted), matches)
+
+    def test_final_read_finds_a_turn_after_the_last_deadline_poll(self) -> None:
+        self.drop_all = True
+        def screen_after_poll(*arguments: str) -> str:
+            if self.elapsed >= 5:
+                self.write_turn("resume the saved work", seconds_after_launch=5)
+            return self.read_screen(*arguments)
+        with patch.object(self.client, "run", side_effect=screen_after_poll):
+            outcome = self.submit(timeout_ms=5_000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(cast(herdr.PromptSubmitted, outcome).at, self.launched_at + timedelta(seconds=5))
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_final_read_also_precedes_a_non_deadline_give_up(self) -> None:
+        self.drop_all = True
+        def screen_after_poll(*arguments: str) -> str:
+            if self.elapsed >= 5:
+                self.write_turn("resume the saved work", seconds_after_launch=5)
+                self.screen = "────────\n❯ another task\n────────"
+            return self.read_screen(*arguments)
+        with patch.object(self.client, "run", side_effect=screen_after_poll):
+            outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_final_read_finds_a_turn_when_the_screen_read_fails_after_the_last_poll(self) -> None:
+        self.drop_all = True
+        def screen_after_poll(*arguments: str) -> str:
+            if self.elapsed >= 5:
+                self.write_turn("resume the saved work", seconds_after_launch=5)
+                raise OSError("scratch pane read failed")
+            return self.read_screen(*arguments)
+        with patch.object(self.client, "run", side_effect=screen_after_poll):
+            outcome = self.submit()
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
     def test_lost_prompt_is_typed_again_after_loading_finishes(self) -> None:
         self.drop_before = 7
         self.submit_on_type = True
@@ -575,9 +668,15 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_a_replacement_process_cannot_inherit_the_turn_written_during_submission(self) -> None:
         self.submit_on_type = True
-        with patch.object(herdr, "prompt_recipient_process", side_effect=[
-                herdr.PromptRecipientProcess(23456, "first-recipient"),
-                herdr.PromptRecipientProcess(34567, "replacement-process")]):
+        observations = 0
+
+        def recipient(_session: str) -> herdr.PromptRecipientProcess:
+            nonlocal observations
+            observations += 1
+            return (herdr.PromptRecipientProcess(23456, "first-recipient") if observations == 1
+                    else herdr.PromptRecipientProcess(34567, "replacement-process"))
+
+        with patch.object(herdr, "prompt_recipient_process", side_effect=recipient):
             outcome = self.submit()
         self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
         self.assertEqual(len(self.typed), 1)

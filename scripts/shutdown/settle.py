@@ -43,6 +43,7 @@ from user_zone import user_zone
 from scripts.accounts.accounts import HAND_ORIGIN
 if TYPE_CHECKING:
     from ..accounts import refusals, accounts
+    from . import restart as restart_work
     from ..notify import review
     from ..notify.push_texts import RenderedPush, render, user_send_argv
 else:
@@ -1340,6 +1341,17 @@ def report_stop(records: list[SessionShutdown]) -> None:
     import restart as restart_work
     checked = restart_work.clear_running_on_target(records)
     records = checked.remaining + checked.finished
+    restart_liveness = {saved["session"]["session_id"]: restart_work.restart_failed_liveness(saved)
+                        for saved in records if saved["progress"]["kind"] == "restart failed"}
+    running = {identity for identity, observed in restart_liveness.items()
+               if isinstance(observed, restart_work.SessionLive)}
+
+    def restart_line(saved: SessionShutdown) -> str:
+        command = shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
+        observed = restart_liveness.get(saved["session"]["session_id"])
+        unknown = f"; liveness unknown: {observed.reason}" if isinstance(observed, restart_work.SessionLivenessUnknown) else ""
+        return f"in a terminal on {saved['machine']}: {command}{unknown}"
+
     first = records[0]
     status, output = run_remote(["records", "--json", "--here"])
     request_ids = {saved["request_id"] for saved in records}
@@ -1358,12 +1370,16 @@ def report_stop(records: list[SessionShutdown]) -> None:
         lines.extend(f"  {saved['session']['name']}: {stop_issue_text(issue)}" for issue in saved["stop_issues"])
     for saved in records:
         progress = saved["progress"]
-        if progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
+        if saved["session"]["session_id"] in running:
+            lines.append(f"  {saved['session']['name']}: restart prompt not confirmed; session is running — check it")
+        elif progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
             lines.append(f"  {saved['session']['name']}: {progress['reason']}")
         elif progress["kind"] == "manual restart":
             lines.append(f"  {saved['session']['name']}: in a terminal on {saved['machine']}: {progress['command']}")
-    failed = [saved for saved in records if store.stop_incomplete(saved)]
-    restore_failed = [saved for saved in records if saved["progress"]["kind"] in {"restart failed", "manual restart", "timers pending"}]
+    failed = [saved for saved in records if saved["session"]["session_id"] not in running and store.stop_incomplete(saved)]
+    restore_failed = [saved for saved in records
+                      if saved["progress"]["kind"] in {"restart failed", "manual restart", "timers pending"}
+                      and saved["session"]["session_id"] not in running]
     if failed:
         summary = f"{first['label']}: stop partial"
         for saved in failed:
@@ -1371,14 +1387,16 @@ def report_stop(records: list[SessionShutdown]) -> None:
     elif restore_failed:
         summary = f"{first['label']} is not fully back"
         for saved in restore_failed:
-            lines.append(f"in a terminal on {saved['machine']}: " + shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"]))
-    elif all(saved["progress"]["kind"] == "restarted" for saved in records):
+            lines.append(restart_line(saved))
+    elif all(saved["progress"]["kind"] == "restarted" or saved["session"]["session_id"] in running for saved in records):
         summary = f"{first['label']} is back"
     else:
         summary = f"{first['label']} is down"
         for saved in records:
-            lines.append(f"in a terminal on {saved['machine']}: " + shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"]))
-    tell_showrunners_outcome([saved for saved in records if saved["machine"] == local_machine()])
+            if saved["session"]["session_id"] not in running:
+                lines.append(restart_line(saved))
+    tell_showrunners_outcome([saved for saved in records if saved["machine"] == local_machine()],
+                            restart_observations=tuple(restart_liveness.items()))
     text = "\n".join(lines)
     origins = {saved["requested_by"]["session_id"] for saved in records if saved["requested_by"]["kind"] == "session"}
     route = "natedev" if local_machine().casefold() == "mac" else ""
@@ -1469,20 +1487,32 @@ def tell_showrunner_stopping(saved: SessionShutdown) -> None:
                      key=f"shutdown-unit-{saved['session']['session_id']}")
 
 
-def tell_showrunners_outcome(records: list[SessionShutdown]) -> None:
+def tell_showrunners_outcome(records: list[SessionShutdown], *,
+                            restart_observations: tuple[tuple[str, restart_work.SessionLive | restart_work.SessionNotLive | restart_work.SessionLivenessUnknown], ...] = ()) -> None:
     """The second line to a stopped unit's showrunner: back, or not back and why."""
+    import restart as restart_work
+    observed_restarts = dict(restart_observations)
     for saved in records:
         if saved.get("showrunner_told") is None:
             continue
         progress = saved["progress"]
         name = saved["session"]["name"]
-        if progress["kind"] in {"restarted", "timers pending"}:
+        observed = observed_restarts.get(saved["session"]["session_id"])
+        if progress["kind"] == "restart failed" and observed is None:
+            observed = restart_work.restart_failed_liveness(saved)
+        if progress["kind"] == "restart failed" and isinstance(observed, restart_work.SessionLive):
+            told = SHOWRUNNER_TOLD_BACK
+            summary = f"{name} is back on {saved.get('target') or saved['label']}; its restart prompt was not confirmed — check it"
+            text = summary
+        elif progress["kind"] in {"restarted", "timers pending"}:
             told = SHOWRUNNER_TOLD_BACK
             summary = f"{name} is back on {saved.get('target') or saved['label']}"
             text = summary
         elif progress["kind"] in {"restart failed", "manual restart"}:
             told = not_back_text(saved)
             reason = progress["reason"] if progress["kind"] == "restart failed" else "it needs a manual restart"
+            if isinstance(observed, restart_work.SessionLivenessUnknown):
+                reason += f"; liveness unknown: {observed.reason}"
             summary = f"{name} did not come back: {reason}"
             command = shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
             text = f"{summary}. The user is told; in a terminal on {saved['machine']}: {command} retries it."

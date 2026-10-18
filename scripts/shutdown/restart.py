@@ -1809,7 +1809,7 @@ def launch_entry(
                 return EntrySettled()
             case SessionNotLive():
                 pass
-    if record["requested_by"]["kind"] == "snapshot" and progress["kind"] in {"already gone", "restart failed"}:
+    if progress["kind"] == "restart failed" or (record["requested_by"]["kind"] == "snapshot" and progress["kind"] == "already gone"):
         observed = _owner_liveness(session)
         if isinstance(observed, SessionLive):
             print(f"{session['name']}: already running; skipped")
@@ -1998,9 +1998,11 @@ def confirm_entry(
 
 
 def _machine_result(records: list[SessionShutdown], machine: str, label: str) -> MachineRestartResult:
+    incomplete = [item for item in records if item["progress"]["kind"] != "restarted"
+                  and not restart_failed_session_running(item)]
     failed = tuple(
         FailedSessionRestart(item["session"]["name"], item["progress"]["reason"])
-        for item in records if item["progress"]["kind"] == "restart failed"
+        for item in incomplete if item["progress"]["kind"] == "restart failed"
     )
     manual = tuple(
         ManualSessionRestart(item["session"]["name"], item["progress"]["command"])
@@ -2013,9 +2015,7 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
     )
     restarted = sum(item["progress"]["kind"] in {"restarted", "timers pending"} for item in records)
     return MachineRestartResult(
-        machine, label, "partial" if failed or manual or pending or any(
-            item["progress"]["kind"] != "restarted" for item in records
-        ) else "done",
+        machine, label, "partial" if incomplete else "done",
         restarted=restarted, workers=sum(len(item["workers"]) for item in records if item["progress"]["kind"] == "restarted"),
         failed=len(failed), manual=len(manual), failed_sessions=failed,
         manual_sessions=manual, timers_not_started=pending,
@@ -2109,6 +2109,14 @@ def relaunch_session(
     desktop_state: DesktopLaunchState,
 ) -> SessionShutdown:
     """Claim and launch one session; leave registry confirmation to the caller."""
+    if record["progress"]["kind"] == "restart failed":
+        observed = _owner_liveness(record["session"])
+        if isinstance(observed, SessionLive):
+            print(f"{record['session']['name']}: already running; skipped")
+            return record
+        if isinstance(observed, SessionLivenessUnknown):
+            print(f"{record['session']['name']}: recovery refused: {observed.reason}")
+            return record
     if dry_run:
         _ = launch_entry(record, settle.record_time(), desktop_state, dry_run=True)
         return record
@@ -2827,6 +2835,16 @@ def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerR
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
+def restart_failed_liveness(saved: SessionShutdown) -> SessionLive | SessionNotLive | SessionLivenessUnknown:
+    """Observe the session behind an unconfirmed restart without changing its record."""
+    return _owner_liveness(saved["session"])
+
+
+def restart_failed_session_running(saved: SessionShutdown) -> bool:
+    return (saved["progress"]["kind"] == "restart failed"
+            and isinstance(restart_failed_liveness(saved), SessionLive))
+
+
 def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]:
     try:
         records = session_records(login)
@@ -2835,7 +2853,8 @@ def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]
     return [saved for saved in records
             if saved["machine"] == settle.local_machine()
             and saved["progress"]["kind"] in {"restart failed", "manual restart"}
-            and (not ids or saved["session"]["session_id"] in ids)]
+            and (not ids or saved["session"]["session_id"] in ids)
+            and not restart_failed_session_running(saved)]
 
 
 def _pushed_not_back(login: str, ids: tuple[str, ...]) -> set[str]:
@@ -2970,7 +2989,10 @@ def restart(
             if failure_alert:
                 # A retry that fails the same way as a pushed failure tells the user nothing new.
                 pushed = _pushed_not_back(selected.login, ids)
-                failed = [item for item in local.failed_sessions if item.name not in pushed]
+                running = {saved["session"]["name"] for saved in session_records(selected.login)
+                           if (not ids or saved["session"]["session_id"] in ids)
+                           and restart_failed_session_running(saved)}
+                failed = [item for item in local.failed_sessions if item.name not in pushed and item.name not in running]
                 manual = [item for item in local.manual_sessions if item.name not in pushed]
                 names = [item.name for item in failed]
                 names.extend(match.group(1) for line in peer["lines"]
@@ -2982,7 +3004,7 @@ def restart(
                     machines.append(peer["machine"])
                 # Pending scheduled jobs are reported in the command output; they need no user step.
                 peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
-                    re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+)", line)
+                    re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+|already running; skipped$)", line)
                     for line in peer["lines"]))
                 if names or not_reached or failed or peer_requires_retry:
                     for push in restart_push(selected.label, names, machine=" and ".join(machines)):
