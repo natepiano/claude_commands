@@ -379,6 +379,17 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   trap 'worker_record release' EXIT
 fi
 
+# A phase claims its files before any seat edits them, wherever the seat runs
+# (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
+if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
+  --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "error" > "${STATUS_FILE}"
+  bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+  exit 1
+fi
+
 : > "${SUMMARY_FILE}"
 rm -f "${REPLY_FILE}"
 echo "implementing" > "${STATUS_FILE}"

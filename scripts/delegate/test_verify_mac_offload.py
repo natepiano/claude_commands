@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import contextlib
 from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
 from datetime import datetime, timezone
@@ -31,6 +32,44 @@ HANG_GUARD_S = 300
 def restore_sigint() -> None:
     # Background suite processes may inherit SIG_IGN; Bash cannot trap that.
     _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def processes_carrying(marker: str) -> set[int]:
+    """Live processes, other than this one, whose environment holds `marker`; a zombie's reads empty."""
+    needle = marker.encode()
+    found: set[int] = set()
+    for entry in Path("/proc").iterdir() if Path("/proc").is_dir() else ():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if needle in (entry / "environ").read_bytes().split(b"\0"):
+                found.add(int(entry.name))
+        except OSError:
+            continue
+    return found
+
+
+def reap(marker: str) -> set[int]:
+    """Kill every process carrying `marker` and wait until none is left.
+
+    verify.sh runs each step in its own process group and its step owner in
+    its own session, so a kill of verify's group leaves the step's tree
+    running under init. A stopped process cannot fork or exit, so stopping
+    each one found until a scan finds no new one catches the whole tree.
+    """
+    stopped: set[int] = set()
+    while fresh := processes_carrying(marker) - stopped:
+        for pid in fresh:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGSTOP)
+        stopped |= fresh
+    for pid in stopped:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + HANG_GUARD_S
+    while processes_carrying(marker) & stopped and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return stopped
 
 
 class CargoEvent(TypedDict):
@@ -140,7 +179,7 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
 
     signal.signal(signal.SIGTERM, stop)
     print("   Compiling sample v0.1.0", flush=True)
-    (root / "cargo-compiling").write_text("compiling\n", encoding="utf-8")
+    (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
     while not (root / "cargo-release").exists():
         time.sleep(0.01)
     if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
@@ -461,6 +500,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(self.assert_nothing_outlives)
         self.home = self.root / "home"
         self.home.mkdir()
         claude = self.home / ".claude"
@@ -893,12 +933,25 @@ signal.pause()
         self.assertTrue(records)
         return cast(RoutingRecord, json.loads(records[-1]))
 
+    def child_marker(self) -> str:
+        """The environment entry every process this test starts inherits."""
+        return f"TEST_RUNNER_STATE={self.runner_state}"
+
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        """Kill the call and every process under it, its steps' own groups and sessions too."""
+        _ = reap(self.child_marker())
         _ = process.communicate(timeout=HANG_GUARD_S)
+
+    def assert_nothing_outlives(self) -> None:
+        # Runs after every other cleanup: a process a call left behind
+        # holds no token and no turn, but `build_hold.py quiet` counts it
+        # as a cargo run for as long as it lives.
+        deadline = time.monotonic() + 2
+        while processes_carrying(self.child_marker()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        survivors = reap(self.child_marker())
+        if survivors:
+            self.fail(f"processes outlived the test: {sorted(survivors)}")
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
                       step_sleep: bool = False, once: Path | None = None) -> subprocess.Popen[str]:
@@ -1771,8 +1824,7 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
                     process.send_signal(signal_number)
                     output, errors = process.communicate(timeout=HANG_GUARD_S)
                 except BaseException:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=HANG_GUARD_S)
+                    self.stop_verify(process)
                     raise
                 self.assertEqual(
                     process.returncode, 128 + signal_number, output + errors
@@ -1821,8 +1873,7 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
             process.send_signal(signal.SIGTERM)
             output, errors = process.communicate(timeout=HANG_GUARD_S)
         except BaseException:
-            os.killpg(process.pid, signal.SIGKILL)
-            _ = process.communicate(timeout=HANG_GUARD_S)
+            self.stop_verify(process)
             raise
 
         self.assertEqual(
@@ -1857,6 +1908,15 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assertEqual((record["copy"], record["copy_count"], record["target"]), (outcome, "1", target))
         self.assertGreaterEqual(float(record["copy_s"]), 0)
         self.assertGreaterEqual(float(record["copy_natedev_s"]), 0)
+
+    def test_a_stopped_call_leaves_no_step_or_copy_running(self) -> None:
+        process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
+        cargo = int((self.runner_state / "cargo-compiling").read_text())
+        # The step runs in its own process group, so a kill of verify's group alone misses it.
+        self.assertNotEqual(os.getpgid(cargo), process.pid)
+        self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
+        self.stop_verify(process)
+        self.assertEqual(processes_carrying(self.child_marker()), set())
 
     def test_copy_failure_first_stops_natedev_and_exits_with_the_copy_status(self) -> None:
         process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "failed", "TEST_COPY_STATUS": "42"})

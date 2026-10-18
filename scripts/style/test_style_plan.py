@@ -146,6 +146,17 @@ class StylePlanTests(unittest.TestCase):
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule.removesuffix("#uncovered"))
             ledger.record(rule=rule, path=path, commit=commit, verdict="clean", detail="", ticket=ticket, worker="test", rule_blob=blob)
 
+    def held_proposal(self, rule: str, path: str) -> Path:
+        issue = self.root / "proposal.md"
+        with style_ledger.open_ledger(self.repo) as ledger:
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            finding = ledger.hold(rule, path, 1, "held defect", "restructure", "before", "after", blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+            ledger.record(rule=rule, path=path, commit=self.tip, verdict="held", detail="", ticket="outside",
+                          worker="test", rule_blob=blob)
+        _ = issue.write_text(f"---\nstatus: open\nstyle_findings: [{finding.finding_id}]\n---\n")
+        return issue
+
     def count_tickets(self) -> int:
         with closing(sqlite3.connect(self.ledger().database)) as connection:
             rows = cast(list[tuple[int]], connection.execute("SELECT COUNT(*) FROM tickets").fetchall())
@@ -343,6 +354,79 @@ class StylePlanTests(unittest.TestCase):
         self.assertIn(
             "A defect several rules name is held once, under the rule it breaks most directly, "
             + "naming the others in its text.", text)
+
+    def test_every_ticket_kind_preserves_comment_reasons_only_when_the_rule_is_pinned(self) -> None:
+        comments = self.rule("comments-name-code-constructs")
+        other = self.rule("other-names")
+        self.sync()
+        ledger = self.ledger()
+        issue = self.root / "approved.md"
+        for rule in (comments, other):
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            finding = ledger.hold(rule, self.sources[0], 1, "comment reason", "rename",
+                                  "// reason", "// reason naming constructs", blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+        guidance = "Keep every reason a comment states; name the constructs in addition to it, never in its place."
+        context = style_plan.delegation_context(self.plan.read_text())
+        kinds: tuple[style_ledger.TicketKind, ...] = ("read", "listed", "structure", "proposal")
+        for number, kind in enumerate(kinds, 1):
+            ticket_id = f"names-unit-{number}"
+            ledger.ticket_add(ticket_id, "names-unit", kind, "names", "crates/alpha", [self.sources[0]],
+                              [comments, other], rule=comments if kind == "listed" else "",
+                              proposal=str(issue) if kind == "proposal" else "")
+            ticket = ledger.queued_tickets("names-unit")[-1]
+            texts = ledger.pinned_rule_texts(ticket_id)
+            windows = {self.sources[0]: (style_plan.ReadWindow(1, 1),)}
+            baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != comments),
+                                             self.plan, context, file_windows=windows)
+            self.assertNotIn(guidance, baseline)
+            for suffix in ("", "#uncovered"):
+                with self.subTest(kind=kind, surface=suffix):
+                    pins = tuple(style_ledger.PinnedRuleText(pin.rule_id + suffix, pin.blob, pin.text)
+                                 if pin.rule_id == comments else pin for pin in texts)
+                    text = style_plan.phase_text(ticket, pins, self.plan, context, file_windows=windows)
+                    self.assertEqual(text.count(guidance), 1)
+                    rule_line = next(line for line in text.splitlines() if line.startswith(f"- `{comments + suffix}`:"))
+                    self.assertEqual(text.replace(rule_line + "\n", "").replace(guidance + "\n", ""), baseline)
+
+    def test_structure_phase_asks_when_to_split_each_file_only_when_the_rule_is_pinned(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        split = self.rule("when-to-split-a-module", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [structure, split],
+                          cells=tuple((rule, path) for rule in (structure, split) for path in self.sources[:2]))
+        ticket = ledger.queued_tickets("modules-unit")[0]
+        texts = ledger.pinned_rule_texts(ticket["id"])
+        context = style_plan.delegation_context(self.plan.read_text())
+        baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != split),
+                                         self.plan, context)
+        self.assertNotIn("type clusters", baseline)
+        ownership_guidance = (
+            "A split finding names the split alone: each test, type or function that belongs with an owner "
+            + "in another file is its own finding under the rule that places it, even when the split moves it."
+        )
+        self.assertNotIn(ownership_guidance, baseline)
+        guidance = (
+            "For every file, name its type clusters (each type with the impls and functions that serve it) "
+            + "and its test domains (groups of tests that exercise separate behaviour), then decide against "
+            + "`when-to-split-a-module` whether the file should split, and hold a finding when it should. "
+            + "Ask this of every file, also one where other rules already hold findings: moving or reordering "
+            + "code under another rule does not answer whether the file should split. " + ownership_guidance
+        )
+        for suffix in ("", "#uncovered"):
+            with self.subTest(surface=suffix):
+                pins = tuple(style_ledger.PinnedRuleText(pin.rule_id + suffix, pin.blob, pin.text)
+                             if pin.rule_id == split else pin for pin in texts)
+                text = style_plan.phase_text(ticket, pins, self.plan, context)
+                self.assertEqual(text.count(guidance), 1)
+                self.assertEqual(text.count(ownership_guidance), 1)
+                self.assertIn(
+                    "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
+                    + "and never stop at a file's first finding.\n" + guidance + "\n", text)
+                rule_line = next(line for line in text.splitlines() if line.startswith(f"- `{split + suffix}`:"))
+                self.assertEqual(text.replace(rule_line + "\n", "").replace(guidance + "\n", ""), baseline)
 
     def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -909,6 +993,126 @@ class StylePlanTests(unittest.TestCase):
             self.assertLessEqual(len(group) * 200, 5000)
         for directory in ("one", "two"):
             self.assertEqual(sum(any(f"/{directory}/" in path for path in group) for group in slices), 1)
+
+    def test_refill_skips_unchanged_held_read_cells_under_open_proposals_after_other_crate_edits(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+
+        self.assertEqual(next(cell.state for cell in self.ledger().cells(read) if cell.path == self.sources[0]), "stale")
+        self.assertEqual(self.candidates(), ())
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_open_proposal_structure_cells_neither_reissue_nor_block_other_families_when_the_file_is_unchanged(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        read = self.rule("read")
+        self.sync()
+        _ = self.held_proposal(structure, self.sources[0])
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(structure, path, self.tip)
+            self.record(read, path, self.tip)
+        self.assertEqual(next(cell.state for cell in self.ledger().cells(structure) if cell.path == self.sources[0]), "stale")
+        self.assertEqual(self.candidates("modules"), ())
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
+            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [self.sources[0]])
+
+    def test_refill_reissues_a_held_cell_under_an_open_proposal_when_its_own_file_changes(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
+
+    def test_refill_reissues_an_unchanged_held_cell_as_soon_as_its_proposal_is_not_open(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        issue = self.held_proposal(read, self.sources[0])
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        self.assertEqual(self.candidates(), ())
+
+        for status in ("closed", "approved", "declined"):
+            with self.subTest(status=status):
+                _ = issue.write_text(f"---\nstatus: {status}\n---\n")
+                self.assertEqual(self.candidates(), (
+                    style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+                ))
+
+    def test_refill_still_issues_stale_cells_that_were_never_held(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        self.record(read, self.sources[0], self.tip)
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
+
+    def test_refill_requires_every_finding_on_a_held_cell_to_have_an_open_proposal(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        self.assertEqual(self.candidates(), ())
+
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == read)
+        finding = ledger.hold(read, self.sources[0], 1, "another defect", "rename", "before", "after", blob, "outside")
+        expected = (style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),)
+        self.assertEqual(self.candidates(), expected)
+        second = self.root / "second-proposal.md"
+        _ = second.write_text("---\nstatus: open\n---\n")
+        ledger.file_held(finding.finding_id, second)
+        self.assertEqual(self.candidates(), ())
+        _ = second.write_text("---\nstatus: closed\n---\n")
+        self.assertEqual(self.candidates(), expected)
+
+    def test_refill_uses_the_latest_verdict_instead_of_an_older_held_judgment(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        self.record(read, self.sources[0], self.tip, ticket="later-clean")
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
 
     def test_structure_precedes_family_reads_and_retains_partial_rule_sites(self) -> None:
         read = self.rule("read")

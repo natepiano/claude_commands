@@ -62,7 +62,7 @@ against the union of one-rule findings using the same model.
 
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
-| modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
+| modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. Re-sample with fix L's batches (one blind judge per batch): 30 of 36, 83.3%; split-by-type-ownership 7/8, module-structure 9/12, when-to-split 2/4 (`resample_modules_table.md`). Two blind judges per batch, findings combined: 32 of 36, 88.9%, still below the bar; module-structure 11/12, when-to-split 2/4. The four defects neither judge found sit in the three largest files, two of them when-to-split (`resample2_modules_table.md`). | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
 | names | PASS | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 63 of 117, 53.8%, below the 100 of 117 a windowed pass reached before fixes P to X; type-named bindings 30/66 and comments 29/43 fell as the name-bindings paragraph drew the judges (`resample_names_table.md`). Rerun 7, after fixes Y and Z, on the six rules left in the names ticket (111 findings; name-bindings moved to its own ticket and met its own bar, 36 of 37): runs of 104, 99 and 104, a median of 104 of 111, 93.7%; comments 36 to 40 of 43, type-named 62 to 64 of 66 (`rerun7_names_table.md`). Two runs' findings together reach 108 to 109 of 111 in every pairing, and a blind re-judging of every finding outside the reference found 0.6% to 0.8% of a two-run union false, against a bar of 10% (`rerun7_names_precision_table.md`); fix AA gives the names read ticket two blind judges, so the family passes on that union. | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
 | types | PASS | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 55 of 61, 90.2%; owned bools 43/43, if-else 8/13, From 3/4, public failures 1/1, and none of the ten out-of-scope `pub` sites flagged (`resample_types_table.md`). Rerun 7, after fixes Y and Z: 59 of 61, 96.7%, which meets the bar; if-else 12/13, From 3/4 (`rerun7_types_table.md`). | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
 
@@ -107,7 +107,11 @@ criterion is then judged from three points.
 | --- | --- | --- | --- | --- |
 | `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
 | `ac95d94d` | names-unit-12 `96da4419` at 16:26:13Z, merged to main at 16:31:20Z | 0.09 h | no: main's last product merge, `ec3297e9`, landed at 15:16:13Z, before the checkpoint | yes: `f091ed48` merges the ticket onto `ec3297e9`, and its tree equals the automatic merge |
-| third | pending | pending | pending | pending |
+| `8f9e8260` | names-unit-15 `82493d60` at 05:01:50Z, merged to main at 05:15:25Z | 0.23 h | no: main's last product merge, `d0d35e1b`, landed at 04:43:22Z, before the checkpoint | yes: `d9795213` merges the ticket onto `d0d35e1b`, and its tree equals the automatic merge |
+
+Judged from three points: every hand-off reached main within an hour, and
+`style/main` took each in cleanly. Two of three had no product merge between;
+the one that did merged without conflict. The criterion passes.
 
 ## Restart
 
@@ -622,9 +626,44 @@ Pending: parent's saved style child summary and rendered style line.
   modules ticket's cycle. A test pins the read count and three exact
   tickets; it fails before the fix. The unit director closed the review on
   their own read of the change.
+- **Fix AC — modules structure tickets ask the when-to-split question of every file** (commit `2c1c3f54`):
+  two blind judge sets on the 20-file modules sample found 33 of the 35
+  reference findings between them. Both misses were files that should
+  split, which no judge asked of a file once other rules held findings on
+  it. When `when-to-split-a-module` is pinned, the ticket now asks it of
+  every file. The reference is corrected to 35: the wire.rs over-split
+  finding is dropped, because `parallel_cases.rs` is shared with an
+  integration test and cannot fold back. The ChildReportFailure finding is
+  credited, because moving the hook suite fixes it. A test pins the line;
+  it fails before the fix. After it, one blind judge per batch finds 34
+  of the 35 references (97.1%; the miss is a reciprocal sibling dependency
+  in birth_stamp). A blind check of the 15 findings outside the reference,
+  the four new splits first, rules all 15 real: the step adds no
+  over-splitting.
+- **Fix AD — tickets pinning `comments-name-code-constructs` keep every stated reason** (commit `8b0f18b0`):
+  on cargo-liner, names writers replaced reason-giving comments with
+  narration of the code. Neither the rule nor the ticket said to keep the
+  reason. The ticket now does, marked temporary until the rule text
+  carries the same sentence, which waits on the user. A test covers every
+  ticket kind; it fails before the fix.
+- **Fix AE — a when-to-split finding names the split alone** (commit `dc484424`):
+  after fix AC one judge held four defects in shared_capture.rs as one
+  split finding, a wrong count with no before and after per move. The
+  when-to-split line now says each piece that belongs with another owner
+  is its own finding under the rule that places it. The test pins the
+  sentence; it fails before the fix.
+- **Fix AF — refill skips held cells while their proposals stay open and their files are unchanged** (commit `8000d78d`):
+  on cargo-liner the names planner issued five tickets for the same four
+  held sites, each closing with nothing to do, because a crate-scope edit
+  elsewhere made the cells stale. Refill now skips a cell whose latest
+  verdict is held, whose findings all sit under open proposals, and whose
+  own file is unchanged since; it reissues when either changes, and such
+  cells no longer hold other families back. Two other reported reissues
+  (clean forbidden-word and census cells) trace to crate-scope rules and
+  wait on the input_scope change. Seven tests; four fail before the fix.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`.
 Live verification of the fixes and subsequent measurements remain pending.
