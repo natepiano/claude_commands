@@ -41,7 +41,7 @@ ENTRIES = (
         + "{stopped} did not restart, so that work stays paused. "
         + "The command above retries the restart on natedev and the Mac.",
         (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)"}),
-         PushExample("many_long_names", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
+         PushExample("one_long_name", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
              "stopped": "One session (build-followups-two-accounts-unit-director)"}))),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),

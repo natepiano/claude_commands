@@ -1877,7 +1877,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** restarting a hold on a same-mode update.
 
-### Phase 65 — A quoted row inside a prompt never becomes the composer's top  · status: todo
+### Phase 65 — A quoted row inside a prompt never becomes the composer's top  · status: done
 
 **Depends on:** Phase 64, Phase 62 (sequenced after it; no file overlap)
 

@@ -282,7 +282,7 @@ class PromptSubmissionTests(unittest.TestCase):
     def real_composer_screen(top_rule: str, *, marker_gap: str = " ", status_suffix: str = "",
                              mode: str = "⏵⏵ auto mode on · 1 shell",
                              input_text: str = "resume the saved work") -> str:
-        # Screen structure supplied by the Phase 64 Work Order; no live pane is read.
+        # Synthetic screen modelled on live Claude panes; no live pane is read.
         return ("● Finished the previous task\n"
                 "✻ Worked for 2m 10s\n"
                 f"{top_rule}\n"
@@ -326,6 +326,22 @@ class PromptSubmissionTests(unittest.TestCase):
         prompt = "resume the saved work\n--- context ---\n──── saved context ─\ncontinue here"
         self.screen = self.real_composer_screen("──────────────────────── two-accounts ─", input_text=prompt)
         self.assert_real_composer_retries_once(prompt)
+
+    def test_indented_quote_after_rule_inside_live_prompt_gets_one_enter_retry(self) -> None:
+        prompt = "resume the saved work\n---\n> quoted line\ncontinue here"
+        visible_input = "resume the saved work\n  ---\n  > quoted line\n  continue here"
+        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─",
+                                               input_text=visible_input)
+        self.assert_real_composer_retries_once(prompt)
+
+    def test_old_quoted_prompt_above_empty_live_composer_gets_no_enter(self) -> None:
+        prompt = "resume the saved work\n---\n> quoted line\ncontinue here"
+        old_input = "resume the saved work\n  ---\n  > quoted line\n  continue here"
+        self.screen = ("─── old session ─\n❯ " + old_input + "\n────────\n● Finished that task\n"
+                       + self.real_composer_screen("──────────────────────── two-accounts ─", input_text=""))
+        self.assertIsInstance(self.submit(text=prompt), herdr.PromptNotSubmitted)
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed], [("destination:p1", prompt)])
+        self.assertEqual(self.enters, [])
 
     def test_named_composer_with_rule_character_in_label_gets_one_enter_retry(self) -> None:
         self.screen = self.real_composer_screen("─── two─accounts ─")
