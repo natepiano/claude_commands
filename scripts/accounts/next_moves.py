@@ -406,6 +406,10 @@ def move_next_move(group: NextMoveGroup, source: GroupPosition, destination: Gro
         raise NextMoveError(f"next: cannot move entry: {error}") from error
 
 
+def format_next_move_percent(percent: float) -> str:
+    return repr(float(percent)).removesuffix(".0")
+
+
 def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSITION) -> str:
     hold = ""
     if isinstance(entry, ClaudeGroupMove):
@@ -418,7 +422,7 @@ def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSI
             estimate = (f"{duration.minutes:g} min default: no pace history" if isinstance(duration.source, NoUsablePace)
                         else f"≈{duration.minutes:g} min")
             hold = f", hold half a point ({estimate})"
-    return f"{entry.group} {position.value}: at {entry.at_percent:g}% → {target_label(entry)}{hold}"
+    return f"{entry.group} {position.value}: at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}{hold}"
 
 
 def render_next_moves(entries: tuple[NextMove, ...]) -> str:
@@ -477,7 +481,7 @@ def update_next_move_hold(group: NextMoveGroup, position: GroupPosition, mode: H
                 raise GroupPositionOutOfRange(group, position, len(group_entries))
             entry = group_entries[position.value - 1]
             if isinstance(expected, ExpectedNextMove) and (entry.at_percent != expected.percent or target_label(entry) != expected.target):
-                raise NextMoveError(f"next: {group} {position.value} is now at {entry.at_percent:g}% → {target_label(entry)}; nothing changed")
+                raise NextMoveError(f"next: {group} {position.value} is now at {format_next_move_percent(entry.at_percent)}% → {target_label(entry)}; nothing changed")
             if not isinstance(entry, ClaudeGroupMove):
                 raise NextMoveError("next: workers entries cannot hold")
             changed = replace(entry, hold_mode=mode)

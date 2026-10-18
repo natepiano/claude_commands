@@ -1855,7 +1855,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** enumerated footer phrases (every live screen failed them); taking the top rule as the rule just before the closing rule (a rule-like prompt row displaces it).
 
-### Phase 66 — A listed percent guards its own update  · status: todo
+### Phase 66 — A listed percent guards its own update  · status: done
 
 **Depends on:** Phase 62
 
