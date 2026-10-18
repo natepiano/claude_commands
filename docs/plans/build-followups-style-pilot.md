@@ -107,7 +107,11 @@ criterion is then judged from three points.
 | --- | --- | --- | --- | --- |
 | `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
 | `ac95d94d` | names-unit-12 `96da4419` at 16:26:13Z, merged to main at 16:31:20Z | 0.09 h | no: main's last product merge, `ec3297e9`, landed at 15:16:13Z, before the checkpoint | yes: `f091ed48` merges the ticket onto `ec3297e9`, and its tree equals the automatic merge |
-| third | pending | pending | pending | pending |
+| `8f9e8260` | names-unit-15 `82493d60` at 05:01:50Z, merged to main at 05:15:25Z | 0.23 h | no: main's last product merge, `d0d35e1b`, landed at 04:43:22Z, before the checkpoint | yes: `d9795213` merges the ticket onto `d0d35e1b`, and its tree equals the automatic merge |
+
+Judged from three points: every hand-off reached main within an hour, and
+`style/main` took each in cleanly. Two of three had no product merge between;
+the one that did merged without conflict. The criterion passes.
 
 ## Restart
 
