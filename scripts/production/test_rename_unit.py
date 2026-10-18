@@ -153,9 +153,6 @@ class UnitRenameTests(unittest.TestCase):
             self.write(self.root / f"vault/showrunners/{folder}/alpha-unit.md", "\n".join([
                 "---", "phase_table: true", f"production: {production}", "unit: alpha-unit", "---", "",
                 "# alpha-unit", ""]))
-        self.write(self.home / ".claude/scripts/fix/fix.conf", "\n".join([
-            "[projects]", "claude", "", "[active_checkout]", "claude = claude-demo-alpha",
-            "claude/sub = claude-demo-alpha/sub", "other = claude-demo-alphabet", ""]))
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,9 +238,6 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("unit: alpha-unit", (self.root / "issues/other-production.md").read_text())
         self.assertIn("unit: gamma-unit", (self.root / "vault/showrunners/demo-sr/alpha-unit.md").read_text())
         self.assertIn("unit: alpha-unit", (self.root / "vault/showrunners/other-sr/alpha-unit.md").read_text())
-        conf = (self.home / ".claude/scripts/fix/fix.conf").read_text()
-        self.assertIn("claude = claude-demo-gamma\nclaude/sub = claude-demo-gamma/sub\n"
-                      + "other = claude-demo-alphabet", conf)
         self.assertIs(self.journal()["done"], True)
 
     def seed_record(self, progress: str = "stopped", name: str = "alpha") -> Path:

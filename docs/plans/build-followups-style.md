@@ -567,9 +567,21 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - One names read ticket with one judge: it misses the 95% recall bar.
 - Modules structure tickets without the when-to-split step: they miss the recall bar.
 
-### Phase 18 — Retire the fix pipeline and narrow the nightly rust mode  · status: todo
+### Phase 18 — Retire the fix pipeline and narrow the nightly rust mode  · status: done
 **Depends on:** Phase 16, Phase 17
 **Blocked by:** pilot pass — every criterion in `docs/plans/build-followups-style-pilot.md` reads pass, and the build-followups showrunner gives the go.
+
+#### Phase report
+
+Each kept command ran once after the deletions, with no missing-path error:
+- Every kept command file resolves each `~/.claude` path it names. `/mend_fix` names none.
+- `style_rules.py --help` (`/focused_eval`, `/style_rename`, `/style_delete`) and `style_admin.py --help` exit 0.
+- `load-rust-style.sh --list-files --scope edit` (`/rust_style`, `/local_style`) exits 0 and lists 26 rule files. It is a zsh script; bash fails on it by design.
+- `/berth_fix` `capture.sh`, `launch.sh` and `berth/install/install.sh` pass `bash -n`.
+- `lint_config.sh` (`/lint_config`) prints its ops and exits 0.
+- `basedpyright scripts` reports the same diagnostics as the baseline: two missing third-party imports (`bpy`, `PIL`) in older scripts and the older warnings. The phase adds none.
+- The showrunner message with the nix list, the Mac launchd unload and the held-file edits went to natedev.
+- The Spec's `git grep` finds the retired names only in history lines, this plan, the three held files and `.claude/settings.local.json`. That file holds permission entries, so its line edits went in the same message.
 
 #### Work Order
 

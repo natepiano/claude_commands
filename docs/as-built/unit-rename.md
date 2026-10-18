@@ -45,8 +45,7 @@ steps:
    - the stall-watch stretch;
    - the reviewer leases and memory;
    - the newest run record and the recorder state;
-   - this production's open proposal issues and phase notes (`phase_table.owned_notes`);
-   - `fix.conf` redirects.
+   - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
 8. **Retire.** The old branch is deleted once origin holds the new tip.
 9. **Restart record.** The fields that move:
    - `host.unit`;
@@ -68,7 +67,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the doc cells and plan headers (apply's own edit would change nothing);
   - the branches and worktree;
   - the transcript folders, the stall stretch and the newest run;
-  - proposals, phase notes and `fix.conf`;
+  - proposals and phase notes;
   - the shutdown record and the live session's mark.
 - **Control.** The old id must still be in the merge-branch subjects. If the matcher finds nothing
   in history, it is broken.
