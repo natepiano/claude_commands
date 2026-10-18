@@ -114,7 +114,7 @@ class AddUnitTests(ShutdownTestCase):
         # Rows read in this process name worktrees that exist nowhere: answer for them here, so no
         # test asks the real disk, and a row with a worktree never asks herdr. RetiredRowTests covers the rule.
         _ = self.enterContext(patch.object(production_units, "worktree_is_linked", return_value=True))
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
         ))
@@ -164,6 +164,7 @@ class AddUnitTests(ShutdownTestCase):
         self.write_agent_config()
         _ = sync_state.touch()
         self.env = {**os.environ, "HOME": str(self.root / "home"),
+                    "HERDR_PLATFORM": "linux",
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "STUB_STATE": str(self.state),
                     "SHOWRUNNERS_CONFIG": str(self.config), "CLAUDE_TEST_SECRET": "must-not-leak",

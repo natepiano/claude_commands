@@ -108,14 +108,14 @@ class PromptSubmissionTests(unittest.TestCase):
     events: list[tuple[float, Callable[[], None]]] = []
     submit_on_type: bool = False
     submit_on_enter: int = 0
-    client: herdr.Herdr = herdr.Herdr("fixture")
+    client: herdr.Herdr = cast(herdr.Herdr, Mock())
     start: Mock = Mock()
     read: Mock = Mock()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
         self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
         self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
         self.path.parent.mkdir(parents=True)
