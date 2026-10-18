@@ -3834,6 +3834,65 @@ class RestartTests(ShutdownTestCase):
         self.assertIn("third@example.invalid", output.getvalue())
         self.assertIsNotNone(record.find_session(LOGIN, "same-id"))
 
+    def test_failed_move_relaunch_checks_live_unknown_and_dead_sessions(self) -> None:
+        cases = (
+            ("live", restart.SessionLive()),
+            ("unknown", restart.SessionLivenessUnknown("scratch registry unreadable")),
+            ("dead", restart.SessionNotLive()),
+        )
+        for name, liveness in cases:
+            with self.subTest(liveness=name):
+                saved = entry(top_level("failed-move-" + name,
+                    host=inventory.HerdrHost(kind="herdr", herdr_session="failed-move", pane_id="w1:p1", presentation="detached")),
+                    state=record.SessionRestartFailed(kind="restart failed", at=STOPPED,
+                                                     reason="restart prompt not submitted"))
+                saved["target"] = "claude3"
+                saved["source_label"] = LABEL
+                self.create([saved])
+                with (patch.object(restart, "_session_liveness", return_value=liveness),
+                      patch.object(restart, "_owner_liveness", return_value=liveness),
+                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                      patch.object(restart, "_retire") as retire,
+                      patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch,
+                      redirect_stdout(io.StringIO()) as output):
+                    _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+                if isinstance(liveness, restart.SessionLive):
+                    launch.assert_not_called()
+                    retire.assert_not_called()
+                    self.assertIn("failed-move-live: already running; skipped", output.getvalue())
+                    self.assertEqual(record.find_session(LOGIN, saved["session"]["session_id"]), saved)
+                elif isinstance(liveness, restart.SessionLivenessUnknown):
+                    launch.assert_not_called()
+                    retire.assert_not_called()
+                    self.assertIn("scratch registry unreadable", output.getvalue())
+                    current = record.find_session(LOGIN, saved["session"]["session_id"])
+                    assert current is not None
+                    self.assertEqual(current["progress"]["kind"], "restart failed")
+                else:
+                    launch.assert_called_once()
+
+    def test_live_failed_restart_sends_no_not_back_push_until_the_session_exits(self) -> None:
+        saved = entry(top_level("slow-resume"), state=record.SessionRestartFailed(
+            kind="restart failed", at=STOPPED, reason="restart prompt not submitted"))
+        self.create([saved])
+        result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=1,
+            failed_sessions=(restart.FailedSessionRestart("slow-resume", "restart prompt not submitted"),))
+        for liveness in (restart.SessionLive(), restart.SessionNotLive()):
+            with (self.subTest(liveness=liveness),
+                  patch.object(restart, "_session_liveness", return_value=liveness),
+                  patch.object(restart, "_owner_liveness", return_value=liveness),
+                  patch.object(restart, "named_claude_account", return_value=self.account),
+                  patch.object(restart, "_up", return_value=result),
+                  patch.object(settle, "alert_user") as alert,
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                    alerts=restart.AlertWhenNotBack(), only=["slow-resume"], here=True), 1)
+            if isinstance(liveness, restart.SessionLive):
+                alert.assert_not_called()
+                self.assertEqual(record.find_session(LOGIN, "slow-resume"), saved)
+            else:
+                alert.assert_called_once()
+
     def test_materialized_snapshot_retry_keeps_a_saved_live_owner_without_registry_row(self) -> None:
         for progress in (record.SessionAlreadyGone(kind="already gone", at=STOPPED),
                          record.SessionRestartFailed(kind="restart failed", at=STOPPED, reason="window failed")):
@@ -4928,6 +4987,57 @@ class RestartTests(ShutdownTestCase):
                         ):
                             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
                         self.assertEqual(alert.call_count, 0 if policy == "none" else 1)
+
+    def test_machine_result_is_done_when_its_only_shortfall_is_a_live_failed_restart(self) -> None:
+        saved = entry(top_level("slow-resume"), state=record.SessionRestartFailed(
+            kind="restart failed", at=RESTARTED, reason="restart prompt not submitted"))
+        for observed in (restart.SessionLive(), restart.SessionNotLive(),
+                         restart.SessionLivenessUnknown("scratch registry unreadable")):
+            with (self.subTest(liveness=observed),
+                  patch.object(restart, "_owner_liveness", return_value=observed) as liveness):
+                result = restart._machine_result([saved], "Mac", LABEL)  # pyright: ignore[reportPrivateUsage]
+            liveness.assert_called_once_with(saved["session"])
+            if isinstance(observed, restart.SessionLive):
+                self.assertEqual(result.status, "done")
+                self.assertEqual(result.exit_status, 0)
+                self.assertEqual(result.failed_sessions, ())
+            else:
+                self.assertEqual(result.status, "partial")
+                self.assertEqual(result.failed, 1)
+                self.assertEqual(result.failed_sessions,
+                    (restart.FailedSessionRestart("slow-resume", "restart prompt not submitted"),))
+
+    def test_peer_live_skipped_restart_sends_no_push_but_a_dead_failure_does(self) -> None:
+        saved = entry(top_level("peer"), state=record.SessionRestartFailed(
+            kind="restart failed", at=RESTARTED, reason="restart prompt not submitted"))
+        saved["machine"] = "Mac"
+        cases = (("done", "Peer: already running; skipped", False),
+                 ("partial", "Peer: already running; skipped", False),
+                 ("partial", "Mac: Peer restart failed: restart prompt not submitted", True))
+        for outcome, line, should_push in cases:
+            with self.subTest(outcome=outcome, line=line):
+                def remote(args: list[str], **_kwargs: object) -> tuple[int, str]:
+                    if args == ["records", "--json", "--here"]:
+                        return 0, json.dumps([saved])
+                    self.assertEqual(args, ["up", LOGIN, "--here", "--json"])
+                    return (1 if outcome == "partial" else 0), peer_json(outcome=outcome, lines=[line])
+                with (patch.object(restart, "named_claude_account", return_value=self.account),
+                      patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")),
+                      patch.object(restart, "session_records", return_value=[]),
+                      patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(restart, "run_remote", side_effect=remote) as peer,
+                      patch.object(settle, "alert_user") as alert,
+                      redirect_stdout(io.StringIO())):
+                    code = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                           alerts=restart.AlertWhenNotBack())
+                self.assertEqual(code, 1 if outcome == "partial" else 0)
+                self.assertTrue(peer.called)
+                if should_push:
+                    alert.assert_called_once()
+                    self.assertIn("Peer", cast(RenderedPush, alert.call_args.args[0]).body)
+                else:
+                    alert.assert_not_called()
 
     def test_restart_uses_the_peer_incomplete_records_alert_policy(self) -> None:
         for policy in ("none", "user"):

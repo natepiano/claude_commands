@@ -1830,6 +1830,34 @@ def forget_session(login: str, session_id: str, machine: str) -> SessionForgotte
         return SessionForgotten(saved)
 
 
+def forget_failed_restart(
+    login: str, session_id: str, machine: str, expected_request_id: str,
+) -> SessionForgotten | SessionRetained | NoShutdown:
+    """Archive only the expected request's failed restart under the account lock."""
+    if _existing_account_directory(login) is None:
+        return NoShutdown()
+    _ = migrate(login)
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "sessions" / _session_filename(session_id)
+        if not _regular_record(path):
+            return NoShutdown()
+        saved = _session_shutdown(_read_json(path), str(path))
+        _check_account(login, saved["login"], path)
+        if saved["session"]["session_id"] != session_id:
+            raise InvalidRecord(f"{path} is used by a different session id")
+        if (saved["machine"].casefold() != machine.casefold()
+                or saved["request_id"] != expected_request_id
+                or saved["progress"]["kind"] != "restart failed"):
+            return SessionRetained(saved)
+        history = directory / "history"
+        _ = _record_directory(history, create=True)
+        target = history / f"{saved['requested_at']}-{path.name}"
+        if _lstat(target) is not None:
+            raise InvalidRecord(f"{target} already exists")
+        os.replace(path, target)
+        return SessionForgotten(saved)
+
+
 def withdraw_session(
     login: str, session_id: str, restore_and_notify: Callable[[SessionShutdown], None]
 ) -> SessionWithdrawn | SessionRetained:

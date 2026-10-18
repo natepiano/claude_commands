@@ -344,6 +344,73 @@ class StylePlanTests(unittest.TestCase):
             "A defect several rules name is held once, under the rule it breaks most directly, "
             + "naming the others in its text.", text)
 
+    def test_every_ticket_kind_preserves_comment_reasons_only_when_the_rule_is_pinned(self) -> None:
+        comments = self.rule("comments-name-code-constructs")
+        other = self.rule("other-names")
+        self.sync()
+        ledger = self.ledger()
+        issue = self.root / "approved.md"
+        for rule in (comments, other):
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            finding = ledger.hold(rule, self.sources[0], 1, "comment reason", "rename",
+                                  "// reason", "// reason naming constructs", blob, "outside")
+            ledger.file_held(finding.finding_id, issue)
+        guidance = "Keep every reason a comment states; name the constructs in addition to it, never in its place."
+        context = style_plan.delegation_context(self.plan.read_text())
+        kinds: tuple[style_ledger.TicketKind, ...] = ("read", "listed", "structure", "proposal")
+        for number, kind in enumerate(kinds, 1):
+            ticket_id = f"names-unit-{number}"
+            ledger.ticket_add(ticket_id, "names-unit", kind, "names", "crates/alpha", [self.sources[0]],
+                              [comments, other], rule=comments if kind == "listed" else "",
+                              proposal=str(issue) if kind == "proposal" else "")
+            ticket = ledger.queued_tickets("names-unit")[-1]
+            texts = ledger.pinned_rule_texts(ticket_id)
+            windows = {self.sources[0]: (style_plan.ReadWindow(1, 1),)}
+            baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != comments),
+                                             self.plan, context, file_windows=windows)
+            self.assertNotIn(guidance, baseline)
+            for suffix in ("", "#uncovered"):
+                with self.subTest(kind=kind, surface=suffix):
+                    pins = tuple(style_ledger.PinnedRuleText(pin.rule_id + suffix, pin.blob, pin.text)
+                                 if pin.rule_id == comments else pin for pin in texts)
+                    text = style_plan.phase_text(ticket, pins, self.plan, context, file_windows=windows)
+                    self.assertEqual(text.count(guidance), 1)
+                    rule_line = next(line for line in text.splitlines() if line.startswith(f"- `{comments + suffix}`:"))
+                    self.assertEqual(text.replace(rule_line + "\n", "").replace(guidance + "\n", ""), baseline)
+
+    def test_structure_phase_asks_when_to_split_each_file_only_when_the_rule_is_pinned(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        split = self.rule("when-to-split-a-module", "tier: D\nfamily: modules\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          list(self.sources[:2]), [structure, split],
+                          cells=tuple((rule, path) for rule in (structure, split) for path in self.sources[:2]))
+        ticket = ledger.queued_tickets("modules-unit")[0]
+        texts = ledger.pinned_rule_texts(ticket["id"])
+        context = style_plan.delegation_context(self.plan.read_text())
+        baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != split),
+                                         self.plan, context)
+        self.assertNotIn("type clusters", baseline)
+        guidance = (
+            "For every file, name its type clusters (each type with the impls and functions that serve it) "
+            + "and its test domains (groups of tests that exercise separate behaviour), then decide against "
+            + "`when-to-split-a-module` whether the file should split, and hold a finding when it should. "
+            + "Ask this of every file, also one where other rules already hold findings: moving or reordering "
+            + "code under another rule does not answer whether the file should split."
+        )
+        for suffix in ("", "#uncovered"):
+            with self.subTest(surface=suffix):
+                pins = tuple(style_ledger.PinnedRuleText(pin.rule_id + suffix, pin.blob, pin.text)
+                             if pin.rule_id == split else pin for pin in texts)
+                text = style_plan.phase_text(ticket, pins, self.plan, context)
+                self.assertEqual(text.count(guidance), 1)
+                self.assertIn(
+                    "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
+                    + "and never stop at a file's first finding.\n" + guidance + "\n", text)
+                rule_line = next(line for line in text.splitlines() if line.startswith(f"- `{split + suffix}`:"))
+                self.assertEqual(text.replace(rule_line + "\n", "").replace(guidance + "\n", ""), baseline)
+
     def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()

@@ -311,7 +311,7 @@ class TranscriptCursor:
 
     def submitted_prompt(self, text: str) -> PromptSubmitOutcome:
         for at, row in self.read_turns():
-            if row.get("type") == "user" and not row.get("isMeta", False) and text in _turn_text(row):
+            if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
 
@@ -333,6 +333,16 @@ def _turn_text(row: dict[str, object]) -> str:
                     texts.append(text)
         return "\n".join(texts)
     return ""
+
+
+def _prompt_matches(text: str, recorded_text: str) -> bool:
+    if text in recorded_text:
+        return True
+    if text.startswith("/"):
+        command, *arguments = text.split(maxsplit=1)
+        return (f"<command-name>{command}</command-name>" in recorded_text
+                and (not arguments or f"<command-args>{arguments[0].strip()}</command-args>" in recorded_text))
+    return False
 
 
 def submitted_prompt(transcript: SessionTranscript, text: str, launched_at: datetime) -> PromptSubmitOutcome:
@@ -1103,13 +1113,22 @@ class Herdr:
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         typings, enters = 0, 0
+        recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
 
-        def failure(reason: str) -> PromptNotSubmitted:
+        def failure(reason: str) -> PromptSubmitOutcome:
+            if typings and isinstance(cursor, TranscriptCursor):
+                proof = cursor.submitted_prompt(opening.text)
+                if isinstance(proof, PromptSubmitted):
+                    if (isinstance(recipient, PromptRecipientProcess)
+                            and prompt_recipient_process(cursor.transcript.session_id) != recipient):
+                        reason = "prompt recipient changed during submission"
+                    else:
+                        return PromptSubmitted(proof.at, recipient)
             detail = f"{reason}; prompt typed {typings} times" if typings else reason
             visible = "\n".join(screen.splitlines()[-40:]) if isinstance(screen, str) else screen
             return PromptNotSubmitted(detail, visible)
 
-        def deadline_failure() -> PromptNotSubmitted:
+        def deadline_failure() -> PromptSubmitOutcome:
             reason = "opening prompt deadline elapsed"
             if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
                 reason += ": transcript unreadable"
