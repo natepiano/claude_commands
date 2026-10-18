@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from scripts.delegate import board_json
 from scripts.lib import unit_runs
-from scripts.production import fake_showrunner
+from scripts.production import fake_showrunner, showrunners
 from scripts.production.cli_fixture import invoke_cli
 
 
@@ -53,6 +53,7 @@ class BoardJsonTests(unittest.TestCase):
     run_root: Path = Path()
     former_root: Path = Path()
     notifier: Path = Path()
+    showrunner_state: Path = Path()
     sessions: Path = Path()
     session_script: Path = Path()
     output: Path = Path()
@@ -69,6 +70,7 @@ class BoardJsonTests(unittest.TestCase):
         self.run_root.mkdir()
         self.former_root.mkdir()
         self.notifier = self.root / "notifier"
+        self.showrunner_state = self.root / "showrunners"
         self.sessions = self.root / "sessions"
         self.notifier.mkdir()
         self.sessions.mkdir()
@@ -98,6 +100,7 @@ class BoardJsonTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "SHOWRUNNERS_SESSIONS": str(self.session_script),
+            "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
             "UNIT_BOARD_DIR": str(self.output),
             "XDG_STATE_HOME": str(self.root / "state"),
         }
@@ -149,6 +152,11 @@ class BoardJsonTests(unittest.TestCase):
             "| --- | --- | --- | --- |",
             f"| G2 | alpha phase 3 | renderer phase 9 | {gate} |", "",
         )), encoding="utf-8")
+
+    def attach(self, child: str, parent: str) -> None:
+        directory = self.showrunner_state / child
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
 
     @staticmethod
     def event(kind: str, at: int, *, phase: str = "2", instance: str = "two",
@@ -224,7 +232,7 @@ class BoardJsonTests(unittest.TestCase):
                 if module is not None:
                     for field, value in (
                         ("NOTIFIER_STATE_DIR", self.notifier), ("SESSIONS_DIR", self.sessions),
-                        ("SESSIONS", self.session_script),
+                        ("SESSIONS", self.session_script), ("SHOWRUNNER_STATE_DIR", self.showrunner_state),
                     ):
                         _ = scope.enter_context(patch.object(module, field, value))
             return invoke_cli(
@@ -251,7 +259,7 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(len(units), 1)
         return documents[0], object_fields(units[0])
 
-    def test_cwd_inside_unit_focuses_that_unit_and_only_its_production(self) -> None:
+    def test_unit_worktree_does_not_select_a_production_or_unit(self) -> None:
         fixture = self.production()
         other = self.production("other")
         nested = fixture.worktree / "nested"
@@ -259,23 +267,122 @@ class BoardJsonTests(unittest.TestCase):
 
         response, documents = self.generate("--cwd", str(nested))
 
-        self.assertEqual(response["files"], [str(self.output / "show.json")])
-        self.assertEqual(response["focus"], "alpha")
+        self.assertEqual(response["files"], [])
+        self.assertNotIn("focus", response)
         self.assertEqual(response["watch"], [str(self.notifier.resolve())])
-        self.assertEqual(documents[0]["production"], fixture.slug)
-        unit = object_fields(array_items(documents[0]["units"])[0])
-        self.assertEqual(unit["key"], "alpha")
-        self.assertEqual(unit["plan"], str(fixture.plan))
+        self.assertEqual(documents, [])
+        self.assertFalse((self.output / f"{fixture.slug}.json").exists())
         self.assertFalse((self.output / f"{other.slug}.json").exists())
 
-    def test_showrunner_checkout_selects_its_production_without_a_unit_focus(self) -> None:
-        fixture = self.production()
-        _ = self.production("other")
+    def test_showrunner_cwd_and_production_select_the_same_three_level_subtree(self) -> None:
+        root = self.production("z-root")
+        child = self.production("m-child")
+        grandchild = self.production("a-grandchild")
+        other = self.production("other", running=False)
+        self.attach(child.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+        nested = root.checkout / "nested"
+        nested.mkdir()
 
-        response, documents = self.generate("--cwd", str(fixture.checkout))
+        for arguments in (("--cwd", str(nested)), ("--production", root.slug)):
+            with self.subTest(arguments=arguments):
+                response, documents = self.generate(*arguments)
 
-        self.assertIsNone(response["focus"])
-        self.assertEqual([doc["production"] for doc in documents], [fixture.slug])
+                self.assertEqual(response["files"], [str(self.output / f"{slug}.json")
+                                                     for slug in (root.slug, child.slug, grandchild.slug)])
+                self.assertEqual([doc["production"] for doc in documents],
+                                 [root.slug, child.slug, grandchild.slug])
+                self.assertNotIn("focus", response)
+                self.assertEqual(response["watch"], sorted(str(path.resolve()) for path in (
+                    self.notifier, self.showrunner_state,
+                    self.showrunner_state / child.slug, self.showrunner_state / grandchild.slug,
+                )))
+                for fixture, document in zip((root, child, grandchild), documents, strict=True):
+                    unit = object_fields(array_items(document["units"])[0])
+                    self.assertEqual(unit["key"], "alpha")
+                    self.assertEqual(unit["plan"], str(fixture.plan))
+                self.assertFalse((self.output / f"{other.slug}.json").exists())
+
+        # A nested showrunner sees its own subtree, without its parent or siblings.
+        response, documents = self.generate("--cwd", str(child.checkout))
+        self.assertEqual([doc["production"] for doc in documents], [child.slug, grandchild.slug])
+        self.assertNotIn("focus", response)
+
+    def test_attach_and_detach_change_a_watched_directory_and_refresh_the_subtree(self) -> None:
+        root = self.production("root")
+        child = self.production("child")
+        child_state = self.showrunner_state / child.slug
+        child_state.mkdir(parents=True)
+        # An unrelated directory must not become a discovery source.
+        (self.showrunner_state / "unregistered").mkdir()
+        expected_watch = sorted(str(path.resolve()) for path in (
+            self.notifier, self.showrunner_state, child_state,
+        ))
+        runners = showrunners
+        with patch.object(runners, "NOTIFIER_STATE_DIR", self.notifier), \
+                patch.object(runners, "SHOWRUNNER_STATE_DIR", self.showrunner_state):
+            for operation in ("attach", "detach"):
+                with self.subTest(operation=operation):
+                    # Give each actual filesystem operation room to advance mtime,
+                    # without sleeping or relying on filesystem clock resolution.
+                    os.utime(child_state, (NOW, NOW))
+                    response, documents = self.generate("--cwd", str(root.checkout))
+                    self.assertEqual(response["watch"], expected_watch)
+                    watched_mtime = child_state.stat().st_mtime_ns
+                    self.assertEqual([doc["production"] for doc in documents],
+                                     [root.slug] if operation == "attach" else [root.slug, child.slug])
+
+                    if operation == "attach":
+                        self.assertFalse((child_state / "parent").exists())
+                        runners.attach(child.slug, root.slug)
+                    else:
+                        self.assertEqual(runners.detach(child.slug), root.slug)
+                    self.assertGreater(child_state.stat().st_mtime_ns, watched_mtime)
+
+                    response, documents = self.generate("--cwd", str(root.checkout))
+                    self.assertEqual(response["watch"], expected_watch)
+                    self.assertEqual([doc["production"] for doc in documents],
+                                     [root.slug, child.slug] if operation == "attach" else [root.slug])
+
+    def test_subtree_keeps_nearest_levels_before_grandchildren_and_includes_stopped_showrunners(self) -> None:
+        root = self.production("root")
+        child = self.production("b-child", running=False)
+        sibling = self.production("z-sibling", running=False)
+        grandchild = self.production("a-grandchild", running=False)
+        self.attach(child.slug, root.slug)
+        self.attach(sibling.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+
+        _, documents = self.generate("--production", root.slug)
+
+        self.assertEqual([doc["production"] for doc in documents],
+                         [root.slug, child.slug, sibling.slug, grandchild.slug])
+
+    def test_descendant_not_in_the_registered_showrunners_is_left_out(self) -> None:
+        root = self.production("root")
+        child = self.production("child")
+        grandchild = self.production("grandchild")
+        self.attach(child.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+        # The tree lookup can outlive a registry entry while its timer is removed.
+        # Keep real board generation and registry reads; vary only that boundary.
+        with patch.object(showrunners, "descendants_of",
+                          return_value=[child.slug, "unregistered", grandchild.slug]):
+            response, documents = self.generate("--production", root.slug)
+
+        self.assertEqual([doc["production"] for doc in documents],
+                         [root.slug, child.slug, grandchild.slug])
+        self.assertNotIn("focus", response)
+        self.assertFalse((self.output / "unregistered.json").exists())
+
+    def test_unknown_explicit_production_does_not_fall_back_to_registered_productions(self) -> None:
+        _ = self.production()
+
+        response, documents = self.generate("--production", "unregistered")
+
+        self.assertEqual(response["files"], [])
+        self.assertEqual(documents, [])
+        self.assertNotIn("focus", response)
 
     def test_deleted_plan_is_omitted_from_the_unit_path(self) -> None:
         fixture = self.production()
@@ -302,21 +409,24 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(unit["plan"], str(as_built))
         self.assertNotEqual(unit["plan"], str(fixture.plan))
 
-    def test_unrelated_cwd_lists_every_running_production(self) -> None:
+    def test_unrelated_cwd_does_not_fall_back_to_running_productions(self) -> None:
         _ = self.production()
         _ = self.production("other")
         _ = self.production("stopped", running=False)
 
         response, documents = self.generate("--cwd", "/")
 
-        self.assertIsNone(response["focus"])
-        self.assertEqual({doc["production"] for doc in documents}, {"show", "other"})
+        self.assertNotIn("focus", response)
+        self.assertEqual(response["files"], [])
+        self.assertEqual(documents, [])
+        self.assertFalse((self.output / "show.json").exists())
+        self.assertFalse((self.output / "other.json").exists())
         self.assertFalse((self.output / "stopped.json").exists())
 
     def test_no_registered_production_resolves_without_output_files(self) -> None:
         response, documents = self.generate("--cwd", "/")
         self.assertEqual(response, {
-            "files": [], "focus": None, "watch": [str(self.notifier.resolve())],
+            "files": [], "watch": [str(self.notifier.resolve())],
         })
         self.assertEqual(documents, [])
 
@@ -325,7 +435,7 @@ class BoardJsonTests(unittest.TestCase):
 
         response, documents = self.generate("--cwd", "/")
 
-        self.assertEqual(response, {"files": [], "focus": None, "watch": []})
+        self.assertEqual(response, {"files": [], "watch": []})
         self.assertEqual(documents, [])
 
     def test_output_directory_uses_xdg_then_home_when_no_override_is_set(self) -> None:

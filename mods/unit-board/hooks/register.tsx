@@ -35,11 +35,9 @@ function viewState(data: BoardSnapshot<BoardData>, selection: Selection, now: nu
 }
 
 function commandSelection(data: BoardSnapshot<BoardData>, wanted: string): Selection {
-  const key = wanted || data.focus;
-  if (!key) return { kind: 'board' };
-  const focused = data.focus ? data.boards[0] : undefined;
-  const board = focused?.units.some(unit => unit.key === key) ? focused : data.boards.find(board => board.units.some(unit => unit.key === key));
-  return board ? { kind: 'unit', production: board.production, unit: key } : { kind: 'board' };
+  if (!wanted) return { kind: 'board' };
+  const board = data.boards.find(board => board.units.some(unit => unit.key === wanted));
+  return board ? { kind: 'unit', production: board.production, unit: wanted } : { kind: 'board' };
 }
 
 function retainWatch(active: OpenPane, path: RefreshPaths) {
@@ -169,7 +167,6 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const lifecycle = ++accountsLifecycle;
-    await $.command.register({ name: PANE, description: 'Show the production board pane' });
     await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
     const panes = await $.ui.panes();
     if (panes.some(pane => pane.id === PANE)) {
@@ -195,7 +192,7 @@ export const register: Register = on => {
     }
     return next(e);
   });
-  on('command.run', { command: PANE }, async ($, e) => {
+  on('command.run', { command: 'showrunner:unit_board' }, async ($, e) => {
     const wanted = e.args.trim();
     if (wanted === 'close') {
       await $.ui.close({ id: PANE });

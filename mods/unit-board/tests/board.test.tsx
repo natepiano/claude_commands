@@ -16,7 +16,7 @@ async function render($: Engine, on: On, surface: RenderSurface, data: BoardData
     return detail
       ? UnitView(elements, columns, bodyRows, data, data.units[0]!, NOW / 1000, () => {})
       : BoardView(elements, columns, bodyRows, { files: [], watch: [], loadedAt: NOW / 1000,
-        boards: [data], focus: null }, NOW / 1000, () => {});
+        boards: [data] }, NOW / 1000, () => {});
   });
   return $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "phase8-layout", surface,
     props: { ...props, bodyColumns: columns, scroll: { offset: 0, bodyRows } } });
@@ -123,6 +123,18 @@ function longUnit(): BoardData {
 // Run the same layout assertions against both engine element surfaces.
 describe("board layout", () => {
   for (const surface of ["terminal", "desktop"] as const) {
+    test(`${surface}: an empty board gives only the showrunner command instruction`, async ($, on) => {
+      on("ui.render", { component: "Pane", requestId: "empty-board" }, ($, event) =>
+        BoardView($.ui.resolve(event), 170, 50,
+          { files: [], watch: [], loadedAt: NOW / 1000, boards: [] }, NOW / 1000, () => {}));
+      const ui = await $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "empty-board",
+        surface, props });
+
+      expect(lines(await ui.drawn()).filter(line => line.trim()))
+        .toEqual(["Run /showrunner:unit_board in a showrunner session."]);
+      expect(await ui.findAll({ type: "Button" })).toEqual([]);
+    });
+
     for (const bodyRows of [4, 50]) {
       for (const hasStrip of [false, true]) {
       test(`${surface}: a 76-column no-phase unit shows its stage once with ${hasStrip ? "a strip" : "no strip"} in ${bodyRows} rows`, async ($, on) => {

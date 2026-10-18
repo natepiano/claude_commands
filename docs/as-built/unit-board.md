@@ -2,7 +2,7 @@
 
 ## What it is
 
-A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/unit-board` shows the production board (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, and `/accounts-board` shows the accounts table that `accounts.py` reports, logins included, without the addresses ever passing through a model reply. `/unit:report` prints a short report (phase, stage, one ETA line, workers, summary), and adds the recorder's tables only when asked with `tables`.
+A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, and `/accounts-board` shows the accounts table that `accounts.py` reports, logins included, without the addresses ever passing through a model reply. `/unit:report` prints a short report (phase, stage, one ETA line, workers, summary), and adds the recorder's tables only when asked with `tables`.
 
 ## How it works
 
@@ -14,9 +14,9 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                          phase_table.build_plan(plan) ◄───────┘  (chain, gates, PhaseHistory)
                                   │                        │
             progress_history.py progress           board_json.py --cwd <cwd>
-            (short report / --tables)              writes <slug>.json, prints {files, focus, watch}
+            (short report / --tables)              writes <slug>.json, prints {files, watch}
                                                            │
-                                       mod: /unit-board ── reads JSON, stats sources while open
+                                       mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /accounts-board ── runs accounts.py status --json --stored --with-login
 ```
 
@@ -51,10 +51,10 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ~/.claude/scripts/lib/py ~/.claude/scripts/delegate/board_json.py (--cwd <path> | --production <slug>)
 ```
 
-[`board_json.py`](../../scripts/delegate/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "focus": <unit key|null>, "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. It logs nothing.
+[`board_json.py`](../../scripts/delegate/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. It logs nothing.
 
-- Resolve (`showrunners.registered_showrunners()` + `production_units.live_unit_table`): `--cwd` inside a unit worktree gives that production and `focus` = the unit; inside a showrunner checkout, its production; anywhere else, every production whose showrunner is running, `focus` null.
-- `watch` is the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`) when it exists, so an open pane notices a production started later.
+- Resolve (`showrunners.registered_showrunners()`): `--cwd` inside a showrunner checkout gives that production, then each production in `showrunners.descendants_of(slug)` (nearest level first), each only when registered. `--production <slug>` gives the same list. Any other `--cwd`, a unit worktree included, gives no files.
+- `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
 - The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/delegate/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
 - `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase {id, of, title}` or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
@@ -100,13 +100,14 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 **Commands.**
 
-- `/unit-board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd>`, reads each listed file and stores the unit view for `<unit>` or `focus`, else the board view; it replies `Unit board opened.` `open` buttons on the board and the `board` button on a unit switch views. `/unit-board close` replies `Unit board closed.`
+- `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd>`, reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `Run /showrunner:unit_board in a showrunner session.`; it replies `Unit board opened.` `open` buttons on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
+- A mod command name allows only letters, digits, `_` and `-`, so [`commands/showrunner/unit_board.md`](../../commands/showrunner/unit_board.md) gives the name. The mod answers it with a `command.run` hook on `{ command: 'showrunner:unit_board' }` that returns `{ text }` and never calls `next`, so no model turn starts. In a session without the mod, the file's body makes the model reply one line naming `unit-board@nate-local`.
 - `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored", "--with-login"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
-- `session.start` only registers both commands and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh.
+- `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh.
 
 **State.** Plugin state `unit-board` holds two keys, each a record keyed by pane id; a missing entry is a closed pane.
 
-- `panes`: `PaneState<BoardData>` = `loading` | `board {data, now}` | `unit {data, production, unit, now}` | `failed {reason}`. `data` is a `BoardSnapshot {files, watch, loadedAt, boards, focus}`.
+- `panes`: `PaneState<BoardData>` = `loading` | `board {data, now}` | `unit {data, production, unit, now}` | `failed {reason}`. `data` is a `BoardSnapshot {files, watch, loadedAt, boards}`.
 - `accountsPanes`: `AccountsPaneState<StoredAccountsStatus>` = `loading` | `accounts {data, zone}` | `failed {reason}`.
 
 Timers stay module-level and are never persisted: `OpenPane {timer, cwd, busy, paths, selection}` (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`) and `OpenAccountsPane {timer, busy, paths, zone}`. Paths and selection survive a failed refresh. An `accountsLifecycle` counter, bumped on `session.start`, open and `ui.close`, cancels an accounts load or zone lookup that a close overtook.
@@ -168,7 +169,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Worker lines come from `_current_worker_windows` / `_current_worker_cells`: per slot, the live window, else the most recent finished one, independent of the director's own activity.
 - In the clocks table Project ETA is the chain's finish (`_project_chain_eta`), low/high shifted by the open phase's band; under an untimed gate it reads `after G<k>` with `—` for low/high.
 - The legacy (non-dual) layout keeps its old form plus one ETA line after the phase line. The vault phase note keeps the full phase list.
-- [`commands/unit/report.md`](../../commands/unit/report.md): `/unit:report [tables|on|off]` presents phase and stage, ETA line, worker table, summary sentences, then `See /unit-board for the board.`; `tables` passes `--tables` and adds both tables after the ETA line. `<DelegationResultFormat>` in [`commands/unit/direct.md`](../../commands/unit/direct.md) closes every delegation result and launch with this short report.
+- [`commands/unit/report.md`](../../commands/unit/report.md): `/unit:report [tables|on|off]` presents phase and stage, ETA line, worker table, summary sentences, then `See /showrunner:unit_board for the board.`; `tables` passes `--tables` and adds both tables after the ETA line. `<DelegationResultFormat>` in [`commands/unit/direct.md`](../../commands/unit/direct.md) closes every delegation result and launch with this short report.
 
 ## Invariants
 
