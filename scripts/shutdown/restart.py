@@ -742,11 +742,19 @@ HerdrDestination = NewHerdrSession | RecordedHerdrPane | SharedHerdrTab
 
 
 def herdr_space(session: Session) -> str:
-    """The shared session's workspace for a Claude session: its production, else `sessions`."""
+    """The shared session's workspace for a Claude session: its production's, else `ad-hoc`."""
     if session["kind"] == "showrunner":
-        from showrunners import production_slug
-        return production_slug(session["doc"])
-    return "sessions"
+        from showrunners import herdr_space as production_space, production_slug
+        return production_space(production_slug(session["doc"]), session["doc"])
+    return "ad-hoc"
+
+
+def herdr_tab_title(session: Session) -> str:
+    """The session's tab title in that workspace: a showrunner's name loses its production prefix."""
+    if session["kind"] == "showrunner":
+        from showrunners import production_slug, tab_title
+        return tab_title(production_slug(session["doc"]), session["name"])
+    return session["name"]
 
 
 class HerdrDestinationTaken(OSError):
@@ -1155,7 +1163,8 @@ def _herdr_launch(
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
         if name == herdr.shared_session():
-            pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
+            pane = herdr.open_tab(name, herdr_space(session), herdr_tab_title(session), session["name"], parts.cwd,
+                                  environment)
         else:
             pane = herdr.open_pane(name, name, parts.cwd, environment)
         try:
@@ -1915,8 +1924,12 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     start = [str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
     if launcher == "review.sh":
         return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
-    kind = seat["role"] if seat["role"] in {"impl", "test", "fix"} else "impl"
-    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", seat["role"]])
+    from scripts.delegate.worker_state import worker_slot
+
+    # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
+    team_role = worker_slot(Path(seat["run_dir"]), seat["seat"]) or seat["role"]
+    kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
+    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
 
 
 def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:

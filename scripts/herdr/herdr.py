@@ -840,37 +840,71 @@ class Herdr:
         _ = self.run("pane", "rename", pane, label)
         return pane
 
-    def open_tab(self, space: str, label: str, cwd: str, environment: dict[str, str]) -> str:
-        """Open a tab named `label` in the workspace named `space`, creating the workspace first."""
-        options = ["--label", label, "--cwd", cwd]
+    def open_tab(self, space: str, title: str, label: str, cwd: str, environment: dict[str, str]) -> str:
+        """Open a tab titled `title` in the workspace named `space`, creating the workspace first.
+
+        The tab's pane is named `label`, the full session name that lookups use.
+        """
+        options = ["--label", title, "--cwd", cwd]
         for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
         workspaces = [json_object(item, "herdr workspace") for item in json_items(
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         found = [item for item in workspaces if item.get("label") == space]
-        if found:
-            workspace = json_text(found[0].get("workspace_id"), "herdr workspace id")
+        workspace = json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
+        if workspace is not None:
             result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
         else:
             options[1] = space
             result = self.result("workspace", "create", *options, "--no-focus")
             tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
-            _ = self.run("tab", "rename", tab, label)
+            _ = self.run("tab", "rename", tab, title)
         root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
         pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
         _ = self.run("pane", "rename", pane, label)
-        return pane
+        return pane if workspace is None else self.order_tabs(workspace).get(pane, pane)
 
-    def tab_labels(self) -> list[str]:
-        return [json_text(json_object(item, "herdr tab").get("label"), "herdr tab label")
-                for item in json_items(self.result("tab", "list").get("tabs"), "herdr tab list")]
+    def order_tabs(self, workspace: str) -> dict[str, str]:
+        """Put the workspace's showrunner tab first and its other tabs in alphabetical order.
 
-    def close_tab_labelled(self, label: str) -> None:
-        """Close every tab named `label`; none named so leaves nothing to close."""
-        for item in json_items(self.result("tab", "list").get("tabs"), "herdr tab list"):
-            tab = json_object(item, "herdr tab")
-            if tab.get("label") == label:
-                _ = self.run("tab", "close", json_text(tab.get("tab_id"), "herdr tab id"))
+        The showrunner's tab carries the workspace's own name. herdr 0.9.5 cannot move a tab, but a
+        pane moved into a new tab puts that tab last: so every tab from the first one out of place
+        moves, in order. Each pane keeps its process, and focus goes back where it was. A tab with
+        several panes leaves the order as it is. Returns each moved pane's new id by its old one.
+        """
+        spaces = [json_object(item, "herdr workspace") for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        name = next((item.get("label") for item in spaces if item.get("workspace_id") == workspace), None)
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        order = sorted(range(len(tabs)), key=lambda index: (titles[index] != name, titles[index]))
+        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
+        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+            return {}
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        pane_of = {json_text(row.get("tab_id"), "herdr pane tab id"): json_text(row.get("pane_id"), "herdr pane id")
+                   for row in rows}
+        focused = next((item for item in spaces if item.get("focused") is True), None)
+        active = next((item.get("active_tab_id") for item in spaces if item.get("workspace_id") == workspace), None)
+        moved: dict[str, str] = {}
+        active_tab = active
+        for index in order[start:]:
+            tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
+            pane = pane_of[tab]
+            result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
+                                 .get("move_result"), "herdr pane move")
+            created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
+            moved[pane] = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
+            _ = self.run("tab", "rename", created, titles[index])
+            if tab == active:
+                active_tab = created
+        if isinstance(active_tab, str):
+            _ = self.run("tab", "focus", active_tab)
+        if focused is not None and focused.get("workspace_id") != workspace:
+            self.focus_workspace(json_text(focused.get("workspace_id"), "herdr workspace id"))
+        return moved
 
     def close_tab_of(self, pane: str) -> None:
         """Close the tab holding `pane`; a pane already gone leaves nothing to close."""
@@ -1674,8 +1708,8 @@ def shared_session() -> str:
     return name
 
 
-def open_tab(name: str, space: str, label: str, cwd: str, environment: dict[str, str]) -> str:
-    return Herdr(name).open_tab(space, label, cwd, environment)
+def open_tab(name: str, space: str, title: str, label: str, cwd: str, environment: dict[str, str]) -> str:
+    return Herdr(name).open_tab(space, title, label, cwd, environment)
 
 
 def close_agent(session: str, pane: str) -> None:

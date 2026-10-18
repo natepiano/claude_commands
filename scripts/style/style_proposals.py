@@ -22,6 +22,7 @@ import rules
 import style_ledger
 from add_style import StandingStyleProduction, standing_style_production
 from issues import Issue, frontmatter, open_issues
+from proposal_issue import STAR
 from unit_files import unit_file_holders
 
 
@@ -114,6 +115,17 @@ def batch_name(label: str, findings: tuple[style_ledger.HeldFinding, ...]) -> st
     return f"style {label[:32]} {digest}.md"
 
 
+def proposed_ranking(kind: style_ledger.FindingKind, finding_count: int) -> str:
+    effort = 1 if finding_count <= 3 else 2 if finding_count <= 15 else 3
+    impact = 1 if kind == "rename" else 2
+    return (f"goal 1 - Ship Hana · alignment {STAR * 2} · impact {STAR * impact} "
+            + f"· urgency {STAR} · effort {STAR * effort}")
+
+
+def proposal_kind(finding: style_ledger.HeldFinding, definition: rules.Rule) -> style_ledger.FindingKind:
+    return "restructure" if definition.tier == "D" or definition.mode_propose else finding.kind
+
+
 def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> tuple[Path, ...]:
     definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
     waiting = ledger.held_findings(style_ledger.UnfiledFindingsFromOpenTickets())
@@ -142,10 +154,10 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
         for finding in recovered:
             ledger.file_held(finding.finding_id, issue_path)
         valid = [finding for finding in valid if finding.finding_id not in identities]
-    batches: dict[tuple[str, str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
+    batches: dict[tuple[style_ledger.FindingKind, str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
     for finding in valid:
         definition = definitions[finding.rule.removesuffix("#uncovered")]
-        kind = "restructure" if definition.tier == "D" or definition.mode_propose else finding.kind
+        kind = proposal_kind(finding, definition)
         crate = crate_for(ledger, finding.path)
         batches[(kind, "" if kind == "restructure" else finding.rule, crate)].append(finding)
     if not batches:
@@ -157,7 +169,8 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     written: list[Path] = []
     for (kind, rule, crate), items in sorted(batches.items()):
         findings = tuple(items)
-        label = PurePosixPath(rule.removesuffix("#uncovered")).stem if rule else PurePosixPath(crate).name
+        label = (PurePosixPath(rule.removesuffix("#uncovered")).stem if rule else
+                 repository_name(ledger.repo) if crate == "." else PurePosixPath(crate).name)
         issue = proposals / batch_name(label, findings)
         body = [f"# Style {kind}: {label}", "", f"Parent: {parent}", "", "Recommended answer: approve the described change; schedule it with any live units holding these files.", ""]
         for finding in findings:
@@ -171,6 +184,7 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
             project = issue_project(ledger.repo, crate, proposals.parent)
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
                              "--proposed-by", style_slug(ledger.repo),
+                             "--proposed-ranking", proposed_ranking(kind, len(findings)),
                              "--extra-tags", "style", "--findings", ",".join(finding.finding_id for finding in findings),
                              "--body-file", str(body_file))
         for finding in findings:
@@ -178,6 +192,40 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
         written.append(issue)
         print(f"filed {issue}")
     return tuple(written)
+
+
+def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
+    definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
+    ranked = 0
+    for issue in open_issues(proposals, "style"):
+        try:
+            findings = issue_findings(ledger, issue.path)
+            kinds: set[style_ledger.FindingKind] = set()
+            crates: set[str] = set()
+            for finding in findings:
+                rule = finding.rule.removesuffix("#uncovered")
+                if rule not in definitions:
+                    raise style_ledger.LedgerError(f"unknown rule {rule}")
+                kinds.add(proposal_kind(finding, definitions[rule]))
+                crates.add(crate_for(ledger, finding.path))
+            if len(kinds) != 1 or len(crates) != 1:
+                raise style_ledger.LedgerError("findings do not form one proposal batch")
+            kind: style_ledger.FindingKind = next(iter(kinds))
+            text = issue.path.read_bytes().decode("utf-8")
+            updated = re.sub(r"^Proposed ranking:[ \t]*(?=\r?$)",
+                             lambda match: match[0].rstrip(" \t") + " " + proposed_ranking(kind, len(findings)),
+                             text, count=1, flags=re.MULTILINE)
+            if kind == "restructure" and crates == {"."}:
+                updated = re.sub(r"^# Style restructure: (?=\r?$)",
+                                 lambda match: match[0] + repository_name(ledger.repo),
+                                 updated, count=1, flags=re.MULTILINE)
+            if updated != text:
+                _ = issue.path.write_bytes(updated.encode("utf-8"))
+                ranked += 1
+                print(f"ranked {issue.path}")
+        except (style_ledger.LedgerError, OSError, UnicodeError) as error:
+            print(f"skipped {issue.path}: {error}")
+    print(f"ranked {ranked} issues")
 
 
 def complete(ledger: style_ledger.Ledger) -> None:
@@ -211,6 +259,8 @@ def main(argv: list[str]) -> int:
     filing = sub.add_parser("file")
     _ = filing.add_argument("--proposals", type=Path, required=True)
     _ = filing.add_argument("--parent", required=True)
+    ranking = sub.add_parser("rank")
+    _ = ranking.add_argument("--proposals", type=Path, required=True)
     _ = sub.add_parser("complete")
     declining = sub.add_parser("decline")
     _ = declining.add_argument("--issue", type=Path, required=True)
@@ -222,6 +272,8 @@ def main(argv: list[str]) -> int:
         with style_ledger.open_ledger(args.repo) as ledger:
             if args.command == "file":
                 _ = file_proposals(ledger, args.proposals.expanduser().resolve(), args.parent)
+            elif args.command == "rank":
+                rank_proposals(ledger, args.proposals.expanduser().resolve())
             elif args.command == "decline":
                 decline(ledger, args.issue.expanduser().resolve(), args.words)
             else:

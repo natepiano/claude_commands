@@ -108,14 +108,14 @@ class PromptSubmissionTests(unittest.TestCase):
     events: list[tuple[float, Callable[[], None]]] = []
     submit_on_type: bool = False
     submit_on_enter: int = 0
-    client: herdr.Herdr = herdr.Herdr("fixture")
+    client: herdr.Herdr = cast(herdr.Herdr, Mock())
     start: Mock = Mock()
     read: Mock = Mock()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root)}, clear=True)))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
         self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
         self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
         self.path.parent.mkdir(parents=True)
@@ -1876,20 +1876,54 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.shared_session(), "fixture")
 
     def test_open_tab_creates_the_production_workspace_once_then_adds_tabs(self) -> None:
-        options = ["--label", "prod", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
+        options = ["--label", "boss", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
             "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
-        self.assertEqual(herdr.open_tab("fixture", "prod", "prod-showrunner", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
+        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
         self.assertEqual(self.commands()[1:], [["--session", "fixture", "workspace", "create", *options],
-                                               ["--session", "fixture", "tab", "rename", "w1:t1", "prod-showrunner"],
-                                               ["--session", "fixture", "pane", "rename", "w1:p1", "prod-showrunner"]])
+                                               ["--session", "fixture", "tab", "rename", "w1:t1", "boss"],
+                                               ["--session", "fixture", "pane", "rename", "w1:p1", "boss"]])
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
-            {"workspace_id": "w1", "label": "prod"}]}}))
+            {"workspace_id": "w1", "label": "boss"}]}}))
         tab = ["tab", "create", "--workspace", "w1", "--label", "alpha", "--cwd", "/wt", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(tab, json.dumps({"result": {"root_pane": {"pane_id": "w1:p2"}}}))
-        self.assertEqual(herdr.open_tab("fixture", "prod", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual(self.commands()[-2:], [["--session", "fixture", *tab],
-                                                ["--session", "fixture", "pane", "rename", "w1:p2", "alpha"]])
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]}}))
+        self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "prod-alpha", "/wt", {}), "w1:p2")
+        self.assertEqual(self.commands()[-4:], [["--session", "fixture", *tab],
+                                                ["--session", "fixture", "pane", "rename", "w1:p2", "prod-alpha"],
+                                                ["--session", "fixture", "workspace", "list"],
+                                                ["--session", "fixture", "tab", "list", "--workspace", "w1"]])
+
+    def test_order_tabs_puts_the_showrunner_first_then_moves_each_tab_out_of_place(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "boss", "focused": False, "active_tab_id": "w1:t2"},
+            {"workspace_id": "w2", "label": "other", "focused": True, "active_tab_id": "w2:t1"}]}}))
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "delta", "pane_count": 1},
+            {"tab_id": "w1:t3", "label": "alpha", "pane_count": 1}]}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"},
+            {"pane_id": "w1:p3", "tab_id": "w1:t3"}, {"pane_id": "w2:p1", "tab_id": "w2:t1"}]}}))
+        for pane, tab in (("w1:p3", "w1:t4"), ("w1:p2", "w1:t5")):
+            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
+                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
+        self.assertEqual(herdr.Herdr("fixture").order_tabs("w1"), {"w1:p3": "w1:p3", "w1:p2": "w1:p2"})
+        acted = [command[2:] for command in self.commands() if command[2:4] not in (["workspace", "list"], ["tab", "list"],
+                                                                                     ["pane", "list"])]
+        self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
+                                 ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "delta"],
+                                 ["tab", "focus", "w1:t5"], ["workspace", "focus", "w2"]])
+
+    def test_order_tabs_leaves_a_tab_with_several_panes_and_an_ordered_space_alone(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
+        for tabs in ([{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "zed", "pane_count": 1},
+                      {"tab_id": "w1:t3", "label": "alpha", "pane_count": 2}],
+                     [{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]):
+            self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": tabs}}))
+            self.assertEqual(herdr.Herdr("fixture").order_tabs("w1"), {})
+        self.assertEqual({tuple(command[2:4]) for command in self.commands()}, {("workspace", "list"), ("tab", "list")})
 
     def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
         self.share()
@@ -1900,13 +1934,6 @@ class HerdrTests(unittest.TestCase):
         herdr.close_agent("fixture", "w1:p2")
         self.assertEqual(self.commands()[-1], ["--session", "fixture", "tab", "close", "w1:t2"])
         self.assertNotIn(["--session", "fixture", "server", "stop"], self.commands())
-
-    def test_close_tab_labelled_closes_the_named_tab(self) -> None:
-        self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": [
-            {"tab_id": "w1:t1", "label": "prod"}, {"tab_id": "w2:t3", "label": "alpha"}]}}))
-        self.herdr.close_tab_labelled("alpha")
-        self.assertEqual(self.commands()[-1], ["--session", "fixture", "tab", "close", "w2:t3"])
-        self.assertEqual(self.herdr.tab_labels(), ["prod", "alpha"])
 
     def test_focus_workspace_targets_the_named_session_and_reports_refusal(self) -> None:
         self.herdr.focus_workspace("w3")

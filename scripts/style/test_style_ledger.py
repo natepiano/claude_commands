@@ -1691,6 +1691,27 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(stored, (branch_tip, "refs/heads/style/main"))
         self.assertNotIn("refs/heads/style/main", self.git("for-each-ref", "--format=%(refname)"))
 
+    def test_reconcile_uses_the_pushed_tip_when_the_style_branch_is_missing(self) -> None:
+        _ = self.rule("read")
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "main")
+        self.write(self.sources[0], "pub fn unpushed() {}\n")
+        _ = self.commit("Unpushed branch-point work")
+        ledger = self.ledger()
+
+        _ = ledger.reconcile("main", "style/main")
+
+        self.assertEqual(ledger.summary().synced_tip, self.initial_tip)
+
+    def test_origin_without_a_tracking_ref_refuses_to_use_the_local_branch_point(self) -> None:
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        with self.assertRaisesRegex(style_ledger.LedgerError, "origin.*refs/remotes/origin/main.*fetch"):
+            _ = self.ledger().reconcile("main", "style/main")
+
     def test_reconcile_matching_style_branch_preserves_an_older_synced_tip(self) -> None:
         _ = self.rule("read")
         _ = self.git("branch", "style/main")
@@ -1909,6 +1930,64 @@ class StyleLedgerTests(unittest.TestCase):
             ).fetchone())
         self.assertNotEqual(first_merge, second_merge)
         self.assertEqual(stored, ("merged", second_merge))
+
+    def test_reconcile_and_handoff_merged_accept_only_a_pushed_branch_point_merge(self) -> None:
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "main")
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(self.sources[0], "pub fn corrected() {}\n")
+        checkpoint = self.commit("Style checkpoint")
+        ledger = self.ledger()
+        _ = ledger.reconcile("refs/heads/main", "style/main")
+        ledger.handoff_add(checkpoint)
+        ledger.handoff_send(checkpoint, "parent")
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "--no-ff", "-qm", "Unpushed integration", "style/main")
+        merge_commit = self.git("rev-parse", "HEAD")
+
+        self.assertEqual(ledger.reconcile("refs/heads/main", "style/main"), ())
+        self.assertEqual(ledger.pending_handoffs()[0]["state"], "sent")
+        for evidence in ("", merge_commit):
+            with self.subTest(evidence=evidence):
+                with self.assertRaisesRegex(style_ledger.LedgerError, "hand-off is not merged"):
+                    ledger.handoff_merged(checkpoint, evidence)
+        _ = self.git("push", "-q", "origin", "main")
+        ledger.handoff_merged(checkpoint)
+
+        self.assertEqual(ledger.pending_handoffs(), ())
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            stored = cast(tuple[str], connection.execute(
+                "SELECT merge_commit FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchone())
+        self.assertEqual(stored, (merge_commit,))
+
+    def test_reconcile_fast_forward_evidence_stops_at_the_pushed_tip(self) -> None:
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "main")
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(self.sources[0], "pub fn corrected() {}\n")
+        checkpoint = self.commit("Style checkpoint")
+        ledger = self.ledger()
+        _ = ledger.reconcile("main", "style/main")
+        ledger.handoff_add(checkpoint)
+        ledger.handoff_send(checkpoint, "parent")
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "--ff-only", "-q", "style/main")
+        _ = self.git("push", "-q", "origin", "main")
+        self.write("README.md", "Unpushed product work.\n")
+        _ = self.commit("Advance only local branch point")
+
+        self.assertEqual(ledger.reconcile("main", "style/main"), (f"hand-off {checkpoint}: sent -> merged",))
+
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            stored = cast(tuple[str], connection.execute(
+                "SELECT merge_commit FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchone())
+        self.assertEqual(stored, (checkpoint,))
 
     def test_reconcile_recovers_merged_handoff_ticket_and_missing_unit_branch(self) -> None:
         rule_id = self.rule("read")

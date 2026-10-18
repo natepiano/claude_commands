@@ -67,8 +67,11 @@ for it. Checkpoint stages only code paths and never the plan or anything under
 `docs/style-production/`; standing plans skip shrink and every closing gate.
 Run refill at startup, after restart or compaction, and after each ticket.
 Before selecting a new ticket, refill waits for sync if the branch point's
-current tip is not an ancestor of the ledger's synced tip; an open ticket still
-resumes or waits for merge.
+pushed tip is not an ancestor of the ledger's synced tip; an open ticket still
+resumes or waits for merge. The pushed tip is `origin/<branch point>`, or the
+local branch when the repository has no `origin`. The checkouts share one
+repository, so the local branch can hold a parent merge whose gate is still
+running. Reconcile and the hand-off merge check read the same pushed tip.
 Report a waiting state once and end the turn blocked until sync, a board retry
 message, or `ticket <id> merged; refill.` wakes the director. `ticket merge`
 sends that wake to every unit waiting for sync. Refill records its wait before

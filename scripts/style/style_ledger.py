@@ -340,6 +340,17 @@ def _git(repo: Path, *arguments: str) -> str:
     return result.stdout.rstrip("\n")
 
 
+def pushed_branch_point_tip(repo: Path, branch_point: str) -> str:
+    branch = branch_point.removeprefix("refs/heads/")
+    if "origin" in _git(repo, "remote").splitlines():
+        ref = f"refs/remotes/origin/{branch}"
+        try:
+            return _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+        except LedgerError as error:
+            raise LedgerError(f"origin exists but pushed branch point {ref} cannot be resolved; fetch origin first") from error
+    return _git(repo, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+
+
 def _under(path: str, directory: str) -> bool:
     return directory == "." or path == directory or path.startswith(directory.rstrip("/") + "/")
 
@@ -1000,11 +1011,12 @@ class Ledger:
                 )
 
     def _first_merge(self, checkpoint: str, branch_point: str) -> str:
-        for commit in _git(self.repo, "rev-list", "--first-parent", "--reverse", "--merges", branch_point).splitlines():
+        branch_tip = pushed_branch_point_tip(self.repo, branch_point)
+        for commit in _git(self.repo, "rev-list", "--first-parent", "--reverse", "--merges", branch_tip).splitlines():
             if self._is_ancestor(checkpoint, commit):
                 return commit
         # A fast-forward has no merge commit; its containing branch-point tip is the evidence.
-        return _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
+        return branch_tip
 
     def handoff_merged(self, checkpoint: str, merge_commit: str = "") -> None:
         checkpoint = _git(self.repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
@@ -1018,7 +1030,7 @@ class Ledger:
             branch_point = branches[0][0]
         else:
             raise LedgerError("hand-off merge requires a branch point saved by reconcile")
-        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
+        branch_tip = pushed_branch_point_tip(self.repo, branch_point)
         if not self._is_ancestor(checkpoint, branch_tip):
             raise LedgerError(f"{checkpoint}: hand-off is not merged into {branch_point}")
         if merge_commit:
@@ -1026,7 +1038,7 @@ class Ledger:
             if not self._is_ancestor(checkpoint, actual_merge) or not self._is_ancestor(actual_merge, branch_tip):
                 raise LedgerError(f"{checkpoint}: {merge_commit} is not merge evidence on {branch_point}")
         else:
-            actual_merge = self._first_merge(checkpoint, branch_tip)
+            actual_merge = self._first_merge(checkpoint, branch_point)
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             rows = cast(list[tuple[str]], self._connection.execute("SELECT state FROM handoffs WHERE checkpoint=?", (checkpoint,)).fetchall())
@@ -1168,7 +1180,7 @@ class Ledger:
             _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
-        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
+        branch_tip = pushed_branch_point_tip(self.repo, branch_point)
         style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
         present = subprocess.run(
             ["git", "-C", str(self.repo), "show-ref", "--verify", "--quiet", style_branch],
@@ -1192,7 +1204,7 @@ class Ledger:
             if self._is_ancestor(checkpoint, branch_tip):
                 with self._connection:
                     _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?",
-                                                 (self._first_merge(checkpoint, branch_tip), _now(), checkpoint))
+                                                 (self._first_merge(checkpoint, branch_point), _now(), checkpoint))
                 changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute("SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') ORDER BY id").fetchall())
         for id, branch, state, checkpoint in tickets:

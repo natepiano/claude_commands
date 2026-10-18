@@ -70,7 +70,7 @@ class AddShowrunnerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state = self.root / "stub"
         self.state.mkdir()
         bin_path = self.root / "bin"
@@ -113,6 +113,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.processes = []
         self.addCleanup(self.close_processes)
         self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")},
+                    "HERDR_PLATFORM": "linux",
                     "HOME": str(self.root / "home"), "STUB_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "HERDR_BIN": str(fake),
@@ -384,7 +385,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(prompt.call_count, 1)
         self.assertEqual(keys.call_count, 1)
         readiness.assert_called_once_with("destination:p1")
-        self.assertEqual(tab.call_args.args[:3], ("agents", "kid", "kid"))
+        self.assertEqual(tab.call_args.args[:4], ("agents", "kid", "kid", "kid"))
         self.assertGreaterEqual(elapsed, 5)
 
     def test_unsubmitted_showrunner_is_named_and_never_attached_even_if_live(self) -> None:

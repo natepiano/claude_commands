@@ -24,6 +24,7 @@ for dependency in ("message", "production", "herdr", "lib"):
 import sessions
 import herdr
 import relaunch
+import unit_lookup
 from inventory import Inventory, Session, terminal_kind, live_supervisor, codex_seats
 from record import (
     CLAIM_STALE_SECONDS,
@@ -360,9 +361,10 @@ def _stop_codex_servers(
 def _stop_unit_session(
     session: Session, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit" or session["host"]["kind"] != "unit":
+    host = session["host"]
+    if session["kind"] != "unit" or host["kind"] != "unit":
         return []
-    name = session["host"]["session_name"]
+    name = host["session_name"]
     issue: SessionStopIssue = {
         "kind": "unit session left running",
         "at": _timestamp(clock),
@@ -372,11 +374,13 @@ def _stop_unit_session(
     }
     claim.check()
     if name == herdr.shared_session():
-        # The shared session holds every production: close only this unit's tab, named for its session.
+        # The shared session holds every production: close only the tab of the pane that carries this unit's marks.
         client = herdr.Herdr(name)
         try:
-            client.close_tab_labelled(session["name"])
-            left = session["name"] in client.tab_labels()
+            marked = unit_lookup.marked_unit(host["production"], host["unit"])
+            if marked is not None and marked.place.session == name:
+                client.close_tab_of(marked.place.pane)
+            left = marked is not None and any(pane["pane_id"] == marked.place.pane for pane in client.panes())
         except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
             left = True
         finally:

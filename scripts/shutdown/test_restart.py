@@ -407,7 +407,10 @@ class RestartTests(ShutdownTestCase):
                     record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
                     record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="private-thread-review", turn_live=False, launcher_command=[]),
                     record.PausedSeat(run_dir=str(run), seat="test", role="test", thread_id="private-thread-test", turn_live=True, launcher_command=[]),
+                    record.PausedSeat(run_dir=str(run), seat="project-impl", role="fix", thread_id="private-thread-repair", turn_live=False, launcher_command=[]),
                 ]
+                # The roster role is the last pass kind; the identity record holds the slot implement.sh claims by.
+                _ = (run / "impl_worker_impl.json").write_text(json.dumps({"name": "project-impl", "slot": "impl"}))
                 saved = entry(owner)
                 saved["codex_seats"] = seats
                 if moved:
@@ -445,6 +448,10 @@ class RestartTests(ShutdownTestCase):
                 self.assertTrue(unread_line.endswith(shlex.join([
                     str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
                     str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
+                repaired_line = next(line for line in lines if line.startswith("project-impl (fix, idle):"))
+                self.assertTrue(repaired_line.endswith(shlex.join([
+                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
+                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"])))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
                 self.assertNotIn(old_prompt, text)
@@ -1861,6 +1868,7 @@ class RestartTests(ShutdownTestCase):
                 restart.SharedHerdrTab("agents"), owner, dry_run=False)
         self.assertEqual(result.prompt_outcome, failed)
         opened.assert_called_once()
+        self.assertEqual(opened.call_args.args[1:4], ("ad-hoc", "kept name", "kept name"))
         pane.assert_not_called()
         self.assertEqual(start.call_args.args[1], "destination:p1")
         opening = cast(herdr.OpeningPrompt, start.call_args.kwargs["opening"])

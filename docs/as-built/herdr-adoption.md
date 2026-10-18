@@ -70,6 +70,10 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
 
 **Clients and server environment.** `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)` counts this user's `herdr session attach <name>` clients and bare `herdr` TUI clients for that session. The session comes from argv `--session` first, then the client's `HERDR_SESSION`, else `default`. A client that exits mid-read counts as gone. `server_environment(name)` returns the environment of the single process holding the session's listening socket. Callers refuse when it holds a variable that must be unset, since panes inherit the server's environment.
 
+**Shared session layout (user, 2026-10-18).** When `herdr.shared_session()` names a session, every Claude launcher opens a tab in it, never a session of its own. `Herdr.open_tab(space, title, label, cwd, environment)` finds or creates the workspace `space`, titles the tab `title` and names its pane `label`. A production's workspace is `showrunners.herdr_space(slug, doc)`: the doc's `- **Showrunner session:**` line, else the slug, so it reads `natedev`, `hana` or `cargo-liner`. The name never depends on whether the showrunner runs, so a unit restarted first finds the same workspace. A session outside any production goes to `ad-hoc`. A tab's title is `showrunners.tab_title(slug, name)`: the session name without its `<slug>-` prefix (`herdr-panes`, not `build-followups-herdr-panes`), because the workspace already names the production. The pane keeps the full session name, which lookups use. A stop closes a unit's tab through the pane that carries its marks (`unit_lookup.marked_unit`), never by a title. A title is short and can repeat across workspaces (`review`).
+
+**Tab order (user, 2026-10-18).** In each workspace the showrunner's tab comes first and the other tabs follow in alphabetical order. The showrunner's tab is the one titled with the workspace's own name. `open_tab` calls `Herdr.order_tabs(workspace)` after it adds a tab to an existing workspace. herdr 0.9.5 has no command to move a tab, but `pane move --new-tab` puts the pane in a new tab at the end. So `order_tabs` moves each tab from the first one out of place, in order, and gives each new tab its old title. The pane keeps its id and its process. Focus goes back to the workspace and tab that had it. A tab with several panes leaves the order as it is. It returns each moved pane's new id by its old one.
+
 **Workspaces and focus.** `Herdr.focus_workspace(id)` runs `workspace focus`. `Herdr.close_startup_workspaces(restored_workspace)` closes every other workspace that is still herdr's untouched startup shell, and lists workspaces and panes again before each close. Untouched means a workspace labelled `~` with one tab, one pane and `agent_status` `unknown`, whose pane has no agent, `agent_status` `unknown`, cwd and foreground cwd equal to home, `revision` 0, and `scroll.max_offset_from_bottom` 0. `_StartupShellEvidence` is `UNTOUCHED` or `PRESERVE`. Missing or mistyped evidence keeps the workspace.
 
 ### Session commands
@@ -198,6 +202,30 @@ Old records and snapshots still parse, and they never become herdr destinations.
 - `fake_herdr.py`: `HERDR_BIN` points at it. It appends each argv to `FAKE_HERDR_LOG` as a JSON line. It answers from `FAKE_HERDR_RESPONSES`, keyed by the space-joined argv without the executable, else `"default"`. Fields: `stdout`, `code`, `stderr`, `write_files`, `require_paths` (a missing path exits 98) and `remove_paths`. A list replays in order and keeps the last entry. It refuses an `agent start` whose name fails `[a-z][a-z0-9_-]{0,31}` with `invalid_agent_name`. `herdr_listener(proc, pid, name, environment)` gives a fake server the session's listening socket in a fake `/proc/net/unix` plus an fd link.
 - `fake_unit_host.py`: `environment(root)` sets `HERDR_BIN`, `HERDR_PROC`, `FAKE_HERDR_LOG` and `FAKE_HERDR_RESPONSES` for an empty host. `HostedUnit(session, pane, marks, screen)`. `write(env, units)` publishes a server process (pid `991000 + 2i`), its listener, a marked `zsh` pane shell, the session list, and pane reads (`recent` and `recent-unwrapped`; 3, 60 and 400 lines; with and without ANSI). `place_process(env, pid, pane)` puts a registry process under that pane's shell. `calls(env)` returns logged argv. `live_pid(test)` gives a real live pid for registry checks.
 - Darwin cases fake `LAUNCHCTL`, `HERDR_PS`, `HERDR_LSOF`, `SHUTDOWN_OPEN` and `SHUTDOWN_SYSCTL`, and pin `herdr._PLATFORM`. Linux `/proc` cases use `scripts/shutdown/test_support.linux_process_fixture`, which pins `sys.platform` and `herdr._PLATFORM`.
+
+Use these fixture rules on Linux and macOS:
+
+- Resolve the temporary root in `test_add_unit.py` and `test_add_showrunner.py`. On macOS, `/tmp` points to `/private/tmp`. Trust keys and worktree paths must use the same resolved root as the code under test.
+- Set `HERDR_PLATFORM=linux` in each Linux launcher fixture's environment. Do not set it for the whole run. Darwin tests must still select the Darwin path.
+- Keep `HERDR_BIN=/nonexistent/herdr` in `PromptSubmissionTests`' cleared environment. Its fake pane calls do not need herdr on `PATH`.
+- Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
+
+Run the nine suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
+
+```sh
+(
+  test_home=$(mktemp -d) || exit
+  trap 'rm -rf "$test_home"' EXIT
+  env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
+    HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+    scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
+    scripts.shutdown.test_restart scripts.shutdown.test_account_move \
+    scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle \
+    scripts.production.test_add_unit scripts.production.test_add_showrunner \
+    scripts.notify.test_push_texts
+)
+```
 
 ## Invariants
 

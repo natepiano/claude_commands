@@ -95,6 +95,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
+- **Showrunner session:** <name> — the showrunner's session name; it also names the production's workspace in the shared herdr session (the slug when absent)
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
   minutes when the user asks for a schedule; each update reports every unit in full; the
