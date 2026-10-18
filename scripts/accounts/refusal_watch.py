@@ -151,6 +151,18 @@ class LegacyHoldDuration:
 
 
 @dataclass(frozen=True)
+class GroupSelection:
+    account: str | accounts.GroupNotConfigured
+    move_id: str | accounts.NoGroupTransition
+
+
+def _group_selection(selected: accounts.GroupAccounts, group: accounts.ClaudeGroup) -> GroupSelection:
+    transition = accounts.group_transition(group)
+    return GroupSelection(accounts.group_label(selected, group),
+                          transition.move_id if isinstance(transition, accounts.GroupTransition) else transition)
+
+
+@dataclass(frozen=True)
 class HoldStarted:
     account: str
     at: datetime
@@ -161,6 +173,10 @@ class HoldStarted:
     def __post_init__(self) -> None:
         if self.at.utcoffset() is None:
             raise ValueError("hold start needs a zone")
+
+    def is_current(self, selection: GroupSelection, percent: float) -> bool:
+        return (self.account == selection.account and self.move_id == selection.move_id
+                and self.percent == percent)
 
 
 @dataclass(frozen=True)
@@ -332,10 +348,8 @@ def started_next_move_holds(entries: tuple[next_moves.NextMove, ...]) -> dict[st
         hold = holds.get(entry.id)
         if hold is None or not isinstance(hold.duration, next_moves.ResolvedHold):
             continue
-        transition = accounts.group_transition(entry.group)
-        selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
-        if (hold.account == accounts.group_label(selected, entry.group)
-                and hold.move_id == selection_id and hold.percent == entry.at_percent):
+        selection = _group_selection(selected, entry.group)
+        if hold.is_current(selection, entry.at_percent):
             started[entry.id] = next_moves.StartedHold(hold.at, hold.duration)
     return started
 
@@ -1012,18 +1026,15 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
     moved = set(moved_groups)
     held_refusals = refusals.load()
     for rule in rules:
-        source_label = accounts.group_label(selected, rule.group)
-        transition = accounts.group_transition(rule.group)
-        selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
+        selection = _group_selection(selected, rule.group)
         hold = holds.get(rule.entry_id)
-        if hold is not None and (hold.account != source_label or hold.move_id != selection_id
-                                 or hold.percent != rule.when.percent):
+        if hold is not None and not hold.is_current(selection, rule.when.percent):
             del holds[rule.entry_id]
-        if (isinstance(source_label, accounts.GroupNotConfigured)
+        if (isinstance(selection.account, accounts.GroupNotConfigured)
                 or rule.group in moved or rule.group in in_flight):
             continue
         try:
-            source_identity = accounts.account_identity(accounts.claude_account_dir(source_label))
+            source_identity = accounts.account_identity(accounts.claude_account_dir(selection.account))
         except accounts.AccountsError:
             continue
         if not isinstance(source_identity, agent_accounts.NumberedAccount):
@@ -1036,19 +1047,19 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             continue
         if isinstance(rule.when.hold_mode, next_moves.HalfPointHold) or rule.when.hold_mode.minutes > 0:
             if rule.entry_id not in holds:
-                holds[rule.entry_id] = HoldStarted(source_label, now, selection_id, rule.when.percent,
-                                                  next_moves.resolve_hold(rule.when.hold_mode, source_label, now))
+                holds[rule.entry_id] = HoldStarted(selection.account, now, selection.move_id, rule.when.percent,
+                                                  next_moves.resolve_hold(rule.when.hold_mode, selection.account, now))
                 state["auto_move_holds"] = holds
             started = holds[rule.entry_id]
             if isinstance(started.duration, LegacyHoldDuration):
                 started = HoldStarted(started.account, started.at, started.move_id, started.percent,
-                                      next_moves.resolve_hold(rule.when.hold_mode, source_label, now))
+                                      next_moves.resolve_hold(rule.when.hold_mode, selection.account, now))
                 holds[rule.entry_id] = started
                 state["auto_move_holds"] = holds
             if (isinstance(started.duration, next_moves.ResolvedHold)
                     and (now - started.at).total_seconds() / 60 < started.duration.minutes):
                 continue
-        if source_label == rule.to:
+        if selection.account == rule.to:
             lines.append(_record_blocked_head(state, rule, TargetIsCurrentAccount(), now, dry_run))
             continue
         try:
@@ -1081,7 +1092,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             continue
         _ = notices.pop(rule.entry_id, None)
         why = f"auto: {rule.entry_id}"
-        lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {source_label} to {rule.to}")
+        lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {selection.account} to {rule.to}")
         moved.add(rule.group)
         if dry_run:
             continue

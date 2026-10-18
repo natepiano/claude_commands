@@ -1926,7 +1926,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** a locked watch-state read for the list; a bare `Optional` for a row's hold.
 
-### Phase 68 — One stale-hold check for the list and the runner  · status: todo
+### Phase 68 — One stale-hold check for the list and the runner  · status: done
 
 **Depends on:** Phase 67
 
