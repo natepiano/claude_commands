@@ -245,6 +245,23 @@ class UnitLookupTests(unittest.TestCase):
         self.assertIsInstance(found["trunk-unit"].claude, ClaudeUnknown)
         self.assertIsInstance(found["fps-unit"].claude, LiveClaude)
 
+    def test_a_broken_record_of_an_exited_session_leaves_every_unit_stopped(self) -> None:
+        # During an account move many sessions exit at once; their records are not evidence about other panes.
+        self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit")})
+        exited = subprocess.Popen(["true"])
+        _ = exited.wait(timeout=30)
+        _ = (self.records / f"{exited.pid}.json").write_text("{")
+        self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, ClaudeNotRunning)
+
+    def test_a_broken_record_of_a_live_session_makes_only_its_own_pane_unknown(self) -> None:
+        self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit"), "$2": marked("fps", "w5:p1", "fps-unit")})
+        pid = fake_unit_host.live_pid(self)
+        fake_unit_host.place_process(self.environment, pid, "w5:p1")
+        _ = (self.records / f"{pid}.json").write_text("{")
+        found = unit_lookup.marked_units("show")
+        self.assertIsInstance(found["trunk-unit"].claude, ClaudeNotRunning)
+        self.assertEqual(found["fps-unit"].claude, ClaudeUnknown(f"the session record of pid {pid} could not be read"))
+
 
     def test_two_sessions_carrying_one_units_mark_are_an_error(self) -> None:
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit"), "$2": marked("copy", "w5:p1", "trunk-unit")})

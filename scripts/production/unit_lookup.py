@@ -138,37 +138,75 @@ class RecordsPartlyUnread(NamedTuple):
     reason: str
 
 
-def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[HerdrPlace, LiveClaude], RecordsRead | RecordsPartlyUnread]:
-    """Newest live Claude per herdr pane, with the completeness of the records."""
+def _place_of(pid: int, places: dict[int, HerdrPlace]) -> HerdrPlace | None:
+    place = places.get(pid)
+    if place is not None:
+        return place
+    # A live registry PID may be absent from the snapshot because its
+    # working directory was deleted. Placement needs no cwd.
+    placement = herdr.herdr_place_of(pid)
+    return None if isinstance(placement, herdr.NotInHerdr) else placement
+
+
+def _pid_runs(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OverflowError):
+        return False
+    return True
+
+
+class UnreadAt(NamedTuple):
+    """Records that could not be read: the panes they belong to, and whether any names no process."""
+
+    places: dict[HerdrPlace, str]
+    unplaced: RecordsRead | RecordsPartlyUnread
+
+
+def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[HerdrPlace, LiveClaude], UnreadAt]:
+    """Newest live Claude per herdr pane, and the panes whose record could not be read.
+
+    Claude names each record after its pid. A record that cannot be read for a pid that no longer runs,
+    or whose file was removed after the listing, is a session that has exited: during an account move
+    many exit at once. It makes only its own pane unknown, never every pane.
+    """
     places = {process.pid: process.place for process in processes}
     try:
         paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
     except OSError as error:
-        return {}, RecordsPartlyUnread(f"cannot list session records: {error}")
+        return {}, UnreadAt({}, RecordsPartlyUnread(f"cannot list session records: {error}"))
     newest: dict[HerdrPlace, tuple[int, LiveClaude]] = {}
-    evidence: RecordsRead | RecordsPartlyUnread = RecordsRead()
+    unread: dict[HerdrPlace, str] = {}
+    unplaced: RecordsRead | RecordsPartlyUnread = RecordsRead()
     for path in paths:
         record = read_session(path)
         if isinstance(record, UnreadableSessionRecord):
-            evidence = RecordsPartlyUnread("one or more session records could not be read")
-            continue
+            pid = int(path.stem) if path.stem.isdigit() else None
+            if pid is not None and (not path.exists() or not _pid_runs(pid)):
+                continue
+            # A record that Claude is writing reads complete a moment later.
+            record = read_session(path)
+            if isinstance(record, UnreadableSessionRecord):
+                place = None if pid is None else _place_of(pid, places)
+                if pid is None:
+                    unplaced = RecordsPartlyUnread("one or more session records could not be read")
+                elif place is not None:
+                    unread[place] = f"the session record of pid {pid} could not be read"
+                continue
         if not live_session(record):
             continue
-        place = places.get(record["pid"])
+        place = _place_of(record["pid"], places)
         if place is None:
-            # A live registry PID may be absent from the snapshot because its
-            # working directory was deleted. Placement needs no cwd.
-            placement = herdr.herdr_place_of(record["pid"])
-            if isinstance(placement, herdr.NotInHerdr):
-                continue
-            place = placement
+            continue
         if place not in newest or record["updatedAt"] > newest[place][0]:
             newest[place] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
                                                            record["messagingSocketPath"], record["pid"]))
-    return {place: claude for place, (_, claude) in newest.items()}, evidence
+    return {place: claude for place, (_, claude) in newest.items()}, UnreadAt(unread, unplaced)
 
 
-def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], evidence: RecordsRead | RecordsPartlyUnread,
+def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: UnreadAt,
                   processes: list[herdr.HerdrProcess]) -> Iterable[tuple[str, MarkedUnit]]:
     """Each running herdr pane carrying both marks, once per place."""
     running = {session["name"] for session in herdr.live_sessions()}
@@ -181,7 +219,15 @@ def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], evidence: RecordsRead |
         if not slug or not unit:
             continue
         seen.add(place)
-        claude: Claude = claudes.get(place, ClaudeUnknown(evidence.reason) if isinstance(evidence, RecordsPartlyUnread) else ClaudeNotRunning())
+        claude: Claude
+        if place in claudes:
+            claude = claudes[place]
+        elif place in unread.places:
+            claude = ClaudeUnknown(unread.places[place])
+        elif isinstance(unread.unplaced, RecordsPartlyUnread):
+            claude = ClaudeUnknown(unread.unplaced.reason)
+        else:
+            claude = ClaudeNotRunning()
         yield slug, MarkedUnit(unit, claude, place)
 
 
@@ -196,8 +242,8 @@ def every_marked_unit() -> MarkedProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
     try:
         processes = herdr.herdr_processes()
-        claudes, evidence = _claudes(processes)
-        marked = list(_herdr_marked(claudes, evidence, processes))
+        claudes, unread = _claudes(processes)
+        marked = list(_herdr_marked(claudes, unread, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
     found: dict[str, dict[str, list[MarkedUnit]]] = {}
