@@ -87,15 +87,9 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
   - The worker stays open until `end_session.sh`.
 - **Neither flag**: runs the fresh blind reviewer through `agent_exec.sh … readonly`, with no address (`mesh=none`). The skills use this form only for a review outside a run.
 
-**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` records five things:
+**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
 
-- `git rev-parse HEAD`
-- `git status --porcelain`
-- a SHA-256 of `git diff HEAD`
-- a SHA-256 over every untracked, non-ignored file's name and content (a symlink's target, for symlinks)
-- the changed paths
-
-After the turn it compares the first four. Any difference makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
+After the turn `review_tree.py changes` checks every path that was dirty before or after, or that HEAD moved under, and lists each one whose entries differ. When two or more phases are open in the session and the review names its phase with `--phase`, a changed path that another open phase's `phases/<phase>/files` list holds is that phase's writer at work: the launcher log notes it and the check leaves it out. A path the reviewed phase holds, or no phase holds, stays the review's. Any path left makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
 
 ### Choosing a worker for a review
 
