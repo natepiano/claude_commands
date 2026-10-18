@@ -458,17 +458,17 @@
     }
   },
   "shutdown.restart_failed": {
-    "many_long_names": {
+    "one_long_name": {
       "objections": [],
-      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 60 Spec 4 and Phase 63 Spec 4: a failed-restart push names each session (user report via the showrunner, 2026-10-17); reviewer: opus",
-      "sha256": "1957c94c28f01190d4200c14074336b3e56838e63ac3a31b6219b954819aa39b",
-      "time": "2026-10-17T19:25:50.277221-04:00"
+      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 65 Spec 4: example key renamed, text unchanged (showrunner add-on, 2026-10-17); reviewer: opus",
+      "sha256": "18e1f2b816796ea65e2488c2166f6ff89dc8e4113c30408ef7c3853b6788b3c6",
+      "time": "2026-10-17T21:43:37.983637-04:00"
     },
     "typical": {
       "objections": [],
-      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 60 Spec 4 and Phase 63 Spec 4: a failed-restart push names each session (user report via the showrunner, 2026-10-17); reviewer: opus",
-      "sha256": "1957c94c28f01190d4200c14074336b3e56838e63ac3a31b6219b954819aa39b",
-      "time": "2026-10-17T19:25:40.013021-04:00"
+      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 65 Spec 4: example key renamed, text unchanged (showrunner add-on, 2026-10-17); reviewer: opus",
+      "sha256": "18e1f2b816796ea65e2488c2166f6ff89dc8e4113c30408ef7c3853b6788b3c6",
+      "time": "2026-10-17T21:43:29.144586-04:00"
     }
   },
   "shutdown.restart_incomplete": {

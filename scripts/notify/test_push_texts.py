@@ -107,6 +107,9 @@ class PushTextTests(unittest.TestCase):
 
     def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
+        self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
+        stop = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.stop_failed")
+        self.assertEqual({example.name for example in stop.examples}, {"typical", "many_long_names"})
         for example in entry.examples:
             with self.subTest(example=example.name):
                 push = push_texts.render_entry(entry, example.values)

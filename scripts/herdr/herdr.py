@@ -969,7 +969,7 @@ class Herdr:
         # the border immediately followed by the composer marker can be one.
         top_borders = [i for i, line in enumerate(lines[:closing])
                        if re.fullmatch(r"\s*[─━-]{3,}(?:\s+.+\s+[─━-]+)?\s*", line)
-                       and re.match(r"^\s*[❯>]", lines[i + 1])]
+                       and re.match(r"^[❯>]", lines[i + 1])]
         if not top_borders:
             return False
         # Footer rows are indented. Column-zero output after an old composer
@@ -977,7 +977,7 @@ class Herdr:
         if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
             return False
         region = lines[top_borders[-1] + 1:closing]
-        region[0] = re.sub(r"^\s*[❯>]\s*", "", region[0])
+        region[0] = re.sub(r"^[❯>]\s*", "", region[0])
         # Physical screen wraps can split a word or path without a space.
         # Inside a word only a screen newline may intervene; between words the
         # prompt still requires whitespace, so different input cannot match by
