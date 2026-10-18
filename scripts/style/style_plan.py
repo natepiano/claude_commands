@@ -303,10 +303,6 @@ def _is_name_bindings_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "name-bindings-to-match-parameters.md"
 
 
-def _is_comments_name_constructs_rule(rule_id: str) -> bool:
-    return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "comments-name-code-constructs.md"
-
-
 def _is_when_to_split_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "when-to-split-a-module.md"
 
@@ -544,9 +540,6 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
         *([f"`{ticket['crate']}` is binary-only (no library target): none of its items, `pub` or not, is public outside the crate."]
           if crate_targets is CrateTargets.BINARY_ONLY else []),
-        # Temporary: remove this guidance once comments-name-code-constructs.md carries the sentence.
-        *(["Keep every reason a comment states; name the constructs in addition to it, never in its place."]
-          if any(_is_comments_name_constructs_rule(pinned.rule_id) for pinned in texts) else []),
         *(["A conversion between the binding and the call passes through: `map_or`, `From::from`, `.into()`, "
            + "an accessor such as `.path()` or `.as_str()`, and a method that returns the same value in another form, "
            + "such as `.to_local_def_id()`; name the binding after the parameter the converted value fills. "
