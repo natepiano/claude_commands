@@ -21,7 +21,8 @@
 #             first: "<session> - unit director …" for a unit director, "<session> showrunner"
 #             for a showrunner.
 #             Line 2: "<account> | 5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
-#             each piece only when present, each " until ..." only when its window carries a reset time.
+#             each piece only when present, the 5-hour piece only when under 10% is left,
+#             each " until ..." only when its window carries a reset time.
 #             Line 3, when present: this session's "For you: …" counts row, from
 #             the "<session id> <row>" lines in $counts that statusline.sh reads
 #             from each showrunner's counts cache, with each count in bold.
@@ -177,7 +178,10 @@ def usage($config; $label; $window; $fmt):
      (if $account == "" or ($account | contains("@")) then empty
       elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
       else $account end | . as $label | color($colors; "account." + $label)),
-     usage($colors; "5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
+     # The 5-hour window shows only when under 10% of it is left (user, 2026-10-18).
+     (window("five_hour"; .rate_limits.five_hour?) as $five_hour
+      | select((remaining($five_hour) // 100) < 10)
+      | usage($colors; "5-hour"; $five_hour; "%H:%M")),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
 | ((.session_id // "") as $id

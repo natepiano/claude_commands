@@ -161,6 +161,11 @@ the merge branch. Merge history follows that commit, so the unit's past merges s
 the new id. Then it relaunches the unit and verifies that nothing live still holds the old name.
 `review-unit` and `nightly-review-unit` keep their names.
 
+To retire a unit, run `/showrunner:retire_unit <unit>` from the showrunner session. It refuses
+while the unit has uncommitted work or a checkpoint not merged. It stops everything the unit owns
+(its sessions, Codex seats, reviewers, holds, reservations, Mac claims and processes), marks the row
+retired, and removes the worktree and branch. `--dry-run` lists all of it and changes nothing.
+
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
 The status script, the dailies, the waits and the stall watch then skip it. The word
