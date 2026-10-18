@@ -289,43 +289,17 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 **Depends on:** Phase 9
 **Blocked by:** G6, G7
 
-#### Work Order
+#### As-built
 
-**Goal:** the 24 hours after T_rounds are measured on Phase 4's two limits, and the as-built records PASS or FAIL for each.
-
-**Spec:**
-
-The showrunner, 2026-10-17: "Then Phase 10: re-measure over 24 hours against the same two limits."
-
-The wake: at Phase 9's checkpoint, the unit director creates
-`zsh ~/.claude/scripts/message/notifier.sh new mul-add-rounds-remeasure --every 15 --to session:<this session's id> --from mul-add-rounds-remeasure --command "mul-add rounds re-measure due: run phase 10" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py window <phase-9-checkpoint> 24"`
-and removes it on the wake.
-
-Method: copy Phase 8's `measure.py`, `commits.py` and `audit.py` from `~/.local/state/mul-add-hook/lint-rewrite/` into `~/.local/state/mul-add-hook/lint-rounds/` and run the copies with the window T_rounds ≤ start < T_rounds + 24 h, by Phase 8's per-call verdict rule. Report what Phase 8 reported, plus rounds per call (each saved count line is one round; sum the fixes of every line) and how many calls the 5-round cap stopped. Rank what remains by failed verdicts, as Phase 8 did. `audit.py` re-derives the counts independently and must PASS.
-
-The copies change where Phase 8's scripts assume one replay per call:
-- **Cohort.** A call belongs to the window when its first judgment starts inside it. Read each call's complete step sequence, even past the window's end, before picking its final judgment; never let an initial judgment stand as the verdict because the final one started after the window closed.
-- **Counts per call.** `measure.py` (around lines 181–185) refuses repeated call ids and more than one count line, and `audit.py` expects one count line: read each call's count log once, sum every line, and sum replay durations separately from the judgments. `audit.py` re-derives both totals on its own.
-- **Rounds and cap stops.** A round is one saved count line, and a replay that applied nothing or failed adds none. The cap message lives only in lint output, which is not always kept, so a cap stop is a call with five saved count lines. A call with four lines followed by a failed fifth replay is not a cap stop. Where a call's count log is missing, report its rounds as unknown, never as zero.
-- **Replay history.** `commits.py` keys replay evidence by call id alone (around lines 109 and 142), which would keep only the last round. Keep every round's replay in order per call, so a call that rewrote in round one and then failed stays apart from one that never rewrote anything.
-
-If both limits PASS, the as-built proposes retiring the edit hook; the proposal goes to the showrunner, and nothing is removed in this phase. If either FAILs, the as-built names the largest remaining cause by failed verdicts.
+- Window 2026-10-17 16:59:51 EDT (2026-10-17T20:59:51Z) ≤ first judgment < 2026-10-18 16:59:51 EDT. Each call is read to its end, and its verdict is its final judging clippy step, also when that step starts after the window. Both limits **PASS**: 0 of 147 final verdicts fail with `suboptimal_flops` (0.000 per 100, limit 1.979), and the sole-cause seat cost is 0.000 seat-hours a day (limit 0.100). 42 verdicts fail on other errors. `audit.py` PASS.
+- 26 replays in 12 calls add 2,285.385 s of clippy time. The count logs hold 37 fixes in 14 applied rounds: ten calls need one round and two calls need two. No call reaches the five-round cap, and no call has an unknown round count.
+- The as-built section is "Rewrite rounds, re-measure". It proposes to retire the multiply-add edit hook; the proposal is with the showrunner, and nothing is removed.
 
 **Files:**
-- `docs/as-built/build-followups-mul-add.md` — "Rewrite rounds, re-measure" under "Measured outcome", with the bounded SQL
-- `~/.local/state/mul-add-hook/lint-rounds/` — outside the repository: the copied scripts and their JSON
+- `docs/as-built/build-followups-mul-add.md` — "Rewrite rounds, re-measure"
+- `~/.local/state/mul-add-hook/lint-rounds/` — `measure.py`, `commits.py`, `audit.py`, `synthetic_checks.py` and their JSON
 
-**Workers:** 1 writer + 1 adversary review.
-- `impl` — the scripts' copies, their synthetic checks, the run, the as-built section
-
-**Constraints from prior phases:**
-- Phase 4's limits: 1.979 per 100 and 0.100 seat-hours a day. Phase 8's result (4.032 and 0.448, per call) is the baseline row.
-- Phase 8: the verdict is the last judging clippy step per `call_id`; JSON replay steps (`--message-format=json` in argv) are never verdicts. Warning counts include repeated diagnostics, so causes are ranked by failed verdicts.
-- Count logs stay in `~/.local/state/mul-add-hook/lint-rewrite/<call_id>.log` (Phase 9 writes one line per round there). `watch.py`'s `rewrite_count` already sums every round's line.
-- Phase 9: a rewrite call now runs one first judgment, up to five JSON replays and one final judgment, all with `--keep-going`; the verdict rule above still picks the final judgment. A call the cap stopped prints `verify.sh: stopped the multiply-add rewrite after 5 rounds` in its lint output. A replay or applier failure in a later round keeps the earlier rounds' edits and still formats and judges.
-- The build log index is UTC; state times in EDT with UTC beside them. Never write `~/.local/state/buildlog`, the block log or the hana tree.
-
-**Acceptance gate:** synthetic checks run against the copied scripts and pass: two applied rounds then an empty replay (2 rounds, fixes summed once); five applied rounds (one cap stop); four applied rounds then a failed fifth replay (not a cap stop); a round-one rewrite followed by a failed replay (kept apart from a call that never rewrote); a call whose first judgment is inside the window and whose final judgment is after it (verdict taken from the final judgment). `audit.py` PASS; both verdicts stated with their arithmetic; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
+**Gotchas:** the build index lags the build log by minutes, so a call that has ended can still lack its completion record; the scripts refuse a verdict until every cohort call has one. A per-step count of the same window gives 14.130 per 100, because rewrite rounds fix what an early step reports; only the final judgment is a verdict.
 
 ## Out of scope
 
