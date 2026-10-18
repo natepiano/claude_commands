@@ -631,7 +631,11 @@ Pending: parent's saved style child summary and rendered style line.
   finding is dropped, because `parallel_cases.rs` is shared with an
   integration test and cannot fold back. The ChildReportFailure finding is
   credited, because moving the hook suite fixes it. A test pins the line;
-  it fails before the fix. A one-judge re-sample is being scored.
+  it fails before the fix. After it, one blind judge per batch finds 34
+  of the 35 references (97.1%; the miss is a reciprocal sibling dependency
+  in birth_stamp). A blind check of the 15 findings outside the reference,
+  the four new splits first, rules all 15 real: the step adds no
+  over-splitting.
 - **Fix AD — tickets pinning `comments-name-code-constructs` keep every stated reason** (commit `8b0f18b0`):
   on cargo-liner, names writers replaced reason-giving comments with
   narration of the code. Neither the rule nor the ticket said to keep the
