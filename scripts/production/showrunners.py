@@ -258,6 +258,25 @@ def current_name(slug: str) -> str:
     return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
 
 
+def herdr_space(slug: str, doc: str) -> str:
+    """The shared herdr session's workspace for a production, named for its showrunner.
+
+    The doc's `Showrunner session:` line names it, else the slug. The name never depends on whether
+    the showrunner runs, so a unit restarted before its showrunner finds the same workspace.
+    """
+    try:
+        text = Path(doc).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        text = ""
+    line = re.search(r"^- \*\*Showrunner session:\*\*\s*`?([^`\s]+)`?\s*$", text, re.MULTILINE)
+    return line[1] if line else slug
+
+
+def tab_title(slug: str, session: str) -> str:
+    """A session's tab title in its production's workspace: its name without the production prefix."""
+    return session.removeprefix(f"{slug}-")
+
+
 def current_address(slug: str) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""

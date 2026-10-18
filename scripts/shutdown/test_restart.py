@@ -1868,6 +1868,7 @@ class RestartTests(ShutdownTestCase):
                 restart.SharedHerdrTab("agents"), owner, dry_run=False)
         self.assertEqual(result.prompt_outcome, failed)
         opened.assert_called_once()
+        self.assertEqual(opened.call_args.args[1:4], ("ad-hoc", "kept name", "kept name"))
         pane.assert_not_called()
         self.assertEqual(start.call_args.args[1], "destination:p1")
         opening = cast(herdr.OpeningPrompt, start.call_args.kwargs["opening"])
