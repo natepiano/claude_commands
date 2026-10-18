@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.production import showrunners
@@ -268,6 +268,71 @@ class RefusalWatchTests(unittest.TestCase):
     def hold_rule(self, name: str = "units-low", *, target: str = "claude2",
                   minutes: float = 10) -> next_moves.ClaudeGroupMove:
         return next_moves.ClaudeGroupMove(name, "units", 1, minutes, target, NOW)
+
+    def test_list_and_runner_share_the_current_hold_verdict_for_every_selection_state(self) -> None:
+        entry = self.hold_rule("shared-verdict", minutes=30)
+        self.next_entries(entry)
+        # Without a fresh reading, the runner can only retain or discard this hold.
+        usage_store.write({})
+        duration = next_moves.ResolvedHold(30, next_moves.FixedHold(30))
+        recorded = accounts.GroupTransition("current-move", accounts.HandOrigin())
+        no_transition = accounts.NoGroupTransition()
+        cases: tuple[tuple[str, str | accounts.GroupNotConfigured,
+                           accounts.GroupTransition | accounts.NoGroupTransition,
+                           str, str | accounts.NoGroupTransition, float, bool], ...] = (
+            ("current recorded move", "claude1", recorded, "claude1", "current-move", 1, True),
+            ("account differs", "claude3", recorded, "claude1", "current-move", 1, False),
+            ("group unconfigured", accounts.GroupNotConfigured(), recorded, "claude1", "current-move", 1, False),
+            ("move id differs", "claude1", recorded, "claude1", "previous-move", 1, False),
+            ("legacy hold against recorded move", "claude1", recorded, "claude1", no_transition, 1, False),
+            ("recorded hold against legacy selection", "claude1", no_transition, "claude1", "current-move", 1, False),
+            ("both legacy transitions", "claude1", no_transition, "claude1", no_transition, 1, True),
+            ("percent differs", "claude1", recorded, "claude1", "current-move", 2, False))
+        for reason, selected_account, transition, held_account, held_move, percent, current in cases:
+            with self.subTest(reason=reason):
+                selected: accounts.GroupAccounts = {}
+                if isinstance(selected_account, str):
+                    selected["units"] = selected_account
+                held = refusal_watch.HoldStarted(held_account, NOW, held_move, percent, duration)
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+                    auto_move_holds={entry.id: held}))
+                with (patch.object(accounts, "group_accounts", return_value=selected),
+                      patch.object(accounts, "group_transition", return_value=transition)):
+                    shown = refusal_watch.started_next_move_holds((entry,))
+                    self.assertEqual(refusal_watch.run_auto_moves(NOW), [])
+                expected_shown = {entry.id: next_moves.StartedHold(NOW, duration)} if current else {}
+                self.assertEqual(shown, expected_shown)
+                saved = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(saved, {entry.id: held} if current else {})
+                self.assertEqual(bool(shown), entry.id in saved)
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+
+    def test_list_and_runner_both_follow_the_shared_predicate_when_its_verdict_is_forced(self) -> None:
+        entry = self.hold_rule("forced-verdict", minutes=30)
+        self.next_entries(entry)
+        usage_store.write({})
+        selected: accounts.GroupAccounts = {"units": "claude1"}
+        transition = accounts.GroupTransition("current-move", accounts.HandOrigin())
+        duration = next_moves.ResolvedHold(30, next_moves.FixedHold(30))
+        for verdict in (False, True):
+            with self.subTest(verdict=verdict):
+                # Force rejection of a current hold and acceptance of a stale one.
+                held = refusal_watch.HoldStarted("claude3" if verdict else "claude1", NOW,
+                    "previous-move" if verdict else "current-move", 2 if verdict else 1, duration)
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+                    auto_move_holds={entry.id: held}))
+                with (patch.object(accounts, "group_accounts", return_value=selected),
+                      patch.object(accounts, "group_transition", return_value=transition),
+                      patch.object(refusal_watch.HoldStarted, "is_current", autospec=True,
+                                   return_value=verdict) as predicate):
+                    shown = refusal_watch.started_next_move_holds((entry,))
+                    self.assertEqual(refusal_watch.run_auto_moves(NOW), [])
+                expected_call = call(held, refusal_watch.GroupSelection("claude1", "current-move"), entry.at_percent)
+                self.assertEqual(predicate.call_args_list, [expected_call, expected_call])
+                self.assertEqual(shown, {entry.id: next_moves.StartedHold(NOW, duration)} if verdict else {})
+                self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}),  # pyright: ignore[reportPrivateUsage]
+                                 {entry.id: held} if verdict else {})
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
 
     def test_list_keeps_the_runners_started_minutes_after_restart_and_changed_pace(self) -> None:
         _ = self.groups()
