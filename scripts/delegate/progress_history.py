@@ -63,6 +63,9 @@ ARMED_REVIEW_KEY = "early_review"
 # holds the most recently started open phase under `phase`, which every reader
 # that needs "the open phase" uses, and the older open ones here, oldest first.
 OPEN_PHASES_KEY = "open_phases"
+# A phase closed by finish-phase takes no more passes, its plan review's included.
+CLOSED_PHASE_RULE = ("A finished phase takes no more passes: run its plan review before its finish-phase "
+                     + "(docs/delegate/phase_end.md, step 3 before step 5).")
 # The state that describes the current phase alone. A phase a newer one
 # displaces keeps its own copy under PARKED_KEY, and gets it back when the newer
 # one finishes and it is current again.
@@ -1405,7 +1408,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
     if phase_id and phase is None:
         open_ids = ", ".join(_open_phase_ids(state)) or "none"
-        raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
+        raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
     now = plan_history.now_epoch()
