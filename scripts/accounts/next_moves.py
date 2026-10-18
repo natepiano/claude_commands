@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
@@ -69,26 +69,103 @@ FIRST_GROUP_POSITION = GroupPosition(1)
 
 
 @dataclass(frozen=True)
+class FixedHold:
+    minutes: float
+
+    def __post_init__(self) -> None:
+        try:
+            valid = not isinstance(self.minutes, bool) and self.minutes >= 0 and math.isfinite(self.minutes)
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise NextMoveError("next: hold_minutes must be finite and nonnegative")
+
+
+@dataclass(frozen=True)
+class HalfPointHold:
+    """Wait for an estimated half point of the selected account's allowance."""
+
+
+HoldMode = FixedHold | HalfPointHold
+
+
+@dataclass(frozen=True)
+class PaceEstimate:
+    points_per_hour: float
+
+
+@dataclass(frozen=True)
+class NoUsablePace:
+    """Use the default because account history gives no positive pace."""
+
+
+@dataclass(frozen=True)
+class ResolvedHold:
+    minutes: float
+    source: FixedHold | PaceEstimate | NoUsablePace
+
+
+class GroupHoldResolver(Protocol):
+    def group_half_point_hold(self, group: Literal["units", "showrunners"], now: datetime) -> ResolvedHold: ...
+
+
+def account_pace(label: str, now: datetime) -> PaceEstimate | NoUsablePace:
+    from scripts.whoami import run_out
+
+    readings = run_out.read_readings(run_out.READINGS_LOG).get(label, [])
+    rate = run_out.weighted_rate(readings, now.timestamp())
+    if rate is None or not math.isfinite(rate) or rate <= 0:
+        return NoUsablePace()
+    return PaceEstimate(rate * 3600)
+
+
+def resolve_hold(mode: HoldMode, label: str, now: datetime) -> ResolvedHold:
+    if isinstance(mode, FixedHold):
+        return ResolvedHold(mode.minutes, mode)
+    pace = account_pace(label, now)
+    minutes = math.ceil(30 / pace.points_per_hour) if isinstance(pace, PaceEstimate) else 40
+    return ResolvedHold(minutes, pace)
+
+
+def parse_hold_mode(text: str) -> HoldMode:
+    if text == "half-point":
+        return HalfPointHold()
+    try:
+        return FixedHold(float(text))
+    except ValueError as error:
+        raise NextMoveError("next: hold must be half-point or nonnegative minutes") from error
+
+
+@dataclass(frozen=True, init=False)
 class ClaudeGroupMove:
     id: str
     group: Literal["units", "showrunners"]
     at_percent: float
-    hold_minutes: float
+    hold_mode: HoldMode
     to: str
     added_at: datetime
+
+    def __init__(self, id: str, group: Literal["units", "showrunners"], at_percent: float,
+                 hold_mode: HoldMode | float, to: str, added_at: datetime) -> None:
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "group", group)
+        object.__setattr__(self, "at_percent", at_percent)
+        object.__setattr__(self, "hold_mode", hold_mode if isinstance(hold_mode, (FixedHold, HalfPointHold)) else FixedHold(hold_mode))
+        object.__setattr__(self, "to", to)
+        object.__setattr__(self, "added_at", added_at)
+        self.__post_init__()
+
+    @property
+    def hold_minutes(self) -> float:
+        if not isinstance(self.hold_mode, FixedHold):
+            raise NextMoveError("next: half-point hold has no fixed minutes")
+        return self.hold_mode.minutes
 
     def __post_init__(self) -> None:
         if not self.id or self.group not in ("units", "showrunners"):
             raise NextMoveError("next: expected an id and units or showrunners")
         if isinstance(self.at_percent, bool) or not 0 <= self.at_percent <= 100 or not math.isfinite(self.at_percent):
             raise NextMoveError("next: percent must be from 0 to 100")
-        try:
-            valid_hold = (not isinstance(self.hold_minutes, bool) and self.hold_minutes >= 0
-                          and math.isfinite(self.hold_minutes))
-        except OverflowError:
-            valid_hold = False
-        if not valid_hold:
-            raise NextMoveError("next: hold_minutes must be finite and nonnegative")
         if not re.fullmatch(r"claude[1-9][0-9]*", self.to):
             raise NextMoveError("next: target must be a numbered Claude account")
         if self.added_at.utcoffset() is None:
@@ -146,8 +223,13 @@ def next_moves_file() -> Path:
 
 def encode_next_moves(entries: tuple[NextMove, ...]) -> str:
     return json.dumps([dict(id=entry.id, group=entry.group, at_percent=entry.at_percent,
-                            **({"hold_minutes": entry.hold_minutes} if isinstance(entry, ClaudeGroupMove) else {}),
+                            **(encode_hold_mode(entry.hold_mode) if isinstance(entry, ClaudeGroupMove) else {}),
                             to=target_label(entry), added_at=entry.added_at.isoformat()) for entry in entries])
+
+
+def encode_hold_mode(mode: HoldMode) -> dict[str, object]:
+    return ({"hold_mode": "fixed", "hold_minutes": mode.minutes} if isinstance(mode, FixedHold)
+            else {"hold_mode": "half-point"})
 
 
 def decode_next_moves(text: str) -> tuple[NextMove, ...]:
@@ -163,6 +245,9 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
             fields = cast(dict[str, object], item)
             name, group, target, added = (fields.get(key) for key in ("id", "group", "to", "added_at"))
             percent, hold = fields.get("at_percent"), fields.get("hold_minutes", 0)
+            mode = fields.get("hold_mode", "fixed")
+            if mode not in ("fixed", "half-point"):
+                raise NextMoveError("next: unknown hold mode")
             if (not isinstance(name, str) or group not in ("units", "showrunners", "workers")
                     or not isinstance(target, str) or not isinstance(added, str)
                     or not isinstance(percent, (int, float)) or isinstance(percent, bool)
@@ -170,13 +255,14 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
                 raise NextMoveError("next: invalid entry fields")
             entry: NextMove
             if group == "workers":
-                if hold != 0:
+                if hold != 0 or mode != "fixed":
                     raise NextMoveError("next: workers entries cannot hold minutes")
                 destination = DelegateToClaude() if target == "claude" else CodexWorkersTarget(target)
                 entry = WorkersMove(name, float(percent), destination, datetime.fromisoformat(added))
             else:
                 entry = ClaudeGroupMove(name, group, float(percent),
-                                        float(hold), target, datetime.fromisoformat(added))
+                                        HalfPointHold() if mode == "half-point" else FixedHold(float(hold)),
+                                        target, datetime.fromisoformat(added))
             if entry.id in ids:
                 raise NextMoveError("next: duplicate entry id")
             ids.add(entry.id)
@@ -249,10 +335,11 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
 
 
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
-                  hold_minutes: float = 0, *, insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
+                  hold_minutes: float | HoldMode = 0, *, insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
     # All text-to-domain conversions use the same boundary as file and remote reads.
     entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
-        hold_minutes=hold_minutes, to=to, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+        **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
+        to=to, added_at=datetime.now(timezone.utc).isoformat())]))[0]
     if not role_map.is_role_map_host():
         try:
             arguments = ("next-write", encode_next_moves((entry,)))
@@ -320,8 +407,17 @@ def move_next_move(group: NextMoveGroup, source: GroupPosition, destination: Gro
 
 
 def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSITION) -> str:
-    hold = (f", hold {entry.hold_minutes:g} min"
-            if isinstance(entry, ClaudeGroupMove) and entry.hold_minutes else "")
+    hold = ""
+    if isinstance(entry, ClaudeGroupMove):
+        if isinstance(entry.hold_mode, FixedHold):
+            if entry.hold_mode.minutes:
+                hold = f", hold {entry.hold_mode.minutes:g} min"
+        else:
+            resolver = cast(GroupHoldResolver, cast(object, import_module("scripts.accounts.accounts")))
+            duration = resolver.group_half_point_hold(entry.group, datetime.now(timezone.utc))
+            estimate = (f"{duration.minutes:g} min default: no pace history" if isinstance(duration.source, NoUsablePace)
+                        else f"≈{duration.minutes:g} min")
+            hold = f", hold half a point ({estimate})"
     return f"{entry.group} {position.value}: at {entry.at_percent:g}% → {target_label(entry)}{hold}"
 
 
@@ -330,3 +426,62 @@ def render_next_moves(entries: tuple[NextMove, ...]) -> str:
                           for index, entry in enumerate((entry for entry in entries if entry.group == group), 1))
                 for group in ("showrunners", "units", "workers")]
     return "\n\n".join(section for section in sections if section) or "nothing set up"
+
+
+def list_next_moves() -> str:
+    if role_map.is_role_map_host():
+        return render_next_moves(read_next_moves())
+    try:
+        return role_map.ssh_role_map(("next", "list")).rstrip("\n")
+    except role_map.RemoteCommandRefused as error:
+        raise NextMoveError(str(error)) from error
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NextMoveError(f"next: remote list failed: {error}") from error
+
+
+@dataclass(frozen=True)
+class ExpectedNextMove:
+    percent: float
+    target: str
+
+
+@dataclass(frozen=True)
+class UncheckedNextMove:
+    """Apply the hold change to the current entry at this position."""
+
+
+UNCHECKED_NEXT_MOVE = UncheckedNextMove()
+
+
+def update_next_move_hold(group: NextMoveGroup, position: GroupPosition, mode: HoldMode,
+                          expected: ExpectedNextMove | UncheckedNextMove = UNCHECKED_NEXT_MOVE) -> str:
+    if group == "workers":
+        raise NextMoveError("next: workers entries cannot hold")
+    if not role_map.is_role_map_host():
+        arguments = ("next", "hold", group, str(position.value),
+                     "half-point" if isinstance(mode, HalfPointHold) else repr(float(mode.minutes)))
+        if isinstance(expected, ExpectedNextMove):
+            arguments += ("--expect", repr(float(expected.percent)), expected.target)
+        try:
+            return role_map.ssh_role_map(arguments).rstrip("\n")
+        except role_map.RemoteCommandRefused as error:
+            raise NextMoveError(str(error)) from error
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise NextMoveError(f"next: remote hold failed: {error}") from error
+    watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
+    try:
+        with watcher.editing_next_moves() as edit:
+            entries = read_next_moves()
+            group_entries = [entry for entry in entries if entry.group == group]
+            if position.value > len(group_entries):
+                raise GroupPositionOutOfRange(group, position, len(group_entries))
+            entry = group_entries[position.value - 1]
+            if isinstance(expected, ExpectedNextMove) and (entry.at_percent != expected.percent or target_label(entry) != expected.target):
+                raise NextMoveError(f"next: {group} {position.value} is now at {entry.at_percent:g}% → {target_label(entry)}; nothing changed")
+            if not isinstance(entry, ClaudeGroupMove):
+                raise NextMoveError("next: workers entries cannot hold")
+            changed = replace(entry, hold_mode=mode)
+            edit.commit(tuple(changed if saved.id == entry.id else saved for saved in entries))
+            return render_next_move(changed, position)
+    except OSError as error:
+        raise NextMoveError(f"next: cannot update hold: {error}") from error

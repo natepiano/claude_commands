@@ -435,7 +435,8 @@ class CommandLine(argparse.Namespace):
     next_action: str = ""
     group: next_moves.NextMoveGroup = "units"
     percent: float = 0
-    hold_minutes: float = 0
+    hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
+    next_expect: list[str] = []
     next_position: next_moves.GroupPosition = next_moves.GroupPosition(1)
     next_destination: next_moves.GroupPosition = next_moves.GroupPosition(1)
     insertion: next_moves.AppendToGroup | next_moves.InsertAt = next_moves.AppendToGroup()
@@ -4031,7 +4032,14 @@ def _parser() -> argparse.ArgumentParser:
     _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
-    _ = next_add.add_argument("--hold-minutes", type=float, default=0)
+    hold_options = next_add.add_mutually_exclusive_group()
+    _ = hold_options.add_argument("--hold-minutes", dest="hold_mode",
+                                  type=lambda text: next_moves.FixedHold(float(text)), default=next_moves.FixedHold(0))
+    def half_point_hold(text: str) -> next_moves.HalfPointHold:
+        if text != "half-point":
+            raise argparse.ArgumentTypeError("hold must be half-point")
+        return next_moves.HalfPointHold()
+    _ = hold_options.add_argument("--hold", dest="hold_mode", type=half_point_hold)
     _ = next_add.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
     _ = next_verbs.add_parser("list")
     next_remove = next_verbs.add_parser("remove")
@@ -4043,6 +4051,11 @@ def _parser() -> argparse.ArgumentParser:
     _ = next_move.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_move.add_argument("next_position", type=position)
     _ = next_move.add_argument("next_destination", type=position)
+    next_hold = next_verbs.add_parser("hold")
+    _ = next_hold.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_hold.add_argument("next_position", type=position)
+    _ = next_hold.add_argument("hold_mode", type=next_moves.parse_hold_mode)
+    _ = next_hold.add_argument("--expect", dest="next_expect", nargs=2, default=[], metavar=("PERCENT", "TARGET"))
     parser.set_defaults(action="status", as_json=False, stored=False, with_login=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
@@ -4091,6 +4104,12 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def group_half_point_hold(group: ClaudeGroup, now: datetime) -> next_moves.ResolvedHold:
+    label = group_label(group_accounts(), group)
+    return (next_moves.resolve_hold(next_moves.HalfPointHold(), label, now) if isinstance(label, str)
+            else next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+
+
 def validate_next_move_target(entry: next_moves.NextMove) -> None:
     if isinstance(entry, next_moves.ClaudeGroupMove):
         _ = claude_account_dir(entry.to)
@@ -4127,11 +4146,11 @@ def main(argv: list[str]) -> int:
             if options.next_action == "add":
                 if role_map.is_role_map_host():
                     candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
-                        at_percent=options.percent, hold_minutes=options.hold_minutes, to=options.label,
+                        at_percent=options.percent, **next_moves.encode_hold_mode(options.hold_mode), to=options.label,
                         added_at=datetime.now(timezone.utc).isoformat())]))[0]
                     validate_next_move_target(candidate)
                 _ = next_moves.add_next_move(options.group, options.percent, options.label,
-                                             options.hold_minutes, insertion=options.insertion)
+                                             options.hold_mode, insertion=options.insertion)
                 print(next_moves.render_next_moves(next_moves.read_next_moves()) if role_map.is_role_map_host()
                       else f"added {options.group} next move")
             elif options.next_action == "remove":
@@ -4140,9 +4159,19 @@ def main(argv: list[str]) -> int:
             elif options.next_action == "move":
                 next_moves.move_next_move(options.group, options.next_position, options.next_destination)
                 print(f"moved {options.group} {options.next_position.value} to {options.next_destination.value}")
+            elif options.next_action == "hold":
+                expected: next_moves.ExpectedNextMove | next_moves.UncheckedNextMove = next_moves.UncheckedNextMove()
+                if options.next_expect:
+                    try:
+                        percent = float(options.next_expect[0])
+                    except ValueError as error:
+                        raise next_moves.NextMoveError("next: expected percent must be from 0 to 100") from error
+                    if not math.isfinite(percent) or not 0 <= percent <= 100:
+                        raise next_moves.NextMoveError("next: expected percent must be from 0 to 100")
+                    expected = next_moves.ExpectedNextMove(percent, options.next_expect[1])
+                print(next_moves.update_next_move_hold(options.group, options.next_position, options.hold_mode, expected))
             else:
-                entries = next_moves.read_next_moves()
-                print(next_moves.render_next_moves(entries))
+                print(next_moves.list_next_moves())
             return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():
