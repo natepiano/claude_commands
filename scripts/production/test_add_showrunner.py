@@ -384,7 +384,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(prompt.call_count, 1)
         self.assertEqual(keys.call_count, 1)
         readiness.assert_called_once_with("destination:p1")
-        self.assertEqual(tab.call_args.args[:3], ("agents", "kid", "kid"))
+        self.assertEqual(tab.call_args.args[:4], ("agents", "kid", "kid", "kid"))
         self.assertGreaterEqual(elapsed, 5)
 
     def test_unsubmitted_showrunner_is_named_and_never_attached_even_if_live(self) -> None:

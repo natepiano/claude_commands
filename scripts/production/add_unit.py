@@ -23,6 +23,7 @@ sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import autocompact
 import rename_state
+import showrunners
 import unit_lookup
 import unit_names
 from production_units import Refusal, cell_value, production_field, unit_rows, unit_headings, unit_table
@@ -758,7 +759,9 @@ def launch_session(
     host = herdr.shared_session()
     if host:
         _ = herdr.start_server(host, timeout_ms)
-        pane = herdr.open_tab(host, request.production.slug, name, str(request.session_cwd), environment)
+        production = request.production
+        pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
+                              showrunners.tab_title(production.slug, name), name, str(request.session_cwd), environment)
     else:
         host = name
         herdr.start_new_server(host, timeout_ms)
