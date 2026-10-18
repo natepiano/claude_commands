@@ -1987,3 +1987,40 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:** a `restart failed` record can belong to a live session; any new surface that prints a restart command for one reads `restart_failed_liveness` first, or following it starts a second copy.
 
 **Ruled out:** a type alias for the three-way liveness union (polish only).
+
+### Phase 71 — A running session's unconfirmed restart can be closed  · status: done
+
+#### Work Order
+
+**Goal:** a `restart failed` record whose session is running never keeps that session out of a move, and every line that tells the user to check such a session also names the command that closes its record.
+
+**Constraints from prior phases:** showrunner ruling 2026-10-18 01:5x EDT. After Phase 70, a live session's `restart failed` record stays in `sessions/` until `shutdown forget`. Until then every move refuses the session with `already has a shutdown in progress`: `move_sessions` in `scripts/accounts/accounts.py` (~2832, the path hand, group, refusal and auto moves share) and the hand-move check (~3133). An exhausted account therefore could not move cargo-liner-style or cargo-liner tonight; both records were closed by hand with `forget` at 01:46 EDT. The code today:
+- The running line `<name>: restart prompt not confirmed; session is running — check it` is written in three places: `shutdown._shutdown_record_lines` (`scripts/shutdown/shutdown.py` ~396), `shutdown._follow_action` (~773) and `settle.report_stop` (`scripts/shutdown/settle.py` ~1374). `settle.tell_showrunners_outcome` (~1505) tells a showrunner `<name> is back on <target>; its restart prompt was not confirmed — check it`.
+- `shutdown forget <id> --account <login>` (`_forget`, shutdown.py ~576) archives a `restart failed` record to `history/` through `record.forget_session` (`scripts/shutdown/record.py` ~1806), then calls `acknowledge_snapshot`.
+- `settle.shutdown_command(*arguments)` (~601) builds a runnable shutdown command.
+- `restart.restart_failed_liveness(saved)` and `restart.restart_failed_session_running(saved)` read liveness without changing the record (Phase 70).
+
+**Spec:**
+1. **The line names the closing command.** One function in `settle.py` returns the running line: `<name>: restart prompt not confirmed; session is running — check it, then close its record: <command>`, where `<command>` is `settle.shutdown_command("forget", <session id>, "--account", <login>)`. `shutdown status`, `follow` and the stop report all use it, so the text has one source. The showrunner message becomes `<name> is back on <target>; its restart prompt was not confirmed — check it, then close its record: <command>`.
+2. **A move closes a running session's unconfirmed restart.** Where a move would refuse a session with `already has a shutdown in progress`, a `restart failed` record whose session is live does not refuse. The move archives that record exactly as `forget` does (`record.forget_session`, then `acknowledge_snapshot`), prints `<name>: closed its unconfirmed restart record; the session is running`, and moves the session as it would any other. Unknown liveness, a session that is not live, and every other record kind still refuse as today. `--dry-run` archives nothing; its preview says the record will be closed.
+3. **Nothing else changes.** `forget` keeps its behavior, the journal's `failed` line stays, and the record is still never confirmed or moved to `restarted`.
+
+**Files:**
+- `scripts/shutdown/settle.py` — the shared running line; `report_stop` and `tell_showrunners_outcome` use it.
+- `scripts/shutdown/shutdown.py` — status and follow use the shared line.
+- `scripts/accounts/accounts.py` — the move paths close a running session's `restart failed` record.
+- `scripts/shutdown/record.py` — `forget_failed_restart`, the guarded archive a move uses (review repair).
+- `scripts/accounts/refusal_watch.py` — the watcher no longer skips a running session's unconfirmed restart (review repair).
+- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py` — the line names the command on every surface.
+- `scripts/accounts/test_moves.py` — the move closes a live failed record and refuses the rest.
+- `scripts/shutdown/test_record.py`, `scripts/accounts/test_refusal_watch.py` — the guarded archive and the watcher regressions.
+
+**Workers:** 1 writer + 1 tester. impl owns `settle.py`, `shutdown.py` and `accounts.py`; test owns the three test files.
+
+**Verification:** scratch-HOME suites `scripts.shutdown.test_restart scripts.shutdown.test_account_move scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle scripts.accounts.test_moves scripts.accounts.test_accounts scripts.accounts.test_refusals scripts.accounts.test_refusal_watch scripts.accounts.test_next_moves scripts.notify.test_push_texts`; basedpyright 0/0 on the changed files.
+
+**Acceptance gate:**
+- **Line:** for a live session's `restart failed` record, `shutdown status`, `follow`, the stop report and the showrunner message each print the closing command `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py forget <id> --account <login>`, and running that command closes the record.
+- **Move (field case):** a hand move and an auto move of a live session with a `restart failed` record archive the record to `history/`, print the closed line, and move the session. On today's code both refuse with `already has a shutdown in progress`.
+- **Still refused:** unknown liveness, a session that is not live, and any other record kind refuse as today; `--dry-run` archives nothing.
+- **Suites:** they pass, basedpyright reports 0/0, and the merge gate on natedev passes.

@@ -605,6 +605,16 @@ def shutdown_command(*arguments: str) -> str:
         + shlex.join(arguments)
     )
 
+
+def running_restart_line(saved: SessionShutdown, *, for_showrunner: bool = False) -> str:
+    """Explain an unconfirmed live restart and how to close its record."""
+    command = shutdown_command("forget", saved["session"]["session_id"], "--account", saved["login"])
+    name = saved["session"]["name"]
+    subject = (f"{name} is back on {saved.get('target') or saved['label']}; its restart prompt was not confirmed"
+               if for_showrunner else f"{name}: restart prompt not confirmed; session is running")
+    return f"{subject} — check it, then close its record: {command}"
+
+
 def _warm() -> bool:
     try:
         result = subprocess.run(
@@ -1371,7 +1381,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
     for saved in records:
         progress = saved["progress"]
         if saved["session"]["session_id"] in running:
-            lines.append(f"  {saved['session']['name']}: restart prompt not confirmed; session is running — check it")
+            lines.append("  " + running_restart_line(saved))
         elif progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
             lines.append(f"  {saved['session']['name']}: {progress['reason']}")
         elif progress["kind"] == "manual restart":
@@ -1502,7 +1512,7 @@ def tell_showrunners_outcome(records: list[SessionShutdown], *,
             observed = restart_work.restart_failed_liveness(saved)
         if progress["kind"] == "restart failed" and isinstance(observed, restart_work.SessionLive):
             told = SHOWRUNNER_TOLD_BACK
-            summary = f"{name} is back on {saved.get('target') or saved['label']}; its restart prompt was not confirmed — check it"
+            summary = running_restart_line(saved, for_showrunner=True)
             text = summary
         elif progress["kind"] in {"restarted", "timers pending"}:
             told = SHOWRUNNER_TOLD_BACK
