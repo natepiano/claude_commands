@@ -170,6 +170,28 @@ class StyleLedgerTests(unittest.TestCase):
             "--after", "new_name", "--rule-blob", rule_blob or self.blob(rule), "--ticket", ticket,
         ).stdout.strip()
 
+    def test_latest_held_judgments_selects_each_cells_latest_commit_and_excludes_later_non_held_verdicts(self) -> None:
+        rule = self.rule("read")
+        other_rule = self.rule("other-read")
+        self.record(rule, self.sources[0], self.initial_tip, "held")
+        self.record(rule, self.sources[1], self.initial_tip, "held")
+        self.record(other_rule, self.sources[0], self.initial_tip, "held")
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        tip = self.commit("Change the held file")
+        self.record(rule, self.sources[0], tip, "held")
+        ledger = self.ledger()
+        self.assertEqual(ledger.latest_held_judgments(), {
+            (rule, self.sources[0]): tip,
+            (rule, self.sources[1]): self.initial_tip,
+            (other_rule, self.sources[0]): self.initial_tip,
+        })
+
+        self.record(rule, self.sources[0], tip, "clean", ticket="later-clean")
+        self.assertEqual(ledger.latest_held_judgments(), {
+            (rule, self.sources[1]): self.initial_tip,
+            (other_rule, self.sources[0]): self.initial_tip,
+        })
+
     def structure_module(self) -> tuple[str, str, str, str]:
         path = "crates/alpha/src/theme/colors.rs"
         sibling = "crates/alpha/src/theme/mod.rs"

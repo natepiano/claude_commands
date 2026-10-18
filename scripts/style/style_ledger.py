@@ -1347,6 +1347,15 @@ class Ledger:
                  datetime.now(timezone.utc).isoformat()),
             )
 
+    def latest_held_judgments(self) -> dict[tuple[str, str], str]:
+        """Return judgment commits for cells whose latest verdict is held."""
+        rows = cast(list[tuple[str, str, str]], self._connection.execute(
+            'SELECT j.rule,j.path,j."commit" FROM judgments j WHERE j.verdict=\'held\' '
+            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.rule=j.rule AND latest.path=j.path '
+            + 'ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
+        ).fetchall())
+        return {(rule, path): commit for rule, path, commit in rows}
+
     def lint_record(self, tip: str, tool: LintTool, passed: bool, diagnostics: dict[str, int]) -> None:
         if any(count < 0 for count in diagnostics.values()):
             raise LedgerError("diagnostic counts must be nonnegative")

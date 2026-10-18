@@ -311,6 +311,32 @@ def _is_when_to_split_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "when-to-split-a-module.md"
 
 
+def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
+    """Leave unchanged held sites with open proposals out of coverage work."""
+    held = ledger.latest_held_judgments()
+    findings: dict[tuple[str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
+    for finding in ledger.held_findings(style_ledger.AllHeldFindings()):
+        findings[(finding.rule, finding.path)].append(finding)
+    tip = synced_tip(ledger)
+    result: list[style_ledger.Cell] = []
+    for cell in ledger.cells():
+        key = (cell.rule, cell.path)
+        if cell.state in ("open", "stale") and key in held and findings[key]:
+            if all(isinstance(finding.state, style_ledger.Filed)
+                   and frontmatter(finding.state.proposal).get("status") == ["open"]
+                   for finding in findings[key]):
+                try:
+                    previous = git(ledger.repo, "rev-parse", "--verify", f"{held[key]}:{cell.path}")
+                    current = git(ledger.repo, "rev-parse", "--verify", f"{tip}:{cell.path}")
+                except style_ledger.LedgerError:
+                    pass
+                else:
+                    if previous == current:
+                        continue
+        result.append(cell)
+    return tuple(result)
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -318,7 +344,7 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
     structure_crates: set[str] = set()
-    for cell in ledger.cells():
+    for cell in _refill_cells(ledger):
         stale[cell.crate] += cell.state == "stale"
         if cell.state in ("open", "stale"):
             pending.append(cell)
@@ -555,7 +581,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                + "and its test domains (groups of tests that exercise separate behaviour), then decide against "
                + "`when-to-split-a-module` whether the file should split, and hold a finding when it should. "
                + "Ask this of every file, also one where other rules already hold findings: moving or reordering "
-               + "code under another rule does not answer whether the file should split."]
+               + "code under another rule does not answer whether the file should split. "
+               + "A split finding names the split alone: each test, type or function that belongs with an owner "
+               + "in another file is its own finding under the rule that places it, even when the split moves it."]
               if any(_is_when_to_split_rule(pinned.rule_id) for pinned in texts) else []),
             "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
             + "under the rule it breaks most directly, naming the others in its text.",
@@ -735,7 +763,7 @@ def _select_phase(
     candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
     if not candidates:
         if family != "modules":
-            pending = tuple(cell for cell in ledger.cells()
+            pending = tuple(cell for cell in _refill_cells(ledger)
                             if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
             structure = tuple(cell for cell in pending if cell.tier == "D")
             own = tuple(cell for cell in pending if cell.family == family)

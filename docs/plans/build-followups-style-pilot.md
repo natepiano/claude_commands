@@ -631,16 +631,35 @@ Pending: parent's saved style child summary and rendered style line.
   finding is dropped, because `parallel_cases.rs` is shared with an
   integration test and cannot fold back. The ChildReportFailure finding is
   credited, because moving the hook suite fixes it. A test pins the line;
-  it fails before the fix. A one-judge re-sample is being scored.
+  it fails before the fix. After it, one blind judge per batch finds 34
+  of the 35 references (97.1%; the miss is a reciprocal sibling dependency
+  in birth_stamp). A blind check of the 15 findings outside the reference,
+  the four new splits first, rules all 15 real: the step adds no
+  over-splitting.
 - **Fix AD — tickets pinning `comments-name-code-constructs` keep every stated reason** (commit `8b0f18b0`):
   on cargo-liner, names writers replaced reason-giving comments with
   narration of the code. Neither the rule nor the ticket said to keep the
   reason. The ticket now does, marked temporary until the rule text
   carries the same sentence, which waits on the user. A test covers every
   ticket kind; it fails before the fix.
+- **Fix AE — a when-to-split finding names the split alone** (commit `dc484424`):
+  after fix AC one judge held four defects in shared_capture.rs as one
+  split finding, a wrong count with no before and after per move. The
+  when-to-split line now says each piece that belongs with another owner
+  is its own finding under the rule that places it. The test pins the
+  sentence; it fails before the fix.
+- **Fix AF — refill skips held cells while their proposals stay open and their files are unchanged** (commit `8000d78d`):
+  on cargo-liner the names planner issued five tickets for the same four
+  held sites, each closing with nothing to do, because a crate-scope edit
+  elsewhere made the cells stale. Refill now skips a cell whose latest
+  verdict is held, whose findings all sit under open proposals, and whose
+  own file is unchanged since; it reissues when either changes, and such
+  cells no longer hold other families back. Two other reported reissues
+  (clean forbidden-word and census cells) trace to crate-scope rules and
+  wait on the input_scope change. Seven tests; four fail before the fix.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`.
 Live verification of the fixes and subsequent measurements remain pending.
