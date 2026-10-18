@@ -311,6 +311,32 @@ def _is_when_to_split_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "when-to-split-a-module.md"
 
 
+def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
+    """Leave unchanged held sites with open proposals out of coverage work."""
+    held = ledger.latest_held_judgments()
+    findings: dict[tuple[str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
+    for finding in ledger.held_findings(style_ledger.AllHeldFindings()):
+        findings[(finding.rule, finding.path)].append(finding)
+    tip = synced_tip(ledger)
+    result: list[style_ledger.Cell] = []
+    for cell in ledger.cells():
+        key = (cell.rule, cell.path)
+        if cell.state in ("open", "stale") and key in held and findings[key]:
+            if all(isinstance(finding.state, style_ledger.Filed)
+                   and frontmatter(finding.state.proposal).get("status") == ["open"]
+                   for finding in findings[key]):
+                try:
+                    previous = git(ledger.repo, "rev-parse", "--verify", f"{held[key]}:{cell.path}")
+                    current = git(ledger.repo, "rev-parse", "--verify", f"{tip}:{cell.path}")
+                except style_ledger.LedgerError:
+                    pass
+                else:
+                    if previous == current:
+                        continue
+        result.append(cell)
+    return tuple(result)
+
+
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
@@ -318,7 +344,7 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
     structure_crates: set[str] = set()
-    for cell in ledger.cells():
+    for cell in _refill_cells(ledger):
         stale[cell.crate] += cell.state == "stale"
         if cell.state in ("open", "stale"):
             pending.append(cell)
@@ -737,7 +763,7 @@ def _select_phase(
     candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
     if not candidates:
         if family != "modules":
-            pending = tuple(cell for cell in ledger.cells()
+            pending = tuple(cell for cell in _refill_cells(ledger)
                             if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
             structure = tuple(cell for cell in pending if cell.tier == "D")
             own = tuple(cell for cell in pending if cell.family == family)
