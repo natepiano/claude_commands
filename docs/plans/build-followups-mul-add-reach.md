@@ -81,9 +81,11 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 | --- | --- | --- | --- |
 | G1 | Phase 3 | Phase 2's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 2 checkpoint> HEAD` succeeds |
 | G2 | Phase 4 | 96 hours after T_reach (2026-10-12 14:13:42 EDT) | the clock reads 2026-10-16 14:13:42 EDT or later |
-| G3 | Phases 6, 7 | Phase 5's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 5 checkpoint> HEAD` succeeds; T_lint is the committer time of the first `~/.claude` commit that contains it |
-| G4 | Phase 7 | 24 hours after T_lint | the clock reads T_lint + 24 h or later, in EDT; the notifier instance `mul-add-remeasure` wakes this session then |
+| G3 | Phases 6, 8 | Phase 5's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 5 checkpoint> HEAD` succeeds; T_lint is the committer time of the first `~/.claude` commit that contains it |
+| G4 | Phase 8 | 24 hours after T_lint | the clock reads T_lint + 24 h or later, in EDT; the notifier instance `mul-add-remeasure` wakes this session then |
 | G5 | Phase 6 | the first live rewrite | a hana `verify.sh lint` call that started after T_lint ran the rewrite step and its final clippy verdict passed; the notifier instance `mul-add-first-fire` wakes this session then |
+| G6 | Phase 10 | Phase 9's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 9 checkpoint> HEAD` succeeds; T_rounds is the committer time of the first `~/.claude` commit that contains it |
+| G7 | Phase 10 | 24 hours after T_rounds | the clock reads T_rounds + 24 h or later, in EDT; the notifier instance `mul-add-rounds-remeasure` wakes this session then |
 
 ## Phases
 
@@ -198,152 +200,132 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 ### Phase 5 — Rewrite multiply-adds in the lint step  · status: done
 
-**Depends on:** Phase 4
+#### As-built
 
-#### Work Order
-
-**Goal:** when `verify.sh lint`'s clippy verdict fails on a multiply-add, the lint step applies clippy's own machine-applicable `suboptimal_flops` rewrite, prints how many it rewrote, and judges the rewritten tree, so no agent turn is spent on that warning.
-
-**Spec:**
-
-The showrunner moved this into scope on 2026-10-16 after Phase 4 failed both limits: "verify.sh's lint step applies clippy's machine-applicable multiply-add rewrite (only that lint's suggestions) before it judges the run, and the run reports how many it rewrote."
-
-Where it runs. `scripts/delegate/verify.sh`, verb `lint` (lines 1650–1740 today): mend `--fix` → `fmt_cargo` on `FMT_SCOPE` → `VERDICT_KEY="$(tree_key)"` → `taplo fmt --check` → `invoke_clippy --workspace --all-targets --all-features` (line 1718) → rustdoc. The rewrite is added around that one clippy call, nowhere else: never in `example`, `check`, `test` or `final`.
-
-Judge first, rewrite only on a multiply-add failure (unit director's call, under Fast: about 8 in 100 hana clippy steps carry the lint, so an unconditional rewrite pass would add a workspace clippy compile to the other 92):
-
-1. Run the judging clippy exactly as today, with its output also captured to a temporary log the way `MEND_LOG` captures mend's (`tee`, `pipefail`; read the status from the pipeline, never from `tee`). A pass continues to rustdoc unchanged.
-2. On failure, look for the lint in the captured log. Match clippy's documentation link for it, `#suboptimal_flops`, which appears in every wording of the diagnostic ("may be calculated" and "can be calculated" both occur). No match: exit with clippy's status, as today.
-3. On a match, ask cargo for the same diagnostics as JSON: run the judging command again with `--message-format=json` added, through a new `invoke.sh` helper `invoke_clippy_mul_add_json <cargo scope args…>` called with `--workspace --all-targets --all-features`, through `run` so the build log records it, stdout to a temporary file. Cargo replays the cached diagnostics of every crate that compiled and recompiles only the crates that failed, so this costs far less than a full clippy pass. Then apply the suggestions with a new script, `python3 scripts/lint/apply_mul_add.py --workspace-root <root> <json file>`:
-   - keep `compiler-message` records whose `message.code.code` is `clippy::suboptimal_flops`; from each, take every span in `message.spans` and in `message.children[].spans` with `suggestion_applicability == "MachineApplicable"` and a non-null `suggested_replacement`;
-   - resolve each span's `file_name` against the workspace root; skip a file outside it (a registry or git dependency);
-   - drop exact duplicates (the same file, `byte_start`, `byte_end` and replacement: one diagnostic reported for the lib and the test target); when two spans in one file overlap, keep the earlier and count the other as skipped;
-   - edit each file as bytes, last span first, and write it only when it changed;
-   - print one line: `verify.sh: rewrote <n> multiply-add(s) in <m> file(s)`, plus `(<k> skipped: overlapping)` when k > 0; exit 0, or 1 when a file cannot be read or written (after editing none of the files it could not write).
-   Why not `cargo clippy --fix`: three probes on 2026-10-16 (`-A warnings` with a later `-W`, then `-D`, then `--cap-lints=deny`) each exited 0 with no `Fixed` line and the source unchanged; the flags all reached clippy (its dep-info records them), yet cargo fix applied nothing, so the cause sits inside cargo fix itself (attempts log `attempts-lint-rewrite-flags`). The JSON route has no lint flags to get right: only the one lint's suggestions are ever applied, and a source-level `#[allow]` already removed that diagnostic from the judging run.
-4. With zero rewrites, print `verify.sh: clippy's multiply-add rewrite changed nothing` and exit with the first verdict's status. The JSON run keeps `-D warnings`, so it exits 101 when it did its job; it counts as failed only when its stream has no `build-finished` record or it exits with anything other than 0 or 101. When it fails that way, or `apply_mul_add.py` fails, print `verify.sh: clippy's multiply-add rewrite failed; see the output above` and exit with the first verdict's status.
-5. After a rewrite with at least one fix: run `fmt_cargo` on `FMT_SCOPE` again (a `mul_add` call can push a line past the width), recompute `VERDICT_KEY="$(tree_key)"` when `RUN_LOG` is set (the recorded verdict must name the tree the second judgment read), then run the judging clippy once more. Its status is the lint step's clippy result. Never a third clippy.
-6. The clippy `lint.conf` switch gates all of it: with clippy off, nothing new runs and no second `SKIPPED` line is printed (`test_clippy_off_names_the_full_scope_without_running_it` expects exactly one).
-
-`invoke_clippy` stays the one judging entry point; the helper sits beside it in `scripts/lint/invoke.sh` (lines 494–514 today) and returns the rewrite's status. The lint cache's tree key already covers `verify.sh`, `invoke.sh` and `lint.conf` (verify.sh line 770), so old lint records stop matching on their own.
-
-Measurement needs (Phases 6 and 7 read the build log): the rewrite's JSON step has `--message-format=json` in its argv; the judging steps do not. Keep it that way. Every step `run` runs is recorded with its argv and `call_id`, but the build log keeps the log of failed steps only, so `verify.sh` also saves a successful rewrite's output by `call_id` under `~/.local/state/mul-add-hook/lint-rewrite/`, at a location an environment variable sets (the tests point it at a temporary folder); a failed save never fails lint.
-
-Tests, in `scripts/delegate/test_verify_lint_scope.py` (`VerifyLintScopeTests`, line 121: the real `verify.sh` with a fake `cargo` and `taplo` on `PATH` that record argv; `write_config(clippy=…)` line 218, `calls(command)` line 270). Teach the fake cargo to fail a judging clippy with a log carrying `#suboptimal_flops` and to print a JSON diagnostic stream for `--message-format=json`, driven by environment variables the test sets. `apply_mul_add.py` gets its own tests in `scripts/lint/test_apply_mul_add.py` on temporary files: a single rewrite, two spans in one file applied last first, the lib-and-test duplicate counted once, an overlap skipped and counted, a non-`MachineApplicable` or other-lint suggestion ignored, a span outside the workspace root ignored, multi-byte UTF-8 before the span. Cover:
-- a passing judgment runs no rewrite (one clippy call, as today);
-- a failure without the lint runs no rewrite and keeps clippy's status;
-- a multiply-add failure runs, in order: judging clippy, the JSON run (argv pinned: the judging argv plus `--message-format=json`), the rewrite of the fake stream's spans in temporary source files, fmt, judging clippy; the count line matches the stream (two files, three spans → `rewrote 3 multiply-add(s) in 2 file(s)`); the lint passes when the second judgment passes;
-- the second judgment failing fails lint with its status;
-- a rewrite with zero fixes, and a rewrite that exits nonzero, each keep the first verdict and run no second judgment;
-- clippy off: no rewrite and one `SKIPPED` line.
-Update the existing tests that assert exactly one clippy call where needed (`test_lint_matches_ci_and_preserves_other_stages` line 275, `test_features_reach_mend_and_doc_but_do_not_narrow_clippy` line 285, `test_clippy_off_names_the_full_scope_without_running_it` line 311); on a passing judgment they keep holding as written.
-
-Watch scripts for Phases 6 and 7, outside the repository in `~/.local/state/mul-add-hook/lint-rewrite/` (create it): `watch.py`, standard library only, typed, read-only against `~/.local/state/buildlog/index.sqlite` and `git -C ~/.claude`.
-- `watch.py first-fire <phase-5-checkpoint>` exits 1 while the checkpoint is not in `~/.claude` `HEAD`; otherwise T_lint is the committer time of the first first-parent `~/.claude` commit containing it, and it exits 0 when some hana `verify.sh lint` call that started at or after T_lint has a clippy step whose argv has `--message-format=json` followed, in the same `call_id`, by a judging clippy step with status 0. It prints that call's id, start (EDT and UTC) and the rewrite count read from its log. Exit 1 otherwise; exit 3 on an unreadable index.
-- `watch.py window <phase-5-checkpoint> <hours>` exits 0 once the clock reads T_lint + hours or later, 1 before, and prints T_lint and the due time in EDT and UTC.
-- Check it by hand once against today's index with a commit that is in `HEAD` (exit 1 expected from `first-fire`: no rewrite has run yet) and one that is not; record the commands and exits in your summary. These are measurement scripts, like Phase 4's, not repository tests.
+- `verify.sh lint` judges first. When the workspace clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) fails and its captured output contains `#suboptimal_flops`, `invoke_clippy_mul_add_json` (`scripts/lint/invoke.sh`) replays the same call with `--message-format=json` through `run`. A replay exit of 0 or 101 is accepted; any other keeps the first verdict.
+- `scripts/lint/apply_mul_add.py --workspace-root <root> <json>` applies only `clippy::suboptimal_flops` `MachineApplicable` suggestions from `message.spans` and `children[].spans`, inside the workspace root (symlinks resolved), duplicates once, overlaps skipped and counted, bytes edited last span first, every file checked before any write. It requires Cargo's `build-finished` record. Exit 0 rewrote, 3 (`NOTHING_APPLIED`) nothing to rewrite, 1 incomplete stream or I/O failure.
+- It prints `verify.sh: rewrote <n> multiply-add(s) in <m> file(s)`; lint then formats `FMT_SCOPE` again, recomputes `VERDICT_KEY` and judges once more, and that verdict stands. Nothing to rewrite prints `verify.sh: clippy's multiply-add rewrite changed nothing`; a failure prints `…rewrite failed…`; both keep the first verdict. Clippy off runs nothing new and prints one `SKIPPED` line.
+- `run_json_stdout` keeps cargo's JSON alone on stdout and sends the banner and stderr to stderr and the step log through a temporary FIFO and an ordinary background `tee`, joined before return (bash 3.2 constructs). Every step returns its command's own status, also when `tee` fails.
+- The count line of each successful rewrite is saved as `<call_id>.log` under `MUL_ADD_REWRITE_LOG_DIR` (default `~/.local/state/mul-add-hook/lint-rewrite/`); a failed save prints a notice and never fails lint. The lint cache key covers the applier.
 
 **Files:**
-- `scripts/lint/invoke.sh` — `invoke_clippy_mul_add_json`
-- `scripts/lint/apply_mul_add.py` — applies the `suboptimal_flops` MachineApplicable suggestions from cargo's JSON
-- `scripts/lint/test_apply_mul_add.py` — its tests
-- `scripts/delegate/verify.sh` — the `lint` verb's clippy step: capture, detect, rewrite, re-format, re-key, re-judge, count line
-- `scripts/delegate/test_verify_lint_scope.py` — the fake cargo's new modes and the tests above
-- `docs/as-built/build-followups-mul-add.md` — a "Lint-step rewrite" section: the sequence, why the JSON route and not `cargo clippy --fix`, the count line, the `--message-format=json` argv as the measurement's marker
-- `~/.local/state/mul-add-hook/lint-rewrite/watch.py` — outside the repository: `first-fire` and `window`, the checks Phases 6 and 7 wake on
+- `scripts/delegate/verify.sh` — lint rewrite branch; `WORKSPACE_ROOT` feeds Taplo and the applier
+- `scripts/lint/invoke.sh` — `invoke_clippy_mul_add_json`, `run_json_stdout`
+- `scripts/lint/apply_mul_add.py`, `scripts/lint/test_apply_mul_add.py` — the applier and its tests
+- `scripts/delegate/test_verify_lint_scope.py` — lint-step tests with fake Cargo
+- `~/.local/state/mul-add-hook/lint-rewrite/watch.py` — `first-fire <checkpoint>` and `window <checkpoint> <hours>`; `probe-2026-10-16/` holds the scratch-crate probe
 
-**Workers:** 1 writer + 1 tester, split by file: the shell steps and the watch script against their tests.
-- `impl` — `scripts/lint/invoke.sh`, `scripts/delegate/verify.sh`, `scripts/lint/apply_mul_add.py`, `~/.local/state/mul-add-hook/lint-rewrite/watch.py`, the as-built section, the scratch-crate probe
-- `test` — `scripts/delegate/test_verify_lint_scope.py` and `scripts/lint/test_apply_mul_add.py`, from this Spec alone
+**Binds later work:** the JSON replay step is marked by `--message-format=json` in its argv and shares the lint call's `call_id`; judging steps have no marker. Rewrite counts live in the saved `<call_id>.log` count lines.
 
-**Constraints from prior phases:**
-- Phase 4 measured 2026-10-12 14:13:42 to 2026-10-16 14:13:42 EDT: 70 of 850 hana clippy steps carry the lint, 8.235 per 100 against the 1.979 limit; 16 sole-cause failures cost 1.104 seat-hours a day against 0.100. Both FAIL. 208 of 227 warnings had no earlier hook block. Its scripts are in `~/.local/state/mul-add-hook/reach-2026-10-16/` (`measure.py`, `commits.py`, `audit.py`), read-only.
-- Clippy's diagnostic comes in two wordings, "may be calculated" and "can be calculated"; match the documentation link, not the header.
-- The build log index names its seat column `worker`; steps carry `argv`, `call_id`, `status` and `log`.
-- `clippy::suboptimal_flops` stays enabled in Cargo (the user, 2026-10-06); this phase adds a rewrite, it never allows the lint.
-- The edit hook (`scripts/hooks/post-tool-use-mul-add.py`) stays as it is; Phase 7 decides whether to propose retiring it.
-- New commands for this phase, beyond the Delegation Context: tests `python3 -m unittest discover -s scripts/delegate -p 'test_verify_lint_scope.py'`; the gate `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` from the worktree root (about 100 s; every suite in parallel, the lib suite included); `basedpyright` on each changed `.py` file, `~/.local/state/mul-add-hook/lint-rewrite/watch.py` included.
-- `scripts/delegate/` is also edited by the builder-report unit; edits there go through the berth board.
+**Gotchas:** under `-D warnings` the JSON replay normally exits 101. Named descriptor redirections (`{fd}>`) break the Mac's bash 3.2.
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/delegate -p 'test_verify_lint_scope.py'` and `python3 -m unittest discover -s scripts/lint -p 'test_apply_mul_add.py'` pass, with every case in the Spec's test lists.
-- `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` passes from the worktree root.
-- `basedpyright` reports `0 errors, 0 warnings, 0 notes` on each changed `.py` file and on `watch.py`.
-- Scratch-crate probe, run once by `impl` under `/tmp/claude/delegate/<session>/phases/5/scratch/` and deleted after: a crate whose `Cargo.toml` denies `clippy::nursery` and whose source holds one `a * b + c` on `f64`, one unused import, and one other machine-applicable clippy lint; the JSON run plus `apply_mul_add.py` rewrite only the multiply-add (diff shown in the summary), an `#[allow(clippy::suboptimal_flops)]` control stays unchanged, and the count line reads 1.
-- `watch.py` hand check as the Spec states, exits recorded.
+**Ruled out:** `cargo clippy --fix` limited to one lint — with `-A warnings` plus `-W`, `-D`, or `-D` and `--cap-lints=deny`, it rewrote nothing.
 
-### Phase 6 — First live rewrite  · status: todo
+### Phase 6 — First live rewrite  · status: done
 
-**Depends on:** Phase 5
-**Blocked by:** G3, G5
+#### As-built
 
-#### Work Order
-
-**Goal:** the first real hana lint call that fails on a multiply-add after Phase 5 is live shows the rewrite count and passes, and the showrunner hears it the moment it happens.
-
-**Spec:**
-
-The user, via the showrunner, 2026-10-16: "i think 96 hours is too late to find out if this is working"; the showrunner: "As soon as Phase 5 is promoted, prove the rewrite fires: the first real hana clippy step with a multiply-add warning shows the rewrite count and passes; report it the moment it happens."
-
-The wake: at Phase 5's checkpoint, the unit director creates the notifier instance (`docs/as-built/session-notifier.md`; no polling, no agent re-arms a timer):
-`zsh ~/.claude/scripts/message/notifier.sh new mul-add-first-fire --every 5 --to session:<this session's id> --from mul-add-first-fire --command "mul-add first fire: run phase 6" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py first-fire <phase-5-checkpoint>"`
-The check sends only when G5 clears. On the wake, the unit director removes the instance (`notifier.sh remove mul-add-first-fire`), runs `watch.py first-fire` once more, and sends the showrunner the call's time, its rewrite count and the passing verdict before dispatching anything.
-
-Then `impl` reads that call's steps from the build log (judging clippy failed with `#suboptimal_flops`; the JSON step and the saved count line; fmt; judging clippy status 0) and confirms in the hana repository that the commit following the call carries the `mul_add` rewrite. It adds one paragraph to the as-built's "Lint-step rewrite" section: the call's time in EDT and UTC, the count, the passing verdict, and the commit.
+- The first passing live rewrite was hana lint call `v20261017T014232-1432240-10080`, started 2026-10-16 21:42:32 EDT (2026-10-17T01:42:32Z): judging clippy failed with `#suboptimal_flops` (101), the JSON replay (101) supplied one suggestion, the count line read `rewrote 1 multiply-add(s) in 1 file(s)`, fmt passed and the final judging clippy passed (0). The showrunner heard it at the wake.
+- The fix was `crates/hana_diegetic/src/layout/element.rs:2511`; it sat uncommitted in `~/rust/widget-enhancements`, whose branch still pointed at the call's starting commit. The paragraph is in the as-built's "Lint-step rewrite" section.
 
 **Files:**
 - `docs/as-built/build-followups-mul-add.md` — the first-fire paragraph
 
-**Workers:** 1 writer; nothing to test.
-- `impl` — the as-built paragraph, from the build log and the hana history (read-only)
+**Binds later work:** a rewrite lands as an uncommitted edit in the calling worktree, so no hana commit marks it. Three earlier count logs in the window (2026-10-16 20:43Z, 21:12Z, 21:42Z) rewrote without a passing verdict in their call.
 
-**Constraints from prior phases:**
-- Phase 5 marks the rewrite's JSON step by `--message-format=json` in its argv; judging clippy steps have none. Both share the lint call's `call_id`.
-- `watch.py` is in `~/.local/state/mul-add-hook/lint-rewrite/`.
-- Never write `~/.local/state/buildlog` or the hana tree.
+### Phase 7 — Complete step logs under load  · status: done
 
-**Acceptance gate:** `watch.py first-fire <phase-5-checkpoint>` exits 0 and names the call the paragraph describes; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
+#### As-built
 
-### Phase 7 — Re-measure the lint-step rewrite  · status: todo
+- Cause: `run_json_stdout`'s stdout and stderr each had their own `tee -a` on one log; their chunks are not line-aligned, so under load a JSON record landed inside a stderr line, which the completeness test read as a missing line. No bytes were lost.
+- Fix: stdout streams to the caller at once through `tee` into a temporary file, appended to the log after the stderr `tee` is joined. The log holds stderr, then stdout. Reproduction (2,048 nested calls, 64 at a time, 512 CPU workers): 28 damaged logs at load 100–270 before, 0 at load 208–382 after.
+- `test_concurrent_json_and_stderr_keep_complete_lines_in_both_logs` sends 1,000 lines on each stream through the nested call and checks both logs on return; it catches the old runner often but not on every run.
 
-**Depends on:** Phase 6
-**Blocked by:** G3, G4
+**Files:**
+- `scripts/lint/invoke.sh` — `run_json_stdout`
+- `scripts/delegate/test_verify_lint_scope.py` — the regression test
+
+**Ruled out:** unit-board's merge as the cause — the race is in this runner; that merge only changed timing.
+
+### Phase 8 — Re-measure the lint-step rewrite  · status: done
+
+#### As-built
+
+- Window 2026-10-16 16:09:48 EDT (2026-10-16T20:09:48Z) ≤ start < 2026-10-17 16:09:48 EDT, per lint call: the verdict is the last judging clippy step of each `call_id`. Both limits **FAIL**: 5 of 124 final verdicts failed with `suboptimal_flops` (4.032 per 100, limit 1.979); one sole-cause call cost 0.448 seat-hours a day (limit 0.100). 14 JSON replays recorded 28 fixes and added 1,275.1 s of clippy time. `audit.py` PASS.
+- Causes, ranked by failed verdicts: overlapping suggestions in a chained sum, whose inner term the applier skips (2, and the whole seat-time failure); macro-body suggestions, `MaybeIncorrect` (2); crates downstream of the first failing crate, never seen by the replay (1). The section is "Lint-step rewrite, re-measure" in the as-built.
+
+**Files:**
+- `docs/as-built/build-followups-mul-add.md` — "Lint-step rewrite, re-measure"
+- `~/.local/state/mul-add-hook/lint-rewrite/` — `measure.py`, `commits.py`, `audit.py` and their JSON
+
+**Binds later work:** warning counts include repeated diagnostics (one macro expression appeared nine times in one verdict), so causes are ranked by failed verdicts.
+
+**Ruled out:** retiring the edit hook, since both limits fail.
+
+### Phase 9 — Rewrite until nothing is left  · status: done
+
+**Depends on:** Phase 8
+
+#### As-built
+
+- `verify.sh lint`'s multiply-add rewrite runs a first judgment, then up to five rounds of JSON replay plus `apply_mul_add.py`, then one format, cache rekey and final judgment. Every clippy step carries `--keep-going`, so crates that do not depend on the failing one are judged too; crates that do are reached in the next round once the upstream rewrite lands.
+- A round that applies nothing, a replay status other than 0 or 101, or an applier failure ends the loop; edits from earlier rounds stay and are formatted and judged. With no applied round, the first verdict stands and `changed nothing` prints.
+- Each applied round prints its own count line, and every line is saved in order to `~/.local/state/mul-add-hook/lint-rewrite/<call_id>.log`. Five applied rounds print `verify.sh: stopped the multiply-add rewrite after 5 rounds`.
+- Macro-body suggestions (`MaybeIncorrect`) are left alone.
+
+**Files:**
+- `scripts/delegate/verify.sh` — the rewrite rounds in the `lint` verb
+- `scripts/delegate/test_verify_lint_scope.py` — fake cargo with per-round diagnostic streams; chained sum, downstream crate, five-round cap, later-round failure and macro body
+- `scripts/style/test_style_sync.py` — its clippy argv expectation carries `--keep-going`
+
+**Binds later work:** a call's fixes are the sum of its count lines (`watch.py`'s `rewrite_count` sums them); a cap stop shows as five saved count lines, since the cap message is only in lint output.
+
+**Gotchas:** `--keep-going` sits at the lint call sites, not in `scripts/lint/invoke.sh`, so examples and other consumers keep their argv. A round-one replay failure prints both its failure line and `changed nothing`.
+
+**Ruled out:** rewriting inside macro bodies, whose suggestions clippy marks `MaybeIncorrect`.
+
+### Phase 10 — Re-measure the rewrite rounds  · status: todo
+
+**Depends on:** Phase 9
+**Blocked by:** G6, G7
 
 #### Work Order
 
-**Goal:** the 24 hours after T_lint are measured on Phase 4's two limits, and the as-built records PASS or FAIL for each.
+**Goal:** the 24 hours after T_rounds are measured on Phase 4's two limits, and the as-built records PASS or FAIL for each.
 
 **Spec:**
 
-The showrunner, 2026-10-16: "The re-measure window is 24 hours, not 96 (about 185 hana clippy steps: at today's 8.2 per 100 we would expect about 15 failures, at the 1.979 limit about 4, so a day separates them clearly). Same two limits."
+The showrunner, 2026-10-17: "Then Phase 10: re-measure over 24 hours against the same two limits."
 
-The wake: at Phase 5's checkpoint, the unit director also creates
-`zsh ~/.claude/scripts/message/notifier.sh new mul-add-remeasure --every 15 --to session:<this session's id> --from mul-add-remeasure --command "mul-add re-measure due: run phase 7" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py window <phase-5-checkpoint> 24"`
+The wake: at Phase 9's checkpoint, the unit director creates
+`zsh ~/.claude/scripts/message/notifier.sh new mul-add-rounds-remeasure --every 15 --to session:<this session's id> --from mul-add-rounds-remeasure --command "mul-add rounds re-measure due: run phase 10" --check "python3 $HOME/.local/state/mul-add-hook/lint-rewrite/watch.py window <phase-9-checkpoint> 24"`
 and removes it on the wake.
 
-Method: copy Phase 4's `measure.py`, `commits.py` and `audit.py` from `~/.local/state/mul-add-hook/reach-2026-10-16/` into `~/.local/state/mul-add-hook/lint-rewrite/` and run the copies with the window T_lint ≤ start < T_lint + 24 h. One change of unit: the verdict is per lint call, not per clippy step. A judging step that a rewrite followed in the same `call_id` is not the call's verdict; the last judging clippy step of each call is (a step with no `call_id` stands alone). Rewrite JSON steps (`--message-format=json` in argv) are never verdicts. Report:
-- verdict steps, failed, and failed carrying `#suboptimal_flops`, per 100 verdict steps, against **1.979** (PASS at or below);
-- sole-cause seat-hours a day by Phase 4's definition, scaled to the 24-hour window, against **0.100**;
-- rewrite steps: count, fixes total, how many were followed by a passing verdict, and their added clippy time (the cost of the rewrite, named);
-- the same step count by Phase 4's per-step rule beside it, so the change of unit is visible.
-`audit.py` re-derives the counts independently and must PASS.
+Method: copy Phase 8's `measure.py`, `commits.py` and `audit.py` from `~/.local/state/mul-add-hook/lint-rewrite/` into `~/.local/state/mul-add-hook/lint-rounds/` and run the copies with the window T_rounds ≤ start < T_rounds + 24 h, by Phase 8's per-call verdict rule. Report what Phase 8 reported, plus rounds per call (each saved count line is one round; sum the fixes of every line) and how many calls the 5-round cap stopped. Rank what remains by failed verdicts, as Phase 8 did. `audit.py` re-derives the counts independently and must PASS.
 
-If both limits PASS, the as-built proposes retiring the edit hook (one moving part fewer); the proposal goes to the showrunner, and nothing is removed in this phase. If either FAILs, the as-built names the largest remaining cause from the warnings the rewrite left.
+The copies change where Phase 8's scripts assume one replay per call:
+- **Cohort.** A call belongs to the window when its first judgment starts inside it. Read each call's complete step sequence, even past the window's end, before picking its final judgment; never let an initial judgment stand as the verdict because the final one started after the window closed.
+- **Counts per call.** `measure.py` (around lines 181–185) refuses repeated call ids and more than one count line, and `audit.py` expects one count line: read each call's count log once, sum every line, and sum replay durations separately from the judgments. `audit.py` re-derives both totals on its own.
+- **Rounds and cap stops.** A round is one saved count line, and a replay that applied nothing or failed adds none. The cap message lives only in lint output, which is not always kept, so a cap stop is a call with five saved count lines. A call with four lines followed by a failed fifth replay is not a cap stop. Where a call's count log is missing, report its rounds as unknown, never as zero.
+- **Replay history.** `commits.py` keys replay evidence by call id alone (around lines 109 and 142), which would keep only the last round. Keep every round's replay in order per call, so a call that rewrote in round one and then failed stays apart from one that never rewrote anything.
+
+If both limits PASS, the as-built proposes retiring the edit hook; the proposal goes to the showrunner, and nothing is removed in this phase. If either FAILs, the as-built names the largest remaining cause by failed verdicts.
 
 **Files:**
-- `docs/as-built/build-followups-mul-add.md` — "Lint-step rewrite, re-measure" under "Measured outcome", with the bounded SQL
-- `~/.local/state/mul-add-hook/lint-rewrite/` — outside the repository: the copied scripts and their JSON
+- `docs/as-built/build-followups-mul-add.md` — "Rewrite rounds, re-measure" under "Measured outcome", with the bounded SQL
+- `~/.local/state/mul-add-hook/lint-rounds/` — outside the repository: the copied scripts and their JSON
 
-**Workers:** 1 writer + 1 adversary review; nothing to test.
-- `impl` — the scripts' copies, the run, the as-built section
+**Workers:** 1 writer + 1 adversary review.
+- `impl` — the scripts' copies, their synthetic checks, the run, the as-built section
 
 **Constraints from prior phases:**
-- Phase 4's limits: 1.979 per 100 and 0.100 seat-hours a day. Its own result (8.235 and 1.104) is the baseline row.
-- Phase 6's first-fire paragraph names the first rewrite; the window still starts at T_lint, not at that call.
-- The build log index is UTC; state times in EDT with UTC beside them.
-- Never write `~/.local/state/buildlog`, the block log or the hana tree.
+- Phase 4's limits: 1.979 per 100 and 0.100 seat-hours a day. Phase 8's result (4.032 and 0.448, per call) is the baseline row.
+- Phase 8: the verdict is the last judging clippy step per `call_id`; JSON replay steps (`--message-format=json` in argv) are never verdicts. Warning counts include repeated diagnostics, so causes are ranked by failed verdicts.
+- Count logs stay in `~/.local/state/mul-add-hook/lint-rewrite/<call_id>.log` (Phase 9 writes one line per round there). `watch.py`'s `rewrite_count` already sums every round's line.
+- Phase 9: a rewrite call now runs one first judgment, up to five JSON replays and one final judgment, all with `--keep-going`; the verdict rule above still picks the final judgment. A call the cap stopped prints `verify.sh: stopped the multiply-add rewrite after 5 rounds` in its lint output. A replay or applier failure in a later round keeps the earlier rounds' edits and still formats and judges.
+- The build log index is UTC; state times in EDT with UTC beside them. Never write `~/.local/state/buildlog`, the block log or the hana tree.
 
-**Acceptance gate:** `audit.py` PASS; both verdicts stated with their arithmetic; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
+**Acceptance gate:** synthetic checks run against the copied scripts and pass: two applied rounds then an empty replay (2 rounds, fixes summed once); five applied rounds (one cap stop); four applied rounds then a failed fifth replay (not a cap stop); a round-one rewrite followed by a failed replay (kept apart from a call that never rewrote); a call whose first judgment is inside the window and whose final judgment is after it (verdict taken from the final judgment). `audit.py` PASS; both verdicts stated with their arithmetic; `git diff --check -- docs/as-built/build-followups-mul-add.md` passes.
 
 ## Out of scope
 

@@ -126,7 +126,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.addCleanup(self.fixture_cleanups)
         root = self.fixture.root
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
@@ -159,17 +159,18 @@ class VerifyHoldWaitTests(unittest.TestCase):
         }
         _ = self.cycle_file.write_text(json.dumps(cycle))
 
+    def fixture_cleanups(self) -> None:
+        # Outside a run, doCleanups keeps a failed cleanup to itself:
+        # a process the fixture found outliving the test fails this one.
+        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed; a process may have outlived the test")
+
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)
         self.addCleanup(self.stop_process, process)
         return process
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        _ = process.communicate(timeout=HANG_GUARD_S)
+        self.fixture.stop_verify(process)
 
     def wait_for_call(self, process: subprocess.Popen[str]) -> build_hold.ReleaseEntry:
         deadline = time.monotonic() + HANG_GUARD_S

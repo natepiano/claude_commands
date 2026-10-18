@@ -61,6 +61,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 if TYPE_CHECKING:
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
+    from scripts.shutdown.record import SessionShutdown
 
 
 class PromptTakingMember(Protocol):
@@ -82,6 +83,14 @@ class MovePromptReader(Protocol):
 
 class MoveFollower(Protocol):
     def follow(self, login: str, request_id: str) -> int: ...
+
+
+class RestartRecordLiveness(Protocol):
+    def restart_failed_session_running(self, saved: SessionShutdown) -> bool: ...
+
+
+class ShutdownLocation(Protocol):
+    def local_machine(self) -> str: ...
 
 
 MoveAlerts = Literal["user", "none"]
@@ -433,10 +442,13 @@ class CodexStatus:
 
 class CommandLine(argparse.Namespace):
     next_action: str = ""
-    group: ClaudeGroup = "units"
+    group: next_moves.NextMoveGroup = "units"
     percent: float = 0
-    hold_minutes: float = 0
-    entry_id: str = ""
+    hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
+    next_expect: list[str] = []
+    next_position: next_moves.GroupPosition = next_moves.GroupPosition(1)
+    next_destination: next_moves.GroupPosition = next_moves.GroupPosition(1)
+    insertion: next_moves.AppendToGroup | next_moves.InsertAt = next_moves.AppendToGroup()
     entries: str = ""
     action: str = ""
     label: str = ""
@@ -1258,7 +1270,11 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
     if probe:
+        from scripts.herdr.herdr import UNIT_MARKS
+
         environment[PROBE_ENV] = "1"
+        for name in UNIT_MARKS:
+            _ = environment.pop(name, None)
     try:
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
@@ -2721,12 +2737,13 @@ def _roles_lock() -> Generator[None]:
         yield
 
 
-def _write_role(role: str, label: str) -> None:
+def _write_role(role: str, label: str, *, why: str = "by hand",
+                cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> None:
     _validate_role(role)
     if role != "workers":
         raise AccountsError(UNIT_ROLE_GONE)
-    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), "by hand",
-                               datetime.now(timezone.utc).isoformat()))
+    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), why,
+                               datetime.now(timezone.utc).isoformat(), cause=cause))
 
 
 def set_role(role: str, label: str) -> None:
@@ -2784,6 +2801,32 @@ def _move_down_argv(source: str, ids: tuple[str, ...], target: str, why: str, al
         "--restart", "--to", target, "--why", why) + (("--no-alert",) if alerts == "none" else ())
 
 
+@dataclass(frozen=True)
+class MoveShutdownReady:
+    lines: tuple[str, ...] = ()
+
+
+def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShutdownReady | MoveRefused:
+    """Close only a proven live session's unconfirmed restart before moving it."""
+    if TYPE_CHECKING:
+        from scripts.shutdown import record
+    else:
+        record = import_module("record")
+    restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
+    settle = cast(ShutdownLocation, cast(object, import_module("settle")))
+    if not restart.restart_failed_session_running(saved):
+        return MoveRefused("already has a shutdown in progress")
+    name = saved["session"]["name"]
+    if dry_run:
+        return MoveShutdownReady((f"{name}: would close its unconfirmed restart record; the session is running",))
+    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+                                         settle.local_machine(), saved["request_id"])
+    if not isinstance(outcome, record.SessionForgotten):
+        return MoveRefused("already has a shutdown in progress")
+    _ = record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
+    return MoveShutdownReady((f"{name}: closed its unconfirmed restart record; the session is running",))
+
+
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "", alerts: MoveAlerts = "user") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
     target = numbered_account_label(target, "claude").label
@@ -2812,7 +2855,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                 refuse(session_id, destination.reason)
             return tuple(outcomes[session_id] for session_id in ids)
         live = {item.session_id: item for item in inventory.listing()}
-        before = {saved["session"]["session_id"] for saved in record.all_session_records()}
+        before = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
         for session_id in ids:
             found = live.get(session_id)
             if found is None:
@@ -2821,13 +2864,17 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
             if found.kind == "worker":
                 refuse(session_id, "workers move with their unit director")
                 continue
-            if session_id in before:
-                refuse(session_id, "already has a shutdown in progress")
-                continue
             owners[session_id] = found
             if found.login.casefold() == destination.login.casefold():
                 refuse(session_id, "already on " + destination.label)
                 continue
+            if session_id in before:
+                prepared = _prepare_move_shutdown(before[session_id], dry_run=False)
+                if isinstance(prepared, MoveRefused):
+                    refuse(session_id, prepared.reason)
+                    continue
+                for line in prepared.lines:
+                    print(line)
             groups.setdefault(found.login, []).append(session_id)
         for login, selected_ids in groups.items():
             source = account.label_for("Claude", login)
@@ -3046,9 +3093,10 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     if isinstance(checked, MoveRefused):
         return checked
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.shutdown import inventory, record
     else:
         inventory = import_module("inventory")
+        record = import_module("record")
     registrations = inventory.showrunner_registrations()
     members = live_group_members(registrations=registrations)[group]
     selected = [session for session in members if not session_on_account(session, target)]
@@ -3061,7 +3109,15 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
+        closing: tuple[str, ...] = ()
+        for saved in record.all_session_records():
+            if saved["session"]["session_id"] not in ids:
+                continue
+            prepared = _prepare_move_shutdown(saved, dry_run=True)
+            if isinstance(prepared, MoveShutdownReady):
+                closing += prepared.lines
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
+            *closing,
             *(move_preview_line(item, now) for item in selected),
             *_move_preview_commands(selected, target, reason, alerts), *notices))
     previous_target = group_label(group_accounts(), group)
@@ -3122,11 +3178,17 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             return MoveRefused(f"{owner.name} belongs to {group}; in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move {group} {target}")
         if session_on_account(owner, target):
             return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
-        if any(saved["session"]["session_id"] == owner.session_id for saved in record.all_session_records()):
-            return MoveRefused(f"{owner.name} already has a shutdown in progress")
+        closing: tuple[str, ...] = ()
+        for saved in record.all_session_records():
+            if saved["session"]["session_id"] != owner.session_id:
+                continue
+            prepared = _prepare_move_shutdown(saved, dry_run=True)
+            if isinstance(prepared, MoveRefused):
+                return MoveRefused(f"{owner.name} {prepared.reason}")
+            closing += prepared.lines
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
-            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now),
+            return MoveDryRun(owner.session_id, (*checked.notices, *closing, move_preview_line(owner, now),
                 *_move_preview_commands([owner], target, reason, alerts)))
         results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN, alerts=alerts)
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
@@ -3260,7 +3322,8 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
     return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
 
 
-def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
+def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
+                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> WorkersSwapOutcome:
     refuse_default(label)
     try:
         workers_home = _workers_home()
@@ -3290,7 +3353,7 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
         switches = _retire_workers_servers(target_home, account_label, dry_run=True)
         return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
     try:
-        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label)
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, why=why, cause=cause)
     except OSError as error:
         raise AccountsError(f"accounts: could not move the workers role: {error}") from error
     try:
@@ -3302,11 +3365,12 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     return WorkersSwapStarted(lines)
 
 
-def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:
+def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
+         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> SwapOutcome | WorkersSwapOutcome:
     """Select the new unit account only after every old-account session can move."""
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -3610,6 +3674,14 @@ class StatusUnavailable:
 
 
 @dataclass(frozen=True)
+class WeeklyNotReadSince:
+    """The last reading predates a weekly reset; it cannot describe this week's allowance."""
+
+    read_at: datetime
+    reason: agent_accounts.StaleTokenSkip | agent_accounts.NoWeeklyReadSkip
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -3618,7 +3690,7 @@ class StatusRow:
     login: str
     login_cell: str
     roles: tuple[str, ...]
-    weekly_left_percent: float | StatusUnavailable
+    weekly_left_percent: float | StatusUnavailable | WeeklyNotReadSince
     resets_at: datetime | StatusUnavailable
     credits: float | Literal["unlimited"] | StatusUnavailable
     on_credits: str
@@ -3680,7 +3752,7 @@ def _status_row(
     tool = "codex" if isinstance(status, CodexStatus) else "claude"
     login_cell = ("not set up" if not status.is_set_up else "unavailable" if not status.account_is_safe_to_inspect
                   else status.login or "not logged in")
-    weekly: float | StatusUnavailable = StatusUnavailable()
+    weekly: float | StatusUnavailable | WeeklyNotReadSince = StatusUnavailable()
     resets: datetime | StatusUnavailable = StatusUnavailable()
     credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
     read_at: datetime | StatusUnavailable = StatusUnavailable()
@@ -3699,6 +3771,9 @@ def _status_row(
                 weekly = StatusUnavailable("unavailable")
                 resets = StatusUnavailable("unavailable")
             read_at = _read_at(usage) or StatusUnavailable()
+            if (window is not None and isinstance(read_at, datetime)
+                    and (reset := _stored_time(window["resets"])) is not None and reset <= now):
+                weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now)
     return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
@@ -3713,8 +3788,14 @@ def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
     credits = row.credits
     read = row.read_at
     role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    if isinstance(weekly, WeeklyNotReadSince):
+        weekly_cell = f"not read since {weekly.read_at.astimezone(zone):%H:%M}"
+        if isinstance(weekly.reason, agent_accounts.StaleTokenSkip):
+            weekly_cell += ": no session to refresh its login"
+    else:
+        weekly_cell = weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%"
     return (row.folder, row.label, row.login_cell, role_cell,
-        weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%",
+        weekly_cell,
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
@@ -3725,7 +3806,7 @@ def render_status_json(reading: StatusReading, *, with_login: bool = False) -> s
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
-            weekly_left_percent=None if isinstance(row.weekly_left_percent, StatusUnavailable) else row.weekly_left_percent,
+            weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
@@ -3996,16 +4077,39 @@ def _parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("next-read")
     next_writer = commands.add_parser("next-write")
     _ = next_writer.add_argument("entries")
+    def insertion(text: str) -> next_moves.InsertAt:
+        return next_moves.InsertAt(next_moves.GroupPosition(int(text)))
+    _ = next_writer.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
     next_command = commands.add_parser("next")
     next_verbs = next_command.add_subparsers(dest="next_action", required=True)
     next_add = next_verbs.add_parser("add")
-    _ = next_add.add_argument("group", choices=CLAUDE_GROUPS)
+    _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
     _ = next_add.add_argument("percent", type=float)
     _ = next_add.add_argument("label")
-    _ = next_add.add_argument("--hold-minutes", type=float, default=0)
+    hold_options = next_add.add_mutually_exclusive_group()
+    _ = hold_options.add_argument("--hold-minutes", dest="hold_mode",
+                                  type=lambda text: next_moves.FixedHold(float(text)), default=next_moves.FixedHold(0))
+    def half_point_hold(text: str) -> next_moves.HalfPointHold:
+        if text != "half-point":
+            raise argparse.ArgumentTypeError("hold must be half-point")
+        return next_moves.HalfPointHold()
+    _ = hold_options.add_argument("--hold", dest="hold_mode", type=half_point_hold)
+    _ = next_add.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
     _ = next_verbs.add_parser("list")
     next_remove = next_verbs.add_parser("remove")
-    _ = next_remove.add_argument("entry_id")
+    _ = next_remove.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    def position(text: str) -> next_moves.GroupPosition:
+        return next_moves.GroupPosition(int(text))
+    _ = next_remove.add_argument("next_position", type=position)
+    next_move = next_verbs.add_parser("move")
+    _ = next_move.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_move.add_argument("next_position", type=position)
+    _ = next_move.add_argument("next_destination", type=position)
+    next_hold = next_verbs.add_parser("hold")
+    _ = next_hold.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_hold.add_argument("next_position", type=position)
+    _ = next_hold.add_argument("hold_mode", type=next_moves.parse_hold_mode)
+    _ = next_hold.add_argument("--expect", dest="next_expect", nargs=2, default=[], metavar=("PERCENT", "TARGET"))
     parser.set_defaults(action="status", as_json=False, stored=False, with_login=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
@@ -4054,6 +4158,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def group_half_point_hold(group: ClaudeGroup, now: datetime) -> next_moves.ResolvedHold:
+    label = group_label(group_accounts(), group)
+    return (next_moves.resolve_hold(next_moves.HalfPointHold(), label, now) if isinstance(label, str)
+            else next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+
+
+def validate_next_move_target(entry: next_moves.NextMove) -> None:
+    if isinstance(entry, next_moves.ClaudeGroupMove):
+        _ = claude_account_dir(entry.to)
+    elif isinstance(entry.to, next_moves.CodexWorkersTarget):
+        _ = check_codex_target(entry.to.label, accounts_home() / ".codex", repair=False)
+
+
 @role_map.role_map_command
 def main(argv: list[str]) -> int:
     parser = _parser()
@@ -4075,27 +4192,40 @@ def main(argv: list[str]) -> int:
                 if len(entries) != 1:
                     raise AccountsError("accounts: next-write requires one entry")
                 entry = entries[0]
-                _ = claude_account_dir(entry.to)
-                with next_moves.next_moves_lock():
-                    current = next_moves.read_next_moves()
-                    if any(saved.id == entry.id for saved in current):
-                        raise AccountsError(f"accounts: duplicate next entry {entry.id}")
-                    next_moves.write_next_moves((*current, entry))
+                validate_next_move_target(entry)
+                next_moves.insert_next_move(entry, options.insertion)
                 print(next_moves.encode_next_moves(entries))
             return 0
         if options.action == "next":
             if options.next_action == "add":
                 if role_map.is_role_map_host():
-                    _ = claude_account_dir(options.label)
-                entry = next_moves.add_next_move(options.group, options.percent, options.label,
-                                                 options.hold_minutes)
-                print(next_moves.render_next_move(entry))
+                    candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
+                        at_percent=options.percent, **next_moves.encode_hold_mode(options.hold_mode), to=options.label,
+                        added_at=datetime.now(timezone.utc).isoformat())]))[0]
+                    validate_next_move_target(candidate)
+                _ = next_moves.add_next_move(options.group, options.percent, options.label,
+                                             options.hold_mode, insertion=options.insertion)
+                print(next_moves.list_next_moves() if role_map.is_role_map_host()
+                      else f"added {options.group} next move")
             elif options.next_action == "remove":
-                next_moves.remove_next_move(options.entry_id)
-                print(f"removed {options.entry_id}")
+                next_moves.remove_next_move(options.group, options.next_position)
+                print(f"removed {options.group} {options.next_position.value}")
+            elif options.next_action == "move":
+                next_moves.move_next_move(options.group, options.next_position, options.next_destination)
+                print(f"moved {options.group} {options.next_position.value} to {options.next_destination.value}")
+            elif options.next_action == "hold":
+                expected: next_moves.ExpectedNextMove | next_moves.UncheckedNextMove = next_moves.UncheckedNextMove()
+                if options.next_expect:
+                    try:
+                        percent = float(options.next_expect[0])
+                    except ValueError as error:
+                        raise next_moves.NextMoveError("next: expected percent must be from 0 to 100") from error
+                    if not math.isfinite(percent) or not 0 <= percent <= 100:
+                        raise next_moves.NextMoveError("next: expected percent must be from 0 to 100")
+                    expected = next_moves.ExpectedNextMove(percent, options.next_expect[1])
+                print(next_moves.update_next_move_hold(options.group, options.next_position, options.hold_mode, expected))
             else:
-                entries = next_moves.read_next_moves()
-                print("\n".join(next_moves.render_next_move(entry) for entry in entries) or "nothing set up")
+                print(next_moves.list_next_moves())
             return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():

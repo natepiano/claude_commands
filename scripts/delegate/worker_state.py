@@ -74,6 +74,45 @@ def _convert_record(path: Path) -> None:
         _ = scratch.replace(path)
 
 
+def worker_record_path(run: Path, name: str, slot: str) -> Path:
+    """The worker's durable identity file: its slot's, except the repair worker's own.
+
+    A repair worker runs in slot impl as `<project>-fix` (worker_name.sh). Keyed by its slot,
+    its record would replace the impl worker's, and the impl worker could not be followed again.
+    """
+    key = "fix" if name.endswith("-fix") else slot
+    return run / f"impl_worker_{key}.json"
+
+
+def worker_slot(run: Path, name: str) -> str | None:
+    """The team role the named worker's durable identity was recorded under; None when no record names it."""
+    for path in sorted(run.glob("impl_worker_*.json")):
+        try:
+            value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        record = cast(WorkerLaunchRecord, cast(object, value))
+        slot = record.get("slot")
+        if record.get("name") == name and isinstance(slot, str) and slot:
+            return slot
+    return None
+
+
+def _rekey_record(run: Path, path: Path) -> None:
+    """Move a repair worker's record out of the slot file an earlier launcher wrote it to."""
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return
+    if not isinstance(value, dict):
+        return
+    name = cast(WorkerLaunchRecord, cast(object, value)).get("name")
+    if isinstance(name, str) and name:
+        _ = _move_old_name(path, worker_record_path(run, name, path.stem.removeprefix("impl_worker_")))
+
+
 def migrate_worker_records(run: Path) -> None:
     """Convert durable identity names and claim fields under the launch lock."""
     _ = worker_ledger(run)
@@ -82,6 +121,8 @@ def migrate_worker_records(run: Path) -> None:
     for pattern in ("impl_worker_*.json", "impl_claim_*.json"):
         for path in run.glob(pattern):
             _convert_record(path)
+    for path in run.glob("impl_worker_*.json"):
+        _rekey_record(run, path)
 
 
 @contextmanager

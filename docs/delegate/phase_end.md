@@ -11,6 +11,13 @@ Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
 `commands/plan/phase_review.md`.
 
 <PhaseEnd>
+Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the
+next boundary instead of closing, even with no todo phase. Skip step 7 (shrink,
+shrink commit and notice); never stage, commit or shrink the excluded plan or
+pinned rule files. A no-change ticket follows <CheckpointCommit/> step 6's
+ancestry-checked HEAD path with no code commit, push or merge request, then
+refills; other tickets checkpoint the code commit before marking the phase done.
+
 Run these steps in order for each completed loop or verbose phase:
 
 1. **Code commit.** Run <CheckpointCommit/> for the phase's code, tests, and
@@ -31,7 +38,9 @@ Run these steps in order for each completed loop or verbose phase:
    inserted next under `/plan:to_phased_plan` → <PhaseNumbering/> and runs next.
    A source-comment edit made by the review stays in the tree for the next
    phase's checkpoint commit; with no todo phase left, <FinalGateCommit/>
-   carries it.
+   carries it. The review launches with `--phase <id>`, which needs the phase
+   open: its `finish-phase` in step 5 waits until this review has finished,
+   also beside a running phase.
 4. **Add-on check.** Run <ConsiderNextItems/>.
 5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
    `remove_workers.py`, helpers, launchers, and apps. Run it before the next

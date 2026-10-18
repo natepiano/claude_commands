@@ -16,8 +16,10 @@ keeps the transcript, so a worker removed in error comes back with
 
 Every launch appends `<id>\\t<name>` to its run's `workers` ledger. This removes:
 
-  * every worker in `--session-dir`'s ledger -- the caller's own run, at the end
-    of a phase or of the run, when nothing will message those workers again;
+  * every worker in each `--session-dir`'s ledger -- the caller's own run, at the
+    end of a phase, or every run its unit director holds, at the end of the run
+    (end_session.sh passes one `--session-dir` per run), when nothing will message
+    those workers again;
   * every worker of a run that is not live, from any ledger under the run
     roots -- the sweep that catches a run whose unit director died before its
     own cleanup ran.
@@ -217,18 +219,18 @@ def ledger_ids(run: Path) -> list[str]:
 
 
 def removal_targets(
-    roots: tuple[Path, ...], own_run: Path | None, rows: list[AgentRow], live: set[Path]
+    roots: tuple[Path, ...], own_runs: set[Path], rows: list[AgentRow], live: set[Path]
 ) -> dict[str, str]:
     """Worker id to the reason it is being removed."""
     targets: dict[str, str] = {}
-    if own_run is not None:
+    for own_run in sorted(own_runs):
         for worker_id in ledger_ids(own_run):
-            targets[worker_id] = "this run's phase is over"
+            _ = targets.setdefault(worker_id, "this run's phase is over")
     for directory in (found for root in roots for found in root.glob("*")):
         if not directory.is_dir() or not worker_ledger(directory).is_file():
             continue
         run = directory.resolve()
-        if run == own_run or run in live:
+        if run in own_runs or run in live:
             continue
         for worker_id in ledger_ids(run):
             _ = targets.setdefault(worker_id, f"run {run.name} is not live")
@@ -237,7 +239,7 @@ def removal_targets(
         if match is None:
             continue
         runs = {(root / match.group(1)).resolve() for root in roots}
-        if own_run in runs:
+        if runs & own_runs:
             _ = targets.setdefault(row.get("id", ""), "this run's phase is over")
         elif not runs & live:
             _ = targets.setdefault(row.get("id", ""), f"run {match.group(1)} is not live")
@@ -246,13 +248,15 @@ def removal_targets(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
-    _ = parser.add_argument("--session-dir", help="the caller's own run; all its workers go")
+    _ = parser.add_argument(
+        "--session-dir", action="append", default=[], help="a run of the caller's; all its workers go (repeatable)"
+    )
     _ = parser.add_argument("--delegate-root", help="one run root in place of both run-folder names")
     args = parser.parse_args()
-    session_dir = cast("str | None", args.session_dir)
+    session_dirs = cast("list[str]", args.session_dir)
     given = cast("str | None", args.delegate_root)
     roots = (Path(given),) if given else DEFAULT_ROOTS
-    own_run = Path(session_dir).resolve() if session_dir else None
+    own_runs = {Path(session_dir).resolve() for session_dir in session_dirs if session_dir}
 
     claude = claude_bin()
     rows = list_sessions(claude)
@@ -264,11 +268,11 @@ def main() -> int:
     # sweep to the real run roots; tests and callers inspecting another root
     # must invoke codex_mesh.py themselves. List Claude sessions first so an
     # early failure can truthfully promise that cleanup changed nothing.
-    if own_run is not None and any(root.resolve() in {default.resolve() for default in DEFAULT_ROOTS} for root in roots):
+    if own_runs and any(root.resolve() in {default.resolve() for default in DEFAULT_ROOTS} for root in roots):
         sweep_app_servers(roots[0])
 
     listed_sessions = {row.get("sessionId", "") for row in rows}
-    targets = removal_targets(roots, own_run, rows, live_runs(roots, listed_sessions))
+    targets = removal_targets(roots, own_runs, rows, live_runs(roots, listed_sessions))
 
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     removed = 0

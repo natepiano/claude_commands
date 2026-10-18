@@ -370,7 +370,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py",
-            "board.sh", "worker_name.sh", "worker_state.py",
+            "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh"):
@@ -753,7 +753,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertIn("[pool_code1] register:", board)
         self.assertIn("compacted code1", board)
         self.assertFalse((Path(environment["STUB_POOL_MESH_DIR"]) / "board.log").exists())
-        self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract.log").read_text())
+        self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract-pool.log").read_text())
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
         self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
         events = [event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]
@@ -830,7 +830,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
-        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract.log").read_text())
+        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract-pool.log").read_text())
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
         self.assertEqual(list(session.glob("review_message_*")), [])
 
@@ -934,6 +934,16 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertTrue(list(phase_dir.glob("review_findings_*.txt")))
         self.assertTrue(list(phase_dir.glob("review_status*")))
         self.assertEqual(sorted(path.name for path in session.glob("review_*")), [])
+
+    def test_a_pool_review_names_the_director_in_the_unit_run_folder(self) -> None:
+        session = self.start_implementation("director")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
+        result = subprocess.run(self.pool_command(session), env=environment, capture_output=True, text=True,
+                                check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "director").read_text(encoding="utf-8"), "sid-director\n")
 
     def test_a_phase_id_with_a_space_names_a_directory_without_it(self) -> None:
         session = self.start_implementation("phase-directory-name")
@@ -1141,6 +1151,59 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertIn("changed the working tree", result.stderr)
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
         self.assertEqual(self.call_records("pool-calls.jsonl")[-1]["verb"], "release")
+
+    def side_by_side_review(self, name: str, edited: str, *, commit_change: bool = False) -> tuple[
+            subprocess.CompletedProcess[str], Path]:
+        """Review phase 3 while phase 4, open beside it, holds `other.txt` and its writer edits `edited`."""
+        session = self.start_implementation(name)
+        self.finish_implementation(session)
+        # The stub's commit adds every file, so the plan start_implementation writes is committed first.
+        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True)
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.com",
+             "commit", "-q", "-m", "plan"],
+            cwd=self.working_dir, check=True, capture_output=True, text=True,
+        )
+        for phase, files in (("3", "reviewed.txt\n"), ("4", "other.txt\n")):
+            directory = session / "phases" / phase
+            directory.mkdir(parents=True, exist_ok=True)
+            _ = (directory / "delegated_phase_reservation_state.json").write_text(
+                json.dumps({"state": "active", "phase": phase}), encoding="utf-8")
+            _ = (directory / "files").write_text(files, encoding="utf-8")
+        environment = self.pool_fixture()
+        environment["STUB_REVIEW_EDIT"] = str(self.working_dir / edited)
+        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
+        if commit_change:
+            environment["STUB_REVIEW_COMMIT"] = "1"
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        return result, session / "phases" / "3"
+
+    def test_a_parallel_phase_writing_its_own_files_during_a_review_leaves_the_review_passed(self) -> None:
+        result, phase_dir = self.side_by_side_review("parallel-writer", "other.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
+        log = "".join(path.read_text(encoding="utf-8") for path in phase_dir.glob("review_agent_1*.log"))
+        self.assertIn("open phase 4's files changed during the review: other.txt", log)
+        self.assertEqual(list(phase_dir.glob("review_tree_*")), [])
+
+    def test_a_parallel_phase_commit_during_a_review_leaves_the_review_passed(self) -> None:
+        result, phase_dir = self.side_by_side_review("parallel-commit", "other.txt", commit_change=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
+
+    def test_beside_a_parallel_phase_an_edit_to_the_reviewed_phases_file_still_fails(self) -> None:
+        result, phase_dir = self.side_by_side_review("parallel-own-edit", "reviewed.txt")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changed the working tree: reviewed.txt", result.stderr)
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "error\n")
+
+    def test_beside_a_parallel_phase_an_edit_no_phase_holds_still_fails(self) -> None:
+        result, _ = self.side_by_side_review("parallel-unheld-edit", "loose.txt")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changed the working tree: loose.txt", result.stderr)
 
     def test_pool_excludes_to_and_slot_before_any_allocation(self) -> None:
         session = self.start_implementation("pool-exclusive")
@@ -1491,6 +1554,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
         )
+        # The seat's log is its own, so a second seat on pass 1 cannot truncate it.
+        self.assertTrue((session_dir / "review_agent_1-review2.log").is_file())
+        self.assertEqual(os.readlink(session_dir / "review_agent.log"), "review_agent_1-review2.log")
         reviews = [
             event for event in self.pass_events("new-worker")
             if event.get("pass_kind") == "review"

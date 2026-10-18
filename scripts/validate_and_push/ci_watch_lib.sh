@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # Shared helpers for watching GitHub CI through transient API/network errors.
 #
-# Why: GitHub's API and gh's watch streams are not perfectly reliable. A dropped
-# connection, a 5xx, or a rate-limit blip makes `gh run watch` / `gh pr checks
-# --watch` exit non-zero even though CI itself is healthy and still running. The
-# downlevel agent that drives the style-fix merge flow treats any non-zero exit
-# as a hard failure and stops. These helpers retry through transient errors and
-# surface a failure only once CI has actually concluded red.
+# A dropped connection, a server error or a rate limit can stop `gh run watch`
+# or `gh pr checks --watch` while CI still runs. push_pr_branch_and_merge.sh
+# uses these helpers to retry temporary errors before it merges the PR.
+# The helpers fail when CI fails or the retry limit is reached.
 #
 # Source this file; it defines watch_run_until_settled and
 # watch_pr_checks_until_settled. Both return 0 on green, 1 on a real red

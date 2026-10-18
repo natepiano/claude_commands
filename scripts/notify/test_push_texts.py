@@ -105,6 +105,18 @@ class PushTextTests(unittest.TestCase):
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
 
+    def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
+        self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
+        stop = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.stop_failed")
+        self.assertEqual({example.name for example in stop.examples}, {"typical", "many_long_names"})
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                stopped = push.values["stopped"]
+                self.assertRegex(stopped, r"\([^()]+\)")
+                self.assertIn(stopped, push.message)
+
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
         for entry in push_texts.catalog():
             for example in entry.examples:

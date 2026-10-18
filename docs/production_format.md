@@ -95,14 +95,19 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
+- **Showrunner session:** <name> — the showrunner's session name; it also names the production's workspace in the shared herdr session (the slug when absent)
 - **Log:** <repo-relative path> — git-excluded; one line per event
 - **Updates:** `on demand` (the default, also when the line is missing), or every <N>
   minutes when the user asks for a schedule; each update reports every unit in full; the
   update timer reads N from this line, `on demand` runs no timer and a dailies runs only
   when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
   timer and no footer unless asked)
-- **Merge tests:** <packages tested on every merge besides the changed ones, e.g. the
-  app crate>; omit if none
+- **Merge tests:** <backticked commands run in the showrunner checkout on every merge,
+  besides the changed packages' tests, e.g. `./verify.sh test -p app`; text after the
+  first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;
+  `~` and `$VAR` expand. Its first word must be on PATH or an executable file in the
+  checkout: a package name, a directory or an unset variable is refused before the merge
+  starts
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
@@ -314,6 +319,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
+   Standing style units instead use
+   `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`.
+   Refill waits for the previous ticket's merge, so no unmerged unit work remains
+   at phase start. Report a refused fast-forward to the style showrunner as an
+   error; never create a merge commit to work around it.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
    `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
    Worktrees share refs, so no fetch is needed. Check it yourself; a message
@@ -431,7 +441,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     positional arguments. The unit's reviewer is permanent: each review
     resumes its thread, and the pool forks a second one only while two reviews
     run at once. `<slug>` is the production doc's file name without
-    `-production.md`.
+    `-production.md`. Until `review-unit` primes the pool, the launcher
+    refuses with `no primed code template`: send that review to an idle
+    worker with `--to`, and tell the showrunner once.
 
 17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
     through `/issue` with tag `proposal`, `proposed_by` your unit's name, and

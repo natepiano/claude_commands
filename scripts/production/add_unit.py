@@ -14,13 +14,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from zoneinfo import ZoneInfo
+from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "hooks"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
+import autocompact
 import rename_state
+import showrunners
 import unit_lookup
 import unit_names
 from production_units import Refusal, cell_value, production_field, unit_rows, unit_headings, unit_table
@@ -30,6 +33,7 @@ from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
 if TYPE_CHECKING:
+    import herdr
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
@@ -712,7 +716,8 @@ def launch_session(
     *,
     target: str = "",
     model: str = "",
-) -> None:
+    autocompact_window: str = "",
+) -> herdr.PromptSubmitOutcome:
     """Start Claude in its own herdr session carrying this unit's marks."""
     import herdr
     from scripts.accounts import accounts
@@ -735,7 +740,13 @@ def launch_session(
     if isinstance(director.effort, Effort):
         arguments.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
-        arguments.extend(["--resume", request.session.session_id])
+        session_id = request.session.session_id
+        arguments.extend(["--resume", session_id])
+    else:
+        session_id = str(uuid4())
+        arguments.extend(["--session-id", session_id])
+    if autocompact_window:
+        arguments.extend(["--autocompact", autocompact_window])
     session_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
     profile = request.profile
@@ -745,13 +756,23 @@ def launch_session(
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
     name = host_session_name(request)
     timeout_ms = int(request.timeout * 1000)
-    herdr.start_new_server(name, timeout_ms)
-    pane = herdr.open_pane(name, name, str(request.session_cwd), environment)
+    host = herdr.shared_session()
+    if host:
+        _ = herdr.start_server(host, timeout_ms)
+        production = request.production
+        pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
+                              session_name, str(request.session_cwd), environment)
+    else:
+        host = name
+        herdr.start_new_server(host, timeout_ms)
+        pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
     try:
-        herdr.start_agent(name, pane, kind="claude", agent_arguments=arguments,
-                          opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
+        outcome = herdr.start_agent(host, pane, kind="claude", agent=name, agent_arguments=arguments,
+            opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
+            timeout_ms=timeout_ms)
+        return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
     except herdr.AgentExited:
-        herdr.stop_session(name)
+        herdr.close_agent(host, pane)
         raise
 
 
@@ -780,9 +801,8 @@ def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
 
 def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound | NoMarkedUnit:
     """The unit's session, found by its mark."""
-    unit = unit_lookup.marked_units(request.production.slug).get(
-        request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit
-    )
+    unit = unit_lookup.marked_unit(
+        request.production.slug, request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit)
     return NoMarkedUnit() if unit is None else MarkedUnitFound(unit)
 
 
@@ -900,6 +920,39 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
     return transcript_model(request.session.session_id) if isinstance(launched_unit(request), MarkedUnitFound) else ""
 
 
+def autocompact_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
+    """The session's recorded auto-compact window, with --autocompact as the value to record."""
+    if isinstance(request.session, NewSession):
+        if explicit:
+            raise Refusal("--autocompact requires --resume")
+        return ""
+    try:
+        if explicit:
+            value = autocompact.checked(explicit)
+            return "" if value == autocompact.AUTO else value
+        return autocompact.recorded(request.session.session_id)
+    except (autocompact.BadAutocompact, OSError, UnicodeError) as error:
+        raise Refusal(f"auto-compact record: {error}") from error
+
+
+def registered_unit(request: RequestedUnitLaunch) -> bool:
+    lines = request.production.doc.read_text(encoding="utf-8").splitlines()
+    return any(cell_value(cells.get("Unit", "")) == request.unit for cells in unit_table(lines))
+
+
+def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, check: bool) -> None:
+    """Record a registered unit's window for its next restart; a running unit is not relaunched."""
+    try:
+        value = autocompact.checked(value)
+        if not check:
+            autocompact.record(session_id, value)
+    except (autocompact.BadAutocompact, OSError, UnicodeError) as error:
+        raise Refusal(f"auto-compact record: {error}") from error
+    verb = "would apply" if check else "applies"
+    setting = "the saved setting" if value == autocompact.AUTO else f"auto-compact {value}"
+    print(f"{request.unit}: {setting} {verb} to session {session_id} at its next restart")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
@@ -914,6 +967,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--account", default="")
     _ = parser.add_argument("--model", default="")
+    _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
@@ -925,6 +979,12 @@ def main(argv: list[str]) -> int:
     import herdr
     try:
         request = launch_request(args)
+        explicit_autocompact = cast(str, args.autocompact)
+        if (explicit_autocompact and isinstance(request.session, ResumedSession)
+                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)):
+            # Setting a registered unit's window is not new work: no new-work check or launch applies.
+            set_autocompact(request, request.session.session_id, explicit_autocompact, cast(bool, args.check))
+            return 0
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
@@ -935,6 +995,7 @@ def main(argv: list[str]) -> int:
                 f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
             )
         resume_model = model_for_resume(request, cast(str, args.model))
+        resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
         # Read the shutdown launch barrier only when a unit is launched.
         import launch_permission
 
@@ -945,6 +1006,7 @@ def main(argv: list[str]) -> int:
             raise Refusal(
                 f"shutdown state unreadable: launch barrier: {error}"
             ) from error
+        outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
         try:
             purpose: launch_permission.LaunchPurpose = (
                 launch_permission.RecordedSessionRestoreLaunchPurpose(
@@ -973,6 +1035,8 @@ def main(argv: list[str]) -> int:
             request = ready.launch
             if cast(bool, args.check):
                 return 0
+            if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
+                autocompact.record(request.session.session_id, cast(str, args.autocompact))
             marked_unit = launched_unit(request)
             if (
                 isinstance(request.session, ResumedSession)
@@ -986,14 +1050,15 @@ def main(argv: list[str]) -> int:
                     )
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
                     try:
-                        herdr.stop_session(unit.place.session)
+                        herdr.close_agent(unit.place.session, unit.place.pane)
                     except herdr.HerdrFailure as error:
                         raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
                     marked_unit = NoMarkedUnit()
             name = host_session_name(request)
             if isinstance(marked_unit, NoMarkedUnit):
                 try:
-                    running = any(entry["name"] == name for entry in herdr.live_sessions())
+                    running = not herdr.shared_session() and any(
+                        entry["name"] == name for entry in herdr.live_sessions())
                 except herdr.HerdrFailure as error:
                     raise Refusal(str(error)) from error
                 if running:
@@ -1011,11 +1076,15 @@ def main(argv: list[str]) -> int:
                     record_scheduled_restore_prompt(
                         request.launch_kind.session_id, prompt
                     )
-                launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
-                               if isinstance(request.session, ResumedSession) else "", model=resume_model)
+                outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
+                               if isinstance(request.session, ResumedSession) else "", model=resume_model,
+                               autocompact_window=resume_autocompact)
         finally:
             _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):
+            print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
+            if isinstance(outcome, herdr.PromptNotSubmitted):
+                raise RuntimeError(f"{request.identity.unit}: restart prompt not submitted: {outcome.reason}")
             record(request)
             attach = f"herdr session attach {host_session_name(request)}"
             if isinstance(marked_unit, MarkedUnitFound):
@@ -1023,6 +1092,8 @@ def main(argv: list[str]) -> int:
                 attach = f"herdr session attach {unit.place.session}"
             print(f"{request.identity.unit} restore launched: {attach}")
             return 0
+        if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(marked_unit, NoMarkedUnit):
+            raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}")
         launched = wait_for_remote_control(request)
         record(request)
         attach = f"herdr session attach {launched.place.session}"

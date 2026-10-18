@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
-# flags, config/lint.conf gating, and macOS sandbox-failure detection. This is the single bottom layer. The lint CLI in
-# this directory is the public entry point (shell aliases, validate_ci.sh,
-# the fix pipeline and pre_release_checks.sh); delegate/verify.sh sources this
-# file directly and adds only its per-package scope rules on top. Nothing
+# flags, config/lint.conf gating, and macOS sandbox-failure detection.
+# The lint CLI in this directory serves shell aliases, validate_ci.sh and
+# pre_release_checks.sh. delegate/verify.sh sources this file directly and adds
+# only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.
 #
@@ -206,18 +206,21 @@ LINT_LEFT_QUEUE_STATUS=75
 
 # Record both streams without putting stderr into a JSON consumer's stdout.
 run_json_stdout() (
-    local log=$1 stderr_dir stderr_pid status=0
+    local log=$1 stream_dir stderr_pid status=0
     shift
     : > "$log" || return $?
-    stderr_dir="$(mktemp -d)" || return $?
-    trap 'rm -rf "$stderr_dir"' EXIT
-    mkfifo "$stderr_dir/stderr" || return $?
+    stream_dir="$(mktemp -d)" || return $?
+    trap 'rm -rf "$stream_dir"' EXIT
+    mkfifo "$stream_dir/stderr" || return $?
     # An ordinary background process can be waited for on Bash 3.2 too.
-    tee -a "$log" < "$stderr_dir/stderr" >&2 &
+    tee -a "$log" < "$stream_dir/stderr" >&2 &
     stderr_pid=$!
-    "$@" 2> "$stderr_dir/stderr" | tee -a "$log" || status=${PIPESTATUS[0]}
+    # Two tee writers can insert stdout chunks inside stderr lines in the log.
+    # Stream stdout to its caller now, then append its copy after stderr drains.
+    "$@" 2> "$stream_dir/stderr" | tee "$stream_dir/stdout" || status=${PIPESTATUS[0]}
     # Drain stderr before callers inspect or remove the completed step's log.
     wait "$stderr_pid" || true
+    cat "$stream_dir/stdout" >> "$log" || true
     return "$status"
 )
 
@@ -553,9 +556,8 @@ invoke_mend() {
     fi
     # RUSTC_WRAPPER cleared: a compiler cache replays cached output instead of
     # running rustc, which suppresses the diagnostics mend analyzes
-    # Scope comes from the caller (the lint CLI resolves it, or a caller like
-    # the fix pipeline passes --manifest-path). Forcing --workspace here silently
-    # overrode both: a per-project run linted the whole workspace instead.
+    # The caller sets the scope. The lint CLI resolves its scope before this
+    # call. Keep the caller's flags so targeted runs stay within that scope.
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }
 

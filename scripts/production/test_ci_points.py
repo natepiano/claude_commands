@@ -506,5 +506,40 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                       lifted.stdout)
 
 
+    def test_mixed_handoff_history_does_not_advance_the_ci_interval(self) -> None:
+        for number in range(1, 5):
+            _ = self.merge(number)
+        for subject in (
+            "Merge alpha-unit hand-off (aaaaaaa) into production",
+            "Merge style-child hand-off (bbbbbbb) into production",
+            "Merge alpha-unit phase 4 shrink (ccccccc) into production",
+            "chore(example): rename unit alpha-unit to renamed-unit",
+        ):
+            _ = self.git("commit", "--allow-empty", "-m", subject)
+        due = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(due, "due", True)
+        self.assertIn("4 of 5 code merges", due.stdout)
+        self.ci_result(self.git("rev-parse", "HEAD"))
+        _ = self.start_point()
+        self.assert_step(self.collect_point(), "ci collect", True)
+        record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
+        self.assertEqual(record["count"], 4)
+
+    def test_ci_fix_commit_label_uses_last_unit_phase_when_a_handoff_is_newest(self) -> None:
+        _ = self.merge(2)
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (aaaaaaa) into production")
+        _ = self.start_point()
+        command = (self.stub_state / "validate-calls").read_text()
+        self.assertIn("ci(example): validation fixes after alpha-unit phase 2", command)
+        self.assertNotIn("hand-off", command)
+
+    def test_notice_clear_cannot_treat_a_child_named_like_the_target_as_a_unit_phase(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Merge beta-unit hand-off (bbbbbbb) into production")
+        result = self.run_ci("notice", "clear", "G1")
+        self.assert_step(result, "notice clear", False)
+        self.assertIn("beta-unit phase 2 has no code merge", result.stdout)
+        self.assertNotIn("send alpha-unit", result.stdout)
+
+
 if __name__ == "__main__":
     _ = unittest.main()

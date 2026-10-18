@@ -19,6 +19,8 @@ from scripts.accounts import accounts, role_map
 from scripts.agents import codex_mesh
 from scripts.whoami import agent_accounts
 
+send_role_map_command = role_map.ssh_role_map
+
 
 class RoleMapReadTime(datetime):
     @classmethod
@@ -58,6 +60,35 @@ class RoleMapTests(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(error):
             code = accounts.main(list(arguments))
         return code, output.getvalue(), error.getvalue()
+
+    def test_remote_command_refusal_retains_the_last_nonempty_stderr_line(self) -> None:
+        message = "next: units has 1 entries; position 3 is out of range"
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["fixture ssh"], 1, stdout="", stderr=f"fixture diagnostic\n{message}\n\n")) as transport:
+            with self.assertRaises(role_map.RemoteCommandRefused) as error:
+                _ = send_role_map_command(("next", "remove", "units", "3"))
+        self.assertEqual(str(error.exception), message)
+        transport.assert_called_once()
+
+    def test_remote_connection_failure_remains_a_transport_error_with_its_reason(self) -> None:
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["fixture ssh"], 255, stdout="", stderr="fixture cannot connect\n")) as transport:
+            with self.assertRaises(OSError) as error:
+                _ = send_role_map_command(("next", "remove", "units", "3"))
+        self.assertNotIsInstance(error.exception, role_map.RemoteCommandRefused)
+        self.assertEqual(str(error.exception), "fixture cannot connect")
+        transport.assert_called_once()
+
+    def test_role_history_append_is_one_whole_line_write(self) -> None:
+        self.seed(self.home, groups={"units": "claude1"})
+        with (patch.object(socket, "gethostname", return_value="natedev"),
+              patch.object(os, "write", wraps=os.write) as write):
+            _ = accounts.set_group_account("units", "claude2", why="auto: line-write", origin=accounts.AutoOrigin())
+        write.assert_called_once()
+        line = cast(bytes, write.call_args.args[1])
+        self.assertTrue(line.endswith(b"\n"))
+        self.assertEqual(json.loads(line)["why"], "auto: line-write")
+        self.assertEqual(accounts.roles_history_file().read_bytes(), line)
 
     def remote(self, arguments: tuple[str, ...]) -> str:
         """Run the real remote CLI against a second scratch home, never a shell or ssh."""

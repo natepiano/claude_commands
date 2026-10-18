@@ -13,9 +13,12 @@ import sqlite3
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Iterator
+import uuid
+from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Literal, TypedDict, cast
@@ -30,8 +33,31 @@ Verdict = Literal["clean", "fixed", "exception", "held", "waived"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
 
 
+class CellInputScope(StrEnum):
+    FILE = "file"
+    CRATE = "crate"
+    MANIFEST = "manifest"
+    MODULE = "module"
+
+
+def _cell_scope(rule: Rule, path: str, tip: RepositoryTip) -> CellInputScope:
+    if (rule.tier == "D" and path.endswith(".rs") and path != tip.crate(path)
+            and rule.input_scope != "manifest"):
+        return CellInputScope.MODULE
+    if rule.tier == "D" and rule.input_scope == "file" and path == tip.crate(path):
+        return CellInputScope.CRATE
+    return CellInputScope(rule.input_scope)
+
+
 class LedgerError(ValueError):
     """A ledger operation cannot represent the requested check."""
+
+
+@dataclass(frozen=True)
+class SyncWait:
+    unit: str
+    since: str
+    token: str
 
 
 @dataclass(frozen=True)
@@ -54,18 +80,46 @@ class ListedSite:
 
 
 @dataclass(frozen=True)
-class RuleProgress:
+class RuleCounts:
     rule_id: str
     tier: Tier
-    family: Family | None
-    cells_current: int
-    cells_total: int
-    done: bool
+    current: int
+    stale: int
+    open: int
+    awaiting_merge: int
+    held: int
+    input_scope: InputScope
+
+    @property
+    def total(self) -> int:
+        return self.current + self.stale + self.open + self.awaiting_merge
+
+    @property
+    def complete(self) -> bool:
+        return self.current == self.total
+
+
+@dataclass(frozen=True)
+class WholeRepository:
+    """Coverage across every crate in the repository."""
+
+
+@dataclass(frozen=True)
+class CrateCoverage:
+    crate: str
+
+
+CoverageScope = WholeRepository | CrateCoverage
+_WHOLE_REPOSITORY = WholeRepository()
+
+
+def _crate_filter(scope: CoverageScope) -> str | None:
+    return scope.crate if isinstance(scope, CrateCoverage) else None
 
 
 FindingKind = Literal["rename", "type", "restructure"]
-HeldStateName = Literal["unfiled", "filed", "waived"]
-TicketKind = Literal["read", "listed", "structure"]
+HeldStateName = Literal["unfiled", "filed", "waived", "built"]
+TicketKind = Literal["read", "listed", "structure", "proposal"]
 TicketState = Literal["queued", "assigned", "checkpointed", "merged", "dropped"]
 
 
@@ -85,6 +139,70 @@ class Waived:
 
 
 @dataclass(frozen=True)
+class Built:
+    """The approved finding has merged into the style branch."""
+
+
+@dataclass(frozen=True)
+class AllHeldFindings:
+    """Findings in every state."""
+
+
+@dataclass(frozen=True)
+class HeldFindingsInState:
+    state: HeldStateName
+
+
+@dataclass(frozen=True)
+class UnfiledFindingsFromOpenTickets:
+    """Findings still subject to revision by an assigned or checkpointed ticket."""
+
+
+@dataclass(frozen=True)
+class ApprovedProposal:
+    issue: Path
+    unit: str
+    finding_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SelectedByCoverage:
+    """The ticket requires the mechanical change filter against its saved base."""
+
+    base: str
+
+
+@dataclass(frozen=True)
+class HeldJudgment:
+    rule: str
+    path: str
+    commit: str
+    ticket: str
+    worker: str
+    rule_blob: str
+
+
+@dataclass(frozen=True)
+class CellWaived:
+    judgment: HeldJudgment
+
+
+@dataclass(frozen=True)
+class CellStillHeld:
+    judgment: HeldJudgment
+
+
+@dataclass(frozen=True)
+class InputChangedSinceJudged:
+    """The held judgment no longer describes the current input."""
+
+
+@dataclass(frozen=True)
+class NoHeldJudgment:
+    """There is no held judgment for this finding's cell."""
+
+
+@dataclass(frozen=True)
 class HeldFinding:
     finding_id: str
     rule: str
@@ -96,7 +214,7 @@ class HeldFinding:
     after: str
     rule_blob: str
     ticket: str
-    state: Unfiled | Filed | Waived
+    state: Unfiled | Filed | Waived | Built
 
 
 @dataclass(frozen=True)
@@ -154,15 +272,23 @@ class TicketRecord(TypedDict):
     rule: str
     crate: str
     files: list[str]
+    cells: list[list[str]]
     sites: list[dict[str, object]]
     rules: list[str]
     rule_blobs: dict[str, str]
     state: TicketState
     branch: str
     base: str
+    proposal: str
     checkpoint: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class UnjudgedTicketCell:
+    rule: str
+    path: str
 
 
 @dataclass(frozen=True)
@@ -182,6 +308,7 @@ class Judgment:
     input_fingerprint: str
     commit: str
     verdict: Verdict
+    input_scope: CellInputScope
 
 
 @dataclass(frozen=True)
@@ -211,6 +338,17 @@ def _git(repo: Path, *arguments: str) -> str:
     if result.returncode:
         raise LedgerError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout.rstrip("\n")
+
+
+def pushed_branch_point_tip(repo: Path, branch_point: str) -> str:
+    branch = branch_point.removeprefix("refs/heads/")
+    if "origin" in _git(repo, "remote").splitlines():
+        ref = f"refs/remotes/origin/{branch}"
+        try:
+            return _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+        except LedgerError as error:
+            raise LedgerError(f"origin exists but pushed branch point {ref} cannot be resolved; fetch origin first") from error
+    return _git(repo, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
 
 
 def _under(path: str, directory: str) -> bool:
@@ -292,7 +430,15 @@ def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
             _ = destination.write_bytes(content)
 
 
-def _fingerprint(repo: Path, tip: RepositoryTip, scope: InputScope, path: str) -> str:
+def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+    if scope == CellInputScope.MODULE:
+        if path not in tip.blobs:
+            raise LedgerError(f"{path}: no file at {tip.commit}")
+        directory = PurePosixPath(path).parent
+        parent_module = directory.as_posix() + ".rs"
+        inputs = sorted((name, blob) for name, blob in tip.blobs.items()
+                        if name.endswith(".rs") and (PurePosixPath(name).parent == directory or name == parent_module))
+        return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
     if scope == "manifest":
         paths = {"Cargo.toml", *(str(PurePosixPath(directory) / "Cargo.toml") for directory in tip.crate_dirs)}
         manifests = sorted((name, blob) for name, blob in tip.blobs.items() if name in paths)
@@ -396,6 +542,19 @@ MIGRATIONS = {
         CREATE TABLE rule_texts (blob TEXT PRIMARY KEY, text BLOB NOT NULL);
         ALTER TABLE tickets ADD COLUMN base TEXT NOT NULL DEFAULT '';
     """,
+    6: """
+        ALTER TABLE tickets ADD COLUMN proposal TEXT NOT NULL DEFAULT '';
+    """,
+    7: """
+        CREATE TABLE sync_waits (unit TEXT PRIMARY KEY, since TEXT NOT NULL, token TEXT NOT NULL);
+    """,
+    8: """
+        CREATE TABLE ticket_yields (
+            ticket TEXT NOT NULL, path TEXT NOT NULL, recorded_at TEXT NOT NULL,
+            PRIMARY KEY(ticket, path)
+        );
+    """,
+    9: "ALTER TABLE tickets ADD COLUMN cells TEXT NOT NULL DEFAULT '[]';",
 }
 
 
@@ -405,7 +564,7 @@ class Ledger:
         self.database: Path = database
         self._catalog: tuple[Rule, ...] = rule_catalog.load_rules(repo)
         self._tips: dict[str, RepositoryTip] = {}
-        self._fingerprints: dict[tuple[str, InputScope, str], str] = {}
+        self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
@@ -448,11 +607,19 @@ class Ledger:
             self._tips[commit] = _tip(self.repo, commit)
         return self._tips[commit]
 
-    def _fingerprint(self, tip: RepositoryTip, scope: InputScope, path: str) -> str:
-        key = (tip.commit, scope, tip.crate(path) if scope == "crate" else path if scope == "file" else ".")
+    def _fingerprint(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+        key = (tip.commit, scope, tip.crate(path) if scope == "crate" else "." if scope == "manifest" else path)
         if key not in self._fingerprints:
             self._fingerprints[key] = _fingerprint(self.repo, tip, scope, path)
         return self._fingerprints[key]
+
+    def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str) -> bool:
+        try:
+            previous = (row.input_fingerprint if row.input_scope == scope
+                        else self._fingerprint(self._tip(row.commit), scope, path))
+            return previous == self._fingerprint(tip, scope, path)
+        except LedgerError:
+            return False
 
     def _is_ancestor(self, commit: str, tip: str) -> bool:
         key = (commit, tip)
@@ -479,6 +646,13 @@ class Ledger:
             self._catalog = rule_catalog.load_rules(self.repo)
             self._refresh_sites(self._tip(commit))
 
+    def ensure_synced_tip(self, tip: str, style_branch: str) -> None:
+        """Initialize a production at its style branch tip without rewriting an exact match."""
+        style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
+        sync = cast(list[tuple[str, str]], self._connection.execute("SELECT tip,style_branch FROM sync WHERE id=1").fetchall())
+        if not sync or sync[0] != (tip, style_branch):
+            self.set_tip(tip, style_branch)
+
     def synced_at(self) -> datetime:
         rows = cast(list[tuple[str]], self._connection.execute("SELECT synced_at FROM sync WHERE id=1").fetchall())
         if not rows:
@@ -486,8 +660,8 @@ class Ledger:
         return datetime.fromisoformat(rows[0][0])
 
     def _ticket(self, ticket_id: str) -> TicketRecord:
-        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str]],
-                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base FROM tickets WHERE id=?", (ticket_id,)).fetchall())
+        rows = cast(list[tuple[str, str, TicketKind, str, str, str, str, str, str, str, TicketState, str, str, str, str, str, str, str]],
+                    self._connection.execute("SELECT id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,base,proposal,cells FROM tickets WHERE id=?", (ticket_id,)).fetchall())
         if not rows:
             raise LedgerError(f"unknown ticket {ticket_id}")
         row = rows[0]
@@ -496,7 +670,7 @@ class Ledger:
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
             "rules": cast(list[str], json.loads(row[8])), "rule_blobs": cast(dict[str, str], json.loads(row[9])),
             "state": row[10], "branch": row[11], "checkpoint": row[12], "created_at": row[13], "updated_at": row[14],
-            "base": row[15],
+            "base": row[15], "proposal": row[16], "cells": cast(list[list[str]], json.loads(row[17])),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -515,6 +689,7 @@ class Ledger:
     def ticket_add(
         self, id: str, unit: str, kind: TicketKind, family: str, crate: str,
         files: list[str], rules: list[str], rule: str = "", sites: list[dict[str, object]] | None = None,
+        proposal: str = "", cells: tuple[tuple[str, str], ...] = (),
     ) -> None:
         if not re.fullmatch(re.escape(unit) + r"-\d+", id):
             raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
@@ -526,6 +701,11 @@ class Ledger:
             raise LedgerError(f"{id}: sites are for listed or structure tickets only")
         if not rules:
             raise LedgerError(f"{id}: ticket must cover at least one rule")
+        if cells and kind != "structure":
+            raise LedgerError(f"{id}: explicit cells are for structure tickets only")
+        cells = tuple((rule_id, self._path(path)) for rule_id, path in cells)
+        if any(cell[0] not in rules for cell in cells):
+            raise LedgerError(f"{id}: cell rule is outside ticket rules")
         files = [self._path(path) for path in files]
         crate = self._path(crate)
         with self._connection:
@@ -533,18 +713,34 @@ class Ledger:
             exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
             if exists:
                 previous = self._ticket(id)
-                if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"]) != (unit, kind, family, crate, files, rules, rule, sites or []):
+                if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells]):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return
+            if kind == "proposal":
+                proposal_rows = cast(list[tuple[str, str]], self._connection.execute(
+                    "SELECT finding_id,state FROM held_findings WHERE proposal=?", (proposal,),
+                ).fetchall())
+                if any(state != "filed" for _, state in proposal_rows):
+                    raise LedgerError(f"{id}: proposal requires every finding filed")
+                findings = tuple(self._held(row[0]) for row in proposal_rows)
+                if not proposal or not findings:
+                    raise LedgerError(f"{id}: proposal requires filed findings")
+                if set(files) != {finding.path for finding in findings} or set(rules) != {finding.rule for finding in findings}:
+                    raise LedgerError(f"{id}: proposal files and rules must match its filed findings")
+            elif proposal:
+                raise LedgerError(f"{id}: proposal is for proposal tickets only")
             self._catalog = rule_catalog.load_rules(self.repo)
             definitions = {rule_id: self._component_rule(rule_id) for rule_id in rules}
             pins = {rule_id: definition.blob for rule_id, definition in definitions.items()}
             for rule_id, definition in definitions.items():
                 text = definition.path.read_bytes()
-                hashed = subprocess.run(
+                result = subprocess.run(
                     ["git", "-C", str(self.repo), "hash-object", "--stdin"],
-                    input=text, capture_output=True, check=True,
-                ).stdout.decode().strip()
+                    input=text, capture_output=True, check=False,
+                )
+                if result.returncode:
+                    raise LedgerError(result.stderr.decode(errors="replace").strip() or "git hash-object failed")
+                hashed = result.stdout.decode().strip()
                 if hashed != pins[rule_id]:
                     raise LedgerError(f"{rule_id}: rule changed while pinning; rerun")
                 _ = self._connection.execute(
@@ -552,10 +748,10 @@ class Ledger:
                 )
             now = _now()
             _ = self._connection.execute(
-                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at) "
-                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?)",
+                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,branch,checkpoint,created_at,updated_at,proposal,cells) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,'queued','','',?,?,?,?)",
                 (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
-                 json.dumps(rules), json.dumps(pins, sort_keys=True), now, now),
+                 json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal, json.dumps(cells)),
             )
 
     def pinned_rule_texts(self, ticket_id: str) -> tuple[PinnedRuleText, ...]:
@@ -584,6 +780,41 @@ class Ledger:
         highest = max((int(row[0].removeprefix(unit + "-")) for row in rows), default=0)
         return f"{unit}-{highest + 1}"
 
+    def unjudged_ticket_cells(self, id: str) -> tuple[UnjudgedTicketCell, ...]:
+        ticket = self._ticket(id)
+        if ticket["kind"] == "proposal":
+            return ()
+        paths = [ticket["crate"]] if ticket["kind"] == "structure" else ticket["files"]
+        rules = [ticket["rule"]] if ticket["kind"] == "listed" else ticket["rules"]
+        judged = set(cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT rule,path FROM judgments WHERE ticket=?", (id,),
+        ).fetchall()))
+        yielded = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
+            "SELECT path FROM ticket_yields WHERE ticket=?", (id,),
+        ).fetchall())}
+        owned = ({(rule, path) for rule, path in ticket["cells"] if path not in yielded}
+                 if ticket["cells"] else {(rule, path) for rule in rules for path in paths if path not in yielded})
+        return tuple(UnjudgedTicketCell(rule, path) for rule, path in sorted(owned - judged))
+
+    def ticket_yield(self, id: str, path: str) -> None:
+        path = self._path(path)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["state"] != "assigned":
+                raise LedgerError(f"{id}: cannot yield from {ticket['state']}")
+            if ticket["kind"] in ("structure", "proposal"):
+                raise LedgerError(f"{id}: cannot yield a {ticket['kind']} ticket")
+            if path not in ticket["files"]:
+                raise LedgerError(f"{id}: {path} is not in ticket files")
+            if self._connection.execute("SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (id, path)).fetchone():
+                return
+            _ = self._connection.execute("DELETE FROM judgments WHERE ticket=? AND path=?", (id, path))
+            _ = self._connection.execute(
+                "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
+            )
+            _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
+
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> None:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -598,10 +829,22 @@ class Ledger:
             predecessor = {"assigned": "queued", "checkpointed": "assigned", "merged": "checkpointed"}
             if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
                 raise LedgerError(f"{id}: cannot become {target} from {state}")
+            if target == "checkpointed":
+                missing = self.unjudged_ticket_cells(id)
+                if missing:
+                    raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
+                self._restamp_checkpoint_judgments(ticket, commit)
+            if target == "merged":
+                self._restamp_checkpoint_judgments(ticket, ticket["checkpoint"])
             if target == "assigned":
                 active = self.ticket_open(ticket["unit"])
                 if active:
                     raise LedgerError(f"{id}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
+            if target == "merged" and ticket["kind"] == "proposal":
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET state='built',updated_at=? WHERE proposal=? AND state='filed'",
+                    (_now(), ticket["proposal"]),
+                )
             _ = self._connection.execute(
                 "UPDATE tickets SET state=?,branch=?,checkpoint=?,updated_at=? WHERE id=?",
                 (target, branch if target == "assigned" else ticket["branch"],
@@ -629,8 +872,92 @@ class Ledger:
     def ticket_checkpoint(self, id: str, commit: str) -> None:
         self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
 
+    def _restamp_checkpoint_judgments(self, ticket: TicketRecord, checkpoint: str) -> None:
+        """Carry this ticket's verdicts across edits made only by this ticket."""
+        if not ticket["base"] or not self._is_ancestor(ticket["base"], checkpoint):
+            return
+        self._catalog = rule_catalog.load_rules(self.repo)
+        tip = self._tip(checkpoint)
+        # Commits inherited at the start or merged from another branch are not ours.
+        own_commits = set(_git(self.repo, "rev-list", "--first-parent", checkpoint,
+                               "^" + ticket["base"]).splitlines())
+        rows = cast(list[tuple[int, str, str, str]], self._connection.execute(
+            'SELECT j.id,j.rule,j.path,j."commit" FROM judgments j WHERE j.ticket=? '
+            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.ticket=j.ticket '
+            + 'AND latest.rule=j.rule AND latest.path=j.path ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
+            (ticket["id"],),
+        ).fetchall())
+        for judgment_id, rule, path, judged_commit in rows:
+            try:
+                definition = self._component_rule(rule)
+                if definition.family != ticket["family"] or judged_commit == checkpoint:
+                    continue
+                if not self._is_ancestor(judged_commit, checkpoint):
+                    continue
+                changed_commits = set(_git(self.repo, "rev-list", "--full-history", checkpoint,
+                                          "^" + judged_commit, "--", path).splitlines())
+                if not changed_commits <= own_commits:
+                    continue
+                scope = _cell_scope(definition, path, tip)
+                fingerprint = self._fingerprint(tip, scope, path)
+            except LedgerError:
+                continue
+            _ = self._connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
+                + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,? FROM judgments WHERE id=? '
+                + 'ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) DO NOTHING',
+                (scope, fingerprint, checkpoint, datetime.now(timezone.utc).isoformat(), judgment_id),
+            )
+
     def ticket_merge(self, id: str) -> None:
+        ticket = self._ticket(id)
+        if ticket["state"] == "merged":
+            return
+        if ticket["state"] != "checkpointed":
+            raise LedgerError(f"{id}: cannot become merged from {ticket['state']}")
+        rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+        branch = rows[0][0] if rows else ""
+        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
+        if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
+            raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         self._ticket_transition(id, "merged")
+
+    def wait_for_sync(self, unit: str) -> None:
+        with self._connection:
+            _ = self._connection.execute(
+                "INSERT INTO sync_waits VALUES (?,?,?) ON CONFLICT(unit) DO NOTHING", (unit, _now(), uuid.uuid4().hex),
+            )
+
+    def clear_sync_wait(self, unit: str) -> None:
+        with self._connection:
+            _ = self._connection.execute("DELETE FROM sync_waits WHERE unit=?", (unit,))
+
+    def acknowledge_sync_wait(self, wait: SyncWait) -> None:
+        with self._connection:
+            _ = self._connection.execute(
+                "DELETE FROM sync_waits WHERE unit=? AND token=?", (wait.unit, wait.token),
+            )
+
+    def sync_waits(self) -> tuple[SyncWait, ...]:
+        rows = cast(list[tuple[str, str, str]], self._connection.execute(
+            "SELECT unit,since,token FROM sync_waits ORDER BY since,unit",
+        ).fetchall())
+        return tuple(SyncWait(unit, since, token) for unit, since, token in rows)
+
+    def ticket_origin(self, id: str) -> ApprovedProposal | SelectedByCoverage:
+        ticket = self._ticket(id)
+        if ticket["kind"] != "proposal":
+            return SelectedByCoverage(ticket["base"])
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT finding_id FROM held_findings WHERE proposal=? ORDER BY finding_id", (ticket["proposal"],),
+        ).fetchall())
+        return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(row[0] for row in rows))
+
+    def proposal_tickets(self) -> tuple[TicketRecord, ...]:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE kind='proposal' ORDER BY created_at,id",
+        ).fetchall())
+        return tuple(self._ticket(row[0]) for row in rows)
 
     def ticket_drop(self, id: str) -> None:
         self._ticket_transition(id, "dropped")
@@ -663,12 +990,33 @@ class Ledger:
                 raise LedgerError("hand-off send requires --to")
             _ = self._connection.execute("UPDATE handoffs SET state='sent',sent_to=?,updated_at=? WHERE checkpoint=?", (to, _now(), checkpoint))
 
+    def handoff_reroute(self, checkpoint: str, to: str) -> None:
+        checkpoint = _git(self.repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
+        if not to:
+            raise LedgerError("hand-off reroute requires --to")
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            rows = cast(list[tuple[str, str]], self._connection.execute(
+                "SELECT state,sent_to FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchall())
+            if not rows:
+                raise LedgerError(f"unknown hand-off {checkpoint}")
+            state, sent_to = rows[0]
+            if state != "sent":
+                hint = "; use handoff send" if state == "pending" else ""
+                raise LedgerError(f"{checkpoint}: cannot reroute hand-off in state {state}{hint}")
+            if sent_to != to:
+                _ = self._connection.execute(
+                    "UPDATE handoffs SET sent_to=?,updated_at=? WHERE checkpoint=?", (to, _now(), checkpoint),
+                )
+
     def _first_merge(self, checkpoint: str, branch_point: str) -> str:
-        for commit in _git(self.repo, "rev-list", "--first-parent", "--reverse", "--merges", branch_point).splitlines():
+        branch_tip = pushed_branch_point_tip(self.repo, branch_point)
+        for commit in _git(self.repo, "rev-list", "--first-parent", "--reverse", "--merges", branch_tip).splitlines():
             if self._is_ancestor(checkpoint, commit):
                 return commit
         # A fast-forward has no merge commit; its containing branch-point tip is the evidence.
-        return _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
+        return branch_tip
 
     def handoff_merged(self, checkpoint: str, merge_commit: str = "") -> None:
         checkpoint = _git(self.repo, "rev-parse", "--verify", f"{checkpoint}^{{commit}}")
@@ -682,7 +1030,7 @@ class Ledger:
             branch_point = branches[0][0]
         else:
             raise LedgerError("hand-off merge requires a branch point saved by reconcile")
-        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
+        branch_tip = pushed_branch_point_tip(self.repo, branch_point)
         if not self._is_ancestor(checkpoint, branch_tip):
             raise LedgerError(f"{checkpoint}: hand-off is not merged into {branch_point}")
         if merge_commit:
@@ -690,7 +1038,7 @@ class Ledger:
             if not self._is_ancestor(checkpoint, actual_merge) or not self._is_ancestor(actual_merge, branch_tip):
                 raise LedgerError(f"{checkpoint}: {merge_commit} is not merge evidence on {branch_point}")
         else:
-            actual_merge = self._first_merge(checkpoint, branch_tip)
+            actual_merge = self._first_merge(checkpoint, branch_point)
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             rows = cast(list[tuple[str]], self._connection.execute("SELECT state FROM handoffs WHERE checkpoint=?", (checkpoint,)).fetchall())
@@ -746,14 +1094,71 @@ class Ledger:
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
         row = rows[0]
-        state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Unfiled()
+        state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Built() if row[10] == "built" else Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state)
 
-    def held_findings(self, state: HeldStateName | None = None) -> tuple[HeldFinding, ...]:
-        rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT finding_id FROM held_findings WHERE (? IS NULL OR state=?) ORDER BY created_at,finding_id", (state, state),
-        ).fetchall())
+    def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
+        if isinstance(selection, UnfiledFindingsFromOpenTickets):
+            query = self._connection.execute(
+                "SELECT h.finding_id FROM held_findings h JOIN tickets t ON t.id=h.ticket "
+                + "WHERE h.state='unfiled' AND t.state IN ('assigned','checkpointed') "
+                + "ORDER BY h.created_at,h.finding_id",
+            )
+        elif isinstance(selection, HeldFindingsInState):
+            query = self._connection.execute(
+                "SELECT finding_id FROM held_findings WHERE state=? ORDER BY created_at,finding_id", (selection.state,),
+            )
+        else:
+            query = self._connection.execute("SELECT finding_id FROM held_findings ORDER BY created_at,finding_id")
+        rows = cast(list[tuple[str]], query.fetchall())
         return tuple(self._held(row[0]) for row in rows)
+
+    def decline_held(self, finding_id: str, words: str) -> CellWaived | CellStillHeld | InputChangedSinceJudged | NoHeldJudgment:
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            finding = self._held(finding_id)
+            if isinstance(finding.state, Built):
+                raise LedgerError(f"{finding_id}: finding already built")
+            tip = self._synced_tip()
+            self._catalog = rule_catalog.load_rules(self.repo)
+            try:
+                definition = self._component_rule(finding.rule)
+            except LedgerError:
+                _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+                return InputChangedSinceJudged()
+            path = tip.crate(finding.path) if definition.tier == "D" and definition.input_scope == "manifest" else finding.path
+            rows = cast(list[tuple[int, str, str, str, str, str, str, str, str]], self._connection.execute(
+                'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint FROM judgments '
+                + "WHERE rule=? AND path=? AND verdict='held' ORDER BY recorded_at DESC,id DESC",
+                (finding.rule, path),
+            ).fetchall())
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+            if not rows:
+                return NoHeldJudgment()
+            row = rows[0]
+            judgment = HeldJudgment(*row[1:7])
+            newest = cast(tuple[int], self._connection.execute(
+                "SELECT id FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
+                (finding.rule, path),
+            ).fetchone())[0]
+            held_row = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]))
+            try:
+                unchanged = (self._judgment_inputs_match(held_row, tip, _cell_scope(definition, path, tip), path)
+                             and self._is_ancestor(row[3], tip.commit))
+            except LedgerError:
+                unchanged = False
+            if (newest != row[0] or definition.blob != finding.rule_blob or row[6] != finding.rule_blob
+                    or not unchanged):
+                return InputChangedSinceJudged()
+            others = tuple(other for other in self.held_findings(AllHeldFindings())
+                           if other.rule == finding.rule and not isinstance(other.state, Waived)
+                           and (tip.crate(other.path) if definition.tier == "D" and definition.input_scope == "manifest" else other.path) == path)
+            if others:
+                return CellStillHeld(judgment)
+            _ = self._connection.execute(
+                "UPDATE judgments SET verdict='waived',verdict_detail=?,recorded_at=? WHERE id=?", (words, _now(), row[0]),
+            )
+            return CellWaived(judgment)
 
     def file_held(self, finding_id: str, proposal: Path) -> None:
         with self._connection:
@@ -762,7 +1167,7 @@ class Ledger:
             if isinstance(finding.state, Filed) and finding.state.proposal == proposal:
                 return
             if not isinstance(finding.state, Unfiled):
-                state = "filed" if isinstance(finding.state, Filed) else "waived"
+                state = "filed" if isinstance(finding.state, Filed) else "built" if isinstance(finding.state, Built) else "waived"
                 raise LedgerError(f"{finding_id}: cannot file finding in state {state}")
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
@@ -775,13 +1180,22 @@ class Ledger:
             _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
-        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch_point}^{{commit}}")
+        branch_tip = pushed_branch_point_tip(self.repo, branch_point)
         style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
-        style_tip = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
+        present = subprocess.run(
+            ["git", "-C", str(self.repo), "show-ref", "--verify", "--quiet", style_branch],
+            capture_output=True, text=True, check=False,
+        )
+        if present.returncode == 1:
+            style_tip = branch_tip
+        elif present.returncode:
+            raise LedgerError(present.stderr.strip())
+        else:
+            style_tip = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
         changes: list[str] = []
         sync = cast(list[tuple[str, str]], self._connection.execute("SELECT tip,style_branch FROM sync WHERE id=1").fetchall())
         if not sync or sync[0][1] != style_branch:
-            self.set_tip(sync[0][0] if sync else branch_tip, style_branch)
+            self.set_tip(style_tip, style_branch)
             changes.append(f"style branch {style_branch}")
         with self._connection:
             _ = self._connection.execute("INSERT INTO reconciliation VALUES (1,?) ON CONFLICT(id) DO UPDATE SET branch_point=excluded.branch_point", (branch_point,))
@@ -790,7 +1204,7 @@ class Ledger:
             if self._is_ancestor(checkpoint, branch_tip):
                 with self._connection:
                     _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?",
-                                                 (self._first_merge(checkpoint, branch_tip), _now(), checkpoint))
+                                                 (self._first_merge(checkpoint, branch_point), _now(), checkpoint))
                 changes.append(f"hand-off {checkpoint}: {handoff['state']} -> merged")
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute("SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') ORDER BY id").fetchall())
         for id, branch, state, checkpoint in tickets:
@@ -807,15 +1221,18 @@ class Ledger:
         return tuple(changes)
 
     def summary(self) -> StyleLedgerSummary:
-        cells = tuple(self.cells())
-        progress = tuple(rule for rule in self._rule_progress(cells) if rule.tier in ("A", "B", "C", "D"))
+        return self.summary_of(self.rule_counts(WholeRepository()))
+
+    def summary_of(self, repository_counts: tuple[RuleCounts, ...]) -> StyleLedgerSummary:
+        progress = tuple(rule for rule in repository_counts if rule.tier in ("A", "B", "C", "D"))
+        total = sum(rule.total for rule in repository_counts)
         waiting_rows = self.pending_handoffs()
         waiting = PendingHandoffs(len(waiting_rows), datetime.fromisoformat(waiting_rows[0]["created_at"])) if waiting_rows else NoPendingHandoffs()
         proposals = cast(tuple[int], self._connection.execute("SELECT COUNT(DISTINCT proposal) FROM held_findings WHERE state='filed'").fetchone())[0]
         return StyleLedgerSummary(
-            sum(rule.done for rule in progress), len(progress), sum(rule.tier == "unclassified" for rule in self._catalog),
-            100.0 * sum(cell.state == "current" for cell in cells) / len(cells) if cells else 0.0,
-            sum(cell.state == "stale" for cell in cells), proposals, waiting, self.synced_at(), self._synced_tip().commit,
+            sum(rule.complete for rule in progress), len(progress), sum(rule.tier == "unclassified" for rule in self._catalog),
+            100.0 * sum(rule.current for rule in repository_counts) / total if total else 0.0,
+            sum(rule.stale for rule in repository_counts), proposals, waiting, self.synced_at(), self._synced_tip().commit,
         )
 
     def _refresh_sites(self, tip: RepositoryTip) -> None:
@@ -935,33 +1352,45 @@ class Ledger:
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
         path = self._path(path)
+        if ticket and self._connection.execute("SELECT 1 FROM tickets WHERE id=?", (ticket,)).fetchone():
+            owned = self._ticket(ticket)["cells"]
+            if owned and [rule, path] not in owned:
+                raise LedgerError(f"{ticket}: {rule} {path} is outside ticket cells")
         if isinstance(definition.reach, MemberReach) and not _under(path, definition.reach.crate_dir.as_posix()):
             raise LedgerError(f"{rule}: {path} is outside rule reach")
         if definition.tier in ("A", "E"):
             raise LedgerError(f"{rule}: tier {definition.tier} has no judgment cells in this phase")
         tip = self._tip(commit)
-        scope = definition.input_scope
+        scope = _cell_scope(definition, path, tip)
         if definition.tier == "B":
             synced = self._synced_tip()
             self._refresh_sites(synced)
             if path not in {site.path for site in self._listed_sites(rule, synced)}:
                 raise LedgerError(f"{rule}: {path} holds no listed site at the synced tip")
             if not path.endswith(".rs"):
-                scope = "file"
+                scope = CellInputScope.FILE
             if path not in tip.blobs:
                 raise LedgerError(f"{rule}: {path} is not a file at {tip.commit}")
         elif definition.tier == "D":
+            paths = set(tip.rust_files)
             crates = {tip.crate(file) for file in tip.rust_files}
             if definition.candidates is not None:
                 synced = self._synced_tip()
                 self._refresh_sites(synced)
-                crates.update(site.crate for site in self._listed_sites(rule, synced))
-            if path not in crates:
-                raise LedgerError(f"{rule}: {path} must name a crate with included files")
+                sites = self._listed_sites(rule, synced)
+                crates.update(site.crate for site in sites)
+                paths.update(site.path for site in sites)
+            if path not in crates and path not in paths:
+                raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
         fingerprint = self._fingerprint(tip, scope, path)
         with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            if ticket and self._connection.execute(
+                "SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket, path),
+            ).fetchone():
+                raise LedgerError(f"{ticket}: {path} was yielded")
             _ = self._connection.execute(
                 'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
                 + 'VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
@@ -969,6 +1398,15 @@ class Ledger:
                 (rule, rule_blob, scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
                  datetime.now(timezone.utc).isoformat()),
             )
+
+    def latest_held_judgments(self) -> dict[tuple[str, str], str]:
+        """Return judgment commits for cells whose latest verdict is held."""
+        rows = cast(list[tuple[str, str, str]], self._connection.execute(
+            'SELECT j.rule,j.path,j."commit" FROM judgments j WHERE j.verdict=\'held\' '
+            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.rule=j.rule AND latest.path=j.path '
+            + 'ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
+        ).fetchall())
+        return {(rule, path): commit for rule, path, commit in rows}
 
     def lint_record(self, tip: str, tool: LintTool, passed: bool, diagnostics: dict[str, int]) -> None:
         if any(count < 0 for count in diagnostics.values()):
@@ -988,22 +1426,26 @@ class Ledger:
             )
 
     def _judgments(self, rule: str, path: str) -> tuple[Judgment, ...]:
-        rows = cast(list[tuple[str, str, str, Verdict]], self._connection.execute(
-            'SELECT rule_blob,input_fingerprint,"commit",verdict FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
+        rows = cast(list[tuple[str, str, str, Verdict, str]], self._connection.execute(
+            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
         ).fetchall())
-        return tuple(Judgment(*row) for row in rows)
+        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope))
+                     for blob, fingerprint, commit, verdict, scope in rows)
 
     def _judgment_state(self, rule: Rule, path: str, tip: RepositoryTip) -> tuple[CellState, str]:
         rows = self._judgments(rule.rule_id, path)
-        fingerprint = self._fingerprint(tip, rule.input_scope, path)
+        scope = _cell_scope(rule, path, tip)
         pending = ""
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
         style_branch = branches[0][0] if branches else ""
         for row in rows:
             if row.rule_blob != rule.blob:
                 continue
-            ancestor = self._is_ancestor(row.commit, tip.commit)
-            if ancestor and row.input_fingerprint == fingerprint:
+            try:
+                ancestor = self._is_ancestor(row.commit, tip.commit)
+            except LedgerError:
+                continue
+            if ancestor and self._judgment_inputs_match(row, tip, scope, path):
                 return "current", row.verdict
             if not ancestor and style_branch:
                 try:
@@ -1011,7 +1453,7 @@ class Ledger:
                         self._branch_tips[style_branch] = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
                     branch_commit = self._branch_tips[style_branch]
                     checked_tip = self._tip(branch_commit)
-                    if self._is_ancestor(row.commit, branch_commit) and self._fingerprint(checked_tip, rule.input_scope, path) == row.input_fingerprint:
+                    if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path):
                         if not pending:
                             pending = row.verdict
                 except LedgerError:
@@ -1054,7 +1496,8 @@ class Ledger:
             if definition.tier == "B":
                 paths = sorted({site.path for site in sites})
             elif definition.tier == "D":
-                paths = sorted({tip.crate(path) for path in files} | {site.crate for site in sites})
+                paths = (sorted({tip.crate(path) for path in files} | {site.crate for site in sites})
+                         if definition.input_scope == "manifest" else sorted(set(files) | {site.path for site in sites}))
             else:
                 paths = files
             components = [(definition, paths)]
@@ -1070,7 +1513,7 @@ class Ledger:
                 if rule_id is not None and rule_id.endswith("#uncovered") and component.rule_id != rule_id:
                     continue
                 for path in component_paths:
-                    cell_crate = path if component.tier == "D" else tip.crate(path)
+                    cell_crate = path if component.tier == "D" and component.input_scope == "manifest" else tip.crate(path)
                     if crate is not None and cell_crate != crate:
                         continue
                     if component.tier == "A":
@@ -1088,35 +1531,47 @@ class Ledger:
         for cell, _ in self._coverage(rule, crate):
             yield cell
 
-    def rules(self) -> Iterator[RuleProgress]:
-        yield from self._rule_progress(tuple(self.cells()))
+    def rule_counts(self, scope: CoverageScope) -> tuple[RuleCounts, ...]:
+        return self._count_rows(self._coverage(None, _crate_filter(scope)))
 
-    def _rule_progress(self, cells: tuple[Cell, ...]) -> Iterator[RuleProgress]:
+    def _count_rows(self, coverage: Iterable[tuple[Cell, str]]) -> tuple[RuleCounts, ...]:
+        states: dict[str, Counter[CellState]] = {}
+        held: Counter[str] = Counter()
+        for cell, verdict in coverage:
+            rule_id = cell.rule.removesuffix("#uncovered")
+            if rule_id not in states:
+                states[rule_id] = Counter()
+            states[rule_id][cell.state] += 1
+            if cell.state == "current" and verdict == "held":
+                held[rule_id] += 1
+        rows: list[RuleCounts] = []
         for definition in self._catalog:
             if definition.tier == "unclassified":
                 continue
-            own = [cell for cell in cells if cell.rule in (definition.rule_id, definition.rule_id + "#uncovered")]
-            current = sum(cell.state == "current" for cell in own)
-            yield RuleProgress(definition.rule_id, definition.tier, definition.family, current, len(own),
-                               current == len(own))
+            counts = states.get(definition.rule_id, Counter())
+            rows.append(RuleCounts(definition.rule_id, definition.tier,
+                                   counts["current"], counts["stale"], counts["open"], counts["awaiting merge"],
+                                   held[definition.rule_id], definition.input_scope))
+        return tuple(rows)
 
-
-    def status(self, rule: str | None = None, crate: str | None = None, as_json: bool = False) -> None:
-        coverage = tuple(self._coverage(rule, crate))
-        unclassified = self.unclassified_rules()
+    def status(self, rule: str | None = None, scope: CoverageScope = _WHOLE_REPOSITORY, as_json: bool = False) -> None:
         if as_json:
+            coverage = tuple(self._coverage(rule, _crate_filter(scope)))
+            unclassified = self.unclassified_rules()
             print(json.dumps({"cells": [asdict(cell) for cell, _ in coverage], "unclassified_rules": unclassified}, sort_keys=True))
         else:
+            rows = self._count_rows(self._coverage(rule, _crate_filter(scope)))
+            repository_rows = self.rule_counts(scope) if rule or isinstance(scope, CrateCoverage) else rows
+            complete = {row.rule_id: row.complete for row in repository_rows}
+            unclassified = self.unclassified_rules()
             if unclassified:
                 print(f"unclassified: {len(unclassified)} rules — pull nate_style")
             print("rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone")
-            for progress in self.rules():
-                if rule and progress.rule_id != rule.removesuffix("#uncovered"):
+            for row in rows:
+                if rule and row.rule_id != rule.removesuffix("#uncovered"):
                     continue
-                own = [(cell, verdict) for cell, verdict in coverage if cell.rule in (progress.rule_id, progress.rule_id + "#uncovered")]
-                counts = [str(sum(cell.state == state for cell, _ in own)) for state in ("current", "stale", "open", "awaiting merge")]
-                held = sum(cell.state == "current" and verdict == "held" for cell, verdict in own)
-                print("\t".join([progress.rule_id, *counts, str(held), str(progress.done).lower()]))
+                counts = [str(count) for count in (row.current, row.stale, row.open, row.awaiting_merge, row.held)]
+                print("\t".join([row.rule_id, *counts, str(complete[row.rule_id]).lower()]))
 
 
 
@@ -1154,6 +1609,7 @@ class LedgerArguments(argparse.Namespace):
     family: str = ""
     files: str = "[]"
     sites: str = "[]"
+    cells: str = "[]"
     rules: str = "[]"
     checkpoint: str = ""
     to: str = ""
@@ -1174,6 +1630,21 @@ def _json_strings(serialized: str) -> list[str]:
     return cast(list[str], value)
 
 
+def _json_cells(serialized: str) -> tuple[tuple[str, str], ...]:
+    value = cast(object, json.loads(serialized))
+    if not isinstance(value, list):
+        raise LedgerError("expected a JSON list of [rule, path] pairs")
+    cells: list[tuple[str, str]] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, list):
+            raise LedgerError("expected a JSON list of [rule, path] pairs")
+        pair = cast(list[object], item)
+        if len(pair) != 2 or not isinstance(pair[0], str) or not isinstance(pair[1], str):
+            raise LedgerError("expected a JSON list of [rule, path] pairs")
+        cells.append((pair[0], pair[1]))
+    return tuple(cells)
+
+
 def _json_sites(serialized: str) -> list[dict[str, object]]:
     value = cast(object, json.loads(serialized))
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in cast(list[object], value)):
@@ -1183,10 +1654,27 @@ def _json_sites(serialized: str) -> list[dict[str, object]]:
 
 def _held_json(finding: HeldFinding) -> dict[str, object]:
     result: dict[str, object] = asdict(finding)
-    result["state"] = "filed" if isinstance(finding.state, Filed) else "waived" if isinstance(finding.state, Waived) else "unfiled"
+    result["state"] = "filed" if isinstance(finding.state, Filed) else "waived" if isinstance(finding.state, Waived) else "built" if isinstance(finding.state, Built) else "unfiled"
     if isinstance(finding.state, Filed):
         result["proposal"] = str(finding.state.proposal)
     return result
+
+
+def _wake_sync_waiters(repo: Path, ticket_id: str) -> None:
+    scripts = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run([
+            str(scripts / "lib/py"), str(scripts / "style/style_sync.py"),
+            "wake-waiters", "--repo", str(repo), "--ticket", ticket_id,
+        ], capture_output=True, text=True, check=False)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode:
+            print("style_ledger: wake: " + " ".join(
+                (result.stderr.strip() or f"style_sync.py exited {result.returncode}").splitlines(),
+            ))
+    except OSError as error:
+        print("style_ledger: wake: " + " ".join(str(error).splitlines()))
 
 
 def main() -> None:
@@ -1218,8 +1706,8 @@ def main() -> None:
     for command in (record, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
-        ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open")),
-        ("handoff", ("add", "send", "merged", "pending")),
+        ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
+        ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "file", "waive", "list")),
     ):
@@ -1237,17 +1725,21 @@ def main() -> None:
                 if action == "add":
                     for field in ("unit", "family", "crate", "files", "rules"):
                         _ = command.add_argument(f"--{field}", required=True)
-                    _ = command.add_argument("--kind", choices=("read", "listed", "structure"), required=True)
+                    _ = command.add_argument("--kind", choices=("read", "listed", "structure", "proposal"), required=True)
                     _ = command.add_argument("--rule", default="")
                     _ = command.add_argument("--sites", default="[]")
+                    _ = command.add_argument("--cells", default="[]")
+                    _ = command.add_argument("--proposal", default="")
                 elif action == "assign":
                     _ = command.add_argument("--branch", required=True)
                 elif action == "checkpoint":
                     _ = command.add_argument("--commit", required=True)
+                elif action == "yield":
+                    _ = command.add_argument("--path", required=True)
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
-                if action == "send":
+                if action in ("send", "reroute"):
                     _ = command.add_argument("--to", required=True)
                 elif action == "merged":
                     _ = command.add_argument("--merge-commit", default="")
@@ -1259,7 +1751,7 @@ def main() -> None:
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
             elif action == "list":
-                _ = command.add_argument("--state", choices=("unfiled", "filed", "waived"), default=None)
+                _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built"), default=None)
                 _ = command.add_argument("--json", action="store_true")
             else:
                 _ = command.add_argument("--id", required=True)
@@ -1281,7 +1773,8 @@ def main() -> None:
                     raise LedgerError("diagnostics must be an object of file paths to nonnegative counts")
                 ledger.lint_record(args.tip, args.tool, args.passed == "1", cast(dict[str, int], value))
             elif args.command == "status":
-                ledger.status(args.rule or None, args.crate or None, args.json)
+                scope = CrateCoverage(args.crate) if args.crate else WholeRepository()
+                ledger.status(args.rule or None, scope, args.json)
             elif args.command == "summary":
                 result = ledger.summary().to_json()
                 if args.json:
@@ -1295,15 +1788,19 @@ def main() -> None:
             elif args.command == "ticket":
                 if args.action == "add":
                     ledger.ticket_add(args.id, args.unit, cast(TicketKind, args.kind), args.family, args.crate,
-                                      _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites))
+                                      _json_strings(args.files), _json_strings(args.rules), args.rule, _json_sites(args.sites), args.proposal, _json_cells(args.cells))
                 elif args.action == "assign":
                     ledger.ticket_assign(args.id, args.branch)
                 elif args.action == "checkpoint":
                     ledger.ticket_checkpoint(args.id, args.commit)
                 elif args.action == "merge":
                     ledger.ticket_merge(args.id)
+                    if ledger.sync_waits():
+                        _wake_sync_waiters(ledger.repo, args.id)
                 elif args.action == "drop":
                     ledger.ticket_drop(args.id)
+                elif args.action == "yield":
+                    ledger.ticket_yield(args.id, args.path)
                 else:
                     for ticket in ledger.ticket_open(args.unit):
                         print(json.dumps(ticket, sort_keys=True))
@@ -1312,6 +1809,8 @@ def main() -> None:
                     ledger.handoff_add(args.checkpoint)
                 elif args.action == "send":
                     ledger.handoff_send(args.checkpoint, args.to)
+                elif args.action == "reroute":
+                    ledger.handoff_reroute(args.checkpoint, args.to)
                 elif args.action == "merged":
                     ledger.handoff_merged(args.checkpoint, args.merge_commit)
                 else:
@@ -1335,7 +1834,7 @@ def main() -> None:
                 elif args.action == "waive":
                     ledger.waive_held(args.id)
                 else:
-                    findings = ledger.held_findings(args.state)
+                    findings = ledger.held_findings(HeldFindingsInState(args.state) if args.state else AllHeldFindings())
                     if args.json:
                         print(json.dumps([_held_json(finding) for finding in findings], sort_keys=True))
                     else:

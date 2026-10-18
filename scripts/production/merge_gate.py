@@ -12,8 +12,10 @@ OS allocation limit; unexpected job growth can still exceed the cap.
 --tests-only runs the same suite runner without performing any git operations.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
---production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
+the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
 its frontmatter; the first row creates a missing list, and the list commits itself in its vault.
+The production is --production, else the calling showrunner's (its update timer); a gate that
+finds neither is refused before the merge, so no merge lands without its rows.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -456,6 +459,23 @@ def rollback_merge(repo: Path, baseline: str) -> None:
         raise GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or result.stderr.strip()}; {result.stderr.strip()}")
 
 
+def notify_style(repo: Path, branch: str, tip: str) -> None:
+    try:
+        script = (os.environ.get("MERGE_GATE_STYLE_SYNC") or shutil.which("style_sync.py")
+                  or str(Path(__file__).resolve().parents[1] / "style/style_sync.py"))
+        python = shutil.which("python3") or sys.executable
+        _ = sys.stdout.flush()
+        result = subprocess.run(
+            [python, script, "notify", "--repo-dir", str(repo), "--branch", branch, "--tip", tip],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode or result.stdout.strip() or result.stderr.strip():
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            print("style sync: " + detail.replace("\n", "; "), flush=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("style sync: " + str(error).replace("\n", "; "), flush=True)
+
+
 def merge_checkpoint(args: GateArguments) -> int:
     repo = Path(str(args.repo)).resolve()
     # Untracked files (each showrunner's LOG) never block; a merge that would
@@ -474,7 +494,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused("checkpoint is not on origin unit branch")
     if git(repo, "merge-base", "--is-ancestor", previous, checkpoint).returncode:
         raise GateRefused("previous checkpoint is not an ancestor of checkpoint")
-    review_list = change_review_list(args)
+    production, review_list = change_review_list(args)
     try:
         commits = change_review.unit_commits(repo, checkpoint, previous, str(args.merge_branch))
     except change_review.ChangeReviewError as error:
@@ -500,32 +520,36 @@ def merge_checkpoint(args: GateArguments) -> int:
         rollback_merge(repo, baseline)
         raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
+    notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
     if review_list is not None:
-        record_changes(repo, review_list, Path(str(args.production)).expanduser(), commits, str(args.merge_branch))
+        record_changes(repo, review_list, production, commits, str(args.merge_branch))
     if args.promote:
         promote(args)
     return 0
 
 
-def change_review_list(args: GateArguments) -> Path | None:
-    """The list the merge adds rows to: --change-review, else the production's, else none.
+def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
+    """The production whose merge this is, and the list its rows go to: --change-review, else its own.
 
-    Rows always name their production, so --change-review needs --production too.
+    The production is --production, else the calling showrunner's. Rows always name their
+    production, so --change-review needs --production too.
     """
-    if not args.production:
-        if args.change_review:
-            raise GateRefused("--change-review needs --production: every row's list names its production")
-        return None
-    if args.change_review:
-        return Path(str(args.change_review)).expanduser()
+    if args.change_review and not args.production:
+        raise GateRefused("--change-review needs --production: every row's list names its production")
     try:
-        found = change_review.list_path(Path(str(args.production)).expanduser())
+        production = change_review.production_doc(str(args.production))
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
+    if args.change_review:
+        return production, Path(str(args.change_review)).expanduser()
+    try:
+        found = change_review.list_path(production)
     except OSError as error:
         raise GateRefused(f"production doc unreadable: {error}") from error
     if found is None:
         print("Change review: the production doc has no Change review line; no rows written", flush=True)
-    return found
+    return production, found
 
 
 def record_changes(repo: Path, review_list: Path, production: Path, commits: list[change_review.Commit],
@@ -538,6 +562,10 @@ def record_changes(repo: Path, review_list: Path, production: Path, commits: lis
         drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED)
     except (change_review.ChangeReviewError, OSError) as error:
         raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
+    if rows:
+        ids = [change_review.row_id(row) for row in rows]
+        print(f"Change review: {len(rows)} row(s) added to {review_list}: "
+              + (ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"), flush=True)
     for row in rows:
         print(f"Change review: {row}", flush=True)
     for line in drifted:
@@ -551,7 +579,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
-    _ = parser.add_argument("--production", default="", help="the production doc whose header names the list")
+    _ = parser.add_argument("--production", default="",
+                            help="the production doc whose header names the list (default: the calling showrunner's)")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")

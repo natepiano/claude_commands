@@ -179,7 +179,8 @@ def director_lines(every: unit_lookup.MarkedProductions, level: str, check: bool
     lines = [_director_line(marked, level, check)
              for slug in sorted(every.units) for _, marked in sorted(every.units[slug].items())
              if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)]
-    lines.extend(f"{slug}: skipped — {fault}" for slug, fault in sorted(every.faults.items()))
+    lines.extend(f"{slug}: skipped {fault}" for slug, units in sorted(every.faults.items())
+                 for _, fault in sorted(units.items()))
     return lines or ["no unit director is running"]
 
 

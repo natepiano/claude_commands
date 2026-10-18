@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +33,9 @@ def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
     path.chmod(0o755)
 
+
+# A marked worker is python, not sleep: the Mac hides a system binary's environment from ps.
+MARKED_SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
@@ -141,6 +145,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
+            # herdr reads a Mac process's marks with the real ps; the fake one answers only the watcher's list.
+            "HERDR_PS": shutil.which("ps") or "ps",
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }
@@ -442,6 +449,39 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
 
+    def test_a_hold_that_states_its_end_is_not_bumped_before_then(self) -> None:
+        """START is 12:00 PDT: a hold ending at 14:00, dated or not, bumps only once 14:00 is past."""
+        for status in ("— holding: waiting on the re-measure window, which ends 2026-10-06 14:00 PDT",
+                       "— holding: waiting on the re-measure window until 14:00 PDT",
+                       "— holding: waiting on the window until 21:00 UTC",
+                       "— holding: waiting on the window, which opens Tue 10-06 14:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                for at in (START, START + 300, START + 7199):
+                    self.assertEqual(self.tick(at).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 7199 + 300).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_a_hold_naming_a_past_time_still_bumps(self) -> None:
+        """A time without a date is the nearest one: 11:50 read at 12:00 is this morning, not tonight."""
+        for status in ("— holding: waiting on the tests since 11:50 PDT",
+                       "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT",
+                       "— holding: waiting on the window, which closed Mon 10-05 14:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                self.assertEqual(len(self.sent()), 2)
+
     def test_shell_seen_then_gone_starts_a_new_idle_stretch(self) -> None:
         _ = self.tick(START)
         _ = self.tick(START + 300)
@@ -517,7 +557,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.send_log.unlink(missing_ok=True)
                 _ = self.tick(START)
                 marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
-                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           env={**os.environ, **marks})
                 self.children.append(worker)
                 self.process_rows.append(f"{worker.pid} 1 sleep 60")
@@ -529,7 +569,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         doc = self.root / "showrunner-production.md"
         _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
         self.panes["unit-one"]["slug"] = "old-showrunner"
-        worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
                                        "SHOWRUNNER_UNIT_ID": "unit-one"})
         self.children.append(worker)
@@ -749,7 +789,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             json.dumps({"pid": "unreadable", "sessionId": "", "name": "", "running": False}))
         result = self.tick(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("stall-watch: unit-one: one or more session records could not be read", result.stderr)
+        self.assertIn(f"stall-watch: unit-one: the session record of pid {self.children[0].pid} could not be read", result.stderr)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
 

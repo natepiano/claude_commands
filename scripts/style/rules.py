@@ -92,14 +92,16 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
             raise RuleValidationError(path, "tier A requires a clippy, mend or rustfmt mechanism, and vice versa")
 
         declared_family = _scalar(metadata, "family", path)
-        if (tier in ("B", "C", "D") or origin == "local") and not declared_family:
-            raise RuleValidationError(path, "family is required for B, C, D and local rules")
+        if tier in ("B", "C", "D") and not declared_family:
+            raise RuleValidationError(path, "family is required for tier B, C and D")
         if tier in ("A", "E") and declared_family:
             raise RuleValidationError(path, "family is forbidden for tier A and E")
         if declared_family:
             if declared_family not in ("names", "values", "types", "modules"):
                 raise RuleValidationError(path, "family must be names, values, types or modules")
             family = declared_family
+        if tier == "D" and family != "modules":
+            raise RuleValidationError(path, "tier D requires the modules family")
 
         declared_scope = _scalar(metadata, "input_scope", path, "crate")
         if declared_scope not in ("file", "crate", "manifest"):

@@ -24,6 +24,7 @@ for dependency in ("message", "production", "herdr", "lib"):
 import sessions
 import herdr
 import relaunch
+import unit_lookup
 from inventory import Inventory, Session, terminal_kind, live_supervisor, codex_seats
 from record import (
     CLAIM_STALE_SECONDS,
@@ -144,10 +145,6 @@ def run_codex_mesh(arguments: list[str]) -> int | None:
 
 def run_systemctl(arguments: list[str]) -> int | None:
     return _run(["systemctl", *arguments])
-
-
-def run_launchctl(arguments: list[str]) -> int | None:
-    return _run(["launchctl", *arguments])
 
 
 def _run(command: list[str]) -> int | None:
@@ -364,9 +361,10 @@ def _stop_codex_servers(
 def _stop_unit_session(
     session: Session, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit" or session["host"]["kind"] != "unit":
+    host = session["host"]
+    if session["kind"] != "unit" or host["kind"] != "unit":
         return []
-    name = session["host"]["session_name"]
+    name = host["session_name"]
     issue: SessionStopIssue = {
         "kind": "unit session left running",
         "at": _timestamp(clock),
@@ -375,6 +373,19 @@ def _stop_unit_session(
         "cause": "stop not confirmed",
     }
     claim.check()
+    if name == herdr.shared_session():
+        # The shared session holds every production: close only the tab of the pane that carries this unit's marks.
+        client = herdr.Herdr(name)
+        try:
+            marked = unit_lookup.marked_unit(host["production"], host["unit"])
+            if marked is not None and marked.place.session == name:
+                client.close_tab_of(marked.place.pane)
+            left = marked is not None and any(pane["pane_id"] == marked.place.pane for pane in client.panes())
+        except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+            left = True
+        finally:
+            claim.check()
+        return [issue] if left else []
     try:
         herdr.stop_session(name)
     except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):

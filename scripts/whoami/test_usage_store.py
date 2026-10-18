@@ -12,7 +12,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 import usage_store
-from agent_accounts import Quota, Report
+from agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip
 
 READ = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 RESETS = datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc)
@@ -128,6 +128,43 @@ class UsageStoreTests(unittest.TestCase):
         ], READ + timedelta(minutes=2))
 
         self.assertEqual(usage_store.store_file().read_text(encoding="utf-8"), before)
+
+    def test_stale_token_skip_round_trips_without_changing_last_good_readings(self) -> None:
+        usage_store.save([Report("Claude", email="Main@Example.invalid",
+            quotas=[Quota("Weekly", 90, RESETS)])], READ, {"claude2": "main@example.invalid"})
+        before = usage_store.load()["main@example.invalid"].copy()
+        labels = cast(object, json.loads(usage_store.label_file().read_text()))
+        usage_store.save([Report("Claude", email="Main@Example.invalid",
+            quota_problem="display wording can change", weekly_read_skip=StaleTokenSkip())],
+            RESETS + timedelta(minutes=2), {"claude2": "main@example.invalid"})
+        held = usage_store.load()["main@example.invalid"]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), StaleTokenSkip)
+        self.assertEqual({key: value for key, value in held.items() if key != "weekly_read_skip"}, before)
+        self.assertEqual(json.loads(usage_store.label_file().read_text()), labels)
+        self.assertFalse(usage_store.merge(usage_store.load(), [Report("Claude", email="main@example.invalid",
+            weekly_read_skip=StaleTokenSkip())], RESETS + timedelta(minutes=4)))
+
+    def test_another_read_failure_clears_the_stale_token_reason_without_refreshing_usage(self) -> None:
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quotas=[Quota("Weekly", 90, RESETS)])], READ)
+        before = usage_store.load()["main@example.invalid"].copy()
+        usage_store.save([Report("Claude", email="main@example.invalid", weekly_read_skip=StaleTokenSkip())], RESETS)
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quota_problem="Weekly quota: not read (stale token; a Claude session on this account refreshes it)")],
+            RESETS + timedelta(minutes=2))
+        held = usage_store.load()["main@example.invalid"]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), NoWeeklyReadSkip)
+        self.assertEqual(held, before)
+
+    def test_a_successful_read_clears_the_stale_token_skip_and_saves_new_usage(self) -> None:
+        usage_store.save([Report("Claude", email="main@example.invalid", weekly_read_skip=StaleTokenSkip())], READ)
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quotas=[Quota("Weekly", 37, RESETS)])], READ + timedelta(minutes=2))
+        held = usage_store.load()["main@example.invalid"]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), NoWeeklyReadSkip)
+        assert "weekly" in held
+        self.assertEqual(held["weekly"]["left"], 63)
+        self.assertEqual(held["weekly"]["at"], (READ + timedelta(minutes=2)).isoformat())
 
     def test_load_drops_what_it_cannot_read(self) -> None:
         self.assertEqual(usage_store.load(), {})

@@ -166,6 +166,9 @@ fi
 PY="${SCRIPT_DIR}/../lib/py"
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
+# Every dispatch names the run's director in the run folder (unit_runs.py), which the
+# production tree reads: a marker names one run per director, and a director runs phases side by side.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
@@ -227,10 +230,11 @@ from pathlib import Path
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
-identity_file = root / f"impl_worker_{slot}.json"
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
-from worker_state import worker_claim_lock, worker_ledger
+from worker_state import worker_claim_lock, worker_ledger, worker_record_path
+
+identity_file = worker_record_path(root, name, slot)
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -373,6 +377,17 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
   worker_record claim
   trap 'worker_record release' EXIT
+fi
+
+# A phase claims its files before any seat edits them, wherever the seat runs
+# (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
+if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
+  --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "error" > "${STATUS_FILE}"
+  bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+  exit 1
 fi
 
 : > "${SUMMARY_FILE}"

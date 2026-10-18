@@ -5,6 +5,59 @@ export interface Cell { ch: string; tone: Tone }
 export interface Run { text: string; tone: Tone }
 export interface Ruler { track: Cell[]; labels: string; from: number; to: number }
 
+/** Terminal cells occupied by ordinary, combining, wide and emoji characters. */
+export function cellWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (/[\p{Mark}\p{Cf}]/u.test(ch) || code < 0x20 || (code >= 0x7f && code < 0xa0)) continue;
+    const wide = code >= 0x1100 && (code <= 0x115f || code === 0x2329 || code === 0x232a
+      || (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f)
+      || (code >= 0xac00 && code <= 0xd7a3) || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0xfe10 && code <= 0xfe19) || (code >= 0xfe30 && code <= 0xfe6f)
+      || (code >= 0xff01 && code <= 0xff60) || (code >= 0xffe0 && code <= 0xffe6)
+      || (code >= 0x1b000 && code <= 0x1b2ff) || (code >= 0x20000 && code <= 0x3fffd));
+    width += wide || /[\p{Emoji_Presentation}\p{Extended_Pictographic}]/u.test(ch) ? 2 : 1;
+  }
+  return width;
+}
+
+/** Keep the following column's space even when a title fills its entire cell. */
+export function fitText(text: string, width: number): string {
+  text = text.replace(/[ \t]*[\r\n\t][\s]*/gu, ' ');
+  width = Math.max(0, Math.floor(width));
+  if (cellWidth(text) <= width) return text;
+  if (!width) return '';
+  let prefix = '';
+  let used = 0;
+  for (const ch of text) {
+    const size = cellWidth(ch);
+    if (used + size > width - 1) break;
+    prefix += ch;
+    used += size;
+  }
+  return prefix + '…';
+}
+
+export function doneText(keys: readonly string[], width: number, label = 'Done'): string {
+  for (let count = keys.length; count >= 0; count--) {
+    const names = keys.slice(0, count).join(', ');
+    const more = count < keys.length ? `${names ? ', ' : ''}+${keys.length - count} more` : '';
+    const line = `${label}: ${names}${more}`;
+    if (cellWidth(line) <= width) return line;
+  }
+  return fitText(`${label}: +${keys.length} more`, width);
+}
+
+export function overdueText(at: number, now: number): string {
+  if (now <= at) return '';
+  const minutes = Math.floor((now - at) / 60);
+  const hours = Math.floor(minutes / 60);
+  const elapsed = hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h`
+    : hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+  return ` · overdue ${elapsed}`;
+}
+
 export function runsOf(cells: readonly Cell[]): Run[] {
   const runs: Run[] = [];
   for (const cell of cells) {
@@ -51,7 +104,7 @@ export function labelRuns(marks: readonly { column: number; text: string }[], wi
 
 export function rulerCells(unit: BoardUnit, now: number, width: number, utcOffsetMinutes = 0): Ruler {
   width = Math.max(1, Math.floor(width));
-  const phase = unit.phases.find(row => row.id === unit.phase?.id);
+  const phase = unit.phases.find(row => row.id === unit.phase?.id && row.status === 'open');
   const from = phase?.start?.at ?? now;
   const promise = unit.eta?.at;
   const end = Math.max(promise?.at ?? now, now, from + 1);

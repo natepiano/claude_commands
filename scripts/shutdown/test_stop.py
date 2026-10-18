@@ -29,6 +29,7 @@ import settle
 import sessions
 import stop
 import relaunch
+import unit_lookup
 
 LOGIN = "owner@example.com"
 LABEL = "claude2"
@@ -226,6 +227,37 @@ def machine_inventory(
 
 
 @final
+@final
+class _HeldClaim:
+    def check(self) -> None:
+        pass
+
+
+class SharedHerdrStopTests(unittest.TestCase):
+    def test_a_unit_in_the_shared_session_closes_only_the_tab_of_its_marked_pane(self) -> None:
+        session = cast(inventory.Session, cast(object, {
+            "kind": "unit", "name": "review",
+            "host": {"kind": "unit", "production": "prod", "unit": "review-unit", "session_name": "agents"}}))
+        claim = cast(stop.StopClaim, cast(object, _HeldClaim()))
+        marked = unit_lookup.MarkedUnit("review-unit", unit_lookup.ClaudeNotRunning(), herdr.HerdrPlace("agents", "w3:pE"))
+        cases: list[tuple[unit_lookup.MarkedUnit | None, list[herdr.PaneIdentity], int, int]] = [
+            (marked, [], 1, 0),
+            (marked, [{"pane_id": "w3:pE", "label": "prod-review"}], 1, 1),
+            (None, [], 0, 0),
+        ]
+        for found, panes, closes, issues in cases:
+            with (self.subTest(found=found, panes=panes), patch.object(herdr, "shared_session", return_value="agents"),
+                  patch.object(unit_lookup, "marked_unit", return_value=found) as lookup,
+                  patch.object(herdr.Herdr, "close_tab_of") as closed,
+                  patch.object(herdr.Herdr, "panes", return_value=panes)):
+                result = stop._stop_unit_session(session, lambda: NOW_UTC, claim)  # pyright: ignore[reportPrivateUsage]
+            lookup.assert_called_once_with("prod", "review-unit")
+            self.assertEqual(closed.call_count, closes)
+            if closes:
+                closed.assert_called_once_with("w3:pE")
+            self.assertEqual(len(result), issues)
+
+
 class StopTests(ShutdownTestCase):
     root: Path = Path()
 

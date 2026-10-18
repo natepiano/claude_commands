@@ -12,7 +12,7 @@ import herdr  # noqa: E402
 from herdr import AgentBlocked, Herdr  # noqa: E402
 from herdr import HerdrFailure as HerdrFailure  # noqa: E402
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from unit_lookup import Place, marked_units, sessions_dir  # noqa: E402
+from unit_lookup import Place, marked_unit, sessions_dir  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
          "[--lines N --joined --ansi | <text> | <key>...]")
@@ -99,7 +99,7 @@ def main(arguments: list[str]) -> int:
               or verb == "where" and rest):
             raise ValueError(USAGE)
         if kind == "unit":
-            unit = marked_units(slug).get(name)
+            unit = marked_unit(slug, name)
             if unit is None:
                 raise NoSuchTarget(target)
             place = unit.place

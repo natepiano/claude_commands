@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -23,6 +24,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
+from issues import frontmatter
 
 FENCE = "---"
 # Values the vault writes bare; every other value is written double-quoted.
@@ -141,7 +143,8 @@ def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
     if verb == "start":
         return {"stage": "active"}
     if verb == "close":
-        return {"as_built": cast(str, args.as_built), "status": "closed", "date_closed": _vault_date(today)}
+        detail = {"as_built": cast(str, args.as_built)} if cast(str | None, args.as_built) else {"reason": cast(str, args.reason)}
+        return {**detail, "status": "closed", "date_closed": _vault_date(today)}
     goal = cast(str, args.goal)
     if GOAL.match(goal) is None:
         raise Refusal(f"--goal takes a goal like '1 - Ship Hana', not {goal!r}")
@@ -153,6 +156,36 @@ def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
     }
 
 
+def create(path: Path, project: str, short: str, proposed_by: str, tags: list[str],
+           findings: list[str], body: str, template: Path, today: date, proposed_ranking: str = "") -> bool:
+    """Create once; the finding identities protect crash recovery from overwriting an issue."""
+    identities = sorted(set(findings))
+    if not identities:
+        raise Refusal("create requires at least one finding")
+    if path.exists():
+        if sorted(frontmatter(path).get("style_findings", [])) != identities:
+            raise Refusal(f"{path}: different style_findings")
+        return False
+    text = template.expanduser().read_text(encoding="utf-8")
+    values = {
+        "AREA": "unfiled", "PROJECT": project, "SHORT": short, "PROPOSED_BY": proposed_by,
+        "DATE": today.isoformat(), "CATEGORY": "refactor", "DEPENDS_ON": "[]",
+    }
+    text = re.sub(r"\{\{([A-Z_]+)\}\}", lambda match: values.get(match[1], ""), text)
+    lines = text.splitlines(keepends=True)
+    for key, value in (("tags", list(dict.fromkeys(["issue", "proposal", *tags]))), ("style_findings", identities)):
+        end = _closing_fence(lines, path)
+        span = _key_span(lines, end, key)
+        start, stop = span if span is not None else (end, end)
+        lines[start:stop] = [f"{key}: {json.dumps(value, ensure_ascii=False)}\n"]
+    text = "".join(lines).rstrip() + f"\n\nProposed ranking: {proposed_ranking}\n\n" + body.rstrip() + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Exclusive create keeps a concurrent filer from replacing an issue after approval.
+    with path.open("x", encoding="utf-8") as stream:
+        _ = stream.write(text)
+    return True
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
@@ -162,7 +195,17 @@ def main(argv: list[str]) -> int:
     _ = approve.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
     _ = verbs.add_parser("start", help="stage active")
     close = verbs.add_parser("close", help="set as_built and close")
-    _ = close.add_argument("--as-built", required=True, help="the as-built doc, e.g. docs/hana/as-built/<file>.md")
+    closure = close.add_mutually_exclusive_group(required=True)
+    _ = closure.add_argument("--as-built", help="the as-built doc")
+    _ = closure.add_argument("--reason", help="why the issue is closed")
+    creation = verbs.add_parser("create", help="create a proposal from held findings")
+    _ = creation.add_argument("issue", type=Path)
+    for name in ("project", "short", "proposed-by", "findings"):
+        _ = creation.add_argument(f"--{name}", required=True)
+    _ = creation.add_argument("--extra-tags", nargs="+", default=[])
+    _ = creation.add_argument("--proposed-ranking", default="")
+    _ = creation.add_argument("--body-file", type=Path, required=True)
+    _ = creation.add_argument("--template", type=Path, default=Path.home() / "rust/hanadocs/.claude/templates/issue.yaml")
     stars = verbs.add_parser("stars", help="set the five ranking values")
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
@@ -174,6 +217,13 @@ def main(argv: list[str]) -> int:
     path = cast(Path, args.issue).expanduser()
     today = datetime.now(user_zone()).date()
     try:
+        if cast(str, args.verb) == "create":
+            created = create(path, cast(str, args.project), cast(str, args.short), cast(str, args.proposed_by),
+                             cast(list[str], args.extra_tags), cast(str, args.findings).split(","),
+                             cast(Path, args.body_file).read_text(), cast(Path, args.template), today,
+                             cast(str, args.proposed_ranking))
+            print(f"create {path.name}: {'created' if created else 'unchanged'}")
+            return 0
         changed = edit(path, fields_for(args, today), today)
     except (Refusal, OSError, UnicodeError) as error:
         print(f"proposal_issue: {error}", file=sys.stderr)

@@ -51,7 +51,7 @@ State:
   (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
-  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply carries the printed `reviewed question` text.
+  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The footer hook asks for it only until one reply has carried it.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -121,9 +121,17 @@ State:
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
-  - **A child showrunner is never a unit.** It has no Units row, and you never
-    merge its branch, type into its pane or type into its units' panes.
-  - **A broadcast** (a build hold, a quota alert, an announcement) already
+  - **A child showrunner is never a unit.** It has no Units row. Never type
+    into its pane or its units' panes. One merge exception: a same-repository
+    child with `**Kind:** style` sends
+    `From the showrunner of <style slug>: hand-off <hash>`. Correctness-review
+    its diff against the branch point as for a unit checkpoint, then run
+    `merge_checkpoint.py --from-child <style slug> --checkpoint <hash> --production <your doc> --started <time>`.
+    A locally merged hand-off is pushed before acknowledgment; a duplicate
+    already on origin is acknowledged without another merge or push. A root
+    uses `--root-self`, receives no acknowledgment and runs ledger `reconcile`
+    after the merge. Other child branches are never merged.
+  - **A broadcast** (a build hold, an announcement) already
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
   - **The user's words for a production below you** go to your child that
@@ -193,7 +201,6 @@ State:
   - anything that cannot be undone;
   - a block that waits on the user, and a step only they can run;
   - a fault they would see;
-  - a quota alert (<QuotaAlert/>);
   - the discussion agenda (<Agenda/>).
 
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
@@ -236,6 +243,9 @@ State:
   When the user's answer needs research before they can finish it, remove the
   item from `open_for_user` in that turn; it returns, in full, when the
   research reports (user, 2026-10-15).
+  The user sees the count at all times in the Claude Code status line's
+  `For you: …` row, under the quota row, with the changes, proposals and
+  projects.
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -256,7 +266,7 @@ State:
   director answered without a time, message it yourself, because
   the command will not repeat the request. Report `none measured - requested`
   until it answers.
-- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. A held quota alert comes next, led by `quota: ` (<QuotaAlert/>). Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
+- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
 - **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
   footer --production PRODUCTION_DOC` for the footer, adding
   `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
@@ -277,10 +287,9 @@ State:
   block carries the question count, so this line leaves it out.
   When the footer switch is off, the command says `footers off`; omit both the
   footer and the Waiting on block. It still stores `open_for_user`, so the
-  dailies count it. It prints the counts line with the open questions added
-  (`For you: 1 change to review, 2 questions`) when anything is counted; the
-  reply ends with that line alone, and the footer hook blocks a reply that
-  does not. A `-` reply carries no line. The command reads the switch, the notifier's
+  dailies count it. It prints no counts line. A reply never carries a
+  `For you: …` line, because the user reads those counts in the status line.
+  The footer hook blocks a reply that has one (user, 2026-10-18). The command reads the switch, the notifier's
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
   item complete enough to stand alone when the user asks for the list: what
   is asked, where, why and the choices. Remove
@@ -504,7 +513,7 @@ script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minute
 that report (`/showrunner:dailies` → Status check and clock).
 `/showrunner:report_interval <minutes>` changes N.
 
-Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
+Log `UPDATES` and its `next_due`.
 
 Each run of the script does two things:
 - It scans every unit director for a form or decision waiting on the user.
@@ -530,7 +539,6 @@ whatever arrived:
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
 | a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
 | a unit director's decision only the user can settle | show it to the user; relay the answer |
-| a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
@@ -1153,12 +1161,6 @@ back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
 process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
 each in your session.
 </PauseForMove>
-
-<QuotaAlert>
-Read `~/.claude/docs/quota_alerts.md` at <StartUpdates/>. Relay only Codex notices through `python3 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC --state-dir DAILIES_STATE_DIR --notice "<full notice>"`.
-
-Codex notices that say nothing switched keep delegation on Codex; report a quota refusal at once. A move to Claude continues delegation there. Held Codex alerts are listed first in every Waiting on block, led by `quota: `, until restored; restoration resumes delegation and drops them. Claude has no session quota relay: `/next_moves` controls its one-shot group moves, and an uncovered low account gets one phone reminder.
-</QuotaAlert>
 
 ---
 

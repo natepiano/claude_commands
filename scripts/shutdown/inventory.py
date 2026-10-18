@@ -1360,7 +1360,8 @@ def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts
 def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
     every = unit_lookup.every_marked_unit()
     if every.faults:
-        raise ObservationFailure("production unit marks: " + "; ".join(f"{slug}: {detail}" for slug, detail in every.faults.items()))
+        raise ObservationFailure("production unit marks: " + "; ".join(
+            f"{slug}: {every.production_fault(slug)}" for slug in sorted(every.faults)))
     docs = {runner.slug: runner.doc for runner in timers.registrations}
     units: dict[str, UnitMarks] = {}
     for slug, marked in every.units.items():
