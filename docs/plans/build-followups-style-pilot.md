@@ -258,9 +258,23 @@ Waiting to merge back: none
 ```
 
 Source: saved `pilot/coverage.txt`. The old sync tip is the defect described in
-Fix A below. The slash-command invocation itself, later held proposals and
-nonzero hand-off counts remain pending; the first hand-off, `28db0785`, merged at
-15:09Z.
+Fix A below.
+
+At 17:30 EDT on 2026-10-18, the same script ran on a snapshot of the live
+ledger. It exited 0 in 10.3 seconds and printed 61 rows: A 14, B 20, C 14,
+D 13. Its header was:
+
+```text
+cargo-liner-style — synced main 22a2514 at 16:23 EDT, 959 files
+Rules done: 14 of 61 (14 by lint) · cells current 31.7% · open 30,173 · stale 3,874 · awaiting merge 0 · held 260
+Waiting to merge back: none
+```
+
+The held count is now nonzero. No hand-off waited at that time, so the
+awaiting-merge count was 0 again; eight hand-offs had merged (see Restart).
+The script ran on a snapshot because it saves its last-report comparison
+beside the ledger. The slash command itself runs only in a showrunner
+session, and this report did not run it there.
 
 ## --from-child trace
 
