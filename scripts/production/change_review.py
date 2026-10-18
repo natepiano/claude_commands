@@ -185,7 +185,8 @@ def missing(commits: list[Commit]) -> list[str]:
 
 
 def visible(commits: list[Commit]) -> list[Visible]:
-    return [item for commit in reversed(commits) if needs_trailer(commit.subject, commit.files)
+    """Every visible change a checkpoint names, also one whose files are all Markdown and need no line."""
+    return [item for commit in reversed(commits) if commit.subject.startswith("checkpoint(")
             for item in entries(commit.message) if isinstance(item, Visible)]
 
 
