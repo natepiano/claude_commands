@@ -49,23 +49,20 @@ The 24-hour re-measure of the lint step's rewrite rounds (2026-10-17 16:59:51 ED
 
 ### Phase 1 — Remove the hook  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** no Claude or Codex edit runs the multiply-add hook, and no code for it remains.
-
-**Spec:**
-- Delete `scripts/hooks/post-tool-use-mul-add.py`, `scripts/hooks/mul_add_lib.py` and `scripts/hooks/test_mul_add.py`.
-- In `scripts/hooks/codex_hooks.py`, remove the `mul_add` handler from the installed list. The installer also removes an already installed `mul_add` handler (matched by its script name `post-tool-use-mul-add.py`) from the Codex hook configuration it manages, and leaves every other handler as it is. A second run changes nothing.
-- In `scripts/hooks/fn_length_lib.py`, remove code that only the multiply-add hook used, such as the `suboptimal_flops` lint scope. Keep everything the function-length hook uses. Use grep to prove each removed name has no caller left.
-- Remove the multiply-add hook from comments and docstrings that name it, in `scripts/hooks/`.
-- Do not edit `settings.json`.
+- No Claude or Codex edit runs the multiply-add hook. `post-tool-use-mul-add.py`, `mul_add_lib.py` and `test_mul_add.py` are gone. The lint step's multiply-add rewrite is unchanged.
+- `codex_hooks.py` installs and trusts only the fn-length and berth handlers. On install it removes each handler whose `command` equals `RETIRED_COMMAND` exactly (the command the old installer wrote, any timeout). It keeps each group in place, even when the group is empty, so other groups keep their indexes. It prints one stderr warning, which names the file, when another handler still names the script. The warning does not change the exit status.
+- A removal that moves a sibling handler carries that handler's trust to its new key. Before the rewrite, the installer lists the trusted, enabled entries of the file by event, matcher, command, timeout and hash. After the rewrite, it writes one `hooks.state` upsert for each entry that is now untrusted and matches one of them. An install that removes nothing makes the same app-server calls as before.
+- `fn_length_lib.py` no longer holds the replacement payload or the `no_std` helpers. The function-length hook still gets the final Rust paths in payload order.
 
 **Files:**
-- `scripts/hooks/post-tool-use-mul-add.py`, `scripts/hooks/mul_add_lib.py`, `scripts/hooks/test_mul_add.py` — deleted
-- `scripts/hooks/codex_hooks.py`, `scripts/hooks/test_codex_hooks.py`
-- `scripts/hooks/fn_length_lib.py`, `scripts/hooks/test_fn_length.py`
+- `scripts/hooks/codex_hooks.py` — installs and trusts the Codex `apply_patch` handlers, and removes the retired handler
+- `scripts/hooks/test_codex_hooks.py` — install, trust and cleanup tests against a fake app-server
+- `scripts/hooks/fn_length_lib.py`, `scripts/hooks/test_fn_length.py` — the shared edit parser, Rust scanner and Cargo lint reader
 
-**Workers:** 1 writer + 1 adversary review.
-- `impl` — every file above
+**Gotchas:**
+- A Codex trust key holds the group and handler index, but the trusted hash does not. A removal inside a group moves the handlers after it to new keys.
+- `settings.json` names the deleted script until the user edits it. The checkpoint merges only with that edit or after it.
 
-**Acceptance gate:** `test_codex_hooks.py` covers three cases with a synthetic Codex configuration: a fresh install lists no `mul_add` handler; an install over a configuration that holds the old `mul_add` handler removes it and keeps the others; a second install changes nothing. `test_fn_length.py` and `test_codex_hooks.py` pass. `basedpyright` reports `0 errors, 0 warnings, 0 notes` on each changed file. `grep -rn -E 'mul_add_lib|post-tool-use-mul-add' scripts` finds only the installer's stale-handler match.
+**Ruled out:** a script-name match on any argument, because it removes unrelated commands and misses a shell suffix.
