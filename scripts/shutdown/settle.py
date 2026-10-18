@@ -612,7 +612,7 @@ def running_restart_line(saved: SessionShutdown, *, for_showrunner: bool = False
     name = saved["session"]["name"]
     subject = (f"{name} is back on {saved.get('target') or saved['label']}; its restart prompt was not confirmed"
                if for_showrunner else f"{name}: restart prompt not confirmed; session is running")
-    return f"{subject} — check it, then close its record: {command}"
+    return f"{subject} — check it, then close its record in a terminal on {saved['machine']}: {command}"
 
 
 def _warm() -> bool:

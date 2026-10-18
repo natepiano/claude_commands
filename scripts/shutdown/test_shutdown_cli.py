@@ -1063,7 +1063,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     if isinstance(liveness, restart_work.SessionLive):
                         command = settle.shutdown_command("forget", "session-123", "--account", LOGIN)
                         self.assertIn("restart prompt not confirmed; session is running — check it, " +
-                                      f"then close its record: {command}", text)
+                                      f"then close its record in a terminal on natedev: {command}", text)
                         self.assertNotIn("shutdown.py restart", text)
                         self.assertNotIn("bring back:", text)
                     else:
@@ -1071,6 +1071,45 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                         if isinstance(liveness, restart_work.SessionLivenessUnknown):
                             self.assertIn("scratch registry unreadable", text)
                 self.assertEqual(record.find_session(LOGIN, "session-123"), saved)
+
+    def test_status_names_the_peer_terminal_for_a_running_sessions_closing_command(self) -> None:
+        for local_machine, peer_machine in (("natedev", "Mac"), ("Mac", "natedev")):
+            with self.subTest(local=local_machine, peer=peer_machine):
+                saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+                    reason="restart prompt not submitted"), "peer-session")
+                saved["machine"] = peer_machine
+                local = inventory.Inventory(machine=local_machine, login=LOGIN, label=LABEL,
+                                            sessions=[], unattributed=[])
+                peer = inventory.Inventory(machine=peer_machine, login=LOGIN, label=LABEL,
+                                           sessions=[saved["session"]], unattributed=[])
+
+                def remote(arguments: list[str]) -> tuple[int, str]:
+                    if arguments == ["status", LOGIN, "--json", "--here"]:
+                        return 0, json.dumps(peer)
+                    self.assertEqual(arguments, ["records", "--json", "--here"])
+                    return 0, json.dumps([saved])
+
+                with (patch.object(settle, "local_machine", return_value=local_machine),
+                      patch.object(shutdown, "other_machine", return_value=peer_machine),
+                      patch.object(shutdown, "inventory", return_value=local),
+                      patch.object(shutdown, "run_remote", side_effect=remote) as remote_read,
+                      patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+                      patch.object(restart_work, "_owner_liveness",
+                                   side_effect=AssertionError("peer liveness must come from its inventory")),
+                      patch.object(restart_work, "_session_liveness",
+                                   side_effect=AssertionError("peer liveness must come from its inventory")),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(shutdown.main(["status", LOGIN]), 0)
+                self.assertEqual([call.args[0] for call in remote_read.call_args_list],
+                                 [["status", LOGIN, "--json", "--here"], ["records", "--json", "--here"]])
+                command = settle.shutdown_command("forget", "peer-session", "--account", LOGIN)
+                text = output.getvalue()
+                self.assertIn("  alpha: restart prompt not confirmed; session is running — check it, " +
+                              f"then close its record in a terminal on {peer_machine}: {command}", text)
+                self.assertNotIn(f"then close its record in a terminal on {local_machine}:", text)
+                self.assertNotIn("shutdown.py restart", text)
+                self.assertNotIn("bring back:", text)
+                self.assertNotIn("liveness unknown", text)
 
     def test_printed_closing_command_forgets_the_running_sessions_failed_record(self) -> None:
         saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
@@ -1083,9 +1122,10 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
               patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        lines = [line for line in output.getvalue().splitlines() if "then close its record: " in line]
+        closing_prefix = "then close its record in a terminal on natedev: "
+        lines = [line for line in output.getvalue().splitlines() if closing_prefix in line]
         self.assertEqual(len(lines), 1, output.getvalue())
-        printed = lines[0].split("then close its record: ", 1)[1]
+        printed = lines[0].split(closing_prefix, 1)[1]
         self.assertEqual(printed, settle.shutdown_command("forget", "session-123", "--account", LOGIN))
         self.assertEqual(printed, "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py " +
                          f"forget session-123 --account {LOGIN}")

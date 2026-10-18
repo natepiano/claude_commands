@@ -2010,7 +2010,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:** the archive is not journalled, so a `restart failed` record in `history/` may have been closed by `forget` or by a move.
 
-### Phase 72 — The closing command names the machine that holds the record  · status: todo
+### Phase 72 — The closing command names the machine that holds the record  · status: done
 
 **Depends on:** Phase 71
 
