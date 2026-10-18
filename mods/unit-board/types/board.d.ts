@@ -34,4 +34,4 @@ export interface BoardData {
   production: string; as_of: BoardTime; zone: string; utc_offset_minutes: number;
   units: BoardUnit[]; sources: string[];
 }
-export interface BoardResult { files: string[]; focus: string | null; watch: string[] }
+export interface BoardResult { files: string[]; watch: string[] }

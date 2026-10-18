@@ -4,7 +4,6 @@ export interface BoardSnapshot<Production> {
   watch: string[];
   loadedAt: number;
   boards: Production[];
-  focus: string | null;
 }
 
 export type PaneState<Production> =

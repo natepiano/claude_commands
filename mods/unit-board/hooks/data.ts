@@ -82,7 +82,7 @@ export async function loadBoard(
     boards.push(JSON.parse(await calls.read(path)) as BoardData);
   }
   ensureOpen();
-  return { files: response.files, boards, focus: response.focus, watch: response.watch, loadedAt };
+  return { files: response.files, boards, watch: response.watch, loadedAt };
 }
 
 export interface AccountsLoader {

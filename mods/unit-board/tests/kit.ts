@@ -68,7 +68,7 @@ export function hostEngine(on: On) {
   return { opened, closed, forbidden };
 }
 
-export function engineFiles(on: On, focus: string | null = null) {
+export function engineFiles(on: On) {
   const host = hostEngine(on);
   const clock = mock.clock(on, { now: NOW });
   mock.env(on, { HOME: "/test-home", XDG_STATE_HOME: "/test-state" });
@@ -96,7 +96,7 @@ export function engineFiles(on: On, focus: string | null = null) {
       mtimes.set(path, clock.now());
       return path;
     });
-    return { value: { exitCode: 0, stdout: JSON.stringify({ files: paths, focus, watch: [REGISTRY] }), stderr: "",
+    return { value: { exitCode: 0, stdout: JSON.stringify({ files: paths, watch: [REGISTRY] }), stderr: "",
       isStdoutTruncated: false, isStderrTruncated: false } };
   });
   on("fs.read", (_$, e) => {
@@ -176,7 +176,7 @@ export function lifecycleHarness() {
       calls.push("process");
       signal();
       await pending;
-      return { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], focus: null, watch: [REGISTRY] }), stderr: "" };
+      return { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }), stderr: "" };
     } },
   };
   // The registered hooks use only these services. Keep the partial host at this

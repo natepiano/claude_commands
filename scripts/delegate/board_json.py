@@ -295,22 +295,16 @@ def checkout(document: Path) -> Path:
     return next((path for path in document.parents if (path / ".git").exists()), document.parent.parent if document.parent.name == "docs" else document.parent)
 
 
-def resolve(cwd: str, production: str) -> tuple[list[showrunners.Showrunner], str | None]:
+def resolve(cwd: str, production: str) -> list[showrunners.Showrunner]:
     registered = showrunners.registered_showrunners()
-    if production:
-        return [runner for runner in registered if runner["slug"] == production], None
-    directory = Path(cwd).expanduser().resolve()
-    for runner in registered:
-        document = Path(runner["doc"])
-        rows = production_units.live_unit_table(document.read_text(encoding="utf-8").splitlines(), runner["slug"])
-        for cells in rows:
-            worktree = Path(production_units.cell_value(cells.get("Worktree", ""))).expanduser().resolve()
-            if directory.is_relative_to(worktree):
-                return [runner], production_units.cell_value(cells.get("Unit", "")).removesuffix("-unit")
-    for runner in registered:
-        if directory.is_relative_to(checkout(Path(runner["doc"]))):
-            return [runner], None
-    return [runner for runner in registered if runner["session"]], None
+    if not production:
+        directory = Path(cwd).expanduser().resolve()
+        production = next((runner["slug"] for runner in registered
+                           if directory.is_relative_to(checkout(Path(runner["doc"])))), "")
+    by_slug = {runner["slug"]: runner for runner in registered}
+    if production not in by_slug:
+        return []
+    return [by_slug[slug] for slug in [production, *showrunners.descendants_of(production)] if slug in by_slug]
 
 
 def build(runner: showrunners.Showrunner) -> dict[str, object]:
@@ -343,15 +337,18 @@ def main(arguments: list[str]) -> int:
     _ = group.add_argument("--cwd", default="")
     _ = group.add_argument("--production", default="")
     args = parser.parse_args(arguments)
-    runners, focus = resolve(cast(str, args.cwd), cast(str, args.production))
+    runners = resolve(cast(str, args.cwd), cast(str, args.production))
     root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
     for runner in runners:
         path = root / f"{runner['slug']}.json"
         write_board(path, build(runner))
         files.append(str(path))
-    watch = existing_sources({showrunners.NOTIFIER_STATE_DIR})
-    print(json.dumps({"files": files, "focus": focus, "watch": watch}))
+    watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
+    watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
+                         for runner in showrunners.registered_showrunners())
+    watch = existing_sources(watch_sources)
+    print(json.dumps({"files": files, "watch": watch}))
     return 0
 
 

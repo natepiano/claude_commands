@@ -150,7 +150,7 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
     }
   }
   return <Box flexDirection="column">
-    {boards.length === 0 && bodyRows > 0 && <Text color="inactive">No running productions.</Text>}
+    {boards.length === 0 && bodyRows > 0 && <Text color="inactive">Run /showrunner:unit_board in a showrunner session.</Text>}
     {boards.map(({ data, folds, blocks, hidden, showHeader, showOverflow }) => <Box flexDirection="column" flexShrink={0}>
       {showHeader && <Box justifyContent="space-between">
         <Text bold wrap="truncate-end">{data.production}</Text>
