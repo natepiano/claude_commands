@@ -164,11 +164,11 @@ class PromptSubmissionTests(unittest.TestCase):
     def enter_prompt(self, pane: str, *keys: str) -> None:
         self.enters.append((pane, keys))
         if len(self.enters) == self.submit_on_enter:
-            self.write_turn("resume the saved work", seconds_after_launch=self.elapsed + 1)
+            self.write_turn(self.typed[-1][1], seconds_after_launch=self.elapsed + 1)
 
-    def submit(self, timeout_ms: int = 30_000) -> herdr.PromptSubmitOutcome:
+    def submit(self, timeout_ms: int = 30_000, *, text: str = "resume the saved work") -> herdr.PromptSubmitOutcome:
         return self.client.submit_opening_prompt("destination:p1",
-            herdr.OpeningPrompt("resume the saved work", self.transcript), self.launched_at, timeout_ms)
+            herdr.OpeningPrompt(text, self.transcript), self.launched_at, timeout_ms)
 
     def test_shared_tab_lost_enter_is_retried_once_without_typing_the_prompt_twice(self) -> None:
         self.submit_on_enter = 1
@@ -277,6 +277,91 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual([(pane, text) for pane, text, _at in self.typed],
                          [("destination:p1", "resume the saved work")])
         self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+
+    @staticmethod
+    def real_composer_screen(top_rule: str, *, marker_gap: str = " ", status_suffix: str = "",
+                             mode: str = "⏵⏵ auto mode on · 1 shell",
+                             input_text: str = "resume the saved work") -> str:
+        # Screen structure supplied by the Phase 64 Work Order; no live pane is read.
+        return ("● Finished the previous task\n"
+                "✻ Worked for 2m 10s\n"
+                f"{top_rule}\n"
+                f"❯{marker_gap}{input_text}\n"
+                "────────────────────────────────────────────────────────────────\n"
+                "  unit director for natedev | claude2 | claude-build-followups-two-accounts | "
+                f"128,047 | Opus 5.5 high{status_suffix}\n"
+                "  5-hour 100% left until 00:59 EDT | weekly 40% left until Thu 06:59 EDT\n"
+                f"  {mode}\n"
+                "\n"
+                "  ● main\n"
+                "  ◯ general-purpose  Check the regression   2m 10s · ↓ 127.6k tokens\n")
+
+    def assert_real_composer_retries_once(self, text: str = "resume the saved work") -> None:
+        self.submit_on_enter = 1
+        outcome = self.submit(text=text)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                         [("destination:p1", text)])
+        self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+        cast(Mock, self.read).assert_called_once()
+
+    def test_named_composer_with_status_mode_and_agent_footer_gets_one_enter_retry(self) -> None:
+        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─")
+        self.assert_real_composer_retries_once()
+
+    def test_unnamed_composer_with_status_and_auto_cycle_footer_gets_one_enter_retry(self) -> None:
+        self.screen = self.real_composer_screen("────────────────────────────────────────",
+                                               mode="⏵⏵ auto mode on (shift+tab to cycle)")
+        self.assert_real_composer_retries_once()
+
+    def test_named_composer_with_remote_control_status_suffix_gets_one_enter_retry(self) -> None:
+        self.screen = self.real_composer_screen("──────────────────────── style ─", status_suffix="        /rc")
+        self.assert_real_composer_retries_once()
+
+    def test_named_composer_with_no_break_space_after_marker_gets_one_enter_retry(self) -> None:
+        self.screen = self.real_composer_screen("──────────────────────── ups ─", marker_gap="\xa0")
+        self.assert_real_composer_retries_once()
+
+    def test_multiline_prompt_with_rule_like_rows_gets_one_enter_retry(self) -> None:
+        prompt = "resume the saved work\n--- context ---\n──── saved context ─\ncontinue here"
+        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─", input_text=prompt)
+        self.assert_real_composer_retries_once(prompt)
+
+    def test_named_composer_with_rule_character_in_label_gets_one_enter_retry(self) -> None:
+        self.screen = self.real_composer_screen("─── two─accounts ─")
+        self.assert_real_composer_retries_once()
+
+    def test_old_rule_containing_prompt_above_empty_live_composer_gets_no_enter(self) -> None:
+        prompt = "resume the saved work\n--- context ---\n──── saved context ─\ncontinue here"
+        self.screen = ("─── old session ─\n❯ " + prompt + "\n────────\n● Finished that task\n"
+                       + self.real_composer_screen("──────────────────────── two-accounts ─", input_text=""))
+        self.assertIsInstance(self.submit(text=prompt), herdr.PromptNotSubmitted)
+        self.assertEqual([(pane, text) for pane, text, _at in self.typed], [("destination:p1", prompt)])
+        self.assertEqual(self.enters, [])
+
+    def test_named_composer_does_not_retry_prompt_visible_only_above_its_empty_input(self) -> None:
+        self.screen = ("❯ resume the saved work\n"
+                       + self.real_composer_screen("──────────────────────── two-accounts ─", input_text=""))
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_named_bordered_prompt_above_column_zero_output_gets_no_enter(self) -> None:
+        self.screen = (self.real_composer_screen("──────────────────────── two-accounts ─")
+                       + "ctrl+c cancels the operation described above\n")
+        self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
+
+    def test_real_composer_retry_still_rechecks_its_recipient_before_enter(self) -> None:
+        self.screen = self.real_composer_screen("──────────────────────── two-accounts ─")
+        with patch.object(herdr, "prompt_recipient_process", side_effect=[
+                herdr.PromptRecipientProcess(23456, "first-recipient"),
+                herdr.PromptRecipientProcess(34567, "replacement-process")]):
+            outcome = self.submit()
+        self.assertEqual(outcome, herdr.PromptNotSubmitted("prompt recipient changed before Enter retry"))
+        self.assertEqual(len(self.typed), 1)
+        self.assertEqual(self.enters, [])
 
     def test_an_unsubmitted_input_gets_at_most_three_enter_retries(self) -> None:
         self.assertIsInstance(self.submit(), herdr.PromptNotSubmitted)
