@@ -86,6 +86,10 @@ class WaitingAgentCLI:
         self.returncode = -9
 
 
+REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
+REAL_LOAD_FACTOR = herdr.load_factor
+
+
 @final
 class PromptSubmissionTests(unittest.TestCase):
     """Real scratch transcripts, with every pane command and elapsed second faked."""
@@ -116,6 +120,8 @@ class PromptSubmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
+        # Test limits stay as written on a loaded machine.
+        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
         self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
         self.path.parent.mkdir(parents=True)
@@ -901,6 +907,8 @@ class HerdrTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
+        # Test limits stay as written on a loaded machine.
+        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         # These fixtures specify process startup and argv; PromptSubmissionTests
         # exercises the real transcript/readiness path without this substitute.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -2257,6 +2265,54 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
                                      {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_a_slow_start_on_a_loaded_machine_still_gets_its_opening_prompt(self) -> None:
+        # Claude is ready for input 200 s after the start: past the 90 s limit, inside it scaled by load.
+        for factor, typed_at, limit in ((4.0, 200.0, "300000"), (1.0, None, "90000")):
+            with self.subTest(factor=factor):
+                clock: list[float] = [0.0]
+                started: list[list[str]] = []
+                typed: list[float] = []
+
+                def sleep(seconds: float) -> None:
+                    clock[0] += seconds
+
+                def start(_client: herdr.Herdr, argv: list[str], _kind: str, _pane: str,
+                          _timeout: float) -> subprocess.CompletedProcess[str]:
+                    started.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                def state(_client: herdr.Herdr, _pane: str, _transcript: object, _launched_at: datetime, *,
+                          cursor: object = None) -> herdr.PromptInputReady | herdr.PromptInputNotReady:
+                    del cursor
+                    return (herdr.PromptInputReady("composer", True) if clock[0] >= 200
+                            else herdr.PromptInputNotReady("destination session is still loading"))
+
+                def prompt(_client: herdr.Herdr, _pane: str, _text: str) -> None:
+                    typed.append(clock[0])
+
+                with (patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)),
+                      patch.object(herdr, "load_factor", return_value=factor),
+                      patch.object(herdr.Herdr, "submit_opening_prompt", REAL_SUBMIT_OPENING_PROMPT),
+                      patch.object(herdr.Herdr, "start_command", autospec=True, side_effect=start),
+                      patch.object(herdr.Herdr, "prompt_input_state", autospec=True, side_effect=state),
+                      patch.object(herdr.Herdr, "prompt", autospec=True, side_effect=prompt)):
+                    outcome = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.OpeningPrompt("go"), 90_000)
+                self.assertEqual(started[0][started[0].index("--timeout") + 1], limit)
+                assert isinstance(outcome, herdr.PromptNotSubmitted)
+                if typed_at is None:
+                    self.assertEqual((outcome.reason, outcome.never_typed, typed),
+                                     ("destination never became ready for input", True, []))
+                else:
+                    self.assertEqual(len(typed), 1)
+                    self.assertGreaterEqual(typed[0], typed_at)
+                    self.assertFalse(outcome.never_typed)
+
+    def test_load_factor_is_the_load_per_cpu_from_one_to_six(self) -> None:
+        for load, factor in ((4.0, 1.0), (64.0, 2.0), (400.0, 6.0)):
+            with (self.subTest(load=load), patch.object(os, "getloadavg", return_value=(load, 0.0, 0.0)),
+                  patch.object(os, "cpu_count", return_value=32)):
+                self.assertEqual(REAL_LOAD_FACTOR(), factor)
 
     def test_agent_not_ready_reads_screen_without_input(self) -> None:
         arguments = ["agent", "start", "worker", "--kind", "claude", "--pane", "pane-1", "--timeout", "100", "--", "--model", "fixture-model"]

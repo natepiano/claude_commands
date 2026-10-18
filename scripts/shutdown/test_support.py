@@ -83,6 +83,8 @@ class ShutdownTestCase(unittest.TestCase):
         super().setUp()
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
+        # Launch limits stay as written on a loaded machine.
+        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         self._send_leaf_hits.clear()
         # Run after patch cleanups, so caught assertions still fail the test.
         self.addCleanup(self._fail_send_leaf_hits)
