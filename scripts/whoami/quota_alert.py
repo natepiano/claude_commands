@@ -1059,9 +1059,9 @@ def blocked_next_move_reason_key(reason: BlockedHeadReason) -> str:
     return hashlib.sha256(repr(stable).encode()).hexdigest()
 
 
-def blocked_next_move_line(group: str, target: str, entry_id: str, reason: BlockedHeadReason) -> str:
+def blocked_next_move_line(group: str, target: str, _entry_id: str, reason: BlockedHeadReason) -> str:
     if isinstance(reason, TargetIsCurrentAccount):
-        return f"{group} → {target} due (entry {entry_id}), {target} is already the current account"
+        return f"{group} 1 → {target} due, {target} is already the current account"
     if isinstance(reason, TargetReadingUnavailable):
         detail = ("no reading" if isinstance(reason.last_read, NoTargetReading)
                   else f"no fresh reading since {reason.last_read.astimezone(user_zone()):%H:%M}")
@@ -1073,7 +1073,7 @@ def blocked_next_move_line(group: str, target: str, entry_id: str, reason: Block
         detail = "an unresolved refusal"
     else:
         detail = f"preparation refused: {reason.reason}"
-    return f"{group} → {target} due (entry {entry_id}), {target} has {detail}"
+    return f"{group} 1 → {target} due, {target} has {detail}"
 
 
 def notify_blocked_next_move(group: str, target: str, entry_id: str, reason: BlockedHeadReason,

@@ -24,16 +24,18 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
+PROMPT_SETTLE_SECONDS = 10
 _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
@@ -160,13 +162,273 @@ class AgentNotReady(HerdrFailure):
 
 
 @dataclass(frozen=True)
+class SessionTranscript:
+    config_dir: Path
+    session_id: str
+
+
+@dataclass(frozen=True)
+class UnspecifiedPromptTranscript:
+    """The caller has not identified the conversation that must receive the prompt."""
+
+
+UNSPECIFIED_PROMPT_TRANSCRIPT = UnspecifiedPromptTranscript()
+
+
+@dataclass(frozen=True)
+class PromptScreenNotRead:
+    """No visible screen has been read for this submission."""
+
+
+@dataclass(frozen=True)
+class PromptInputReady:
+    """The destination session can accept its opening prompt."""
+
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+    idle: bool = False
+
+
+@dataclass(frozen=True)
+class PromptInputNotReady:
+    reason: str
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+
+
+@dataclass(frozen=True)
+class PromptInputTimedOut:
+    """The destination did not become ready before the launch deadline."""
+
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+
+
+@dataclass(frozen=True)
+class PromptRecipientProcess:
+    pid: int
+    started_at: str
+
+
+@dataclass(frozen=True)
+class PromptRecipientUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class PromptSubmitted:
+    at: datetime
+    process: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("prompt recipient was not identified")
+
+
+@dataclass(frozen=True)
+class PromptNotSubmitted:
+    reason: str
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+
+
+@dataclass(frozen=True)
+class PromptSubmissionNotRequired:
+    """The launch intentionally leaves the session without an opening prompt."""
+
+
+PromptSubmitOutcome = PromptSubmitted | PromptNotSubmitted
+
+
+@dataclass(frozen=True)
 class OpeningPrompt:
     text: str
+    transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
 
 @dataclass(frozen=True)
 class NoOpeningPrompt:
     """Leave the ready agent waiting for the user to type."""
+
+
+@dataclass(frozen=True)
+class TranscriptReadable:
+    """Every matching transcript file was read successfully."""
+
+
+@dataclass(frozen=True)
+class TranscriptUnreadable:
+    """A matching transcript file could not be read; absence of a turn is unproven."""
+
+
+@dataclass
+class TranscriptCursor:
+    """The complete new turns seen by one submission, with per-file byte positions."""
+
+    transcript: SessionTranscript
+    since: datetime
+    offsets: dict[Path, int] = field(default_factory=dict)
+    sizes: dict[Path, int] = field(default_factory=dict)
+    turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
+    readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
+        self.readability = TranscriptReadable()
+        # A session id is a file component, never a glob supplied by a caller.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
+            return []
+        try:
+            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
+        except OSError:
+            self.readability = TranscriptUnreadable()
+            paths = ()
+        for path in paths:
+            try:
+                with path.open("rb") as stream:
+                    offset = self.offsets.get(path, 0)
+                    size = os.fstat(stream.fileno()).st_size
+                    if size < self.sizes.get(path, 0):
+                        offset = 0
+                        self.turns[path] = []
+                    self.sizes[path] = size
+                    self.offsets[path] = offset
+                    _ = stream.seek(offset)
+                    while line := stream.readline():
+                        # Leave partial UTF-8 and partial JSON unread until the writer
+                        # completes this row. Offsets always fall after a newline.
+                        if not line.endswith(b"\n"):
+                            break
+                        self.offsets[path] = stream.tell()
+                        try:
+                            value = cast(object, json.loads(line))
+                            if not isinstance(value, dict):
+                                continue
+                            row = cast(dict[str, object], value)
+                            stamp = row.get("timestamp")
+                            if not isinstance(stamp, str):
+                                continue
+                            at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                            if at.tzinfo is not None and at > self.since:
+                                self.turns.setdefault(path, []).append((at, row))
+                        except (ValueError, TypeError, UnicodeError):
+                            continue
+            except OSError:
+                self.readability = TranscriptUnreadable()
+                continue
+        return [turn for turns in self.turns.values() for turn in turns]
+
+    def submitted_prompt(self, text: str) -> PromptSubmitOutcome:
+        for at, row in self.read_turns():
+            if row.get("type") == "user" and not row.get("isMeta", False) and text in _turn_text(row):
+                return PromptSubmitted(at)
+        return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+
+def _turn_text(row: dict[str, object]) -> str:
+    message = row.get("message", row)
+    if not isinstance(message, dict):
+        return ""
+    content: object = cast(dict[str, object], message).get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for value in cast(list[object], content):
+            if isinstance(value, dict):
+                block = cast(dict[str, object], value)
+                text = block.get("text")
+                if block.get("type") == "text" and isinstance(text, str):
+                    texts.append(text)
+        return "\n".join(texts)
+    return ""
+
+
+def submitted_prompt(transcript: SessionTranscript, text: str, launched_at: datetime) -> PromptSubmitOutcome:
+    return TranscriptCursor(transcript, launched_at).submitted_prompt(text)
+
+
+@dataclass(frozen=True)
+class ComposerInput:
+    text: str
+
+    def contains(self, text: str) -> bool:
+        # Physical wraps can split words, but spaces in the prompt must still
+        # match whitespace. This is the same match used for Enter-only retries.
+        pattern = r"\s+".join(r"\n?".join(re.escape(char) for char in word) for word in text.split())
+        return bool(pattern) and re.search(pattern, self.text) is not None
+
+
+@dataclass(frozen=True)
+class NoComposer:
+    """The visible screen has no current input box."""
+
+
+def _prompt_screen(screen: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen)
+
+
+def _composer_input(screen: str) -> ComposerInput | NoComposer:
+    """Parse the final live composer, excluding old input and its footer."""
+    lines = _prompt_screen(screen).splitlines()
+    closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
+    if not closing_borders:
+        return NoComposer()
+    closing = closing_borders[-1]
+    # A rule-like input row is not a top border. The actual marker is at column 0.
+    top_borders = [i for i, line in enumerate(lines[:closing])
+                   if re.fullmatch(r"\s*[─━-]{3,}(?:\s+.+\s+[─━-]+)?\s*", line)
+                   and re.match(r"^[❯>]", lines[i + 1])]
+    if not top_borders:
+        return NoComposer()
+    # Column-zero output below the last box makes that box scrollback.
+    if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
+        return NoComposer()
+    region = lines[top_borders[-1] + 1:closing]
+    region[0] = re.sub(r"^[❯>]\s*", "", region[0])
+    return ComposerInput("\n".join(line.strip() for line in region))
+
+
+def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
+    """Identify the process receiving input, including before its socket opens."""
+    import sessions
+
+    try:
+        identities = {PromptRecipientProcess(row["pid"], row.get("procStart", ""))
+                      for row in sessions.running_sessions() if row["sessionId"] == session_id}
+    except (OSError, ValueError) as error:
+        return PromptRecipientUnavailable(str(error))
+    if len(identities) != 1:
+        return PromptRecipientUnavailable("prompt recipient is missing or ambiguous")
+    process = identities.pop()
+    if not process.started_at:
+        return PromptRecipientUnavailable("prompt recipient start is unrecorded")
+    return process
+
+
+def encode_prompt_outcome(outcome: PromptSubmitOutcome) -> str:
+    if isinstance(outcome, PromptNotSubmitted):
+        return json.dumps({"kind": "not submitted", "reason": outcome.reason,
+                           **({"screen": outcome.screen} if isinstance(outcome.screen, str) else {})})
+    process = outcome.process
+    return json.dumps({"kind": "submitted", "at": outcome.at.isoformat(),
+                       "process": {"pid": process.pid, "started_at": process.started_at}
+                       if isinstance(process, PromptRecipientProcess) else {}})
+
+
+def decode_prompt_outcome(text: str) -> PromptSubmitOutcome:
+    try:
+        value = cast(object, json.loads(text))
+        if isinstance(value, dict):
+            row = cast(dict[str, object], value)
+            if row.get("kind") == "submitted" and isinstance(row.get("at"), str):
+                at = datetime.fromisoformat(cast(str, row["at"]))
+                if at.tzinfo is not None:
+                    process = row.get("process")
+                    if isinstance(process, dict):
+                        fields = cast(dict[str, object], process)
+                        pid, started_at = fields.get("pid"), fields.get("started_at")
+                        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(started_at, str) and started_at:
+                            return PromptSubmitted(at, PromptRecipientProcess(pid, started_at))
+                    return PromptSubmitted(at)
+            if row.get("kind") == "not submitted" and isinstance(row.get("reason"), str):
+                screen = row.get("screen")
+                return PromptNotSubmitted(cast(str, row["reason"]),
+                                          screen if isinstance(screen, str) else PromptScreenNotRead())
+    except (ValueError, TypeError):
+        pass
+    return PromptNotSubmitted("launcher supplied no valid submit proof")
 
 
 @dataclass(frozen=True)
@@ -630,10 +892,11 @@ class Herdr:
                 _ = self.run("workspace", "close", candidate.workspace_id)
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
-        """Wait through busy-pane refusals, start the executable, then prompt once."""
+                    opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
+        """Start once, then prove the opening prompt arrived as this session's user turn."""
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
+        launched_at = datetime.now(timezone.utc)
         deadline = time.monotonic() + timeout_ms / 1000
         attempt_timeout_ms = timeout_ms
         try:
@@ -668,7 +931,9 @@ class Herdr:
                 screen = f"agent_not_ready; startup screen could not be read: {read_error}"
             raise AgentNotReady(screen) from error
         if isinstance(opening, OpeningPrompt):
-            self.prompt(pane, opening.text)
+            return self.submit_opening_prompt(pane, opening, launched_at,
+                                              max(0, int((deadline - time.monotonic()) * 1000)))
+        return PromptSubmissionNotRequired()
 
     def start_command(self, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
@@ -767,6 +1032,208 @@ class Herdr:
         if not isinstance(ready, bool):
             raise HerdrFailure("herdr agent readiness: expected interactive_ready boolean")
         return {"agent_status": status, "interactive_ready": ready}
+
+    def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
+                           launched_at: datetime, *,
+                           cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
+                           ) -> PromptInputReady | PromptInputNotReady:
+        ready, idle = False, False
+        try:
+            observation = self.readiness(pane)
+            idle = observation["agent_status"] == "idle"
+            ready = observation["agent_status"] in {"working", "idle"} and observation["interactive_ready"]
+        except (OSError, subprocess.SubprocessError, HerdrFailure):
+            pass
+        if not ready and isinstance(transcript, SessionTranscript):
+            reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
+            ready = any(row.get("type") == "system" and "/remote-control is active" in _turn_text(row)
+                        for _, row in reader.read_turns())
+        if not ready:
+            return PromptInputNotReady("destination session is still loading")
+        screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
+        composer = _composer_input(screen)
+        if isinstance(composer, ComposerInput) and not composer.text.strip():
+            return PromptInputReady(screen, idle)
+        return PromptInputNotReady("destination has no empty composer", screen)
+
+    def wait_for_prompt_input(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript, launched_at: datetime,
+                              timeout_ms: int, *,
+                              cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
+                              ) -> PromptInputReady | PromptInputTimedOut:
+        if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
+            cursor = TranscriptCursor(transcript, launched_at)
+        deadline = time.monotonic() + timeout_ms / 1000
+        screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        while time.monotonic() < deadline:
+            state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
+            if isinstance(state.screen, str):
+                screen = state.screen
+            if isinstance(state, PromptInputReady):
+                return state
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+        return PromptInputTimedOut(screen)
+
+    def prompt_in_input(self, pane: str, text: str) -> bool:
+        """Read only the visible composer's last input region, never transcript scrollback."""
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible"))
+        return isinstance(composer, ComposerInput) and composer.contains(text)
+
+    def prompt_input_empty(self, pane: str) -> bool:
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible"))
+        return isinstance(composer, ComposerInput) and not composer.text.strip()
+
+    def _wait_for_submit(self, cursor: TranscriptCursor, text: str, deadline: float) -> PromptSubmitOutcome:
+        while True:
+            result = cursor.submitted_prompt(text)
+            if isinstance(result, PromptSubmitted):
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            time.sleep(min(0.1, remaining))
+
+    def submit_opening_prompt(self, pane: str, opening: OpeningPrompt, launched_at: datetime,
+                              timeout_ms: int) -> PromptSubmitOutcome:
+        if timeout_ms <= 0 or not opening.text.strip():
+            return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
+        deadline = time.monotonic() + timeout_ms / 1000
+        cursor = (TranscriptCursor(opening.transcript, launched_at)
+                  if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
+        screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        typings, enters = 0, 0
+
+        def failure(reason: str) -> PromptNotSubmitted:
+            detail = f"{reason}; prompt typed {typings} times" if typings else reason
+            visible = "\n".join(screen.splitlines()[-40:]) if isinstance(screen, str) else screen
+            return PromptNotSubmitted(detail, visible)
+
+        def deadline_failure() -> PromptNotSubmitted:
+            reason = "opening prompt deadline elapsed"
+            if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
+                reason += ": transcript unreadable"
+            return failure(reason)
+
+        try:
+            ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at, timeout_ms, cursor=cursor)
+            screen = ready.screen
+            if isinstance(ready, PromptInputTimedOut):
+                if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
+                    return deadline_failure()
+                return failure("destination never became ready for input")
+            recipient = (prompt_recipient_process(opening.transcript.session_id)
+                         if isinstance(opening.transcript, SessionTranscript)
+                         else PromptRecipientUnavailable("transcript identity not supplied"))
+
+            def bound_outcome(outcome: PromptSubmitted) -> PromptSubmitOutcome:
+                if (isinstance(recipient, PromptRecipientProcess)
+                        and isinstance(opening.transcript, SessionTranscript)
+                        and prompt_recipient_process(opening.transcript.session_id) != recipient):
+                    return failure("prompt recipient changed during submission")
+                return PromptSubmitted(outcome.at, recipient)
+
+            # Readiness can take time: a matching turn may have arrived meanwhile.
+            if isinstance(cursor, TranscriptCursor):
+                existing = cursor.submitted_prompt(opening.text)
+                if isinstance(existing, PromptSubmitted):
+                    return bound_outcome(existing)
+                while isinstance(cursor.readability, TranscriptUnreadable):
+                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+                    if isinstance(result, PromptSubmitted):
+                        return bound_outcome(result)
+                    screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
+                    if time.monotonic() >= deadline:
+                        return deadline_failure()
+                    if isinstance(cursor.readability, TranscriptReadable):
+                        ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
+                            max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                        if isinstance(ready.screen, str):
+                            screen = ready.screen
+                        if isinstance(ready, PromptInputTimedOut):
+                            return deadline_failure()
+                        existing = cursor.submitted_prompt(opening.text)
+                        if isinstance(existing, PromptSubmitted):
+                            return bound_outcome(existing)
+            while time.monotonic() < deadline:
+                typings += 1
+                try:
+                    self.prompt(pane, opening.text)
+                except HerdrFailure as error:
+                    if error.code != "agent_prompt_stalled":
+                        if isinstance(cursor, TranscriptCursor):
+                            proof = cursor.submitted_prompt(opening.text)
+                            if isinstance(proof, PromptSubmitted):
+                                return bound_outcome(proof)
+                        return failure(str(error))
+                last_input = time.monotonic()
+                if not isinstance(cursor, TranscriptCursor):
+                    return failure("caller did not identify the transcript; submit is unproven")
+                while True:
+                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+                    if isinstance(result, PromptSubmitted):
+                        return bound_outcome(result)
+                    screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
+                    composer = _composer_input(screen)
+                    if time.monotonic() >= deadline:
+                        return deadline_failure()
+                    if isinstance(cursor.readability, TranscriptUnreadable):
+                        continue
+                    if isinstance(composer, NoComposer):
+                        continue
+                    if composer.contains(opening.text):
+                        if enters == 3:
+                            return failure("no user turn after three Enter retries")
+                        if (isinstance(recipient, PromptRecipientProcess)
+                                and prompt_recipient_process(cursor.transcript.session_id) != recipient):
+                            return failure("prompt recipient changed before Enter retry")
+                        # A turn can land during the screen/process reads too.
+                        proof = cursor.submitted_prompt(opening.text)
+                        if isinstance(proof, PromptSubmitted):
+                            return bound_outcome(proof)
+                        if isinstance(cursor.readability, TranscriptUnreadable):
+                            continue
+                        if time.monotonic() >= deadline:
+                            return deadline_failure()
+                        self.send_keys(pane, "Enter")
+                        enters += 1
+                        last_input = time.monotonic()
+                        continue
+                    if composer.text.strip():
+                        return failure("destination input contains other text")
+                    # Working can mean queued input, even with an empty box. Only
+                    # an idle recipient after a quiet settle window may be re-typed.
+                    observation = self.readiness(pane)
+                    if (observation["agent_status"] != "idle"
+                            or time.monotonic() - last_input < PROMPT_SETTLE_SECONDS):
+                        continue
+                    if typings == 3:
+                        return failure("no user turn after three typings")
+                    ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
+                        max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                    if isinstance(ready.screen, str):
+                        screen = ready.screen
+                    if isinstance(ready, PromptInputTimedOut):
+                        if isinstance(cursor.readability, TranscriptUnreadable):
+                            return deadline_failure()
+                        return failure("destination never became ready for re-type")
+                    if not ready.idle:
+                        continue
+                    if not isinstance(recipient, PromptRecipientProcess):
+                        return failure("prompt recipient unavailable before re-type")
+                    if prompt_recipient_process(cursor.transcript.session_id) != recipient:
+                        return failure("prompt recipient changed before re-type")
+                    # The last guard immediately before another typing: a late
+                    # accepted turn wins over every readiness or idle observation.
+                    proof = cursor.submitted_prompt(opening.text)
+                    if isinstance(proof, PromptSubmitted):
+                        return bound_outcome(proof)
+                    if isinstance(cursor.readability, TranscriptUnreadable):
+                        continue
+                    break
+            return deadline_failure()
+        except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+            return failure(str(error))
 
     def prompt(self, pane: str, text: str) -> None:
         _ = self.run("agent", "prompt", pane, text)
@@ -1866,10 +2333,10 @@ def _agent_name(name: str) -> str:
 
 
 def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
-                opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
+                opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
     """Start in the named session, using the pane's label as the agent label."""
     _check_agent_arguments(kind, agent_arguments)
     herdr = Herdr(name)
     labels = [row.get("label") for row in herdr.panes() if row["pane_id"] == pane]
     label = labels[0] if labels else pane
-    herdr.start_agent(label or pane, pane, kind, agent_arguments, opening, timeout_ms)
+    return herdr.start_agent(label or pane, pane, kind, agent_arguments, opening, timeout_ms)

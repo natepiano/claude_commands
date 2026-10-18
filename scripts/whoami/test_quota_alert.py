@@ -362,11 +362,11 @@ class QuotaAlertTests(unittest.TestCase):
         note = note_file.read_note(note.path)
         assert isinstance(note, note_file.Note)
         unit = next_moves.add_next_move("units", 1, "claude3")
-        runner = next_moves.add_next_move("showrunners", 1, "claude1")
+        _ = next_moves.add_next_move("showrunners", 1, "claude1")
         _ = self.alert([note], self.now)
         _ = self.alert([note], self.now + timedelta(minutes=30))
         self.assertEqual((self.noted, self.sent, self.pushed), ([], [], []))
-        next_moves.remove_next_move(runner.id)
+        next_moves.remove_next_move("showrunners", next_moves.GroupPosition(1))
         _ = self.alert([note], self.now + timedelta(minutes=32))
         self.assertEqual(len(self.noted), 1)
         _ = self.alert([note], self.now + timedelta(minutes=64))
@@ -620,13 +620,13 @@ class QuotaAlertTests(unittest.TestCase):
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
         _ = quota_alert.CONFIG.write_text(json.dumps(config))
-        entry = next_moves.add_next_move("workers", 1, "codex2")
+        _ = next_moves.add_next_move("workers", 1, "codex2")
         note = self.note("codex1.md", "active", "2")
         _ = self.alert([note], self.now)
         self.assertEqual((self.noted, self.sent), ([], []))
         with quota_alert.state_file() as state:
             self.assertEqual(state["episodes"]["codex1"].get("push"), "due")
-        next_moves.remove_next_move(entry.id)
+        next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
         _ = self.alert([note], self.now + timedelta(minutes=2))
         self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
         self.assertEqual(self.sent, [])
@@ -1323,7 +1323,8 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         self.relay.assert_called_once()
         recipient, text, _ = cast(tuple[str, str, str | None], self.relay.call_args.args)
         self.assertEqual(recipient, "director")
-        for detail in ("workers", "codex3", head.id, "due", "no fresh reading",
+        self.assertNotIn(head.id, text)
+        for detail in ("workers 1", "codex3", "due", "no fresh reading",
                        (self.now - timedelta(minutes=11)).strftime("%H:%M")):
             self.assertIn(detail, text)
         self.assertIn(text, output.getvalue())
@@ -1370,7 +1371,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         _ = self.alert()
         self.swap.assert_not_called()
         self.assertEqual(next_moves.read_next_moves(), (head,))
-        next_moves.remove_next_move(head.id)
+        next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
         _ = self.alert(self.now + timedelta(minutes=2))
         _ = self.alert(self.now + timedelta(minutes=4))
         self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
@@ -1605,7 +1606,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                     self.assertEqual(state.get("codex_zero", {})["codex1"]["notice"], expected_notice)
                 if not opened_while_queued:
                     _ = next_moves.add_next_move("workers", 1, "codex1")
-                head, = next_moves.read_next_moves()
+                self.assertEqual(len(next_moves.read_next_moves()), 1)
                 _ = self.alert(self.now + timedelta(minutes=2))
                 queued_push = self.zero_pushes()[-1]
                 self.assertIn("wait for the account move you queued", queued_push.body)
@@ -1613,7 +1614,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                     episode = state.get("codex_zero", {})["codex1"]
                     self.assertEqual(episode["phone"], "due")
                     self.assertEqual(episode["notice"], expected_notice)
-                next_moves.remove_next_move(head.id)
+                next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
                 _ = self.alert(self.now + timedelta(minutes=4))
                 self.assertEqual(self.zero_pushes()[-1], expected_push)
                 with quota_alert.state_file() as state:
@@ -1652,7 +1653,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                     self.assertEqual(episode["forecast_notice"], expected_notice)
                 if not opened_while_queued:
                     _ = next_moves.add_next_move("workers", 1, "codex1")
-                head, = next_moves.read_next_moves()
+                self.assertEqual(len(next_moves.read_next_moves()), 1)
                 _ = self.alert(self.now + timedelta(minutes=62), balance="6310")
                 self.assertIn("wait for the account move you queued", self.zero_pushes()[-1].body)
                 with quota_alert.state_file() as state:
@@ -1660,7 +1661,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                     assert "forecast_phone" in episode and "forecast_notice" in episode
                     self.assertEqual(episode["forecast_phone"], "due")
                     self.assertEqual(episode["forecast_notice"], expected_notice)
-                next_moves.remove_next_move(head.id)
+                next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
                 _ = self.alert(self.now + timedelta(minutes=64), balance="6310")
                 self.assertEqual(self.zero_pushes()[-1], expected_push)
                 with quota_alert.state_file() as state:

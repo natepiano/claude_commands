@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Literal, TypedDict, cast
@@ -30,6 +31,22 @@ from rules import Family, InputScope, MemberReach, Rule, Tier
 CellState = Literal["current", "stale", "open", "awaiting merge"]
 Verdict = Literal["clean", "fixed", "exception", "held", "waived"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
+
+
+class CellInputScope(StrEnum):
+    FILE = "file"
+    CRATE = "crate"
+    MANIFEST = "manifest"
+    MODULE = "module"
+
+
+def _cell_scope(rule: Rule, path: str, tip: RepositoryTip) -> CellInputScope:
+    if (rule.tier == "D" and path.endswith(".rs") and path != tip.crate(path)
+            and rule.input_scope != "manifest"):
+        return CellInputScope.MODULE
+    if rule.tier == "D" and rule.input_scope == "file" and path == tip.crate(path):
+        return CellInputScope.CRATE
+    return CellInputScope(rule.input_scope)
 
 
 class LedgerError(ValueError):
@@ -291,6 +308,7 @@ class Judgment:
     input_fingerprint: str
     commit: str
     verdict: Verdict
+    input_scope: CellInputScope
 
 
 @dataclass(frozen=True)
@@ -401,7 +419,15 @@ def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
             _ = destination.write_bytes(content)
 
 
-def _fingerprint(repo: Path, tip: RepositoryTip, scope: InputScope, path: str) -> str:
+def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+    if scope == CellInputScope.MODULE:
+        if path not in tip.blobs:
+            raise LedgerError(f"{path}: no file at {tip.commit}")
+        directory = PurePosixPath(path).parent
+        parent_module = directory.as_posix() + ".rs"
+        inputs = sorted((name, blob) for name, blob in tip.blobs.items()
+                        if name.endswith(".rs") and (PurePosixPath(name).parent == directory or name == parent_module))
+        return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
     if scope == "manifest":
         paths = {"Cargo.toml", *(str(PurePosixPath(directory) / "Cargo.toml") for directory in tip.crate_dirs)}
         manifests = sorted((name, blob) for name, blob in tip.blobs.items() if name in paths)
@@ -527,7 +553,7 @@ class Ledger:
         self.database: Path = database
         self._catalog: tuple[Rule, ...] = rule_catalog.load_rules(repo)
         self._tips: dict[str, RepositoryTip] = {}
-        self._fingerprints: dict[tuple[str, InputScope, str], str] = {}
+        self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
@@ -570,11 +596,19 @@ class Ledger:
             self._tips[commit] = _tip(self.repo, commit)
         return self._tips[commit]
 
-    def _fingerprint(self, tip: RepositoryTip, scope: InputScope, path: str) -> str:
-        key = (tip.commit, scope, tip.crate(path) if scope == "crate" else path if scope == "file" else ".")
+    def _fingerprint(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+        key = (tip.commit, scope, tip.crate(path) if scope == "crate" else "." if scope == "manifest" else path)
         if key not in self._fingerprints:
             self._fingerprints[key] = _fingerprint(self.repo, tip, scope, path)
         return self._fingerprints[key]
+
+    def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str) -> bool:
+        try:
+            previous = (row.input_fingerprint if row.input_scope == scope
+                        else self._fingerprint(self._tip(row.commit), scope, path))
+            return previous == self._fingerprint(tip, scope, path)
+        except LedgerError:
+            return False
 
     def _is_ancestor(self, commit: str, tip: str) -> bool:
         key = (commit, tip)
@@ -1055,12 +1089,13 @@ class Ledger:
                 "SELECT id FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
                 (finding.rule, path),
             ).fetchone())[0]
+            held_row = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]))
             try:
-                unchanged = row[8] == self._fingerprint(tip, cast(InputScope, row[7]), path)
+                unchanged = (self._judgment_inputs_match(held_row, tip, _cell_scope(definition, path, tip), path)
+                             and self._is_ancestor(row[3], tip.commit))
             except LedgerError:
                 unchanged = False
             if (newest != row[0] or definition.blob != finding.rule_blob or row[6] != finding.rule_blob
-                    or not self._is_ancestor(row[3], tip.commit)
                     or not unchanged):
                 return InputChangedSinceJudged()
             others = tuple(other for other in self.held_findings(AllHeldFindings())
@@ -1274,14 +1309,14 @@ class Ledger:
         if definition.tier in ("A", "E"):
             raise LedgerError(f"{rule}: tier {definition.tier} has no judgment cells in this phase")
         tip = self._tip(commit)
-        scope = definition.input_scope
+        scope = _cell_scope(definition, path, tip)
         if definition.tier == "B":
             synced = self._synced_tip()
             self._refresh_sites(synced)
             if path not in {site.path for site in self._listed_sites(rule, synced)}:
                 raise LedgerError(f"{rule}: {path} holds no listed site at the synced tip")
             if not path.endswith(".rs"):
-                scope = "file"
+                scope = CellInputScope.FILE
             if path not in tip.blobs:
                 raise LedgerError(f"{rule}: {path} is not a file at {tip.commit}")
         elif definition.tier == "D":
@@ -1295,8 +1330,6 @@ class Ledger:
                 paths.update(site.path for site in sites)
             if path not in crates and path not in paths:
                 raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
-            if path in crates and scope == "file":
-                scope = "crate"  # Legacy structure tickets still own crate verdicts.
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
         fingerprint = self._fingerprint(tip, scope, path)
@@ -1332,22 +1365,26 @@ class Ledger:
             )
 
     def _judgments(self, rule: str, path: str) -> tuple[Judgment, ...]:
-        rows = cast(list[tuple[str, str, str, Verdict]], self._connection.execute(
-            'SELECT rule_blob,input_fingerprint,"commit",verdict FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
+        rows = cast(list[tuple[str, str, str, Verdict, str]], self._connection.execute(
+            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
         ).fetchall())
-        return tuple(Judgment(*row) for row in rows)
+        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope))
+                     for blob, fingerprint, commit, verdict, scope in rows)
 
     def _judgment_state(self, rule: Rule, path: str, tip: RepositoryTip) -> tuple[CellState, str]:
         rows = self._judgments(rule.rule_id, path)
-        fingerprint = self._fingerprint(tip, rule.input_scope, path)
+        scope = _cell_scope(rule, path, tip)
         pending = ""
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
         style_branch = branches[0][0] if branches else ""
         for row in rows:
             if row.rule_blob != rule.blob:
                 continue
-            ancestor = self._is_ancestor(row.commit, tip.commit)
-            if ancestor and row.input_fingerprint == fingerprint:
+            try:
+                ancestor = self._is_ancestor(row.commit, tip.commit)
+            except LedgerError:
+                continue
+            if ancestor and self._judgment_inputs_match(row, tip, scope, path):
                 return "current", row.verdict
             if not ancestor and style_branch:
                 try:
@@ -1355,7 +1392,7 @@ class Ledger:
                         self._branch_tips[style_branch] = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
                     branch_commit = self._branch_tips[style_branch]
                     checked_tip = self._tip(branch_commit)
-                    if self._is_ancestor(row.commit, branch_commit) and self._fingerprint(checked_tip, rule.input_scope, path) == row.input_fingerprint:
+                    if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path):
                         if not pending:
                             pending = row.verdict
                 except LedgerError:

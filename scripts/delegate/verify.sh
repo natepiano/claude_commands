@@ -1886,7 +1886,7 @@ case "$CMD" in
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
             CLIPPY_LOG="$(mktemp)"
             # pipefail preserves clippy's status while tee captures diagnostics.
-            if invoke_clippy --workspace --all-targets --all-features 2>&1 | tee "$CLIPPY_LOG"; then
+            if invoke_clippy --workspace --all-targets --all-features --keep-going 2>&1 | tee "$CLIPPY_LOG"; then
                 rm -f "$CLIPPY_LOG"
                 CLIPPY_LOG=""
             else
@@ -1894,34 +1894,45 @@ case "$CMD" in
                 if ! grep -Fq '#suboptimal_flops' "$CLIPPY_LOG"; then
                     exit "$clippy_status"
                 fi
-                json_status=0
-                invoke_clippy_mul_add_json --workspace --all-targets --all-features > "$CLIPPY_LOG" || json_status=$?
-                # -D warnings also makes a useful diagnostic replay exit 101.
-                if [[ "$json_status" != 0 && "$json_status" != 101 ]]; then
-                    echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
-                    exit "$clippy_status"
-                fi
-                apply_status=0
-                mul_add_report="$("$PY" "$MUL_ADD_APPLIER" --workspace-root "$WORKSPACE_ROOT" "$CLIPPY_LOG")" || apply_status=$?
-                case "$apply_status" in
-                    0) echo "$mul_add_report" ;;
-                    3) # NOTHING_APPLIED from apply_mul_add.py.
-                        echo "$mul_add_report"
-                        echo "verify.sh: clippy's multiply-add rewrite changed nothing"
-                        exit "$clippy_status"
-                        ;;
-                    *)
+                mul_add_reports=""
+                for ((rewrite_round=1; rewrite_round<=5; rewrite_round++)); do
+                    json_status=0
+                    invoke_clippy_mul_add_json --workspace --all-targets --all-features --keep-going > "$CLIPPY_LOG" || json_status=$?
+                    # -D warnings also makes a useful diagnostic replay exit 101.
+                    if [[ "$json_status" != 0 && "$json_status" != 101 ]]; then
                         echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
-                        exit "$clippy_status"
-                        ;;
-                esac
+                        break
+                    fi
+                    apply_status=0
+                    mul_add_report="$("$PY" "$MUL_ADD_APPLIER" --workspace-root "$WORKSPACE_ROOT" "$CLIPPY_LOG")" || apply_status=$?
+                    case "$apply_status" in
+                        0)
+                            echo "$mul_add_report"
+                            mul_add_reports="${mul_add_reports}${mul_add_report}"$'\n'
+                            ;;
+                        3) # NOTHING_APPLIED from apply_mul_add.py.
+                            break
+                            ;;
+                        *)
+                            echo "verify.sh: clippy's multiply-add rewrite failed; see the output above" >&2
+                            break
+                            ;;
+                    esac
+                done
+                if (( rewrite_round > 5 )); then
+                    echo 'verify.sh: stopped the multiply-add rewrite after 5 rounds'
+                fi
                 rm -f "$CLIPPY_LOG"
                 CLIPPY_LOG=""
+                if [[ -z "$mul_add_reports" ]]; then
+                    echo "verify.sh: clippy's multiply-add rewrite changed nothing"
+                    exit "$clippy_status"
+                fi
                 # The JSON step's buildlog output has diagnostics, not the count.
                 # Keep the applied count separately for first-fire measurement.
                 if [[ "${BUILDLOG_OFF:-0}" != 1 ]]; then
                     rewrite_logs="${MUL_ADD_REWRITE_LOG_DIR:-${MUL_ADD_HOOK_STATE:-$HOME/.local/state/mul-add-hook}/lint-rewrite}"
-                    if ! { mkdir -p "$rewrite_logs" && printf '%s\n' "$mul_add_report" > "$rewrite_logs/$BUILDLOG_CALL_ID.log"; }; then
+                    if ! { mkdir -p "$rewrite_logs" && printf '%s' "$mul_add_reports" > "$rewrite_logs/$BUILDLOG_CALL_ID.log"; }; then
                         echo "verify.sh: could not retain multiply-add rewrite output" >&2
                     fi
                 fi
@@ -1929,7 +1940,7 @@ case "$CMD" in
                 if [[ -n "${RUN_LOG}" ]]; then
                     VERDICT_KEY="$(tree_key)"
                 fi
-                invoke_clippy --workspace --all-targets --all-features
+                invoke_clippy --workspace --all-targets --all-features --keep-going
             fi
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

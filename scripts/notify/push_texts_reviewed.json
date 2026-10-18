@@ -458,15 +458,17 @@
     }
   },
   "shutdown.restart_failed": {
-    "many_long_names": {
-      "reviewer": "opus",
-      "sha256": "9907644376f89f8308d043bdabdfabfc561846e95cc47bf9ce89c600a4f4a827",
-      "time": "2026-10-14T17:14:54.384371-04:00"
+    "one_long_name": {
+      "objections": [],
+      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 65 Spec 4: example key renamed, text unchanged (showrunner add-on, 2026-10-17); reviewer: opus",
+      "sha256": "18e1f2b816796ea65e2488c2166f6ff89dc8e4113c30408ef7c3853b6788b3c6",
+      "time": "2026-10-17T21:43:37.983637-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "9907644376f89f8308d043bdabdfabfc561846e95cc47bf9ce89c600a4f4a827",
-      "time": "2026-10-14T17:14:42.537350-04:00"
+      "objections": [],
+      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 65 Spec 4: example key renamed, text unchanged (showrunner add-on, 2026-10-17); reviewer: opus",
+      "sha256": "18e1f2b816796ea65e2488c2166f6ff89dc8e4113c30408ef7c3853b6788b3c6",
+      "time": "2026-10-17T21:43:29.144586-04:00"
     }
   },
   "shutdown.restart_incomplete": {

@@ -226,13 +226,21 @@ def is_role_map_host() -> bool:
         return True
 
 
+class RemoteCommandRefused(OSError):
+    """The host ran the command and supplied its refusal for the caller to report."""
+
+
 def ssh_role_map(arguments: tuple[str, ...]) -> str:
     """Only transport boundary; callers never invoke remote account launches."""
     command = "python3 ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
     result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                              ROLE_MAP_HOST, command), capture_output=True, text=True, timeout=20)
     if result.returncode:
-        raise OSError("remote role map command failed")
+        message = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                       "remote role map command failed")
+        if result.returncode == 255:
+            raise OSError(message)
+        raise RemoteCommandRefused(message)
     return result.stdout
 
 

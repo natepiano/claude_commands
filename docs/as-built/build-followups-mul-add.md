@@ -127,6 +127,46 @@ FMA improves runtime by eliminating the fallback calls and allowing vectorizatio
 
 ## Measured outcome
 
+**Lint-step rewrite, re-measure.** The complete 24-hour window is **2026-10-16 16:09:48 EDT (2026-10-16T20:09:48Z) ≤ start < 2026-10-17 16:09:48 EDT (2026-10-17T20:09:48Z)**, in America/New_York, UTC-04:00. It starts at T_lint, including the calls before the first passing rewrite. The verdict unit is the last judging clippy step in each `call_id`; JSON replay steps are excluded, and a step without a call ID stands alone. Sources in this subsection are the adapted scripts and generated JSON in `~/.local/state/mul-add-hook/lint-rewrite/`.
+
+| Measure | Lint-step rewrite, re-measure | Limit / verdict | Source |
+| --- | --- | --- | --- |
+| Final clippy verdicts | **124 total; 39 failed; 5 failed with `suboptimal_flops`** | — | `measure.py` → `measurements.json`: `verdict_steps`, `failed_verdicts`, `suboptimal_verdicts` |
+| Target failures per 100 verdicts | **5 / 124 × 100 = 4.032** | ≤1.979: **FAIL** | `measure.py`: `failed_per_100`, `failed_verdict` |
+| Sole-cause seat-hours per day | **(956 + 657.026) / 3,600 / 1 = 0.448**; one sole-cause call | ≤0.100: **FAIL** | `measure.py`: `wall_seconds`, `gap_seconds`, `span_days`, `sole_call_ids`, `seat_hours_per_day` |
+| Same window, earlier per-step rule | **151 clippy steps; 66 failed; 32 with the target: 32 / 151 × 100 = 21.192** | Includes replay diagnostics | `measure.py`: `total_steps`, `failed_steps`, `per_step_suboptimal` |
+| Judging steps before grouping by call | **137 steps; 18 with the target** | Excludes JSON replays | `measure.py`: `judging_steps`, `judging_suboptimal` |
+| JSON replay cost and result | **14 replays; 28 recorded fixes; 3 followed by a passing final clippy verdict; 1,275.100 s added clippy time** | One replay has no saved count | `measure.py`: `rewrite_steps`, `rewrite_fixes`, `rewrite_passing_verdicts`, `rewrite_clippy_seconds`, `rewrite_missing_count_logs` |
+| Earlier detector-reach measurement | **8.235 target failures per 100 steps; 1.104 sole-cause seat-hours/day** | Both FAIL | “Detector reach, re-measure” below; its earlier 96-hour window and per-step unit differ |
+
+Both limits **FAIL**. The limit counts failed verdicts, so the causes are ranked by the five failed verdicts, not by warnings:
+
+| Cause | Failed verdicts | Evidence |
+| --- | --- | --- |
+| **Overlapping suggestions in a chained sum** (`a * x + b * y + c * z`): clippy suggests an outer and an inner `mul_add` over the same bytes; the applier takes the outer one and skips the inner, which the final judgment then reports | **2**, and the whole seat-time failure | `v20261016T214258-406393-16864`: count "1 skipped: overlapping", one residual at `crates/hana/src/tool/rear_patch_panel/mod.rs:3967`; `v20261017T102205-1529647-3466`: count "3 skipped: overlapping", three residuals in `tests/arrange_glyph/envelope.rs` and `selection/patch_edit/session.rs` |
+| **Suggestions inside a macro body**: `MaybeIncorrect`, so the applier's `MachineApplicable` requirement leaves them unchanged | **2** | `v20261017T054451-3834727-27451` at `hana_mimesis_tools/src/show.rs:205` (no saved count); `v20261017T160057-1031444-24087` at `show.rs:777`, one expression reported nine times |
+| **Crates the failing run never reached**: the first clippy run stopped when `hana_conduit` failed, so the replay saw only that crate; after the rewrite the final run reached `hana` and the test targets and failed there | **1** | `v20261017T094538-3264439-10778`: the first and replay runs report only `hana_conduit/src/routing/draped.rs`; the final run reports `hana/src/conduit/cable.rs` and `tests/cable_motion/jack_entry.rs` |
+
+The largest remaining cause is the **overlap skip**: it ties macro bodies on failed verdicts and alone accounts for the seat-time failure. Counted by warnings instead, macro bodies would lead with 10 of the **18 target warnings**, but nine of those ten are one expression repeated. Overall, **17 warnings in four verdicts** remain after a recorded positive rewrite; **one warning in one verdict** has no retained positive count (`commits.py` → `commits.json`: `diagnostic_groups`, `causes`, `remaining_warnings`, `replay_targets`). Warning totals include repeated diagnostics; they count neither distinct expressions nor distinct edits. The missing count log cannot alone distinguish zero edits from a failed log save. These results do not support retiring the edit hook.
+
+The seat-time failure comes from call `v20261016T214258-406393-16864`: its final judgment retains one warning at `crates/hana/src/tool/rear_patch_panel/mod.rs:3967`. The replay supplied overlapping outer and inner multiply-add suggestions; the saved count reports one fix and one overlap skipped, leaving the inner expression for the final judgment (`commits.json`: `replay_targets`, `remaining_warnings`; that call's saved `.log`). Its **956 s** call wall time plus **657.026 s** to the next lint call's end totals **1,613.026 s**. As before, the next call must share worktree, worker and session, start inside the window, and end within **1,800 s** after the failed call ends. There is one accepted interval: call-wall median **956 s**, interval median and p75 **657.026 s** (`measurements.json`: `loops`, `call_wall_median_seconds`, `gap_median_seconds`, `gap_p75_seconds`). Replay time above is the added JSON clippy cost, reported separately from this sole-cause seat-time metric.
+
+Reproduce by running `python3 -B ~/.local/state/mul-add-hook/lint-rewrite/measure.py`, then `commits.py` and `audit.py` from the same directory. `measure.py` reads the index in read-only mode, decompresses failed logs individually in memory, and reads saved `<call_id>.log` counts; it writes `measurements.json` and `warnings.json`. The adapted `commits.py` reads those outputs and bounded step/log records to write `commits.json` with call sequences and residual diagnostics. It follows calls rather than Git commits because rewrites enter the calling worktree as uncommitted edits. `audit.py` independently ranks verdicts in SQL and rereads diagnostic logs and saved counts; **`audit.json` reports PASS** for the counts, sums, selected verdict IDs and both limit verdicts. All copied scripts report **0 errors, 0 warnings, 0 notes** under basedpyright.
+
+The complete input queries are below; each pair of placeholders binds the UTC start and exclusive end stated above. `measure.py` sorts rows by precise start time and ID, removes replay argv, and keeps the last judgment per call. Seat-time calculations select `tool='verify.sh' AND verb='lint'` from the bounded calls. `commits.py` uses the third query for stage order; `audit.py` records its independent `ROW_NUMBER` verdict query in `audit.json`.
+
+```sql
+SELECT * FROM steps WHERE repo='hana' AND step='clippy'
+  AND datetime(started_at)>=datetime(?) AND datetime(started_at)<datetime(?)
+  ORDER BY datetime(started_at),id;
+SELECT * FROM calls WHERE repo='hana'
+  AND datetime(started_at)>=datetime(?) AND datetime(started_at)<datetime(?)
+  ORDER BY datetime(started_at),id;
+SELECT * FROM steps WHERE repo='hana'
+  AND datetime(started_at)>=datetime(?) AND datetime(started_at)<datetime(?)
+  ORDER BY datetime(started_at),id;
+```
+
 **Detector reach, live check.** The wider detector, which reports every likely multiply-add on an edited line with a conditional message, reached the live natedev hooks at **T_reach = 2026-10-12 14:13:42 EDT (America/New_York, UTC-04:00; 2026-10-12T18:13:42Z)**, the committer time of merge `b22c1218`. In separate scratch crates outside every repository, Codex `apply_patch` and Claude `Edit` each received one block when adding `let centre_row = top + metrics.button.height * 0.5;`. Both blocks read, with the scratch path normalized: `<file>:3: if top + metrics.button.height * 0.5 is f32 or f64 arithmetic, write metrics.button.height.mul_add(0.5, top) (clippy::suboptimal_flops). Leave integer and vector arithmetic as it is. The edit was applied.` A second `apply_patch` changed only `let top` and received no block; Claude's second `Edit` did the same and received no block. The live `blocks.jsonl` contains one matching record per block, tagged `codex` and `claude`. `python3 scripts/hooks/codex_hooks.py check` exited 0 and reported both handlers trusted.
 
 **Detector reach, re-measure.** The complete window is **2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z) ≤ start < 2026-10-16 14:13:42 EDT (2026-10-16T18:13:42Z)**, in America/New_York, UTC-04:00. The fixed span is 96 hours. Sources below name the scripts kept with their outputs in `~/.local/state/mul-add-hook/reach-2026-10-16/` (each reads and writes beside itself); comparison values and limits are those specified by the plan's phase-4 Work Order.
