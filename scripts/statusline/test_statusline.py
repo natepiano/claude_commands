@@ -79,7 +79,7 @@ class ColorTests(unittest.TestCase):
                 self.assertEqual(status_lines(payload, showrunner=record, colors=SHIPPED_COLORS,
                                               SHOWRUNNER_UNIT="show"), [
                     "\x1b[94munit director\x1b[0m | project | 0 | Opus",
-                    "\x1b[36mclaude1\x1b[0m | 5-hour \x1b[92m62% left\x1b[0m | weekly \x1b[92m40% left\x1b[0m",
+                    "\x1b[36mclaude1\x1b[0m | weekly \x1b[92m40% left\x1b[0m",
                 ])
 
     def test_shipped_role_colors_and_unassigned(self) -> None:
@@ -151,8 +151,11 @@ class ColorTests(unittest.TestCase):
                 self.assertEqual(status_lines(ContextInput(context_window=window), colors=SHIPPED_COLORS)[0].split(" | ")[2], "90,000")
 
     def test_each_usage_window_colors_the_integer_left_at_both_thresholds(self) -> None:
-        for name, index in (("5-hour", 1), ("weekly", 2)):
+        for name, index in (("5-hour", 1), ("weekly", -1)):
             for used, left, code in ((89, 11, 92), (90, 10, 93), (94, 6, 93), (95, 5, 91), (89.1, 10, 93)):
+                # The 5-hour window shows only when under 10% of it is left.
+                if name == "5-hour" and left >= 10:
+                    continue
                 with self.subTest(window=name, used=used):
                     payload = limits({"used_percentage": used}, {"used_percentage": used})
                     field = status_lines(payload, colors=SHIPPED_COLORS)[1].split(" | ")[index]
@@ -182,7 +185,7 @@ class ColorTests(unittest.TestCase):
 
     def test_colors_wrap_only_the_fields_and_preserve_both_plain_lines(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
-        payload = {**limits({"used_percentage": 90, "resets_at": reset}, {"used_percentage": 95, "resets_at": reset}),
+        payload = {**limits({"used_percentage": 91, "resets_at": reset}, {"used_percentage": 95, "resets_at": reset}),
                    "session_id": "sid", "workspace": {"current_dir": "/tmp/project"},
                    "model": {"display_name": "Opus"}, "effort": {"level": "high"},
                    "context_window": ContextWindow(total_input_tokens=80_000, context_window_size=100_000)}
@@ -191,7 +194,7 @@ class ColorTests(unittest.TestCase):
         self.assertEqual([ANSI.sub("", line) for line in colored], plain)
         self.assertEqual(colored, [
             "\x1b[95mshowrunner\x1b[0m | project | \x1b[93m80,000\x1b[0m | Opus high",
-            "\x1b[36mclaude1\x1b[0m | 5-hour \x1b[93m10% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
+            "\x1b[36mclaude1\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
         ])
 
 
@@ -207,12 +210,18 @@ class UsageLineTests(unittest.TestCase):
     def test_reset_times_in_each_season(self) -> None:
         edt = int(datetime(2026, 10, 13, 18, 0, tzinfo=timezone.utc).timestamp())
         est = int(datetime(2026, 12, 3, 12, 0, tzinfo=timezone.utc).timestamp())
-        lines = status_lines(limits({"used_percentage": 38, "resets_at": edt}, {"used_percentage": 60, "resets_at": est}))
-        self.assertEqual(lines[1], "claude1 | 5-hour 62% left until 14:00 EDT | weekly 40% left until Thu 07:00 EST")
+        lines = status_lines(limits({"used_percentage": 95, "resets_at": edt}, {"used_percentage": 60, "resets_at": est}))
+        self.assertEqual(lines[1], "claude1 | 5-hour 5% left until 14:00 EDT | weekly 40% left until Thu 07:00 EST")
 
     def test_missing_reset_shows_percent_alone(self) -> None:
-        lines = status_lines(limits({"used_percentage": 38}, {"used_percentage": 60, "resets_at": None}))
-        self.assertEqual(lines[1], "claude1 | 5-hour 62% left | weekly 40% left")
+        lines = status_lines(limits({"used_percentage": 95}, {"used_percentage": 60, "resets_at": None}))
+        self.assertEqual(lines[1], "claude1 | 5-hour 5% left | weekly 40% left")
+
+    def test_the_5_hour_window_shows_only_under_10_percent_left(self) -> None:
+        for used, line in ((89.1, "claude1 | weekly 40% left"), (90, "claude1 | weekly 40% left"),
+                           (91, "claude1 | 5-hour 9% left | weekly 40% left")):
+            with self.subTest(used=used):
+                self.assertEqual(status_lines(limits({"used_percentage": used}, {"used_percentage": 60}))[1], line)
 
     def test_missing_rate_limits_leave_the_account_alone_on_the_second_line(self) -> None:
         self.assertEqual(status_lines({})[1:], ["claude1"])
@@ -229,10 +238,10 @@ class UsageLineTests(unittest.TestCase):
                 epochs.extend([edge - 1, edge])
             hour = following
         self.assertEqual(len(epochs), 15 * 2 * 2)
-        inputs = [limits({"used_percentage": 0, "resets_at": t}, {"used_percentage": 0, "resets_at": t}) for t in epochs]
+        inputs = [limits({"used_percentage": 95, "resets_at": t}, {"used_percentage": 0, "resets_at": t}) for t in epochs]
         lines = status_lines(*inputs)[1::2]
         expected = [
-            f"claude1 | 5-hour 100% left until {user_time(t, '%H:%M %Z')} | weekly 100% left until {user_time(t, '%a %H:%M %Z')}"
+            f"claude1 | 5-hour 5% left until {user_time(t, '%H:%M %Z')} | weekly 100% left until {user_time(t, '%a %H:%M %Z')}"
             for t in epochs
         ]
         self.assertEqual(lines, expected)
@@ -269,7 +278,7 @@ class StoredReadingTests(unittest.TestCase):
     def test_a_fresh_reading_for_the_label_replaces_the_response_figure(self) -> None:
         path = self.labels({"claude1": self.weekly(2.0, self.now - 120, self.reset)})
         self.assertEqual(
-            status_lines(self.live, labels=path)[1].split(" | ")[2],
+            status_lines(self.live, labels=path)[1].split(" | ")[-1],
             f"weekly 2% left until {user_time(self.reset, '%a %H:%M %Z')}",
         )
 
@@ -295,9 +304,9 @@ class StoredReadingTests(unittest.TestCase):
     def test_a_missing_file_given_as_dev_null_gives_the_response_figure(self) -> None:
         self.assertIn("weekly 3% left", status_lines(self.live, labels=Path("/dev/null"))[1])
 
-    def test_a_none_open_five_hour_reading_shows_all_left_with_no_reset(self) -> None:
-        path = self.labels({"claude1": {"five_hour": {"left": 100.0, "resets_at": None, "at": self.now - 60}}})
-        self.assertTrue(status_lines(self.live, labels=path)[1].startswith("claude1 | 5-hour 100% left | weekly"))
+    def test_a_five_hour_reading_with_no_reset_shows_its_figure_alone(self) -> None:
+        path = self.labels({"claude1": {"five_hour": {"left": 5.0, "resets_at": None, "at": self.now - 60}}})
+        self.assertTrue(status_lines(self.live, labels=path)[1].startswith("claude1 | 5-hour 5% left | weekly"))
 
     def test_an_address_as_the_account_never_reaches_the_line(self) -> None:
         self.assertNotIn("@", "\n".join(status_lines(self.live, account="someone@example.invalid")))
@@ -404,7 +413,7 @@ class RoleTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 self.assertEqual(self.command_lines(payload, shell=shell, SHOWRUNNER_UNIT="show"), [
                     "\x1b[94munit director\x1b[0m | project | 0 | Opus",
-                    "5-hour \x1b[92m62% left\x1b[0m | weekly \x1b[92m40% left\x1b[0m",
+                    "weekly \x1b[92m40% left\x1b[0m",
                 ])
 
     def test_unit_director_without_a_notifier_conf_keeps_the_plain_role_name(self) -> None:
@@ -482,7 +491,7 @@ class RoleTests(unittest.TestCase):
 
         self.assertEqual(lines, [
             "\x1b[38;5;141munassigned\x1b[0m | project | 0 | Opus",
-            "5-hour \x1b[92m62% left\x1b[0m | weekly \x1b[92m40% left\x1b[0m",
+            "weekly \x1b[92m40% left\x1b[0m",
         ])
         self.assertFalse((self.home / ".local/state/notifier").exists())
 
