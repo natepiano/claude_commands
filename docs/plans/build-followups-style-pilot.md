@@ -179,16 +179,20 @@ Pass criterion: no product unit waits on a style reservation.
 | Result | Numbers | Source command |
 | --- | --- | --- |
 | partial | 12:00Z to 15:09Z: 0 recorded overlap answers naming a style holder, 0 recorded incursions naming a style blocker, 0 `ticket_yields` rows | Read-only scan of the 3,033 journal entries in the interval |
+| pass, small sample | 14:56Z to 21:30Z on 2026-10-18: 0 refused checks or claims of any kind, while modules-unit made 7 style claims and product units made 2 claims | Read-only scan of the 417 journal entries in the interval, for `overlap_refused` records |
 
 A refused check or claim is not journaled (`verb/check.rs:226-232`,
 `verb/claim/mod.rs:1473-1477`, `ledger/handle.rs:748-765`), so a product unit
 that waited and retried leaves no record. Zero recorded overlaps passes for what
 is recorded; the criterion itself cannot be shown from records.
 
-Open item the criterion waits on: cargo-berth journaling each refused check or
-claim (requester, paths, holder), placed as cargo-liner berth-parallel-unit's
-Phase 10, after its Phase 9. The yielding criterion can be measured once that
-phase merges.
+cargo-berth now journals each refused check or claim as one `overlap_refused`
+record that names the requester, the paths and each holder. The change merged
+on cargo-liner main as `ae490d0c` (berth-parallel-unit Phase 10). The installed
+binary, built at 14:56Z on 2026-10-18, writes the record, so the second row
+counts from then. No refusal of any kind was recorded in that window, so no
+product unit waited on a style reservation. The sample is small: product
+units made only 2 claims in it.
 
 Tickets per hour per unit, merged tickets over first ticket created to last
 merged: modules 7 in 2.41 h (2.90/h), names 6 in 1.88 h (3.19/h), types 4 in
