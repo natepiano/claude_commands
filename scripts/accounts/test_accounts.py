@@ -2823,6 +2823,38 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("hold half a point", next_moves.render_next_move(entries[1]))
         self.assertIn("hold half a point", next_moves.render_next_move(entries[2]))
 
+    def test_listed_percent_guards_its_hold_update_locally_and_through_the_mac(self) -> None:
+        entry = next_moves.add_next_move("units", 1.234567, "claude2", 5)
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            if code:
+                raise role_map.RemoteCommandRefused(error.strip())
+            self.assertEqual(error, "")
+            return output
+
+        for mac_client, minutes in ((False, "12"), (True, "17")):
+            with (self.subTest(mac_client=mac_client),
+                  patch.object(role_map, "is_role_map_host", return_value=not mac_client),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                code, listed, error = self.run_cli("next", "list")
+                self.assertEqual((code, error), (0, ""))
+                displayed = listed.split("at ", 1)[1].split("%", 1)[0]
+                self.assertEqual(displayed, "1.234567")
+                code, reply, error = self.run_cli("next", "hold", "units", "1", minutes,
+                                                 "--expect", displayed, "claude2")
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(reply, f"units 1: at {displayed}% → claude2, hold {minutes} min\n")
+            changed, = next_moves.read_next_moves()
+            assert isinstance(changed, next_moves.ClaudeGroupMove)
+            self.assertEqual((changed.id, changed.at_percent, changed.hold_mode),
+                             (entry.id, entry.at_percent, next_moves.FixedHold(float(minutes))))
+        self.assertEqual(requests, [("next", "list"),
+            ("next", "hold", "units", "1", "17.0", "--expect", "1.234567", "claude2")])
+
     def test_mac_hold_preserves_fractional_minutes_and_checks_the_exact_expected_percent(self) -> None:
         entry = next_moves.add_next_move("units", 1.234567, "claude2", 5)
         requests: list[tuple[str, ...]] = []

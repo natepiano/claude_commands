@@ -215,6 +215,21 @@ class NextMovesTests(unittest.TestCase):
                     _ = next_moves.read_next_moves()
                 self.assertEqual(path.read_text(), original)
 
+    def test_listed_percent_round_trips_for_claude_and_workers_entries(self) -> None:
+        for percent, displayed in ((1.234567, "1.234567"), (1, "1"), (0, "0"), (100, "100"),
+                                   (1.0000000000000002, "1.0000000000000002"),
+                                   (99.99999999999999, "99.99999999999999"), (5e-324, "5e-324")):
+            entries: tuple[next_moves.NextMove, ...] = (
+                next_moves.ClaudeGroupMove("unit", "units", percent, 5, "claude2", NOW),
+                next_moves.ClaudeGroupMove("runner", "showrunners", percent, 5, "claude3", NOW),
+                next_moves.WorkersMove("worker", percent, next_moves.DelegateToClaude(), NOW))
+            with self.subTest(percent=percent):
+                for line in next_moves.render_next_moves(entries).splitlines():
+                    if line:
+                        token = line.split("at ", 1)[1].split("%", 1)[0]
+                        self.assertEqual(token, displayed)
+                        self.assertEqual(float(token), percent)
+
     def test_half_point_and_legacy_fixed_entries_round_trip_without_losing_the_mode(self) -> None:
         half = next_moves.ClaudeGroupMove("half", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
         fixed = next_moves.ClaudeGroupMove("fixed", "showrunners", 1, next_moves.FixedHold(17), "claude3", NOW)

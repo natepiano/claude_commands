@@ -11,7 +11,7 @@ Translate $ARGUMENTS into `python3 ~/.claude/scripts/accounts/accounts.py next`:
 - “drop units 2” → `remove units 2`.
 - “swap showrunners 1 and 2” → `move showrunners 1 2`; `move GROUP N M` moves position N to M.
 - Insert at a position with `add GROUP PERCENT TARGET --at N`; omission appends.
-- Change a hold with `hold GROUP N half-point|MINUTES --expect PERCENT TARGET`, immediately after `list` identifies that entry. A refusal means re-list; never recreate a consumed entry or undo an update with another `hold`.
+- Change a hold with `hold GROUP N half-point|MINUTES --expect PERCENT TARGET`, copying the listed percent and target immediately after `list`. A different mode clears the started hold; the same mode keeps it, including a retry after a lost reply. A refusal means re-list; never recreate a consumed entry or undo an update with another `hold`.
 - Positions start at 1 within each group; never accept or show internal ids.
 
 Workers entries cannot have either hold mode. A workers move to Claude holds there until the source account’s weekly reset. A half-point hold fixes its minutes at its first low reading using the selected account’s pace history, or 40 minutes without usable pace; the list shows natedev’s current estimate on both machines.
