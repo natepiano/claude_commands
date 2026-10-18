@@ -647,7 +647,7 @@ def block_reason(instance_dirs: list[str], reply: str,
 
 
 def counts_line(productions: list[Production], questions: int) -> str | None:
-    """The counts line a footers-off reply ends with: each production's counts and the open questions."""
+    """The status line's counts line: each production's counts and the open questions."""
     production_scripts = str(DAILIES.parent)
     if production_scripts not in sys.path:
         sys.path.insert(0, production_scripts)
@@ -658,24 +658,16 @@ def counts_line(productions: list[Production], questions: int) -> str | None:
     return footer_counts.counts_line(counts._replace(questions=questions))
 
 
-def counts_block_reason(productions: list[Production], reply: str) -> str | None:
-    """With footers off, the reply's last line is the counts line, and none when nothing is counted."""
-    if reply.strip() == "-":
-        return None
-    counted = open_questions(productions, {production.slug: place_of(production.slug).below
-                                           for production in productions})
-    # A list that cannot be read leaves the question count unknown, so the line is not checked.
-    if counted is None:
-        return None
-    expected = counts_line(productions, counted)
+def counts_block_reason(reply: str) -> str | None:
+    """With footers off, the reply has no counts line: the user reads the counts in the status line."""
+    production_scripts = str(DAILIES.parent)
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
     import footer_counts
 
-    lines = [line for line in reply_lines(reply) if line.strip()]
-    last = lines[-1] if lines else ""
-    if expected is None:
-        return (f"Footers are off and nothing waits on the user: remove the last line `{last}`."
-                if last.startswith(footer_counts.COUNTS_HEAD) else None)
-    return None if last == expected else f"Footers are off: end the reply with this line, on its own:\n\n{expected}"
+    counted = [line.strip() for line in reply_lines(reply) if line.strip().startswith(footer_counts.COUNTS_HEAD)]
+    return (f"Footers are off: remove the line `{counted[0]}`. The status line shows these counts."
+            if counted else None)
 
 
 def footer_block_reason(instance_dirs: list[str], reply: str,
@@ -686,7 +678,7 @@ def footer_block_reason(instance_dirs: list[str], reply: str,
     if not productions:
         return None
     if all(states[production.slug] is FooterState.OFF for production in productions):
-        return counts_block_reason(productions, reply)
+        return counts_block_reason(reply)
     lines = reply_lines(reply)
     waiting = waiting_bullets(lines)
     footer_lines, bullets = waiting if waiting is not None else ([], [])

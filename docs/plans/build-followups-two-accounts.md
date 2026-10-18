@@ -2026,3 +2026,26 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Binds later work:** "Readout of the moves" names this text (`, then close its record in a terminal on <machine>: <command>`); the readout reads only the journal and records, never the line.
 
 **Gotchas:** `shutdown forget` takes only local records, so any new line that prints a record command names `saved["machine"]`.
+
+### Phase 73 — The herdr and production suites pass on macOS  · status: done
+
+#### As-built
+
+- `test_add_unit.py` and `test_add_showrunner.py` build `self.root` as `Path(tempfile.TemporaryDirectory()).resolve()`. Trust keys and Worktree cells then match the paths that production resolves (on macOS, `/tmp` is a symlink to `/private/tmp`). Their fixture env pins `"HERDR_PLATFORM": "linux"`, so the Linux launcher fixtures run as Linux on every machine.
+- `PromptSubmissionTests` (`scripts/herdr/test_herdr.py`) puts `"HERDR_BIN": "/nonexistent/herdr"` in its cleared env. Its class-level `client` is a typed `Mock` placeholder (`cast(herdr.Herdr, Mock())`). `setUp` builds the only real `herdr.Herdr("agents")`, after the env applies. No herdr lookup runs at import.
+- `docs/as-built/herdr-adoption.md` "Test doubles" holds the four fixture rules and the Mac run command for the nine suites: a scratch HOME and `TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr python3 -m unittest <suites>`. The command runs from the root of a copy of the tree under test, not from the Mac's live `~/.claude`.
+- Test-only: no production file changes.
+
+**Files:**
+- `scripts/production/test_add_unit.py`, `scripts/production/test_add_showrunner.py` — resolved temporary root, pinned platform.
+- `scripts/herdr/test_herdr.py` — `HERDR_BIN` in the cleared env; the client is built only in `setUp`.
+- `docs/as-built/herdr-adoption.md` — the fixture rules and the Mac run command.
+
+**Gotchas:**
+- A class attribute that builds a herdr client runs at import, before any `setUp` env applies. Build clients only in `setUp`.
+- The run-level `HERDR_BIN` in the Mac command hides an import-time herdr lookup. To check a fixture for one, run it with an empty `PATH` and no `HERDR_BIN`.
+- The Mac command uses `scripts.` module names, so it runs only from the root of a tree that holds the branch under test.
+
+**Ruled out:** `HERDR_PLATFORM` on the run command — it takes precedence over test_restart's `_PLATFORM="darwin"` patches and breaks them.
+
+**Live check passed 2026-10-18:** the documented run command passed the nine suites on the Mac from a copy of main at ae28d4fd: 1054 tests OK in 194 s. Change-review row C51.

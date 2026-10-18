@@ -761,13 +761,13 @@ def launch_session(
         _ = herdr.start_server(host, timeout_ms)
         production = request.production
         pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
-                              showrunners.tab_title(production.slug, name), name, str(request.session_cwd), environment)
+                              session_name, str(request.session_cwd), environment)
     else:
         host = name
         herdr.start_new_server(host, timeout_ms)
         pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
     try:
-        outcome = herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
+        outcome = herdr.start_agent(host, pane, kind="claude", agent=name, agent_arguments=arguments,
             opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
             timeout_ms=timeout_ms)
         return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")

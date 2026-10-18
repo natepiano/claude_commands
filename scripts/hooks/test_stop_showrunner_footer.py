@@ -32,8 +32,6 @@ ONE_OPEN = "There is 1 open question for you."
 TWO_OPEN = "There are 2 open questions for you."
 
 
-# The counts line a footers-off reply ends with while one question is open.
-ONE_QUESTION = "\n\nFor you: 1 question"
 
 class OutstandingUserQuestion(TypedDict):
     since: str
@@ -290,26 +288,24 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = reports.write_text(json.dumps([{"text": "hanadocs is back", "until": later},
                                            {"text": "the Mac is free", "until": "2026-10-01T09:00"}]))
         path = self.transcript(peer("hanadocs restarted"))
-        self.assert_passes(self.run_hook("Vault promotion still waits on your choice." + ONE_QUESTION, transcript_path=path))
-        self.assert_passes(self.run_hook("You asked to hear: hanadocs is back, at 19:52." + ONE_QUESTION, transcript_path=path))
+        self.assert_passes(self.run_hook("Vault promotion still waits on your choice.", transcript_path=path))
+        self.assert_passes(self.run_hook("You asked to hear: hanadocs is back, at 19:52.", transcript_path=path))
         # A report whose `until` has passed is no longer registered.
         self.assertEqual(self.reason("You asked to hear: the Mac is free.", transcript_path=path),
                          showrunner_footer.NOTHING_FOR_USER)
         denied = self.transcript(notification(), denial())
-        self.assert_passes(self.run_hook("Auto mode refused the vault commit; it needs you." + ONE_QUESTION, transcript_path=denied))
+        self.assert_passes(self.run_hook("Auto mode refused the vault commit; it needs you.", transcript_path=denied))
 
-    def test_with_footers_off_the_reply_ends_with_the_counts_line(self) -> None:
+    def test_with_footers_off_a_reply_carries_no_counts_line(self) -> None:
         self.footers_off()
-        self.assert_passes(self.run_hook("Done."))
-        blocked = self.reason("Done.\n\nFor you: 1 project")
-        self.assertIn("remove the last line `For you: 1 project`", blocked)
-        ledger = self.root / "ledger.md"
-        _ = ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n")
-        _ = self.doc.write_text(self.doc.read_text() + f"- **Improvement queue:** {ledger}\n")
         _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-16T19:00", "text": "Vault promotion"}]))
-        expected = "For you: 1 project, 1 question"
-        self.assertIn(expected, self.reason("Vault promotion still waits on your choice."))
-        self.assert_passes(self.run_hook(f"Vault promotion still waits on your choice.\n\n{expected}"))
+        self.assert_passes(self.run_hook("Vault promotion still waits on your choice."))
+        for line in ("For you: 1 question", "For you: 1 project, 1 question"):
+            with self.subTest(line=line):
+                blocked = self.reason(f"Vault promotion still waits on your choice.\n\n{line}")
+                self.assertIn(f"remove the line `{line}`", blocked)
+        self.assertIn("remove the line `For you: 1 question`",
+                      self.reason("For you: 1 question\n\nVault promotion still waits on your choice."))
         self.assert_passes(self.run_hook("-", transcript_path=self.transcript(peer("ack"))))
 
     def test_a_registered_item_still_needs_the_footer(self) -> None:
@@ -398,12 +394,12 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 self.assert_passes(self.run_hook(example))
         item = {"since": "2026-10-06T08:00", "text": "run", "question": choice, "reviewed": choice}
         _ = self.outstanding.write_text(json.dumps([item]))
-        self.assert_passes(self.run_hook(choice + ONE_QUESTION))
+        self.assert_passes(self.run_hook(choice))
         self.assertIn("record the item", self.reason(choice + "\nDelete the work (recommended), or keep it."))
         code_choice = "Run `check.py` (recommended), or wait?"
         showrunner_footer.add_pending_reviewed(self.instance, [
             showrunner_footer.PendingReviewedQuestion("check", code_choice)])
-        self.assert_passes(self.run_hook("Run `check.py` (recommended),\n or wait?" + ONE_QUESTION))
+        self.assert_passes(self.run_hook("Run `check.py` (recommended),\n or wait?"))
 
     def test_unregistered_requests_block_with_footers_off_and_on_hook_retries(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -440,10 +436,10 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         for field, record in records:
             with self.subTest(field=field):
                 _ = self.outstanding.write_text(json.dumps([record]))
-                self.assert_passes(self.run_hook("Say  go and I'll run `check.py`." + ONE_QUESTION))
+                self.assert_passes(self.run_hook("Say  go and I'll run `check.py`."))
         shorter: OutstandingUserQuestion = {"since": "2026-10-16T08:00", "text": "Say go and I'll run"}
         _ = self.outstanding.write_text(json.dumps([shorter]))
-        self.assert_passes(self.run_hook("Say go and I'll run the diagnostic." + ONE_QUESTION))
+        self.assert_passes(self.run_hook("Say go and I'll run the diagnostic."))
 
     def test_registered_question_does_not_authorise_another_ask_in_the_same_reply(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -456,7 +452,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn("update_registration.py footer --state", reason)
         item["reviewed"] = first + "\n" + second
         _ = self.outstanding.write_text(json.dumps([item]))
-        self.assert_passes(self.run_hook(first + " " + second + ONE_QUESTION))
+        self.assert_passes(self.run_hook(first + " " + second))
 
     def test_unrelated_production_and_code_only_text_do_not_register_a_user_ask(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -467,7 +463,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = self.outstanding.write_text(json.dumps([code_only]))
         self.assertIn(question, self.reason(question))
         _ = self.outstanding.write_text(json.dumps([stranger]))
-        self.assert_passes(self.run_hook(question + ONE_QUESTION))
+        self.assert_passes(self.run_hook(question))
 
     def test_a_new_ask_beside_a_shown_question_is_registered_without_repeating_the_question(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -520,7 +516,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 self.assertIn("record the item", self.reason(
                     reply + f"\n{marker} Delete the work (recommended), or keep it?"))
                 self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
-                self.assert_passes(self.run_hook(reply + ONE_QUESTION))
+                self.assert_passes(self.run_hook(reply))
 
     def test_recorded_list_choices_can_be_recalled_without_their_markers(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
@@ -529,8 +525,8 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 question = f"{marker} Run now (recommended), or wait?"
                 _ = self.outstanding.write_text(json.dumps([{
                     "since": "2026-10-06T08:00", "text": "run", "question": question, "reviewed": question}]))
-                self.assert_passes(self.run_hook("Run  now (recommended), or wait?" + ONE_QUESTION))
-                self.assert_passes(self.run_hook("2) Run now (recommended), or wait?" + ONE_QUESTION))
+                self.assert_passes(self.run_hook("Run  now (recommended), or wait?"))
+                self.assert_passes(self.run_hook("2) Run now (recommended), or wait?"))
 
     def test_root_can_recall_a_lower_productions_recorded_choice(self) -> None:
         self.timer("kid")
@@ -539,7 +535,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = self.outstanding.with_name("kid.json").write_text(json.dumps([
             {"since": "2026-10-06T08:00", "text": "choose route", "question": question, "reviewed": question}]))
         self.assertEqual(self.run_switch("off").returncode, 0)
-        self.assert_passes(self.run_hook(question + ONE_QUESTION))
+        self.assert_passes(self.run_hook(question))
         self.assertIn("record the item", self.reason("Use the long route (recommended), or wait?"))
 
     def test_footer_stays_valid_when_a_reading_arrives_after_its_stamp(self) -> None:

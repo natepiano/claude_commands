@@ -3953,5 +3953,31 @@ class SettleTests(ShutdownTestCase):
 
 
 
+class PromptDetectionTests(unittest.TestCase):
+    RULE: str = "─" * 40
+    PERMISSION: str = "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel"
+
+    def test_words_that_contain_form_never_report_a_form(self) -> None:
+        transcript = ("The information is in the right format.\nWe perform the platform check.\n"
+                      "Fill in the form, or press esc to cancel the edit.\n")
+        for bottom in ("", f"{self.RULE}\n❯ \n{self.RULE}\n  ? for shortcuts"):
+            with self.subTest(input_box=bool(bottom)):
+                self.assertFalse(settle.waits_on_prompt(transcript + bottom))
+
+    def test_a_permission_prompt_waits_for_the_user(self) -> None:
+        self.assertTrue(settle.waits_on_prompt(f"Earlier output\n{self.RULE}\n{self.PERMISSION}\n"))
+        self.assertTrue(settle.waits_on_prompt(f"{self.RULE}\n❯ 1. Yes\n  2. No\nEnter to select"))
+
+    def test_a_prompt_scrolled_above_the_input_box_no_longer_waits(self) -> None:
+        self.assertFalse(settle.waits_on_prompt(f"{self.PERMISSION}\nDone.\n{self.RULE}\n❯ \n{self.RULE}"))
+
+    def test_a_busy_session_never_reports_a_form(self) -> None:
+        for status, expected in (("busy", False), ("idle", True)):
+            with (self.subTest(status=status),
+                  patch.object(settle, "_screen", return_value=settle.ScreenText(self.PERMISSION)) as screen):
+                self.assertEqual(settle._showing_form(top_level("one", "one", status=status)), expected)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(screen.called, status != "busy")
+
+
 if __name__ == "__main__":
     _ = unittest.main()
