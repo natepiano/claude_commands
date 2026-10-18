@@ -208,6 +208,7 @@ Use these fixture rules on Linux and macOS:
 - Resolve the temporary root in `test_add_unit.py` and `test_add_showrunner.py`. On macOS, `/tmp` points to `/private/tmp`. Trust keys and worktree paths must use the same resolved root as the code under test.
 - Set `HERDR_PLATFORM=linux` in each Linux launcher fixture's environment. Do not set it for the whole run. Darwin tests must still select the Darwin path.
 - Keep `HERDR_BIN=/nonexistent/herdr` in `PromptSubmissionTests`' cleared environment. Its fake pane calls do not need herdr on `PATH`.
+- Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
 
 Run the nine suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
 
