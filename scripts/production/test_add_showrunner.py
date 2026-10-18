@@ -245,6 +245,8 @@ class AddShowrunnerTests(unittest.TestCase):
         }
         responses[f"--session {slug} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        responses[f"--session {slug} pane read w1:p1 --source visible"] = CommandResponse(
+            code=0, stdout="────────\n❯ \n────────")
         prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
         responses[f"--session {slug} agent prompt w1:p1 {prompt}"] = CommandResponse(
             code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{slug}"): ""})
@@ -340,10 +342,14 @@ class AddShowrunnerTests(unittest.TestCase):
         transcript.parent.mkdir(parents=True)
         text = f"/showrunner:produce {child.doc} resume"
         elapsed = 0.0
+        screen = "────────\n❯ \n────────"
 
         def advance(seconds: float) -> None:
             nonlocal elapsed
             elapsed += seconds
+
+        def visible(*_args: str) -> str:
+            return screen
 
         def turn(*, meta: bool) -> None:
             with transcript.open("a") as output:
@@ -352,11 +358,15 @@ class AddShowrunnerTests(unittest.TestCase):
                     "message": {"role": "user", "content": text}}) + "\n")
 
         def typed(_client: herdr.Herdr, pane: str, prompt: str) -> None:
+            nonlocal screen
             self.assertEqual((pane, prompt), ("destination:p1", text))
+            screen = f"────────\n❯ {text}\n────────"
             turn(meta=True)
 
         def enter(_client: herdr.Herdr, pane: str, *keys: str) -> None:
+            nonlocal screen
             self.assertEqual((pane, keys), ("destination:p1", ("Enter",)))
+            screen = "────────\n❯ \n────────"
             turn(meta=False)
 
         with (patch.object(runtime, "shared_session", return_value="agents"),
@@ -367,7 +377,7 @@ class AddShowrunnerTests(unittest.TestCase):
               patch.object(runtime.Herdr, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
               patch.object(runtime.Herdr, "readiness", return_value={"agent_status": "idle", "interactive_ready": True}) as readiness,
               patch.object(runtime.Herdr, "prompt", autospec=True, side_effect=typed) as prompt,
-              patch.object(runtime.Herdr, "run", return_value=f"────────\n❯ {text}\n────────"),
+              patch.object(runtime.Herdr, "run", side_effect=visible),
               patch.object(runtime.Herdr, "send_keys", autospec=True, side_effect=enter) as keys):
             outcome = add_showrunner.launch(child, "opus", "high", "resumed-id", self.root, selected)
         self.assertIsInstance(outcome, runtime.PromptSubmitted)

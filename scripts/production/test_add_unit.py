@@ -394,6 +394,8 @@ class AddUnitTests(ShutdownTestCase):
             screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
             responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
                 code=0, stdout=screen)
+            responses[f"--session {name} pane read w1:p1 --source visible"] = CommandResponse(
+                code=0, stdout="────────\n❯ \n────────")
             process = self.root / "proc/102"
             server = self.root / "proc/101"
             if sessions and not any(session["name"] == name for session in sessions):
