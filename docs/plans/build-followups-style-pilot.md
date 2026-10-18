@@ -765,7 +765,7 @@ demand.
   the five values from each batch, and a root-crate batch takes the
   repository name. After the fix merges, the same writer fills the open
   issues in one vault commit. The showrunner approved the fix and the backfill.
-- **Fix AI — style tools read the pushed branch point, not the local one** (pending):
+- **Fix AI — style tools read the pushed branch point, not the local one** (commit `4253334f`):
   refill, reconcile and the hand-off merge check read the local `main` ref.
   The checkouts share one repository, so that ref holds the parent's merge
   while its gate runs. On 2026-10-18 at 07:01Z, the parent merged hand-off
@@ -775,9 +775,21 @@ demand.
   `a779ebde`, then reached main beside it. The trees are equal, so no code is
   wrong, but main holds two merges of one hand-off. The showrunner approved the fix and keeps the merge already on
   main, because the trees are equal.
+- **Fix AJ — style proposals read the crate layout once per run** (commit `6b246818`):
+  the filer and the ranker read the crate layout again for each finding, at
+  3.7 seconds a read on cargo-liner. The backfill over about 4,000 held
+  findings would have taken about four hours. Each run now reads the layout
+  and the held findings once. With the fix, the backfill dry run took 19
+  seconds. The showrunner approved the fix.
+- **Ranking backfill:** on 2026-10-18, the ranker filled all 279 open style
+  issues in the vault and skipped none. Only the empty `Proposed ranking:`
+  lines changed, and one empty root title became `# Style restructure:
+  cargo-liner`. No vault commit was made: no style issue was ever committed,
+  so a commit would add all 279 files for the first time. The showrunner
+  chose to leave them untracked, as the rest of the folder is.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`, fix AH as `053fa900`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`, fix AH as `053fa900`, fix AI as `050815fb`.
 Live verification of the fixes and subsequent measurements remain pending.

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import tomllib
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -18,6 +19,7 @@ from typing import cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
+import coverage_report
 import rules
 import style_ledger
 from add_style import StandingStyleProduction, standing_style_production
@@ -56,8 +58,12 @@ def approved_issue(folder: Path, unit: str, ledger: style_ledger.Ledger) -> Issu
 
 
 def issue_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
-    ids = frontmatter(issue).get("style_findings", [])
     by_id = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+    return _issue_findings(by_id, issue)
+
+
+def _issue_findings(by_id: Mapping[str, style_ledger.HeldFinding], issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
+    ids = frontmatter(issue).get("style_findings", [])
     if not ids or any(finding_id not in by_id for finding_id in ids):
         raise style_ledger.LedgerError(f"{issue}: unknown or absent style_findings")
     return tuple(by_id[finding_id] for finding_id in ids)
@@ -76,9 +82,15 @@ def style_slug(repo: Path) -> str:
 
 
 def crate_for(ledger: style_ledger.Ledger, path: str) -> str:
+    return _crate_for(_workspace_directories(ledger), path)
+
+
+def _workspace_directories(ledger: style_ledger.Ledger) -> tuple[str, ...]:
+    return tuple(member.directory for member in coverage_report.workspace(ledger, ledger.summary().synced_tip))
+
+
+def _crate_for(directories: tuple[str, ...], path: str) -> str:
     # A finding names a site even when its coverage cell is the enclosing crate.
-    from coverage_report import workspace
-    directories = [member.directory for member in workspace(ledger, ledger.summary().synced_tip)]
     return next((directory for directory in sorted(directories, key=len, reverse=True)
                  if path == directory or path.startswith(directory + "/")), ".")
 
@@ -128,6 +140,7 @@ def proposal_kind(finding: style_ledger.HeldFinding, definition: rules.Rule) -> 
 
 def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> tuple[Path, ...]:
     definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
+    directories = _workspace_directories(ledger)
     waiting = ledger.held_findings(style_ledger.UnfiledFindingsFromOpenTickets())
     open_ticket_counts: dict[str, int] = defaultdict(int)
     for finding in waiting:
@@ -158,7 +171,7 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     for finding in valid:
         definition = definitions[finding.rule.removesuffix("#uncovered")]
         kind = proposal_kind(finding, definition)
-        crate = crate_for(ledger, finding.path)
+        crate = _crate_for(directories, finding.path)
         batches[(kind, "" if kind == "restructure" else finding.rule, crate)].append(finding)
     if not batches:
         return ()
@@ -196,10 +209,12 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
 
 def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
     definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
+    directories = _workspace_directories(ledger)
+    by_id = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
     ranked = 0
     for issue in open_issues(proposals, "style"):
         try:
-            findings = issue_findings(ledger, issue.path)
+            findings = _issue_findings(by_id, issue.path)
             kinds: set[style_ledger.FindingKind] = set()
             crates: set[str] = set()
             for finding in findings:
@@ -207,7 +222,7 @@ def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
                 if rule not in definitions:
                     raise style_ledger.LedgerError(f"unknown rule {rule}")
                 kinds.add(proposal_kind(finding, definitions[rule]))
-                crates.add(crate_for(ledger, finding.path))
+                crates.add(_crate_for(directories, finding.path))
             if len(kinds) != 1 or len(crates) != 1:
                 raise style_ledger.LedgerError("findings do not form one proposal batch")
             kind: style_ledger.FindingKind = next(iter(kinds))
