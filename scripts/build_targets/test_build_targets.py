@@ -728,6 +728,39 @@ class WaitLocalTests(IsolatedTargetTest):
                     10, "natedev is held by hana for render checks; launch after the release.\n", "",
                 ))
 
+    def verify_calls(self, session_id: str) -> tuple[int, int, int]:
+        """register-local, check-admission and wait-local, in verify.sh's order, as `session_id`."""
+        with mock.patch.dict(os.environ, {"HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": session_id}), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return (build_targets.command_register_local("call-a", pid=12345),
+                    build_targets.command_check_admission("call-a"),
+                    build_targets.command_wait_local("call-a", pid=12345))
+
+    def test_holder_session_verify_passes_its_own_hold_without_queueing(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("The holder must not wait")), \
+             mock.patch.object(build_hold, "register_wait", wraps=build_hold.register_wait) as register:
+            self.assertEqual(self.verify_calls("holder-session"), (0, 0, 0))
+        register.assert_not_called()
+        self.assertFalse((self.root / "registration").exists())
+        self.assertEqual([path.name for path in self.holders.iterdir()], ["holder-session"])
+
+    def test_holder_session_verify_waits_while_another_hold_is_in_force(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
+                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+
+        def other_releases(_seconds: float) -> None:
+            self.sleeps += 1
+            build_hold.holder_path(self.holders, "other-session").unlink()
+
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=other_releases):
+            self.assertEqual(self.verify_calls("holder-session"), (10, 10, 0))
+        self.assertEqual(self.sleeps, 1)
+        self.assertEqual(json.loads((self.root / "registration").read_text())["key"], "holder-session")
+
     def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
         self.begin_hold()
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Registration must return")):

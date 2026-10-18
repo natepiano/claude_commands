@@ -526,5 +526,19 @@ raise SystemExit(1)
             self.assertEqual(showrunners.highest_running([]), [])
 
 
+
+class HerdrNameTests(unittest.TestCase):
+    def test_workspace_is_named_for_the_showrunner_and_tabs_drop_the_production_prefix(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        named, unnamed = root / "prod-production.md", root / "other-production.md"
+        _ = named.write_text("# Prod\n\n- **Showrunner checkout:** `/repo`\n- **Showrunner session:** boss\n")
+        _ = unnamed.write_text("# Other\n")
+        self.assertEqual(showrunners.herdr_space("prod", str(named)), "boss")
+        self.assertEqual(showrunners.herdr_space("other", str(unnamed)), "other")
+        self.assertEqual(showrunners.herdr_space("gone", str(root / "gone-production.md")), "gone")
+        self.assertEqual(showrunners.tab_title("prod", "prod-alpha"), "alpha")
+        self.assertEqual(showrunners.tab_title("prod", "prod"), "prod")
+        self.assertEqual(showrunners.tab_title("prod", "boss"), "boss")
+
 if __name__ == "__main__":
     _ = unittest.main()

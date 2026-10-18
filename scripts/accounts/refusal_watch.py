@@ -58,6 +58,10 @@ class ShutdownProgressReader(Protocol):
     def shutdown_in_progress(self, saved: record.SessionShutdown) -> bool: ...
 
 
+class RestartRecordLiveness(Protocol):
+    def restart_failed_session_running(self, saved: record.SessionShutdown) -> bool: ...
+
+
 @dataclass(frozen=True)
 class ContinuationDelivered:
     """The live owner accepted its continuation after the quota wait."""
@@ -134,6 +138,8 @@ class HoldStartedDocument(TypedDict):
     at: str
     move_id: str
     percent: float
+    minutes: NotRequired[float]
+    source: NotRequired[dict[str, object]]
 
 
 class WatchStateDocument(TypedDict):
@@ -144,21 +150,43 @@ class WatchStateDocument(TypedDict):
 
 
 @dataclass(frozen=True)
+class LegacyHoldDuration:
+    """A pre-duration hold still uses its entry's fixed minutes."""
+
+
+@dataclass(frozen=True)
+class GroupSelection:
+    account: str | accounts.GroupNotConfigured
+    move_id: str | accounts.NoGroupTransition
+
+
+def _group_selection(selected: accounts.GroupAccounts, group: accounts.ClaudeGroup) -> GroupSelection:
+    transition = accounts.group_transition(group)
+    return GroupSelection(accounts.group_label(selected, group),
+                          transition.move_id if isinstance(transition, accounts.GroupTransition) else transition)
+
+
+@dataclass(frozen=True)
 class HoldStarted:
     account: str
     at: datetime
     move_id: str | accounts.NoGroupTransition
     percent: float
+    duration: next_moves.ResolvedHold | LegacyHoldDuration = LegacyHoldDuration()
 
     def __post_init__(self) -> None:
         if self.at.utcoffset() is None:
             raise ValueError("hold start needs a zone")
 
+    def is_current(self, selection: GroupSelection, percent: float) -> bool:
+        return (self.account == selection.account and self.move_id == selection.move_id
+                and self.percent == percent)
+
 
 @dataclass(frozen=True)
 class LeftAtMost:
     percent: float
-    hold_minutes: float = 0
+    hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
 
 
 @dataclass(frozen=True)
@@ -177,7 +205,7 @@ class UnreadableNextMoveLog:
 def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
     try:
         return tuple(AutoMoveRule(entry.id, entry.group, entry.to,
-                                  LeftAtMost(entry.at_percent, entry.hold_minutes))
+                                  LeftAtMost(entry.at_percent, entry.hold_mode))
                      for entry in next_moves.read_next_moves() if isinstance(entry, next_moves.ClaudeGroupMove))
     except next_moves.NextMoveError as error:
         return (UnreadableNextMoveLog(str(error)),)
@@ -244,11 +272,45 @@ def _load_state() -> WatchState:
                     and 0 <= percent <= 100 and math.isfinite(percent)):
                 try:
                     holds[name] = HoldStarted(label, datetime.fromisoformat(at),
-                                             move_id if move_id else accounts.NoGroupTransition(), float(percent))
+                                             move_id if move_id else accounts.NoGroupTransition(), float(percent),
+                                             _decode_hold_duration(fields))
                 except ValueError:
                     continue
         result["auto_move_holds"] = holds
     return result
+
+
+def _decode_hold_duration(fields: dict[str, object]) -> next_moves.ResolvedHold | LegacyHoldDuration:
+    if "minutes" not in fields:
+        return LegacyHoldDuration()
+    minutes, source = fields.get("minutes"), fields.get("source")
+    if (not isinstance(minutes, (int, float)) or isinstance(minutes, bool)
+            or minutes < 0 or not math.isfinite(minutes) or not isinstance(source, dict)):
+        raise ValueError("invalid hold duration")
+    details = cast(dict[str, object], source)
+    kind = details.get("kind")
+    if kind == "fixed":
+        return next_moves.ResolvedHold(float(minutes), next_moves.FixedHold(float(minutes)))
+    if kind == "no usable pace":
+        return next_moves.ResolvedHold(float(minutes), next_moves.NoUsablePace())
+    pace = details.get("points_per_hour")
+    if (kind == "pace" and isinstance(pace, (int, float)) and not isinstance(pace, bool)
+            and pace > 0 and math.isfinite(pace)):
+        return next_moves.ResolvedHold(float(minutes), next_moves.PaceEstimate(float(pace)))
+    raise ValueError("invalid hold source")
+
+
+def _hold_document(hold: HoldStarted) -> HoldStartedDocument:
+    document = HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
+                                   move_id=hold.move_id if isinstance(hold.move_id, str) else "", percent=hold.percent)
+    if isinstance(hold.duration, next_moves.ResolvedHold):
+        document["minutes"] = hold.duration.minutes
+        source = hold.duration.source
+        document["source"] = ({"kind": "pace", "points_per_hour": source.points_per_hour}
+                              if isinstance(source, next_moves.PaceEstimate) else
+                              {"kind": "no usable pace"} if isinstance(source, next_moves.NoUsablePace)
+                              else {"kind": "fixed"})
+    return document
 
 
 def _state_document(state: WatchState) -> WatchStateDocument:
@@ -257,9 +319,7 @@ def _state_document(state: WatchState) -> WatchStateDocument:
         document["auto_move_notices"] = state["auto_move_notices"]
     if "auto_move_holds" in state:
         document["auto_move_holds"] = {
-            name: HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
-                                     move_id=hold.move_id if isinstance(hold.move_id, str) else "",
-                                     percent=hold.percent)
+            name: _hold_document(hold)
             for name, hold in state["auto_move_holds"].items()
         }
     return document
@@ -267,6 +327,35 @@ def _state_document(state: WatchState) -> WatchStateDocument:
 
 def _save_state(state: WatchState) -> None:
     _atomic_json(state_root() / "refusal_watch.json", _state_document(state))
+
+
+def started_next_move_holds(entries: tuple[next_moves.NextMove, ...]) -> dict[str, next_moves.StartedHold] | next_moves.WatchStateUnreadable:
+    """Read current heads' resolved holds without reacquiring the editor's watch lock."""
+    if not entries:
+        return {}
+    try:
+        state = _load_state()
+    except (OSError, ValueError, OverflowError):
+        return next_moves.WatchStateUnreadable()
+    holds = state.get("auto_move_holds", {})
+    if not holds:
+        return {}
+    selected = accounts.group_accounts()
+    heads: set[accounts.ClaudeGroup] = set()
+    started: dict[str, next_moves.StartedHold] = {}
+    for entry in entries:
+        if not isinstance(entry, next_moves.ClaudeGroupMove) or entry.group in heads:
+            continue
+        heads.add(entry.group)
+        if isinstance(entry.hold_mode, next_moves.FixedHold) and entry.hold_mode.minutes == 0:
+            continue
+        hold = holds.get(entry.id)
+        if hold is None or not isinstance(hold.duration, next_moves.ResolvedHold):
+            continue
+        selection = _group_selection(selected, entry.group)
+        if hold.is_current(selection, entry.at_percent):
+            started[entry.id] = next_moves.StartedHold(hold.at, hold.duration)
+    return started
 
 
 @contextmanager
@@ -279,20 +368,46 @@ def _watch_lock() -> Generator[None]:
         yield
 
 
+@dataclass(frozen=True)
+class LockedNextMoveEdit:
+    """An edit whose watch and log locks remain held through cleanup and commit."""
+
+    before: tuple[next_moves.NextMove, ...]
+
+    def commit(self, entries: tuple[next_moves.NextMove, ...]) -> None:
+        heads: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in self.before:
+            _ = heads.setdefault(entry.group, entry.id)
+        new_heads: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in entries:
+            _ = new_heads.setdefault(entry.group, entry.id)
+        discarded = {entry.id for entry in self.before} - {entry.id for entry in entries}
+        discarded.update(entry_id for group, entry_id in heads.items() if new_heads.get(group) != entry_id)
+        prior_modes = {entry.id: entry.hold_mode for entry in self.before if isinstance(entry, next_moves.ClaudeGroupMove)}
+        changed_modes = {entry.id for entry in entries if isinstance(entry, next_moves.ClaudeGroupMove)
+                         and entry.id in prior_modes and prior_modes[entry.id] != entry.hold_mode}
+        if discarded or changed_modes:
+            state = _load_state()
+            original = deepcopy(state)
+            for entry_id in discarded | changed_modes:
+                _ = state.get("auto_move_holds", {}).pop(entry_id, None)
+            for entry_id in discarded:
+                _ = state.get("auto_move_notices", {}).pop(entry_id, None)
+            if state != original:
+                _save_state(state)
+            if discarded:
+                import quota_alert
+                with quota_alert.state_file() as quota_state:
+                    for entry_id in discarded:
+                        _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
+        next_moves.write_next_moves(entries)
+
+
 @contextmanager
-def removing_next_move(entry_id: str) -> Generator[None]:
-    """Hold the watcher lock before the log lock, then discard the removed hold."""
-    with _watch_lock():
-        yield
-        state = _load_state()
-        holds = state.get("auto_move_holds", {})
-        removed_hold = holds.pop(entry_id, None)
-        removed_notice = state.get("auto_move_notices", {}).pop(entry_id, None)
-        if removed_hold is not None or removed_notice is not None:
-            _save_state(state)
-        import quota_alert
-        with quota_alert.state_file() as quota_state:
-            _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
+def editing_next_moves() -> Generator[LockedNextMoveEdit]:
+    """Resolve edits under watch then log locks; cleanup must precede the log write."""
+    with _watch_lock(), next_moves.next_moves_lock():
+        yield LockedNextMoveEdit(next_moves.read_next_moves())
 
 
 class TranscriptEntry(TypedDict, total=False):
@@ -538,7 +653,9 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     # An unreadable queue cannot prove a group has nothing next.
     pending_groups = (set(accounts.CLAUDE_GROUPS) if any(isinstance(rule, UnreadableNextMoveLog) for rule in configured)
                       else {rule.group for rule in configured if isinstance(rule, AutoMoveRule)})
-    open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
+    restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
+    open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()
+                if not restart.restart_failed_session_running(saved)}
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
     for entry in entries:
@@ -915,18 +1032,15 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
     moved = set(moved_groups)
     held_refusals = refusals.load()
     for rule in rules:
-        source_label = accounts.group_label(selected, rule.group)
-        transition = accounts.group_transition(rule.group)
-        selection_id = transition.move_id if isinstance(transition, accounts.GroupTransition) else transition
+        selection = _group_selection(selected, rule.group)
         hold = holds.get(rule.entry_id)
-        if hold is not None and (hold.account != source_label or hold.move_id != selection_id
-                                 or hold.percent != rule.when.percent):
+        if hold is not None and not hold.is_current(selection, rule.when.percent):
             del holds[rule.entry_id]
-        if (isinstance(source_label, accounts.GroupNotConfigured)
+        if (isinstance(selection.account, accounts.GroupNotConfigured)
                 or rule.group in moved or rule.group in in_flight):
             continue
         try:
-            source_identity = accounts.account_identity(accounts.claude_account_dir(source_label))
+            source_identity = accounts.account_identity(accounts.claude_account_dir(selection.account))
         except accounts.AccountsError:
             continue
         if not isinstance(source_identity, agent_accounts.NumberedAccount):
@@ -937,13 +1051,21 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         if source.weekly.left > rule.when.percent:
             _ = holds.pop(rule.entry_id, None)
             continue
-        if rule.when.hold_minutes > 0:
+        if isinstance(rule.when.hold_mode, next_moves.HalfPointHold) or rule.when.hold_mode.minutes > 0:
             if rule.entry_id not in holds:
-                holds[rule.entry_id] = HoldStarted(source_label, now, selection_id, rule.when.percent)
+                holds[rule.entry_id] = HoldStarted(selection.account, now, selection.move_id, rule.when.percent,
+                                                  next_moves.resolve_hold(rule.when.hold_mode, selection.account, now))
                 state["auto_move_holds"] = holds
-            if (now - holds[rule.entry_id].at).total_seconds() / 60 < rule.when.hold_minutes:
+            started = holds[rule.entry_id]
+            if isinstance(started.duration, LegacyHoldDuration):
+                started = HoldStarted(started.account, started.at, started.move_id, started.percent,
+                                      next_moves.resolve_hold(rule.when.hold_mode, selection.account, now))
+                holds[rule.entry_id] = started
+                state["auto_move_holds"] = holds
+            if (isinstance(started.duration, next_moves.ResolvedHold)
+                    and (now - started.at).total_seconds() / 60 < started.duration.minutes):
                 continue
-        if source_label == rule.to:
+        if selection.account == rule.to:
             lines.append(_record_blocked_head(state, rule, TargetIsCurrentAccount(), now, dry_run))
             continue
         try:
@@ -976,7 +1098,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             continue
         _ = notices.pop(rule.entry_id, None)
         why = f"auto: {rule.entry_id}"
-        lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {source_label} to {rule.to}")
+        lines.append(f"{rule.group}: {why}; {'would move' if dry_run else 'move'} from {selection.account} to {rule.to}")
         moved.add(rule.group)
         if dry_run:
             continue

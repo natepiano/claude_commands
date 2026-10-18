@@ -38,7 +38,9 @@ Run these steps in order for each completed loop or verbose phase:
    inserted next under `/plan:to_phased_plan` → <PhaseNumbering/> and runs next.
    A source-comment edit made by the review stays in the tree for the next
    phase's checkpoint commit; with no todo phase left, <FinalGateCommit/>
-   carries it.
+   carries it. The review launches with `--phase <id>`, which needs the phase
+   open: its `finish-phase` in step 5 waits until this review has finished,
+   also beside a running phase.
 4. **Add-on check.** Run <ConsiderNextItems/>.
 5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
    `remove_workers.py`, helpers, launchers, and apps. Run it before the next

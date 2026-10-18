@@ -13,7 +13,7 @@ already trusts, since a showrunner never answers Claude's folder-trust prompt.
 
 Exit 0 when the child is attached, or --check found nothing in the way; 1 when the prompt was sent
 but the showrunner did not appear or attach (the session is left running); 2 on a refusal;
-3 (SESSION_NOT_READY) when the session is open but not ready and its opening prompt was not sent.
+3 (SESSION_NOT_READY) when the session is open but its opening prompt was not proven submitted.
 """
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+from uuid import uuid4
 
 import showrunners
 from add_unit import Production, read_production
@@ -114,27 +115,30 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
         raise Refusal(str(error)) from error
 
 
-def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> None:
-    """Start Claude in the child's named herdr session and prompt it once."""
+def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> herdr.PromptSubmitOutcome:
+    """Start once and prove the opening prompt reached this showrunner's transcript."""
     from scripts.whoami.account import named_account_environment
 
     prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
     arguments = ["--model", model, "--effort", effort]
-    if resume:
-        arguments.extend(["--resume", resume])
+    session_id = resume or str(uuid4())
+    arguments.extend(["--resume" if resume else "--session-id", session_id])
     arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
     environment = {"ENABLE_TOOL_SEARCH": "true"}
     environment.update(named_account_environment(selected.dir))
     host = herdr.shared_session()
     if host:
         _ = herdr.start_server(host, 90_000)
-        pane = herdr.open_tab(host, child.slug, child.slug, str(cwd), environment)
+        pane = herdr.open_tab(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, child.slug,
+                              str(cwd), environment)
     else:
         host = child.slug
         herdr.start_new_server(host, 90_000)
         pane = herdr.open_pane(host, child.slug, str(cwd), environment)
-    herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
-                      opening=herdr.OpeningPrompt(prompt), timeout_ms=90_000)
+    outcome = herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
+        opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)), timeout_ms=90_000)
+    return (outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
+            else herdr.PromptNotSubmitted("launcher supplied no submit proof"))
 
 
 def showrunner_appeared(slug: str) -> bool:
@@ -191,7 +195,7 @@ def main(argv: list[str]) -> int:
         print(f"check: ok — would start {child.slug} in {where} and attach it to {caller}")
         return 0
     try:
-        launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected)
+        outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected)
     except herdr.SessionTaken as error:
         print(f"add_showrunner: {error}", file=sys.stderr)
         return 2
@@ -203,6 +207,9 @@ def main(argv: list[str]) -> int:
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
         print(f"add_showrunner: the session did not start: {detail}", file=sys.stderr)
         return 2
+    if isinstance(outcome, herdr.PromptNotSubmitted):
+        print(f"add_showrunner: {child.slug}: opening prompt not submitted: {outcome.reason}", file=sys.stderr)
+        return SESSION_NOT_READY
     print(f"started {child.slug}: herdr session attach {child.slug}")
     later = (f"Its session is still running: look at it with `herdr session attach {child.slug}`, then run "
              + f"`showrunners.py attach {child.slug} {caller}` once it has an update timer.")

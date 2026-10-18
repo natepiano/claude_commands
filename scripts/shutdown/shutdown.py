@@ -393,7 +393,10 @@ def _shutdown_record_lines(
             return [
                 line
                 for record in outcome["records"]
-                for line in settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation)
+                for line in (["  " + settle.running_restart_line(record)]
+                             if record["progress"]["kind"] == "restart failed"
+                             and isinstance(_restart_failed_liveness(record, observations), restart_work.SessionLive)
+                             else settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation))
             ]
         case "unreachable":
             return [
@@ -668,7 +671,18 @@ def _remote_conductor_status(login: str) -> ConductorRunning | ConductorNotRunni
         return ConductorUnavailable(str(error))
 
 
-def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning | ConductorNotRunning | ConductorUnavailable) -> list[str]:
+def _restart_failed_liveness(saved: SessionShutdown, observations: tuple[Inventory, ...] = ()) -> restart_work.SessionLive | restart_work.SessionNotLive | restart_work.SessionLivenessUnknown:
+    if saved["machine"].casefold() == settle.local_machine().casefold():
+        return restart_work.restart_failed_liveness(saved)
+    for report in observations:
+        if report["machine"].casefold() == saved["machine"].casefold():
+            if any(owner["session_id"] == saved["session"]["session_id"] for owner in report["sessions"]):
+                return restart_work.SessionLive()
+    return restart_work.SessionLivenessUnknown(f"session liveness not confirmed on {saved['machine']}")
+
+
+def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning | ConductorNotRunning | ConductorUnavailable,
+                    observations: tuple[Inventory, ...] = ()) -> list[str]:
     lines: list[str] = []
     take_out: list[SessionShutdown] = []
     stop_now: list[SessionShutdown] = []
@@ -684,6 +698,12 @@ def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning 
             lines.append(f"  conductor ownership unavailable: {ownership.reason}")
     for saved in records:
         progress = saved["progress"]["kind"]
+        if progress == "restart failed":
+            observed = _restart_failed_liveness(saved, observations)
+            if isinstance(observed, restart_work.SessionLive):
+                continue
+            if isinstance(observed, restart_work.SessionLivenessUnknown):
+                lines.append(f"  {saved['session']['name']}: liveness unknown: {observed.reason}")
         if progress in {"waiting", "ready", "held by usage limit", "reaping"}:
             take_out.append(saved)
             stop_now.append(saved)
@@ -746,6 +766,13 @@ def _follow_action(saved: SessionShutdown) -> str:
     progress = saved["progress"]
     kind = progress["kind"]
     place = f"in a terminal on {saved['machine']}"
+    liveness_reason = ""
+    if kind == "restart failed":
+        observed = _restart_failed_liveness(saved)
+        if isinstance(observed, restart_work.SessionLive):
+            return settle.running_restart_line(saved)
+        if isinstance(observed, restart_work.SessionLivenessUnknown):
+            liveness_reason = f"; liveness unknown: {observed.reason}"
     if progress["kind"] == "manual restart":
         return f"{saved['session']['name']}: {place}: {progress['command']}"
     verb = "now" if kind in {"stop failed", "waiting", "stopped", "already gone"} else "restart"
@@ -754,7 +781,7 @@ def _follow_action(saved: SessionShutdown) -> str:
         return f"{saved['session']['name']}: process identity lost; inspect its window before restarting; {place}: {command}"
     if kind == "waiting":
         return settle.holdout_line(saved)
-    return f"{saved['session']['name']}: {kind}; {place}: {command}"
+    return f"{saved['session']['name']}: {kind}{liveness_reason}; {place}: {command}"
 
 
 def follow(login: str, request_id: str) -> int:
@@ -1310,7 +1337,7 @@ def _dispatch(options: CommandLine) -> int:
                 if outcome["kind"] == "records":
                     waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} for saved in outcome["records"])
                     ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
-                    record_lines.extend(_status_actions(outcome["records"], ownership))
+                    record_lines.extend(_status_actions(outcome["records"], ownership, observations))
                 if record_lines:
                     print("\n".join(record_lines))
                 if index == 0:

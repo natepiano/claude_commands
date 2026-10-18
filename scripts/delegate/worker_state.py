@@ -84,6 +84,22 @@ def worker_record_path(run: Path, name: str, slot: str) -> Path:
     return run / f"impl_worker_{key}.json"
 
 
+def worker_slot(run: Path, name: str) -> str | None:
+    """The team role the named worker's durable identity was recorded under; None when no record names it."""
+    for path in sorted(run.glob("impl_worker_*.json")):
+        try:
+            value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        record = cast(WorkerLaunchRecord, cast(object, value))
+        slot = record.get("slot")
+        if record.get("name") == name and isinstance(slot, str) and slot:
+            return slot
+    return None
+
+
 def _rekey_record(run: Path, path: Path) -> None:
     """Move a repair worker's record out of the slot file an earlier launcher wrote it to."""
     try:

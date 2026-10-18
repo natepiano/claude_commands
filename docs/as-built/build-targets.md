@@ -23,7 +23,7 @@ Each machine that can run a build job is a build target with its own rules. nate
 
 ### The target command: `scripts/build_targets/build_targets.py`
 
-Every command decides "held" through `target_state` and reads admission through `build_hold.read_admission`. Exits: 0 free or admitted, 10 held and the call still needs its turn, 12 hold state unreadable (with `verify.sh: natedev's hold state cannot be read (<reason>); not starting.`), 2 a usage or config error.
+Every command decides "held" through `target_state` and reads admission through `build_hold.read_admission`. `check-local`, `check-admission`, `register-local` and `wait-local` admit the session whose hold file is the only hold in force on natedev (`caller_holds_only_own`, the owner lookup of `build_hold.owning_session`): a holder's own launches and `verify.sh` calls run under its hold and never queue behind it, while a hold another session also has in force still makes them wait. Exits: 0 free or admitted, 10 held and the call still needs its turn, 12 hold state unreadable (with `verify.sh: natedev's hold state cannot be read (<reason>); not starting.`), 2 a usage or config error.
 
 | Command | Role |
 | --- | --- |

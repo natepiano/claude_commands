@@ -29,7 +29,7 @@ from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts, next_moves, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -37,6 +37,10 @@ from scripts.accounts import moves, worker_names
 import account
 import agent_accounts
 import usage_store
+import quota_alert
+from scripts.whoami import run_out
+
+send_role_map_command = role_map.ssh_role_map
 
 
 def stored_group_labels(path: Path) -> dict[str, str]:
@@ -150,6 +154,8 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(patch.dict(os.environ, environment, clear=True)),
         )
         del environment_context
+        _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
+        _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
         self.live = {}
         self.live_reads = self.enterContext(patch.object(agent_accounts, "claude_live", side_effect=self.live_report))
         self.codex_reads = cast(AsyncMock, self.enterContext(patch.object(
@@ -2730,16 +2736,510 @@ class AccountsTests(unittest.TestCase):
         assert isinstance(entries[0], next_moves.ClaudeGroupMove)
         self.assertEqual((entries[0].group, entries[0].at_percent, entries[0].hold_minutes, entries[0].to),
                          ("units", 1, 5, "claude2"))
-        self.assertIn(entries[0].id, output)
-        self.assertIn("when units reach 1% → claude2", output)
+        self.assertNotIn(entries[0].id, output)
+        self.assertIn("units 1:", output)
+        self.assertIn("→ claude2", output)
         code, listed, error = self.run_cli("next", "list")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(listed, output)
-        code, _, error = self.run_cli("next", "remove", entries[0].id)
+        code, _, error = self.run_cli("next", "remove", "units", "1")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(next_moves.read_next_moves(), ())
         code, output, error = self.run_cli("next", "list")
         self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
+
+    def test_next_list_numbers_each_group_in_display_order_without_exposing_ids(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        units = next_moves.add_next_move("units", 1, "claude2", 40)
+        worker = next_moves.add_next_move("workers", 0, "claude")
+        runner = next_moves.add_next_move("showrunners", 2, "claude2")
+        second = next_moves.add_next_move("units", 3, "claude3")
+        with next_moves.next_moves_lock():
+            next_moves.write_next_moves((units, worker, runner, second))
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        lines = [line for line in output.splitlines() if "→" in line]
+        self.assertEqual([line.split(":", 1)[0] for line in lines],
+                         ["showrunners 1", "units 1", "units 2", "workers 1"])
+        for entry in (units, worker, runner, second):
+            self.assertNotIn(entry.id, output)
+        self.assertIn("hold 40", lines[1])
+        self.assertEqual(next_moves.read_next_moves(), (units, worker, runner, second))
+
+    def test_next_half_point_add_and_hold_update_preserve_ids_order_and_fixed_minutes(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        code, output, error = self.run_cli("next", "add", "units", "1", "claude2", "--hold", "half-point")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("hold half a point", output)
+        first, = next_moves.read_next_moves()
+        worker = next_moves.add_next_move("workers", 0, "claude")
+        second = next_moves.add_next_move("units", 2, "claude3", 7)
+        with next_moves.next_moves_lock():
+            next_moves.write_next_moves((first, worker, second))
+        code, output, error = self.run_cli("next", "hold", "units", "1", "12", "--expect", "1", "claude2")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("units 1: at 1% → claude2, hold 12 min", output)
+        changed, saved_worker, saved_second = next_moves.read_next_moves()
+        self.assertEqual((changed.id, changed.added_at, changed.at_percent),
+                         (first.id, first.added_at, first.at_percent))
+        self.assertEqual((saved_worker, saved_second), (worker, second))
+        code, output, error = self.run_cli("next", "hold", "units", "1", "half-point")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("units 1: at 1% → claude2, hold half a point", output)
+        self.assertEqual(next_moves.read_next_moves(), (first, worker, second))
+
+    def test_mac_half_point_add_and_hold_resolve_positions_on_the_host(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        first = next_moves.add_next_move("units", 1, "claude2", 5)
+        second = next_moves.add_next_move("units", 2, "claude3", 7)
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            self.assertNotEqual(arguments[0], "next-read")
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            if code:
+                raise role_map.RemoteCommandRefused(error.strip())
+            self.assertEqual(error, "")
+            return output
+
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote)):
+            code, output, error = self.run_cli("next", "hold", "units", "2", "half-point",
+                                              "--expect", "2", "claude3")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("units 2: at 2% → claude3, hold half a point", output)
+            code, output, error = self.run_cli("next", "add", "units", "3", "claude2",
+                                              "--hold", "half-point", "--at", "2")
+            self.assertEqual((code, error), (0, ""))
+        self.assertEqual(requests[0][:6], ("next", "hold", "units", "2", "half-point", "--expect"))
+        self.assertEqual(float(requests[0][6]), 2)
+        self.assertEqual(requests[0][7:], ("claude3",))
+        self.assertEqual(requests[1][0], "next-write")
+        self.assertEqual(requests[1][2:], ("--at", "2"))
+        entries = next_moves.read_next_moves()
+        self.assertEqual((entries[0], entries[2].id), (first, second.id))
+        self.assertIn("hold half a point", next_moves.render_next_move(entries[1]))
+        self.assertIn("hold half a point", next_moves.render_next_move(entries[2]))
+
+    def test_empty_list_does_not_read_corrupt_watch_state_locally_or_through_the_mac(self) -> None:
+        state_path = refusal_watch.state_root() / "refusal_watch.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        _ = state_path.write_text("{")
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            return output
+
+        for mac_client in (False, True):
+            with (self.subTest(mac_client=mac_client),
+                  patch.object(role_map, "is_role_map_host", return_value=not mac_client),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote),
+                  patch.object(refusal_watch, "_load_state", side_effect=AssertionError("empty list read watch state")) as read):
+                self.assertEqual(self.run_cli("next", "list"), (0, "nothing set up\n", ""))
+                read.assert_not_called()
+        self.assertEqual(requests, [("next", "list")])
+        self.assertEqual(state_path.read_text(), "{")
+
+    def test_corrupt_started_hold_state_lists_estimates_and_one_notice_on_both_machines(self) -> None:
+        self.login_directory("claude1", "source@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude1"}))
+        at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        head = next_moves.add_next_move("units", 1, "claude2", next_moves.HalfPointHold())
+        _ = next_moves.add_next_move("units", 2, "claude3", next_moves.HalfPointHold())
+        held = refusal_watch.HoldStarted("claude1", at, accounts.NoGroupTransition(), 1,
+            next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.9)))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={head.id: held}))
+        notice = "started holds not shown: watch state unreadable"
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            return output
+
+        with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22)),
+              patch.object(accounts, "group_half_point_hold",
+                           return_value=next_moves.ResolvedHold(5, next_moves.PaceEstimate(6)))):
+            code, started, error = self.run_cli("next", "list")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("34 min at 0.9 points/hour, 12 min left", started)
+            state_path = refusal_watch.state_root() / "refusal_watch.json"
+            _ = state_path.write_text("{")
+            before_log = next_moves.next_moves_file().read_bytes()
+            expected = ("units 1: at 1% → claude2, hold half a point (≈5 min)\n"
+                        + "units 2: at 2% → claude3, hold half a point (≈5 min)\n"
+                        + notice + "\n")
+            for mac_client in (False, True):
+                with (self.subTest(mac_client=mac_client),
+                      patch.object(role_map, "is_role_map_host", return_value=not mac_client),
+                      patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                    code, listed, error = self.run_cli("next", "list")
+                    self.assertEqual((code, listed, error), (0, expected, ""))
+                    self.assertEqual(listed.count(notice), 1)
+                    self.assertEqual(state_path.read_text(), "{")
+                    self.assertEqual(next_moves.next_moves_file().read_bytes(), before_log)
+        self.assertEqual(requests, [("next", "list")])
+
+    def test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac(self) -> None:
+        self.login_directory("claude1", "source@example.invalid")
+        self.login_directory("claude2", "target@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude1"}))
+        at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        entry = next_moves.add_next_move("units", 1.234567, "claude2", next_moves.HalfPointHold())
+        held = refusal_watch.HoldStarted("claude1", at, accounts.NoGroupTransition(), entry.at_percent,
+            next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.9)))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={entry.id: held}))
+        before = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        expected = "units 1: at 1.234567% → claude2, hold half a point (34 min at 0.9 points/hour, 12 min left)\n"
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            if code:
+                raise role_map.RemoteCommandRefused(error.strip())
+            self.assertEqual(error, "")
+            return output
+
+        with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22, seconds=1)),
+              patch.object(run_out, "weighted_rate", side_effect=AssertionError("started row read fresh pace"))):
+            code, listed, error = self.run_cli("next", "list")
+            self.assertEqual((code, listed, error), (0, expected, ""))
+            code, added, error = self.run_cli("next", "add", "workers", "1", "claude")
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(added, expected + "\nworkers 1: at 1% → claude\n")
+            code, reply, error = self.run_cli("next", "hold", "units", "1", "half-point",
+                                              "--expect", "1.234567", "claude2")
+            self.assertEqual((code, reply, error), (0, expected, ""))
+            with (patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                code, mac_listed, error = self.run_cli("next", "list")
+                self.assertEqual((code, mac_listed, error), (0, added, ""))
+                code, mac_reply, error = self.run_cli("next", "hold", "units", "1", "half-point",
+                                                      "--expect", "1.234567", "claude2")
+                self.assertEqual((code, mac_reply, error), (0, expected, ""))
+            self.assertEqual(refusal_watch._load_state(), before)  # pyright: ignore[reportPrivateUsage]
+            code, changed, error = self.run_cli("next", "hold", "units", "1", "10")
+            self.assertEqual((code, changed, error), (0, "units 1: at 1.234567% → claude2, hold 10 min\n", ""))
+        self.assertEqual(requests, [("next", "list"),
+            ("next", "hold", "units", "1", "half-point", "--expect", "1.234567", "claude2")])
+        self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_listed_percent_guards_its_hold_update_locally_and_through_the_mac(self) -> None:
+        entry = next_moves.add_next_move("units", 1.234567, "claude2", 5)
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            if code:
+                raise role_map.RemoteCommandRefused(error.strip())
+            self.assertEqual(error, "")
+            return output
+
+        for mac_client, minutes in ((False, "12"), (True, "17")):
+            with (self.subTest(mac_client=mac_client),
+                  patch.object(role_map, "is_role_map_host", return_value=not mac_client),
+                  patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                code, listed, error = self.run_cli("next", "list")
+                self.assertEqual((code, error), (0, ""))
+                displayed = listed.split("at ", 1)[1].split("%", 1)[0]
+                self.assertEqual(displayed, "1.234567")
+                code, reply, error = self.run_cli("next", "hold", "units", "1", minutes,
+                                                 "--expect", displayed, "claude2")
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(reply, f"units 1: at {displayed}% → claude2, hold {minutes} min\n")
+            changed, = next_moves.read_next_moves()
+            assert isinstance(changed, next_moves.ClaudeGroupMove)
+            self.assertEqual((changed.id, changed.at_percent, changed.hold_mode),
+                             (entry.id, entry.at_percent, next_moves.FixedHold(float(minutes))))
+        self.assertEqual(requests, [("next", "list"),
+            ("next", "hold", "units", "1", "17.0", "--expect", "1.234567", "claude2")])
+
+    def test_mac_hold_preserves_fractional_minutes_and_checks_the_exact_expected_percent(self) -> None:
+        entry = next_moves.add_next_move("units", 1.234567, "claude2", 5)
+        requests: list[tuple[str, ...]] = []
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            requests.append(arguments)
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            if code:
+                raise role_map.RemoteCommandRefused(error.strip())
+            self.assertEqual(error, "")
+            return output
+
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote)):
+            code, output, error = self.run_cli("next", "hold", "units", "1", "10.1234567",
+                                              "--expect", "1.234567", "claude2")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("units 1:", output)
+        changed, = next_moves.read_next_moves()
+        assert isinstance(changed, next_moves.ClaudeGroupMove)
+        self.assertEqual((changed.id, changed.at_percent, changed.hold_mode),
+                         (entry.id, entry.at_percent, next_moves.FixedHold(10.1234567)))
+        self.assertEqual(requests, [("next", "hold", "units", "1", "10.1234567",
+                                     "--expect", "1.234567", "claude2")])
+        different = next_moves.ClaudeGroupMove(changed.id, changed.group, 1.23457,
+                                              changed.hold_mode, changed.to, changed.added_at)
+        with next_moves.next_moves_lock():
+            next_moves.write_next_moves((different,))
+        before = next_moves.next_moves_file().read_bytes()
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote)):
+            code, output, error = self.run_cli("next", "hold", "units", "1", "20.1234567",
+                                              "--expect", "1.234568", "claude2")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertIn("nothing changed", error)
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+        self.assertEqual(next_moves.read_next_moves(), (different,))
+        self.assertEqual(requests[-1], ("next", "hold", "units", "1", "20.1234567",
+                                        "--expect", "1.234568", "claude2"))
+
+    def test_mac_hold_refusal_is_verbatim_and_transport_failure_keeps_the_verb(self) -> None:
+        entry = next_moves.add_next_move("units", 1, "claude2", 5)
+        before = next_moves.next_moves_file().read_bytes()
+        refusal = "next: units has 1 entries; position 3 is out of range"
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            with patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli(*arguments)
+            self.assertNotEqual(code, 0)
+            self.assertEqual(output, "")
+            raise role_map.RemoteCommandRefused(error.strip())
+
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote)):
+            code, output, error = self.run_cli("next", "hold", "units", "3", "half-point")
+        self.assertNotEqual(code, 0)
+        self.assertEqual((output, error), ("", refusal + "\n"))
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture cannot connect"))):
+            code, output, error = self.run_cli("next", "hold", "units", "1", "half-point")
+        self.assertNotEqual(code, 0)
+        self.assertEqual((output, error), ("", "next: remote hold failed: fixture cannot connect\n"))
+        self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+
+    def test_workers_half_point_hold_is_refused_without_changing_the_queue(self) -> None:
+        entry = next_moves.add_next_move("workers", 1, "claude")
+        before = next_moves.next_moves_file().read_bytes()
+        for arguments in (("add", "workers", "1", "claude", "--hold", "half-point"),
+                          ("hold", "workers", "1", "half-point")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                self.assertIn("workers", error)
+                self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+                self.assertEqual(next_moves.read_next_moves(), (entry,))
+
+    def test_mac_lists_the_hosts_half_point_estimate_despite_different_local_pace(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        self.login_directory("claude3", "next-target@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude2"}))
+        code, _, error = self.run_cli("next", "add", "units", "1", "claude3", "--hold", "half-point")
+        self.assertEqual((code, error), (0, ""))
+        host_history, mac_history = self.root / "host-pace.jsonl", self.root / "mac-pace.jsonl"
+        at = datetime.now(timezone.utc)
+        clock = self.enterContext(patch.object(next_moves, "datetime", wraps=datetime))
+        cast(MagicMock, clock.now).return_value = at
+        for path, per_hour in ((host_history, 1), (mac_history, 6)):
+            _ = path.write_text("\n".join(json.dumps({"account": "claude2",
+                "at": (at - timedelta(minutes=180 - index * 10)).isoformat(),
+                "remaining": 10 - index * per_hour / 6}) for index in range(19)))
+        with patch.object(run_out, "READINGS_LOG", host_history):
+            code, host_output, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("hold half a point (≈", host_output)
+        with patch.object(run_out, "READINGS_LOG", mac_history):
+            code, local_estimate, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertNotEqual(local_estimate, host_output)
+
+        def remote(arguments: tuple[str, ...]) -> str:
+            self.assertEqual(arguments, ("next", "list"))
+            with (patch.object(role_map, "is_role_map_host", return_value=True),
+                  patch.object(run_out, "READINGS_LOG", host_history)):
+                code, output, error = self.run_cli(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            return output
+
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=remote) as transport,
+              patch.object(run_out, "READINGS_LOG", mac_history)):
+            code, mac_output, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(mac_output, host_output)
+        transport.assert_called_once()
+
+    def test_half_point_list_explains_the_default_when_history_is_missing(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude2"}))
+        with patch.object(run_out, "READINGS_LOG", self.root / "no-history"):
+            code, output, error = self.run_cli("next", "add", "units", "1", "claude2", "--hold", "half-point")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("hold half a point (40 min default: no pace history)", output)
+            code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(listed, output)
+
+    def test_next_cli_moves_removes_and_inserts_by_group_position_and_preserves_ids(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        first = next_moves.add_next_move("units", 1, "claude2")
+        worker = next_moves.add_next_move("workers", 0, "claude")
+        second = next_moves.add_next_move("units", 2, "claude3")
+        runner = next_moves.add_next_move("showrunners", 3, "claude2")
+        code, output, error = self.run_cli("next", "move", "units", "2", "1")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual([entry for entry in next_moves.read_next_moves() if entry.group == "units"],
+                         [second, first])
+        code, added, error = self.run_cli("next", "add", "units", "4", "claude2", "--at", "2")
+        self.assertEqual((code, error), (0, ""))
+        unit_entries = [entry for entry in next_moves.read_next_moves() if entry.group == "units"]
+        self.assertEqual((unit_entries[0], unit_entries[2]), (second, first))
+        inserted = unit_entries[1]
+        self.assertEqual(inserted.at_percent, 4)
+        code, removed, error = self.run_cli("next", "remove", "units", "2")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual([entry for entry in next_moves.read_next_moves() if entry.group == "units"],
+                         [second, first])
+        self.assertEqual([entry for entry in next_moves.read_next_moves() if entry.group != "units"],
+                         [worker, runner])
+        for entry in (first, second, worker, runner, inserted):
+            for reply in (output, added, removed):
+                self.assertNotIn(entry.id, reply)
+
+    def test_remote_positional_edits_resolve_on_the_host_after_its_log_changes(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        first = next_moves.add_next_move("units", 1, "claude2")
+        second = next_moves.add_next_move("units", 2, "claude3")
+        worker = next_moves.add_next_move("workers", 0, "claude")
+        inserted_on_host = next_moves.ClaudeGroupMove("host-added-head", "units", 5, 0, "claude2",
+                                                     datetime.now(timezone.utc))
+        for verb in ("move", "remove", "add"):
+            with self.subTest(verb=verb):
+                with next_moves.next_moves_lock():
+                    next_moves.write_next_moves((first, worker, second))
+                requests: list[tuple[str, ...]] = []
+
+                def remote(arguments: tuple[str, ...]) -> str:
+                    requests.append(arguments)
+                    self.assertNotEqual(arguments[0], "next-read", "a client must not resolve a position")
+                    with patch.object(role_map, "is_role_map_host", return_value=True):
+                        with next_moves.next_moves_lock():
+                            next_moves.write_next_moves((inserted_on_host, first, worker, second))
+                        code, output, error = self.run_cli(*arguments)
+                        self.assertEqual((code, error), (0, ""))
+                        return output
+
+                args = (["move", "units", "2", "1"] if verb == "move" else
+                        ["remove", "units", "2"] if verb == "remove" else
+                        ["add", "units", "9", "claude2", "--at", "2"])
+                with (patch.object(role_map, "is_role_map_host", return_value=False),
+                      patch.object(role_map, "ssh_role_map", side_effect=remote)):
+                    code, output, error = self.run_cli("next", *args)
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(len(requests), 1)
+                units = [entry for entry in next_moves.read_next_moves() if entry.group == "units"]
+                if verb == "move":
+                    self.assertEqual(units, [first, inserted_on_host, second])
+                elif verb == "remove":
+                    self.assertEqual(units, [inserted_on_host, second])
+                else:
+                    self.assertEqual((units[0], units[2], units[3]), (inserted_on_host, first, second))
+                    self.assertEqual(units[1].at_percent, 9)
+                self.assertEqual([entry for entry in next_moves.read_next_moves() if entry.group == "workers"],
+                                 [worker])
+                for entry in next_moves.read_next_moves():
+                    self.assertNotIn(entry.id, output)
+
+    def test_mac_positional_refusals_print_the_hosts_last_error_line_without_a_transport_wrapper(self) -> None:
+        entry = next_moves.add_next_move("units", 1, "claude2")
+        before = next_moves.next_moves_file().read_bytes()
+        refusal = "next: units has 1 entries; position 3 is out of range"
+        for arguments in (("move", "units", "1", "3"), ("remove", "units", "3"),
+                          ("add", "units", "1", "claude2", "--at", "3")):
+            with (self.subTest(arguments=arguments),
+                  patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=send_role_map_command),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                      ["fixture ssh"], 1, stdout="", stderr=f"fixture diagnostic\n{refusal}\n\n")) as transport):
+                code, output, error = self.run_cli("next", *arguments)
+            self.assertNotEqual(code, 0)
+            self.assertEqual((output, error), ("", refusal + "\n"))
+            transport.assert_called_once()
+            self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+
+    def test_mac_positional_transport_failures_keep_the_remote_verb_and_connection_error(self) -> None:
+        for verb, arguments in (("move", ("move", "units", "1", "3")),
+                                ("remove", ("remove", "units", "3")),
+                                ("add", ("add", "units", "1", "claude2", "--at", "3"))):
+            with (self.subTest(verb=verb),
+                  patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=send_role_map_command),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                      ["fixture ssh"], 255, stdout="", stderr="fixture cannot connect\n")) as transport):
+                code, output, error = self.run_cli("next", *arguments)
+            self.assertNotEqual(code, 0)
+            self.assertEqual((output, error), ("", f"next: remote {verb} failed: fixture cannot connect\n"))
+            transport.assert_called_once()
+
+    def test_next_cli_out_of_range_names_group_size_and_does_not_write(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        _ = next_moves.add_next_move("units", 1, "claude2")
+        before = next_moves.next_moves_file().read_bytes()
+        for arguments in (("move", "units", "2", "1"), ("move", "units", "1", "2"),
+                          ("remove", "units", "2"), ("remove", "workers", "1"),
+                          ("add", "units", "1", "claude2", "--at", "3")):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli("next", *arguments)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(output, "")
+                group = "workers" if "workers" in arguments else "units"
+                self.assertIn(group, error)
+                self.assertIn("0" if group == "workers" else "1", error)
+                self.assertEqual(len(error.strip().splitlines()), 1)
+                self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+    def test_next_cli_refuses_ids_and_nonpositive_positions_without_changing_the_log(self) -> None:
+        entry = next_moves.add_next_move("units", 1, "claude2")
+        before = next_moves.next_moves_file().read_bytes()
+        for arguments in (("remove", entry.id), ("remove", "units", entry.id),
+                          ("move", "units", entry.id, "1"), ("remove", "units", "0"),
+                          ("move", "units", "1", "-1"),
+                          ("add", "units", "1", "claude2", "--at", "0")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as error:
+                try:
+                    code = accounts.main(["next", *arguments])
+                except SystemExit as refused:
+                    code = refused.code
+                self.assertNotEqual(code, 0)
+                self.assertTrue(error.getvalue())
+                self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
 
     def test_next_refuses_unknown_accounts_groups_and_invalid_percent_without_storing_an_entry(self) -> None:
         self.login_directory("claude2", "target@example.invalid")
@@ -2767,18 +3267,23 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         self.assertTrue(check.called)
         self.assertIs(cast(object, check.call_args.kwargs["repair"]), False)
-        self.assertIn("when workers reach 1% → codex2", output)
+        self.assertIn("workers 1:", output)
+        self.assertIn("→ codex2", output)
         with patch.object(accounts, "check_codex_target", side_effect=AssertionError("Claude is not a Codex login")):
             code, output, error = self.run_cli("next", "add", "workers", "0", "claude")
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("when workers reach 0% → claude", output)
+        self.assertIn("workers 2:", output)
+        self.assertIn("→ claude", output)
         entries = next_moves.read_next_moves()
         code, listed, error = self.run_cli("next", "list")
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("when workers reach 1% → codex2", listed)
-        self.assertIn("when workers reach 0% → claude", listed)
+        self.assertIn("workers 1:", listed)
+        self.assertIn("→ codex2", listed)
+        self.assertIn("workers 2:", listed)
+        self.assertIn("→ claude", listed)
         for entry in entries:
-            self.assertEqual(self.run_cli("next", "remove", entry.id)[0], 0)
+            self.assertNotIn(entry.id, listed)
+            self.assertEqual(self.run_cli("next", "remove", "workers", "1")[0], 0)
         self.assertEqual(next_moves.read_next_moves(), ())
 
     def test_workers_next_cli_rejects_hold_unknown_account_and_remote_invalid_entry(self) -> None:
