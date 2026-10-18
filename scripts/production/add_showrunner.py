@@ -129,13 +129,13 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     host = herdr.shared_session()
     if host:
         _ = herdr.start_server(host, 90_000)
-        pane = herdr.open_tab(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, child.slug,
-                              str(cwd), environment)
+        pane = herdr.open_tab(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, str(cwd),
+                              environment)
     else:
         host = child.slug
         herdr.start_new_server(host, 90_000)
         pane = herdr.open_pane(host, child.slug, str(cwd), environment)
-    outcome = herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
+    outcome = herdr.start_agent(host, pane, kind="claude", agent=child.slug, agent_arguments=arguments,
         opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)), timeout_ms=90_000)
     return (outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
             else herdr.PromptNotSubmitted("launcher supplied no submit proof"))

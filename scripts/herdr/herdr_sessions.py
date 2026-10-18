@@ -197,7 +197,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        outcome = herdr.start_agent(name, pane, kind="claude", agent_arguments=claude_arguments,
+        outcome = herdr.start_agent(name, pane, kind="claude", agent=name, agent_arguments=claude_arguments,
                                     opening=opening, timeout_ms=90_000)
         if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
             reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
