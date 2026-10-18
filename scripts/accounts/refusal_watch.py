@@ -58,6 +58,10 @@ class ShutdownProgressReader(Protocol):
     def shutdown_in_progress(self, saved: record.SessionShutdown) -> bool: ...
 
 
+class RestartRecordLiveness(Protocol):
+    def restart_failed_session_running(self, saved: record.SessionShutdown) -> bool: ...
+
+
 @dataclass(frozen=True)
 class ContinuationDelivered:
     """The live owner accepted its continuation after the quota wait."""
@@ -649,7 +653,9 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     # An unreadable queue cannot prove a group has nothing next.
     pending_groups = (set(accounts.CLAUDE_GROUPS) if any(isinstance(rule, UnreadableNextMoveLog) for rule in configured)
                       else {rule.group for rule in configured if isinstance(rule, AutoMoveRule)})
-    open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
+    restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
+    open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()
+                if not restart.restart_failed_session_running(saved)}
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
     for entry in entries:

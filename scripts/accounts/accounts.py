@@ -61,6 +61,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 if TYPE_CHECKING:
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
+    from scripts.shutdown.record import SessionShutdown
 
 
 class PromptTakingMember(Protocol):
@@ -82,6 +83,14 @@ class MovePromptReader(Protocol):
 
 class MoveFollower(Protocol):
     def follow(self, login: str, request_id: str) -> int: ...
+
+
+class RestartRecordLiveness(Protocol):
+    def restart_failed_session_running(self, saved: SessionShutdown) -> bool: ...
+
+
+class ShutdownLocation(Protocol):
+    def local_machine(self) -> str: ...
 
 
 MoveAlerts = Literal["user", "none"]
@@ -2792,6 +2801,32 @@ def _move_down_argv(source: str, ids: tuple[str, ...], target: str, why: str, al
         "--restart", "--to", target, "--why", why) + (("--no-alert",) if alerts == "none" else ())
 
 
+@dataclass(frozen=True)
+class MoveShutdownReady:
+    lines: tuple[str, ...] = ()
+
+
+def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShutdownReady | MoveRefused:
+    """Close only a proven live session's unconfirmed restart before moving it."""
+    if TYPE_CHECKING:
+        from scripts.shutdown import record
+    else:
+        record = import_module("record")
+    restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
+    settle = cast(ShutdownLocation, cast(object, import_module("settle")))
+    if not restart.restart_failed_session_running(saved):
+        return MoveRefused("already has a shutdown in progress")
+    name = saved["session"]["name"]
+    if dry_run:
+        return MoveShutdownReady((f"{name}: would close its unconfirmed restart record; the session is running",))
+    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+                                         settle.local_machine(), saved["request_id"])
+    if not isinstance(outcome, record.SessionForgotten):
+        return MoveRefused("already has a shutdown in progress")
+    _ = record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
+    return MoveShutdownReady((f"{name}: closed its unconfirmed restart record; the session is running",))
+
+
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "", alerts: MoveAlerts = "user") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
     target = numbered_account_label(target, "claude").label
@@ -2820,7 +2855,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                 refuse(session_id, destination.reason)
             return tuple(outcomes[session_id] for session_id in ids)
         live = {item.session_id: item for item in inventory.listing()}
-        before = {saved["session"]["session_id"] for saved in record.all_session_records()}
+        before = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
         for session_id in ids:
             found = live.get(session_id)
             if found is None:
@@ -2829,13 +2864,17 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
             if found.kind == "worker":
                 refuse(session_id, "workers move with their unit director")
                 continue
-            if session_id in before:
-                refuse(session_id, "already has a shutdown in progress")
-                continue
             owners[session_id] = found
             if found.login.casefold() == destination.login.casefold():
                 refuse(session_id, "already on " + destination.label)
                 continue
+            if session_id in before:
+                prepared = _prepare_move_shutdown(before[session_id], dry_run=False)
+                if isinstance(prepared, MoveRefused):
+                    refuse(session_id, prepared.reason)
+                    continue
+                for line in prepared.lines:
+                    print(line)
             groups.setdefault(found.login, []).append(session_id)
         for login, selected_ids in groups.items():
             source = account.label_for("Claude", login)
@@ -3054,9 +3093,10 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     if isinstance(checked, MoveRefused):
         return checked
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.shutdown import inventory, record
     else:
         inventory = import_module("inventory")
+        record = import_module("record")
     registrations = inventory.showrunner_registrations()
     members = live_group_members(registrations=registrations)[group]
     selected = [session for session in members if not session_on_account(session, target)]
@@ -3069,7 +3109,15 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
+        closing: tuple[str, ...] = ()
+        for saved in record.all_session_records():
+            if saved["session"]["session_id"] not in ids:
+                continue
+            prepared = _prepare_move_shutdown(saved, dry_run=True)
+            if isinstance(prepared, MoveShutdownReady):
+                closing += prepared.lines
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
+            *closing,
             *(move_preview_line(item, now) for item in selected),
             *_move_preview_commands(selected, target, reason, alerts), *notices))
     previous_target = group_label(group_accounts(), group)
@@ -3130,11 +3178,17 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             return MoveRefused(f"{owner.name} belongs to {group}; in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move {group} {target}")
         if session_on_account(owner, target):
             return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
-        if any(saved["session"]["session_id"] == owner.session_id for saved in record.all_session_records()):
-            return MoveRefused(f"{owner.name} already has a shutdown in progress")
+        closing: tuple[str, ...] = ()
+        for saved in record.all_session_records():
+            if saved["session"]["session_id"] != owner.session_id:
+                continue
+            prepared = _prepare_move_shutdown(saved, dry_run=True)
+            if isinstance(prepared, MoveRefused):
+                return MoveRefused(f"{owner.name} {prepared.reason}")
+            closing += prepared.lines
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
-            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now),
+            return MoveDryRun(owner.session_id, (*checked.notices, *closing, move_preview_line(owner, now),
                 *_move_preview_commands([owner], target, reason, alerts)))
         results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN, alerts=alerts)
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)

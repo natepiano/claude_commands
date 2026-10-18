@@ -8,6 +8,7 @@ import io
 from datetime import datetime
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1060,7 +1061,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 self.assertEqual(code, 1)
                 for text in (status_text, follow_text):
                     if isinstance(liveness, restart_work.SessionLive):
-                        self.assertIn("restart prompt not confirmed; session is running — check it", text)
+                        command = settle.shutdown_command("forget", "session-123", "--account", LOGIN)
+                        self.assertIn("restart prompt not confirmed; session is running — check it, " +
+                                      f"then close its record: {command}", text)
                         self.assertNotIn("shutdown.py restart", text)
                         self.assertNotIn("bring back:", text)
                     else:
@@ -1068,6 +1071,34 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                         if isinstance(liveness, restart_work.SessionLivenessUnknown):
                             self.assertIn("scratch registry unreadable", text)
                 self.assertEqual(record.find_session(LOGIN, "session-123"), saved)
+
+    def test_printed_closing_command_forgets_the_running_sessions_failed_record(self) -> None:
+        saved = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="restart prompt not submitted"))
+        self.assertTrue(record.create_session(saved))
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(restart_work, "_owner_liveness", return_value=restart_work.SessionLive()),
+              patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionLive()),
+              patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        lines = [line for line in output.getvalue().splitlines() if "then close its record: " in line]
+        self.assertEqual(len(lines), 1, output.getvalue())
+        printed = lines[0].split("then close its record: ", 1)[1]
+        self.assertEqual(printed, settle.shutdown_command("forget", "session-123", "--account", LOGIN))
+        self.assertEqual(printed, "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py " +
+                         f"forget session-123 --account {LOGIN}")
+        arguments = shlex.split(printed)
+        self.assertTrue(arguments[1].endswith("/shutdown/shutdown.py"))
+        with redirect_stdout(io.StringIO()) as closed:
+            self.assertEqual(shutdown.main(arguments[2:]), 0)
+        self.assertIn("forgotten", closed.getvalue())
+        self.assertIsNone(record.find_session(LOGIN, "session-123"))
+        archived = list((self.state / LOGIN / "history").glob("*.json"))
+        self.assertEqual([json.loads(path.read_text()) for path in archived], [saved])
+        self.assertEqual(list((self.state / LOGIN / "sessions").glob("*.json")), [])
+        self.assertEqual(len(list((self.state / LOGIN / "history").glob("*.json"))), 1)
 
     def test_bring_back_command_keeps_dead_sibling_and_excludes_live_failed_session(self) -> None:
         live = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,

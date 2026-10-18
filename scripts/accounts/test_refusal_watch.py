@@ -31,11 +31,12 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory, record, settle
+    from scripts.shutdown import inventory, record, restart, settle
     from scripts.message import sessions
 else:
     inventory = import_module("inventory")
     record = import_module("record")
+    restart = import_module("restart")
     settle = import_module("settle")
     sessions = import_module("sessions")
 
@@ -3032,6 +3033,62 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])
+
+    def save_failed_restart(self, identity: str) -> record.SessionShutdown:
+        _ = self.down(["/fake/shutdown.py", "--only", identity, "--to", "claude3",
+                       "--why", "older stop", "--move-id", "older-transition"],
+                      env={"REFUSAL_WATCH_INVENTORY": "read existing"})
+
+        def fail(current: record.SessionShutdown) -> None:
+            current["progress"] = record.SessionRestartFailed(
+                kind="restart failed", at=NOW.isoformat(), reason="prompt unconfirmed")
+
+        saved = record.update_session(SOURCE_LOGIN, identity, fail)
+        self.commands.clear()
+        return saved
+
+    def test_refusal_watch_moves_a_running_session_with_an_unconfirmed_restart(self) -> None:
+        _ = self.owner("running-refused")
+        saved = self.save_failed_restart("running-refused")
+        _ = self.transcript("running-refused")
+        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionLive()) as observed,
+              patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
+              patch.object(accounts, "move_sessions", wraps=accounts.move_sessions) as move,
+              redirect_stdout(io.StringIO())):
+            # run takes the normal scratch watch lock and executes _run.
+            _ = refusal_watch.run(NOW)
+        self.assertGreater(observed.call_count, 0)
+        move.assert_called_once()
+        self.assertEqual(move.call_args.args[0], ("running-refused",))
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(self.commands[0][self.commands[0].index("--only") + 1], "running-refused")
+        current = record.find_session(SOURCE_LOGIN, "running-refused")
+        assert current is not None
+        self.assertEqual(current["progress"]["kind"], "waiting")
+        history = self.home / "shutdown" / SOURCE_LOGIN / "history"
+        self.assertEqual([json.loads(path.read_text()) for path in history.glob("*.json")], [saved])
+
+    def test_automatic_group_watch_moves_a_running_session_with_an_unconfirmed_restart(self) -> None:
+        path = self.groups()
+        _ = self.owner("running-unit", host="unit")
+        saved = self.save_failed_restart("running-unit")
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
+              patch.object(accounts, "move_sessions", wraps=accounts.move_sessions) as move,
+              redirect_stdout(io.StringIO())):
+            _ = refusal_watch.run(NOW)
+        move.assert_called_once()
+        self.assertEqual(move.call_args.args[0], ("running-unit",))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(len(self.commands), 1)
+        current = record.find_session(SOURCE_LOGIN, "running-unit")
+        assert current is not None
+        self.assertEqual(current["progress"]["kind"], "waiting")
+        self.assertEqual(current.get("target"), "claude2")
+        history = self.home / "shutdown" / SOURCE_LOGIN / "history"
+        self.assertEqual([json.loads(archived.read_text()) for archived in history.glob("*.json")], [saved])
 
     def test_assumed_wait_overrides_only_its_decision_and_never_stored_usage(self) -> None:
         _ = self.owner("assumed", host="ghostty")

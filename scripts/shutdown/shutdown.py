@@ -393,7 +393,7 @@ def _shutdown_record_lines(
             return [
                 line
                 for record in outcome["records"]
-                for line in ([f"  {record['session']['name']}: restart prompt not confirmed; session is running — check it"]
+                for line in (["  " + settle.running_restart_line(record)]
                              if record["progress"]["kind"] == "restart failed"
                              and isinstance(_restart_failed_liveness(record, observations), restart_work.SessionLive)
                              else settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation))
@@ -770,7 +770,7 @@ def _follow_action(saved: SessionShutdown) -> str:
     if kind == "restart failed":
         observed = _restart_failed_liveness(saved)
         if isinstance(observed, restart_work.SessionLive):
-            return f"{saved['session']['name']}: restart prompt not confirmed; session is running — check it"
+            return settle.running_restart_line(saved)
         if isinstance(observed, restart_work.SessionLivenessUnknown):
             liveness_reason = f"; liveness unknown: {observed.reason}"
     if progress["kind"] == "manual restart":
