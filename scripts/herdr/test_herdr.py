@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1879,7 +1879,7 @@ class HerdrTests(unittest.TestCase):
         options = ["--label", "boss", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
             "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
-        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
+        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
         self.assertEqual(self.commands()[1:], [["--session", "fixture", "workspace", "create", *options],
                                                ["--session", "fixture", "tab", "rename", "w1:t1", "boss"],
                                                ["--session", "fixture", "pane", "rename", "w1:p1", "boss"]])
@@ -1889,9 +1889,9 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(tab, json.dumps({"result": {"root_pane": {"pane_id": "w1:p2"}}}))
         self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
             {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]}}))
-        self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "prod-alpha", "/wt", {}), "w1:p2")
+        self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
         self.assertEqual(self.commands()[-4:], [["--session", "fixture", *tab],
-                                                ["--session", "fixture", "pane", "rename", "w1:p2", "prod-alpha"],
+                                                ["--session", "fixture", "pane", "rename", "w1:p2", "alpha"],
                                                 ["--session", "fixture", "workspace", "list"],
                                                 ["--session", "fixture", "tab", "list", "--workspace", "w1"]])
 
@@ -1914,6 +1914,26 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
                                  ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "delta"],
                                  ["tab", "focus", "w1:t5"], ["workspace", "focus", "w2"]])
+
+    def test_retitle_names_the_pane_and_tab_then_orders_only_on_a_change(self) -> None:
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "boss"}, {"tab_id": "w1:t2", "label": "old-name"}]}}))
+        for label, changed in (("old-name", True), ("new-name", False)):
+            with self.subTest(label=label):
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+                    {"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1", "label": label}]}}))
+                if not changed:
+                    self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+                        {"tab_id": "w1:t2", "label": "new-name"}]}}))
+                self.log.unlink(missing_ok=True)
+                with patch.object(herdr.Herdr, "order_tabs", return_value={}) as ordered:
+                    self.assertEqual(herdr.Herdr("fixture").retitle("w1:p2", "new-name"), changed)
+                acted = [command[2:] for command in self.commands() if command[3:4] == ["rename"]]
+                self.assertEqual(acted, [["pane", "rename", "w1:p2", "new-name"], ["tab", "rename", "w1:t2", "new-name"]]
+                                 if changed else [])
+                self.assertEqual(ordered.call_args_list, [call("w1")] if changed else [])
+        with self.assertRaisesRegex(herdr.HerdrFailure, "no pane"):
+            _ = herdr.Herdr("fixture").retitle("w9:p9", "new-name")
 
     def test_order_tabs_leaves_a_tab_with_several_panes_and_an_ordered_space_alone(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
@@ -2565,18 +2585,16 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "agent_arguments must omit"):
             _ = herdr.start_agent(
                 "fixture", "pane-1", kind="claude", agent_arguments=["claude", "--resume", "conversation"],
-                opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
+                opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000, agent="worker",
             )
         self.assertEqual(self.commands(), [])
 
-    def test_module_start_passes_extra_arguments_and_uses_pane_label(self) -> None:
-        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{"pane_id": "pane-1", "label": "worker"}]}}))
+    def test_module_start_passes_extra_arguments_and_names_the_agent(self) -> None:
         _ = herdr.start_agent(
             "fixture", "pane-1", kind="claude", agent_arguments=["--resume", "conversation"],
-            opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
+            opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000, agent="worker",
         )
         self.assertEqual(self.start_commands(), [
-            ["--session", "fixture", "pane", "list"],
             ["--session", "fixture", "agent", "start", "worker", "--kind", "claude", "--pane", "pane-1",
              "--timeout", "10000", "--", "--resume", "conversation"],
             ["--session", "fixture", "agent", "prompt", "pane-1", "continue"],
@@ -2589,10 +2607,8 @@ class HerdrTests(unittest.TestCase):
                 with self.subTest(label=label, module_launch=module_launch):
                     self.log.unlink(missing_ok=True)
                     if module_launch:
-                        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-                            {"pane_id": "7pane-1", "label": label},
-                        ]}}))
-                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
+                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200,
+                                              agent=label or "7pane-1")
                     else:
                         _ = self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
                     start, prompt = self.start_commands()[-2:]

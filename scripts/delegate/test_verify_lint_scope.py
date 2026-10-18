@@ -17,6 +17,10 @@ import unittest
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
+# A hang limit, not a speed check. One `verify.sh lint` call starts about 60 processes: 10 s at
+# load 75 on natedev, and over 30 s at load 160 (two merge gates went red at 30 s, 2026-10-18).
+# A real hang still fails, after this many seconds.
+HANG_SECONDS = 300
 
 
 class CargoInvocation(TypedDict):
@@ -303,7 +307,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         return subprocess.run(
             ["bash", str(VERIFY), *arguments], cwd=cwd,
             env={**self.environment, "TEST_TAPLO_STATUS": str(taplo_status)},
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, check=False, timeout=HANG_SECONDS,
         )
 
     def taplo_calls(self) -> list[TaploInvocation]:
@@ -839,7 +843,7 @@ class InvokeOutputTests(unittest.TestCase):
         environment = dict(os.environ, HOME=str(root), TMPDIR=str(root))
         return subprocess.run(
             ["bash", "-c", script], cwd=root, env=environment,
-            capture_output=True, text=True, check=False, timeout=10,
+            capture_output=True, text=True, check=False, timeout=HANG_SECONDS,
         )
 
     def command_stubs(self) -> str:

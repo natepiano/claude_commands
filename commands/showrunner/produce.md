@@ -287,10 +287,9 @@ State:
   block carries the question count, so this line leaves it out.
   When the footer switch is off, the command says `footers off`; omit both the
   footer and the Waiting on block. It still stores `open_for_user`, so the
-  dailies count it. It prints the counts line with the open questions added
-  (`For you: 1 change to review, 2 questions`) when anything is counted; the
-  reply ends with that line alone, and the footer hook blocks a reply that
-  does not. A `-` reply carries no line. The command reads the switch, the notifier's
+  dailies count it. It prints no counts line. A reply never carries a
+  `For you: …` line, because the user reads those counts in the status line.
+  The footer hook blocks a reply that has one (user, 2026-10-18). The command reads the switch, the notifier's
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
   item complete enough to stand alone when the user asks for the list: what
   is asked, where, why and the choices. Remove

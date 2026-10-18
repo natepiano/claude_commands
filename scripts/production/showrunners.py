@@ -272,11 +272,6 @@ def herdr_space(slug: str, doc: str) -> str:
     return line[1] if line else slug
 
 
-def tab_title(slug: str, session: str) -> str:
-    """A session's tab title in its production's workspace: its name without the production prefix."""
-    return session.removeprefix(f"{slug}-")
-
-
 def current_address(slug: str) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""

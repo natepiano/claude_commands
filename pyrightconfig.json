@@ -59,7 +59,8 @@
         "scripts/message",
         "scripts/notify",
         "scripts/production",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
