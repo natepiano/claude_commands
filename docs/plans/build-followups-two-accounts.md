@@ -2048,4 +2048,4 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** `HERDR_PLATFORM` on the run command — it takes precedence over test_restart's `_PLATFORM="darwin"` patches and breaks them.
 
-**Live check outstanding (with the user):** after the demo frees the Mac, the documented run command passes the nine suites on the Mac. Its owner is the change-review row from checkpoint b316bbc3.
+**Live check passed 2026-10-18:** the documented run command passed the nine suites on the Mac from a copy of main at ae28d4fd: 1054 tests OK in 194 s. Change-review row C51.
