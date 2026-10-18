@@ -1830,7 +1830,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** sampling the recipient after the launcher returns (a replacement process inherits the proof); a module-level `import sessions` in `herdr.py`; raising on a name too long for one push (it suppresses every push of the batch).
 
-### Phase 64 — Enter retries reach a real session's composer  · status: todo
+### Phase 64 — Enter retries reach a real session's composer  · status: done
 
 **Depends on:** Phase 63
 

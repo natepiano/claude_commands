@@ -961,22 +961,23 @@ class Herdr:
         lines = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen).splitlines()
         # Claude's composer is bounded by horizontal rules. Older prompts above
         # the final composer are scrollback, even when they contain the same text.
-        borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
-        if len(borders) < 2:
+        closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
+        if not closing_borders:
             return False
-        # Anything after the closing rule must be composer chrome. Assistant
-        # output below an old composer makes that composer scrollback, even if
-        # the next input marker has not appeared yet.
-        footer = (r"(?:\? for shortcuts|esc to interrupt|esc to cancel|ctrl\+c to interrupt|"
-                  r"ctrl\+c to cancel|ctrl\+c to exit|"
-                  r"⏵⏵ (?:accept edits|bypass permissions) on \(shift\+tab to cycle\))")
-        if any(line.strip() and not re.fullmatch(rf"\s*{footer}(?:\s+·\s+{footer})*\s*", line)
-               for line in lines[borders[-1] + 1:]):
+        closing = closing_borders[-1]
+        # A rule-like row inside multiline input is not the top border: only
+        # the border immediately followed by the composer marker can be one.
+        top_borders = [i for i, line in enumerate(lines[:closing])
+                       if re.fullmatch(r"\s*[─━-]{3,}(?:\s+.+\s+[─━-]+)?\s*", line)
+                       and re.match(r"^\s*[❯>]", lines[i + 1])]
+        if not top_borders:
             return False
-        region = lines[borders[-2] + 1:borders[-1]]
-        if not region or not re.match(r"^\s*[❯>]", region[0]):
+        # Footer rows are indented. Column-zero output after an old composer
+        # makes that composer scrollback, regardless of the output's wording.
+        if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
             return False
-        region[0] = re.sub(r"^\s*[❯>]\s?", "", region[0])
+        region = lines[top_borders[-1] + 1:closing]
+        region[0] = re.sub(r"^\s*[❯>]\s*", "", region[0])
         # Physical screen wraps can split a word or path without a space.
         # Inside a word only a screen newline may intervene; between words the
         # prompt still requires whitespace, so different input cannot match by
