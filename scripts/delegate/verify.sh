@@ -33,8 +33,8 @@
 # the whole workspace.
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
-# it with /lint_config), so one switch silences a check across the fix pipeline
-# and every delegate phase. `lint` also always runs taplo fmt --check at the
+# it with /lint_config). One switch controls a check in the lint CLI and every
+# delegate phase. `lint` also always runs taplo fmt --check at the
 # workspace root, using its taplo.toml. A phase runs all five; its unit director
 # runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
@@ -136,8 +136,8 @@
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
 # single bottom layer, sourced below. This file adds only delegate scope rules
-# on top. Workspace-scope entry points (aliases, validate_ci, the fix pipeline,
-# release checks) use the lint CLI in that directory instead of this script.
+# on top. Shell aliases, validate_ci and release checks use the lint CLI in that
+# directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
 # the same command unsandboxed; anything else is the underlying tool status.

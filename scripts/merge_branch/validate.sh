@@ -25,18 +25,13 @@ fi
 
 # Check if current branch is behind remote
 HAS_REMOTE=false
-CURRENT_TRACKS_ORIGIN=false
-CURRENT_UPSTREAM=""
 CURRENT_BEHIND_REMOTE=false
 BEHIND_COUNT=0
 
 if git remote get-url origin >/dev/null 2>&1; then
     HAS_REMOTE=true
     git fetch origin >/dev/null 2>&1
-    if CURRENT_UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null); then
-        if [[ "$CURRENT_UPSTREAM" == origin/* ]]; then
-            CURRENT_TRACKS_ORIGIN=true
-        fi
+    if git rev-parse --abbrev-ref --symbolic-full-name @{upstream} >/dev/null 2>&1; then
         BEHIND_COUNT=$(git rev-list HEAD..@{upstream} --count 2>/dev/null || echo "0")
         if [[ "$BEHIND_COUNT" -gt 0 ]]; then
             CURRENT_BEHIND_REMOTE=true
@@ -89,8 +84,6 @@ echo "{
   \"source_branch\": \"$SOURCE_BRANCH\",
   \"current_branch\": \"$CURRENT_BRANCH\",
   \"has_remote\": $HAS_REMOTE,
-  \"current_tracks_origin\": $CURRENT_TRACKS_ORIGIN,
-  \"current_upstream\": \"$CURRENT_UPSTREAM\",
   \"current_behind_remote\": $CURRENT_BEHIND_REMOTE,
   \"behind_count\": $BEHIND_COUNT,
   \"ff_possible\": $FF_POSSIBLE,

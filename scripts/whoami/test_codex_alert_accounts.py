@@ -1244,7 +1244,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(fallback.owner, a)
-        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "fix", "codex"))
+        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "module_review", "codex"))
         self.now += timedelta(days=3)
         funded = self.readings(a, self.report(a, 0, "19", five_left=0))
         _ = quota_alert.alert([self.note(1, "active", 0, "19")],
@@ -1253,7 +1253,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
         registry = quota_alert.REGISTRY.read_text()
         self.assertIn("delegate=codex", registry)
-        self.assertIn("fix=codex", registry)
+        self.assertIn("module_review=codex", registry)
 
     def test_missing_and_old_fallback_records_decode_named_states_and_recover(self) -> None:
         with quota_alert.state_file() as state:
