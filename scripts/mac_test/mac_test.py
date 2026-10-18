@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coordinate exclusive test use of the Mac."""
+"""Coordinate test use of the Mac: one claim per repository, and the Mac block."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,14 @@ class StateReadError(ValueError):
     """A Mac coordination record cannot be read or decoded."""
 
 
+class ClaimStateUnreadable(StateReadError):
+    """A claim file, or the claims folder, that cannot be read or decoded."""
+
+    def __init__(self, path: Path, error: Exception) -> None:
+        super().__init__(str(error))
+        self.path: Path = path
+
+
 class ClaimOwnerRecord(TypedDict):
     """The process identity and job details retained by either kind of claim."""
 
@@ -49,6 +58,7 @@ class ClaimOwnerRecord(TypedDict):
     since: str
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
+    copy: NotRequired[bool]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -62,6 +72,55 @@ class RemoteJobClaim(ClaimOwnerRecord):
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
+
+
+@dataclass(frozen=True)
+class RepositoryScope:
+    """A claim that excludes only other claims for the same repository."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class WholeMacScope:
+    """A claim that names no repository, so it excludes every other claim."""
+
+
+ClaimScope = RepositoryScope | WholeMacScope
+WHOLE_MAC = WholeMacScope()
+
+
+@dataclass(frozen=True)
+class HeldClaim:
+    """One claim record, the repository it covers and the file that holds it."""
+
+    scope: ClaimScope
+    path: Path
+    record: RunRecord
+
+
+@dataclass(frozen=True)
+class ClaimFinished:
+    """A claim attempt that ended with its exit status."""
+
+    status: int
+
+
+@dataclass(frozen=True)
+class ClaimBusy:
+    """A claim attempt refused by a live claim whose scope overlaps."""
+
+    holder: RunRecord
+
+
+@dataclass(frozen=True)
+class ClaimHeldByCopy:
+    """A claim attempt whose overlapping live claims are all copies, which give way."""
+
+    holders: tuple[RunRecord, ...]
+
+
+ClaimAttempt = ClaimFinished | ClaimBusy | ClaimHeldByCopy
 
 
 class NoRemoteJob:
@@ -329,7 +388,7 @@ MacActivity = MacActive | MacIdle | ActivityCheckFailed
 class SettleOutcome:
     """State and diagnostics after one complete settlement pass."""
 
-    run: RunState
+    claims: tuple[HeldClaim, ...]
     block: MacBlockState
     expired_block_lift_failure: ExpiredBlockLiftFailure
     ci_problem: Problem
@@ -349,6 +408,7 @@ class InvalidBlockDuration:
 
 BlockDuration = ValidBlockDuration | InvalidBlockDuration
 INVALID_BLOCK_DURATION = InvalidBlockDuration()
+FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state"]
 
 
 class CliArguments(argparse.Namespace):
@@ -366,6 +426,9 @@ class CliArguments(argparse.Namespace):
         self.reason: str = ""
         self.hours: str = ""
         self.showrunner: str = ""
+        self.settings: str = ""
+        self.repo_root: str = ""
+        self.copy: bool = False
 
 
 class StatePaths:
@@ -378,6 +441,7 @@ class StatePaths:
         self.watch_lock: Path = directory / "watch.lock"
         self.claim_watch_lock: Path = directory / "claim_watch.lock"
         self.run: Path = directory / "run.json"
+        self.claims: Path = directory / "claims"
         self.block: Path = directory / "block.json"
 
 
@@ -489,6 +553,10 @@ def read_run(path: Path) -> RunState:
         idle_since = values["idle_since"]
         _ = aware_timestamp(idle_since, path, "idle_since")
         record["idle_since"] = cast(str, idle_since)
+    if "copy" in values:
+        if values["copy"] is not True:
+            raise StateReadError(f"{path} has an invalid copy")
+        record["copy"] = True
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
@@ -778,12 +846,71 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and process_start_time(run["pid"]) != run["proc_start"]
 
 
-def live_run(paths: StatePaths) -> RunState:
-    run = read_run(paths.run)
-    if isinstance(run, dict) and not run_is_live(run):
-        paths.run.unlink(missing_ok=True)
-        return NO_RUN
-    return run
+def copy_gives_way(run: RunRecord) -> bool:
+    """A live copy claim whose process still runs, so a new test can stop it.
+
+    A kept copy claim holds leftovers like any other kept claim and never gives way.
+    """
+    return run.get("copy") is True and process_start_time(run["pid"]) == run["proc_start"]
+
+
+def claim_scope(worktree: str) -> ClaimScope:
+    """The repository a claim covers: the one its worktree is in, else the whole Mac."""
+    repository = offload.repository_identity(Path(worktree))
+    if isinstance(repository, offload.KnownRepository):
+        return RepositoryScope(repository.name)
+    return WHOLE_MAC
+
+
+def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
+    if isinstance(scope, RepositoryScope):
+        return paths.claims / f"{scope.name}.json"
+    return paths.run
+
+
+def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
+    return isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope) or first == second
+
+
+def claim_files(paths: StatePaths) -> tuple[Path, ...]:
+    try:
+        repository_files = sorted(paths.claims.glob("*.json"))
+    except OSError as error:
+        raise ClaimStateUnreadable(paths.claims, error) from error
+    return (paths.run, *repository_files)
+
+
+def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
+    """Every claim record, oldest first.
+
+    `claims/<repo>.json` holds one repository's claim. `run.json` holds a claim
+    that names no repository, or a record left by the machine-wide claim from
+    before; its scope comes from its worktree, so an old record keeps its
+    repository until its owner ends, and covers every repository when its
+    worktree is in none.
+    """
+    held: list[HeldClaim] = []
+    for path in claim_files(paths):
+        try:
+            record = read_run(path)
+        except StateReadError as error:
+            raise ClaimStateUnreadable(path, error) from error
+        if isinstance(record, NoRun):
+            continue
+        scope = claim_scope(record["worktree"]) if path == paths.run else RepositoryScope(path.stem)
+        held.append(HeldClaim(scope, path, record))
+    return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
+
+
+def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
+    """Read every claim and remove each one whose owner has ended."""
+    live: list[HeldClaim] = []
+    for claim in read_claims(paths):
+        if run_is_live(claim.record):
+            live.append(claim)
+        else:
+            claim.path.unlink(missing_ok=True)
+    return tuple(live)
 
 
 def message_script(environment_name: str, file_name: str) -> Path:
@@ -1180,7 +1307,7 @@ def send_to_block_recipients(
 def expire_block(
     paths: StatePaths,
     config: MacTestConfig,
-    run: RunState,
+    claims: tuple[HeldClaim, ...],
     block: PendingMacBlock | ActiveMacBlock,
 ) -> SettleOutcome:
     if not config.ci_repo:
@@ -1201,7 +1328,7 @@ def expire_block(
                 text,
             )
             return SettleOutcome(
-                run,
+                claims,
                 block,
                 ExpiredBlockLiftFailed(restored.line),
                 NO_PROBLEM,
@@ -1228,7 +1355,7 @@ def expire_block(
         expiry_text(block, skipped),
     )
     return SettleOutcome(
-        run,
+        claims,
         NO_MAC_BLOCK,
         NO_EXPIRED_BLOCK_LIFT_FAILURE,
         NO_PROBLEM,
@@ -1319,7 +1446,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
 
 def mac_activity_script() -> str:
     """Count the user's mirror work and build executables without sending signals."""
-    return offload.mirror_selector_script() + r'''
+    return offload.mirror_selector_script(offload.ALL_MIRRORS) + r'''
 mirror_pids=$(select_leftovers) || exit 1
 process_records=$(ps -axww -o pid=,uid=,comm=) || exit 1
 activity_user=$(id -u) || exit 1
@@ -1373,17 +1500,41 @@ def claim_idle_clause(run: RunRecord) -> str:
     return f", idle since {local_time(run['idle_since'], include_zone=False)}"
 
 
+def claim_host(run: RunRecord, config: MacTestConfig) -> str:
+    return run["remote_host"] if "remote_host" in run else config.host
+
+
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
-    """Check one claim; return whether another pass may still be needed."""
+    """Check every live claim once; return whether another pass may still be needed.
+
+    One activity check serves every claim on a host. It counts all of the
+    user's Mac work, since a build process cannot be traced to a repository,
+    so a claim is idle only while the Mac runs nothing at all.
+    """
     with locked(paths.lock):
-        run = read_run(paths.run)
-    if isinstance(run, NoRun) or not run_is_live(run):
+        claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+    if not claims:
         return False
-    host = run["remote_host"] if "remote_host" in run else config.host
-    activity = check_mac_activity(config, host)
+    activity: dict[str, MacActivity] = {}
+    for claim in claims:
+        host = claim_host(claim.record, config)
+        if host not in activity:
+            activity[host] = check_mac_activity(config, host)
     now = utc_now()
+    watched = False
+    for claim in claims:
+        if watch_claim(paths, config, claim, activity[claim_host(claim.record, config)], now):
+            watched = True
+    return watched
+
+
+def watch_claim(
+    paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
+) -> bool:
+    """Apply one activity answer to one claim; return whether it is still watched."""
+    run = claim.record
     with locked(paths.lock):
-        current = read_run(paths.run)
+        current = read_run(claim.path)
         if isinstance(current, NoRun):
             return False
         if (current["pid"], current["proc_start"], current["since"]) != (
@@ -1398,21 +1549,22 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         if isinstance(activity, MacActive):
             if "idle_since" in current:
                 del current["idle_since"]
-                write_json(paths.run, current)
+                write_json(claim.path, current)
             return True
         if "idle_since" not in current:
             current["idle_since"] = timestamp(now)
-            write_json(paths.run, current)
+            write_json(claim.path, current)
             return True
-        idle_since = aware_timestamp(current["idle_since"], paths.run, "idle_since")
+        idle_since = aware_timestamp(current["idle_since"], claim.path, "idle_since")
         if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
             return True
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
-        paths.run.unlink(missing_ok=True)
+        claim.path.unlink(missing_ok=True)
     if block_present:
         start_watcher(paths)
     released_at = local_time(timestamp(now), include_zone=False)
     quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
+    quoted_worktree = "'" + current["worktree"].replace("'", "'\"'\"'") + "'"
     remote_argument = ""
     if "remote_host" in current:
         quoted_host = "'" + current["remote_host"].replace("'", "'\"'\"'") + "'"
@@ -1423,7 +1575,7 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
         + "Claim it again before your next Mac command: "
         + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
-        + f"--what {quoted_what}{remote_argument} (see /build:mac)."
+        + f"--what {quoted_what} --worktree {quoted_worktree}{remote_argument} (see /build:mac)."
     )
     print(text, flush=True)
     if "holder_session" in current:
@@ -1443,8 +1595,7 @@ def command_watch_claim(paths: StatePaths, config: MacTestConfig) -> int:
             try:
                 if not claim_watch_pass(paths, config):
                     with locked(paths.lock):
-                        run = read_run(paths.run)
-                        if isinstance(run, NoRun) or not run_is_live(run):
+                        if not any(run_is_live(claim.record) for claim in read_claims(paths)):
                             # A new claimant must see the watcher lock released.
                             watcher_lock.close()
                             return 0
@@ -1517,11 +1668,11 @@ def full_settle(
     watcher_holds_lock: bool = False,
 ) -> SettleOutcome:
     with locked(paths.lock):
-        run = live_run(paths)
+        claims = live_claims(paths)
         block = read_block(paths.block)
     if isinstance(block, NoMacBlock):
         return SettleOutcome(
-            run,
+            claims,
             block,
             NO_EXPIRED_BLOCK_LIFT_FAILURE,
             NO_PROBLEM,
@@ -1529,7 +1680,7 @@ def full_settle(
         )
     now = utc_now()
     if now >= block.expires:
-        outcome = expire_block(paths, config, run, block)
+        outcome = expire_block(paths, config, claims, block)
         if (
             not watcher_holds_lock
             and not isinstance(outcome.block, NoMacBlock)
@@ -1566,9 +1717,9 @@ def full_settle(
 
     if isinstance(block, PendingMacBlock):
         with locked(paths.lock):
-            run = live_run(paths)
-        if isinstance(run, dict):
-            block = pending_with_wait(block, WaitingOnLocalRun(run["what"]))
+            claims = live_claims(paths)
+        if claims:
+            block = pending_with_wait(block, WaitingOnLocalRun(claims[0].record["what"]))
             with locked(paths.lock):
                 write_block(paths.block, block)
         elif config.ci_repo:
@@ -1611,7 +1762,7 @@ def full_settle(
     if not watcher_holds_lock:
         start_watcher(paths)
     return SettleOutcome(
-        run,
+        claims,
         block,
         NO_EXPIRED_BLOCK_LIFT_FAILURE,
         ci_problem,
@@ -1649,72 +1800,129 @@ def requested_showrunner(name: str) -> Showrunner:
     return NamedShowrunner(name) if name else NO_SHOWRUNNER
 
 
+def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim) -> ClaimAttempt:
+    proc_start = process_start_time(args.pid)
+    if proc_start is None:
+        print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
+        return ClaimFinished(1)
+    kept["pid"] = args.pid
+    kept["proc_start"] = proc_start
+    if args.copy:
+        kept["copy"] = True
+    else:
+        _ = kept.pop("copy", None)
+    write_json(claim.path, kept)
+    print(f"leftovers: {kept['remote_host']}")
+    return ClaimFinished(13)
+
+
+def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> ClaimAttempt:
+    """One claim attempt under state.lock: take over, refuse, or write the claim."""
+    try:
+        claims = live_claims(paths)
+    except ClaimStateUnreadable as error:
+        print(f"state unreadable: {error.path}")
+        return ClaimFinished(12)
+    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+    if isinstance(args.remote, str):
+        for claim in overlapping:
+            record = claim.record
+            if claim.scope == scope and run_is_kept(record):
+                return take_over_kept_claim(args, claim, record)
+    try:
+        block = read_claim_block(paths)
+    except (OSError, StateReadError):
+        print(f"state unreadable: {paths.block}")
+        return ClaimFinished(12)
+    if not isinstance(block, NoMacBlock):
+        print(f"blocked by {block.holder}: {block.reason}")
+        return ClaimFinished(10)
+    if overlapping:
+        # A copy gives way to any new test; a copy never replaces a copy.
+        if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
+            return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
+        return ClaimBusy(overlapping[0].record)
+    proc_start = process_start_time(args.pid)
+    if proc_start is None:
+        print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
+        return ClaimFinished(1)
+    claimed: RunRecord = {
+        "pid": args.pid,
+        "proc_start": proc_start,
+        "what": args.what,
+        "worktree": args.worktree,
+        "since": timestamp(utc_now()),
+    }
+    if args.copy:
+        claimed["copy"] = True
+    if isinstance(args.remote, str):
+        remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
+        claimed = remote_claim
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if session:
+        claimed["holder_session"] = session
+    else:
+        owner = build_hold.owning_session()
+        if isinstance(owner, build_hold.OwningSession):
+            claimed["holder_session"] = owner.session_id
+    path = claim_path(paths, scope)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, claimed)
+    print("claimed")
+    return ClaimFinished(0)
+
+
+def copy_yield_seconds() -> float:
+    try:
+        seconds = float(os.environ.get("MAC_TEST_COPY_YIELD_S", "60"))
+    except ValueError:
+        return 60.0
+    return seconds if math.isfinite(seconds) and seconds > 0 else 60.0
+
+
+def stop_copy(holder: RunRecord) -> None:
+    """SIGTERM a copy claim's runner, never a process that reused its pid."""
+    if process_start_time(holder["pid"]) != holder["proc_start"]:
+        return
+    try:
+        os.kill(holder["pid"], signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def command_claim(args: CliArguments, paths: StatePaths) -> int:
+    scope = claim_scope(args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
+    yield_deadline = 0.0
+    stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
-            try:
-                run = live_run(paths)
-            except (OSError, StateReadError):
-                print(f"state unreadable: {paths.run}")
-                return 12
-            if isinstance(run, dict) and run_is_kept(run) and isinstance(args.remote, str):
-                proc_start = process_start_time(args.pid)
-                if proc_start is None:
-                    print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
-                    return 1
-                kept = run
-                kept["pid"] = args.pid
-                kept["proc_start"] = proc_start
-                write_json(paths.run, kept)
-                print(f"leftovers: {kept['remote_host']}")
-                claim_result = 13
-                break
-            try:
-                block = read_claim_block(paths)
-            except (OSError, StateReadError):
-                print(f"state unreadable: {paths.block}")
-                return 12
-            if not isinstance(block, NoMacBlock):
-                print(f"blocked by {block.holder}: {block.reason}")
-                return 10
-            if isinstance(run, NoRun):
-                proc_start = process_start_time(args.pid)
-                if proc_start is None:
-                    print(
-                        f"cannot claim: process {args.pid} is not running",
-                        file=sys.stderr,
-                    )
-                    return 1
-                claimed: RunRecord = {
-                    "pid": args.pid,
-                    "proc_start": proc_start,
-                    "what": args.what,
-                    "worktree": args.worktree,
-                    "since": timestamp(utc_now()),
-                }
-                if isinstance(args.remote, str):
-                    remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
-                    claimed = remote_claim
-                session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-                if session:
-                    claimed["holder_session"] = session
-                else:
-                    owner = build_hold.owning_session()
-                    if isinstance(owner, build_hold.OwningSession):
-                        claimed["holder_session"] = owner.session_id
-                write_json(paths.run, claimed)
-                print("claimed")
-                claim_result = 0
-                break
-            busy_run = run
-
+            attempt = claim_once(args, paths, scope)
+        if isinstance(attempt, ClaimFinished):
+            if attempt.status in (0, 13):
+                start_claim_watcher(paths)
+            return attempt.status
+        if isinstance(attempt, ClaimHeldByCopy):
+            # Signal outside state.lock, then wait for each copy's runner to
+            # clean up and release; the lock is never held while waiting.
+            if not stopped:
+                yield_deadline = time.monotonic() + copy_yield_seconds()
+            for holder in attempt.holders:
+                if (holder["pid"], holder["proc_start"]) not in stopped:
+                    stopped.add((holder["pid"], holder["proc_start"]))
+                    stop_copy(holder)
+            if time.monotonic() < yield_deadline:
+                time.sleep(0.1)
+                continue
+            busy_run = attempt.holders[0]
+            print(f"busy: {busy_run['what']} since {local_time(busy_run['since'], include_zone=False)}")
+            return 11
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            busy_run = attempt.holder
             if run_is_kept(busy_run):
-                kept = busy_run
-                print(f"busy: leftovers of {kept['what']} on {kept['remote_host']} since "
-                      + f"{local_time(kept['since'], include_zone=False)}")
+                print(f"busy: leftovers of {busy_run['what']} on {busy_run['remote_host']} since "
+                      + f"{local_time(busy_run['since'], include_zone=False)}")
                 return 11
             print(
                 f"busy: {busy_run['what']} since "
@@ -1722,19 +1930,62 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
             )
             return 11
         time.sleep(min(2.0, remaining))
-    start_claim_watcher(paths)
-    return claim_result
 
 
 def command_release(args: CliArguments, paths: StatePaths) -> int:
     with locked(paths.lock):
-        run = live_run(paths)
-        if isinstance(run, dict) and run["pid"] == args.pid:
-            paths.run.unlink(missing_ok=True)
+        # Each file is read alone, so another repository's damaged record
+        # cannot keep this owner's claim in place.
+        for path in claim_files(paths):
+            try:
+                record = read_run(path)
+            except StateReadError:
+                continue
+            if isinstance(record, dict) and record["pid"] == args.pid:
+                path.unlink(missing_ok=True)
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
         start_watcher(paths)
     return 0
+
+
+def free_now(
+    paths: StatePaths, settings: Path | offload.DefaultMacSettings, repo_root: Path, copy: bool = False,
+) -> FreeNowAnswer:
+    """Whether a claim for repo_root's repository made now could start a Mac run.
+
+    Read from local records alone, and cheap enough for LINT_QUEUE_LEAVE_HOOK,
+    which runs it on every held memory poll: no SSH, no gh and no lock. CI is
+    not read, since a claim does not consult it; the claim itself still decides
+    under its lock. Another repository's claim leaves the answer free. A copy
+    claim gives way to a new test, so it holds the scope only for another copy
+    (`copy`).
+    """
+    if not offload.read_config(settings).enabled:
+        return "off"
+    if isinstance(offload.read_backoff(time.time()), offload.ActiveBackoff):
+        return "backoff"
+    scope = claim_scope(str(repo_root))
+    try:
+        if not isinstance(read_claim_block(paths), NoMacBlock):
+            return "blocked"
+        claims = read_claims(paths)
+    except (OSError, StateReadError):
+        return "state"
+    held = any(
+        scopes_overlap(claim.scope, scope)
+        and run_is_live(claim.record)
+        and (copy or not copy_gives_way(claim.record))
+        for claim in claims
+    )
+    return "busy" if held else "free"
+
+
+def command_free_now(args: CliArguments, paths: StatePaths) -> int:
+    settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
+    answer = free_now(paths, settings, Path(args.repo_root), args.copy)
+    print(answer)
+    return 0 if answer == "free" else 1
 
 
 def block_state_line(
@@ -1784,7 +2035,7 @@ def command_block(
         return 2
     with locked(paths.control_lock):
         with locked(paths.lock):
-            run = live_run(paths)
+            claims = live_claims(paths)
             existing = read_block(paths.block)
             if (
                 not isinstance(existing, NoMacBlock)
@@ -1795,7 +2046,7 @@ def command_block(
             now = utc_now()
             expires = now + timedelta(hours=duration.hours)
             if isinstance(existing, NoMacBlock):
-                if isinstance(run, dict):
+                if claims:
                     block: PendingMacBlock | ActiveMacBlock = PendingMacBlock(
                         args.holder,
                         args.reason,
@@ -1804,7 +2055,7 @@ def command_block(
                         requested_delivery(args.holder),
                         requested_showrunner(args.showrunner),
                         "still_on",
-                        WaitingOnLocalRun(run["what"]),
+                        WaitingOnLocalRun(claims[0].record["what"]),
                     )
                 elif config.ci_repo:
                     block = PendingMacBlock(
@@ -1980,19 +2231,21 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             if isinstance(lift_failure, ExpiredBlockLiftFailed)
             else outcome.ci_problem
         )
-        if isinstance(outcome.run, NoRun):
+        if not outcome.claims:
             print("free")
-        elif run_is_kept(outcome.run):
-            kept = outcome.run
-            print(f"running: leftovers of {kept['what']} on {kept['remote_host']} "
-                  + f"since {local_time(kept['since'])}, kept under pid {kept['pid']}"
-                  + claim_idle_clause(kept))
-        else:
-            print(
-                f"running: {outcome.run['what']} ({outcome.run['worktree']}) "
-                + f"since {local_time(outcome.run['since'])}"
-                + claim_idle_clause(outcome.run)
-            )
+        for claim in outcome.claims:
+            run = claim.record
+            if run_is_kept(run):
+                print(f"running: leftovers of {run['what']} on {run['remote_host']} "
+                      + f"since {local_time(run['since'])}, kept under pid {run['pid']}"
+                      + claim_idle_clause(run))
+            else:
+                copy_words = "copy of " if run.get("copy") is True else ""
+                print(
+                    f"running: {copy_words}{run['what']} ({run['worktree']}) "
+                    + f"since {local_time(run['since'])}"
+                    + claim_idle_clause(run)
+                )
         block = outcome.block
         if isinstance(block, NoMacBlock):
             print("no block")
@@ -2065,6 +2318,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--worktree", default=os.getcwd())
     _ = claim.add_argument("--wait", type=float, default=0.0)
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
+    _ = claim.add_argument("--copy", action="store_true")
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
@@ -2077,6 +2331,11 @@ def parser() -> argparse.ArgumentParser:
 
     unblock = commands.add_parser("unblock")
     _ = unblock.add_argument("--holder", required=True)
+
+    free = commands.add_parser("free-now")
+    _ = free.add_argument("--settings", default="")
+    _ = free.add_argument("--repo-root", default=os.getcwd())
+    _ = free.add_argument("--copy", action="store_true")
 
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
@@ -2092,6 +2351,8 @@ def main() -> int:
         return command_claim(args, paths)
     if args.command == "release":
         return command_release(args, paths)
+    if args.command == "free-now":
+        return command_free_now(args, paths)
     config = read_config()
     if args.command == "block":
         return command_block(args, paths, config)

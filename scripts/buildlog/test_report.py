@@ -162,7 +162,7 @@ class ReportSpeedTests(unittest.TestCase):
                         record = call(f"call-{number}", started_at=stamp,
                                       ended_at=(at + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                                       wall_s=1, package=f"package-{number % 20}",
-                                      delegate_session=f"session-{number % 20}", seat="writer",
+                                      delegate_session=f"session-{number % 20}", worker="writer",
                                       target="natedev", hold_wait_s=0.4 if number % 100 == 0 else 0,
                                       token_wait_s=0, build_s=1)
                         if number % 100 == 0:
@@ -213,7 +213,7 @@ def local_clock(at: str) -> str:
     return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
 
 
-def token_holder(record_id: str, acquired_at: str, released_at: str, seat: str, delegate_session: str) -> Record:
+def token_holder(record_id: str, acquired_at: str, released_at: str, worker: str, delegate_session: str) -> Record:
     started_at = "2026-10-01T12:00:00Z"
     started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     acquired = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
@@ -222,7 +222,7 @@ def token_holder(record_id: str, acquired_at: str, released_at: str, seat: str, 
         started_at=started_at,
         ended_at=released_at,
         wait_s=int((acquired - started).total_seconds()),
-        seat=seat,
+        worker=worker,
         delegate_session=delegate_session,
     )
 
@@ -271,13 +271,13 @@ class ReportTests(unittest.TestCase):
         )
         self.assertEqual(
             lines[table_indexes[-1] + 1],
-            "Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does.",
+            "Source: verify.sh calls, memory-gated steps and CI jobs; a worker's own calls run one at a time, so waiting behind its own call adds no delay, behind another worker does.",
         )
         rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in table[2:]]
         self.assertEqual(
             [row[0] for row in rows],
             [
-                "Build-folder turn, behind another seat",
+                "Build-folder turn, behind another worker",
                 "Build-folder turn, behind its own call",
                 "Held target",
                 "Memory admission",
@@ -403,7 +403,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
         _ = index.update()
         with closing(index.read_only()) as connection:
-            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)) + ["Mac copies: none started.", ""], mac)
             nextest_runs = cast(int, connection.execute(
                 "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
                 + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
@@ -436,7 +436,10 @@ class ReportTests(unittest.TestCase):
             step("other-day", host="Mac", started_at="2026-10-01T12:00:00Z"),
         )
         text = self.render()
-        self.assertEqual(self.section_lines(text, "### Mac"), ["### Mac", "", "No steps recorded on the Mac.", ""])
+        self.assertEqual(
+            self.section_lines(text, "### Mac"),
+            ["### Mac", "", "No steps recorded on the Mac.", "", "Mac copies: none started.", ""],
+        )
         self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
@@ -459,7 +462,7 @@ class ReportTests(unittest.TestCase):
         row = self.waiting_rows()["Held target"]
         self.assertEqual(row, [
             f"10.0 min (long, {local_clock(STAMP)})", "1",
-            "2 of 3 calls; not recorded for 1 call", "0.2 seat-hours",
+            "2 of 3 calls; not recorded for 1 call", "0.2 worker-hours",
             "long 10.0 min, short 0.4 s",
         ])
 
@@ -663,13 +666,13 @@ class ReportTests(unittest.TestCase):
 
     def test_lead_block_uses_the_waiting_rows_names_and_durations(self) -> None:
         cases = ((900, 600, False, "Memory admission", 900),
-                 (100, 600, False, "Build-folder turn, behind another seat", 600),
-                 (100, 600, True, "Build-folder turn, behind another seat", 300))
+                 (100, 600, False, "Build-folder turn, behind another worker", 600),
+                 (100, 600, True, "Build-folder turn, behind another worker", 300))
         for memory_wait, token_wait, shares_own_turn, name, longest in cases:
             with self.subTest(name=name, longest=longest):
                 records = [
                     call("waiter", started_at="2026-10-02T12:00:00Z", token_wait_s=token_wait,
-                         wait_s=600, delegate_session="group" if shares_own_turn else None, seat="writer"),
+                         wait_s=600, delegate_session="group" if shares_own_turn else None, worker="writer"),
                     step("memory", mem_wait_s=memory_wait),
                 ]
                 if shares_own_turn:
@@ -683,7 +686,7 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=STAMP, token_wait_s=600, wait_s=600,
-                 delegate_session="group", seat="writer"),
+                 delegate_session="group", worker="writer"),
             token_holder("holder", STAMP, "2026-10-02T12:10:00Z", "writer", "group"),
         )
         name = "Build-folder turn, behind its own call"
@@ -741,8 +744,8 @@ class ReportTests(unittest.TestCase):
         ]
         calls.append(call("other-day", started_at="2026-10-01T12:00:00Z", token_wait_s=7200))
         steps = [
-            step(f"step-{name}", started_at=at, worktree=f"/r/{name}", seat=seat, mem_wait_s=wait)
-            for name, seat, wait in (("alpha", "impl", 900), ("beta", "test", 600), ("gamma", None, 360), ("delta", None, 0))
+            step(f"step-{name}", started_at=at, worktree=f"/r/{name}", worker=worker, mem_wait_s=wait)
+            for name, worker, wait in (("alpha", "impl", 900), ("beta", "test", 600), ("gamma", None, 360), ("delta", None, 0))
         ]
         self.write(self.root / "natedev" / "2026-10.jsonl", *calls, *steps)
         jobs = [
@@ -759,15 +762,15 @@ class ReportTests(unittest.TestCase):
 
         rows = self.waiting_rows()
         zone = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
-        self.assertEqual(rows["Build-folder turn, behind another seat"], [
-            f"10.0 min (alpha, {zone})", "3", "4 of 5 calls", "0.5 seat-hours",
+        self.assertEqual(rows["Build-folder turn, behind another worker"], [
+            f"10.0 min (alpha, {zone})", "3", "4 of 5 calls", "0.5 worker-hours",
             "alpha 16.0 min, beta 7.0 min, gamma 4.0 min",
         ])
         self.assertEqual(rows["Build-folder turn, behind its own call"], [
-            "none", "0", "0 of 5 calls", "0.0 seat-hours", "",
+            "none", "0", "0 of 5 calls", "0.0 worker-hours", "",
         ])
         self.assertEqual(rows["Memory admission"], [
-            f"15.0 min (alpha impl, {zone})", "3", "3 of 4 steps", "0.5 seat-hours",
+            f"15.0 min (alpha impl, {zone})", "3", "3 of 4 steps", "0.5 worker-hours",
             "alpha 15.0 min, beta 10.0 min, gamma 6.0 min",
         ])
         self.assertEqual(rows["CI queue"], [
@@ -778,7 +781,7 @@ class ReportTests(unittest.TestCase):
     def test_waiting_rows_remain_visible_when_no_wait_was_recorded(self) -> None:
         rows = self.waiting_rows()
         self.assertEqual(rows, {name: ["none", "", "", "", ""] for name in
-                                ("Build-folder turn, behind another seat", "Build-folder turn, behind its own call",
+                                ("Build-folder turn, behind another worker", "Build-folder turn, behind its own call",
                                  "Held target", "Memory admission", "CI queue")})
 
     def test_build_folder_wait_fully_behind_own_call_from_previous_day(self) -> None:
@@ -786,7 +789,7 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T12:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/alpha", seat="impl", delegate_session="delegate-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/alpha", worker="impl", delegate_session="delegate-a"),
             token_holder("holder", "2026-10-02T12:00:00Z", "2026-10-02T12:10:00Z", "impl", "delegate-a"),
         )
 
@@ -794,67 +797,67 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"10.0 min (alpha, {local_clock(at)})")
         self.assertEqual(
             rows["Build-folder turn, behind its own call"][2:],
-            ["1 of 1 calls", "0.2 seat-hours", "alpha 10.0 min"],
+            ["1 of 1 calls", "0.2 worker-hours", "alpha 10.0 min"],
         )
-        self.assertEqual(rows["Build-folder turn, behind another seat"][2], "0 of 1 calls")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][2], "0 of 1 calls")
 
-    def test_build_folder_wait_fully_behind_another_seat(self) -> None:
+    def test_build_folder_wait_fully_behind_another_worker(self) -> None:
         at = "2026-10-02T13:00:00Z"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T13:08:00Z",
-                 wait_s=420, token_wait_s=420, worktree="/r/beta", seat="impl", delegate_session="delegate-a"),
+                 wait_s=420, token_wait_s=420, worktree="/r/beta", worker="impl", delegate_session="delegate-a"),
             token_holder("holder", "2026-10-02T13:00:00Z", "2026-10-02T13:07:00Z", "test", "delegate-a"),
         )
 
         rows = self.waiting_rows()
-        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"7.0 min (beta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"7.0 min (beta, {local_clock(at)})")
         self.assertEqual(
-            rows["Build-folder turn, behind another seat"][2:],
-            ["1 of 1 calls", "0.1 seat-hours", "beta 7.0 min"],
+            rows["Build-folder turn, behind another worker"][2:],
+            ["1 of 1 calls", "0.1 worker-hours", "beta 7.0 min"],
         )
         self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
 
-    def test_build_folder_wait_splits_across_own_call_and_another_seat(self) -> None:
+    def test_build_folder_wait_splits_across_own_call_and_another_worker(self) -> None:
         at = "2026-10-02T14:00:00Z"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T14:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/gamma", seat="impl", delegate_session="delegate-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/gamma", worker="impl", delegate_session="delegate-a"),
             token_holder("own", "2026-10-02T14:00:00Z", "2026-10-02T14:04:00Z", "impl", "delegate-a"),
             token_holder("other", "2026-10-02T14:04:00Z", "2026-10-02T14:10:00Z", "test", "delegate-a"),
         )
 
         rows = self.waiting_rows()
-        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"6.0 min (gamma, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"6.0 min (gamma, {local_clock(at)})")
         self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"4.0 min (gamma, {local_clock(at)})")
-        self.assertEqual(rows["Build-folder turn, behind another seat"][2], "1 of 1 calls")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][2], "1 of 1 calls")
         self.assertEqual(rows["Build-folder turn, behind its own call"][2], "1 of 1 calls")
 
-    def test_uncovered_build_folder_wait_counts_as_behind_another_seat(self) -> None:
+    def test_uncovered_build_folder_wait_counts_as_behind_another_worker(self) -> None:
         at = "2026-10-02T15:00:00Z"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T15:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/delta", seat="impl", delegate_session="delegate-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/delta", worker="impl", delegate_session="delegate-a"),
             token_holder("own", "2026-10-02T15:00:00Z", "2026-10-02T15:02:00Z", "impl", "delegate-a"),
             token_holder("other", "2026-10-02T15:02:00Z", "2026-10-02T15:05:00Z", "test", "delegate-a"),
         )
 
         rows = self.waiting_rows()
-        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"8.0 min (delta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"8.0 min (delta, {local_clock(at)})")
         self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"2.0 min (delta, {local_clock(at)})")
 
-    def test_build_folder_wait_without_delegate_session_counts_as_another_seat(self) -> None:
+    def test_build_folder_wait_without_delegate_session_counts_as_another_worker(self) -> None:
         at = "2026-10-02T16:00:00Z"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T16:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/epsilon", seat="impl"),
+                 wait_s=300, token_wait_s=300, worktree="/r/epsilon", worker="impl"),
         )
 
         rows = self.waiting_rows()
-        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"5.0 min (epsilon, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"5.0 min (epsilon, {local_clock(at)})")
         self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
 
     def test_port_lint_calls_neither_count_as_build_folder_calls_nor_hold_the_folder(self) -> None:
@@ -862,14 +865,14 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T18:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/eta", seat="impl", delegate_session="delegate-a"),
+                 wait_s=300, token_wait_s=300, worktree="/r/eta", worker="impl", delegate_session="delegate-a"),
             call("lint", tool="port-lint", started_at=at, ended_at="2026-10-02T18:05:00Z",
-                 worktree="/r/eta", seat="impl", delegate_session="delegate-a"),
+                 worktree="/r/eta", worker="impl", delegate_session="delegate-a"),
         )
 
         rows = self.waiting_rows()
-        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"5.0 min (eta, {local_clock(at)})")
-        self.assertEqual(rows["Build-folder turn, behind another seat"][2], "1 of 1 calls")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"5.0 min (eta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][2], "1 of 1 calls")
         self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
 
     def test_holder_from_another_delegate_session_is_ignored(self) -> None:
@@ -877,12 +880,12 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T17:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/zeta", seat="impl", delegate_session="delegate-a"),
+                 wait_s=300, token_wait_s=300, worktree="/r/zeta", worker="impl", delegate_session="delegate-a"),
             token_holder("unrelated", "2026-10-02T17:00:00Z", "2026-10-02T17:05:00Z", "impl", "delegate-b"),
         )
 
         rows = self.waiting_rows()
-        self.assertEqual(rows["Build-folder turn, behind another seat"][0], f"5.0 min (zeta, {local_clock(at)})")
+        self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"5.0 min (zeta, {local_clock(at)})")
         self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
 
     def test_rebuild_bins_include_edges_and_exclude_unmeasured_steps(self) -> None:
@@ -1135,7 +1138,7 @@ class ReportTests(unittest.TestCase):
             ),
         )
 
-        waits = self.waiting_rows()["Build-folder turn, behind another seat"]
+        waits = self.waiting_rows()["Build-folder turn, behind another worker"]
         self.assertEqual(waits[0], f"5.0 min (feature, {local_clock(STAMP)})")
         self.assertEqual(waits[2], "1 of 1 calls")
 
@@ -1489,6 +1492,87 @@ class ReportTests(unittest.TestCase):
         self.assertLess(lines.index("### Test builds (temporary)"), start)
         self.assertLess(start, lines.index("### Tests per edit"))
 
+    def write_copy_day(self) -> None:
+        def at(minute: int) -> str:
+            return f"2026-10-02T12:{minute:02d}:00Z"
+
+        filtered = "test hana --filter a"
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            *(call(f"ref-{number}", started_at=at(number), command=filtered) for number in range(3)),
+            call("natedev-won", started_at=at(3), command=filtered, mac="declined", mac_reason="busy", mac_s=1.0,
+                 copy="natedev_won", copy_s=20.0, copy_count=1, copy_natedev_s=60.0),
+            call("won-a", started_at=at(4), command=filtered, mac="failed", mac_reason="", mac_s=30.0,
+                 status=1, outcome="failed", target="mac", copy="won", copy_s=30.0, copy_count=1, copy_natedev_s=90.0),
+            call("gave-way", started_at=at(5), mac="declined", mac_reason="busy", mac_s=1.0,
+                 copy="gave_way", copy_s=15.0, copy_count=2, copy_natedev_s=40.0),
+            call("passed-full", started_at=at(6), package="beta", command="test beta", mac="declined",
+                 mac_reason="busy", mac_s=1.0, copy="passed_full", copy_s=50.0, copy_count=1, copy_natedev_s=80.0),
+            call("won-b", started_at=at(7), package="beta", command="test beta --filter x", mac="passed_filter",
+                 mac_reason="", mac_s=25.0, target="mac", copy="won", copy_s=25.0, copy_count=1, copy_natedev_s=100.0),
+            call("won-gamma", started_at=at(8), package="gamma", command="test gamma --filter y", mac="failed",
+                 mac_reason="", mac_s=10.0, status=1, outcome="failed", target="mac",
+                 copy="won", copy_s=10.0, copy_count=1, copy_natedev_s=500.0),
+            call("plain-filter", started_at=at(9), mac="passed_filter", mac_reason="", mac_s=12.0, target="mac"),
+            *(self.nextest_step(f"ref-{number}-step", f"ref-{number}", duration_s=duration)
+              for number, duration in enumerate((100.0, 120.0, 200.0))),
+            self.nextest_step("natedev-won-step", "natedev-won", duration_s=60.0),
+            self.nextest_step("won-a-stopped", "won-a", duration_s=90.0, status=143),
+            self.nextest_step("gave-way-step", "gave-way", duration_s=300.0),
+            self.nextest_step("passed-full-step", "passed-full", duration_s=400.0),
+            self.nextest_step("won-b-stopped", "won-b", duration_s=100.0, status=143),
+        )
+
+    def test_mac_copies_section_counts_outcomes_and_estimates_the_saving(self) -> None:
+        self.write_copy_day()
+        text = self.render()
+        lines = text.splitlines()
+        mac = self.section_lines(text, "### Mac")
+        self.assertEqual(lines[lines.index("### Mac") + len(mac)], "### Mac copies")
+        section = self.section_lines(text, "### Mac copies")
+        self.assertEqual(section[2], "| Package | Copies | Mac won | natedev won | Gave way | Other | Est. saved"
+                         + " | Mac time on copies that did not win |")
+        self.assertEqual([line for line in section if line.startswith("| ")][1:], [
+            # beta: (400 - 100) from the package's one step, as the command has fewer than three.
+            "| beta | 2 | 1 | 0 | 0 | 1 | 5.0 min | 50.0 s |",
+            "| gamma | 1 | 1 | 0 | 0 | 0 | 0.0 s | — |",
+            # hana: the median of 100, 120 and 200 minus 90; the 60 s step ended before t.
+            "| hana | 4 | 1 | 1 | 1 | 0 | 30.0 s | 35.0 s |",
+        ])
+        self.assertTrue(any(line.startswith("Est. saved is an estimate:") for line in section))
+        lead = [line for line in lines[2:lines.index("### Waiting")] if line]
+        self.assertEqual(lead[-1], "Mac copies: 3 of 7 finished first, about 5.5 min saved (estimated).")
+        self.assertNotIn("Mac copies: none started.", text)
+
+    def test_copy_wins_are_not_natedev_runs_or_avoided_runs_or_failed_steps(self) -> None:
+        self.write_copy_day()
+        text = self.render()
+        targets = self.section_lines(text, "### Tests by target")
+        rows = {line.split("|")[1].strip(): [cell.strip() for cell in line.strip("|").split("|")]
+                for line in targets if line.startswith("| ") and not line.startswith("| Package")}
+        # hana: three references, the natedev win and the copy that gave way ran on natedev; won-a did not.
+        self.assertEqual(rows["hana"][5], "5")
+        self.assertEqual(rows["hana"][1:4], ["2", "1", "1"])
+        self.assertEqual(rows["beta"][5], "1")
+        avoided = next(line for line in targets if line.startswith("natedev runs avoided:"))
+        self.assertIn("natedev runs avoided: 1 ", avoided)
+        nextest = self.section_lines(text, "### nextest")
+        self.assertTrue(any(line.startswith("| verify.sh (agents) | 8 | 0 |") for line in nextest))
+        self.assertNotIn("Failed steps:", text)
+        failures = self.section_lines(text, "### Summary: failures")
+        self.assertTrue(any(line.startswith("| nextest | 2 |") for line in failures))
+
+    def test_day_without_a_copy_says_none_started_and_has_no_lead_line(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("plain", mac="declined", mac_reason="busy", mac_s=1.0),
+            self.nextest_step("plain-step", "plain"),
+        )
+        text = self.render()
+        self.assertIn("Mac copies: none started.", text.splitlines())
+        self.assertNotIn("### Mac copies", text)
+        self.assertNotIn("finished first", text)
+
     def test_local_pass_pairs_only_nearest_failure_and_reports_its_reason(self) -> None:
         reason = "uses Linux filesystem semantics"
         self.write(
@@ -1666,7 +1750,7 @@ class ReportTests(unittest.TestCase):
                 mac_reason="",
                 mac_s=10.0,
                 build_s=60,
-                delegate_session="seat-a",
+                delegate_session="worker-a",
             ),
             call(
                 "mac-only",
@@ -1675,7 +1759,7 @@ class ReportTests(unittest.TestCase):
                 mac_reason="",
                 mac_s=20.0,
                 build_s=600,
-                delegate_session="seat-a",
+                delegate_session="worker-a",
             ),
             self.nextest_step(
                 "local-step",
@@ -1727,7 +1811,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(waiting[0], f"1.0 min (feature, {local_clock(STAMP)})")
         self.assertEqual(waiting[2], "1 of 1 steps")
         folder_waiting = waiting_rows[
-            "Build-folder turn, behind another seat"
+            "Build-folder turn, behind another worker"
         ]
         self.assertEqual(folder_waiting[2], "0 of 1 calls")
 
@@ -1802,7 +1886,7 @@ class ReportTests(unittest.TestCase):
         self,
         number: int,
         *trees: str | None,
-        seat: str | None = "seat-a",
+        worker: str | None = "worker-a",
         session: str = "session-a",
         verb: str = "test",
         command: str = "test hana",
@@ -1818,7 +1902,7 @@ class ReportTests(unittest.TestCase):
                 call_id,
                 started_at=at,
                 ended_at=at,
-                delegate_session=seat,
+                delegate_session=worker,
                 session=session,
                 verb=verb,
                 command=command,
@@ -1876,7 +1960,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
         self.assertEqual(self.cell(ratios, "2026-10-02", "Tests/edit"), "3.00")
 
-    def test_lint_rewrite_inside_a_call_is_not_a_seat_edit(self) -> None:
+    def test_lint_rewrite_inside_a_call_is_not_a_worker_edit(self) -> None:
         self.verify_call(0, "tree-a")
         self.verify_call(1, "tree-a", None, "tree-b", verb="lint", command="lint hana")
         self.verify_call(2, "tree-b")
@@ -1890,12 +1974,12 @@ class ReportTests(unittest.TestCase):
         ratios, _ = self.per_edit_tables()
         self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
 
-    def test_delegate_session_then_session_identifies_independent_seats(self) -> None:
-        self.verify_call(0, "tree-a", seat="delegate-a", session="shared")
-        self.verify_call(1, "tree-b", seat="delegate-b", session="shared")
-        self.verify_call(2, "tree-b", seat="delegate-a", session="shared")
-        self.verify_call(3, "tree-c", seat=None, session="fallback")
-        self.verify_call(4, "tree-d", seat=None, session="fallback")
+    def test_delegate_session_then_session_identifies_independent_workers(self) -> None:
+        self.verify_call(0, "tree-a", worker="delegate-a", session="shared")
+        self.verify_call(1, "tree-b", worker="delegate-b", session="shared")
+        self.verify_call(2, "tree-b", worker="delegate-a", session="shared")
+        self.verify_call(3, "tree-c", worker=None, session="fallback")
+        self.verify_call(4, "tree-d", worker=None, session="fallback")
         ratios, _ = self.per_edit_tables()
         self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "2")
         self.assertEqual(self.cell(ratios, "2026-10-02", "Tests"), "5")
@@ -1908,11 +1992,11 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
         self.assertEqual(self.cell(ratios, "2026-10-02", "Tests/edit"), "2.00")
 
-    def test_daily_trend_sums_seats_and_shows_all_seven_days_newest_first(self) -> None:
-        self.verify_call(0, "tree-a", day="2026-10-01", seat="seat-a")
-        self.verify_call(1, "tree-b", day="2026-10-04", seat="seat-a")
-        self.verify_call(2, "tree-x", day="2026-10-04", seat="seat-b")
-        self.verify_call(3, "tree-y", day="2026-10-04", seat="seat-b")
+    def test_daily_trend_sums_workers_and_shows_all_seven_days_newest_first(self) -> None:
+        self.verify_call(0, "tree-a", day="2026-10-01", worker="worker-a")
+        self.verify_call(1, "tree-b", day="2026-10-04", worker="worker-a")
+        self.verify_call(2, "tree-x", day="2026-10-04", worker="worker-b")
+        self.verify_call(3, "tree-y", day="2026-10-04", worker="worker-b")
         ratios, _ = self.per_edit_tables("2026-10-04")
         self.assertEqual(ratios[0], ["Day", "Tests", "Edits", "Tests/edit", "Target"])
         self.assertEqual([row[0] for row in ratios[2:]], [
@@ -1928,11 +2012,11 @@ class ReportTests(unittest.TestCase):
         self.verify_call(0, "tree-0", day="2026-10-01")
         for number in range(1, 9):
             self.verify_call(number, f"tree-{number}", verb="lint", command="lint hana", day="2026-10-01")
-        self.verify_call(9, "tree-a", seat="other", day="2026-10-02", minute=0)
-        self.verify_call(10, "tree-b", seat="other", day="2026-10-02", minute=5)
-        self.verify_call(11, "tree-x", seat="third", day="2026-10-03", minute=0)
-        self.verify_call(12, "tree-y", seat="third", day="2026-10-03", verb="lint", command="lint hana", minute=5)
-        self.verify_call(13, "tree-z", seat="third", day="2026-10-03", verb="lint", command="lint hana", minute=10)
+        self.verify_call(9, "tree-a", worker="other", day="2026-10-02", minute=0)
+        self.verify_call(10, "tree-b", worker="other", day="2026-10-02", minute=5)
+        self.verify_call(11, "tree-x", worker="third", day="2026-10-03", minute=0)
+        self.verify_call(12, "tree-y", worker="third", day="2026-10-03", verb="lint", command="lint hana", minute=5)
+        self.verify_call(13, "tree-z", worker="third", day="2026-10-03", verb="lint", command="lint hana", minute=10)
         ratios, _ = self.per_edit_tables("2026-10-03")
         self.assertEqual(self.cell(ratios, "2026-10-01", "Tests/edit"), "0.12")
         self.assertEqual(self.cell(ratios, "2026-10-01", "Target"), "below")
@@ -1978,15 +2062,15 @@ class ReportTests(unittest.TestCase):
     def test_failures_at_three_four_seven_and_eight_edits_use_correct_bins(self) -> None:
         number = 0
         for edits in (3, 4, 7, 8):
-            seat = f"seat-{edits}"
-            self.verify_call(number, "tree-0", seat=seat, minute=0)
+            worker = f"worker-{edits}"
+            self.verify_call(number, "tree-0", worker=worker, minute=0)
             number += 1
             for changed in range(1, edits):
-                self.verify_call(number, f"tree-{changed}", seat=seat, verb="lint", command="lint hana", minute=changed)
+                self.verify_call(number, f"tree-{changed}", worker=worker, verb="lint", command="lint hana", minute=changed)
                 number += 1
-            self.verify_call(number, f"tree-{edits}", seat=seat, status=1, minute=edits)
+            self.verify_call(number, f"tree-{edits}", worker=worker, status=1, minute=edits)
             number += 1
-            self.verify_call(number, f"tree-{edits}", seat=seat, minute=edits + 10)
+            self.verify_call(number, f"tree-{edits}", worker=worker, minute=edits + 10)
             number += 1
         _, bins = self.per_edit_tables()
         self.assertEqual(self.cell(bins, "1", "Failures"), "0")
@@ -2542,11 +2626,11 @@ class ReportTests(unittest.TestCase):
 
     def test_failure_summary_and_edits_since_green_show_p95(self) -> None:
         for number, recovery in enumerate((5, 10, 20)):
-            seat = f"seat-{number}"
+            worker = f"worker-{number}"
             base = number * 15
-            self.verify_call(number * 3, "tree-a", seat=seat, minute=base)
-            self.verify_call(number * 3 + 1, "tree-b", seat=seat, status=1, minute=base + 1)
-            self.verify_call(number * 3 + 2, "tree-b", seat=seat, minute=base + 1 + recovery)
+            self.verify_call(number * 3, "tree-a", worker=worker, minute=base)
+            self.verify_call(number * 3 + 1, "tree-b", worker=worker, status=1, minute=base + 1)
+            self.verify_call(number * 3 + 2, "tree-b", worker=worker, minute=base + 1 + recovery)
         _, bins = self.per_edit_tables()
         self.assertEqual(bins[0][bins[0].index("Avg to next green") + 1], "p95 to next green")
         self.assertEqual(self.cell(bins, "1", "p95 to next green"), "20.0 min")

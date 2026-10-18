@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Block a showrunner reply whose final lines are not its current footer."""
+"""Block a showrunner reply whose final lines are not its current footer, or that answers a turn
+the user did not start with anything but "-" when nothing needs the user."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from typing import TypedDict, cast
 
 class StopPayload(TypedDict, total=False):
     session_id: str
+    transcript_path: str
     last_assistant_message: str
     stop_hook_active: bool
     agent_id: str
@@ -42,7 +44,7 @@ def showrunner_instances(session_id: str) -> list[str]:
 
 def main() -> None:
     payload = cast(StopPayload, json.loads(sys.stdin.read()))
-    if payload.get("stop_hook_active") or "agent_id" in payload:
+    if "agent_id" in payload:
         return
     session_id = payload.get("session_id", "")
     reply = payload.get("last_assistant_message", "")
@@ -51,13 +53,20 @@ def main() -> None:
     instances = showrunner_instances(session_id)
     if not instances:
         return
+    from pathlib import Path
+
     import showrunner_footer
+    import turn_input
+
+    transcript = payload.get("transcript_path", "")
+    turn = turn_input.read_turn(Path(transcript)) if transcript else None
 
     states: dict[str, showrunner_footer.FooterState] = {}
     for instance in instances:
         slug = os.path.basename(instance).removeprefix("showrunner-")
         states[slug] = showrunner_footer.footer_state(slug)
-    reason = showrunner_footer.block_reason(instances, reply, states)
+    reason = showrunner_footer.block_reason(instances, reply, states,
+                                            skip_footer=payload.get("stop_hook_active", False), turn=turn)
     if reason is not None:
         print(json.dumps({"decision": "block", "reason": reason}))
 

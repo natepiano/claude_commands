@@ -17,6 +17,7 @@ from typing import cast, override
 
 import broadcast
 import codex_winddown
+import fake_unit_host
 import fake_showrunner
 import showrunners
 import roster
@@ -36,20 +37,23 @@ with open(os.environ["LOG"], "a") as log:
 
 
 class CountTests(unittest.TestCase):
-    def test_reset_push_explains_why_work_is_safe_and_how_it_resumes(self) -> None:
-        """F013: a reset is safe once stopped; the clear command resumes new work."""
+    def test_reset_ready_notification_retries_failed_delivery_and_sends_once_after_success(self) -> None:
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (mock.patch.object(codex_winddown, "STATE", directory),
               mock.patch.object(codex_winddown, "instances", return_value=["production"]),
+              mock.patch.object(broadcast, "SEND", directory / "fake-send.py"),
               mock.patch.object(socket, "gethostname", return_value="natedev"),
-              mock.patch.object(broadcast, "send") as send):
+              mock.patch.object(subprocess, "run", side_effect=[
+                  subprocess.CompletedProcess([], 3, "FAILED: unavailable", ""),
+                  subprocess.CompletedProcess([], 0, "SENT", "")]) as run):
             codex_winddown.announce_quiet(0)
-        body = cast(str, send.call_args.args[2])
-        self.assertIn("will not interrupt their work", body)
-        self.assertIn("New Codex work stays paused", body)
-        self.assertIn("clear command", body)
-        argv = cast(tuple[str, ...], send.call_args.args)
-        self.assertIn("/codex_winddown clear", argv[argv.index("--action") + 1])
+            self.assertFalse((directory / codex_winddown.QUIET).exists())
+            codex_winddown.announce_quiet(0)
+            codex_winddown.announce_quiet(0)
+        self.assertEqual(run.call_count, 2)
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[1], str(directory / "fake-send.py"))
+        self.assertEqual(command[command.index("--text-id") + 1], "codex.reset_ready")
 
     def test_announcement_uses_showrunner_and_unit_director_groups(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -229,18 +233,12 @@ class MessageTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in ("notifier", "sessions"):
             (self.root / name).mkdir()
-        # hana's one unit: a row of its production doc, and a tmux session marked as that unit.
+        # hana's one unit: a row of its production doc, and a herdr pane marked as that unit.
         doc = self.root / "show-production.md"
         _ = doc.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                                       "| --- | --- | --- | --- | --- | --- |",
                                       "| trunk-unit | docs/plan.md | /tmp/no-worktree-of-trunk | trunk | — | — |")),
                            encoding="utf-8")
-        _ = (self.root / "tmux.json").write_text(json.dumps({"$1": {
-            "label": "any-label", "panes": ["%1"],
-            "env": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"}}}), encoding="utf-8")
-        self.enterContext(mock.patch.dict(os.environ, {
-            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
-            "FAKE_TMUX_STATE": str(self.root / "tmux.json")}))
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
             "always": [],
@@ -258,7 +256,7 @@ class MessageTests(unittest.TestCase):
             listener.bind(str(self.root / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
                 "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
-                "tmux": "name-at-start:@1.%1" if name == "trunk" else "",
+                "tmux": "",
                 "messagingSocketPath": str(self.root / f"{name}.sock"),
             }), encoding="utf-8")
         _ = (self.root / "notifier.sh").write_text(NOTIFIER_STUB, encoding="utf-8")
@@ -280,12 +278,14 @@ class MessageTests(unittest.TestCase):
             "CODEX_WINDDOWN_NOTIFIER": str(self.root / "notifier.sh"), "BROADCAST_SEND": str(self.root / "send.py"),
             "CODEX_WINDDOWN_STATE": str(self.root / "prompts"), "LOG": str(self.root / "log"),
             "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
-            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
-            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "ROSTER_DELEGATE_ROOT": str(self.root / "delegate"),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
         }
+        self.environment.update(fake_unit_host.environment(self.root))
+        fake_unit_host.write({**os.environ, **self.environment}, [
+            fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
+        fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
         self.set_processes()
 
     def set_processes(self, *lines: str) -> None:
@@ -362,10 +362,8 @@ class MessageTests(unittest.TestCase):
         for _ in range(2):
             _ = self.run_script("count", "hana")
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertEqual(log.count("send --to user --from codex-winddown --summary Codex is ready for your reset --need decision"
-                                   + " --action Reset Codex, then run /codex_winddown clear in a Claude session on"), 1)
-        self.assertIn("--text All Codex agents on", log)
-        self.assertIn("New Codex work stays paused until you run the clear command", log)
+        self.assertEqual(log.count("send --to user --from codex-winddown --need decision --text-id codex.reset_ready"), 1)
+        self.assertIn("--value machine=", log)
         self.set_processes(*agent)
         _ = self.run_script("count", "hana")
         self.set_processes()

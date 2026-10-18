@@ -21,9 +21,10 @@ from unittest import mock
 
 import pushover
 import review
+import push_texts
 from test_review import FakeReviewer, verdict
 from user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
-                         NoActionRequired, first_line, parse_user_action, refused_at)
+                         NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
 
 REAL_REVIEW = review.review
 
@@ -54,6 +55,27 @@ class UserActionTests(unittest.TestCase):
         for priority in (0, 1, 2):
             self.assertEqual(refused_at(required, priority), ActionAllowed())
 
+    def test_session_header_is_parsed_and_kept_above_the_action(self) -> None:
+        self.assertEqual(split_session("Session: Owner\nReason: stopped"), (SessionLine("Owner"), "Reason: stopped"))
+        self.assertEqual(split_session("Reason: stopped"), (NO_SESSION_LINE, "Reason: stopped"))
+        self.assertEqual(first_line(ActionRequired("run it"), SessionLine("Owner")), "Session: Owner\nAction: run it")
+
+    def test_messages_without_session_share_the_explicit_absence_state(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Done", push_texts.NoActionNeeded(),
+                                   "The check passed.", (push_texts.PushExample("typical", {}),))
+        rendered = push_texts.render_entry(entry, {})
+        draft = review.Draft("script", "0", rendered.title, rendered.action, rendered.body, False)
+        parsed = pushover.parse(["--no-action", rendered.title, rendered.body])
+        assert parsed is not None
+        self.assertIs(entry.session, NO_SESSION_LINE)
+        self.assertIs(rendered.session, NO_SESSION_LINE)
+        self.assertIs(push_texts.RenderedPush("test", "script", "note", rendered.title,
+                                            rendered.action, rendered.body, {}).session, NO_SESSION_LINE)
+        self.assertIs(draft.session, NO_SESSION_LINE)
+        self.assertIs(review._draft(dict(review.draft_record(draft))).session, NO_SESSION_LINE)  # pyright: ignore[reportPrivateUsage]
+        self.assertIs(parsed["session"], NO_SESSION_LINE)
+        self.assertIs(split_session(rendered.body)[0], NO_SESSION_LINE)
+
     def test_first_line_states_the_action(self) -> None:
         self.assertEqual(first_line(ActionRequired("choose a branch")), "Action: choose a branch")
         self.assertEqual(first_line(NoActionRequired()), "No action needed.")
@@ -81,6 +103,7 @@ class PushoverTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(folder / "state")})))
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=approve))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
+        _ = self.enterContext(mock.patch.object(pushover, "request_template_fix"))
         _ = self.enterContext(mock.patch.object(review, "run_process", side_effect=AssertionError("real reviewer")))
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
 
@@ -93,6 +116,30 @@ class PushoverTests(unittest.TestCase):
 
         code = pushover.send(argv, self.keys, post)
         return code, urllib.parse.parse_qs(sent[0].decode()) if sent else {}
+
+    def test_catalog_session_reaches_the_post_and_review_record(self) -> None:
+        entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
+            push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
+            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()) as output:
+            code, form = self.run_send(["--text-id", "test"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["message"], ["Session: Owner\nAction: stop Owner\nReason: waiting."])
+        self.assertIn('"session": "Owner"', output.getvalue())
+
+    def test_session_header_counts_toward_the_post_limit_without_truncation(self) -> None:
+        code, form = self.run_send(["--action", "stop Owner", "Owner is blocked", "Session: Owner\n" + "x" * 1200])
+        self.assertEqual(code, 0)
+        message = form["message"][0]
+        self.assertEqual(len(message), pushover.MESSAGE_MAX)
+        self.assertTrue(message.startswith("Session: Owner\nAction: stop Owner\n"))
+
+    def test_session_cannot_push_the_action_past_the_message_limit(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            code, form = self.run_send(["--action", "x" * pushover.ACTION_TEXT_MAX,
+                "Owner is blocked", "Session: Owner\nReason: waiting."])
+        self.assertEqual(code, 2)
+        self.assertEqual(form, {})
 
     def log_lines(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in pushover.LOG_FILE.read_text().splitlines()]
@@ -314,56 +361,85 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(record["held_identity"], review.hold_identity(held))
         self.assertIsInstance(review.held_for(draft.source), review.LiveHold)
 
-    def test_answerable_ask_holds_without_reading_keys_or_posting(self) -> None:
+    def test_session_ask_never_reads_keys_or_schedules_expiry_delivery(self) -> None:
         draft = self.draft(answerable=True)
-        questions = review.Questions(draft, ["Which build stopped?", "Which terminal?"], ["reader-starts-cold"])
+        questions = review.Questions(draft, ["Which build stopped?"], ["reader-starts-cold"])
         with (mock.patch.object(review, "review", return_value=questions),
               mock.patch.object(pushover, "read_keys", side_effect=AssertionError("held read keys")),
               redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(self.run_send(self.arguments(answerable=True)), (4, {}))
-        self.assertIn("within 5 minutes", errors.getvalue())
-        self.assertIn("1. Which build stopped?\n2. Which terminal?", errors.getvalue())
-        found = review.held_for(draft.source)
-        self.assertIsInstance(found, review.LiveHold)
-        assert isinstance(found, review.LiveHold)
-        self.assertEqual((found.hold.draft, found.hold.questions), (draft, questions.questions))
-        self.assertIsNone(self.reviews()[0]["sent"])
-        self.assertFalse(pushover.LOG_FILE.exists())
-
-    def test_script_ask_posts_best_version_without_holding(self) -> None:
-        draft = self.draft()
-        version = replace(draft, body="The build stopped. Choose whether to retry.")
-        outcome = review.Questions(version, ["Which build stopped?"], ["reader-starts-cold"])
-        with mock.patch.object(review, "review", return_value=outcome):
-            code, form = self.run_send(self.arguments())
-        self.assertEqual(code, 0)
-        self.assertEqual(form["message"], [first_line(version.action) + "\n" + version.body])
+            self.assertEqual(self.run_send(self.arguments(answerable=True)), (6, {}))
+        self.assertIn("not sent: reader-starts-cold", errors.getvalue())
         self.assertIsInstance(review.held_for(draft.source), review.NoHold)
-        self.assertIn("rewritten, script text failed: reader-starts-cold", str(self.log_lines()[0]["outcome"]))
+        self.assertIsNone(self.reviews()[0]["sent"])
 
-    def test_revision_ask_verdict_posts_as_rewrite_and_releases_hold(self) -> None:
+    def test_failed_revision_is_retired_and_cannot_post_on_expiry(self) -> None:
         draft = self.draft(answerable=True)
-        review.hold(review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"]))
-        body = "The nightly build stopped. Choose whether to retry."
-        runner = FakeReviewer(verdict(draft, "ask", body=body, questions=["Another question?"],
-                                      failed_rules=[{"rule": "reader-starts-cold", "quote": draft.body}]))
-
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"])
+        review.hold(held)
+        revised = replace(draft, body="The nightly build stopped. Choose whether to retry.")
+        replies = iter((verdict(draft, "rewrite", body=revised.body, failed_rules=[{"rule": "reader-starts-cold", "quote": draft.body}]),
+                        verdict(revised, "rewrite", body="Choose retry.", failed_rules=[{"rule": "reader-starts-cold", "quote": revised.body}])))
+        def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            value = next(replies) if Path(argv[0]).name == "claude" else verdict(draft)
+            return FakeReviewer(value)(argv, timeout=timeout, env=env)
         def read(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
-            self.assertTrue(revision)
             return REAL_REVIEW(draft, revision, runner=runner)
-
         with (mock.patch.object(review, "GUIDE", self.keys.parent),
               mock.patch.object(review, "reviewer_environment", return_value=({}, "default")),
-              mock.patch.object(review, "review", side_effect=read) as reviewer,
-              mock.patch.object(review, "hold", side_effect=AssertionError("revision held again"))):
-            code, form = self.run_send(self.arguments(answerable=True))
-        self.assertEqual(code, 0)
-        reviewer.assert_called_once_with(draft, revision=True)
-        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
-        self.assertIn("Revision: true", command[-1])
-        self.assertEqual(form["message"], [first_line(draft.action) + "\n" + body])
-        self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
+              mock.patch.object(review, "review", side_effect=read)):
+            self.assertEqual(self.run_send(self.arguments(answerable=True)), (6, {}))
+        with mock.patch.object(time, "time", return_value=time.time() + review.claim_stale_seconds() + 600):
+            self.assertEqual(review.due(post=mock.Mock(side_effect=AssertionError("retired claim posted")), keys_file=self.keys), 0)
         self.assertIsInstance(review.held_for(draft.source), review.NoHold)
+        self.assertIsNone(self.reviews()[0]["sent"])
+        self.assertEqual(review.held_path(draft.source).with_suffix(".held").read_text(), review.hold_identity(held))
+
+    def test_held_result_is_published_only_after_its_claim_is_retired(self) -> None:
+        draft = self.draft(answerable=True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"])
+        review.hold(held)
+        retire = review.retire_claim
+        with redirect_stdout(io.StringIO()) as output:
+            def retire_before_output(held: review.Held) -> None:
+                self.assertNotIn("pushover: reviewed JSON:", output.getvalue())
+                retire(held)
+            with (mock.patch.object(review, "review", return_value=review.Failed(draft, ["reader-starts-cold"])),
+                  mock.patch.object(review, "retire_claim", side_effect=retire_before_output)):
+                self.assertEqual(self.run_send(self.arguments(answerable=True)), (6, {}))
+        self.assertIn('"held": true', output.getvalue())
+
+    def test_withheld_session_note_is_not_posted_but_approved_finished_plan_note_is(self) -> None:
+        with mock.patch.object(review, "review", return_value=review.Withheld(self.draft(), "No user action or timely information.")):
+            self.assertEqual(self.run_send(["--no-action", "Still working", "The tests are running."]), (6, {}))
+        self.assertEqual(self.run_send(["--no-action", "Plan finished", "The whole plan finished and merged."])[0], 0)
+
+    def test_blocked_review_failure_is_posted_and_reported(self) -> None:
+        draft = self.draft()
+        failed = review.Failed(replace(draft, priority="2"), ["reader-starts-cold"])
+        with (mock.patch.object(review, "review", return_value=failed), redirect_stdout(io.StringIO()) as output):
+            code, form = self.run_send(["--priority", "2", "--action", "Choose retry.", draft.title, draft.body])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["priority"], ["2"])
+        self.assertIn("sent despite failed review: reader-starts-cold", output.getvalue())
+        self.assertIn("sent despite failed review", str(self.reviews()[0]["detail"]))
+
+    def test_registry_review_failure_sends_rendered_text_and_logs_its_id(self) -> None:
+        rendered = push_texts.RenderedPush("test", "script", "decision", "Choose retry", ActionRequired("Choose retry."), "The build stopped.", {})
+        wrong = review.Draft("script", "1", "Different title", rendered.action, "Different body", False)
+        with (mock.patch.object(push_texts, "render", return_value=rendered),
+              mock.patch.object(review, "held_for", side_effect=AssertionError("registry push used session hold")),
+              mock.patch.object(pushover, "request_template_fix") as fix,
+              mock.patch.object(review, "review", return_value=review.Failed(wrong, ["reader-starts-cold"]))):
+            code, form = self.run_send(["--text-id", "test"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], [rendered.title])
+        self.assertEqual(form["message"], [first_line(rendered.action) + "\n" + rendered.body])
+        self.assertEqual(self.reviews()[0]["text_id"], "test")
+        self.assertIn("sent despite failed review", str(self.reviews()[0]["detail"]))
+        fix.assert_called_once()
+        record = cast(pushover.ReviewedPushRecord, fix.call_args.args[0])
+        self.assertEqual(record.get("text_id"), "test")
+        self.assertEqual(record.get("failed_rules"), ["reader-starts-cold"])
 
     def test_cancelled_revision_drops_its_claim_without_posting_or_reporting_a_rewrite(self) -> None:
         draft = self.draft(answerable=True)
@@ -418,19 +494,6 @@ class PushoverTests(unittest.TestCase):
         with mock.patch.object(review, "review", side_effect=AssertionError("review during delivery")):
             self.assertEqual(self.run_send(self.arguments(answerable=True)), (4, {}))
 
-    def test_hold_write_or_schedule_failure_posts_best_version(self) -> None:
-        draft = self.draft(answerable=True)
-        version = replace(draft, body="The build stopped. Choose whether to retry.")
-        outcome = review.Questions(version, ["Which build stopped?"], ["reader-starts-cold"])
-        for target in ("hold", "schedule"):
-            with (self.subTest(target=target),
-                  mock.patch.object(review, "review", return_value=outcome),
-                  mock.patch.object(review, target, side_effect=OSError("state unavailable"))):
-                code, form = self.run_send(self.arguments(answerable=True))
-            self.assertEqual(code, 0)
-            self.assertEqual(form["message"], [first_line(version.action) + "\n" + version.body])
-            self.assertIsInstance(review.held_for(draft.source), review.NoHold)
-        self.assertTrue(all("hold failed:" in str(entry["outcome"]) for entry in self.log_lines()))
 
     def test_switch_off_skips_reviewer_and_logs_original(self) -> None:
         with redirect_stdout(io.StringIO()):

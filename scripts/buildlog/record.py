@@ -21,6 +21,11 @@ port_lint.py writes its own call records through write_call() here.
       record; WAIT, WALL, BUILD and SAVED are whole seconds, ELAPSED the
       script's $SECONDS at the end. STATUS and BUILD may be empty (unknown).
       BUILDLOG_TOKEN_WAIT_S is the time spent acquiring the cargo token.
+      BUILDLOG_MAC_COPY, BUILDLOG_MAC_COPY_S, BUILDLOG_MAC_COPY_COUNT and
+      BUILDLOG_MAC_COPY_NATEDEV_S describe a Mac copy of a still-compiling
+      natedev test: its outcome word, the seconds copies held the Mac, the
+      copies started, and how long the natedev step had run when the result
+      was decided.
   record.py hold-event <began|ended> <target> <hold key> <holder> <reason> <at> [<until>]
       AT is an ISO 8601 UTC instant with offset. UNTIL is empty when no end was planned.
   record.py backfill-verify [LEDGER]
@@ -164,7 +169,7 @@ def who() -> dict[str, str | None]:
     env = os.environ
     board = env.get("PLAN_DELEGATE_BOARD_DIR") or env.get("PLAN_DELEGATE_SESSION_DIR")
     return {
-        "seat": env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
+        "worker": env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
         "delegate_session": Path(board.rstrip("/")).name if board else None,
         "session": env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None,
     }
@@ -370,6 +375,10 @@ def call(args: list[str]) -> None:
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "target": os.environ.get("BUILDLOG_TARGET", ""),
         "hold_wait_s": optional_nonnegative_number(os.environ.get("BUILDLOG_HOLD_WAIT_S", "")),
+        "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
+        "copy_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_COPY_S", "")),
+        "copy_count": optional_int(os.environ.get("BUILDLOG_MAC_COPY_COUNT", "")),
+        "copy_natedev_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")),
         "wall_s": optional_int(wall) or 0,
         "build_s": optional_int(build),
         "saved_s": optional_int(saved) or 0,
@@ -475,7 +484,7 @@ def backfill(args: list[str]) -> None:
             "worktree": worktree,
             "branch": event["branch"] or None,
             "sha": event["commit"] or None,
-            "seat": None,
+            "worker": None,
             "delegate_session": event["session"] or None,
             "session": None,
             "backfilled": True,

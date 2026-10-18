@@ -67,7 +67,8 @@ PY
         _ = sweep.write_text('#!/bin/sh\nexit 0\n')
         sweep.chmod(0o755)
         self.environment = {
-            **os.environ,
+            **{name: value for name, value in os.environ.items()
+               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
             "HOME": str(self.root),
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "TMPDIR": str(self.root),
@@ -174,7 +175,7 @@ printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
 
-    def test_seat_with_stale_shell_id_marks_owner_after_memory_grant(self) -> None:
+    def test_worker_with_stale_shell_id_marks_owner_after_memory_grant(self) -> None:
         self.set_owner_marker()
         result = self.invoke(str(self.root / "stubs" / "compile"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -183,7 +184,7 @@ printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
         self.assertEqual(self.entry()["outcome"], "Granted")
         self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
 
-    def test_seat_memory_wait_and_return_mark_owner_before_compiling(self) -> None:
+    def test_worker_memory_wait_and_return_mark_owner_before_compiling(self) -> None:
         self.set_owner_marker()
         self.release_memory_after_poll()
         result = self.invoke(str(self.root / "stubs" / "compile"))
@@ -194,7 +195,7 @@ printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
         self.assertEqual(self.entry()["state"], "MemoryGateReturned")
         self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
 
-    def test_seat_without_shell_id_still_marks_owner(self) -> None:
+    def test_worker_without_shell_id_still_marks_owner(self) -> None:
         self.set_owner_marker()
         self.environment["CLAUDE_CODE_SESSION_ID"] = ""
         result = self.invoke(str(self.root / "stubs" / "compile"))
@@ -333,7 +334,7 @@ class VerifyRoutingTests(unittest.TestCase):
         self.assertIn("PASS (recorded)", second.stdout)
         self.assertEqual(self.state(), "AwaitingRelease")
 
-    def test_seat_with_stale_shell_id_marks_marker_owner_through_verify(self) -> None:
+    def test_worker_with_stale_shell_id_marks_marker_owner_through_verify(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
         self.set_owner_marker()

@@ -1,5 +1,0 @@
-{"timestamp":"2026-10-06T00:00:00Z","type":"session_meta","payload":{"id":"same-time","cwd":"/invented/seats"}}
-{"timestamp":"2026-10-06T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
-{"timestamp":"2026-10-06T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":0}}}}
-{"timestamp":"2026-10-06T01:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Add File: invented.py\n+value = 1\n*** End Patch"}}
-{"timestamp":"2026-10-06T02:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":0}}}}

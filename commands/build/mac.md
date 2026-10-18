@@ -17,13 +17,13 @@ Run `block`, `unblock`, and `status` with the sandbox off; they write state, cal
 - A kept claim means the claiming process died but its remote work may remain. `status` prints `running: leftovers of <what> on <host> since <time>, kept under pid <pid>`. Confirm the remote work ended, then run `python3 ~/.claude/scripts/mac_test/mac_test.py release --pid <pid>` to clear it by hand. The offload runner checks and ends leftovers before releasing a taken-over claim.
 - `blocked` or `block pending`: wait for the holder's release or free message; `unblock` removes your own block. If CI can still use the Mac, run `github-warmup`, then repeat `block`. An expiry with a failed CI restore needs `github-warmup`, then `unblock`.
 - `unreachable`: use `/build:targets --probe`; restore the connection before remote work.
-- `state unreadable`: inspect the named `~/.local/state/mac-test/block.json` or `run.json`. Repair it, or remove that damaged file only after checking its holder and any job still running. Then repeat `block` or `unblock` for a block; use `release --pid <pid>` for a readable kept claim. A natedev holder or release record reported by `/build:targets` is handled by `/build:hold`.
+- `state unreadable`: inspect the named `~/.local/state/mac-test/block.json`, `run.json` or `claims/<repo>.json`. Repair it, or remove that damaged file only after checking its holder and any job still running. Then repeat `block` or `unblock` for a block; use `release --pid <pid>` for a readable kept claim. A natedev holder or release record reported by `/build:targets` is handled by `/build:hold`.
 
 ## Taking the Mac for a job of your own
 
 Start the job on natedev. `verify.sh test` and `mac_run.sh` claim for themselves; do not claim before calling them.
 
-Before the first remote command, run `python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<job>' --wait <seconds>`. Continue only after exit 0: 10 means blocked, 11 means busy, and 12 means state unreadable; use the recovery above. When done, run `python3 ~/.claude/scripts/mac_test/mac_test.py release --pid $$`.
+Before the first remote command, run `python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<job>' --worktree <repo dir> --wait <seconds>`. The claim is that repository's (`--worktree` defaults to the current directory; outside any repository it claims the whole Mac): another repository's job can run beside it, a second job of the same repository cannot. Continue only after exit 0: 10 means blocked, 11 means busy, and 12 means state unreadable; use the recovery above. When done, run `python3 ~/.claude/scripts/mac_test/mac_test.py release --pid $$`, which removes every claim that pid holds.
 
 A claim with nothing running on the Mac for 15 minutes is released and its holder is told, so claim right before remote work and claim again after a release.
 

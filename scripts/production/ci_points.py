@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value
 from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history
 
 
@@ -145,7 +146,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     history = merge_branch_history(production.checkout, production.merge_branch)
-    last_code = next((entry for entry in history.entries if isinstance(entry.kind, CodeCheckpoint)), None)
+    last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
     argv = ("bash", str(script), "--to", production.merge_branch, "--fix-commit",
@@ -213,28 +214,6 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
     print(f"--ci-green {tip}")
 
 
-def review_watch_push(table: str) -> tuple[str, str, str]:
-    title = "Reviewer removal lacks comparison data"
-    result = "The report has no comparable defect counts, so the removal's effect is unknown."
-    recommendation = "Acknowledge (recommended; work continues either way): rerun with ack instead of report to stop these report notices."
-    for line in table.splitlines():
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) == 4 and cells[0] == "merge design-check defects per phase (mean)":
-            title = "Reviewer removal: merge defects compared"
-            result = f"Defects found at merge per phase: {cells[2]} before removal, {cells[3]} after."
-            if cells[2] == cells[3] and cells[2] != "—":
-                title = "Reviewer removal left defects unchanged"
-                result = f"Defects found at merge stayed at {cells[3]} per phase before and after."
-                recommendation = "Acknowledge (recommended; defects did not rise): rerun with ack instead of report to stop these report notices."
-            break
-    body = ("An extra code reviewer was removed from merge review. " + result + "\n\n"
-            + "In a terminal on natedev, read:\n"
-            + "python3 ~/.claude/scripts/production/review_regime.py report\n"
-            + recommendation + "\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.")
-    return title, "On natedev, read the report. Choose acknowledge or discuss.", body
-
-
 def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | WatchRepeat | WatchBelowThreshold:
     review_script = Path(os.environ.get("CI_POINTS_REVIEW_REGIME", os.environ.get(
         "DAILIES_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py")))))
@@ -252,15 +231,10 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         if record.exists():
             return WatchRepeat(line)
         table = required(command("watch", sys.executable, str(review_script), "report", "--since", "2026-09-28"), "watch")
-        title, action, notice = review_watch_push(table)
-        send = Path.home() / ".claude/scripts/message/send.py"
-        _ = required(command("watch", sys.executable, str(send), "--to", "user", "--from", "ci_points", "--need", "decision",
-                             "--action", action,
-                             "--summary", title, "--text", notice), "watch")
         moment = datetime.now(production.zone).strftime("%H:%M %Z")
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(f"- {moment}: review watch: {line}\n")
+            _ = log.write(f"- {moment}: review watch: {line}\n{table}\n")
         write_json(record, {"alerted": datetime.now(production.zone).isoformat(timespec="seconds"), "line": line})
         return WatchFirstAlert(line, table)
 
@@ -294,7 +268,7 @@ def notice(production: Production, gate_id: str, kind: str, log: Path | None) ->
         message = f"From the showrunner: {gate_id} lifted — your tests pass without {target} phase {phase} ({log}). Continue."
     else:
         history = merge_branch_history(production.checkout, production.merge_branch)
-        landed = next((entry for entry in history.entries if entry.unit == target and entry.phase == phase
+        landed = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and entry.unit == target and entry.phase == phase
                        and isinstance(entry.kind, CodeCheckpoint)), None)
         if not isinstance(landed, MergeEntry):
             raise PointFailure("notice clear", f"{target} phase {phase} has no code merge on {production.merge_branch}")

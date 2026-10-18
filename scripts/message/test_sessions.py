@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Iterator
 from typing import cast, override
 from unittest import mock
 
@@ -46,7 +47,7 @@ class SessionLookupTests(ShutdownTestCase):
     def record(
         self, filename: str, *, pid: int | None = None, name: str = "agent",
         session_id: str = "session-1", socket_path: Path | None = None, updated: int = 1,
-        proc_start: str = "",
+        proc_start: str = "", entrypoint: str = "",
     ) -> None:
         data = {
             "pid": os.getpid() if pid is None else pid,
@@ -55,6 +56,7 @@ class SessionLookupTests(ShutdownTestCase):
             "messagingSocketPath": str(self.socket_path if socket_path is None else socket_path),
             "updatedAt": updated,
             "procStart": proc_start,
+            **({"entrypoint": entrypoint} if entrypoint else {}),
         }
         _ = (self.sessions / filename).write_text(json.dumps(data))
 
@@ -95,6 +97,25 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(self.run_cli("address", "session:sid-123").stdout, f"uds:{self.socket_path}\n")
         self.assertEqual(self.run_cli("id", "showrunner").stdout.strip(), "sid-123")
         self.assertEqual(self.run_cli("id", str(os.getpid())).stdout.strip(), "sid-123")
+
+    def test_a_relay_named_like_a_session_is_never_found_or_listed(self) -> None:
+        relay_socket = socket.socket(socket.AF_UNIX)
+        self.addCleanup(relay_socket.close)
+        relay_path = self.root / "relay.sock"
+        relay_socket.bind(str(relay_path))
+        self.record("session.json", name="natedev", session_id="sid-session", updated=10, entrypoint="cli")
+        # send.py's relay is a newer `claude -p` run started with `-n natedev`.
+        self.record("relay.json", name="natedev", session_id="sid-relay", socket_path=relay_path, updated=20,
+                    entrypoint="sdk-cli")
+        self.assertEqual(self.run_cli("address", "natedev").stdout, f"uds:{self.socket_path}\n")
+        self.assertEqual(self.run_cli("socket", "session:sid-relay").returncode, 1)
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            live = sessions.live_sessions()
+            running = sessions.running_sessions()
+        self.assertEqual([record["sessionId"] for record in live], ["sid-session"])
+        self.assertEqual([record["sessionId"] for record in running], ["sid-session"])
+        found = sessions.addressed("natedev", live)
+        self.assertEqual(found["sessionId"] if found else None, "sid-session")
 
     def test_newest_live_match_wins(self) -> None:
         other = socket.socket(socket.AF_UNIX)
@@ -285,6 +306,36 @@ class SessionLookupTests(ShutdownTestCase):
         for args in ((), ("socket",), ("address",), ("id",), ("unknown", "agent")):
             self.assertEqual(self.run_cli(*args).returncode, 2)
 
+    def test_registry_read_reports_directory_failure_instead_of_empty_success(self) -> None:
+        original = Path.iterdir
+
+        def paths(path: Path) -> Iterator[Path]:
+            if path == self.sessions:
+                raise PermissionError("registry denied")
+            return original(path)
+
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}), mock.patch.object(Path, "iterdir", paths):
+            read = sessions.read_registry()
+            self.assertEqual(read.unreadable, (self.sessions,))
+            self.assertEqual(read.entries, ())
+            self.assertEqual(sessions.live_sessions(), [])
+
+    def test_registry_read_keeps_good_records_and_names_each_bad_record(self) -> None:
+        self.record("good.json", name="kept")
+        good = self.sessions / "good.json"
+        contents = cast(dict[str, object], json.loads(good.read_text()))
+        contents["cwd"], contents["status"] = "/kept-folder", "idle"
+        _ = good.write_text(json.dumps(contents))
+        broken = self.sessions / "bad.json"
+        _ = broken.write_text("{broken")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            read = sessions.read_registry()
+            self.assertEqual([item.record["name"] for item in read.entries], ["kept"])
+            self.assertEqual(read.unreadable, (broken,))
+            self.assertEqual(read.entries[0].details.get("cwd"), "/kept-folder")
+            self.assertEqual(read.entries[0].details.get("status"), "idle")
+            self.assertEqual([item["name"] for item in sessions.live_sessions()], ["kept"])
+
 
 class ProcessStartTests(ShutdownTestCase):
     def test_linux_start_survives_a_process_name_cut_inside_a_utf8_character(self) -> None:
@@ -344,3 +395,5 @@ class ProcessStartTests(ShutdownTestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+

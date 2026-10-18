@@ -7,7 +7,6 @@ import fcntl
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,12 +14,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
-import showrunners
 import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from account import account_of
-from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, retired_units
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, live_unit_table, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
@@ -110,37 +108,6 @@ class CleanupFailed(NamedTuple):
     detail: str
 
 
-class HoldQuotaAlert(NamedTuple):
-    account: str
-    alert: str
-
-
-class ClearQuotaAlerts(NamedTuple):
-    accounts: tuple[str, ...]
-
-
-class RestoreQuotaAlerts(NamedTuple):
-    accounts: tuple[str, ...]
-    tools: tuple[str, ...]
-
-
-class EveryUnit(NamedTuple):
-    pass
-
-
-class UnitsOnAccount(NamedTuple):
-    # The Claude note label an alert names when more than one Claude account is in use.
-    account: str
-
-
-QuotaRecipients = EveryUnit | UnitsOnAccount
-
-# quota_alert.account_line: "<account>, the active <Tool> account, has …" with one Claude account,
-# "<account> (<roles>) at <n>% of its weekly usage left …" for a Claude account once there are several.
-SINGLE_ACCOUNT_LINE = re.compile(r"(.+?), the active (\w+) account")
-ROLE_ACCOUNT_LINE = re.compile(r"(.+?) \([^)]*\) at .+? of its weekly usage left")
-
-
 class BerthOverlap(NamedTuple):
     scopes: tuple[str, ...]
     blocker: str
@@ -226,12 +193,13 @@ def read_state(path: Path) -> JsonMap:
     return cast(JsonMap, raw)
 
 
-def update_state(path: Path, change: Callable[[JsonMap], StateResult]) -> StateResult:
+def update_state(path: Path, change: Callable[[JsonMap], StateResult], *,
+                 read: Callable[[Path], JsonMap] = read_state) -> StateResult:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(f"{path}.lock")
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        content = read_state(path)
+        content = read(path)
         before = json.dumps(content, sort_keys=True)
         result = change(content)
         if json.dumps(content, sort_keys=True) == before:
@@ -586,128 +554,13 @@ def agenda(production: Production, state_dir: Path) -> None:
         print(f"agenda: ok — {item.unit}|{item.phase}")
 
 
-def quota(production: Production, notice: str, state_dir: Path) -> None:
-    lines = notice.strip().splitlines()
-    line = lines[0] if lines else ""
-    kind = next((prefix for prefix in ("Quota alert acknowledged:", "Quota restored:", "Quota alert:")
-                 if line.startswith(prefix)), "")
-    if not kind:
-        raise WaitingFailure("quota", "expected a quota alert notice")
-    path = state_dir / "quota_seen.json"
-    recipients: QuotaRecipients = EveryUnit()
-    if kind == "Quota alert:":
-        account_text = line.removeprefix(kind).strip()
-        single = SINGLE_ACCOUNT_LINE.match(account_text)
-        role = ROLE_ACCOUNT_LINE.match(account_text)
-        if single is not None:
-            account, tool = single.group(1), single.group(2)
-        elif role is not None:
-            account, tool = role.group(1), "Claude"
-        else:
-            raise WaitingFailure("quota", "expected a quota alert account line")
-        change: HoldQuotaAlert | ClearQuotaAlerts | RestoreQuotaAlerts = HoldQuotaAlert(account, line)
-        if role is not None:
-            recipients = UnitsOnAccount(account)
-            action = (f"{account}, the Claude account you run on, is low: start no new Claude work until a "
-                      + f"quota restored notice for {account}")
-        elif "Every function that ran on" in notice:
-            action = f"delegation continues on Claude; rerun {tool} work in flight"
-        elif "nothing was switched to Claude" in notice:
-            action = (f"keep delegating on {tool}: its weekly allowance is used up and credits may be carrying the "
-                      + f"work; tell the showrunner at once if {tool} refuses work for quota")
-        else:
-            action = f"start no new delegate work on {tool}; running seats finish"
-    elif kind == "Quota alert acknowledged:":
-        named = re.search(r"the user silenced (.+?) (?:in session|outside any session)", line)
-        accounts = [item.strip() for item in named.group(1).split(",")] if named else [line.removeprefix(kind).strip()]
-        change = ClearQuotaAlerts(tuple(accounts))
-        action = "keep delegation paused on the acknowledged account"
-    else:
-        named_accounts: list[str] = []
-        line_tools: list[str] = []
-        for entry in lines[1:]:
-            if single := SINGLE_ACCOUNT_LINE.match(entry):
-                named_accounts.append(single.group(1))
-                line_tools.append(single.group(2).lower())
-            elif role := ROLE_ACCOUNT_LINE.match(entry):
-                named_accounts.append(role.group(1))
-                line_tools.append("claude")
-        named_tools = re.search(r"delegation on (.+?) can resume", line)
-        named_work = re.search(r"work on (.+?) can resume", line)
-        if named_tools is None and named_work is not None:
-            tools = tuple(sorted(set(line_tools)))
-            action = f"work on {named_work.group(1)} can resume"
-        else:
-            tool_names = named_tools.group(1) if named_tools else line.removeprefix(kind).strip()
-            tools = tuple(item.strip().lower() for item in tool_names.split(" and "))
-            action = f"delegation on {tool_names} can resume"
-        change = RestoreQuotaAlerts(tuple(named_accounts), tools)
-    sender = shutil.which("send.py") or str(Path(__file__).resolve().parent.parent / "message/send.py")
-    failures: list[str] = []
-    for unit in units_from_doc(production):
-        if not unit.session:
-            failures.append(f"{unit.name}: no Claude is running in its session, so it was not told")
-            continue
-        if isinstance(recipients, UnitsOnAccount):
-            found = account_of(unit.pid) if unit.pid is not None else None
-            if found is None:
-                failures.append(f"{unit.session}: its Claude account could not be read, so it was not told")
-                continue
-            if found.label.casefold() != recipients.account.casefold():
-                print(f"skip {unit.session}: it runs on {found.label}, not {recipients.account}")
-                continue
-        try:
-            delivered = subprocess.run([sys.executable, sender, "--to", unit.session,
-                                        "--from", showrunners.current_name(production.slug) or "showrunner",
-                                        "--text", f"From the showrunner: {action}"],
-                                       capture_output=True, text=True, check=False)
-        except OSError as error:
-            failures.append(f"{unit.session}: {error}")
-            continue
-        if delivered.returncode == 0:
-            print(f"send {unit.session}: From the showrunner: {action}")
-        elif delivered.returncode == 1:
-            print(f"queued {unit.session}: From the showrunner: {action}")
-        else:
-            failures.append(f"{unit.session}: {detail(delivered)}")
-
-    def change_held(held: JsonMap) -> JsonMap:
-        if isinstance(change, HoldQuotaAlert):
-            held[change.account] = change.alert
-        elif isinstance(change, ClearQuotaAlerts):
-            for account in change.accounts:
-                _ = held.pop(account, None)
-        else:
-            named_held = any(account in held for account in change.accounts)
-            for account in change.accounts:
-                _ = held.pop(account, None)
-            if not named_held:
-                for account, alert in tuple(held.items()):
-                    alert_text = alert if isinstance(alert, str) else ""
-                    alert_account = alert_text.removeprefix("Quota alert:").strip()
-                    single = SINGLE_ACCOUNT_LINE.match(alert_account)
-                    tool = (single.group(2).lower() if single
-                            else "claude" if ROLE_ACCOUNT_LINE.match(alert_account) else "")
-                    if tool in change.tools:
-                        _ = held.pop(account, None)
-        return held
-
-    held = update_state(path, change_held)
-    if failures:
-        report("quota", "failed", "; ".join(failures))
-        raise WaitingFailure("quota", "")
-    report("quota", "ok", f"{len(held)} held account alerts")
-    for alert in held.values():
-        print(f"held: {alert}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="step", required=True)
-    for name in ("scratch-test", "waits", "search", "quota", "agenda", "eta-request"):
+    for name in ("scratch-test", "waits", "search", "agenda", "eta-request"):
         sub = commands.add_parser(name)
         _ = sub.add_argument("--production", required=True, type=Path)
-        if name in ("scratch-test", "quota", "agenda", "eta-request"):
+        if name in ("scratch-test", "agenda", "eta-request"):
             _ = sub.add_argument("--state-dir", required=True, type=Path)
         if name == "scratch-test":
             _ = sub.add_argument("unit")
@@ -715,8 +568,6 @@ def main() -> int:
         elif name == "search":
             _ = sub.add_argument("old")
             _ = sub.add_argument("new")
-        elif name == "quota":
-            _ = sub.add_argument("--notice")
         elif name == "eta-request":
             _ = sub.add_argument("unit")
             _ = sub.add_argument("--phase", required=True)
@@ -730,8 +581,6 @@ def main() -> int:
             waits(production)
         elif step == "search":
             search(production, cast(str, args.old), cast(str, args.new))
-        elif step == "quota":
-            quota(production, cast(str | None, args.notice) or sys.stdin.read(), cast(Path, args.state_dir))
         elif step == "agenda":
             agenda(production, cast(Path, args.state_dir))
         else:

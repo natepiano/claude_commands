@@ -32,12 +32,16 @@ CALL_ID = "natedev-20261002T120000-abcdef"
 SWEEP = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py"]
 NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 # What the ambient session would otherwise stamp on every record: the caller,
-# the delegate seat, the session and the call id all come from these.
+# the delegate worker, the session and the call id all come from these.
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
     "BUILDLOG_LOCAL_REASON",
     "BUILDLOG_MAC_HOLDER",
+    "BUILDLOG_MAC_COPY",
+    "BUILDLOG_MAC_COPY_S",
+    "BUILDLOG_MAC_COPY_COUNT",
+    "BUILDLOG_MAC_COPY_NATEDEV_S",
     "BUILDLOG_TARGET",
     "BUILDLOG_HOLD_WAIT_S",
     "LINT_OUTPUT_DIR",
@@ -656,7 +660,7 @@ class RecordTests(unittest.TestCase):
             "cwd": str(self.repo),
             "repo_path": str(self.repo),
             "branch": "main",
-            "seat": "impl2",
+            "worker": "impl2",
             "delegate_session": "run-7",
             "session": "session-1",
             "backfilled": False,
@@ -760,6 +764,39 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(call_record["mac_reason"], "")
         self.assertEqual(call_record["mac_s"], 12.5)
         self.assertEqual(call_record["local_reason"], local_reason)
+
+    def test_call_records_the_mac_copy_outcome_and_times(self) -> None:
+        result = self.record(
+            "call", "failed", "1", "0", "9", "100", "", "0", "110", "test", "hana",
+            extra={
+                "BUILDLOG_MAC_COPY": "won",
+                "BUILDLOG_MAC_COPY_S": "41.5",
+                "BUILDLOG_MAC_COPY_COUNT": "2",
+                "BUILDLOG_MAC_COPY_NATEDEV_S": "95.25",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.records()[-1]
+        self.assertEqual(
+            [record[key] for key in ("copy", "copy_s", "copy_count", "copy_natedev_s")], ["won", 41.5, 2, 95.25]
+        )
+
+    def test_call_without_a_copy_records_empty_outcome_and_null_times(self) -> None:
+        for value in ("", "abc", "-1", "nan"):
+            with self.subTest(value=value):
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={
+                        "BUILDLOG_MAC_COPY_S": value,
+                        "BUILDLOG_MAC_COPY_COUNT": "" if value == "-1" else value,
+                        "BUILDLOG_MAC_COPY_NATEDEV_S": value,
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = self.records()[-1]
+                self.assertEqual(
+                    [record[key] for key in ("copy", "copy_s", "copy_count", "copy_natedev_s")], ["", None, None, None]
+                )
 
     def test_call_local_reason_defaults_to_empty(self) -> None:
         result = self.record(

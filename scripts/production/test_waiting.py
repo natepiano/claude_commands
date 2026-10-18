@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -21,36 +22,24 @@ from typing import cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
 import dailies_render
 import merge_checkpoint
 import update_registration
 import waiting
-import unit_lookup
-import herdr
+from cli_fixture import invoke_cli
 from fake_herdr import CommandResponse
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-import account
-import agent_accounts
-import quota_alert
-from scripts.accounts.accounts import CodexSeatsAccount
+import fake_unit_host
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("waiting.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
 ALPHA = "alpha-unit"
 BETA = "beta-unit"
 GAMMA = "gamma-unit"
 PHASE = "Phase 2 of 3: panel labels stay clear"
-# Quota notices read no live account dirs: each test names the Claude accounts in use.
-MAIN_CLAUDE = agent_accounts.KnownClaudeAccount("main@example.invalid", "claude 2")
-UNIT_CLAUDE = agent_accounts.KnownClaudeAccount("unit@example.invalid", "claude 3")
-ONE_CLAUDE_ACCOUNT = agent_accounts.ClaudeAccountsInUse(MAIN_CLAUDE, False, (), frozenset())
-TWO_CLAUDE_ACCOUNTS = agent_accounts.ClaudeAccountsInUse(
-    MAIN_CLAUDE, True,
-    (agent_accounts.CheckedNamedClaudeAccount("claude 3", Path("/unread/.claude3"), UNIT_CLAUDE),),
-    frozenset((UNIT_CLAUDE.login,)))
 PHASE_IDENTITY = "Phase 2 of 3"
 BERTH_STUB = '''#!__PYTHON__
 import os
@@ -95,21 +84,6 @@ def setUpModule() -> None:
 
 
 @final
-class QuotaNote:
-    path: Path
-    tool: str
-    values: dict[str, str]
-
-    def __init__(self, path: Path, tool: str, values: dict[str, str]) -> None:
-        self.path = path
-        self.tool = tool
-        self.values = values
-
-    def get(self, key: str) -> str | None:
-        return self.values.get(key)
-
-
-@final
 class WaitingTests(unittest.TestCase):
     root: Path = Path()
     checkout: Path = Path()
@@ -123,6 +97,7 @@ class WaitingTests(unittest.TestCase):
     origin: Path = Path()
     bin_path: Path = Path()
     env: dict[str, str] = {}
+    host_pids: dict[str, int] = {}
 
     @override
     def setUp(self) -> None:
@@ -141,7 +116,7 @@ class WaitingTests(unittest.TestCase):
         berth = self.bin_path / "cargo-berth"
         _ = berth.write_text(BERTH_STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
         berth.chmod(0o755)
-        for name in ("quota_alert.py", "quota", "claude", "tmux", "systemd-run", "ssh", "nix"):
+        for name in ("quota_alert.py", "quota", "claude", "systemd-run", "ssh", "nix"):
             stub = self.bin_path / name
             _ = stub.write_text(NO_EXTERNAL_COMMAND.replace("__PYTHON__", sys.executable), encoding="utf-8")
             stub.chmod(0o755)
@@ -150,7 +125,7 @@ class WaitingTests(unittest.TestCase):
         send.chmod(0o755)
         home = self.root / "home"
         home.mkdir()
-        # Each unit has a tmux session marked as that unit, with a Claude running under the unit's id
+        # Each unit has a herdr session marked as that unit, with a Claude running under the unit's id
         # as its name. Tests that call the tool in this process read the same stand-ins.
         (self.root / "sessions").mkdir()
         self.write(self.root / "showrunners.json", json.dumps({
@@ -162,22 +137,19 @@ class WaitingTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(home),
             "CODEX_HOME": str(home / "codex-fixture"),
-            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
-            "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
-        _ = self.enterContext(mock.patch.object(quota_alert, "seats_home", side_effect=AssertionError(
-            "quota tests must supply Codex readings instead of resolving a live home")))
-        self.write(self.root / "tmux.json", json.dumps({
-            f"${index}": {"label": "any-label", "panes": [f"%{index}"],
-                          "env": {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit}}
-            for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1)}))
+        self.host_pids = {}
+        fake_unit_host.write(os.environ, [
+            fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
+            for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1)])
         for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1):
-            self.claude(unit, f"%{index}")
+            self.claude(unit, f"w{index}:p1")
         self.env = {**os.environ, "HOME": str(home), "WAITING_TEST_BOARD": str(self.board),
                     "WAITING_TEST_SENDS": str(self.sends),
                     "PATH": str(self.bin_path) + os.pathsep + os.environ.get("PATH", "")}
@@ -248,15 +220,19 @@ class WaitingTests(unittest.TestCase):
         return self.git("for-each-ref", "--format=%(refname) %(objectname)", cwd=cwd)
 
     def claude(self, name: str, pane: str) -> None:
-        """Record a live Claude called `name` in `pane`: this test process stands in for it."""
-        path = self.root / f"claude-{pane.removeprefix('%')}.sock"
+        """Record a live Claude called `name` in the fixture pane."""
+        path = self.root / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
             self.addCleanup(held.close)
-        self.write(self.root / "sessions" / f"{pane.removeprefix('%')}.json", json.dumps({
-            "pid": os.getpid(), "sessionId": f"id-{name}", "name": name, "messagingSocketPath": str(path),
-            "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}"}))
+        if pane not in self.host_pids:
+            self.host_pids[pane] = fake_unit_host.live_pid(self)
+        pid = self.host_pids[pane]
+        fake_unit_host.place_process(os.environ, pid, pane)
+        self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
+            "pid": pid, "sessionId": f"id-{name}", "name": name, "messagingSocketPath": str(path),
+            "updatedAt": 1, "tmux": ""}))
 
     def production_doc(self) -> None:
         self.write(self.doc, "\n".join((
@@ -282,12 +258,12 @@ class WaitingTests(unittest.TestCase):
 
     def alpha_session(self, session: str) -> None:
         """The user renamed alpha's session: only the live session record says so."""
-        self.claude(session, "%1")
+        self.claude(session, "w1:p1")
 
     def run_waiting(self, action: str, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), action, *args,
-                               "--production", str(self.doc)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+        arguments = [action, *args, "--production", str(self.doc)]
+        return invoke_cli(waiting, waiting.main, arguments, self.env, self.checkout, production_state=True)
+
 
     def commit(self, worktree: Path, relative: str, content: str) -> str:
         self.write(worktree / relative, content)
@@ -295,8 +271,10 @@ class WaitingTests(unittest.TestCase):
         _ = self.git("commit", "-m", f"change {relative}", cwd=worktree)
         return self.git("rev-parse", "HEAD", cwd=worktree)
 
+
     def worktrees(self) -> str:
         return self.git("worktree", "list", "--porcelain")
+
 
     def assert_scratch_clean(self, worktrees: str, unit_tip: str, merge_tip: str,
                              local_refs: str, origin_refs: str) -> None:
@@ -310,6 +288,7 @@ class WaitingTests(unittest.TestCase):
         for checkout in (self.checkout, self.alpha):
             self.assertNotEqual(self.git_result("rev-parse", "-q", "--verify", "MERGE_HEAD",
                                                 cwd=checkout).returncode, 0)
+
 
     def test_named_unit_refuses_retired_row(self) -> None:
         content = self.doc.read_text(encoding="utf-8")
@@ -441,53 +420,6 @@ class WaitingTests(unittest.TestCase):
         resolved = dailies_render.resolve_eta_moments(report, previous, moment)
         return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
 
-    def quota_note(self, name: str, tool: str = "codex", login: str = "") -> QuotaNote:
-        return QuotaNote(self.root / f"{name}.md", tool, {
-            "state": "active",
-            "weekly_remaining_usage": "4",
-            "resets": "2026-10-12 09:00 PDT",
-            "weekly_usage_checked_at": "2026-10-07 02:00 PDT",
-            **({"login": login} if login else {}),
-        })
-
-    def quota_message(self, note: QuotaNote,
-                      selection: agent_accounts.ClaudeAccountsInUse = ONE_CLAUDE_ACCOUNT) -> str:
-        config: quota_alert.Config = {
-            "threshold_percent": 5.0,
-            "repeat_minutes": 30.0,
-            "stall_minutes": 5.0,
-            "faults_to": "showrunner-example",
-            "always": [],
-        }
-        home = self.root / "codex-fixture"
-        readings = quota_alert.CodexAlertPassReadings(
-            CodexSeatsAccount("default", home),
-            agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.path.stem),
-            (),
-        )
-        return quota_alert.message(note, [], config, selection=selection, codex_readings=readings)
-
-    def acknowledgement_message(self, account: str) -> str:
-        state_path = self.root / "quota-alert-state.json"
-        _ = state_path.write_text(json.dumps({
-            "episodes": {
-                "codex 1": {"since": "2026-10-07T01:00:00+00:00", "last": {}},
-                "codex 2": {"since": "2026-10-07T01:00:00+00:00", "last": {}},
-            },
-        }) + "\n", encoding="utf-8")
-        notices: list[str] = []
-
-        def capture(text: str, here: str | None) -> list[str]:
-            del here
-            notices.append(text)
-            return []
-
-        with (mock.patch.object(quota_alert, "STATE", state_path),
-              mock.patch.object(quota_alert, "tell_others", side_effect=capture)):
-            _ = quota_alert.acknowledge(account, here="showrunner-example",
-                                        now=datetime(2026, 10, 7, 6, 0, tzinfo=ZoneInfo("UTC")))
-        self.assertEqual(len(notices), 1)
-        return notices[0]
 
     def test_scratch_green_uses_detached_unit_tip_and_lift_accepts_its_log(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")
@@ -655,7 +587,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_parallel_eta_requests_for_different_phases_keep_every_record(self) -> None:
         phases = [f"Phase {number}: parallel record" for number in range(1, 13)]
         processes = [self.eta_request_process(phase) for phase in phases]
-        outputs = [process.communicate(timeout=25) for process in processes]
+        outputs = [process.communicate(timeout=300) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
@@ -664,7 +596,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
         processes = [self.eta_request_process(PHASE) for _ in range(12)]
-        outputs = [process.communicate(timeout=25) for process in processes]
+        outputs = [process.communicate(timeout=300) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
@@ -673,19 +605,61 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
 
     def test_eta_request_waits_for_its_state_lock(self) -> None:
+        # The child proves it reached the held lock, rather than racing startup
+        # against a short wait(). Keep the real blocking flock after the signal.
+        program = """import fcntl, os, runpy, sys
+ready = int(sys.argv.pop(1))
+sys.argv.pop(0)
+original = fcntl.flock
+def observed_lock(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            original(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.write(ready, b'blocked')
+        else:
+            raise RuntimeError('expected the parent to hold the state lock')
+    return original(fd, operation)
+fcntl.flock = observed_lock
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
         lock_path = self.state / "eta_seen.json.lock"
-        with lock_path.open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            process = self.eta_request_process(PHASE)
-            with self.assertRaises(subprocess.TimeoutExpired):
-                _ = process.wait(timeout=0.5)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            stdout, stderr = process.communicate(timeout=25)
+        read_ready, write_ready = os.pipe()
+        try:
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                process = subprocess.Popen(
+                    [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
+                     "eta-request", ALPHA, "--phase", PHASE,
+                     "--production", str(self.doc), "--state-dir", str(self.state)],
+                    cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                os.close(write_ready)
+                write_ready = -1
+                try:
+                    readable, _, _ = select.select([read_ready], [], [], 300)
+                    self.assertEqual(readable, [read_ready], "child never reached the held lock")
+                    if os.read(read_ready, 7) != b"blocked":
+                        stdout, stderr = process.communicate(timeout=300)
+                        self.fail("child exited before observing the state lock: " + stdout + stderr)
+                    self.assertIsNone(process.poll())
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    stdout, stderr = process.communicate(timeout=300)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    _ = process.communicate(timeout=300)
+        finally:
+            os.close(read_ready)
+            if write_ready != -1:
+                os.close(write_ready)
         self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", stdout)
 
     def test_waits_accepts_unconfigured_berth_and_still_reports_log_waits(self) -> None:
-        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
         opened = now - timedelta(minutes=72)
         cleared = now - timedelta(minutes=50)
         self.write(self.log, "\n".join((
@@ -695,12 +669,18 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             f"- {(cleared + timedelta(minutes=5)):%H:%M %Z}: block cleared: {BETA} on {ALPHA}", "",
         )))
         self.unconfigured_board()
-        result = self.run_waiting("waits")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("waits: ok — 1 open; berth not configured", result.stdout)
-        self.assertIn(f"{ALPHA} on {BETA}", result.stdout)
-        self.assertRegex(result.stdout, r"open 7[12] minutes")
-        self.assertNotIn(f"{BETA} on {ALPHA}: open", result.stdout)
+        output = io.StringIO()
+        clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
+        with mock.patch.dict(os.environ, self.env), \
+             mock.patch.object(waiting, "datetime", clock), \
+             mock.patch.object(sys, "argv", [str(SCRIPT), "waits", "--production", str(self.doc)]), \
+             redirect_stdout(output):
+            code = waiting.main()
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("waits: ok — 1 open; berth not configured", output.getvalue())
+        self.assertIn(f"{ALPHA} on {BETA}", output.getvalue())
+        self.assertIn("open 72 minutes", output.getvalue())
+        self.assertNotIn(f"{BETA} on {ALPHA}: open", output.getvalue())
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
         content = self.doc.read_text(encoding="utf-8")
@@ -933,170 +913,12 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(agenda.returncode, 0, agenda.stdout + agenda.stderr)
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", agenda.stdout)
 
-    def test_quota_tracks_full_account_stems_through_acknowledgment_and_restore(self) -> None:
-        first_note, second_note = self.quota_note("codex 1"), self.quota_note("codex 2")
-        for note in (first_note, second_note):
-            result = self.run_waiting("quota", "--notice", self.quota_message(note),
-                                      "--state-dir", str(self.state))
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        seen_path = self.state / "quota_seen.json"
-        held = cast(dict[str, object], json.loads(seen_path.read_text()))
-        self.assertEqual(set(held), {"codex 1", "codex 2"})
 
-        acknowledged = self.run_waiting("quota", "--notice", self.acknowledgement_message("codex 1"),
-                                        "--state-dir", str(self.state))
-        self.assertEqual(acknowledged.returncode, 0, acknowledged.stdout + acknowledged.stderr)
-        held = cast(dict[str, object], json.loads(seen_path.read_text()))
-        self.assertEqual(set(held), {"codex 2"})
-
-        restored_notes: list[quota_alert.AgentNote] = [second_note]
-        restored_notice = quota_alert.restored_message(restored_notes, "the codex 2 alert is closed", 5.0,
-                                                       selection=ONE_CLAUDE_ACCOUNT)
-        restored = self.run_waiting("quota", "--notice", restored_notice,
-                                    "--state-dir", str(self.state))
-        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
-        self.assertEqual(json.loads(seen_path.read_text()), {})
-
-    def test_quota_prints_each_held_alert_with_percent_left_and_reset_time(self) -> None:
-        first_note, second_note = self.quota_note("codex 1"), self.quota_note("codex 2")
-        first = self.run_waiting("quota", "--notice", self.quota_message(first_note),
-                                 "--state-dir", str(self.state))
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        second = self.run_waiting("quota", "--notice", self.quota_message(second_note),
-                                  "--state-dir", str(self.state))
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        held = [line for line in second.stdout.splitlines() if line.startswith("held: ")]
-        self.assertEqual(len(held), 2, second.stdout)
-        for account in ("codex 1", "codex 2"):
-            line = next(item for item in held if account in item)
-            self.assertIn("4%", line)
-            self.assertIn("resets 2026-10-12 09:00 PDT", line)
-
-    def test_quota_tells_units_to_keep_delegating_on_codex_and_to_stop_on_claude(self) -> None:
-        codex = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("codex 1")),
-                                 "--state-dir", str(self.state))
-        self.assertEqual(codex.returncode, 0, codex.stdout + codex.stderr)
-        self.assertIn(f"send {ALPHA}: From the showrunner: keep delegating on Codex:", codex.stdout)
-        self.assertIn("tell the showrunner at once if Codex refuses work for quota", codex.stdout)
-        self.assertNotIn("start no new", codex.stdout)
-        claude = self.run_waiting("quota", "--notice", self.quota_message(self.quota_note("claude 2", "claude")),
-                                  "--state-dir", str(self.state))
-        self.assertEqual(claude.returncode, 0, claude.stdout + claude.stderr)
-        self.assertIn(f"send {ALPHA}: From the showrunner: start no new delegate work on Claude;", claude.stdout)
-
-    def test_quota_reaches_a_live_herdr_unit_by_its_claude_name(self) -> None:
-        native_name = "native-director"
-        tmux = cast(dict[str, object], json.loads((self.root / "tmux.json").read_text()))
-        del tmux["$1"]
-        self.write(self.root / "tmux.json", json.dumps(tmux))
-        self.write(self.root / "herdr-responses.json", json.dumps({
-            "--session default session list --json": CommandResponse(
-                code=0,
-                stdout=json.dumps(herdr.SessionListResult(sessions=[herdr.SessionEntry(
-                    name="native", running=True, default=False,
-                    session_dir="/fixture", socket_path="/fixture/socket",
-                )])),
-            ),
-        }))
-
-        def process(pid: int, parent: int, argv: list[str], **environment: str) -> None:
-            directory = self.root / "proc" / str(pid)
-            directory.mkdir(parents=True)
-            _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
-            _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
-            _ = (directory / "environ").write_bytes(
-                ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
-            )
-            (directory / "cwd").symlink_to(self.alpha)
-
-        process(991000, 0, ["herdr", "--session", "native", "server"])
-        process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID="w1:p1",
-                SHOWRUNNER_UNIT="example", SHOWRUNNER_UNIT_ID=ALPHA)
-        path = self.root / "sessions/1.json"
-        record = cast(dict[str, object], json.loads(path.read_text()))
-        record.update(name=native_name, tmux="")
-        self.write(path, json.dumps(record))
-        with mock.patch.dict(os.environ, self.env):
-            marked = unit_lookup.marked_units("example")[ALPHA]
-        self.assertEqual(marked.place, herdr.HerdrPlace("native", "w1:p1"))
-        place = subprocess.run(
-            [sys.executable, str(SCRIPT.with_name("unit_lookup.py")), "pane", "example", ALPHA],
-            env=self.env, capture_output=True, text=True, check=False,
-        )
-        self.assertEqual((place.returncode, place.stdout), (0, "herdr:native:w1:p1\n"), place.stderr)
-
-        notice = self.quota_message(self.quota_note("codex 1"))
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [native_name, BETA])
-        self.assertIn(f"send {native_name}: From the showrunner: keep delegating on Codex:", result.stdout)
-        native_call = calls[0]
-        text = native_call[native_call.index("--text") + 1]
-        self.assertTrue(text.startswith("From the showrunner: keep delegating on Codex:"), text)
-        self.assertIn("tell the showrunner at once if Codex refuses work for quota", text)
-
-    def test_quota_tells_only_units_on_a_low_claude_account_when_several_are_in_use(self) -> None:
-        self.add_gamma()
-        note = self.quota_note("claude 3", "claude", login=UNIT_CLAUDE.login)
-        notice = self.quota_message(note, TWO_CLAUDE_ACCOUNTS)
-        self.assertTrue(notice.startswith("Quota alert: claude 3 (in use) at 4%"), notice)
-        production = add_unit.read_production(self.doc)
-        with mock.patch.dict(os.environ, self.env):
-            units = waiting.units_from_doc(production)
-        self.assertTrue(all(unit.pid == os.getpid() for unit in units), units)
-        # The stand-in units share this process's pid; give each its own so each can run on its own account.
-        numbered = tuple(unit._replace(pid=index) for index, unit in enumerate(units, start=1))
-        on_account = {1: account.Account("claude", UNIT_CLAUDE.login, "claude 3"),
-                      2: account.Account("claude", MAIN_CLAUDE.login, "claude 2")}
-        output = io.StringIO()
-        with (mock.patch.dict(os.environ, self.env), redirect_stdout(output),
-              mock.patch.object(waiting, "units_from_doc", return_value=numbered),
-              mock.patch.object(waiting, "account_of", side_effect=on_account.get),
-              self.assertRaises(waiting.WaitingFailure)):
-            waiting.quota(production, notice, self.state)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [ALPHA])
-        self.assertIn(f"send {ALPHA}: From the showrunner: claude 3, the Claude account you run on, is low: "
-                      + "start no new Claude work until a quota restored notice for claude 3", output.getvalue())
-        self.assertIn(f"skip {BETA}: it runs on claude 2, not claude 3", output.getvalue())
-        self.assertIn(f"{GAMMA}: its Claude account could not be read, so it was not told", output.getvalue())
-        held = cast(dict[str, object], json.loads((self.state / "quota_seen.json").read_text()))
-        self.assertEqual(list(held), ["claude 3"])
-
-        restored_notice = quota_alert.restored_message([note], "claude 3 is back above 5%", 5.0,
-                                                       selection=TWO_CLAUDE_ACCOUNTS)
-        self.assertTrue(restored_notice.startswith("Quota restored: work on claude 3 can resume"), restored_notice)
-        restored = self.run_waiting("quota", "--notice", restored_notice, "--state-dir", str(self.state))
-        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
-        self.assertIn(f"send {BETA}: From the showrunner: work on claude 3 can resume", restored.stdout)
-        self.assertEqual(json.loads((self.state / "quota_seen.json").read_text()), {})
-
-    def test_quota_queues_one_unit_collects_failure_and_saves_held_alert(self) -> None:
-        self.add_gamma()
-        send = self.bin_path / "send.py"
-        self.write(send, SEND_OUTCOME_STUB.replace("__PYTHON__", sys.executable))
-        send.chmod(0o755)
-        notice = self.quota_message(self.quota_note("codex 1"))
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
+    def test_removed_quota_subcommand_refuses_without_sending(self) -> None:
+        result = self.run_waiting("quota", "--notice", "Codex usage exhausted", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [ALPHA, BETA, GAMMA])
-        self.assertIn(f"send {ALPHA}:", result.stdout)
-        self.assertIn(f"queued {BETA}:", result.stdout)
-        self.assertIn(f"quota: failed — {GAMMA}:", result.stdout)
-        held = cast(dict[str, object], json.loads((self.state / "quota_seen.json").read_text()))
-        self.assertEqual(set(held), {"codex 1"})
-
-    def test_quota_reports_a_unit_with_no_claude_running_and_tells_the_others(self) -> None:
-        (self.root / "sessions" / "2.json").unlink()
-        notice = self.quota_message(self.quota_note("codex 1"))
-        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
-        self.assertEqual([call[call.index("--to") + 1] for call in calls], [ALPHA])
-        self.assertIn(f"quota: failed — {BETA}: no Claude is running in its session, so it was not told",
-                      result.stdout)
+        self.assertFalse(self.sends.exists())
+        self.assertEqual(list(self.state.glob("*quota*")), [])
 
     def test_agenda_reports_missing_merge_branch_without_traceback(self) -> None:
         self.write(self.doc, self.doc.read_text(encoding="utf-8").replace(
@@ -1126,26 +948,20 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertNotIn("Ask again only if", unmeasured)
         self.assertIn("the command will not repeat the request", unmeasured)
 
-    def test_quota_alert_and_agenda_contracts_keep_every_user_surface(self) -> None:
-        root = SCRIPT.parents[2]
-        produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
-        quota = produce.split("<QuotaAlert>", 1)[1].split("</QuotaAlert>", 1)[0]
-        agenda = produce.split("<Agenda>", 1)[1].split("</Agenda>", 1)[0]
-        agenda_words = " ".join(agenda.split())
-        open_topics = dailies.split("5. **Open topics.**", 1)[1].split("6. **Review watch.**", 1)[0]
 
-        self.assertIn("listed first in every Waiting on block", " ".join(quota.split()))
-        self.assertIn("led by `quota: `", " ".join(quota.split()))
+    def test_agenda_contract_has_no_quota_hold_protocol(self) -> None:
+        root = SCRIPT.parents[2]
+        produce = (root / "commands/showrunner/produce.md").read_text()
+        dailies = (root / "commands/showrunner/dailies.md").read_text()
+        self.assertNotIn("<QuotaAlert>", produce)
+        self.assertNotIn("held quota alerts", dailies)
         nested = " ".join(produce.split("- **Nested showrunners.**", 1)[1].split("- **What reaches the user:**", 1)[0].split())
-        # A lower showrunner's item lives only in its owner's list, so clearing it there is all it takes.
         self.assertIn("never copy a lower showrunner's item into your own `open_for_user`", nested)
         self.assertIn("The root's count drops by itself: send the root nothing to drop it.", nested)
-        self.assertIn("held quota alerts", open_topics)
-        self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda_words)
-        self.assertEqual(agenda_words.count("`For discussion with you`"), 1)
-        self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda_words)
-
+        agenda = " ".join(produce.split("<Agenda>", 1)[1].split("</Agenda>", 1)[0].split())
+        self.assertIn("`- HH:MM <zone>: agenda: <item>`", agenda)
+        self.assertEqual(agenda.count("`For discussion with you`"), 1)
+        self.assertIn("`- HH:MM <zone>: agenda closed: <item>: <what was decided>`", agenda)
 
 if __name__ == "__main__":
     _ = unittest.main()

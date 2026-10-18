@@ -28,8 +28,8 @@ from scripts.shot_report.transcripts import AvailableTimingSource, ExactAttemptC
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    """Pin fixture dates so the user's zone setting does not change test windows."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Vancouver"}))
 
 
 class EpisodeRecord(TypedDict):
@@ -626,32 +626,78 @@ class ShotReportTest(unittest.TestCase):
                  "attempts": [{"status": "success", "mode": "fit", "crop": "rect", "resolve_ms": 10, "total_ms": 100},
                               {"status": "failure", "failure_reason": "empty_crop", "image_paths": []}]},
                 {"time": "2026-10-01T00:01:00+00:00", "status": "failure", "failure_reason": "timeout",
-                 "invocation_kind": "shot", "attempts": []},
+                 "invocation_kind": "shot", "error": "Capture timed out; wait before retrying", "attempts": []},
                 {"time": "2026-10-01T00:02:00+00:00", "invocation_kind": "unknown", "mode": "pose",
                  "crop": "none", "total_ms": 200},
+                {"time": "2026-10-01T00:02:30+00:00", "status": "failure", "failure_reason": "timeout",
+                 "invocation_kind": "shot", "attempts": []},
                 {"time": "2026-10-01T00:03:00+00:00", "status": "success", "invocation_kind": "views_check",
                  "attempts": [{"status": "success", "mode": "fit", "crop": "none", "total_ms": 90}]},
             ]
             _ = (state_dir / "invocations.jsonl").write_text(
                 "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
             output = report_module.report(state_dir, since="2026-09-30", until="2026-10-02")
-        self.assertIn("kind=shot n=2 success=1 failure=1 legacy_success=0", output)
+        self.assertIn("kind=shot n=3 success=1 failure=2 legacy_success=0", output)
         self.assertIn("kind=views_check n=1 success=1", output)
         self.assertIn("kind=unknown n=1 success=0 failure=0 legacy_success=1", output)
-        self.assertIn("failure_reason=timeout n=1", output)
+        self.assertIn("failure_reason=timeout n=2", output)
         self.assertIn("failure_reason=empty_crop n=1", output)
         self.assertIn("failure_reason=shot_failed n=0", output)
         self.assertIn("kind=shot mode=fit crop=rect n=1 resolve_ms=10.0(n=1)", output)
 
-    def test_winter_window_names_pst_with_offset(self) -> None:
-        stamp = datetime.fromisoformat("2026-01-10T12:00:00+00:00")
-        self.assertIn("PST (-0800)", report_module._pacific(stamp))  # pyright: ignore[reportPrivateUsage]
+    def test_user_time_uses_configured_zone_and_seasonal_offset(self) -> None:
+        with mock.patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
+            for stamp, expected in (
+                ("2026-01-10T12:00:00+00:00", "2026-01-10 13:00 CET (+0100)"),
+                ("2026-07-10T12:00:00+00:00", "2026-07-10 14:00 CEST (+0200)"),
+            ):
+                with self.subTest(stamp=stamp):
+                    actual = report_module._user_time(datetime.fromisoformat(stamp))  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(actual, expected)
 
     def test_winter_report_heading_names_zone_and_both_offsets(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with mock.patch.dict(os.environ, {"USER_ZONE": "UTC"}), tempfile.TemporaryDirectory() as directory:
             heading = report_module.report(Path(directory), "2026-01-10", "2026-01-11").splitlines()[0]
-        self.assertIn("America/Los_Angeles", heading)
-        self.assertEqual(heading.count("PST (-0800)"), 2)
+        self.assertIn("UTC", heading)
+        self.assertEqual(heading.count("UTC (+0000)"), 2)
+
+    def test_weekly_heading_uses_configured_zone(self) -> None:
+        with mock.patch.dict(os.environ, {"USER_ZONE": "Asia/Kolkata"}), tempfile.TemporaryDirectory() as directory:
+            output = report_module.report(Path(directory), "2026-09-08", "2026-10-02")
+        heading = next(line for line in output.splitlines() if "Weekly agent-hours" in line)
+        self.assertRegex(heading, r"Asia/Kolkata|IST")
+
+    def test_report_reads_zone_from_configuration_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            configuration = state_dir / "user_zone.conf"
+            _ = configuration.write_text("zone=Asia/Kolkata\n", encoding="utf-8")
+            environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
+            environment["USER_ZONE_CONF"] = str(configuration)
+            result = subprocess.run([
+                sys.executable, str(COMMAND), "report", "--state-dir", str(state_dir),
+                "--since", "2026-01-10", "--until", "2026-01-11",
+            ], cwd=HERE, env=environment, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heading = result.stdout.splitlines()[0]
+        self.assertIn("Asia/Kolkata", heading)
+        self.assertEqual(heading.count("IST (+0530)"), 2)
+        weekly_heading = next(line for line in result.stdout.splitlines() if "Weekly agent-hours" in line)
+        self.assertRegex(weekly_heading, r"Asia/Kolkata|IST")
+
+    def test_baseline_keeps_its_utc_instant_and_displays_user_zone(self) -> None:
+        with mock.patch.dict(os.environ, {"USER_ZONE": "Asia/Kolkata"}), tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            result = subprocess.run([
+                sys.executable, str(COMMAND), "scan", "--state-dir", str(state_dir),
+                "--claude-root", str(FIXTURES / "claude" / "projects"),
+                "--codex-root", str(FIXTURES / "codex" / "sessions"),
+                "--timings-path", str(state_dir / "missing-timings.jsonl"),
+            ], cwd=HERE, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = result.stdout
+        baseline_lines = [line for line in output.splitlines() if "2026-09-09 12:30 IST (+0530)" in line]
+        self.assertEqual(len(baseline_lines), 2, output)
 
     def test_change_window_stops_at_other_repository_change_on_same_host(self) -> None:
         baseline = next(episode for episode in read_episodes(self.state_dir / "episodes.jsonl") if episode.split == 300)
@@ -678,8 +724,8 @@ class ShotReportTest(unittest.TestCase):
         row = next(line for line in output.splitlines()
                    if line.startswith("claude rollout /hana_shot 300s after host=natedev"))
         self.assertIn("n=1 median_min=1.0", row)
-        self.assertIn(report_module._pacific(rollout + timedelta(minutes=20)), row)  # pyright: ignore[reportPrivateUsage]
-        self.assertNotIn(report_module._pacific(rollout + timedelta(minutes=10)), row)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn(report_module._user_time(rollout + timedelta(minutes=20)), row)  # pyright: ignore[reportPrivateUsage]
+        self.assertNotIn(report_module._user_time(rollout + timedelta(minutes=10)), row)  # pyright: ignore[reportPrivateUsage]
 
     def test_mac_reader_filters_nonmatching_files_and_reexamines_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1278,7 +1324,7 @@ class ShotReportTest(unittest.TestCase):
                     mac_line = next(line for line in report_module.report(state_dir).splitlines()
                                     if line.startswith("Mac:"))
                     self.assertIn(expected, mac_line)
-                    self.assertIn(report_module._pacific(mac_start), mac_line)  # pyright: ignore[reportPrivateUsage]
+                    self.assertIn(report_module._user_time(mac_start), mac_line)  # pyright: ignore[reportPrivateUsage]
 
     def test_change_with_missing_required_key_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

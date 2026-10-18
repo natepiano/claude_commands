@@ -227,7 +227,7 @@ def summarize_window(calls: list[MacTestCall]) -> WindowSummary:
             if isinstance(result.reason, str):
                 unavailable += int(local_reason_says_mac_unavailable(result.reason))
         elif isinstance(result, MacRunCompleted):
-            passed += int(result.outcome in ("passed", "passed_filter"))
+            passed += int(result.outcome in ("passed", "passed_filter", "passed_full"))
             failed += int(result.outcome == "failed")
         elif isinstance(result, MacRunMatchedNoTest):
             no_tests += 1

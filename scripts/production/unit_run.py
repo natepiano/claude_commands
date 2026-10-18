@@ -15,7 +15,7 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.usage import collect
-from add_unit import Refusal, cell_value, unit_table
+from production_units import Refusal, cell_value, unit_table
 
 
 @dataclass(frozen=True)
@@ -51,16 +51,22 @@ def local_run(root: Path, worktree: str) -> RunFound | NoMatchingRun:
     for path in sorted(root.glob("runs/*.jsonl")):
         try:
             with path.open(encoding="utf-8") as stream:
+                # A run file holds one run_started event; stop reading at it.
                 for line in stream:
+                    if '"run_started"' not in line:
+                        continue
                     try:
                         event = cast(object, json.loads(line))
                     except ValueError:
                         continue
-                    candidate = matching_start(path.stem, event, worktree)
-                    if isinstance(candidate, RunFound):
-                        if isinstance(newest, NoMatchingRun) or candidate.started_at > newest.started_at:
-                            newest = candidate
-                        break
+                    fields = cast(dict[str, object], event) if isinstance(event, dict) else {}
+                    if fields.get("event_type") != "run_started":
+                        continue
+                    candidate = matching_start(path.stem, fields, worktree)
+                    if isinstance(candidate, RunFound) and (
+                            isinstance(newest, NoMatchingRun) or candidate.started_at > newest.started_at):
+                        newest = candidate
+                    break
         except (OSError, UnicodeError):
             continue
     return newest

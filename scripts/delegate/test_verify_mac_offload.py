@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import contextlib
 from contextlib import contextmanager
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
@@ -22,11 +25,51 @@ from scripts.build_hold import build_hold
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+# Paths and process exits advance tests; this is only a hung-process guard.
+HANG_GUARD_S = 300
 
 
 def restore_sigint() -> None:
     # Background suite processes may inherit SIG_IGN; Bash cannot trap that.
     _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def processes_carrying(marker: str) -> set[int]:
+    """Live processes, other than this one, whose environment holds `marker`; a zombie's reads empty."""
+    needle = marker.encode()
+    found: set[int] = set()
+    for entry in Path("/proc").iterdir() if Path("/proc").is_dir() else ():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if needle in (entry / "environ").read_bytes().split(b"\0"):
+                found.add(int(entry.name))
+        except OSError:
+            continue
+    return found
+
+
+def reap(marker: str) -> set[int]:
+    """Kill every process carrying `marker` and wait until none is left.
+
+    verify.sh runs each step in its own process group and its step owner in
+    its own session, so a kill of verify's group leaves the step's tree
+    running under init. A stopped process cannot fork or exit, so stopping
+    each one found until a scan finds no new one catches the whole tree.
+    """
+    stopped: set[int] = set()
+    while fresh := processes_carrying(marker) - stopped:
+        for pid in fresh:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGSTOP)
+        stopped |= fresh
+    for pid in stopped:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + HANG_GUARD_S
+    while processes_carrying(marker) & stopped and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return stopped
 
 
 class CargoEvent(TypedDict):
@@ -52,6 +95,10 @@ class RoutingRecord(TypedDict):
     target: str
     hold_wait_s: float
     mem_wait_s: str
+    copy: str
+    copy_s: str
+    copy_count: str
+    copy_natedev_s: str
 
 
 class CallRecord(TypedDict):
@@ -87,6 +134,7 @@ class CargoPackageMetadata(TypedDict):
     id: str
     features: dict[str, list[str]]
     manifest_path: str
+    dependencies: list[dict[str, str]]
     targets: list[CargoTargetMetadata]
 
 
@@ -117,52 +165,65 @@ if arguments[:1] == ["metadata"]:
     raise SystemExit(0)
 if arguments[:2] == ["nextest", "--version"]:
     raise SystemExit(0)
+if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == "1":
+    # A natedev step still compiling: a cargo line, then a wait for
+    # cargo-release (tests start) or SIGTERM (a Mac copy won).
+    import signal
+    import time
+
+    root = Path(os.environ["TEST_RUNNER_STATE"])
+
+    def stop(signal_number: int, _frame: object) -> None:
+        (root / "cargo-stopped").write_text(str(signal_number), encoding="utf-8")
+        raise SystemExit(128 + signal_number)
+
+    signal.signal(signal.SIGTERM, stop)
+    print("   Compiling sample v0.1.0", flush=True)
+    (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    while not (root / "cargo-release").exists():
+        time.sleep(0.01)
+    if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
+        print("     Starting 1 test", flush=True)
 if arguments[:2] == ["nextest", "run"]:
     raise SystemExit(int(os.environ.get("TEST_LOCAL_STATUS", "0")))
 raise SystemExit(0)
 '''
 
 
-GIT_STUB = r'''
-from __future__ import annotations
-
-import os
-from pathlib import Path
-import sys
-
-arguments = sys.argv[1:]
-root = Path(os.environ["PACKAGE_ROOT"])
-if "rev-parse" in arguments and "HEAD^{tree}" in arguments:
-    print("fixed-tree")
-    raise SystemExit(0)
-if "rev-parse" in arguments and "--show-toplevel" in arguments:
-    if "--git-common-dir" in arguments:
-        print(root / ".git")
-        print(root)
-        if "--abbrev-ref" in arguments:
-            print("main")
-    else:
-        print(root)
-    raise SystemExit(0)
-if "rev-parse" in arguments and "--short" in arguments:
-    print("abc1234")
-    raise SystemExit(0)
-if "status" in arguments or "diff" in arguments or "ls-files" in arguments:
-    raise SystemExit(0)
-raise SystemExit(1)
+GIT_STUB = r'''#!/bin/bash
+has() { local word; for word in "$@"; do [[ "$word" == "$wanted" ]] && return 0; done; return 1; }
+wanted=rev-parse
+if has "$@"; then
+    wanted='HEAD^{tree}'
+    if has "$@"; then printf 'fixed-tree\n'; exit 0; fi
+    wanted=--show-toplevel
+    if has "$@"; then
+        wanted=--git-common-dir
+        if has "$@"; then
+            printf '%s\n' "$PACKAGE_ROOT/.git" "$PACKAGE_ROOT"
+            wanted=--abbrev-ref
+            if has "$@"; then printf 'main\n'; fi
+        else
+            printf '%s\n' "$PACKAGE_ROOT"
+        fi
+        exit 0
+    fi
+    wanted=--short
+    if has "$@"; then printf 'abc1234\n'; exit 0; fi
+fi
+for wanted in status diff ls-files ls-tree; do if has "$@"; then exit 0; fi; done
+exit 1
 '''
 
 
-RUSTC_STUB = r'''
-import sys
-
-if sys.argv[1:] == ["-vV"]:
-    print("rustc 1.90.0\nhost: x86_64-unknown-linux-gnu")
-    raise SystemExit(0)
-if sys.argv[1:] == ["-V"]:
-    print("rustc 1.90.0")
-    raise SystemExit(0)
-raise SystemExit(1)
+RUSTC_STUB = r'''#!/bin/bash
+if [[ $# == 1 && $1 == -vV ]]; then
+    printf 'rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\n'
+elif [[ $# == 1 && $1 == -V ]]; then
+    printf 'rustc 1.90.0\n'
+else
+    exit 1
+fi
 '''
 
 
@@ -179,6 +240,52 @@ import time
 arguments = sys.argv[1:]
 root = Path(os.environ["TEST_RUNNER_STATE"])
 result = Path(arguments[arguments.index("--result") + 1])
+
+if "--copy" in arguments:
+    # A Mac copy started by copy_watch.py. With TEST_COPY_CLAIM (mac_test.py)
+    # it holds a real copy claim; with TEST_COPY_WAIT=1 it waits for
+    # copy-release or SIGTERM; then it writes TEST_COPY_MAC and exits
+    # TEST_COPY_STATUS. SIGTERM releases the claim and exits 143.
+    import subprocess
+
+    mac_test = os.environ.get("TEST_COPY_CLAIM", "")
+    claimed = False
+
+    def release_copy_claim() -> None:
+        if claimed:
+            subprocess.run([sys.executable, mac_test, "release", "--pid", str(os.getpid())],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop_copy(signal_number: int, _frame: object) -> None:
+        release_copy_claim()
+        # Renamed into place, so the test never reads it half written.
+        (root / "copy-signal.tmp").write_text(str(signal_number), encoding="utf-8")
+        os.replace(root / "copy-signal.tmp", root / "copy-signal")
+        raise SystemExit(128 + signal_number)
+
+    signal.signal(signal.SIGTERM, stop_copy)
+    if mac_test:
+        claim = subprocess.run(
+            [sys.executable, mac_test, "claim", "--copy", "--pid", str(os.getpid()), "--what", "nextest sample",
+             "--worktree", arguments[arguments.index("--repo-root") + 1]],
+            check=False, capture_output=True, text=True)
+        if claim.returncode != 0:
+            print("copy claim failed: " + claim.stdout + claim.stderr, file=sys.stderr, flush=True)
+            raise SystemExit(99)
+        claimed = True
+    with (root / "copy-events.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+    # Renamed into place, so the test never reads it before the pid is written.
+    (root / "copy-started.tmp").write_text(str(os.getpid()), encoding="utf-8")
+    os.replace(root / "copy-started.tmp", root / "copy-started")
+    if os.environ.get("TEST_COPY_WAIT") == "1":
+        while not (root / "copy-release").exists():
+            time.sleep(0.01)
+    result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
+                      + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
+    release_copy_claim()
+    raise SystemExit(int(os.environ.get("TEST_COPY_STATUS", "1")))
+
 event = {
     "args": arguments,
     "token_held": Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
@@ -301,6 +408,44 @@ else:
 '''
 
 
+# mac_test.py free-now as verify.sh asks it: busy while the runner stub's
+# TEST_RUNNER_BUSY_UNTIL file is missing, so both answer alike. With
+# TEST_FREE_NOW_ONCE, it answers free once, when that file exists, and busy
+# after; a call after that one free answer writes free-now-after-leave.
+# TEST_FREE_NOW_FREE=1 answers free always, so each routing pass tries a claim
+# that may still decline. Each call's words after the settings path go to
+# free-now-roots.
+FREE_NOW_STUB = r'''
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["TEST_RUNNER_STATE"])
+with (root / "free-now-roots").open("a") as output:
+    output.write(" ".join(sys.argv[4:]) + "\n")
+assert sys.argv[1:3] == ["free-now", "--settings"] and Path(sys.argv[3]).is_file(), sys.argv
+with (root / "free-now-events").open("a") as output:
+    output.write(sys.argv[3] + "\n")
+once = os.environ.get("TEST_FREE_NOW_ONCE", "")
+busy_until = os.environ.get("TEST_RUNNER_BUSY_UNTIL", "")
+if os.environ.get("TEST_FREE_NOW_FREE") == "1":
+    free = True
+elif once:
+    if Path(once).exists():
+        Path(once).unlink()
+        (root / "free-now-left").write_text("left\n")
+        free = True
+    else:
+        if (root / "free-now-left").exists():
+            (root / "free-now-after-leave").write_text("asked\n")
+        free = False
+else:
+    free = not busy_until or Path(busy_until).exists()
+print("free" if free else "busy")
+raise SystemExit(0 if free else 1)
+'''
+
+
 RECORD_WRAPPER = r'''
 import json
 import os
@@ -311,7 +456,11 @@ import sys
 if sys.argv[1:2] == ["call"]:
     event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
              "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
-             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0")}
+             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0"),
+             "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
+             "copy_s": os.environ.get("BUILDLOG_MAC_COPY_S", ""),
+             "copy_count": os.environ.get("BUILDLOG_MAC_COPY_COUNT", ""),
+             "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
     with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
         output.write(json.dumps(event) + "\n")
 sys.path.insert(0, str(Path(os.environ["TEST_REAL_RECORD"]).parent))
@@ -351,6 +500,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(self.assert_nothing_outlives)
         self.home = self.root / "home"
         self.home.mkdir()
         claude = self.home / ".claude"
@@ -373,8 +523,9 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "git", GIT_STUB)
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
-        self.write_executable(self.bin_directory / "taplo", "raise SystemExit(0)\n")
+        self.write_executable(self.bin_directory / "taplo", "#!/bin/sh\nexit 0\n")
         self.write_executable(self.runner, RUNNER_STUB)
+        self.write_executable(self.root / "free-now.py", FREE_NOW_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
@@ -418,6 +569,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     "id": "sample-id",
                     "features": {"default": [], "extra": []},
                     "manifest_path": str(self.root / "Cargo.toml"),
+                    "dependencies": [],
                     "targets": [
                         {
                             "name": "sample",
@@ -438,6 +590,9 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     "PLAN_DELEGATE_BOARD_DIR",
                     "PLAN_DELEGATE_SESSION_DIR",
                     "PLAN_DELEGATE_TEAM_ROLE",
+                    "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID",
+                    "PLAN_DELEGATE_DETACHED_RUN",
                     "BUILDLOG_MAC",
                     "BUILDLOG_MAC_REASON",
                     "BUILDLOG_LOCAL_REASON",
@@ -479,6 +634,8 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "PLAN_DELEGATE_BOARD_DIR": str(self.board),
             "PLAN_DELEGATE_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
+            "VERIFY_MAC_COPY_WATCH": str(VERIFY.parent.parent / "mac_test" / "copy_watch.py"),
+            "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
             "TEST_RUNNER_STATE": str(self.runner_state),
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
             "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "owned"),
@@ -487,8 +644,14 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
+        cache = self.root / "cache/claude/python3-3.10"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(sys.executable + "\n")
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
+
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
+        _ = path.write_text(source if source.startswith("#!") else f"#!{sys.executable}\n" + source,
+                            encoding="utf-8")
         path.chmod(0o755)
 
     def verify(
@@ -501,7 +664,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=HANG_GUARD_S,
         )
 
     def start_verify(
@@ -564,11 +727,15 @@ class VerifyMacOffloadTests(unittest.TestCase):
         for name in ("runner-events.jsonl", "runner-started", "runner-signal", "runner-signals-ready"):
             (self.runner_state / name).unlink(missing_ok=True)
 
-    def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 10
+    def wait_for_path(self, path: Path, processes: Sequence[subprocess.Popen[str]] = ()) -> None:
+        deadline = time.monotonic() + HANG_GUARD_S
         while time.monotonic() < deadline:
             if path.exists():
                 return
+            for process in processes:
+                if process.poll() is not None:
+                    output, errors = process.communicate(timeout=HANG_GUARD_S)
+                    self.fail(f"verify exited {process.returncode} before {path}: {output + errors}")
             time.sleep(0.01)
         self.fail(f"timed out waiting for {path}")
 
@@ -576,7 +743,10 @@ class VerifyMacOffloadTests(unittest.TestCase):
         wrapper = self.root / "targets-wrapper.py"
         self.write_executable(wrapper, TARGETS_WRAPPER)
         self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        routing_wait = self.root / "routing-wait.py"
+        self.write_executable(routing_wait, SLEEP_STUB)
         self.environment.update({"BUILD_TARGETS_SCRIPT": str(wrapper),
+                                 "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(routing_wait),
                                  "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets" / "build_targets.py")})
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
@@ -584,6 +754,54 @@ class VerifyMacOffloadTests(unittest.TestCase):
             cycle = build_hold.read_cycle()
             assert cycle is not None
             return self.root / "release" / cycle["id"] / "cycle.json"
+
+    def test_hold_fixture_reaps_its_recorders_without_waiting_for_an_existing_recorder(self) -> None:
+        # The real hold dispatcher starts this child and its reaper. Only a
+        # join at the fixture boundary releases the child to write completion.
+        tree = self.root / "record-tree/scripts"
+        (tree / "build_hold").mkdir(parents=True)
+        (tree / "buildlog").mkdir()
+        release, completed = self.root / "recorder-release", self.root / "recorder-completed"
+        self.write_executable(tree / "buildlog/record.py", f'''
+from pathlib import Path
+from scripts.delegate.wait_for_test_state import wait_for_file
+wait_for_file(Path({str(release)!r}))
+Path({str(completed)!r}).touch()
+'''.replace("from scripts.delegate.wait_for_test_state import wait_for_file",
+            "import sys\nsys.path.insert(0, " + repr(str(VERIFY.resolve().parents[2])) + ")\n"
+            + "from scripts.delegate.wait_for_test_state import wait_for_file"))
+        outside_release = threading.Event()
+        outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
+        outside.start()
+        original_join = threading.Thread.join
+        owned: list[threading.Thread] = []
+
+        def release_on_join(thread: threading.Thread, timeout: float | None = None) -> None:
+            if thread.name == "hold-event-recorder":
+                self.assertIsNot(thread, outside, "fixture tried to wait for a recorder it did not start")
+                owned.append(thread)
+                release.touch()
+            original_join(thread, timeout)
+
+        existing = set(threading.enumerate())
+        try:
+            with mock.patch.object(build_hold, "__file__", str(tree / "build_hold/build_hold.py")), \
+                    mock.patch.object(threading.Thread, "join", release_on_join):
+                with self.hold_environment():
+                    _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
+                        build_hold.HolderIdentity("hana", "hana"), "fixture recording", build_hold.NoReleaseEta(),
+                        datetime.now().astimezone())
+                self.assertTrue(completed.exists(), "fixture returned while its recorder still owned its files")
+            self.assertEqual(len(owned), 1)
+            self.assertFalse(owned[0].is_alive())
+            self.assertTrue(outside.is_alive())
+        finally:
+            release.touch()
+            outside_release.set()
+            for thread in threading.enumerate():
+                if thread is outside or (thread not in existing and thread.name == "hold-event-recorder"):
+                    original_join(thread, HANG_GUARD_S)
+                    self.assertFalse(thread.is_alive())
 
     def control_routing_clock(self) -> Path:
         clock = self.runner_state / "routing-clock"
@@ -595,16 +813,107 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
+    def test_hold_fixture_timeout_reaps_all_children_and_owned_threads_before_restoring_home(self) -> None:
+        tree = self.root / "blocked-record-tree/scripts"
+        (tree / "build_hold").mkdir(parents=True)
+        (tree / "buildlog").mkdir()
+        ready = self.root / "blocked-recorders"
+        ready.mkdir()
+        self.write_executable(tree / "buildlog/record.py", f'''
+import os, signal, sys
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path({str(ready)!r}, sys.argv[4]).write_text(str(os.getpid()))
+signal.pause()
+''')
+        children: list[subprocess.Popen[bytes]] = []
+        threads: list[threading.Thread] = []
+        launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+        start = threading.Thread.start
+        caller_home = os.environ.get("HOME")
+
+        def capture_child(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
+            child = launch(*arguments, **options)
+            children.append(child)
+            return child
+
+        def capture_thread(thread: threading.Thread) -> None:
+            if thread.name == "hold-event-recorder":
+                threads.append(thread)
+            start(thread)
+
+        try:
+            with mock.patch.object(build_hold, "__file__", str(tree / "build_hold/build_hold.py")), \
+                    mock.patch.object(subprocess, "Popen", side_effect=capture_child), \
+                    mock.patch.object(threading.Thread, "start", capture_thread):
+                with self.assertRaisesRegex(AssertionError, "fixture hold recorder never exited"):
+                    with self.hold_environment(timeout=0):
+                        for key in ("first", "second"):
+                            _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
+                                build_hold.HolderIdentity(key, key), "blocked recording", build_hold.NoReleaseEta(),
+                                datetime.now().astimezone())
+                            self.wait_for_path(ready / key)
+                self.assertEqual(len(children), 2)
+                self.assertEqual(len(threads), 2)
+                self.assertTrue(all(child.poll() is not None for child in children))
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual(os.environ.get("HOME"), caller_home)
+        finally:
+            # Also contain a deliberately broken implementation during regression checks.
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                _ = child.wait()
+            for thread in threads:
+                thread.join(timeout=HANG_GUARD_S)
+
     @contextmanager
-    def hold_environment(self) -> Generator[None, None, None]:
+    def hold_environment(self, timeout: float = HANG_GUARD_S) -> Generator[None, None, None]:
+        children: list[subprocess.Popen[bytes]] = []
+        threads: list[threading.Thread] = []
+        launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+        start = threading.Thread.start
+
+        def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
+            process = launch(*arguments, **options)
+            children.append(process)
+            return process
+
+        def start_owned(thread: threading.Thread) -> None:
+            if thread.name == "hold-event-recorder":
+                threads.append(thread)
+            start(thread)
+
         with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
+            "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
             "BUILDLOG_DIR", "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR")}), \
              mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
                                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \
              mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
-            yield
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
+             mock.patch.object(subprocess, "Popen", side_effect=launch_owned), \
+             mock.patch.object(threading.Thread, "start", start_owned):
+            try:
+                yield
+            finally:
+                timed_out = False
+                for thread in threads:
+                    thread.join(timeout=timeout)
+                    timed_out |= thread.is_alive()
+                if timed_out:
+                    # Stop every child before restoring HOME or reporting the
+                    # timeout, including children owned by later reapers.
+                    for process in children:
+                        if process.poll() is None:
+                            process.terminate()
+                    for process in children:
+                        if process.poll() is None:
+                            process.kill()
+                        _ = process.wait()
+                    for thread in threads:
+                        thread.join()
+                self.assertFalse(timed_out, "fixture hold recorder never exited")
 
     def release_local_turn(self) -> None:
         with self.hold_environment(), build_hold.release_lock():
@@ -624,14 +933,30 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertTrue(records)
         return cast(RoutingRecord, json.loads(records[-1]))
 
+    def child_marker(self) -> str:
+        """The environment entry every process this test starts inherits."""
+        return f"TEST_RUNNER_STATE={self.runner_state}"
+
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-        _ = process.communicate(timeout=5)
+        """Kill the call and every process under it, its steps' own groups and sessions too."""
+        _ = reap(self.child_marker())
+        _ = process.communicate(timeout=HANG_GUARD_S)
+
+    def assert_nothing_outlives(self) -> None:
+        # Runs after every other cleanup: a process a call left behind
+        # holds no token and no turn, but `build_hold.py quiet` counts it
+        # as a cargo run for as long as it lives.
+        deadline = time.monotonic() + 2
+        while processes_carrying(self.child_marker()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        survivors = reap(self.child_marker())
+        if survivors:
+            self.fail(f"processes outlived the test: {sorted(survivors)}")
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
-                      step_sleep: bool = False) -> subprocess.Popen[str]:
+                      step_sleep: bool = False, once: Path | None = None) -> subprocess.Popen[str]:
         process = self.start_verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
+            **({"TEST_FREE_NOW_ONCE": str(once)} if once else {}),
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
             "TEST_RUNNER_BUSY_REASON": reason, "TEST_PAUSE_ROUTING_SLEEP": "1",
             "TEST_RUNNER_PAUSE_RETRY": "1" if pause_retry else "0",
@@ -639,7 +964,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
         })
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_path(self.runner_state / "routing-sleep")
+        self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(len(self.runner_events()), 1)
         self.assertIsNone(process.poll())
@@ -731,13 +1056,13 @@ class VerifyMacOffloadTests(unittest.TestCase):
 
     def test_repeated_routing_wait_shows_each_unchanged_diagnostic_once(self) -> None:
         _ = self.routing_fixture()
-        self.environment["BUILD_TARGETS_ESCALATE_S"] = "0"
+        self.environment.update({"BUILD_TARGETS_ESCALATE_S": "0", "TEST_FREE_NOW_FREE": "1"})
         process = self.start_routing(step_sleep=True)
         for step in range(1, 4):
             self.resume_routing_sleep(step)
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-4").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(errors.count("verify.sh: natedev is held by hana for render checks.\n"), 1)
         self.assertEqual(errors.count("verify.sh: natedev has been held for 2 h by hana; ask them.\n"), 1)
@@ -754,6 +1079,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
 
     def test_routing_wait_shows_changed_holder_and_decline_reason_once(self) -> None:
         _ = self.routing_fixture()
+        self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_routing(step_sleep=True)
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
@@ -766,7 +1092,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.resume_routing_sleep(4)
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-5").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         for line in ("verify.sh: natedev is held by hana for render checks.\n",
                      "verify.sh: natedev is held by julian for restore CI.\n",
@@ -782,7 +1108,8 @@ class VerifyMacOffloadTests(unittest.TestCase):
     def test_hold_wait_includes_declined_retry_seconds_and_excludes_running_retry(self) -> None:
         _ = self.routing_fixture()
         clock = self.control_routing_clock()
-        self.environment.update({"TEST_DECLINED_RETRY_SECONDS": "4.5", "TEST_RUNNER_SECONDS": "20"})
+        self.environment.update({"TEST_DECLINED_RETRY_SECONDS": "4.5", "TEST_RUNNER_SECONDS": "20",
+                                 "TEST_FREE_NOW_FREE": "1"})
         process = self.start_routing(step_sleep=True)
         _ = clock.write_text("102")
         self.resume_routing_sleep(1)
@@ -790,7 +1117,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = clock.write_text("105")
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-2").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 3)
         self.assertEqual(self.routing_record()["hold_wait_s"], 2 + 4.5 + 3)
@@ -814,7 +1141,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     build_hold.holder_path(build_hold.holder_directory(), "hana").unlink()
                 _ = (fixture.runner_state / "continue-retry").write_text("continue\n")
                 _ = (fixture.runner_state / "continue-sleep-2").write_text("continue\n")
-                output, errors = process.communicate(timeout=15)
+                output, errors = process.communicate(timeout=HANG_GUARD_S)
                 self.assertEqual(process.returncode, 0, output + errors)
                 self.assertEqual(fixture.last_call()["mac_reason"], expected)
                 self.assertEqual(fixture.last_call()["mac_holder"], "")
@@ -826,7 +1153,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         process = self.start_routing()
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("waiting", errors)
         self.assertEqual(self.local_runs(), [])
@@ -856,7 +1183,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 else:
                     (Path(fixture.environment["BUILD_HOLD_DIR"]) / "hana").unlink()
                 _ = (fixture.runner_state / "continue-sleep").write_text("continue\n")
-                output, errors = process.communicate(timeout=15)
+                output, errors = process.communicate(timeout=HANG_GUARD_S)
                 self.assertEqual(process.returncode, 0, output + errors)
                 self.assertEqual(len(fixture.runner_events()), 1)
                 self.assertEqual(len(fixture.local_runs()), 1)
@@ -866,14 +1193,64 @@ class VerifyMacOffloadTests(unittest.TestCase):
 
     def test_blocked_mac_and_held_local_wait_for_local_release(self) -> None:
         cycle = self.routing_fixture()
+        # Exercise the real event waiter. A retry cannot rescue a missed release:
+        # its interval is longer than the process hang guard, and a fixed sleep
+        # is an immediate fixture error instead of a wall-clock assertion.
+        self.environment["BUILD_TARGETS_POLL_S"] = "3600"
+        self.write_executable(self.bin_directory / "sleep", 'raise SystemExit("routing must wake on release, not sleep")\n')
+        self.write_executable(Path(self.environment["VERIFY_LOCAL_RELEASE_WAIT_SCRIPT"]), f'''
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, {str(VERIFY.parent)!r})
+import local_release_wait
+original_wait = local_release_wait.LocalReleaseEvents.wait
+def observe_wait(self, seconds):
+    (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-sleep").write_text("watching\\n")
+    original_wait(self, seconds)
+local_release_wait.LocalReleaseEvents.wait = observe_wait
+local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
+''')
         process = self.start_routing("blocked")
         self.release_local_turn()
-        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("blocked", errors)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(len(self.local_runs()), 1)
+        self.assert_no_pending_calls(cycle)
+
+    def test_local_release_before_routing_watcher_starts_needs_no_retry_wait(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        cycle = self.routing_fixture()
+        call_id = "already-released"
+        with mock.patch.dict(os.environ, self.environment), self.hold_environment():
+            _ = build_hold.register_wait(f"verify:{call_id}", call_id=call_id, pid=os.getpid())
+            self.release_local_turn()
+            with mock.patch.object(local_release_wait.LocalReleaseEvents, "wait",
+                                   side_effect=AssertionError("an admitted call must not wait for another event")):
+                local_release_wait.wait_for_local_release(3600, call_id)
+            build_hold.remove_call(f"verify:{call_id}", call_id)
+        self.assert_no_pending_calls(cycle)
+
+    def test_routing_without_inotify_polls_until_local_release(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        cycle = self.routing_fixture()
+        call_id = "polling-routing"
+        def release_on_poll(_seconds: float) -> None:
+            self.release_local_turn()
+
+        with mock.patch.dict(os.environ, self.environment), self.hold_environment():
+            _ = build_hold.register_wait(f"verify:{call_id}", call_id=call_id, pid=os.getpid())
+            with mock.patch.object(ctypes, "CDLL", return_value=object()), \
+                 mock.patch.object(time, "monotonic", return_value=100), \
+                 mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
+                local_release_wait.wait_for_local_release(15, call_id)
+            polling.assert_called_once_with(15)
+            self.assertIsInstance(build_hold.read_admission(f"verify:{call_id}", call_id), build_hold.AdmittedTurn)
+            build_hold.remove_call(f"verify:{call_id}", call_id)
         self.assert_no_pending_calls(cycle)
 
     def test_mac_run_withdraws_local_demand_before_another_waiter_is_released(self) -> None:
@@ -891,7 +1268,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertIsNone(process.poll())
         self.assertFalse(self.runner_events()[-1]["registered"])
         _ = (self.runner_state / "continue-retry").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
 
@@ -905,7 +1282,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.wait_for_path(self.runner_state / "retry-running")
         _ = clock.write_text("500")
         process.send_signal(signal.SIGTERM)
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 143, output + errors)
         self.assert_no_pending_calls(cycle_path)
         record = self.routing_record()
@@ -921,7 +1298,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = clock.write_text("103")
         self.release_local_turn()
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         record = self.routing_record()
         self.assertEqual(record["hold_wait_s"], 3 + 7.25)
@@ -934,7 +1311,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual((self.runner_state / "sleep-events").read_text().splitlines(), ["15"])
         self.release_local_turn()
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
 
     def test_interrupted_routing_sleep_records_wait_and_cleans_pending_call(self) -> None:
@@ -942,13 +1319,161 @@ class VerifyMacOffloadTests(unittest.TestCase):
         process = self.start_routing()
         time.sleep(0.1)
         process.send_signal(signal.SIGTERM)
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 143, output + errors)
         self.assert_no_pending_calls(cycle)
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(list((self.root / "tmp").glob("verify-hold.*")), [])
+
+    def test_free_mac_wins_over_a_release_turn_granted_in_the_same_pass(self) -> None:
+        cycle = self.routing_fixture()
+        process = self.start_routing()
+        self.release_local_turn()
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertFalse(self.runner_events()[1]["registered"])
+        self.assert_no_pending_calls(cycle)
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertEqual(self.last_call()["mac"], "passed_filter")
+
+    def wait_until(self, condition: Callable[[], bool], what: str,
+                   processes: Sequence[subprocess.Popen[str]] = ()) -> None:
+        deadline = time.monotonic() + HANG_GUARD_S
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            for process in processes:
+                if process.poll() is not None:
+                    output, errors = process.communicate(timeout=HANG_GUARD_S)
+                    self.fail(f"verify exited {process.returncode} before {what}: {output + errors}")
+            time.sleep(0.01)
+        self.fail(f"timed out waiting for {what}")
+
+    def hold_memory(self) -> Path:
+        """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n", encoding="utf-8")
+        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        return meminfo
+
+    def leave_once(self) -> dict[str, str]:
+        once = self.runner_state / "free-once"
+        _ = once.write_text("free\n")
+        return {"TEST_FREE_NOW_ONCE": str(once)}
+
+    def free_now_settings(self) -> list[str]:
+        path = self.runner_state / "free-now-events"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def free_now_roots(self) -> list[str]:
+        path = self.runner_state / "free-now-roots"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_queued_local_test_leaves_for_a_freed_mac_and_ends_with_its_failure(self) -> None:
+        _ = self.hold_memory()
+        mac_free = self.runner_state / "mac-free"
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
+            "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
+        self.assertEqual(len(self.runner_events()), 1)
+        _ = mac_free.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 42, output + errors)
+        self.assertIn("another machine is free after", output)
+        self.assertEqual(self.local_runs(), [])
+        runners = self.runner_events()
+        self.assertEqual(len(runners), 2)
+        arguments = runners[1]["args"]
+        self.assertEqual(arguments[arguments.index("--last-decline") + 1], "busy")
+        self.assertEqual(set(self.free_now_settings()), {self.environment["MAC_TEST_CONFIG"]})
+        self.assertEqual(set(self.free_now_roots()), {f"--repo-root {self.root}"})
+        self.assertEqual(self.routing_record()["target"], "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
+                         (42, "failed", "", 3.25))
+
+    def test_hold_that_lands_during_the_memory_wait_still_leaves_for_a_freed_mac(self) -> None:
+        meminfo = self.hold_memory()
+        mac_free = self.runner_state / "mac-free"
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
+            "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
+        with self.hold_environment():
+            _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]), build_hold.HolderIdentity("hana", "hana"),
+                                      "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+        cycle_path = self.root / "release" / cycle["id"] / "cycle.json"
+
+        def waiting_on_the_hold() -> bool:
+            entries = cast(build_hold.HoldCycle, json.loads(cycle_path.read_text()))["entries"]
+            return any(entry["calls"] for entry in entries)
+
+        # Memory frees while natedev is held: the step moves to the hold wait,
+        # where the Mac is still busy.
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
+        self.wait_until(waiting_on_the_hold, "the hold wait", (process,))
+        self.assertEqual(len(self.runner_events()), 1)
+        _ = mac_free.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 42, output + errors)
+        self.assertIn("leaving natedev's hold wait to run there", output + errors)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assert_no_pending_calls(cycle_path)
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertEqual(self.last_call()["mac"], "failed")
+
+    def test_mac_busy_again_after_leaving_returns_to_the_local_wait(self) -> None:
+        meminfo = self.hold_memory()
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"), **self.leave_once()})
+        self.addCleanup(self.stop_verify, process)
+        # The Mac claim declined again; the local run waits with the hook still set.
+        self.wait_for_path(self.runner_state / "free-now-after-leave", (process,))
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(self.local_runs(), [])
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(len(self.local_runs()), 1)
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(output.count("verify.sh: running on natedev"), 2)
+        self.assertEqual(self.routing_record()["target"], "natedev")
+        record = self.last_call()
+        self.assertEqual((record["mac"], record["mac_reason"]), ("declined", "busy"))
+
+    def test_leaving_gives_back_a_granted_hold_turn_before_the_mac_runs(self) -> None:
+        cycle = self.routing_fixture()
+        _ = self.hold_memory()
+        once = self.runner_state / "free-once"
+        process = self.start_routing(once=once)
+        self.release_local_turn()
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        # Routing asks free-now once after its sleep; later calls are the hook's.
+        self.wait_until(lambda: len(self.free_now_settings()) >= 2, "the leave hook", (process,))
+        self.assertEqual(self.local_runs(), [])
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = once.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(self.local_runs(), [])
+        runners = self.runner_events()
+        self.assertEqual(len(runners), 2)
+        self.assertFalse(runners[1]["registered"])
+        self.assert_no_pending_calls(cycle)
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertEqual(self.last_call()["mac"], "passed_filter")
 
     def test_mac_state_and_probe_diagnostics_survive_local_fallback(self) -> None:
         for reason, diagnostic in (("state", "mac state cannot be read: invalid block"),
@@ -1123,7 +1648,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 self.assertEqual(record["mac_reason"], "runner")
                 self.assertIsNone(record["mac_s"])
 
-    def test_full_mac_pass_is_confirmed_locally_and_records_local_pass(self) -> None:
+    def test_full_mac_pass_ends_the_call_with_a_mac_pass_record(self) -> None:
         result = self.verify(
             "test",
             "sample",
@@ -1131,19 +1656,32 @@ class VerifyMacOffloadTests(unittest.TestCase):
             extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(
-            "passed on the Mac (macOS); now confirming on natedev, which is the gate.",
-            result.stdout,
-        )
-        self.assertEqual(len(self.local_runs()), 1)
-        self.assertTrue(self.local_runs()[0]["token_held"])
-        self.assertEqual(len(self.saved_results()), 1)
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", result.stdout)
+        self.assertEqual(self.local_runs(), [])
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("passed on the Mac", saved[0].read_text())
+        self.assertIn("host=mac\n", saved[0].read_text())
         record = self.last_call()
-        self.assertEqual(record["mac"], "passed")
-        self.assertEqual(record["mac_s"], 3.25)
-        self.assertEqual(self.routing_record()["target"], "natedev")
+        self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_full", 3.25))
 
-    def test_filtered_mac_pass_ends_without_local_run_or_pass_record(self) -> None:
+        self.clear_observations()
+        again = self.verify("test", "sample", extra={"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("PASS (recorded)", again.stdout)
+        self.assertEqual(self.runner_events(), [])
+
+        # --local asks for Linux, so the Mac's pass does not answer it.
+        self.clear_observations()
+        local = self.verify("test", "sample", "--local", "needs Linux process behavior")
+        self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
+        self.assertNotIn("PASS (recorded)", local.stdout)
+        self.assertEqual(len(self.local_runs()), 1)
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertNotIn("host=mac", saved[0].read_text())
+
+    def test_filtered_mac_pass_ends_the_call_with_a_mac_pass_record(self) -> None:
         result = self.verify(
             "test",
             "sample",
@@ -1153,12 +1691,11 @@ class VerifyMacOffloadTests(unittest.TestCase):
             extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(
-            "PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev.",
-            result.stdout,
-        )
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", result.stdout)
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.saved_results(), [])
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("host=mac\n", saved[0].read_text())
         record = self.last_call()
         self.assertEqual(record["status"], 0)
         self.assertEqual(record["mac"], "passed_filter")
@@ -1166,8 +1703,8 @@ class VerifyMacOffloadTests(unittest.TestCase):
 
     def test_local_flag_requires_a_non_option_reason_before_any_work(self) -> None:
         expected = (
-            'verify.sh: --local needs a reason: --local "<why this test must run on '
-            'Linux>". Leave it off to run on the Mac.\n'
+            'verify.sh: --local needs a reason: --local "<why this test cannot pass on '
+            'macOS>". Leave it off to run on the Mac.\n'
         )
         cases = (
             ("test", "sample", "--local"),
@@ -1285,10 +1822,9 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.runner_state / "runner-signals-ready")
                     process.send_signal(signal_number)
-                    output, errors = process.communicate(timeout=15)
+                    output, errors = process.communicate(timeout=HANG_GUARD_S)
                 except BaseException:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=5)
+                    self.stop_verify(process)
                     raise
                 self.assertEqual(
                     process.returncode, 128 + signal_number, output + errors
@@ -1335,10 +1871,9 @@ class VerifyMacOffloadTests(unittest.TestCase):
         try:
             self.wait_for_path(marker)
             process.send_signal(signal.SIGTERM)
-            output, errors = process.communicate(timeout=15)
+            output, errors = process.communicate(timeout=HANG_GUARD_S)
         except BaseException:
-            os.killpg(process.pid, signal.SIGKILL)
-            _ = process.communicate(timeout=5)
+            self.stop_verify(process)
             raise
 
         self.assertEqual(
@@ -1349,6 +1884,116 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual(self.local_runs(), [])
         self.assertFalse(Path(self.environment["TEST_TOKEN_RECORD"]).exists())
         self.assertEqual(list((self.root / "tmp").iterdir()), [])
+
+    def start_copy_call(self, *words: str, copy: dict[str, str]) -> tuple[subprocess.Popen[str], int]:
+        """Start a call the busy Mac sends to natedev, where its step compiles
+        until cargo-release; return it with the pid of the Mac copy it starts."""
+        process = self.start_verify("test", "sample", *words, "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
+            "TEST_CARGO_HOLD": "1", **copy})
+        self.addCleanup(self.stop_verify, process)
+        started = self.runner_state / "copy-started"
+        self.wait_for_path(started, (process,))
+        self.assertTrue((self.runner_state / "cargo-compiling").exists())
+        self.assertEqual(len(self.runner_events()), 1)
+        return process, int(started.read_text(encoding="utf-8"))
+
+    def wait_for_reaped(self, pid: int, processes: Sequence[subprocess.Popen[str]]) -> None:
+        # Only the watcher collects its copy, and it reads the copy's result
+        # when it does: a gone pid means the watcher has taken the result.
+        self.wait_until(lambda: not Path(f"/proc/{pid}").exists(), f"the copy {pid} to be collected", processes)
+
+    def assert_copy_record(self, outcome: str, target: str) -> None:
+        record = self.routing_record()
+        self.assertEqual((record["copy"], record["copy_count"], record["target"]), (outcome, "1", target))
+        self.assertGreaterEqual(float(record["copy_s"]), 0)
+        self.assertGreaterEqual(float(record["copy_natedev_s"]), 0)
+
+    def test_a_stopped_call_leaves_no_step_or_copy_running(self) -> None:
+        process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
+        cargo = int((self.runner_state / "cargo-compiling").read_text())
+        # The step runs in its own process group, so a kill of verify's group alone misses it.
+        self.assertNotEqual(os.getpgid(cargo), process.pid)
+        self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
+        self.stop_verify(process)
+        self.assertEqual(processes_carrying(self.child_marker()), set())
+
+    def test_copy_failure_first_stops_natedev_and_exits_with_the_copy_status(self) -> None:
+        process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "failed", "TEST_COPY_STATUS": "42"})
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 42, output + errors)
+        self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
+        self.assertEqual(self.saved_results(), [])
+        self.assert_copy_record("won", "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
+                         (42, "failed", "", 2.5))
+
+    def test_copy_filtered_pass_first_stops_natedev_and_records_a_mac_pass(self) -> None:
+        process, _ = self.start_copy_call("--filter", "alpha", copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", output)
+        self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("host=mac\n", saved[0].read_text())
+        self.assert_copy_record("won", "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_filter", 2.5))
+
+    def test_copy_full_pass_first_stops_natedev_and_ends_the_call(self) -> None:
+        process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", output)
+        self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("host=mac\n", saved[0].read_text())
+        self.assert_copy_record("won", "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_full", 2.5))
+
+    def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:
+        process, _ = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
+        _ = (self.runner_state / "cargo-release").write_text("release\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
+        self.assertFalse((self.runner_state / "cargo-stopped").exists())
+        self.assertEqual(len(self.saved_results()), 1)
+        self.assert_copy_record("natedev_won", "natedev")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"]), (0, "declined", "busy"))
+
+    def test_new_test_claim_makes_the_copy_give_way_and_natedev_continues(self) -> None:
+        mac_test_script = str(VERIFY.parent.parent / "mac_test" / "mac_test.py")
+        # No second copy after the first gives way: the next check is an hour off.
+        self.environment["BUILD_TARGETS_POLL_S"] = "3600"
+        process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1", "TEST_COPY_CLAIM": mac_test_script})
+
+        def claim(*words: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run([sys.executable, mac_test_script, *words, "--pid", str(os.getpid())],
+                                  env=self.environment, capture_output=True, text=True, check=False,
+                                  timeout=HANG_GUARD_S)
+
+        new_test = claim("claim", "--what", "nextest other", "--worktree", str(self.root))
+        self.addCleanup(claim, "release")
+        self.assertEqual(new_test.returncode, 0, new_test.stdout + new_test.stderr)
+        self.assertIn("claimed", new_test.stdout)
+        # The claim signals the copy; its handler records the signal some time later on a loaded machine.
+        self.wait_for_path(self.runner_state / "copy-signal", (process,))
+        self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
+        self.wait_for_reaped(copy, (process,))
+        self.assertIsNone(process.poll())
+        _ = (self.runner_state / "cargo-release").write_text("release\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertFalse((self.runner_state / "cargo-stopped").exists())
+        self.assertEqual(len(self.saved_results()), 1)
+        self.assert_copy_record("gave_way", "natedev")
+        self.assertEqual(claim("release").returncode, 0)
 
 
 if __name__ == "__main__":

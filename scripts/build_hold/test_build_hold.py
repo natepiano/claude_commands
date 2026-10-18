@@ -7,6 +7,7 @@ import io
 import fcntl
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -23,12 +24,35 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import build_hold
+import unit_runs
 from sessions import SessionRecord
 from user_zone import user_zone
 
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
+# Loaded by every Python process a test starts. It opens a writer on the test's
+# FIFO and passes it to each child it starts, so a detached child (the CLI's
+# hold-event recorder) holds a writer until it exits, and the test's cleanup
+# reads EOF only once nothing it started can still write into its scratch
+# directory.
+CHILD_LIFETIME = r'''import os
+import subprocess
+
+try:
+    writer = os.open(os.environ["BUILD_HOLD_TEST_LIFETIME_FIFO"], os.O_WRONLY | os.O_NONBLOCK)
+except (KeyError, OSError):
+    writer = -1
+if writer >= 0:
+    original_popen = subprocess.Popen
+
+    class LifetimeChild(original_popen):
+        def __init__(self, *args, **kwargs):
+            kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), writer)
+            super().__init__(*args, **kwargs)
+
+    subprocess.Popen = LifetimeChild
+'''
 
 
 def write_holder(folder: Path, name: str, since: str, purpose: str, release: str = "unknown") -> Path:
@@ -49,12 +73,23 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
 
 class IsolatedBuildHoldTest(unittest.TestCase):
     scratch: Path = Path()
+    lifetime_reader: int = -1
+    lifetime_writer: int = -1
 
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
         meminfo = self.scratch / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
+        lifetime = self.scratch / "child-lifetime"
+        lifetime.mkdir()
+        _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
+        fifo = lifetime / "writers"
+        os.mkfifo(fifo)
+        self.lifetime_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        # Held until cleanup, so the FIFO has had a writer and reports EOF
+        # once the last one closes, even when a test starts no child.
+        self.lifetime_writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.scratch),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
@@ -72,19 +107,40 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
             "PLAN_DELEGATE_BOARD_DIR": "",
             "PLAN_DELEGATE_SESSION_DIR": "",
+            "BUILD_HOLD_TEST_LIFETIME_FIFO": str(fifo),
+            "PYTHONPATH": os.pathsep.join(filter(None, (str(lifetime), os.environ.get("PYTHONPATH", "")))),
         }))
         self.addCleanup(self.reap_recorders)
+        self.addCleanup(self.wait_for_detached_writers)
+
+    def wait_for_detached_writers(self) -> None:
+        """Wait until no process a test started holds its FIFO writer.
+
+        A child opens its writer only when its interpreter loads
+        sitecustomize. Under load the FIFO can report EOF before a slow child
+        gets there, and the read then finds that child's writer and no data,
+        so wait again until a read returns EOF.
+        """
+        os.close(self.lifetime_writer)
+        deadline = time.monotonic() + 30
+        try:
+            while True:
+                remaining = max(deadline - time.monotonic(), 0)
+                readable, _, _ = select.select([self.lifetime_reader], [], [], remaining)
+                self.assertTrue(readable, "Detached children did not finish before scratch cleanup")
+                try:
+                    if os.read(self.lifetime_reader, 1) == b"":
+                        return
+                except BlockingIOError:
+                    pass
+        finally:
+            os.close(self.lifetime_reader)
 
     def reap_recorders(self) -> None:
         for thread in threading.enumerate():
             if thread.name == "hold-event-recorder":
                 thread.join(timeout=5)
                 self.assertFalse(thread.is_alive())
-
-
-class ImportTests(IsolatedBuildHoldTest):
-    def test_helper_imports_from_its_sibling_directory(self) -> None:
-        self.assertEqual(build_hold.__name__, "build_hold")
 
 
 class OwningSessionTests(IsolatedBuildHoldTest):
@@ -121,6 +177,19 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "PLAN_DELEGATE_SESSION_DIR": str(other_run),
         }):
             self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("board-owner"))
+
+    def test_a_marker_under_either_run_folder_name_owns_the_run(self) -> None:
+        for name in ("unit", "delegate"):
+            active = self.scratch / name / "active"
+            active.mkdir(parents=True)
+            _ = (active / f"{name}-owner").write_text(f"{self.scratch / name / 'run'}\n")
+        environment = {name: value for name, value in os.environ.items() if name != "PLAN_DELEGATE_ACTIVE_DIR"}
+        with mock.patch.object(unit_runs, "RUN_ROOT", self.scratch / "unit"), \
+                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.scratch / "delegate"):
+            for name in ("unit", "delegate"):
+                environment["PLAN_DELEGATE_BOARD_DIR"] = str(self.scratch / name / "run")
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(f"{name}-owner"))
 
     def test_marker_content_ignores_surrounding_whitespace(self) -> None:
         marker = self.marker("run-owner", self.delegate_run)
@@ -315,12 +384,12 @@ class HolderTests(IsolatedBuildHoldTest):
             folder = Path(scratch) / "holders"
             self.assertIsInstance(build_hold.read_holders(folder), build_hold.NoHolders)
             folder.mkdir()
-            _ = (folder / "old-seat").write_text("old seat, 2026-10-04T10:56:00-07:00, the focused test\n")
+            _ = (folder / "old-worker").write_text("old worker, 2026-10-04T10:56:00-07:00, the focused test\n")
             state = build_hold.read_holders(folder)
             self.assertIsInstance(state, build_hold.ActiveHolders)
             assert isinstance(state, build_hold.ActiveHolders)
             self.assertEqual(len(state.holders), 1)
-            self.assertEqual(state.holders[0].name, "old-seat")
+            self.assertEqual(state.holders[0].name, "old-worker")
             self.assertEqual(state.holders[0].since, datetime.fromisoformat("2026-10-04T10:56:00-07:00"))
             self.assertIn("the focused test", state.holders[0].purpose)
             self.assertIsInstance(state.holders[0].release, build_hold.UnknownReleaseEta)
@@ -1206,7 +1275,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         assert cycle is not None
         return build_hold.advance_release(cycle, now, clock=lambda: now)
 
-    def test_same_name_sessions_receive_distinct_direct_sends_in_arrival_order(self) -> None:
+    def test_same_name_sessions_receive_distinct_direct_sends_in_one_pass(self) -> None:
         now = self.begin("session-a", "session-b")
         sent: list[tuple[str, str]] = []
 
@@ -1219,29 +1288,25 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
 
         with mock.patch.object(build_hold, "socket_for", side_effect=socket_for), \
              mock.patch.object(build_hold, "send_release", side_effect=deliver):
-            complete, _ = self.advance(now)
+            complete, detail = self.advance(now)
             self.assertFalse(complete)
-            self.assertEqual(sent, [("session-a", "/tmp/session-a.sock")])
-            self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
+            self.assertEqual(sent, [("session-a", "/tmp/session-a.sock"), ("session-b", "/tmp/session-b.sock")])
+            self.assertEqual([entry["state"] for entry in self.entries()], ["ReleasedAwaitingAdmission"] * 2)
+            self.assertEqual(detail, "shared name [session-a]: ReleasedAwaitingAdmission; "
+                                     + "shared name [session-b]: ReleasedAwaitingAdmission")
             self.assertIn("MemoryGateReturned", build_hold.mark_gate("session-a", "MemoryGateReturned", "Granted"))
-            returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            complete, detail = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1))
-            self.assertFalse(complete)
-            self.assertEqual(len(sent), 1)
-            self.assertIn("session-b", detail)
-            self.assertIn("at ", detail)
             status_output = io.StringIO()
             with redirect_stdout(status_output):
                 self.assertEqual(build_hold.main(["status"]), 0)
-            self.assertIn("next shared name [session-b] at ", status_output.getvalue())
-            complete, _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
+            self.assertIn("shared name [session-a]: MemoryGateReturned(Granted)\n"
+                          + "shared name [session-b]: ReleasedAwaitingAdmission\n", status_output.getvalue())
+            self.assertNotIn("next ", status_output.getvalue())
+            complete, detail = self.advance(now)
             self.assertFalse(complete)
-            self.assertEqual(sent, [
-                ("session-a", "/tmp/session-a.sock"),
-                ("session-b", "/tmp/session-b.sock"),
-            ])
+            self.assertEqual(detail, "shared name [session-b]: ReleasedAwaitingAdmission")
+            self.assertEqual(len(sent), 2)
 
-    def test_delayed_unbound_build_yields_to_next_session_after_one_minute(self) -> None:
+    def test_silent_session_ends_at_its_own_deadline_without_holding_others(self) -> None:
         now = self.begin("first", "second")
         sent: list[str] = []
 
@@ -1252,13 +1317,18 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", side_effect=deliver):
             _ = self.advance(now)
-            self.assertEqual(sent, ["first"])
-            _ = self.advance(now + timedelta(minutes=10))
+            self.assertEqual(sent, ["first", "second"])
+            self.assertIn("MemoryGateReturned", build_hold.mark_gate("second", "MemoryGateReturned", "Granted"))
+            complete, detail = self.advance(now + timedelta(minutes=10))
+            self.assertFalse(complete)
+            self.assertEqual(detail, "shared name [first]: ReleasedAwaitingAdmission")
+            complete, _ = self.advance(now + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S))
+            self.assertTrue(complete)
             self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.NoAdmissionAck(now))
             self.assertFalse(self.entries()[0]["session_pending"])
             self.assertEqual(sent, ["first", "second"])
 
-    def test_memory_wait_past_five_minutes_still_blocks_next_release(self) -> None:
+    def test_a_slow_memory_wait_does_not_hold_other_sessions(self) -> None:
         now = self.begin("first", "second")
         sent: list[str] = []
 
@@ -1270,30 +1340,32 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
              mock.patch.object(build_hold, "send_release", side_effect=deliver):
             _ = self.advance(now)
             _ = build_hold.mark_gate("first", "WaitingForMemory")
+            self.assertEqual(sent, ["first", "second"])
+            self.assertIn("MemoryGateReturned", build_hold.mark_gate("second", "MemoryGateReturned", "Granted"))
             waiting = build_hold.aware_instant(self.entries()[0].get("wait_started_at", ""))
-            _ = self.advance(waiting + timedelta(minutes=6))
-            self.assertEqual(sent, ["first"])
-            self.assertEqual(self.entries()[0]["state"], "WaitingForMemory")
+            complete, detail = self.advance(waiting + timedelta(minutes=6))
+            self.assertFalse(complete)
+            self.assertEqual(detail, "shared name [first]: WaitingForMemory")
             _ = build_hold.mark_gate("first", "MemoryGateReturned", "TimedOut")
             returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
+            complete, _ = self.advance(returned)
+            self.assertTrue(complete)
             self.assertEqual(sent, ["first", "second"])
 
-    def test_memory_wait_fallback_starts_after_limit_and_settle(self) -> None:
+    def test_memory_wait_ends_after_the_gate_limit_and_grace(self) -> None:
         now = self.begin("first", "second")
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
              mock.patch.dict(os.environ, {"BUILDLOG_MEM_WAIT_LIMIT_S": "900"}):
             _ = self.advance(now)
             _ = build_hold.mark_gate("first", "WaitingForMemory")
+            self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
             waiting = build_hold.aware_instant(self.entries()[0].get("wait_started_at", ""))
-            deadline = waiting + timedelta(seconds=900 + build_hold.RELEASE_SETTLE_S)
+            deadline = waiting + timedelta(seconds=900 + build_hold.MEMORY_GATE_GRACE_S)
             _ = self.advance(deadline - timedelta(seconds=1))
             self.assertEqual(self.entries()[0]["state"], "WaitingForMemory")
-            self.assertEqual(self.entries()[1]["state"], "AwaitingRelease")
             _ = self.advance(deadline)
             self.assertEqual(self.entries()[0]["state"], "NoAdmissionAck")
-            self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
 
     def test_no_admission_ack_is_not_early(self) -> None:
         now = self.begin("first", "second")
@@ -1301,12 +1373,12 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
             _ = self.advance(now)
             released = build_hold.aware_instant(self.entries()[0].get("released_at", ""))
-            _ = self.advance(released + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1))
-            self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
-            self.assertEqual(self.entries()[1]["state"], "AwaitingRelease")
-            _ = self.advance(released + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
-            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.NoAdmissionAck(released))
-            self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
+            _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1))
+            self.assertEqual([entry["state"] for entry in self.entries()], ["ReleasedAwaitingAdmission"] * 2)
+            complete, _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S))
+            self.assertTrue(complete)
+            for entry in self.entries():
+                self.assertEqual(build_hold.read_release_state(entry), build_hold.NoAdmissionAck(released))
 
     def test_unreadable_session_records_are_a_failed_delivery_not_a_gone_session(self) -> None:
         now = self.begin("unknown", "next")
@@ -1376,28 +1448,24 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertEqual(build_hold.register_wait("late"), "release under way; late builds now")
             _ = build_hold.mark_gate("first", "MemoryGateReturned", "Granted")
             returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
+            complete, _ = self.advance(returned)
+            self.assertTrue(complete)
             self.assertEqual(sent, ["first"])
             self.assertEqual([entry["session_id"] for entry in self.entries()], ["first"])
 
-    def test_unregistered_recipient_is_released_after_registered_memory_gate(self) -> None:
+    def test_unregistered_recipient_is_released_with_the_registered_sessions(self) -> None:
         now = self.begin("first", recipients=(("late name", "late"),))
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
             _ = self.advance(now)
-            self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
-            complete, _ = self.advance(now + timedelta(seconds=build_hold.NO_REGISTRATION_S))
-            self.assertFalse(complete)
-            self.assertEqual([entry["session_id"] for entry in self.entries()], ["first"])
-            self.assertEqual(send.call_count, 1)
-            self.assertIn("MemoryGateReturned", build_hold.mark_gate("first", "MemoryGateReturned", "Granted"))
-            returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1))
-            self.assertEqual(send.call_count, 1)
-            complete, _ = self.advance(returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S))
-            self.assertFalse(complete)
             self.assertEqual([entry["session_id"] for entry in self.entries()], ["first", "late"])
-            self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
+            self.assertEqual([entry["state"] for entry in self.entries()], ["ReleasedAwaitingAdmission"] * 2)
+            self.assertEqual(send.call_count, 2)
+            self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
+            self.assertIn("MemoryGateReturned", build_hold.mark_gate("first", "MemoryGateReturned", "Granted"))
+            complete, detail = self.advance(now + timedelta(seconds=build_hold.NO_REGISTRATION_S))
+            self.assertFalse(complete)
+            self.assertEqual(detail, "late name [late]: ReleasedAwaitingAdmission")
             self.assertEqual(send.call_count, 2)
             self.assertTrue((self.scratch / "holders" / "holder").exists())
 
@@ -1612,8 +1680,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         assert cycle is not None
         cycle["holders"]["holder"]["released_at"] = (now - timedelta(minutes=2)).isoformat()
         cycle["entries"][0] = build_hold.new_entry("first", "shared name")
-        build_hold.store_release_state(cycle["entries"][0], build_hold.MemoryGateReturned(
-            now - timedelta(seconds=build_hold.RELEASE_SETTLE_S + 1), "Granted"))
+        build_hold.store_release_state(cycle["entries"][0], build_hold.MemoryGateReturned(now, "Granted"))
         cycle["entries"][0]["session_pending"] = False
         cycle["entries"][0]["delivery"] = {"generation": cycle.get("holder_generation", 1), "outcome": "Delivered"}
         build_hold.save_cycle(cycle)
@@ -1671,7 +1738,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
              mock.patch.object(time, "sleep"):
             self.assertEqual(build_hold.socket_for("session-a"), build_hold.RecipientLookupFailed("lookup unavailable"))
 
-    def test_a_session_with_nothing_to_build_releases_the_next_at_once(self) -> None:
+    def test_nothing_to_build_ends_only_that_sessions_turn(self) -> None:
         now = self.begin("first", "second")
         sent: list[str] = []
 
@@ -1682,38 +1749,38 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", side_effect=deliver):
             _ = self.advance(now)
-            self.assertEqual(sent, ["first"])
+            self.assertEqual(sent, ["first", "second"])
             answered = subprocess.run(
                 ["python3", str(SCRIPT), "nothing-to-build"], capture_output=True, text=True, check=False,
                 env={**os.environ, "CLAUDE_CODE_SESSION_ID": "first"},
             )
             self.assertEqual(answered.returncode, 0, answered.stderr)
             self.assertEqual(answered.stdout.strip(),
-                             "shared name [first]: NothingToBuild; the release moves on to the next session")
+                             "shared name [first]: NothingToBuild; the release stops waiting for this session")
             self.assertEqual(set(self.entries()[0]), {"session_id", "name", "state", "answered_at", "calls", "active_call_id", "active_released_at", "session_pending", "session_admitted_generation", "delivery"})
             _ = build_hold.aware_instant(self.entries()[0].get("answered_at", ""))
             complete, detail = self.advance(now)
             self.assertFalse(complete)
-            self.assertEqual(sent, ["first", "second"])
-            self.assertIn("second", detail)
+            self.assertEqual(detail, "shared name [second]: ReleasedAwaitingAdmission")
             self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("second"))
             complete, detail = self.advance(now)
             self.assertTrue(complete)
+            self.assertEqual(sent, ["first", "second"])
             self.assertEqual(detail, "shared name [first]: NothingToBuild; shared name [second]: NothingToBuild")
 
     def test_nothing_to_build_answers_only_a_release_still_awaiting_admission(self) -> None:
         now = self.begin("first", "second")
+        self.assertEqual(build_hold.answer_nothing_to_build("second"),
+                         "nothing-to-build ignored: shared name [second]: AwaitingRelease")
         with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
              mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
             _ = self.advance(now)
         self.assertEqual(build_hold.answer_nothing_to_build("unregistered"),
                          "nothing-to-build ignored: this session is not registered")
-        self.assertEqual(build_hold.answer_nothing_to_build("second"),
-                         "nothing-to-build ignored: shared name [second]: AwaitingRelease")
         self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
         self.assertEqual(build_hold.answer_nothing_to_build("first"),
                          "nothing-to-build ignored: shared name [first]: WaitingForMemory")
-        self.assertEqual([entry["state"] for entry in self.entries()], ["WaitingForMemory", "AwaitingRelease"])
+        self.assertEqual([entry["state"] for entry in self.entries()], ["WaitingForMemory", "ReleasedAwaitingAdmission"])
         self.assertEqual(build_hold.answer_nothing_to_build(""), "NoSessionId")
 
     def test_a_queued_release_can_answer_nothing_to_build(self) -> None:
@@ -1800,7 +1867,7 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
     def test_calls_arriving_through_a_whole_release_never_extend_it(self) -> None:
         self.begin("first", "second", "third")
         started = self.now
-        limit = 3 * (build_hold.RELEASE_SETTLE_S + build_hold.RELEASE_POLL_S)
+        limit = build_hold.RELEASE_POLL_S
         complete = False
         poll = 0
         while (self.now - started).total_seconds() <= limit:
@@ -1858,16 +1925,16 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
 
     def test_second_call_from_a_queued_session_builds_at_once_and_its_turn_stays(self) -> None:
         self.begin("first", "second", calls=(("second", "waiting-call"),))
-        _ = self.advance()
         before = self.record_bytes()
         _ = build_hold.register_wait("second", call_id="late-call")
         self.assertIsInstance(build_hold.read_admission("second", "late-call"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("second", "waiting-call"), build_hold.AwaitingTurn)
         self.assertIsInstance(build_hold.read_admission("second"), build_hold.AwaitingTurn)
         self.assertEqual(self.record_bytes(), before)
-        _ = build_hold.answer_nothing_to_build("first")
         _ = self.advance()
+        self.assertEqual(self.sent(), ["first", "second"])
         self.assertEqual(self.entry("second")["active_call_id"], "waiting-call")
+        self.assertIsInstance(build_hold.read_admission("second", "waiting-call"), build_hold.AdmittedTurn)
 
     def test_second_call_during_a_bound_turn_builds_at_once_and_adds_no_turn(self) -> None:
         self.begin("owner", "peer", calls=(("owner", "first-call"),))
@@ -1876,9 +1943,9 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         _ = build_hold.register_wait("owner", call_id="second-call")
         self.assertIsInstance(build_hold.read_admission("owner", "second-call"), build_hold.AdmittedTurn)
         self.assertEqual(self.record_bytes(), before)
+        self.assertEqual(self.sent(), ["owner", "peer"])
         _ = self.mark("owner", "MemoryGateReturned", "first-call")
-        self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-        _ = self.advance()
+        self.assertEqual(self.advance(), (False, "peer [peer]: ReleasedAwaitingAdmission"))
         self.assertEqual(self.sent(), ["owner", "peer"])
         self.assertNotIn("second-call", [call["call_id"] for call in self.entry("owner")["calls"]])
 
@@ -1889,16 +1956,15 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
                                                           else build_hold.ReleaseDelivered())
                 _ = self.advance()
+                self.assertEqual(self.sent(), ["owner", "peer"])
                 self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AwaitingTurn)
                 self.assertIn("registered", build_hold.register_wait("owner", call_id="new-call"))
                 self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
                 self.assertEqual(self.entry("owner")["active_call_id"], "new-call")
                 _ = self.mark("owner", "MemoryGateReturned", "new-call")
-                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
                 _ = self.advance()
-                self.assertEqual(self.sent(), ["owner"])
-                self.now += timedelta(seconds=1)
-                _ = self.advance()
+                self.assertEqual(self.entry("owner")["state"], "MemoryGateReturned")
+                self.assertEqual(self.entry("owner")["active_call_id"], "")
                 self.assertEqual(self.sent(), ["owner", "peer"])
 
     def test_call_registered_during_the_hold_keeps_its_turn(self) -> None:
@@ -1907,11 +1973,9 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         self.assertIsInstance(build_hold.read_admission("owner", "first"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AwaitingTurn)
         _ = self.mark("owner", "MemoryGateReturned", "first")
-        self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
         _ = self.advance()
         self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
         _ = self.mark("owner", "MemoryGateReturned", "second")
-        self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
         self.assertTrue(self.advance()[0])
         self.assertEqual(self.sent(), ["owner"])
 
@@ -1925,7 +1989,8 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         for case in ("new", "served", "queued-session", "bound-session", "late-call", "listed-call"):
             with self.subTest(case=case):
                 self.begin("owner", "peer", calls=(("owner", "active"), ("peer", "waiting")))
-                _ = self.advance()
+                if case not in ("queued-session", "listed-call"):
+                    _ = self.advance()
                 key, call_id = "owner", ""
                 if case == "new":
                     key = "unknown"
@@ -1956,11 +2021,12 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
 
     def test_launch_from_a_queued_session_waits_for_its_turn(self) -> None:
         self.begin("owner", "peer")
-        _ = self.advance()
         self.assertIsInstance(build_hold.read_admission("peer"), build_hold.AwaitingTurn)
         before = self.record_bytes()
         self.assertEqual(build_hold.register_wait("peer"), "release under way; peer keeps its queued turn")
         self.assertEqual(self.record_bytes(), before)
+        _ = self.advance()
+        self.assertIsInstance(build_hold.read_admission("peer"), build_hold.AdmittedTurn)
 
     def test_recipient_recorded_after_the_release_began_gets_no_turn(self) -> None:
         self.begin("owner")
@@ -2111,12 +2177,13 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         self.assertEqual(self.sent(), ["owner", "peer"])
         self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("peer")])
 
-    def test_live_build_in_the_memory_gate_holds_later_sessions(self) -> None:
+    def test_live_build_in_the_memory_gate_does_not_hold_other_sessions(self) -> None:
         for kind in ("call", "live-session", "unknown-session"):
             with self.subTest(kind=kind):
                 calls = (("owner", "active"),) if kind == "call" else ()
                 self.begin("owner", "peer", calls=calls)
                 _ = self.advance()
+                self.assertEqual(self.sent(), ["owner", "peer"])
                 call_id = "active" if kind == "call" else ""
                 _ = self.mark("owner", "WaitingForMemory", call_id)
                 self.release_mocks["lookup"].reset_mock()
@@ -2125,26 +2192,22 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
                     else build_hold.RecipientLive("/test/socket"))
                 self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
                 _ = self.advance()
-                self.assertEqual(self.entry("peer")["state"], "AwaitingRelease")
-                self.assertEqual(self.sent(), ["owner"])
-                if kind == "call":
-                    self.release_mocks["lookup"].assert_not_called()
-                else:
-                    self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("owner")])
+                self.assertEqual(self.entry("owner")["state"], "WaitingForMemory")
+                self.assertEqual(self.entry("peer")["state"], "ReleasedAwaitingAdmission")
+                looked_up = [mock.call("peer")] if kind == "call" else [mock.call("owner"), mock.call("peer")]
+                self.assertEqual(self.release_mocks["lookup"].call_args_list, looked_up)
                 _ = self.mark("owner", "MemoryGateReturned", call_id)
-                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["owner"])
                 self.release_mocks["lookup"].return_value = build_hold.RecipientLive("/test/socket")
-                self.now += timedelta(seconds=1)
-                _ = self.advance()
+                self.assertEqual(self.advance(), (False, "peer [peer]: ReleasedAwaitingAdmission"))
+                _ = build_hold.answer_nothing_to_build("peer")
+                self.assertTrue(self.advance()[0])
                 self.assertEqual(self.sent(), ["owner", "peer"])
 
     def test_holder_joining_after_a_cut_turn_sends_one_message_for_the_new_generation(self) -> None:
         self.begin("owner", "peer")
         _ = self.advance()
-        self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-        _ = self.advance()
+        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+        self.assertTrue(self.advance()[0])
         self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
         self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
         self.now += timedelta(seconds=1)
@@ -2154,12 +2217,11 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         _ = build_hold.register_wait("owner")
         self.start_release()
         _ = self.advance()
-        _ = build_hold.answer_nothing_to_build("peer")
-        _ = self.advance()
-        self.assertEqual(self.sent().count("owner"), 2)
-        _ = build_hold.answer_nothing_to_build("owner")
-        _ = self.advance()
-        self.assertEqual(self.sent().count("owner"), 2)
+        self.assertEqual(self.sent(), ["owner", "peer", "owner", "peer"])
+        for key in ("owner", "peer"):
+            _ = build_hold.answer_nothing_to_build(key)
+        self.assertTrue(self.advance()[0])
+        self.assertEqual(self.sent(), ["owner", "peer", "owner", "peer"])
 
 
 HolderFileContent = TypedDict("HolderFileContent", {"holder": str, "since": str, "for": str, "release_eta": str})
@@ -2222,7 +2284,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
             line = build_hold.release_cycle(folder, "holder")
         self.assertEqual(line, self.stop_line())
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
         holder = build_hold.read_holder(folder / "holder")
         self.assertEqual(holder.since, self.replaced_at)
         cycle = self.cycle()
@@ -2293,7 +2355,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(io.StringIO()):
             line = build_hold.release_cycle(folder, "holder")
         self.assertTrue(line.startswith("released, builds may resume."))
-        self.assertEqual(self.sent, ["first", "first", "second", "third"])
+        self.assertEqual(self.sent, ["first", "second", "third"] * 2)
         self.assertFalse((folder / "holder").exists())
 
     def test_resume_refuses_a_new_hold_whose_name_uses_a_released_holds_file(self) -> None:
@@ -2318,7 +2380,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
                 self.assertEqual(errors.getvalue(), f"build_hold: {self.resume_error(folder)}\n")
                 self.assertEqual(self.record_path().read_bytes(), before)
                 self.assertEqual(build_hold.read_holder(folder / "night-run").since, self.replaced_at)
-                self.assertEqual(self.sent, ["first"])
+                self.assertEqual(self.sent, ["first", "second", "third"])
 
     def test_release_command_stops_when_another_name_replaces_its_hold_file(self) -> None:
         folder = self.begin("night run")
@@ -2341,7 +2403,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
             self.assertEqual(build_hold.main(["release", "--holder", "night run"]), 0)
         self.assertEqual(output.getvalue().splitlines()[-1], self.stop_line("night-run"))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
         self.assertEqual(build_hold.read_holder(folder / "night-run").since, self.replaced_at)
         self.assertEqual(self.record_path().read_bytes(), saved[0])
 
@@ -2350,7 +2412,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         _ = self.replace_during_sleep(folder, release_new=True)
         self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
         self.assertTrue(self.cycle()["release_started_at"])
-        self.assertEqual(self.sent, ["first", "first"])
+        self.assertEqual(self.sent, ["first", "second", "third"] * 2)
 
     def pause_release(self, folder: Path, name: str) -> None:
         with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")), \
@@ -2467,7 +2529,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         folder = self.begin()
         _ = self.replace_during_sleep(folder, another=True)
         self.assertTrue((folder / "other").is_file())
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
         self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
 
     def test_another_holder_joining_ends_the_driver_as_before(self) -> None:
@@ -2482,7 +2544,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         self.assertEqual(line, "released; still held by " + build_hold.holder_text(build_hold.read_holder(folder / "other")))
         self.assertFalse((folder / "holder").exists())
         self.assertTrue((folder / "other").exists())
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
 
     def test_release_under_a_name_with_a_space_lists_only_the_other_holder(self) -> None:
         folder = self.begin("night run")
@@ -2557,7 +2619,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         self.assertNotIn("builds may resume", output.getvalue())
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual([holder.name for holder in state.holders], ["other", "third-holder"])
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
 
     def test_release_command_ends_with_exit_zero_when_no_holder_remains(self) -> None:
         folder = self.begin()
@@ -2603,7 +2665,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
             line = build_hold.release_cycle(folder, "holder")
         self.assertEqual(line, self.stop_line())
         self.assertEqual(build_hold.read_holder(folder / "holder").since, self.replaced_at)
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
         self.assertEqual(path.read_text(), "{still broken")
         self.assertEqual(sorted(file.name for file in path.parent.iterdir()), files)
         self.assertEqual(current.read_text(), cycle_id + "\n")
@@ -2624,7 +2686,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
         copies = list(path.parent.glob("cycle.json.damaged-*"))
         self.assertEqual(len(copies), 1)
         self.assertEqual(copies[0].read_text(), "{broken")
-        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.sent, ["first", "second", "third"])
 
     def test_removed_holder_ends_the_driver_without_reading_a_damaged_record(self) -> None:
         folder = self.begin()
@@ -2838,46 +2900,53 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
             cast(mock.Mock, clock.now).return_value = self.now
             return build_hold.release_cycle(self.scratch / "holders", "holder")
 
-    def test_three_told_sessions_are_saved_together_and_serve_one_turn_at_a_time(self) -> None:
+    def test_three_told_sessions_are_saved_together_and_released_in_one_pass(self) -> None:
+        keys = ("z-first", "a-second", "m-third")
         for ending in ("gate", "nothing", "timeout"):
             with self.subTest(ending=ending):
-                self.begin("z-first", "a-second", "m-third")
-                snapshots: list[list[str]] = []
+                self.begin(*keys)
+                snapshots: list[list[tuple[str, str]]] = []
 
                 def lookup(_key: str) -> build_hold.RecipientLive:
-                    snapshots.append([entry["session_id"] for entry in self.cycle()["entries"]])
+                    snapshots.append([(entry["session_id"], entry["delivery"]["outcome"]) for entry in self.cycle()["entries"]])
                     return build_hold.RecipientLive("/test/socket")
 
                 self.release_mocks["lookup"].side_effect = lookup
+                started = self.now
                 complete, detail = self.advance()
                 self.assertFalse(complete)
-                self.assertNotIn("waiting for registrations", detail)
-                self.assertEqual(snapshots, [["z-first", "a-second", "m-third"]])
-                self.assertEqual(self.sent(), ["z-first"])
-                self.assertEqual(self.entry("a-second")["state"], "AwaitingRelease")
+                self.assertEqual(detail, "; ".join(f"name {key} [{key}]: ReleasedAwaitingAdmission" for key in keys))
+                self.assertEqual(snapshots, [
+                    [("z-first", "NotAttempted"), ("a-second", "NotAttempted"), ("m-third", "NotAttempted")],
+                    [("z-first", "Delivered"), ("a-second", "NotAttempted"), ("m-third", "NotAttempted")],
+                    [("z-first", "Delivered"), ("a-second", "Delivered"), ("m-third", "NotAttempted")],
+                ])
+                self.assertEqual(self.sent(), list(keys))
+                self.assertEqual(build_hold.cycle_status_lines(self.cycle()), [f"name {key} [{key}]: ReleasedAwaitingAdmission" for key in keys])
+                self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("a-second"))
+                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+                complete, detail = self.advance()
+                self.assertFalse(complete)
+                self.assertNotIn("a-second", detail)
                 if ending == "gate":
-                    returned = self.returned("z-first")
-                    self.now = returned + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-                    _ = self.advance()
-                    self.assertEqual(self.sent(), ["z-first"])
-                    self.now += timedelta(seconds=1)
+                    _ = self.returned("z-first")
                 elif ending == "nothing":
-                    self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("z-first"))
+                    self.assertEqual(build_hold.answer_nothing_to_build("z-first"),
+                                     "name z-first [z-first]: NothingToBuild; the release stops waiting for this session")
                 else:
-                    self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-                    _ = self.advance()
-                    self.assertEqual(self.sent(), ["z-first"])
+                    self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
+                    self.assertFalse(self.advance()[0])
                     self.now += timedelta(seconds=1)
-                _ = self.advance()
+                complete, detail = self.advance()
+                self.assertEqual(complete, ending == "timeout")
                 if ending == "timeout":
-                    self.assertEqual(self.entry("z-first")["state"], "NoAdmissionAck")
-                self.assertEqual(self.sent(), ["z-first", "a-second"])
-                self.assertEqual(self.entry("m-third")["state"], "AwaitingRelease")
-                _ = build_hold.answer_nothing_to_build("a-second")
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["z-first", "a-second", "m-third"])
-                _ = build_hold.answer_nothing_to_build("m-third")
-                self.assertTrue(self.advance()[0])
+                    self.assertEqual(build_hold.read_release_state(self.entry("z-first")), build_hold.NoAdmissionAck(started))
+                    self.assertEqual(build_hold.read_release_state(self.entry("m-third")), build_hold.NoAdmissionAck(started))
+                else:
+                    self.assertEqual(detail, "name m-third [m-third]: ReleasedAwaitingAdmission")
+                    _ = build_hold.answer_nothing_to_build("m-third")
+                    self.assertTrue(self.advance()[0])
+                self.assertEqual(self.sent(), list(keys))
 
     def test_departed_session_ends_turn_on_next_poll_without_changing_delivery(self) -> None:
         for queued in (False, True):
@@ -2912,7 +2981,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 else:
                     self.assertNotIn("Not reached", line)
 
-    def test_lookup_failure_preserves_silent_turn_until_normal_deadline_without_waiters(self) -> None:
+    def test_lookup_failure_preserves_silent_turn_until_its_deadline(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
                 self.begin("owner")
@@ -2926,15 +2995,14 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 self.release_mocks["lookup"].return_value = build_hold.RecipientLookupFailed("registry denied")
                 output, errors = io.StringIO(), io.StringIO()
                 with redirect_stdout(output), redirect_stderr(errors):
-                    for elapsed in (build_hold.RELEASE_POLL_S, build_hold.RELEASE_SETTLE_S,
-                                    build_hold.NO_ADMISSION_ACK_S - 1):
+                    for elapsed in (build_hold.RELEASE_POLL_S, build_hold.NO_ADMISSION_ACK_S - 1):
                         self.now = started + timedelta(seconds=elapsed)
                         self.assertFalse(self.advance()[0])
                         self.assertEqual(self.entry("owner")["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
                         self.assertEqual(self.entry("owner")["delivery"], delivery)
                 self.assertEqual(output.getvalue(), "")
                 self.assertEqual(errors.getvalue(), "")
-                self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("owner")] * 3)
+                self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("owner")] * 2)
                 self.release_mocks["lookup"].reset_mock()
                 self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
                 self.assertTrue(self.advance()[0])
@@ -2944,7 +3012,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 self.assertEqual(self.entry("owner")["delivery"], delivery)
                 self.assertEqual(self.sent(), ["owner"])
 
-    def test_silent_delivered_and_queued_turns_yield_at_one_minute_without_deadline_lookup(self) -> None:
+    def test_silent_delivered_and_queued_turns_end_together_at_the_deadline_without_lookup(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
                 self.begin("first", "second")
@@ -2953,26 +3021,22 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                                                            else build_hold.ReleaseDelivered())
                 started = self.now
                 _ = self.advance()
-                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
+                self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
                 self.assertFalse(self.advance()[0])
-                self.assertEqual(self.entry("first")["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
-                self.assertEqual(self.entry("second")["state"], "AwaitingRelease")
-                self.assertEqual(self.sent(), ["first"])
-
-                def lookup(key: str) -> build_hold.RecipientLive:
-                    self.assertNotEqual(key, "first", "The expired turn must end before a session lookup")
-                    return build_hold.RecipientLive("/test/socket")
-
-                self.release_mocks["lookup"].reset_mock()
-                self.release_mocks["lookup"].side_effect = lookup
-                self.now += timedelta(seconds=1)
-                self.assertFalse(self.advance()[0])
-                self.assertEqual(build_hold.read_release_state(self.entry("first")), build_hold.NoAdmissionAck(started))
-                self.assertFalse(self.entry("first")["session_pending"])
+                for key in ("first", "second"):
+                    self.assertEqual(self.entry(key)["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
                 self.assertEqual(self.sent(), ["first", "second"])
-                self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("second")])
+                self.release_mocks["lookup"].reset_mock()
+                self.release_mocks["lookup"].side_effect = AssertionError("An expired turn must end before a session lookup")
+                self.now += timedelta(seconds=1)
+                self.assertTrue(self.advance()[0])
+                for key in ("first", "second"):
+                    self.assertEqual(build_hold.read_release_state(self.entry(key)), build_hold.NoAdmissionAck(started))
+                    self.assertFalse(self.entry(key)["session_pending"])
+                self.assertEqual(self.sent(), ["first", "second"])
+                self.release_mocks["lookup"].assert_not_called()
 
-    def test_late_call_preserves_the_last_silent_turns_full_timeout(self) -> None:
+    def test_late_call_preserves_a_silent_turns_full_timeout(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
                 self.begin("owner")
@@ -2980,7 +3044,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                                                           else build_hold.ReleaseDelivered())
                 started = self.now
                 _ = self.advance()
-                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S + build_hold.RELEASE_POLL_S)
+                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
                 self.assertFalse(self.advance()[0])
                 before = self.cycle()
                 self.assertEqual(build_hold.register_wait("late", call_id="waiting-call"),
@@ -3005,120 +3069,96 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                     _ = self.advance()
                     self.call("owner", "building-call")
                     self.assertIsInstance(build_hold.read_admission("owner", "building-call"), build_hold.AdmittedTurn)
+                    _ = build_hold.answer_nothing_to_build("peer")
                     self.release_mocks["lookup"].reset_mock()
                     self.release_mocks["lookup"].side_effect = AssertionError("A bound call needs no session lookup")
-                    for elapsed in (build_hold.RELEASE_SETTLE_S, build_hold.NO_ADMISSION_ACK_S - 1):
+                    for elapsed in (build_hold.RELEASE_POLL_S, build_hold.NO_ADMISSION_ACK_S - 1):
                         self.now = started + timedelta(seconds=elapsed)
                         self.assertFalse(self.advance()[0])
                         self.assertEqual(self.entry("owner")["active_call_id"], "building-call")
-                        self.assertEqual(self.entry("peer")["state"], "AwaitingRelease")
-                        self.assertEqual(self.sent(), ["owner"])
                     if ending == "gate":
-                        self.now = self.returned("owner", "building-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-                        self.assertFalse(self.advance()[0])
-                        self.assertEqual(self.sent(), ["owner"])
-                        self.now += timedelta(seconds=1)
+                        _ = self.returned("owner", "building-call")
                     else:
                         self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                    self.release_mocks["lookup"].assert_not_called()
-                    self.release_mocks["lookup"].side_effect = None
-                    _ = self.advance()
+                    self.assertTrue(self.advance()[0])
                     if ending == "timeout":
                         self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
                     self.assertEqual(self.entry("owner")["active_call_id"], "")
                     self.assertEqual(self.sent(), ["owner", "peer"])
-                    self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("peer")])
+                    self.release_mocks["lookup"].assert_not_called()
 
-    def test_call_after_cut_turn_is_admitted_without_a_second_message(self) -> None:
+    def test_call_after_lapsed_turn_is_admitted_without_a_second_message(self) -> None:
         for queued in (False, True):
             with self.subTest(queued=queued):
                 self.begin("owner", "peer")
                 self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
                                                           else build_hold.ReleaseDelivered())
                 _ = self.advance()
-                self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-                _ = self.advance()
+                _ = build_hold.answer_nothing_to_build("peer")
+                self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+                self.assertTrue(self.advance()[0])
                 self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
                 before = self.cycle()
                 self.assertEqual(build_hold.register_wait("owner", call_id="late-build"),
                                  "release under way; owner builds now")
                 self.assertIsInstance(build_hold.read_admission("owner", "late-build"), build_hold.AdmittedTurn)
                 self.assertEqual(self.cycle(), before)
-                _ = build_hold.answer_nothing_to_build("peer")
                 self.assertTrue(self.advance()[0])
                 self.assertEqual(self.sent(), ["owner", "peer"])
 
-    def test_late_calls_add_no_turn_while_told_sessions_release_in_order(self) -> None:
-        self.begin("first", "second", "third")
+    def test_late_calls_add_no_turn_while_told_sessions_are_released(self) -> None:
+        keys = ("first", "second", "third")
+        self.begin(*keys)
         _ = self.advance()
-        for index in range(3):
+        self.assertEqual(self.sent(), list(keys))
+        for index in range(6):
             self.assertIn("builds now", build_hold.register_wait(f"late-{index}", call_id=f"call-{index}"))
             self.assertIsInstance(build_hold.read_admission(f"late-{index}", f"call-{index}"), build_hold.AdmittedTurn)
-            _ = self.advance()
-            self.assertEqual(self.sent(), ["first"])
-        _ = build_hold.answer_nothing_to_build("first")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second"])
-        for index in range(3, 6):
-            self.assertIn("builds now", build_hold.register_wait(f"late-{index}", call_id=f"call-{index}"))
-            self.assertIsInstance(build_hold.read_admission(f"late-{index}", f"call-{index}"), build_hold.AdmittedTurn)
-            _ = self.advance()
-            self.assertEqual(self.sent(), ["first", "second"])
-        _ = build_hold.answer_nothing_to_build("second")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second", "third"])
-        _ = build_hold.answer_nothing_to_build("third")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second", "third"])
-        self.assertTrue(self.advance()[0])
+            if index % 2:
+                _ = build_hold.answer_nothing_to_build(keys[index // 2])
+            self.assertEqual(self.advance()[0], index == 5)
+            self.assertEqual(self.sent(), list(keys))
+        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], list(keys))
 
-    def test_call_registered_by_queued_told_session_uses_its_existing_turn(self) -> None:
+    def test_call_registered_by_told_session_uses_its_turn(self) -> None:
         self.begin("first", "second", "third", registered=("first",), calls=(("second", "second-call"),))
         _ = self.advance()
-        _ = build_hold.answer_nothing_to_build("first")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second"])
+        self.assertEqual(self.sent(), ["first", "second", "third"])
         self.assertEqual(self.entry("second")["active_call_id"], "second-call")
         self.assertIsInstance(build_hold.read_admission("second", "second-call"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("second"), build_hold.AdmittedTurn)
-        self.now = self.returned("second", "second-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-        _ = self.advance()
+        _ = self.returned("second", "second-call")
+        complete, detail = self.advance()
+        self.assertFalse(complete)
+        self.assertEqual(detail, "name first [first]: ReleasedAwaitingAdmission; name third [third]: ReleasedAwaitingAdmission")
+        for key in ("first", "third"):
+            _ = build_hold.answer_nothing_to_build(key)
+        self.assertTrue(self.advance()[0])
         self.assertEqual(self.sent(), ["first", "second", "third"])
 
-    def test_resumed_call_waits_for_current_turn_and_settle_then_precedes_unstarted_turns(self) -> None:
-        self.begin("first", "resumed", "second", "third", registered=("second", "third"),
+    def test_resumed_calls_and_told_sessions_are_released_in_one_pass(self) -> None:
+        # Entries keep their registration order: sessions, then unstarted calls, then started calls.
+        keys = ["second", "third", "resumed", "first"]
+        self.begin("first", "resumed", "second", "third", registered=("second", "third"), calls=(("resumed", "resumed-later"),),
                    started_calls=(("first", "first-call"), ("resumed", "resumed-call")))
         _ = self.advance()
-        order = [entry["session_id"] for entry in self.cycle()["entries"]]
-        self.assertEqual(order, ["first", "resumed", "second", "third"])
+        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], keys)
+        self.assertEqual(self.sent(), keys)
+        self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call(key) for key in keys])
         self.assertEqual(self.entry("first")["active_call_id"], "first-call")
-        self.assertEqual(self.sent(), ["first"])
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        _ = self.advance()
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], order)
-        self.assertEqual(self.entry("resumed")["state"], "AwaitingRelease")
-        self.assertIsInstance(build_hold.read_admission("resumed", "resumed-call"), build_hold.AwaitingTurn)
-        self.assertEqual(self.sent(), ["first"])
-        self.release_mocks["lookup"].assert_called_once_with("first")
-        self.now = self.returned("first", "first-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-        _ = self.advance()
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], order)
-        self.assertEqual(self.entry("resumed")["state"], "AwaitingRelease")
-        self.assertEqual(self.sent(), ["first"])
-        self.release_mocks["lookup"].assert_called_once_with("first")
-        self.now += timedelta(seconds=1)
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "resumed"])
         self.assertEqual(self.entry("resumed")["active_call_id"], "resumed-call")
         self.assertIsInstance(build_hold.read_admission("resumed", "resumed-call"), build_hold.AdmittedTurn)
+        self.assertIsInstance(build_hold.read_admission("resumed", "resumed-later"), build_hold.AwaitingTurn)
         for key in ("second", "third"):
-            self.assertEqual(self.entry(key)["state"], "AwaitingRelease")
-        self.now = self.returned("resumed", "resumed-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "resumed", "second"])
-        _ = build_hold.answer_nothing_to_build("second")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "resumed", "second", "third"])
+            self.assertEqual(self.entry(key)["state"], "ReleasedAwaitingAdmission")
+        _ = self.returned("resumed", "resumed-call")
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        self.assertFalse(self.advance()[0])
+        self.assertEqual(self.entry("resumed")["active_call_id"], "resumed-later")
+        self.assertIsInstance(build_hold.read_admission("resumed", "resumed-later"), build_hold.AdmittedTurn)
+        self.assertEqual(self.entry("resumed")["state"], "ReleasedAwaitingAdmission")
+        self.assertEqual(self.sent(), keys)
+        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], keys)
 
     def test_call_registering_after_delivery_takes_open_turn_but_not_memory_wait(self) -> None:
         for turn in ("delivered", "queued", "memory"):
@@ -3140,18 +3180,17 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                     self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
                     self.assertEqual(self.entry("owner")["active_call_id"], "")
                     _ = self.advance()
-                    self.assertEqual(self.sent(), ["owner"])
+                    self.assertEqual(self.sent(), ["owner", "peer"])
                     self.assertEqual(self.entry("owner")["state"], "WaitingForMemory")
                     continue
                 self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
                 self.assertEqual(self.entry("owner")["active_call_id"], "new-call")
                 _ = self.advance()
-                self.assertEqual(self.sent(), ["owner"])
-                self.now = self.returned("owner", "new-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["owner"])
-                self.now += timedelta(seconds=1)
-                _ = self.advance()
+                self.assertEqual(self.sent(), ["owner", "peer"])
+                _ = self.returned("owner", "new-call")
+                self.assertFalse(self.advance()[0])
+                self.assertEqual(self.entry("owner")["state"], "MemoryGateReturned")
+                self.assertEqual(self.entry("owner")["active_call_id"], "")
                 self.assertEqual(self.sent(), ["owner", "peer"])
 
     def test_second_call_during_bound_turn_is_admitted_without_another_turn(self) -> None:
@@ -3163,7 +3202,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         self.assertIn("builds now", build_hold.register_wait("owner", call_id="call-b"))
         self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
         self.assertEqual(self.cycle(), before)
-        self.now = self.returned("owner", "call-a") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+        _ = self.returned("owner", "call-a")
         _ = self.advance()
         self.assertEqual(self.sent(), ["owner", "peer"])
         self.assertEqual(self.entry("owner")["active_call_id"], "")
@@ -3183,57 +3222,56 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 self.assertEqual(build_hold.read_release_state(self.entry("owner")), original_state)
                 self.assertEqual(self.entry("owner")["active_released_at"], original_clock)
                 _ = self.advance()
-                self.assertEqual(self.sent(), ["owner"])
+                self.assertEqual(self.sent(), ["owner", "peer"])
                 self.now += timedelta(seconds=1)
                 _ = self.advance()
                 self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
                 self.assertEqual(self.entry("owner")["active_call_id"], "")
                 self.assertEqual(self.sent(), ["owner", "peer"])
 
-    def test_failed_notification_started_call_holds_resumed_call_until_mark_or_timeout(self) -> None:
+    def test_failed_notification_keeps_started_call_turn_until_mark_or_timeout_without_holding_others(self) -> None:
         for gone in (False, True):
             for ending in ("mark", "timeout"):
                 with self.subTest(gone=gone, ending=ending):
                     self.begin("owner", "resumed", "told", registered=("told",),
                                started_calls=(("owner", "active-call"), ("resumed", "resumed-call")))
-                    self.release_mocks["lookup"].return_value = build_hold.RecipientGone() if gone else build_hold.RecipientLive("/test/socket")
-                    self.release_mocks["send"].return_value = build_hold.ReleaseSendFailed("send failed")
+
+                    def lookup(key: str) -> build_hold.RecipientGone | build_hold.RecipientLive:
+                        return build_hold.RecipientGone() if gone and key == "owner" else build_hold.RecipientLive("/test/socket")
+
+                    def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseSendFailed | build_hold.ReleaseDelivered:
+                        return build_hold.ReleaseSendFailed("send failed") if entry["session_id"] == "owner" else build_hold.ReleaseDelivered()
+
+                    self.release_mocks["lookup"].side_effect = lookup
+                    self.release_mocks["send"].side_effect = send
+                    started = self.now
                     with redirect_stderr(io.StringIO()):
                         _ = self.advance()
                     self.assertEqual(self.entry("owner")["state"], "RecipientGone" if gone else "DeliveryFailed")
                     self.assertEqual(self.entry("owner")["active_call_id"], "active-call")
-                    order = [entry["session_id"] for entry in self.cycle()["entries"]]
-                    self.assertEqual(order, ["owner", "resumed", "told"])
-                    self.release_mocks["lookup"].return_value = build_hold.RecipientLive("/test/socket")
-                    self.release_mocks["send"].return_value = build_hold.ReleaseDelivered()
-                    self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
-                    _ = self.advance()
-                    self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], order)
-                    self.assertEqual(self.entry("resumed")["state"], "AwaitingRelease")
-                    self.assertIsInstance(build_hold.read_admission("resumed", "resumed-call"), build_hold.AwaitingTurn)
-                    self.assertNotIn("resumed", self.sent())
-                    self.release_mocks["lookup"].assert_called_once_with("owner")
-                    if ending == "mark":
-                        self.now = self.returned("owner", "active-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S - 1)
-                        _ = self.advance()
-                        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], order)
-                        self.assertEqual(self.entry("resumed")["state"], "AwaitingRelease")
-                        self.assertNotIn("resumed", self.sent())
-                        self.release_mocks["lookup"].assert_called_once_with("owner")
-                    self.now += timedelta(seconds=1)
-                    _ = self.advance()
-                    self.assertEqual(self.entry("owner")["active_call_id"], "")
-                    self.assertEqual(self.release_mocks["lookup"].call_count, 2)
+                    self.assertEqual(self.sent(), ["told", "resumed"] if gone else ["told", "owner", "resumed"])
                     self.assertEqual(self.entry("resumed")["active_call_id"], "resumed-call")
                     self.assertIsInstance(build_hold.read_admission("resumed", "resumed-call"), build_hold.AdmittedTurn)
-                    self.assertEqual(self.sent()[-1], "resumed")
-                    self.assertEqual(self.entry("told")["state"], "AwaitingRelease")
-                    self.now = self.returned("resumed", "resumed-call") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-                    _ = self.advance()
                     self.assertEqual(self.entry("told")["state"], "ReleasedAwaitingAdmission")
-                    self.assertEqual(self.sent()[-2:], ["resumed", "told"])
+                    _ = self.returned("resumed", "resumed-call")
+                    _ = build_hold.answer_nothing_to_build("told")
+                    self.release_mocks["lookup"].reset_mock()
+                    self.release_mocks["send"].reset_mock()
+                    self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
+                    self.assertEqual(self.advance(), (False, f"name owner [owner]: {'RecipientGone' if gone else 'DeliveryFailed'}"))
+                    self.assertIsInstance(build_hold.read_admission("owner", "active-call"), build_hold.AdmittedTurn)
+                    if ending == "mark":
+                        _ = self.returned("owner", "active-call")
+                    else:
+                        self.now += timedelta(seconds=1)
+                    self.assertTrue(self.advance()[0])
+                    self.assertEqual(self.entry("owner")["active_call_id"], "")
+                    if ending == "timeout":
+                        self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
+                    self.release_mocks["lookup"].assert_not_called()
+                    self.assertEqual(self.sent(), [])
 
-    def test_pending_call_on_terminal_entry_prevents_told_queue_insertion(self) -> None:
+    def test_pending_call_on_terminal_entry_is_released_with_the_told_session(self) -> None:
         self.begin("owner", "told", calls=(("owner", "pending"),))
         cycle = self.cycle()
         entry = cycle["entries"][0]
@@ -3241,10 +3279,8 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         entry["session_pending"] = False
         build_hold.save_cycle(cycle)
         self.assertFalse(self.advance()[0])
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], ["owner"])
-        self.assertEqual(self.sent(), [])
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner"])
+        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], ["owner", "told"])
+        self.assertEqual(self.sent(), ["owner", "told"])
         self.assertEqual(self.entry("owner")["active_call_id"], "pending")
 
     def test_final_line_names_unreached_recipients_in_entry_order(self) -> None:
@@ -3299,7 +3335,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                     if answer == "WaitingForMemory":
                         self.assertIn("WaitingForMemory", build_hold.mark_gate("owner", "WaitingForMemory"))
                         self.assertEqual(self.entry("owner")["delivery"]["outcome"], "Delivered")
-                    self.now = self.returned("owner") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+                    _ = self.returned("owner")
                 self.assertEqual(self.entry("owner")["delivery"]["outcome"], "Delivered")
                 self.assertTrue(self.advance()[0])
                 self.assertNotIn("Not reached", self.final_line())
@@ -3309,15 +3345,13 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         self.begin("first", "second")
         started = self.now
         _ = self.advance()
-        self.now += timedelta(seconds=build_hold.RELEASE_SETTLE_S)
-        _ = self.advance()
-        self.assertEqual(build_hold.read_release_state(self.entry("first")), build_hold.NoAdmissionAck(started))
         self.assertEqual(self.sent(), ["first", "second"])
         self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
         self.assertFalse(self.advance()[0])
-        self.assertEqual(self.entry("second")["state"], "ReleasedAwaitingAdmission")
+        self.assertEqual([entry["state"] for entry in self.cycle()["entries"]], ["ReleasedAwaitingAdmission"] * 2)
         self.now += timedelta(seconds=1)
         self.assertTrue(self.advance()[0])
+        self.assertEqual(build_hold.read_release_state(self.entry("first")), build_hold.NoAdmissionAck(started))
         self.assertEqual([entry["state"] for entry in self.cycle()["entries"]], ["NoAdmissionAck", "NoAdmissionAck"])
         self.assertEqual(self.sent(), ["first", "second"])
         self.assertNotIn("Not reached", self.final_line())
@@ -3326,16 +3360,15 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         self.begin("owner", "peer")
         self.release_mocks["send"].side_effect = [build_hold.ReleaseQueued(), build_hold.ReleaseDelivered()]
         _ = self.advance()
+        _ = build_hold.answer_nothing_to_build("peer")
         self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-        _ = self.advance()
+        self.assertTrue(self.advance()[0])
         self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
         self.assertEqual(self.sent(), ["owner", "peer"])
         expected = f"nothing-to-build ignored: {build_hold.entry_text(self.entry('owner'))}"
         self.assertEqual(build_hold.answer_nothing_to_build("owner"), expected)
         self.assertEqual(self.entry("owner")["delivery"]["outcome"], "Delivered")
         self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-        self.assertEqual(self.entry("peer")["state"], "ReleasedAwaitingAdmission")
-        _ = build_hold.answer_nothing_to_build("peer")
         self.assertTrue(self.advance()[0])
         self.assertNotIn("Not reached", self.final_line())
 
@@ -3352,8 +3385,9 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                     build_hold.save_cycle(cycle)
                     self.release_mocks["send"].side_effect = [build_hold.ReleaseQueued(), build_hold.ReleaseDelivered()]
                     _ = self.advance()
+                    _ = build_hold.answer_nothing_to_build("peer")
                     self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                    _ = self.advance()
+                    self.assertTrue(self.advance()[0])
                     self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
                     cycle = self.cycle()
                     generation = cycle.get("holder_generation", 1)
@@ -3366,8 +3400,6 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                     self.assertEqual(self.entry("owner")["delivery"]["outcome"],
                                      "Delivered" if current_generation else "QueuedUnconfirmed")
                     self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-                    self.assertEqual(self.entry("peer")["state"], "ReleasedAwaitingAdmission")
-                    _ = build_hold.answer_nothing_to_build("peer")
                     self.assertTrue(self.advance()[0])
                     line = self.final_line()
                     if current_generation:
@@ -3386,7 +3418,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 with redirect_stderr(io.StringIO()):
                     _ = self.advance()
                 self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-                self.now = self.returned("owner", "call-a") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+                _ = self.returned("owner", "call-a")
                 expected = "RecipientGone" if outcome == "gone" else "DeliveryFailed" if outcome == "failed" else "Delivered"
                 self.assertEqual(self.entry("owner")["delivery"],
                                  {"generation": self.cycle().get("holder_generation", 1), "outcome": expected})
@@ -3394,7 +3426,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
                 self.assertEqual(self.release_mocks["lookup"].call_count, 1)
                 self.assertEqual(self.release_mocks["send"].call_count, int(outcome != "gone"))
-                self.now = self.returned("owner", "call-b") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+                _ = self.returned("owner", "call-b")
                 self.assertTrue(self.advance()[0])
                 line = self.final_line()
                 if outcome in {"failed", "gone"}:
@@ -3405,7 +3437,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
     def test_new_holder_generation_permits_one_new_notification(self) -> None:
         self.begin("owner", calls=(("owner", "call-a"),))
         _ = self.advance()
-        self.now = self.returned("owner", "call-a") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
+        _ = self.returned("owner", "call-a")
         prior = self.entry("owner")["delivery"]["generation"]
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second-holder", "second-holder"), "new hold", build_hold.NoReleaseEta(), self.now)
         cycle = self.cycle()
@@ -3527,7 +3559,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
 
     def complete(self, key: str, call_id: str) -> None:
         _ = build_hold.mark_gate(key, "MemoryGateReturned", "Granted", call_id=call_id, cycle_id=self.cycle()["id"])
-        self.now = datetime.now().astimezone() + timedelta(seconds=build_hold.RELEASE_SETTLE_S + 1)
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
 
     def write_legacy_completed_session(self) -> str:
         cycle = self.cycle()
@@ -3563,37 +3595,37 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.advance()
         self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
 
-    def test_session_registration_and_call_share_release_and_mark_advances_to_peer(self) -> None:
+    def test_session_registration_and_call_share_one_release_beside_the_peers(self) -> None:
         _ = build_hold.register_wait("owner")
-        self.register("owner", "seat-call")
+        self.register("owner", "worker-call")
         self.register("peer", "peer-call")
         with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as notification:
             self.advance()
-            self.assertEqual(notification.call_count, 1)
-            notified = cast(build_hold.ReleaseEntry, notification.call_args.args[0])
-            self.assertEqual(notified["session_id"], "owner")
-        self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AwaitingTurn)
-        entry = self.cycle()["entries"][0]
-        self.assertEqual(entry["active_call_id"], "seat-call")
-        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="seat-call", cycle_id=self.cycle()["id"])
-        self.assertEqual(self.cycle()["entries"][0]["state"], "MemoryGateReturned")
-        self.now = datetime.now().astimezone() + timedelta(seconds=build_hold.RELEASE_SETTLE_S + 1)
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AdmittedTurn)
-        self.assertLess(build_hold.RELEASE_SETTLE_S + 1, build_hold.NO_ADMISSION_ACK_S)
+            notified = [cast(build_hold.ReleaseEntry, sent.args[0])["session_id"] for sent in notification.call_args_list]
+            self.assertEqual(notified, ["owner", "peer"])
+            self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
+            self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
+            self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AdmittedTurn)
+            entry = self.cycle()["entries"][0]
+            self.assertEqual(entry["active_call_id"], "worker-call")
+            _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="worker-call", cycle_id=self.cycle()["id"])
+            self.assertEqual(self.cycle()["entries"][0]["state"], "MemoryGateReturned")
+            self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+            self.advance()
+            self.assertEqual(self.cycle()["entries"][0]["state"], "MemoryGateReturned")
+            self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AdmittedTurn)
+            self.assertEqual(notification.call_count, 2)
 
     def test_call_after_nothing_to_build_is_admitted_without_record_change(self) -> None:
         _ = build_hold.register_wait("owner")
         self.advance()
         self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("owner"))
         before = self.cycle()
-        self.register("owner", "seat-call")
+        self.register("owner", "worker-call")
         self.assertEqual(self.cycle(), before)
-        self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
+        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
         self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
+        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
 
     def test_call_after_completed_turn_is_admitted_without_record_change(self) -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
@@ -3699,12 +3731,12 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
             self.assertFalse(build_hold.call_is_live(call))
 
     def test_session_mark_and_nothing_to_build_do_not_complete_active_call(self) -> None:
-        self.register("owner", "seat-call")
+        self.register("owner", "worker-call")
         self.advance()
         _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted")
         _ = build_hold.answer_nothing_to_build("owner")
         entry = self.cycle()["entries"][0]
-        self.assertEqual(entry["active_call_id"], "seat-call")
+        self.assertEqual(entry["active_call_id"], "worker-call")
         self.assertNotEqual(entry["state"], "MemoryGateReturned")
         self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
 
@@ -3726,7 +3758,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.register("owner", "call-a")
         self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
 
-    def test_new_holder_invalidates_admission_and_resuming_call_precedes_unstarted_calls(self) -> None:
+    def test_new_holder_invalidates_admission_and_releases_resumed_and_new_calls_together(self) -> None:
         self.register("owner-a", "started")
         self.advance()
         self.complete("owner-a", "started")
@@ -3737,7 +3769,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.register("owner-b", "pending")
         self.advance()
         self.assertIsInstance(build_hold.read_admission("owner-a", "started"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("owner-b", "pending"), build_hold.AwaitingTurn)
+        self.assertIsInstance(build_hold.read_admission("owner-b", "pending"), build_hold.AdmittedTurn)
 
     def test_legacy_completed_session_keeps_its_admission_without_rewriting_record(self) -> None:
         cycle_id = self.write_legacy_completed_session()

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -18,7 +19,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import progress_history
+from scripts.delegate import phase_table, plan_history, progress_history
+from scripts.delegate.recorder_fixture import invoke_recorder
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -62,9 +64,11 @@ class ProgressHistoryTests(unittest.TestCase):
     config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     agents_config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     team_slot: str  # pyright: ignore[reportUninitializedInstanceVariable]
+    last_recorder_stderr: str = ""
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.history_dir = self.root / "history"
@@ -95,11 +99,94 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
+        history = self.root / "sync-event.jsonl"
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            self.assertTrue(history.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                append({"history_file": str(history)}, {"event_type": "probe"})
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(json.loads(history.read_text()), {"event_type": "probe"})
+            history.unlink()
+
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
             f"PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={seconds}\n",
             encoding="utf-8",
         )
+
+    def test_cold_recorder_calls_use_each_home_and_restore_the_callers_configuration(self) -> None:
+        caller = self.root / "caller"
+        caller.mkdir()
+        program = r'''import fcntl, hashlib, json, os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.delegate.recorder_fixture import invoke_recorder
+from scripts.delegate import progress_history
+from scripts.lib import user_zone
+
+root, working = map(Path, sys.argv[1:])
+caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
+          progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+                          (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
+plan = working / 'cold-plan.md'
+plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
+for number in (1, 2):
+    home = root / str(number)
+    config = home / '.claude/config'
+    config.mkdir(parents=True)
+    settings = config / 'delegate.conf'
+    registry = config / 'agents.conf'
+    settings.write_text(f'PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
+    registry.write_text(f'registry-{number}\n')
+    environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
+                   'PLAN_DELEGATE_SYNC_WRITES': '0', 'PLAN_DELEGATE_PASS_OWNER': 'launcher',
+                   'PLAN_DELEGATE_NOW_EPOCH': '1000'}
+    for key in ('PLAN_DELEGATE_CONFIG', 'AGENTS_CONFIG_FILE', 'PLAN_DELEGATE_HISTORY_DIR',
+                'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
+        environment.pop(key, None)
+    session = home / 'session'
+    commands = (
+        ['start-run', '--session-dir', str(session), '--working-dir', str(working),
+         '--plan-doc', str(plan), '--main-model', 'fixture-model'],
+        ['start-phase', '--session-dir', str(session), '--phase-id', '1', '--phase-title', 'First'],
+        ['start-pass', '--session-dir', str(session), '--pass-kind', 'impl', '--activity', 'writing',
+         '--called-task', 'delegate.implementation', '--called-family', 'codex',
+         '--called-model', 'fixture-model'],
+    )
+    for arguments in commands:
+        with patch.object(fcntl, 'flock', wraps=fcntl.flock) as lock:
+            result = invoke_recorder(arguments, environment, working, check=True)
+        assert [call.args[1] for call in lock.call_args_list][0] == fcntl.LOCK_EX
+        assert lock.call_args_list[-1].args[1] == fcntl.LOCK_UN
+        assert (session / '.progress_history.lock').exists()
+    history, = (home / '.local/state/plan-delegate/runs').glob('*.jsonl')
+    events = [json.loads(line) for line in history.read_text().splitlines()]
+    started, = [event for event in events if event['event_type'] == 'pass_started']
+    assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
+    assert progress_history._config_digest.cache_info().currsize == 0
+    restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
+                progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+    assert restored == caller, (restored, caller)
+print('two homes isolated; recorder lock retained; caller restored')
+'''
+        environment = {**os.environ, "HOME": str(caller),
+                       "USER_ZONE_CONF": str(caller / "zone.conf")}
+        result = subprocess.run([sys.executable, "-c", program, str(self.root), str(self.working_dir)],
+                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("two homes isolated; recorder lock retained; caller restored", result.stdout)
 
     def isolate_identity(self, environment: dict[str, str]) -> None:
         """Point unit-director detection at the temporary home, not this machine's.
@@ -121,13 +208,13 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_SESSIONS_DIR"] = str(
             self.root / "notifier-sessions"
         )
-        environment["UNIT_LOOKUP_TMUX"] = "/bin/false"
 
     def run_command(
         self,
         *arguments: str,
         at: int,
         claude_session: str = "",
+        codex_session: str = "",
         zone: str = "UTC",
     ) -> str:
         environment = os.environ.copy()
@@ -139,7 +226,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
-        # environment, so a developer running with a seat exported would
+        # environment, so a developer running with a worker exported would
         # otherwise see it stamped on every pass these tests record.
         if self.team_slot:
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
@@ -149,13 +236,10 @@ class ProgressHistoryTests(unittest.TestCase):
         self.isolate_identity(environment)
         if claude_session:
             environment["CLAUDE_CODE_SESSION_ID"] = claude_session
-        result = subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        if codex_session:
+            environment["CODEX_THREAD_ID"] = codex_session
+        result = invoke_recorder(arguments, environment, Path.cwd(), check=True)
+        self.last_recorder_stderr = result.stderr
         return result.stdout.strip()
 
     def run_failing_command(
@@ -170,7 +254,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
-        # environment, so a developer running with a seat exported would
+        # environment, so a developer running with a worker exported would
         # otherwise see it stamped on every pass these tests record.
         if self.team_slot:
             environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
@@ -178,13 +262,7 @@ class ProgressHistoryTests(unittest.TestCase):
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
-        return subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        return invoke_recorder(arguments, environment, Path.cwd())
 
     def invoke_handler(
         self,
@@ -319,7 +397,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 100,
         )
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -339,7 +417,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -444,7 +522,7 @@ class ProgressHistoryTests(unittest.TestCase):
         parsed: object = json.loads(calibration_text)  # pyright: ignore[reportAny]
         suggestion = cast(int, cast(dict[str, object], parsed)["suggested_percent"])
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -485,7 +563,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(calibration["apply_suggestion"], True)
 
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -503,25 +581,15 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 100,
         )
         self.assertEqual(
-            header.splitlines(),
+            self.table_rows(header, SUMMARY_HEADER)[:2],
             [
-                "**bevy_hana_rubric - feature/rubric**",
-                "",
-                "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
-                "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                "| Project |  80 | 00:01:40 | today 05:35 |           | today 05:35 (-00:00) | today 05:35 (+00:00) |",
-                "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
-                "",
-                "**Phase 3: Retry handling**",
-                "",
-                "| Stage | Start    | Elapsed | Agent 1        | Agent 2 | Result  |",
-                "| ----- | -------- | ------- | -------------- | ------- | ------- |",
-                "| Fix 2 | 05:33:30 | 1m      | fix 1m running | -       | running |",
-                "",
-                "▸ **Fix 2 - correcting retry recovery**",
-                "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                ["Project", "80", "00:01:40", "—", "", "—", "—"],
+                ["Phase 3", "25", "00:01:40", "today 05:40", "",
+                 "today 05:36 (-00:03)", "today 05:46 (+00:06)"],
             ],
         )
+        self.assertIn("▸ **Fix 2 - correcting retry recovery**", header)
+        self.assertEqual(header.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
 
         _ = self.run_command(
             "calibrate",
@@ -532,7 +600,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         unchanged_header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -550,7 +618,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 160,
         )
         self.assertIn(
-            "| Project |  80 | 00:02:40 | today 05:36 | 00:01:00  |",
+            "| Project |  80 | 00:02:40 |           — | 00:01:00  |",
             unchanged_header,
         )
         self.assertIn(
@@ -567,7 +635,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 180,
         )
         independently_changed = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -585,7 +653,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 180,
         )
         self.assertIn(
-            "| Project |  85 | 00:03:00 | today 05:36 |           |",
+            "| Project |  85 | 00:03:00 |           — |           |",
             independently_changed,
         )
         self.assertIn(
@@ -639,33 +707,39 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(decision_counts["raw"], 5)
         self.assertEqual(decision_counts["calibrated"], 1)
 
-    def test_legacy_progress_call_keeps_existing_header(self) -> None:
+    def test_legacy_progress_preserves_its_layout_and_only_adds_tables_on_request(self) -> None:
         started_at = 20_000
         session_dir = self.start_run("legacy", started_at)
         self.start_phase_and_pass(session_dir, started_at)
-        header = self.run_command(
-            "progress",
-            "--session-dir",
-            str(session_dir),
-            "--raw-percent",
-            "20",
-            "--percent",
-            "20",
-            "--activity",
-            "correcting retry recovery",
-            at=started_at + 100,
-        )
-        self.assertEqual(
-            header.splitlines(),
-            [
-                "**bevy_hana_rubric - feature/rubric**",
-                "**Phase 3: Retry handling - elapsed 00:01:40**",
-                "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
-                "**20% complete**",
-                "**Total elapsed 00:01:40**",
-                "**now 1970-01-01 05:35:00 - next report 05:38:00**",
-            ],
-        )
+        for tables in (False, True):
+            with self.subTest(tables=tables):
+                report = self.run_command(
+                    "progress", *(["--tables"] if tables else []),
+                    "--session-dir", str(session_dir), "--raw-percent", "20", "--percent", "20",
+                    "--activity", "correcting retry recovery", at=started_at + 100,
+                )
+                expected = [
+                    "**bevy_hana_rubric - feature/rubric**",
+                    "**Phase 3: Retry handling - elapsed 00:01:40**",
+                    "ETA unavailable",
+                    "**Fix 2 - correcting retry recovery - elapsed 00:01:30**",
+                    "**20% complete**",
+                    "**Total elapsed 00:01:40**",
+                ]
+                self.assertEqual(report.splitlines()[:6], expected)
+                self.assertEqual(report.splitlines()[-1],
+                                 "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+                if tables:
+                    self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:3],
+                                     ["Phase 3", "20", "00:01:40"])
+                    self.assertEqual(
+                        self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
+                        [["Fix 2", "05:33:30", "1m", "fix 1m running", "-", "running"]],
+                    )
+                else:
+                    self.assertEqual(report.splitlines(), [
+                        *expected, "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                    ])
 
     def test_ad_hoc_run_reuses_plan_project_time_for_the_same_worktree_branch(
         self,
@@ -723,7 +797,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         self.start_phase_and_pass(ad_hoc_session, ad_hoc_start)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(ad_hoc_session),
             "--project-raw-percent",
@@ -801,7 +875,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -824,7 +898,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("**now 1970-01-01 05:35:00 - next report 05:50:00**", report)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -847,7 +921,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -865,7 +939,7 @@ class ProgressHistoryTests(unittest.TestCase):
             {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
         ):
             result = self.run_failing_command(
-                "progress",
+                "progress", "--tables",
                 "--session-dir",
                 str(session_dir),
                 "--project-raw-percent",
@@ -884,7 +958,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("--cap-stage is required", result.stderr)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -916,7 +990,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -934,7 +1008,7 @@ class ProgressHistoryTests(unittest.TestCase):
             {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
         ):
             result = self.run_failing_command(
-                "progress",
+                "progress", "--tables",
                 "--session-dir",
                 str(session_dir),
                 "--activity",
@@ -946,7 +1020,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("say nothing about whether the workers are alive", result.stderr)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -996,7 +1070,7 @@ class ProgressHistoryTests(unittest.TestCase):
         events_before = history.read_text(encoding="utf-8")
         state_before = state_path.read_text(encoding="utf-8")
         report = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1086,7 +1160,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
         result = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--activity",
@@ -1096,35 +1170,24 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No active phase to report: phase completed.", result.stderr)
 
-    def test_an_active_phase_progress_report_keeps_its_exact_output(self) -> None:
+    def test_an_active_phase_tables_report_keeps_its_clocks_and_rounds(self) -> None:
         started_at = 20_000
         session_dir = self.start_run("active-phase-output", started_at)
         self.start_phase_and_pass(session_dir, started_at)
 
         report = self.run_progress(session_dir, at=started_at + 100)
 
+        self.assertEqual(report.splitlines()[0], "**bevy_hana_rubric - feature/rubric**")
         self.assertEqual(
-            report,
-            "\n".join(
-                (
-                    "**bevy_hana_rubric - feature/rubric**",
-                    "",
-                    "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
-                    "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                    "| Project |  40 | 00:01:40 | today 05:37 |           | today 05:36 (-00:00) | today 05:38 (+00:01) |",
-                    "| Phase 3 |  30 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
-                    "",
-                    "**Phase 3: Retry handling**",
-                    "",
-                    "| Stage | Start    | Elapsed | Agent 1        | Agent 2 | Result  |",
-                    "| ----- | -------- | ------- | -------------- | ------- | ------- |",
-                    "| Fix 2 | 05:33:30 | 1m      | fix 1m running | -       | running |",
-                    "",
-                    "▸ **Fix 2 - implementing**",
-                    "**now 1970-01-01 05:35:00 - next report 05:38:00**",
-                )
-            ),
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)[:2]],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
         )
+        self.assertEqual(
+            self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
+            [["Fix 2", "05:33:30", "1m", "fix 1m running", "-", "running"]],
+        )
+        self.assertIn("▸ **Fix 2 - implementing**", report)
+        self.assertEqual(report.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
 
     def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
         started_at = 21_000
@@ -1386,7 +1449,7 @@ class ProgressHistoryTests(unittest.TestCase):
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -1407,7 +1470,7 @@ class ProgressHistoryTests(unittest.TestCase):
             # Percents the tick passes are neither required nor checked: the
             # report shows what was recorded, not what this call claims.
             report = self.run_command(
-                "progress",
+                "progress", "--tables",
                 "--session-dir",
                 str(session_dir),
                 "--phase-raw-percent",
@@ -1447,7 +1510,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
         restart = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -1460,7 +1523,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase_and_pass(session_dir, started_at)
         self.close_the_only_pass(session_dir, at=started_at + 200)
         report = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--activity",
@@ -1491,7 +1554,7 @@ class ProgressHistoryTests(unittest.TestCase):
         session_dir = self.start_run("no-window-yet", started_at)
         self.start_phase(session_dir, started_at)
         report = self.run_command(
-            "progress", "--session-dir", str(session_dir), "--activity", "starting", at=started_at + 60
+            "progress", "--tables", "--session-dir", str(session_dir), "--activity", "starting", at=started_at + 60
         )
         self.assertEqual(
             self.table_rows(report, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"]),
@@ -1519,7 +1582,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     def report_phase_percent(self, session_dir: Path, percent: int, at: int) -> None:
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1583,14 +1646,14 @@ class ProgressHistoryTests(unittest.TestCase):
     def test_a_run_with_no_phase_is_refused(self) -> None:
         session_dir = self.start_run("no-phase", 20_000)
         result = self.run_failing_command(
-            "progress", "--session-dir", str(session_dir), "--activity", "idle", at=20_100
+            "progress", "--tables", "--session-dir", str(session_dir), "--activity", "idle", at=20_100
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No active phase to report: phase missing.", result.stderr)
 
     def run_progress(self, session_dir: Path, at: int) -> str:
         return self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1691,7 +1754,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase_and_pass(session_dir, started_at)
 
         first = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -1705,7 +1768,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertIn("elapsed 1 day 01:01:01", first)
 
         second = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -1724,7 +1787,7 @@ class ProgressHistoryTests(unittest.TestCase):
         session_dir = self.start_run("capped", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1757,7 +1820,7 @@ class ProgressHistoryTests(unittest.TestCase):
         session_dir = self.start_run("uncapped", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         result = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -1824,13 +1887,8 @@ class ProgressHistoryTests(unittest.TestCase):
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
-        return subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        self.isolate_identity(environment)
+        return invoke_recorder(arguments, environment, Path.cwd())
 
     def test_start_pass_outside_a_launcher_is_refused(self) -> None:
         session_dir = self.start_run("owned", 20_000)
@@ -1955,7 +2013,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(second), 12)
         self.assertNotEqual(second, expected)
 
-    def test_a_pass_records_the_team_seat_that_launched_it(self) -> None:
+    def test_a_pass_records_the_team_worker_that_launched_it(self) -> None:
         """Which of the three members recorded this pass."""
         self.team_slot = "impl"
         session_dir = self.start_run("slot", 23_000)
@@ -1964,8 +2022,8 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].get("team_slot"), "impl")
 
-    def test_a_pass_with_no_seat_records_an_empty_team_slot(self) -> None:
-        """Empty is unknown, not a seat name.
+    def test_a_pass_with_no_worker_records_an_empty_team_slot(self) -> None:
+        """Empty is unknown, not a worker name.
 
         Passes predating the field, and any recorder outside implement.sh, have
         to stay separable from a launcher that really is the `impl` member.
@@ -1983,11 +2041,11 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0].get("config_digest"), "")
 
-    def test_the_finished_pass_carries_the_seat_that_opened_it(self) -> None:
-        """The reader joins on finished events, so the seat has to survive there.
+    def test_the_finished_pass_carries_the_worker_that_opened_it(self) -> None:
+        """The reader joins on finished events, so the worker has to survive there.
 
         Taken from the pass record rather than the environment: the phase ends
-        under the unit director, which holds no seat at all, and the pass it closes
+        under the unit director, which holds no worker at all, and the pass it closes
         still has to name the member that opened it.
         """
         self.team_slot = "review"
@@ -2038,6 +2096,7 @@ class ProgressHistoryTests(unittest.TestCase):
         at: int,
         called_model: str = "gpt-called",
         fix_pass: int = 0,
+        *extra: str,
     ) -> None:
         """Open a pass the way one member of a phase team opens its own."""
         self.team_slot = slot
@@ -2059,6 +2118,7 @@ class ProgressHistoryTests(unittest.TestCase):
             called_model,
             "--called-effort",
             "high",
+            *extra,
             at=at,
         )
 
@@ -2088,10 +2148,10 @@ class ProgressHistoryTests(unittest.TestCase):
         slots = cast(dict[str, object], state["pass"])
         return {slot: cast(dict[str, object], record) for slot, record in slots.items()}
 
-    def demote_to_legacy_pass(self, session_dir: Path, keep_seat: bool) -> None:
-        """Rewrite state the way a session that started before seats holds it.
+    def demote_to_legacy_pass(self, session_dir: Path, keep_worker: bool) -> None:
+        """Rewrite state the way a session that started before workers holds it.
 
-        One pass object under the key rather than a map, and the seat under the
+        One pass object under the key rather than a map, and the worker under the
         `team_role` name it was stamped with for a day, which is what every run
         already in flight has on disk when this recorder replaces the old one.
         """
@@ -2101,9 +2161,9 @@ class ProgressHistoryTests(unittest.TestCase):
         slots = cast(dict[str, object], state["pass"])
         [record_value] = list(slots.values())
         record = cast(dict[str, object], record_value)
-        seat = record.pop("team_slot", "")
-        if keep_seat:
-            record["team_role"] = seat
+        worker = record.pop("team_slot", "")
+        if keep_worker:
+            record["team_role"] = worker
         state["pass"] = record
         _ = path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -2211,7 +2271,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase(session_dir, 44_010)
         self.start_slot_pass(session_dir, "impl", "impl", 44_020)
         instance = self.pass_slots(session_dir)["impl"]["instance_id"]
-        self.demote_to_legacy_pass(session_dir, keep_seat=True)
+        self.demote_to_legacy_pass(session_dir, keep_worker=True)
         self.finish_slot_pass(session_dir, "impl", "completed", 44_100)
         finished = self.pass_events("legacy", "pass_finished")
         self.assertEqual(len(finished), 1)
@@ -2229,7 +2289,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase(session_dir, 45_010)
         self.start_slot_pass(session_dir, "", "impl", 45_020)
         instance = self.pass_slots(session_dir)[""]["instance_id"]
-        self.demote_to_legacy_pass(session_dir, keep_seat=False)
+        self.demote_to_legacy_pass(session_dir, keep_worker=False)
         self.finish_slot_pass(session_dir, "", "completed", 45_100)
         finished = self.pass_events("legacy-unslotted", "pass_finished")
         self.assertEqual(len(finished), 1)
@@ -2273,7 +2333,7 @@ class ProgressHistoryTests(unittest.TestCase):
             {"interrupted"},
         )
 
-    def test_a_round_gives_every_open_seat_its_own_column(self) -> None:
+    def test_a_round_gives_every_open_worker_its_own_column(self) -> None:
         """Two agents at work read across one row, not as whichever wrote last."""
         session_dir = self.start_run("live-rows", 47_000)
         self.start_phase(session_dir, 47_010)
@@ -2285,7 +2345,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # One row, because both seats are working one round. Each carries its
+        # One row, because both workers are working one round. Each carries its
         # own elapsed: they launch together but do not finish together, and a
         # single shared number would hide exactly that.
         self.assertEqual(
@@ -2304,8 +2364,8 @@ class ProgressHistoryTests(unittest.TestCase):
         # opened first rather than the one that opened last.
         self.assertIn("▸ **Impl - implementing**", header)
 
-    def test_a_seat_that_says_it_is_held_up_does_not_read_as_working(self) -> None:
-        """A seat waiting on its peer has an open window and the peer's clock."""
+    def test_a_worker_that_says_it_is_held_up_does_not_read_as_working(self) -> None:
+        """A worker waiting on its peer has an open window and the peer's clock."""
         session_dir = self.start_run("waiting", 51_000)
         self.start_phase(session_dir, 51_010)
         for slot, kind in (("impl", "impl"), ("test", "test")):
@@ -2325,12 +2385,12 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         # Nothing in the pass records separates these two: both windows are
         # open and both clocks read the same. One is sitting on the other, and
-        # only what each seat said last can say so.
+        # only what each worker said last can say so.
         self.assertEqual(
             list(rows[-1][3:5]),
             ["impl 3m waiting", "test 3m running"],
         )
-        # The board has a kind for it as well as words, and both count: a seat
+        # The board has a kind for it as well as words, and both count: a worker
         # that posted `blocked` said the same thing in the field rather than in
         # the sentence.
         self.run_board(
@@ -2375,8 +2435,8 @@ class ProgressHistoryTests(unittest.TestCase):
             ),
         )
 
-    def test_a_round_gains_a_row_each_time_its_seats_change_role(self) -> None:
-        """Seats recruit each other, and every new shape gets its own row."""
+    def test_a_round_gains_a_row_each_time_its_workers_change_role(self) -> None:
+        """Workers recruit each other, and every new shape gets its own row."""
         session_dir = self.start_run("recruit", 49_000)
         self.start_phase(session_dir, 49_010)
         for slot in ("impl", "test"):
@@ -2387,7 +2447,7 @@ class ProgressHistoryTests(unittest.TestCase):
         for slot, kind in (("impl", "impl"), ("test", "test")):
             self.start_slot_pass(session_dir, slot, kind, 49_020)
         self.team_slot = ""
-        # The test seat is recruited across to write, then both converge on
+        # The test worker is recruited across to write, then both converge on
         # review.
         self.run_board(session_dir, "role", "test", "impl", "recruited", at=49_320)
         for slot in ("impl", "test"):
@@ -2421,11 +2481,11 @@ class ProgressHistoryTests(unittest.TestCase):
                 "Agent 1 → review, Agent 2 → review; running",
             ],
         )
-        # Which delegate is in which seat sits under the table, once, and the
+        # Which delegate is in which worker sits under the table, once, and the
         # unit director is left out of it -- the reader is the unit director. Each
-        # seat carries its last board line and that line's age, because a role
+        # worker carries its last board line and that line's age, because a role
         # alone -- and an open pass window, which grows either way -- cannot say
-        # whether a seat is working or has been silent since it took the role.
+        # whether a worker is working or has been silent since it took the role.
         for label, slot in (("Agent 1", "impl"), ("Agent 2", "test")):
             self.assertIn(
                 f"- **{label}** ({slot}) gpt-called high · 3m ago · handoff: converging",
@@ -2435,8 +2495,8 @@ class ProgressHistoryTests(unittest.TestCase):
     def test_a_role_reannouncement_does_not_split_a_round(self) -> None:
         """A handoff that re-states the role its slot already holds is not a movement.
 
-        What live runs write: each seat opens with a `board.sh role` seconds
-        after its launcher registered the same role, and a seat routes narration
+        What live runs write: each worker opens with a `board.sh role` seconds
+        after its launcher registered the same role, and a worker routes narration
         through `role` because it is the command that takes a note. Every such
         line used to open a near-empty row whose columns matched the row above.
         """
@@ -2470,9 +2530,9 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
     def test_movements_seconds_apart_are_one_row(self) -> None:
-        """Seats converging one `board.sh role` at a time is one movement.
+        """Workers converging one `board.sh role` at a time is one movement.
 
-        The calls land seconds apart because the seats run in sequence, and a
+        The calls land seconds apart because the workers run in sequence, and a
         boundary per call would put a near-empty row on each. One boundary, and
         the roles the later calls carry describe the row from its start.
         """
@@ -2615,8 +2675,9 @@ class ProgressHistoryTests(unittest.TestCase):
             [("Impl", "impl 3m done", "clean"), ("Fix 1", "fix 1m running", "running")],
         )
 
-    def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
-        session_dir = self.start_run("awake", 22_000)
+    def test_finish_pass_ignores_awake_seconds_from_an_older_launcher(self) -> None:
+        """A launcher started before the flag was retired still finishes its pass."""
+        session_dir = self.start_run("older-launcher", 22_000)
         self.start_phase_and_pass(session_dir, 22_010)
         _ = self.run_command(
             "finish-pass",
@@ -2625,34 +2686,12 @@ class ProgressHistoryTests(unittest.TestCase):
             "--status",
             "completed",
             "--agent-awake-seconds",
-            "1800",
-            at=72_020,
+            "2100",
+            at=22_200,
         )
-        finished = self.pass_events("awake", "pass_finished")
+        finished = self.pass_events("older-launcher", "pass_finished")
         self.assertEqual(len(finished), 1)
-        # The point of the field: elapsed covers the stretch the machine spent
-        # suspended, and the beat count does not.
-        self.assertEqual(finished[0].get("pass_elapsed_seconds"), 50_000)
-        self.assertEqual(finished[0].get("agent_awake_seconds"), 1800)
-
-    def test_a_pass_with_nothing_counted_records_no_awake_seconds(self) -> None:
-        for name, reported in (("unreported", ()), ("none-counted", ("-1",))):
-            with self.subTest(name):
-                session_dir = self.start_run(name, 23_000)
-                self.start_phase_and_pass(session_dir, 23_010)
-                awake = ("--agent-awake-seconds", *reported) if reported else ()
-                _ = self.run_command(
-                    "finish-pass",
-                    "--session-dir",
-                    str(session_dir),
-                    "--status",
-                    "completed",
-                    *awake,
-                    at=23_050,
-                )
-                finished = self.pass_events(name, "pass_finished")
-                self.assertEqual(len(finished), 1)
-                self.assertNotIn("agent_awake_seconds", finished[0])
+        self.assertNotIn("agent_awake_seconds", finished[0])
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
@@ -2683,7 +2722,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 100,
         )
         failure = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -2699,7 +2738,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         reason = "three of four recovery checks now pass"
         _ = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--raw-percent",
@@ -2791,7 +2830,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 3_720,
         )
         failure = self.run_failing_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -2818,7 +2857,7 @@ class ProgressHistoryTests(unittest.TestCase):
         session_dir = self.start_run("endpoints", started_at)
         self.start_phase_and_pass(session_dir, started_at)
         unstarted = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -2840,7 +2879,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertNotIn("today", unstarted)
 
         finished = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -2959,8 +2998,8 @@ class ProgressHistoryTests(unittest.TestCase):
         ]
         return rows[rows.index(header) + 1 :]
 
-    def test_a_running_round_reports_the_role_each_seat_holds_now(self) -> None:
-        """One column per seat, showing the role it holds right now."""
+    def test_a_running_round_reports_the_role_each_worker_holds_now(self) -> None:
+        """One column per worker, showing the role it holds right now."""
         self.write_full_config()
         started_at = 60_000
         session_dir = self.start_run("team", started_at)
@@ -2980,13 +3019,13 @@ class ProgressHistoryTests(unittest.TestCase):
         for slot in ("impl", "test"):
             self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
             self.run_board(session_dir, "role", slot, slot, "opening", at=started_at + 2)
-        # The test seat gets recruited into implementation: the slot keeps its
+        # The test worker gets recruited into implementation: the slot keeps its
         # identity and its column, and only the role in the cell changes.
         self.run_board(session_dir, "role", "test", "impl", "recruited", at=started_at + 3)
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
         self.team_slot = ""
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3007,7 +3046,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # The recruited test seat reads `impl` under Agent 2: the seat keeps its
+        # The recruited test worker reads `impl` under Agent 2: the worker keeps its
         # identity and its column, and only the role in the cell moves. It has
         # registered without opening a pass yet, so it reports the role the
         # board knows and no duration, which is the part that is genuinely
@@ -3016,15 +3055,15 @@ class ProgressHistoryTests(unittest.TestCase):
             [rows[0][0], *rows[0][3:5]], ["Impl", "impl 4m running", "impl"]
         )
 
-    def test_a_closed_round_keeps_the_roles_of_its_passless_seats(self) -> None:
-        """A finished round still names what its test seat was doing."""
+    def test_a_closed_round_keeps_the_roles_of_its_passless_workers(self) -> None:
+        """A finished round still names what its test worker was doing."""
         started_at = 62_000
         session_dir = self.start_run("closed", started_at)
         self.start_phase(session_dir, started_at)
         for slot in ("impl", "test"):
             self.run_board(session_dir, "post", slot, "register", "up", at=started_at + 1)
             self.run_board(session_dir, "role", slot, slot, "opening", at=started_at + 2)
-        # One seat records a pass here; the other is board-only for this round,
+        # One worker records a pass here; the other is board-only for this round,
         # which is what the closed round has to keep reporting.
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
         self.finish_slot_pass(session_dir, "impl", "completed", started_at + 310)
@@ -3044,15 +3083,15 @@ class ProgressHistoryTests(unittest.TestCase):
             [rows[0][0], *rows[0][3:5]], ["Impl", "impl 5m done", "test"]
         )
 
-    def test_each_seat_reports_its_last_board_line_and_its_age(self) -> None:
-        """The note under the table says what each seat said, and how long ago."""
+    def test_each_worker_reports_its_last_board_line_and_its_age(self) -> None:
+        """The note under the table says what each worker said, and how long ago."""
         started_at = 63_000
         session_dir = self.start_run("narration", started_at)
         self.start_phase(session_dir, started_at)
         # `test` is board-only: it registers and narrates but opens no pass.
         self.run_board(session_dir, "post", "test", "register", "up", at=started_at + 1)
         # `impl` opens a pass before it has posted anything, which is the case
-        # the note has to name rather than leave looking like a seat at work.
+        # the note has to name rather than leave looking like a worker at work.
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 10)
         self.team_slot = ""
         self.assertIn(
@@ -3066,14 +3105,14 @@ class ProgressHistoryTests(unittest.TestCase):
             session_dir, "post", "impl", "status", "rerunning the scoped test", at=started_at + 120
         )
         header = self.run_progress(session_dir, started_at + 300)
-        # The age is the whole point: a seat four minutes into one activity and a
-        # seat that has said nothing read differently, where two identical role
+        # The age is the whole point: a worker four minutes into one activity and a
+        # worker that has said nothing read differently, where two identical role
         # words in the table do not.
         self.assertIn("- **Agent 1** (impl) gpt-called high · 3m ago · rerunning the scoped test", header)
         self.assertIn("- **Agent 2** (test) · 4m ago · writing the token race test", header)
 
-    def test_a_finished_seat_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
-        """The launcher's exit post names the kind; the seat's narration names the work."""
+    def test_a_finished_worker_keeps_its_own_last_words_under_the_launcher_done(self) -> None:
+        """The launcher's exit post names the kind; the worker's narration names the work."""
         started_at = 64_000
         session_dir = self.start_run("ownwords", started_at)
         self.start_phase(session_dir, started_at)
@@ -3083,8 +3122,8 @@ class ProgressHistoryTests(unittest.TestCase):
         self.run_board(
             session_dir, "post", "test", "status", "hana_catalyst tests 240 passed", at=started_at + 200
         )
-        # What implement.sh posts on exit: after the seat's last line, and marked
-        # as the launcher's. Without the mark every finished seat read `fix
+        # What implement.sh posts on exit: after the worker's last line, and marked
+        # as the launcher's. Without the mark every finished worker read `fix
         # finished` and the narration the reader wanted sat one line up, unseen.
         self.run_board(
             session_dir,
@@ -3114,12 +3153,12 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
     def broad_review(self, session_dir: Path, lenses: tuple[str, ...], started_at: int) -> None:
-        """Both seats write, then the broad review seats one pass per lens.
+        """Both workers write, then the broad review workers one pass per lens.
 
-        Each lens takes the seat review.sh gives it and posts the register line
+        Each lens takes the worker review.sh gives it and posts the register line
         the launcher posts, a second apart in the order given.
         """
-        seats = {"adversary": "test", "contract": "impl", "craft": "review"}
+        workers = {"adversary": "test", "contract": "impl", "craft": "review"}
         self.start_phase(session_dir, started_at)
         for offset, slot in enumerate(("impl", "test")):
             self.start_slot_pass(session_dir, slot, slot, started_at + 10 + offset * 10)
@@ -3128,13 +3167,13 @@ class ProgressHistoryTests(unittest.TestCase):
         for offset, lens in enumerate(lenses):
             at = started_at + 700 + offset
             self.run_board(
-                session_dir, "post", seats[lens], "register",
+                session_dir, "post", workers[lens], "register",
                 f"{lens} review up; mesh=none; role=review", at=at,
             )
-            self.start_slot_pass(session_dir, seats[lens], "review", at, called_model=f"gpt-{lens}")
+            self.start_slot_pass(session_dir, workers[lens], "review", at, called_model=f"gpt-{lens}")
         self.team_slot = ""
 
-    def test_a_craft_review_draws_a_third_seat_column(self) -> None:
+    def test_a_craft_review_draws_a_third_worker_column(self) -> None:
         """The craft lens sits in `review`, and the table gains Agent 3 for it."""
         started_at = 66_000
         session_dir = self.start_run("craft-column", started_at)
@@ -3163,10 +3202,10 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
         )
 
-    def test_a_review_without_the_craft_lens_keeps_two_seat_columns(self) -> None:
+    def test_a_review_without_the_craft_lens_keeps_two_worker_columns(self) -> None:
         """No pass in `review`, no Agent 3: not in the header, not in the note.
 
-        The review seat's board line from an earlier phase outlives that phase,
+        The review worker's board line from an earlier phase outlives that phase,
         and must not put a note line under a table with no column for it.
         """
         started_at = 67_000
@@ -3268,7 +3307,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # A writer's pass is not review time.
         self.start_slot_pass(session_dir, "impl", "impl", base + 10)
         self.finish_slot_pass(session_dir, "impl", "completed", base + 3_010)
-        # Every seat's review counts, whatever its status: 600 + 900 + 1200 s.
+        # Every worker's review counts, whatever its status: 600 + 900 + 1200 s.
         reviews = (("impl", 600, "completed"), ("test", 900, "completed"), ("review", 1_200, "error"))
         for slot, _, _ in reviews:
             self.start_slot_pass(session_dir, slot, "review", base + 3_100)
@@ -3292,7 +3331,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
         expected = (
-            "review trial: ux 1 findings, code 4 findings, review-seat minutes 51, "
+            "review trial: ux 1 findings, code 4 findings, review-worker minutes 51, "
             + "ux check minutes 6, ux repair minutes 0"
         )
         self.assertEqual(
@@ -3320,7 +3359,7 @@ class ProgressHistoryTests(unittest.TestCase):
                     "review-trial", "--session-dir", str(session_dir), at=at
                 ),
                 f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
-                + "review-seat minutes 0, ux check minutes 0, ux repair minutes 0",
+                + "review-worker minutes 0, ux check minutes 0, ux repair minutes 0",
             )
 
         for index, lens in enumerate(("adversary,contract", "contract", "contract")):
@@ -3382,16 +3421,16 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         _ = self.run_command("finish-activity", "--session-dir", str(session_dir), at=base + 250)
 
-        def repair(finding: str, lens: str, round_number: int, seats: tuple[tuple[str, int], ...], at: int) -> None:
+        def repair(finding: str, lens: str, round_number: int, workers: tuple[tuple[str, int], ...], at: int) -> None:
             _ = self.run_findings(
                 session_dir, "open", "--severity", "blocker", "--title", f"{lens} finding",
                 "--file", "src/lib.rs", "--caught-by", "delegate", "--lens", lens, at=at,
             )
             _ = self.run_findings(session_dir, "gate", at=at + 5)
             _ = self.run_findings(session_dir, "dispatch", "--covers", finding, at=at + 10)
-            for slot, _ in seats:
+            for slot, _ in workers:
                 self.start_slot_pass(session_dir, slot, "fix", at + 20, fix_pass=round_number)
-            for slot, elapsed in seats:
+            for slot, elapsed in workers:
                 self.finish_slot_pass(session_dir, slot, "completed", at + 20 + elapsed)
             self.team_slot = ""
             _ = self.run_findings(session_dir, "landed", at=at + 2_000)
@@ -3402,13 +3441,13 @@ class ProgressHistoryTests(unittest.TestCase):
 
         # Round 1 repairs a code finding: none of its 600 s is the check's.
         repair("F001", "adversary", 1, (("impl", 600),), base + 300)
-        # Round 2 repairs a ux finding on two seats: 900 + 300 s is 20 minutes.
+        # Round 2 repairs a ux finding on two workers: 900 + 300 s is 20 minutes.
         repair("F002", "ux", 2, (("impl", 900), ("test", 300)), base + 3_000)
 
         # 150 s rounds to 3 minutes, not 2.
         self.assertEqual(
             self.run_command("review-trial", "--session-dir", str(session_dir), at=base + 6_000),
-            "review trial: ux 1 findings, code 1 findings, review-seat minutes 3, "
+            "review trial: ux 1 findings, code 1 findings, review-worker minutes 3, "
             + "ux check minutes 3, ux repair minutes 20",
         )
 
@@ -3468,7 +3507,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 10,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3489,9 +3528,9 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # No board and no seat on the pass: the window sits in no round, so it
+        # No board and no worker on the pass: the window sits in no round, so it
         # renders on its own the way every solo run always has, drawn in the
-        # seat its kind names.
+        # worker its kind names.
         self.assertEqual(
             [rows[0][0], *rows[0][3:5]], ["Impl", "impl 3m running", "-"]
         )
@@ -3564,7 +3603,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 400,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3713,7 +3752,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=started_at + 660,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3734,7 +3773,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # A solo run records no seat, so every window keeps a row and the
+        # A solo run records no worker, so every window keeps a row and the
         # per-window finding attribution it always had -- for the last three
         # stages, which is all the table draws. The three before them are named
         # by the line above it rather than dropped without a word.
@@ -3747,9 +3786,9 @@ class ProgressHistoryTests(unittest.TestCase):
             ],
         )
         self.assertIn("*Earlier: 3 stages not shown - Impl through Fix 1.*", header)
-        # A slotless pass is drawn in the seat its kind names -- the closure
-        # review under Agent 2, the seat that reviews, where a reader looks for
-        # it -- and a unit-director activity names no seat and keeps both dashes.
+        # A slotless pass is drawn in the worker its kind names -- the closure
+        # review under Agent 2, the worker that reviews, where a reader looks for
+        # it -- and a unit-director activity names no worker and keeps both dashes.
         self.assertEqual(
             [tuple(row[3:5]) for row in rows],
             [
@@ -3807,6 +3846,21 @@ class ProgressHistoryTests(unittest.TestCase):
             at=at,
         )
 
+    def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
+        """`review.sh --phase` writes its status there, so the marker must watch the same file."""
+        self.write_agents_registry()
+        started_at = 90_000
+        session_dir = self.start_run("early-phase", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "arm-review", "--session-dir", str(session_dir), "--phase-id", "3", "--lens", "adversary",
+            "--activity", "reviewing the diff the writer is still producing", at=started_at + 100,
+        )
+        state = cast(dict[str, object], json.loads((session_dir / "progress_history_state.json").read_text()))
+        armed = cast(dict[str, object], state["early_review"])
+        self.assertEqual(armed["status_file"], str(session_dir / "phases" / "3" / "review_status_adversary"))
+        self.assertEqual(armed["pid_file"], str(session_dir / "phases" / "3" / "review_pid_adversary"))
+
     def test_an_early_review_runs_as_its_own_row_beside_the_open_pass(self) -> None:
         """The one moment two agents work at once, shown as two running rows."""
         self.write_agents_registry()
@@ -3815,7 +3869,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.start_phase_and_pass(session_dir, started_at)
         _ = self.arm_early_review(session_dir, started_at + 100)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -3836,7 +3890,7 @@ class ProgressHistoryTests(unittest.TestCase):
             header,
             ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
         )
-        # Neither window has opened a round -- the writer predates seats and the
+        # Neither window has opened a round -- the writer predates workers and the
         # armed reviewer has no pass yet -- so there is no round for the
         # reviewer to join and it keeps the row beside the writer that it
         # always had.
@@ -3844,7 +3898,7 @@ class ProgressHistoryTests(unittest.TestCase):
             [(row[0], row[2], row[5]) for row in rows],
             [("Fix 2", "2m", "running"), ("Review Fix 2", "1m", "running (early)")],
         )
-        # The armed reviewer claims the test seat, where the adversary lens sits
+        # The armed reviewer claims the test worker, where the adversary lens sits
         # and a lone closure reviewer reads, so it is drawn under Agent 2.
         self.assertEqual(
             [tuple(row[3:5]) for row in rows],
@@ -4060,26 +4114,33 @@ class ProgressHistoryTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("recorded no phase 9", missing.stderr)
 
-    def test_a_window_picks_up_the_main_agent_changing_mid_run(self) -> None:
-        """`start-run` detects the unit director once, and it can change after."""
-        started_at = 90_000
-        session_dir = self.start_run("switched", started_at)
-        transcript = self.root / ".claude" / "projects" / "demo" / "session-9.jsonl"
-        transcript.parent.mkdir(parents=True)
+    def write_claude_transcript(self, session_id: str, model: str, effort: str) -> None:
+        transcript = self.root / ".claude" / "projects" / "demo" / f"{session_id}.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
         _ = transcript.write_text(
-            "\n".join(
-                (
-                    json.dumps(
-                        {"type": "assistant", "message": {"model": "opus-5"}, "effort": "high"}
-                    ),
-                    json.dumps(
-                        {"type": "assistant", "message": {"model": "sonnet-5"}, "effort": "low"}
-                    ),
-                    "",
-                )
-            ),
+            json.dumps({"type": "assistant", "message": {"model": model}, "effort": effort}) + "\n",
             encoding="utf-8",
         )
+
+    def write_codex_transcript(self, thread_id: str, model: str, effort: str) -> None:
+        transcript = self.root / ".codex" / "sessions" / f"rollout-{thread_id}.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        _ = transcript.write_text(
+            json.dumps({"type": "turn_context", "payload": {"model": model, "effort": effort}}) + "\n",
+            encoding="utf-8",
+        )
+
+    def open_pass_and_activity(
+        self,
+        session_dir: Path,
+        started_at: int,
+        claude_session: str,
+        codex_session: str = "",
+    ) -> list[dict[str, object]]:
+        """Open a phase, then a pass and an activity as the given session.
+
+        Returns the stored `main_agent` after the pass and after the activity.
+        """
         _ = self.run_command(
             "start-phase",
             "--session-dir",
@@ -4107,8 +4168,35 @@ class ProgressHistoryTests(unittest.TestCase):
             "--called-effort",
             "high",
             at=started_at + 10,
-            claude_session="session-9",
+            claude_session=claude_session,
+            codex_session=codex_session,
         )
+        after_pass = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        _ = self.run_command(
+            "start-activity",
+            "--session-dir",
+            str(session_dir),
+            "--label",
+            "Style",
+            "--activity",
+            "style-only review of the phase diff",
+            at=started_at + 20,
+            claude_session=claude_session,
+            codex_session=codex_session,
+        )
+        after_activity = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        return [after_pass, after_activity]
+
+    def test_a_window_picks_up_the_main_agent_changing_mid_run(self) -> None:
+        """`start-run` detects the unit director once, and it can change after."""
+        started_at = 90_000
+        session_dir = self.start_run("switched", started_at)
+        self.write_claude_transcript("main-switched", "sonnet-5", "low")
+        for identity in self.open_pass_and_activity(session_dir, started_at, "main-switched"):
+            self.assertEqual(
+                (identity["model"], identity["effort"], identity["session_id"]),
+                ("sonnet-5", "low", "main-switched"),
+            )
         rendered = self.run_command(
             "timeline",
             "--session-dir",
@@ -4117,6 +4205,77 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertIn("| sonnet-5 low |", rendered)
         self.assertNotIn("gpt-main xhigh", rendered)
+
+    def test_a_window_opened_in_a_codex_worker_keeps_the_director(self) -> None:
+        """A Codex worker inherits the director's Claude session but has its own thread."""
+        started_at = 91_000
+        session_dir = self.start_run("codexworker", started_at)
+        self.write_claude_transcript("main-codexworker", "sonnet-5", "low")
+        self.write_codex_transcript("worker-thread", "gpt-worker", "medium")
+        director = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        for identity in self.open_pass_and_activity(
+            session_dir, started_at, "main-codexworker", codex_session="worker-thread"
+        ):
+            self.assertEqual(identity, director)
+
+    def test_a_window_opened_by_a_claude_worker_keeps_the_director(self) -> None:
+        """A Claude worker is a Claude Code session of its own."""
+        started_at = 92_000
+        session_dir = self.start_run("claudeworker", started_at)
+        self.write_claude_transcript("claude-worker", "sonnet-5", "low")
+        director = cast("dict[str, object]", self.read_state(session_dir)["main_agent"])
+        for identity in self.open_pass_and_activity(session_dir, started_at, "claude-worker"):
+            self.assertEqual(identity, director)
+
+    def test_the_directors_window_repairs_a_main_agent_a_worker_overwrote(self) -> None:
+        """Runs started before the check carry a worker's thread; the run folder names the director."""
+        started_at = 93_000
+        session_dir = self.start_run("repaired", started_at)
+        state = self.read_state(session_dir)
+        state["main_agent"] = {
+            "family": "codex", "model": "gpt-worker", "effort": "medium", "session_id": "worker-thread"}
+        _ = (session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
+        _ = (session_dir / "director").write_text("main-repaired\n", encoding="utf-8")
+        self.write_claude_transcript("main-repaired", "sonnet-5", "low")
+        for identity in self.open_pass_and_activity(session_dir, started_at, "main-repaired"):
+            self.assertEqual(
+                (identity["model"], identity["effort"], identity["session_id"]),
+                ("sonnet-5", "low", "main-repaired"),
+            )
+
+    def test_identity_detection_prefers_codex_falls_back_to_claude_and_refuses_unknown(self) -> None:
+        codex = self.root / ".codex/sessions/turn-codex-session.jsonl"
+        claude = self.root / ".claude/projects/project/claude-session.jsonl"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        _ = codex.write_text(json.dumps({"type": "turn_context", "payload": {"model": "codex-model"}}) + "\n")
+        _ = claude.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-model"}}) + "\n")
+        plan = self.working_dir / "identity-plan.md"
+        _ = plan.write_text("## Delegation Context\n\n- **Project:** Identity fallback\n")
+        environment = os.environ.copy()
+        self.isolate_recorder_roots(environment)
+        self.isolate_identity(environment)
+        environment.update({"CODEX_THREAD_ID": "codex-session", "CLAUDE_CODE_SESSION_ID": "claude-session",
+                            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir), "PLAN_DELEGATE_NOW_EPOCH": "1000"})
+        for family, model in (("codex", "codex-model"), ("claude", "claude-model"), ("unknown", "unknown")):
+            with self.subTest(family=family):
+                session = self.root / f"identity-{family}"
+                result = invoke_recorder(["start-run", "--session-dir", str(session),
+                                          "--working-dir", str(self.working_dir), "--plan-doc", str(plan)],
+                                         environment, self.working_dir)
+                if family == "unknown":
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("Unable to detect the unit director's model and effort", result.stderr)
+                    self.assertFalse((session / "progress_history_state.json").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    identity = cast("dict[str, object]", self.read_state(session)["main_agent"])
+                    self.assertEqual((identity["family"], identity["model"], identity["effort"]),
+                                     (family, model, "unset"))
+                if family == "codex":
+                    _ = codex.write_text('{"type":"turn_context","payload":{}}\n')
+                elif family == "claude":
+                    claude.unlink()
 
     def test_the_eta_names_the_day_the_work_is_expected_to_land(self) -> None:
         """A duration has to be added to the clock by hand; an arrival does not."""
@@ -4150,7 +4309,7 @@ class ProgressHistoryTests(unittest.TestCase):
             at=70_010,
         )
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4167,22 +4326,23 @@ class ProgressHistoryTests(unittest.TestCase):
             "writing the retry path",
             at=80_000,
         )
-        self.assertIn("| Project |  10 | 22:13:20 | 1970-01-10 06:13 |", header)
-        self.assertIn("| Phase 3 |  50 | 02:46:40 |   tomorrow 01:00 |", header)
+        phase_row = next(line for line in header.splitlines() if line.startswith("| Phase 3"))
+        self.assertEqual(
+            [cell.strip() for cell in phase_row.strip("|").split("|")][1:4],
+            ["50", "02:46:40", "tomorrow 01:00"],
+        )
 
 
     def test_the_eta_band_brackets_the_arrival_and_names_its_own_swing(self) -> None:
         """One arrival hides how firm it is; two bracket it and show the spread.
 
-        Ten points of doubt either way, run back through the same projection the
-        ETA uses. The band is asymmetric because the projection is: at 10% those
-        ten points buy four days of optimism and cost nine of pessimism, and the
-        parenthesised distances say so without any clock arithmetic.
+        Ten points of doubt either way produce an asymmetric phase band, and
+        the parenthesised distances show its spread without clock arithmetic.
         """
         session_dir = self.start_run("band", 0)
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4199,13 +4359,10 @@ class ProgressHistoryTests(unittest.TestCase):
             "writing the retry path",
             at=80_000,
         )
-        self.assertIn(
-            "| 1970-01-05 15:06 (-111:06) | 1970-01-19 12:26 (+222:13) |",
-            header,
-        )
-        self.assertIn(
-            "|    tomorrow 00:04 (-00:55) |    tomorrow 02:23 (+01:23) |",
-            header,
+        phase_row = next(line for line in header.splitlines() if line.startswith("| Phase 3"))
+        self.assertEqual(
+            [cell.strip() for cell in phase_row.strip("|").split("|")][5:],
+            ["tomorrow 00:04 (-00:55)", "tomorrow 02:23 (+01:23)"],
         )
 
 
@@ -4228,7 +4385,7 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4268,7 +4425,7 @@ class ProgressHistoryTests(unittest.TestCase):
         session_dir = self.start_run("same_name", 0)
         self.start_phase_and_pass(session_dir, 70_000)
         header = self.run_command(
-            "progress",
+            "progress", "--tables",
             "--session-dir",
             str(session_dir),
             "--project-raw-percent",
@@ -4286,6 +4443,333 @@ class ProgressHistoryTests(unittest.TestCase):
             at=80_000,
         )
         self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
+
+    def report_eta_chain(self, name: str, *, untimed_gate: bool = False) -> tuple[Path, str]:
+        def at(hour: int, minute: int) -> int:
+            return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
+
+        session_dir = self.start_run(name, at(16, 0))
+        plan_path = self.working_dir / "docs" / f"{name}.md"
+        lines = [
+            "### Phase 4 — Finished delivery  · status: done", "",
+            "### Phase 5 — Current delivery  · status: todo", "",
+            "### Phase 6 — Next delivery  · status: todo", "",
+        ]
+        if untimed_gate:
+            lines += ["**Blocked by:** G2", ""]
+        lines += ["### Phase 7 — Last delivery  · status: todo", ""]
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8") + "\n".join(lines), encoding="utf-8",
+        )
+        if untimed_gate:
+            self.add_production_marker(session_dir)
+            _ = (plan_path.parent / "example-production.md").write_text(
+                "\n".join((
+                    "# Production — Example", "", "## Production Context", "",
+                    "- **User zone:** UTC", "", "## Gates", "",
+                    "| Gate | Waiting | Waits on | Clears when |",
+                    "| --- | --- | --- | --- |",
+                    "| G2 | unit-a phase 6 | renderer phase 9 | reviewed checkpoint |", "",
+                )),
+                encoding="utf-8",
+            )
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir),
+            "--phase-id", "4", "--phase-title", "Finished delivery", at=at(16, 18),
+        )
+        _ = self.run_command(
+            "finish-phase", "--session-dir", str(session_dir), "--status", "completed",
+            at=at(16, 28),
+        )
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir),
+            "--phase-id", "5", "--phase-title", "Current delivery", at=at(16, 30),
+        )
+        _ = self.run_command(
+            "start-pass", "--session-dir", str(session_dir), "--pass-kind", "impl",
+            "--activity", "building the delivery", "--called-task", "delegate.implementation",
+            "--called-family", "codex", "--called-model", "fixture-model", at=at(16, 30),
+        )
+        _ = self.run_command(
+            "eta", "--session-dir", str(session_dir), "--time", "18:30",
+            "--earliest", "18:20", "--latest", "18:50", "--basis", "stated",
+            at=at(17, 40),
+        )
+        report = self.run_command(
+            "progress", "--tables", "--session-dir", str(session_dir),
+            "--project-raw-percent", "10", "--project-percent", "10",
+            "--phase-raw-percent", "50", "--phase-percent", "50",
+            "--cap-stage", "implementation", "--activity", "building the delivery",
+            at=at(18, 0),
+        )
+        return session_dir, report
+
+    @staticmethod
+    def report_time(hour: int, minute: int = 0) -> int:
+        return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
+
+    def short_report_fixture(
+        self, name: str, *, promises: tuple[str, ...] = ("17:15", "17:45", "18:30"),
+        running_fix: bool = True, completed_fix: bool = True, gate: str = "",
+    ) -> Path:
+        session_dir = self.start_run(name, self.report_time(15))
+        plan = self.working_dir / "docs" / f"{name}.md"
+        _ = plan.write_text(
+            plan.read_text(encoding="utf-8") + "\n".join((
+                "### Phase 3 — Retry handling  · status: todo", "",
+                "### Phase 4 — Next delivery  · status: todo", "",
+                *(["**Blocked by:** G3", ""] if gate else []),
+            )), encoding="utf-8",
+        )
+        if gate:
+            self.add_production_marker(session_dir)
+            _ = (plan.parent / "example-production.md").write_text("\n".join((
+                "# Production — Example", "", "## Production Context", "",
+                "- **User zone:** UTC", "", "## Gates", "",
+                "| Gate | Waiting | Waits on | Clears when |",
+                "| --- | --- | --- | --- |",
+                f"| G3 | unit-a phase 4 | renderer phase 9 | {gate} |", "",
+            )), encoding="utf-8")
+        self.start_phase(session_dir, self.report_time(15))
+        if completed_fix:
+            self.start_slot_pass(session_dir, "impl", "fix", self.report_time(15, 1), fix_pass=1)
+            self.finish_slot_pass(session_dir, "impl", "completed", self.report_time(15, 3))
+        self.team_slot = ""
+        for index, target in enumerate(promises):
+            _ = self.run_command(
+                "eta", "--session-dir", str(session_dir), "--time", target,
+                "--basis", "remaining retry checks", at=self.report_time(15, 10 + index),
+            )
+        if running_fix:
+            # Two workers in one fix round must read as one running round.
+            for offset, slot in enumerate(("impl", "test")):
+                self.run_board(session_dir, "post", slot, "register", "up",
+                               at=self.report_time(15, 20) + offset)
+                self.run_board(session_dir, "role", slot, "fix", "retry repair",
+                               at=self.report_time(15, 21) + offset)
+                self.start_slot_pass(session_dir, slot, "fix", self.report_time(15, 22) + offset,
+                                     called_model=f"gpt-{slot}", fix_pass=2)
+            self.run_board(session_dir, "post", "impl", "status", "repairing retry recovery",
+                           at=self.report_time(15, 30))
+            self.run_board(session_dir, "post", "test", "blocked", "waiting for retry fixture",
+                           at=self.report_time(15, 31))
+            self.team_slot = ""
+        return session_dir
+
+    def short_progress(
+        self, session_dir: Path, at: int, *, tables: bool = False, zone: str = "UTC",
+    ) -> str:
+        return self.run_command(
+            "progress", *(["--tables"] if tables else []),
+            "--session-dir", str(session_dir),
+            "--project-raw-percent", "40", "--project-percent", "40",
+            "--phase-raw-percent", "30", "--phase-percent", "30",
+            "--cap-stage", "implementation", "--activity", "implementing",
+            at=at, zone=zone,
+        )
+
+    @staticmethod
+    def eta_report_line(report: str) -> str:
+        return next(line for line in report.splitlines()
+                    if line.startswith(("ETA ", "gated ")))
+
+    def test_short_progress_keeps_promises_stage_and_worker_narration_without_tables(self) -> None:
+        session_dir = self.short_report_fixture("short-workers")
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
+        self.assertIn("**Phase 3: Retry handling**", report)
+        self.assertIn("▸ **Fix 2 - implementing**", report)
+        impl = next(line for line in report.splitlines() if "repairing retry recovery" in line)
+        tester = next(line for line in report.splitlines() if "waiting for retry fixture" in line)
+        for slot, model, state, worker in (
+            ("impl", "gpt-impl", "running", impl), ("test", "gpt-test", "blocked", tester),
+        ):
+            self.assertIn(slot, worker)
+            self.assertIn(model, worker)
+            self.assertIn("fix", worker)
+            self.assertIn(state, worker)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_short_progress_names_the_first_eta_and_completed_fix_round(self) -> None:
+        session_dir = self.short_report_fixture("short-first", promises=("16:10",), running_fix=False)
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        self.assertEqual(self.eta_report_line(report), "ETA 16:10 (on its first ETA, 1 fix round)")
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_short_progress_retains_each_worker_while_the_director_runs_an_activity(self) -> None:
+        session_dir = self.short_report_fixture("short-concurrent-activity")
+        _ = self.run_command(
+            "start-activity", "--session-dir", str(session_dir),
+            "--label", "Verify", "--activity", "checking the combined repair",
+            at=self.report_time(15, 40),
+        )
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        for slot, model, state in (("impl", "gpt-impl", "running"), ("test", "gpt-test", "waiting")):
+            worker = next(line for line in report.splitlines() if f"({slot})" in line)
+            self.assertRegex(worker, rf"\({slot}\) fix \S+ {state} ·")
+            self.assertIn(model, worker)
+        self.assertIn("▸ **Fix 2 - implementing**", report)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_short_eta_names_a_running_fix_round_without_zero_completed_rounds(self) -> None:
+        session_dir = self.short_report_fixture("short-running-fix", completed_fix=False)
+
+        report = self.short_progress(session_dir, self.report_time(16))
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round running)")
+
+    def test_short_eta_includes_the_date_for_a_promise_on_a_different_local_day(self) -> None:
+        session_dir = self.short_report_fixture("short-next-day", promises=("2026-10-17T16:10",))
+
+        utc = self.short_progress(session_dir, self.report_time(16))
+        eastern = self.short_progress(session_dir, self.report_time(16), zone="America/New_York")
+
+        self.assertEqual(self.eta_report_line(utc),
+                         "ETA Sat 17 Oct 16:10 (on its first ETA, 1 fix round + 1 running)")
+        self.assertEqual(self.eta_report_line(eastern),
+                         "ETA Sat 17 Oct 12:10 (on its first ETA, 1 fix round + 1 running)")
+
+    def test_short_eta_line_formats_promises_in_the_user_zone(self) -> None:
+        session_dir = self.short_report_fixture("short-user-zone")
+
+        report = self.short_progress(session_dir, self.report_time(16), zone="America/New_York")
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 14:30 (first 13:15, +1:15, moved 2×, 1 fix round + 1 running)")
+
+    def test_short_progress_keeps_an_overdue_promise_instead_of_the_chain_schedule_end(self) -> None:
+        session_dir = self.short_report_fixture("short-overdue")
+
+        before = self.short_progress(session_dir, self.report_time(18, 31))
+        later = self.short_progress(session_dir, self.report_time(19))
+
+        for report in (before, later):
+            self.assertEqual(self.eta_report_line(report),
+                             "ETA 18:30 (passed, first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
+
+    def test_short_report_between_windows_keeps_the_eta_and_workers(self) -> None:
+        session_dir = self.short_report_fixture("short-between")
+        _ = self.short_progress(session_dir, self.report_time(16))
+        for offset, slot in enumerate(("impl", "test")):
+            self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
+        self.team_slot = ""
+        state = session_dir / "progress_history_state.json"
+        history = self.history_dir / "runs" / "short-between.jsonl"
+        before = (state.read_bytes(), history.read_bytes())
+
+        report = self.short_progress(session_dir, self.report_time(16, 10))
+
+        self.assertEqual(self.eta_report_line(report),
+                         "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
+        self.assertIn("repairing retry recovery", report)
+        self.assertIn("waiting for retry fixture", report)
+        self.assertIn("No pass or activity is open.", report)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assertEqual((state.read_bytes(), history.read_bytes()), before)
+
+    def test_tables_flag_adds_both_tables_and_keeps_the_same_eta_line(self) -> None:
+        session_dir = self.short_report_fixture("short-tables")
+
+        short = self.short_progress(session_dir, self.report_time(16))
+        detailed = self.short_progress(session_dir, self.report_time(16), tables=True)
+
+        self.assertEqual(self.eta_report_line(detailed), self.eta_report_line(short))
+        self.assertEqual(
+            [row[0] for row in self.table_rows(
+                detailed, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]],
+            )[:2]],
+            ["Project", "Phase 3"],
+        )
+        self.assertEqual(
+            [row[0] for row in self.table_rows(
+                detailed, ["Stage", "Start", "Elapsed", "Agent 1", "Agent 2", "Result"],
+            )],
+            ["Fix 1", "Fix 2"],
+        )
+        self.assertIn("repairing retry recovery", detailed)
+
+    def test_later_phase_gates_do_not_replace_the_current_phase_promise(self) -> None:
+        for name, gate in (
+            ("timed", "release 2026-10-21 11:47"),
+            ("untimed", "reviewed checkpoint"),
+        ):
+            with self.subTest(gate=gate):
+                session_dir = self.short_report_fixture(f"short-{name}", gate=gate)
+
+                report = self.short_progress(session_dir, self.report_time(16))
+
+                self.assertEqual(self.eta_report_line(report),
+                                 "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
+                self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+                for offset, slot in enumerate(("impl", "test")):
+                    self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
+                self.team_slot = ""
+                between = self.short_progress(session_dir, self.report_time(16, 10))
+                self.assertEqual(self.eta_report_line(between),
+                                 "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
+                self.assertFalse(any(line.startswith("|") for line in between.splitlines()), between)
+
+    def test_eta_line_names_only_the_requested_phases_own_gate(self) -> None:
+        eta_line = cast(Callable[[Path, str], str], vars(progress_history)["_phase_eta_line"])
+        for name, gate, expected in (
+            ("timed", "release 2026-10-21 11:47", "gated until Wed 21 Oct 11:47"),
+            ("untimed", "reviewed checkpoint", "gated by G3: renderer phase 9"),
+        ):
+            with self.subTest(gate=gate):
+                session_dir = self.short_report_fixture(f"short-own-{name}", gate=gate)
+                with patch.dict(os.environ, {
+                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                    "PLAN_DELEGATE_NOW_EPOCH": str(self.report_time(16)), "USER_ZONE": "UTC",
+                }):
+                    self.assertEqual(eta_line(session_dir, "4"), expected)
+
+    def test_short_report_keeps_the_stage_of_an_activity_after_its_phase_finished(self) -> None:
+        session_dir = self.short_report_fixture("short-shrink", running_fix=False)
+        _ = self.run_command("finish-phase", "--session-dir", str(session_dir),
+                             "--status", "completed", at=self.report_time(16))
+        _ = self.run_command("start-activity", "--session-dir", str(session_dir),
+                             "--label", "shrink", "--activity", "recording the as-built phase",
+                             at=self.report_time(16, 1))
+
+        report = self.short_progress(session_dir, self.report_time(16, 2))
+
+        stage = next(line for line in report.splitlines() if line.startswith("▸ "))
+        self.assertIn("shrink", stage)
+        self.assertIn("recording the as-built phase", stage)
+        self.assertNotIn("No pass or activity is open.", report)
+        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+
+    def test_project_eta_uses_the_last_chain_finish_and_shifts_the_open_eta_band(self) -> None:
+        session_dir, report = self.report_eta_chain("project-chain")
+        row = next(line for line in report.splitlines() if line.startswith("| Project"))
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+
+        self.assertEqual(cells[1:4], ["38", "02:00:00", "today 18:54"])
+        self.assertEqual(cells[-2:], ["today 18:44 (-00:10)", "today 19:14 (+00:20)"])
+        with patch.dict(os.environ, {
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+            "PLAN_DELEGATE_NOW_EPOCH": str(int(datetime(2026, 10, 16, 18, tzinfo=UTC).timestamp())),
+            "USER_ZONE": "UTC",
+        }):
+            record = phase_table.build(session_dir)
+        assert isinstance(record.plan_finish, phase_table.PredictedFinish)
+        self.assertEqual(record.plan_finish.at, datetime(2026, 10, 16, 18, 54, tzinfo=UTC))
+
+    def test_project_eta_names_an_untimed_gate_and_has_no_band(self) -> None:
+        _, report = self.report_eta_chain("project-gated", untimed_gate=True)
+        row = next(line for line in report.splitlines() if line.startswith("| Project"))
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+
+        self.assertEqual(cells[1:4], ["38", "02:00:00", "after G2"])
+        self.assertEqual(cells[-2:], ["—", "—"])
 
     def test_eta_records_exact_and_ranged_events(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
@@ -4325,6 +4809,7 @@ class ProgressHistoryTests(unittest.TestCase):
             if event.get("event_type") == "eta_stated"
         ]
         self.assertEqual(len(events), 2)
+        self.assertEqual([event.get("eta_phase_id") for event in events], ["3", "3"])
         self.assertEqual(
             events[0].get("eta_at"),
             datetime(2026, 10, 8, 13, tzinfo=UTC).timestamp(),
@@ -4343,6 +4828,52 @@ class ProgressHistoryTests(unittest.TestCase):
             events[1].get("eta_latest_at"),
             datetime(2026, 10, 8, 14, 30, tzinfo=UTC).timestamp(),
         )
+
+    def test_eta_can_target_the_next_phase_while_another_is_active(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-next-phase", now - 100)
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir),
+            "--phase-id", "2", "--phase-title", "Current delivery",
+            at=now - 50,
+        )
+        active_phase = self.read_state(session_dir)["phase"]
+
+        output = self.run_command(
+            "eta", "--session-dir", str(session_dir),
+            "--phase-id", "3", "--time", "13:00", "--basis", "checkpoint",
+            at=now,
+        )
+
+        events = [event for event in self.read_events("eta-next-phase")
+                  if event.get("event_type") == "eta_stated"]
+        self.assertEqual(output, "ETA recorded: 13:00 UTC")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].get("eta_phase_id"), "3")
+        self.assertEqual(events[0].get("phase_id"), "2")
+        self.assertEqual(events[0].get("basis"), "checkpoint")
+        self.assertEqual(
+            events[0].get("eta_at"),
+            datetime(2026, 10, 8, 13, tzinfo=UTC).timestamp(),
+        )
+        self.assertEqual(self.read_state(session_dir)["phase"], active_phase)
+
+    def test_eta_can_target_a_phase_without_an_active_phase(self) -> None:
+        now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-before-phase", now - 100)
+
+        _ = self.run_command(
+            "eta", "--session-dir", str(session_dir),
+            "--phase-id", "3", "--time", "13:00", "--basis", "checkpoint",
+            at=now,
+        )
+
+        events = [event for event in self.read_events("eta-before-phase")
+                  if event.get("event_type") == "eta_stated"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].get("eta_phase_id"), "3")
+        self.assertFalse(events[0].get("phase_id"))
+        self.assertIsNone(self.read_state(session_dir)["phase"])
 
     def test_eta_uses_the_process_timezone(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
@@ -4373,12 +4904,37 @@ class ProgressHistoryTests(unittest.TestCase):
             datetime(2026, 10, 8, 20, tzinfo=UTC).timestamp(),
         )
 
+    def test_short_eta_uses_the_users_local_calendar_date(self) -> None:
+        now = int(datetime(2026, 10, 8, 2, tzinfo=UTC).timestamp())
+        session_dir = self.start_run("eta-local-date", now - 100)
+        self.start_phase(session_dir, now - 50)
+
+        output = self.run_command(
+            "eta", "--session-dir", str(session_dir),
+            "--time", "20:00", "--basis", "eta-command",
+            at=now, zone="America/Los_Angeles",
+        )
+
+        events = [event for event in self.read_events("eta-local-date")
+                  if event.get("event_type") == "eta_stated"]
+        self.assertEqual(output, "ETA recorded: 20:00 PDT")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            events[0].get("eta_at"),
+            datetime(2026, 10, 8, 3, tzinfo=UTC).timestamp(),
+        )
+
     def test_eta_refuses_invalid_times_without_recording_an_event(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
         cases = (
             (
                 "past",
                 ["--time", "2026-10-08T11:59"],
+                "--time must not be in the past",
+            ),
+            (
+                "past-short-time",
+                ["--time", "11:59"],
                 "--time must not be in the past",
             ),
             (
@@ -4502,7 +5058,7 @@ class ProgressHistoryTests(unittest.TestCase):
             )
         )
 
-    def test_eta_requires_an_active_phase(self) -> None:
+    def test_eta_requires_an_active_phase_without_an_explicit_phase_id(self) -> None:
         now = int(datetime(2026, 10, 8, 12, tzinfo=UTC).timestamp())
         session_dir = self.start_run("eta-no-phase", now - 100)
 
@@ -4802,7 +5358,6 @@ class ProgressHistoryTests(unittest.TestCase):
             os.environ,
             {
                 "PHASE_TABLE_VAULT": str(vault_root),
-                "UNIT_LOOKUP_TMUX": "/bin/false",
                 "NOTIFIER_STATE_DIR": str(notifier_dir),
                 "NOTIFIER_SESSIONS_DIR": str(sessions_dir),
             },
@@ -4810,13 +5365,14 @@ class ProgressHistoryTests(unittest.TestCase):
             report = self.run_progress(session_dir, at=started_at + 100)
 
         note = vault_root / "example-showrunner" / "unit-a.md"
-        self.assertTrue(note.is_file())
+        self.assertTrue(note.is_file(), self.last_recorder_stderr)
         self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:9],
+            note.read_text(encoding="utf-8").splitlines()[:10],
             [
                 "---",
                 "phase_table: true",
-                "production: example",
+                "showrunner: example-showrunner",
+                f'production_file: "{production_doc.resolve().as_uri()}"',
                 "unit: unit-a",
                 'now: "Phase 3 of 1 — Retry handling"',
                 "---",
@@ -4901,7 +5457,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
         self.assertEqual(result, "ETA recorded: 13:00 UTC")
         note = vault_root / "example-showrunner" / "unit-a.md"
-        self.assertTrue(note.is_file())
+        self.assertTrue(note.is_file(), self.last_recorder_stderr)
         note_text = note.read_text(encoding="utf-8")
         self.assertIn("| ETA | 10-08 13:00 |", note_text)
         self.assertIn(
@@ -4974,7 +5530,7 @@ class ProgressHistoryTests(unittest.TestCase):
             [("18", 100), ("6", 290)],
         )
 
-    def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_seats(self) -> None:
+    def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_workers(self) -> None:
         started_at = 41_000
         session_dir = self.start_run("finish-older-phase", started_at)
         self.start_numbered_phase(session_dir, "6", started_at + 10)
@@ -5002,6 +5558,37 @@ class ProgressHistoryTests(unittest.TestCase):
             self.finish_numbered_phase(session_dir, started_at + 20, "--phase-id", "7")
         self.assertIn("Phase 7 is not open; open phases: 6", cast(str, raised.exception.stderr))
         self.assertEqual(self.open_phase_ids(session_dir), ("6", []))
+
+    def test_a_pass_naming_an_older_open_phase_is_stamped_with_it(self) -> None:
+        started_at = 42_500
+        session_dir = self.start_run("pass-names-phase", started_at)
+        self.start_numbered_phase(session_dir, "15", started_at + 10)
+        older = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.start_numbered_phase(session_dir, "16", started_at + 20)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 30, "gpt-called", 0, "--phase-id", "15")
+        self.team_slot = ""
+        self.start_slot_pass(session_dir, "test", "test", started_at + 40)
+        self.team_slot = ""
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(cast(dict[str, object], slots["impl"]["phase"])["instance_id"], older["instance_id"])
+        current = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(cast(dict[str, object], slots["test"]["phase"])["instance_id"], current["instance_id"])
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.start_slot_pass(session_dir, "fix", "fix", started_at + 50, "gpt-called", 0, "--phase-id", "7")
+        self.assertIn("Phase 7 is not open; open phases: 15, 16", cast(str, raised.exception.stderr))
+
+    def test_a_pass_naming_a_finished_phase_names_the_plan_review_order(self) -> None:
+        # A plan review launched after its phase's finish-phase is refused; the refusal says why.
+        started_at = 42_600
+        session_dir = self.start_run("pass-after-finish", started_at)
+        self.start_numbered_phase(session_dir, "13", started_at + 10)
+        self.start_numbered_phase(session_dir, "16", started_at + 20)
+        self.finish_numbered_phase(session_dir, started_at + 30, "--phase-id", "13")
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.start_slot_pass(session_dir, "review", "review", started_at + 40, "gpt-called", 0, "--phase-id", "13")
+        stderr = cast(str, raised.exception.stderr)
+        self.assertIn("Phase 13 is not open; open phases: 16", stderr)
+        self.assertIn("run its plan review before its finish-phase", stderr)
 
     def test_back_filling_an_earlier_phase_leaves_the_open_phase_unchanged(self) -> None:
         started_at = 43_000
@@ -5085,6 +5672,7 @@ class PhaseCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
 
@@ -5174,18 +5762,19 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
     def test_recorder_helpers_use_public_names_without_private_aliases(self) -> None:
         with patch.dict(os.environ, {"PLAN_DELEGATE_NOW_EPOCH": "123.5"}):
-            self.assertEqual(progress_history.now_epoch(), 123.5)
+            self.assertEqual(plan_history.now_epoch(), 123.5)
         self.assertEqual(
-            progress_history.resolve_plan_path(self.root, "docs/plan.md"),
+            plan_history.resolve_plan_path(self.root, "docs/plan.md"),
             (self.root / "docs" / "plan.md").resolve(),
         )
-        self.assertEqual(progress_history.percent_spread(None), 10.0)
+        self.assertEqual(plan_history.percent_spread(None), 10.0)
         self.assertFalse(hasattr(progress_history, "_now_epoch"))
         self.assertFalse(hasattr(progress_history, "_plan_path"))
         self.assertFalse(hasattr(progress_history, "_percent_spread"))
@@ -5211,7 +5800,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            progress_history.plan_phases(plan),
+            plan_history.plan_phases(plan),
             [
                 {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None, "blocked_by": ""},
                 {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None, "blocked_by": ""},
@@ -5236,7 +5825,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        phases = progress_history.plan_phases(plan)
+        phases = plan_history.plan_phases(plan)
 
         self.assertEqual(
             [(phase["depends_on"], phase["blocked_by"]) for phase in phases],
@@ -5257,7 +5846,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [phase["title"] for phase in progress_history.plan_phases(plan)],
+            [phase["title"] for phase in plan_history.plan_phases(plan)],
             ["Gradients (COLRv1 solid + linear/radial)", "Support (macOS)"],
         )
 
@@ -5275,18 +5864,18 @@ class PublicPhaseHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [phase["title"] for phase in progress_history.plan_phases(plan)],
+            [phase["title"] for phase in plan_history.plan_phases(plan)],
             ["Title", "Title"],
         )
 
     def test_eta_band_seconds_exposes_the_existing_projection_math(self) -> None:
         self.assertEqual(
-            progress_history.eta_band_seconds(50, 100, 10.0),
-            progress_history.EtaBand(remaining=100, earliest=66, latest=150),
+            plan_history.eta_band_seconds(50, 100, 10.0),
+            plan_history.EtaBand(remaining=100, earliest=66, latest=150),
         )
         self.assertIsInstance(
-            progress_history.eta_band_seconds(0, 100, 10.0),
-            progress_history.EtaProjectionUnavailable,
+            plan_history.eta_band_seconds(0, 100, 10.0),
+            plan_history.EtaProjectionUnavailable,
         )
 
     def test_plan_runs_finds_matching_history_oldest_first(self) -> None:
@@ -5316,7 +5905,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
             os.environ,
             {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
         ):
-            self.assertEqual(progress_history.plan_runs(plan), [older, newer])
+            self.assertEqual(plan_history.plan_runs(plan), [older, newer])
 
     def test_plan_runs_ignores_project_plan_inherited_without_a_run_plan(self) -> None:
         working_dir = self.root / "worktree"
@@ -5341,7 +5930,106 @@ class PublicPhaseHelperTests(unittest.TestCase):
             os.environ,
             {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
         ):
-            self.assertEqual(progress_history.plan_runs(plan), [])
+            self.assertEqual(plan_history.plan_runs(plan), [])
+
+
+WorkSeconds = Callable[[list[dict[str, object]], str, float, float], int]
+SummaryTable = Callable[[str, dict[str, int], dict[str, int], dict[str, object], float, float, float, dict[str, object]], list[str]]
+CalibrationSamples = Callable[[list[dict[str, object]]], list[dict[str, object]]]
+
+
+def private(name: str) -> object:
+    found = vars(progress_history).get(name)
+    if not callable(found):
+        raise AssertionError(f"progress recorder function is unavailable: {name}")
+    return found
+
+
+def window(kind: str, key: str, started_at: float, finished_at: float | None) -> list[dict[str, object]]:
+    """A pass or activity window of phase `p`, open when `finished_at` is None."""
+    id_field = f"{kind}_instance_id"
+    events: list[dict[str, object]] = [
+        {"phase_instance_id": "p", "event_type": f"{kind}_started", id_field: key, "timestamp_epoch": started_at}
+    ]
+    if finished_at is not None:
+        events.append(
+            {"phase_instance_id": "p", "event_type": f"{kind}_finished", id_field: key, "timestamp_epoch": finished_at}
+        )
+    return events
+
+
+class EtaWorkClockTests(unittest.TestCase):
+    """The phase clock leaves idle stretches out, and the project never lands before its phase.
+
+    herdr-trial, 2026-10-15: a phase whose clock ran through a night quoted the next
+    evening for an hour of work, and the project row arrived hours before it.
+    """
+
+    @property
+    def grace(self) -> int:
+        grace = vars(progress_history).get("IDLE_GRACE_SECONDS")
+        if not isinstance(grace, int):
+            raise AssertionError("progress recorder idle grace is unavailable")
+        return grace
+
+    def work_seconds(self, events: list[dict[str, object]], phase_instance_id: str, started_at: float, until: float) -> int:
+        return cast(WorkSeconds, private("_work_seconds"))(events, phase_instance_id, started_at, until)
+
+    def test_an_overnight_gap_between_dispatches_counts_only_the_grace(self) -> None:
+        night = 10 * 3600
+        events = window("pass", "a", 100, 1_100) + window("pass", "b", 1_100 + night, 2_100 + night)
+        self.assertEqual(self.work_seconds(events, "p", 0, 2_100 + night), 100 + 1_000 + self.grace + 1_000)
+
+    def test_an_open_window_counts_up_to_now(self) -> None:
+        events = window("activity", "a", 0, None)
+        self.assertEqual(self.work_seconds(events, "p", 0, 5 * 3600), 5 * 3600)
+
+    def test_a_wait_after_the_last_window_counts_only_the_grace(self) -> None:
+        events = window("pass", "a", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 600 + 8 * 3600), 600 + self.grace)
+
+    def test_overlapping_windows_count_once(self) -> None:
+        events = window("pass", "a", 0, 1_000) + window("activity", "b", 500, 1_500)
+        self.assertEqual(self.work_seconds(events, "p", 0, 1_500), 1_500)
+
+    def test_another_phase_windows_do_not_count(self) -> None:
+        events = [{**event, "phase_instance_id": "q"} for event in window("pass", "a", 0, 10_000)]
+        events += window("pass", "b", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 10_000), 600 + self.grace)
+
+    def test_a_phase_with_no_windows_keeps_the_wall_clock(self) -> None:
+        self.assertEqual(self.work_seconds([], "p", 1_000, 1_000 + 9 * 3600), 9 * 3600)
+
+    def test_the_project_eta_is_unknown_without_a_plan_chain(self) -> None:
+        summary_table = cast(SummaryTable, private("_summary_table"))
+        # Percent arithmetic can project both clocks, but there is no plan to
+        # supply the Project chain. Only the phase retains that projection.
+        project = {"percent": 90, "elapsed": 10 * 3600, "unchanged": 0}
+        phase = {"percent": 20, "elapsed": 3600, "unchanged": 0}
+        with patch.dict(os.environ, {"USER_ZONE": "UTC"}):
+            rows = [
+                [cell.strip() for cell in line.strip("|").split("|")]
+                for line in summary_table("7", project, phase, {}, 10.0, 0.0, 0.0, {})
+                if line.startswith("| Project") or line.startswith("| Phase")
+            ]
+        project_row, phase_row = rows
+        self.assertEqual([project_row[3], *project_row[5:]], ["—", "—", "—"])
+        self.assertEqual(phase_row[3], "today 04:00")
+
+    def test_calibration_measures_time_spent_in_work_time(self) -> None:
+        calibration_samples = cast(CalibrationSamples, private("_calibration_samples"))
+        night = 10 * 3600
+        phase: dict[str, object] = {"phase_instance_id": "p", "phase_started_at": 0}
+        events: list[dict[str, object]] = [
+            *window("pass", "a", 0, 3_600),
+            *window("pass", "b", 3_600 + night, 7_200 + night),
+            {**phase, "event_type": "progress_reported", "timestamp_epoch": 7_000 + night, "raw_percent": 90, "percent": 90},
+            {**phase, "event_type": "phase_finished", "status": "completed", "timestamp_epoch": 7_200 + night},
+        ]
+        sample, = calibration_samples(events)
+        # Work time: 3600 + grace + 3400 of 3600 + grace + 3600. Wall time read 79%.
+        expected = 100.0 * (7_000 + self.grace) / (7_200 + self.grace)
+        self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
 
 
 if __name__ == "__main__":

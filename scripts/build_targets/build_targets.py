@@ -5,15 +5,21 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from contextlib import ExitStack
+from contextvars import ContextVar
 from datetime import datetime, timezone
+import importlib
 import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 from types import FrameType
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast, final
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 from targets import (
@@ -23,10 +29,12 @@ from targets import (
     ExpiresAt,
     Free,
     Held,
+    IdleSince,
     LocalTarget,
     LocalRequired,
     ReleaseEstimated,
     Running,
+    RunningJob,
     Routing,
     SshTarget,
     StateUnreadable,
@@ -38,7 +46,6 @@ from targets import (
 )
 import offload
 import build_hold
-import mac_test
 import override_guard
 from user_zone import user_zone
 
@@ -68,6 +75,7 @@ class CliArguments(argparse.Namespace):
         self.repo_root: str = ""
         self.package: str = ""
         self.local_reason: str = ""
+        self.leave_hook: str = ""
 
 
 def local_time(instant: datetime) -> str:
@@ -78,12 +86,19 @@ def display_field(value: str) -> str:
     return " ".join(value.split())
 
 
+def running_job_text(job: RunningJob) -> str:
+    text = f"running {display_field(job.what)} since {local_time(job.since)}"
+    if isinstance(job.idle, IdleSince):
+        text += f", idle since {job.idle.when.astimezone(user_zone()).strftime('%H:%M')}"
+    return text
+
+
 def format_state(name: str, state: TargetState) -> str:
     name = display_field(name)
     if isinstance(state, Free):
         return f"{name}: free"
     if isinstance(state, Running):
-        return f"{name}: running {display_field(state.what)} since {local_time(state.since)}"
+        return f"{name}: " + "; ".join(running_job_text(job) for job in state.jobs)
     if isinstance(state, Unreachable):
         return f"{name}: unreachable — {display_field(state.reason)}"
     if isinstance(state, StateUnreadable):
@@ -117,16 +132,7 @@ def command_status(probe: bool = False) -> int:
             if probe and isinstance(target, SshTarget)
             else target_state(target)
         )
-        line = format_state(target.name, state)
-        if isinstance(target, SshTarget) and isinstance(state, Running):
-            try:
-                paths = mac_test.state_paths()
-                run = mac_test.read_run(paths.run)
-                if isinstance(run, dict) and datetime.fromisoformat(run["since"]) == state.since:
-                    line += mac_test.claim_idle_clause(run)
-            except (OSError, mac_test.StateReadError) as error:
-                line = format_state(target.name, StateUnreadable(str(error)))
-        print(line)
+        print(format_state(target.name, state))
     return 0
 
 
@@ -153,8 +159,35 @@ def wait_clock() -> datetime:
     return build_hold.aware_instant(supplied) if supplied else datetime.now(timezone.utc)
 
 
+@final
+class NoActiveLocalAdmissionWait:
+    """No wait owns a release-wait mechanism in this execution context."""
+
+    def wait(self, _seconds: float) -> None:
+        raise RuntimeError("local admission waiting requires an active wait")
+
+
+class LocalAdmissionWait(Protocol):
+    """An admission wait owns and closes its notification or polling mechanism."""
+
+    def arm(self) -> None: ...
+    def wait(self, seconds: float) -> None: ...
+    def __enter__(self) -> "LocalAdmissionWait": ...
+    def __exit__(self, *_arguments: object) -> None: ...
+
+
+# This CLI's import root excludes delegate; keep the runtime import at a typed
+# provider boundary rather than expanding the shared checker configuration.
+release_waiter = cast(Callable[[Path, Path], LocalAdmissionWait], getattr(
+    importlib.import_module("scripts.delegate.local_release_wait"), "local_release_waiter"))
+
+LOCAL_ADMISSION_WAIT: ContextVar[LocalAdmissionWait | NoActiveLocalAdmissionWait] = ContextVar(
+    "local_admission_wait", default=NoActiveLocalAdmissionWait())
+
+
 def wait_sleep(seconds: float) -> None:
-    time.sleep(seconds)
+    # Keep the existing wait boundary; its owner selects notifications or polling.
+    LOCAL_ADMISSION_WAIT.get().wait(seconds)
 
 
 def local_target() -> LocalTarget:
@@ -162,6 +195,23 @@ def local_target() -> LocalTarget:
         if target.name == "natedev" and isinstance(target, LocalTarget):
             return target
     raise ConfigError("targets: natedev local target is required")
+
+
+# wait-local's status when its leave hook found another target free: the call
+# leaves natedev's queue and runs there. It is invoke.sh's LINT_LEFT_QUEUE_STATUS.
+LEFT_QUEUE_STATUS = 75
+
+
+def leave_hook_says_free(leave_hook: str) -> bool:
+    """Run the caller's leave hook (mac_test.py free-now); status 0 means free."""
+    if not leave_hook:
+        return False
+    try:
+        return subprocess.run(["/bin/sh", "-c", leave_hook], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              check=False).returncode == 0
+    except OSError:
+        return False
 
 
 def wait_diagnostic(reason: str) -> str:
@@ -172,6 +222,21 @@ def record_admission(admission: build_hold.AdmittedTurn) -> None:
     destination = os.environ.get("BUILDLOG_HOLD_ADMISSION_FILE", "")
     if destination:
         _ = Path(destination).write_text(f"{admission.cycle_id} {admission.generation}\n")
+
+
+def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
+    try:
+        holds = build_hold.natedev_holds(directory)
+        key = build_hold.holder_path(directory, owner.session_id).name
+    except ValueError:
+        return False
+    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
+
+
+def caller_holds_only_own() -> bool:
+    """The calling session's hold is the only one in force, so natedev is held for it, not against it."""
+    owner = build_hold.owning_session()
+    return isinstance(owner, build_hold.OwningSession) and holds_only_own(owner, build_hold.holder_directory())
 
 
 def register_local_call(key: str, call_id: str, pid: int) -> build_hold.Admission:
@@ -194,7 +259,7 @@ def command_register_local(call_id: str, *, pid: int) -> int:
         if isinstance(state, StateUnreadable):
             print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
             return 12
-        if not isinstance(state, Held):
+        if not isinstance(state, Held) or caller_holds_only_own():
             return 0
         key = build_hold.waiter_key(call_id)
         admission = build_hold.read_admission(key, call_id)
@@ -219,16 +284,18 @@ def command_register_local(call_id: str, *, pid: int) -> int:
         return 12
 
 
-def command_wait_local(call_id: str, *, pid: int = 0) -> int:
+def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> int:
     key = ""
     started = wait_clock()
     announced = False
     escalated = False
+    polled = False
     registered: tuple[str, int] = ("", 0)
     process = pid or os.getpid()
     cancelled = False
     waiter_file = os.environ.get("BUILDLOG_HOLD_WAITER_FILE", "")
     previous_handlers: dict[int, Callable[[int, FrameType | None], object] | int | None] = {}
+    notifications = ExitStack()
 
     def interrupted(signum: int, _frame: object) -> None:
         nonlocal cancelled
@@ -245,14 +312,19 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
+        release_events = notifications.enter_context(release_waiter(
+            build_hold.holder_directory(), build_hold.release_directory()))
+        context = LOCAL_ADMISSION_WAIT.set(release_events)
+        _ = notifications.callback(LOCAL_ADMISSION_WAIT.reset, context)
         interval = max(0.001, float(os.environ.get("BUILD_TARGETS_POLL_S", "15")))
         escalation = float(os.environ.get("BUILD_TARGETS_ESCALATE_S", "7200"))
         while True:
+            release_events.arm()
             state = target_state(target)
             if isinstance(state, StateUnreadable):
                 print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
                 return 12
-            if not isinstance(state, Held):
+            if not isinstance(state, Held) or caller_holds_only_own():
                 return 0
             if not key:
                 key = build_hold.waiter_key(call_id)
@@ -273,19 +345,30 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
                         registered = identity
                     continue
             if not announced:
+                announced = True
                 print(f"verify.sh: natedev is held by {display_field(state.holder)} for "
                       + f"{display_field(state.reason)}; waiting (tests that can run on the Mac keep running there).",
                       file=sys.stderr, flush=True)
-                announced = True
+            # A held natedev cannot start this step, so a free Mac wins and the
+            # call's turn passes to the next waiter. As in memory_gate.sh, the
+            # hook runs from the second poll on: a Mac that declines after
+            # free-now said free costs one poll interval, never a tight loop.
+            if polled and leave_hook_says_free(leave_hook):
+                cancelled = True
+                print("verify.sh: the Mac is free: leaving natedev's hold wait to run there.",
+                      file=sys.stderr, flush=True)
+                return LEFT_QUEUE_STATUS
             if not escalated and (wait_clock() - state.since).total_seconds() >= escalation:
                 print(f"verify.sh: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
                       file=sys.stderr, flush=True)
                 escalated = True
             wait_sleep(interval)
+            polled = True
     except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
         print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
         return 12
     finally:
+        notifications.close()
         if cancelled and key:
             try:
                 build_hold.remove_call(key, call_id)
@@ -335,7 +418,7 @@ def command_check_admission(call_id: str) -> int:
         if isinstance(state, StateUnreadable):
             print(wait_diagnostic(state.reason), file=sys.stderr)
             return 12
-        if not isinstance(state, Held):
+        if not isinstance(state, Held) or caller_holds_only_own():
             return 0
         admission = build_hold.read_admission(build_hold.waiter_key(call_id), call_id)
         if isinstance(admission, build_hold.AdmissionReadError):
@@ -348,15 +431,6 @@ def command_check_admission(call_id: str) -> int:
     except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
         print(wait_diagnostic(str(error)), file=sys.stderr)
         return 12
-
-
-def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
-    try:
-        holds = build_hold.natedev_holds(directory)
-        key = build_hold.holder_path(directory, owner.session_id).name
-    except ValueError:
-        return False
-    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
 
 
 def command_check_local() -> int:
@@ -429,6 +503,7 @@ def parser() -> argparse.ArgumentParser:
     waiter = commands.add_parser("wait-local")
     _ = waiter.add_argument("--call-id", required=True)
     _ = waiter.add_argument("--pid", type=positive_pid, default=0)
+    _ = waiter.add_argument("--leave-hook", default="")
     _ = commands.add_parser("check-local")
     admission = commands.add_parser("check-admission")
     _ = admission.add_argument("--call-id", required=True)
@@ -449,7 +524,7 @@ def main() -> int:
     if args.command == "register-local":
         return command_register_local(args.call_id, pid=args.pid)
     if args.command == "wait-local":
-        return command_wait_local(args.call_id, pid=args.pid)
+        return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook)
     if args.command == "check-local":
         return command_check_local()
     if args.command == "check-admission":

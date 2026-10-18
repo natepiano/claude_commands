@@ -1,13 +1,14 @@
 ---
 description: Add a unit to the running production, create its worktree, and start its unit director.
-argument-hint: '<name> (--plan <path> | --brief "<goal>" | --standby) [--port <n>] [--owns "<text>"]'
+argument-hint: '<name> (--plan <path> | --brief "<goal>" | --standby | --permanent) [--port <n>] [--owns "<text>"]'
 ---
 
 # Add unit
 
 Run this in the showrunner session for a running production. Give exactly one
-of `--plan`, `--brief`, and `--standby`. `--brief` is the user's goal in their own words; pass
-it without rewriting it.
+of `--plan`, `--brief`, `--standby`, and `--permanent`. `--brief` is the user's goal in their own words; pass
+it without rewriting it. `--permanent` is a standby unit that wrap never retires (the
+nightly review).
 
 Run:
 
@@ -16,6 +17,8 @@ Run:
 ```
 
 Show the script's output. If it exits nonzero, show its message and stop.
+New launches print `<unit> started: herdr session attach <name>`; restores print
+`<unit> restore launched: herdr session attach <name>`.
 A name may be given with or without its `-unit` ending; `feature-log` and
 `feature-log-unit` both make unit `feature-log-unit`.
 An existing Units row is adopted; its Port and Owns values stand when omitted.

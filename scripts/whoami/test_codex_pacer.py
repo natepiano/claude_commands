@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import override
 
 import codex_pacer as pacer
+import note_file
 
 
 class FakeNote:
@@ -61,12 +62,22 @@ class PlanTests(unittest.TestCase):
 
     def test_a_closed_window_has_refreshed(self) -> None:
         notes = [FakeNote("codex", {"weekly_remaining_usage": "null", "resets": local(-2)})]
-        self.assertEqual(pacer.accounts(notes, NOW), [pacer.Account(100.0, None, 0)])
+        self.assertEqual(pacer.accounts(notes, NOW), [pacer.Account(100.0, note_file.NoResetKnown(), 0)])
 
     def test_a_lapsed_limit_reset_is_not_counted(self) -> None:
         notes = [FakeNote("codex", {"weekly_remaining_usage": "50", "resets": local(5),
                                     "limit_reset_count": "1", "limit_reset": "2026-09-30T10:00:00-04:00"})]
         self.assertEqual(pacer.accounts(notes, NOW)[0].limit_resets, 0)
+
+    def test_invalid_reset_remains_distinct_from_a_missing_reset_in_accounts(self) -> None:
+        missing, invalid = pacer.accounts([
+            FakeNote("codex", {"weekly_remaining_usage": "25"}),
+            FakeNote("codex", {"weekly_remaining_usage": "25", "resets": "after lunch"}),
+        ], NOW)
+        self.assertEqual(invalid.resets, note_file.InvalidReset("after lunch"))
+        self.assertIsInstance(missing.resets, note_file.NoResetKnown)
+        self.assertNotEqual(invalid.resets, missing.resets)
+        self.assertEqual(pacer.checkpoints([missing, invalid], NOW), [])
 
 
 def rollout_line(kind: str, at: datetime, payload: Mapping[str, object]) -> str:

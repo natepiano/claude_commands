@@ -1,14 +1,14 @@
 ---
 description: Show what this unit's /unit:direct run and its agents are doing right now.
-argument-hint: "[on|off]"
+argument-hint: "[tables|on|off]"
 ---
 
 # Direct — status report
 
-**Usage:** `/unit:report [on|off]`
+**Usage:** `/unit:report [tables|on|off]`
 
-Type this when a run has gone quiet, when an update arrived without its tables,
-or any time you want to know what the agents are doing right now. It runs inside
+Type this to see the phase, stage, ETA, workers and summary; add `tables` for
+the recorder's clocks and round tables. It runs inside
 the current session and already knows the session directory, the phase, and
 which dispatches are live. If no `/unit:direct` run is active, say so in one line and
 stop.
@@ -25,7 +25,8 @@ using the requested word. Relay its output and stop without composing a report.
 A Codex unit has no notifier; say this switch is unavailable there. If the
 command fails, relay its message as printed: exit 1 covers both a session with
 no active run and a run whose notifier instance is missing, and the message
-says which. Reject other arguments.
+says which. `tables` composes the report below with `progress --tables`;
+ordinary reports and notifier ticks omit that flag. Reject other arguments.
 
 Everything below is the contract.
 
@@ -35,7 +36,7 @@ Everything below is the contract.
 1. Check launcher state first. For Codex, `exit_code` alone marks terminal
    completion; a returned `session_id` without it remains active. When no
    dispatch, background verification or open activity remains active, process
-   completion; its result closes with the tables from step 5. A closed pass
+   completion; its result closes with the report from step 5. A closed pass
    alone is not completion (step 5). Ticks arriving during a report, or several
    together, get one report.
 2. Read the current Work Order and verification list, the latest relevant
@@ -65,7 +66,7 @@ Everything below is the contract.
    `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
 4. Apply <EarlyReviewArm/>: steps 2-3 are its evidence and this tick is its only
    trigger point. It runs **before** the recorder, so a reviewer it launches is
-   already working in the round table this tick prints.
+   already listed among this tick's workers.
 5. Run:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
@@ -74,93 +75,50 @@ Everything below is the contract.
    for another. Use its phase suggestion when applicable; otherwise keep the raw value. Then
    run:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"]`
+   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
 
-   The `progress` call also rewrites this unit's phase note; write nothing in
-   that note by hand. When the user asks for the phase table, paste the output
-   of `python3 ~/.claude/scripts/delegate/phase_table.py show --session-dir
-   "${SESSION_DIR}"`. Its times are in the user's zone setting.
+   Pass `--tables` only for `/unit:report tables`. The call also rewrites this
+   unit's phase note, which keeps the full phase list; write nothing there by
+   hand. For a requested full phase table, use `phase_table.py show
+   --session-dir "${SESSION_DIR}"`.
 
-   **Between windows the tables still print.** With the phase active and no
-   pass or activity open — reviews closed, repair writers not started — the
-   recorder prints both tables from the phase's last recorded values, under an
-   `as of` line, and a `No pass or activity is open.` line under them. Paste it
-   like any other tick; there is no report without tables, and "No progress
-   table this time" is never written. A closed pass does not mean the dispatch
-   finished: a live run has shown two seats carrying a closed pass while both
-   were posting to the board, and treating that as completion routes a healthy
-   round through <FixDispatch/>'s abandon path.
-   Check the seats: `impl_status_<slot>`, board posts since the last cursor,
-   and whether the launcher has exited. Alive means say so in prose and keep the
-   run going; terminal means step 1's completion handling. Never open an
-   activity to make the tables render — that records unit-director work that
-   never happened. When the last phase is closed but an activity is still
-   open, `progress` prints both tables from that phase's last recorded values
-   with the activity as the running row: copy them like any other tick. `No
-   active phase to report` remains only when no phase is active and no
-   activity is open.
+   **Between windows, report the last recorded values.** The recorder prints
+   an `as of` line and `No pass or activity is open.` without opening a window
+   or changing progress. A closed pass alone does not finish a dispatch: check
+   `phases/<id>/impl_status_<slot>`, board posts and launcher completion. Alive
+   means keep the run going; terminal means step 1. Never open an activity just
+   to render a report. An activity still open after the phase closes remains
+   the stage; `No active phase to report` means no phase or activity is open.
 
-   Include the override reason only when rejecting an applicable calibrated
-   value. **Copy its Markdown output byte-for-byte** — the scope line, the
-   `as of` line and the `No pass or activity is open.` line when present,
-   both tables with every row and cell, the `Earlier:` line above the round
-   table when there is one, the `- **Verification**` gate block under the
-   table when there is one (already condensed, one line per gate command),
-   and the wall clock. Never reorder, edit, or omit
-   any part of those: the recorder owns every column, duration format, and ETA
-   band. The one exception is the `- **Agent N**` lines under the round table:
-   they are the seats talking to each other, not to the user, so they are
-   step 7's input and are never pasted. When step 4 has armed an early
-   reviewer, say below the tables that the writer and the reviewer are working
-   at once.
-6. Read the round table as seats. It leads with `Stage`, `Start`, and `Elapsed`
-   — `Stage` rather than `Round` because a row is not always a round: a
-   verification, a smoke run, or a lone reviewer each own one. Its seat
-   columns are `Agent 1` and `Agent 2` — the slots `impl` and `test` in that
-   order — plus `Agent 3`, slot `review` (the craft reviewer), only when a
-   shown stage seated it. Slots are identities that never change, numbered so
-   the header carries no role word the cell beneath could contradict. Each cell
-   is the role that seat held over the row's stretch, how long it held it, and
-   what the seat is doing at the end of it:
+   Include the override reason only when rejecting applicable calibration.
+   Copy the recorder's phase heading, stage line, ETA line and wall clock
+   exactly, keeping its `as of` and no-open-window lines when present. The ETA
+   is the latest promise, including `passed` when overdue; never substitute a
+   schedule prediction. For `tables`, also copy both tables, `Earlier:` and
+   verification gate lines byte-for-byte. Worker narration supplies step 7;
+   never paste the `- **Agent N**` lines themselves.
+6. Present sections in this order: phase and stage, ETA line, worker table,
+   summary sentences, then `See /unit-board for the board.` For `tables`, put
+   the two recorder tables after the ETA line. If early review is armed, say
+   the writer and reviewer are working at once.
 
-   - `running` — its window is open and its last board line is work.
-   - `waiting` — open, but the seat says it is held up: on a peer's edit, on the
-     cargo token, on a gate. Both seats reading `running` while one sits on the
-     other is what this word exists to correct, and no clock shows it — a
-     waiting seat's elapsed grows exactly like a working one's.
-   - `idle` — its window has closed while the round has not, so the seat is free
-     for more work rather than finished with the phase.
-   - `done` — the stretch is over. Every row but the last of a live round.
-
-   A cell with a role and no time or state is a seat that recorded no pass; the
-   board knew its role, the ledger never saw it. A further row opens whenever
-   the team actually moves, and its `Result` cell names the movement —
-   `Agent 2 → impl` — so the reader watches `impl / test` become
-   `review / review` without diffing cells. The first row of a round
-   is its opening. The lines under the table lead with the same label and the
-   slot in parentheses — `- **Agent 2** (test) …` — then the agent sitting in
-   that seat and the last thing it said: the seat's own words, never the
-   launcher's. That narration is addressed to the other seat, which is why
-   step 7 rewrites it before it reaches the user. A lone reviewer between
-   rounds sits in the `Agent 2` column on a row of its own.
-
-   The table carries the phase's **last three stages**, not all of them. An
-   `Earlier:` line above it names what the cap left out, and the phase began
-   there, not at the table's first row — never describe a phase as newly opened
-   because its earlier rounds are off the table. When the user asks about work
-   that line covers, answer from `timeline`, which still renders every pass.
-7. Write the seat table yourself: one row per seat the recorder listed, columns
+   Use the recorder's worker lines for slot, role, state, model and effort.
+   `running` means working; `waiting` means held up; `idle` means its window
+   closed while the round continues; `done` means its stretch ended. With
+   `tables`, the round table adds timing and history for the last three stages;
+   use `timeline` for stages named by `Earlier:`.
+7. Write the worker table yourself: one row per worker the recorder listed, columns
    `#`, `Role`, `Model`, `Effort`, `Details`. Take the number and the slot from
-   the seat's label, the model and effort from the recorder when it names them
-   and `-` when it does not. `Details` is a sentence of yours, not the seat's,
-   answering two things: what the seat is doing in the phase's own terms, and
-   whether it is moving, waiting, or done. Build it from the seat's board lines
+   the worker's label, the model and effort from the recorder when it names them
+   and `-` when it does not. `Details` is a sentence of yours, not the worker's,
+   answering two things: what the worker is doing in the phase's own terms, and
+   whether it is moving, waiting, or done. Build it from the worker's board lines
    since the last cursor plus the Work Order, and hold these rules:
 
-   - Track the opening phase of the current Codex thread, not the seat name. If
+   - Track the opening phase of the current Codex thread, not the worker name. If
      that phase is older, begin `Details` with `Opened in phase <id>;`; omit it
      when the thread opened in the current phase. A replacement thread under
-     the same seat name starts fresh and holds only its own opening prompt, so
+     the same worker name starts fresh and holds only its own opening prompt, so
      the dispatch that creates it is an opening prompt, not a follow-up.
    - Read the full board line, never the recorder's 72-character cut. A line
      ending in `…` has lost its information and must never reach the user.
@@ -170,10 +128,10 @@ Everything below is the contract.
      nothing outside the session.
    - Coordination mechanics are not news. Claims, tokens, role announcements,
      handoffs, "no-more-edits", gate reruns — report the state they imply and
-     name the mechanism only when a seat is stuck on it, with how long.
+     name the mechanism only when a worker is stuck on it, with how long.
    - A finding is named by the defect it describes, not by its ID or the
      reviewer's phrasing.
-   - Give an age only when it is news — a seat silent long enough to look
+   - Give an age only when it is news — a worker silent long enough to look
      stalled, or finished and how long ago. "1s ago" tells the reader nothing.
    - One table per report, from this tick's recorder output only. Never carry a
      previous tick's rows forward or print two tables.
@@ -199,8 +157,8 @@ Everything below is the contract.
    with what this phase gives the person using the tool, then its movement and
    what remains. One topic per sentence, no more than two clauses; when a topic
    holds more than two items, give the count and what they have in common.
-   When the opening is not the default, or a seat is doing something other than
-   its name, say so in those words: "the test seat is writing the catalyst
+   When the opening is not the default, or a worker is doing something other than
+   its name, say so in those words: "the test worker is writing the catalyst
    side".
 
    Not this:

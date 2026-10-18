@@ -67,11 +67,11 @@ class AgentsLogTests(unittest.TestCase):
         os.utime(roster, (roster_stamp, roster_stamp))
         _ = (archived_run / "review_status_adversary").write_text("reviewed\n", encoding="utf-8")
         _ = (archived_run / "review_agent_adversary.log").write_text(
-            "Review seat project-test starts\n", encoding="utf-8")
-        seats = archived_run / "seats"
-        _ = seats.write_text("claude-one\tworker-one\nclaude-two\tworker-two\n", encoding="utf-8")
+            "Review worker project-test starts\n", encoding="utf-8")
+        workers = archived_run / "workers"
+        _ = workers.write_text("claude-one\tworker-one\nclaude-two\tworker-two\n", encoding="utf-8")
         ledger_stamp = roster_stamp + 100
-        os.utime(seats, (ledger_stamp, ledger_stamp))
+        os.utime(workers, (ledger_stamp, ledger_stamp))
 
         live = self.root / "live"
         live_run = live / "live-run"
@@ -521,6 +521,25 @@ for index in range(20):
         self.assertTrue(all(record["role"] == "worker" for record in records))
         self.assertEqual(agents_log.assignments(self.log_path).problems, ())
 
+    def test_backfill_reads_runs_and_directors_under_both_run_folder_names(self) -> None:
+        archive, live, _roster_at, _ledger_at = self.backfill_fixture()
+        former = self.root / "former"
+        former_run = former / "former-run"
+        former_run.mkdir(parents=True)
+        _ = (former_run / "mesh_roster.json").write_text(json.dumps({
+            "project-fix": {"thread_id": "former-thread", "role": "fix", "status": "done"},
+        }), encoding="utf-8")
+        (former / "active").mkdir()
+        _ = (former / "active" / "former-director").write_text(f"{former_run}\n", encoding="utf-8")
+
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live), "--live", str(former))
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.assignments["former-thread"][0].role, "fix")
+        self.assertEqual(log.assignments["former-director"][0].role, "director")
+        self.assertEqual(log.assignments["director-session"][0].role, "director")
+
     def test_backfill_recovers_previous_role_workers_director_and_review_lens(self) -> None:
         archive, live, roster_at, ledger_at = self.backfill_fixture()
 
@@ -546,6 +565,40 @@ for index in range(20):
         self.assertTrue(all(assignment.approximate for assignments in log.assignments.values()
                             for assignment in assignments))
         self.assertTrue(all(record["approximate"] is True for record in self.records()))
+
+    def test_remote_role_reader_loads_without_a_delegate_checkout(self) -> None:
+        program = """import sys, types
+for name in ('scripts', 'scripts.usage'):
+    package = types.ModuleType(name)
+    package.__path__ = []
+    sys.modules[name] = package
+module = types.ModuleType('scripts.usage.agents_log')
+module.__file__ = '/scripts/usage/agents_log.py'
+module.__package__ = 'scripts.usage'
+sys.modules[module.__name__] = module
+exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
+"""
+        result = subprocess.run([sys.executable, "-I", "-c", program],
+                                input=Path(agents_log.__file__).read_text(),
+                                capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_archive_backfill_links_the_old_ledger_and_preserves_its_timestamp(self) -> None:
+        archive, live, _, ledger_at = self.backfill_fixture()
+        run = archive / "archived-run"
+        current = run / "workers"
+        previous = run / "seats"
+        _ = current.rename(previous)
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertTrue(previous.samefile(current))
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.assignments["claude-one"],
+                         (agents_log.Assignment(ledger_at, "worker", None, True),))
+        before = self.log_path.read_bytes()
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.log_path.read_bytes(), before)
 
     def test_backfill_rerun_adds_nothing_even_if_mtime_changes(self) -> None:
         archive, live, _, _ = self.backfill_fixture()
@@ -607,7 +660,7 @@ for index in range(20):
         self.assertTrue(all(assignment.approximate for assignment in entries))
         self.assertEqual(entries[1].at, AT)
 
-    def test_backfill_recovers_swapped_review_lenses_from_logs_naming_each_seat(self) -> None:
+    def test_backfill_recovers_swapped_review_lenses_from_logs_naming_each_worker(self) -> None:
         archive, live, _, _ = self.backfill_fixture()
         run = archive / "archived-run"
         _ = (run / "mesh_roster.json").write_text(json.dumps({
@@ -616,9 +669,9 @@ for index in range(20):
         }), encoding="utf-8")
         _ = (run / "review_status_contract").write_text("reviewed\n", encoding="utf-8")
         _ = (run / "review_agent_adversary.log").write_text(
-            "Review seat project-impl starts\n", encoding="utf-8")
+            "Review worker project-impl starts\n", encoding="utf-8")
         _ = (run / "review_agent_1_contract.log").write_text(
-            "Review seat project-test starts\n", encoding="utf-8")
+            "Review worker project-test starts\n", encoding="utf-8")
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
@@ -627,14 +680,14 @@ for index in range(20):
         self.assertEqual(log.assignments["contract-thread"][0].lens, "contract")
         self.assertEqual(log.assignments["adversary-thread"][0].lens, "adversary")
 
-    def test_backfill_uses_the_newest_review_log_that_names_the_full_seat(self) -> None:
+    def test_backfill_uses_the_newest_review_log_that_names_the_full_worker(self) -> None:
         archive, live, _, _ = self.backfill_fixture()
         run = archive / "archived-run"
         old_log = run / "review_agent_adversary.log"
         newest_matching = run / "review_agent_2_contract.log"
-        _ = newest_matching.write_text("seat=project-test; role=review\n", encoding="utf-8")
+        _ = newest_matching.write_text("worker=project-test; role=review\n", encoding="utf-8")
         unrelated = run / "review_agent_3_ux.log"
-        _ = unrelated.write_text("seats: project-test2 other-project-test\n", encoding="utf-8")
+        _ = unrelated.write_text("workers: project-test2 other-project-test\n", encoding="utf-8")
         for index, path in enumerate((old_log, newest_matching, unrelated)):
             stamp = 1_700_000_000 + index * 100
             os.utime(path, (stamp, stamp))
@@ -645,11 +698,29 @@ for index in range(20):
         self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
                          "contract")
 
-    def test_backfill_leaves_review_lens_absent_without_a_log_naming_the_seat(self) -> None:
+    def test_backfill_reads_review_logs_in_phase_directories(self) -> None:
+        archive, live, _, _ = self.backfill_fixture()
+        run = archive / "archived-run"
+        old_log = run / "review_agent_adversary.log"
+        # A worker seat's log carries its slot after the lens.
+        phase_log = run / "phases" / "4" / "review_agent_2_contract-review2.log"
+        phase_log.parent.mkdir(parents=True)
+        _ = phase_log.write_text("worker=project-test; role=review\n", encoding="utf-8")
+        for index, path in enumerate((old_log, phase_log)):
+            stamp = 1_700_000_000 + index * 100
+            os.utime(path, (stamp, stamp))
+
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
+                         "contract")
+
+    def test_backfill_leaves_review_lens_absent_without_a_log_naming_the_worker(self) -> None:
         archive, live, _, _ = self.backfill_fixture()
         run = archive / "archived-run"
         _ = (run / "review_agent_adversary.log").write_text(
-            "Review seat another-test starts\n", encoding="utf-8")
+            "Review worker another-test starts\n", encoding="utf-8")
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
@@ -675,16 +746,16 @@ for index in range(20):
         self.assertEqual(log.assignments["claude-one"][0].role, "worker")
         self.assertEqual(log.assignments["claude-two"][0].role, "worker")
 
-    def test_backfill_recovers_roster_when_the_same_runs_seats_ledger_is_unreadable(self) -> None:
+    def test_backfill_recovers_roster_when_the_same_runs_workers_ledger_is_unreadable(self) -> None:
         archive, live, _, _ = self.backfill_fixture()
-        seats = archive / "archived-run/seats"
-        _ = seats.write_bytes(b"\xff")
+        workers = archive / "archived-run/workers"
+        _ = workers.write_bytes(b"\xff")
 
         result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn(str(seats), result.stderr)
+        self.assertIn(str(workers), result.stderr)
         log = agents_log.assignments(self.log_path)
         self.assertEqual(len(log.assignments["archived-thread"]), 2)
         self.assertNotIn("claude-one", log.assignments)

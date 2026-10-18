@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
+import ci_points
+from cli_fixture import invoke_cli
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
@@ -13,12 +17,12 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
-import ci_points
 
-
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("ci_points.py")
 LIFECYCLE = SCRIPT.with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -31,37 +35,37 @@ with (state / "calls.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps({"name": name, "args": args}) + "\\n")
 if name == "review_regime.py":
     if args[:1] == ["watch"]:
-        delay = os.environ.get("CI_POINTS_TEST_WATCH_DELAY")
-        if delay:
-            import time
-            time.sleep(float(delay))
         print("12 of 12 phases: report ready, waiting for your acknowledgment")
         raise SystemExit(3 if (state / "watch-three").exists() else 0)
     if args[:1] == ["report"]:
         print("| review | after |")
         print("| phases merged | 12 |")
         raise SystemExit(0)
-if name == "gh":
-    record = json.loads((state / "ci-result.json").read_text())
-    if args[:2] == ["repo", "view"]:
-        print(json.dumps({"nameWithOwner": "example/example"}))
-    elif args[:2] == ["run", "list"]:
-        print(json.dumps([{"databaseId": 123, "headSha": record["headSha"],
-                           "status": record["status"], "conclusion": record["conclusion"]}]))
-    elif args[:2] == ["run", "view"]:
-        print(json.dumps(record))
-    elif args[:2] == ["run", "watch"]:
-        hook = os.environ.get("CI_POINTS_TEST_WATCH_HOOK")
-        if hook:
-            import subprocess
-            subprocess.run([sys.executable, hook], check=True)
-        raise SystemExit(0 if record["conclusion"] == "success" else 1)
-    else:
-        raise SystemExit(99)
-    raise SystemExit(0)
-if name in ("send.py", "tmux", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
+if name in ("send.py", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
+'''
+GH_STUB = r'''#!/bin/bash
+set -euo pipefail
+state=${CI_POINTS_TEST_STATE:?}
+reply=$(jq -cn --slurpfile result "$state/ci-result.json" --args '
+    $ARGS.positional as $args | {name:"gh", args:$args},
+    (if $args[0:2] == ["repo", "view"] then {nameWithOwner:"example/example"}
+     elif $args[0:2] == ["run", "list"] then [$result[0] | {databaseId:123, headSha, status, conclusion}]
+     elif $args[0:2] == ["run", "view"] then $result[0]
+     elif $args[0:2] == ["run", "watch"] then {code:(if $result[0].conclusion == "success" then 0 else 1 end)}
+     else {code:99} end)' -- "$@")
+printf '%s\n' "${reply%%$'\n'*}" >> "$state/calls.jsonl"
+answer=${reply#*$'\n'}
+if [[ ${1:-} == run && ${2:-} == watch && -n ${CI_POINTS_TEST_WATCH_HOOK:-} ]]; then
+    "${TEST_PYTHON:?}" "$CI_POINTS_TEST_WATCH_HOOK"
+fi
+case "$answer" in
+    '{"code":0}') exit 0 ;;
+    '{"code":1}') exit 1 ;;
+    '{"code":99}') exit 99 ;;
+    *) printf '%s\n' "$answer" ;;
+esac
 '''
 VALIDATE_STUB = '''#!/bin/sh
 printf '%s\\n' "$*" >> "$CI_POINTS_TEST_STATE/validate-calls"
@@ -75,23 +79,6 @@ exit 0
 
 @final
 class CiPointsTests(unittest.TestCase):
-    def test_review_push_compares_merge_defects_and_explains_acknowledgment(self) -> None:
-        """F012: the review decision includes its result and acknowledgment's effect."""
-        title, action, body = ci_points.review_watch_push(
-            "| merge design-check defects per phase (mean) | 0.5 | 0.4 | 0.4 |")
-        self.assertIn("defects unchanged", title)
-        self.assertIn("0.4 per phase before and after", body)
-        self.assertIn("defects did not rise", body)
-        self.assertIn("stop these report notices", body)
-        self.assertIn("Discuss:", body)
-        self.assertIn("On natedev", action)
-        self.assertIn("python3 ~/.claude/scripts/production/review_regime.py report", body)
-        self.assertLess(len("Action: " + action + "\n" + body), 500)
-        _, _, missing = ci_points.review_watch_push("| phases merged | 12 |")
-        self.assertIn("no comparable defect counts", missing)
-        self.assertIn("work continues either way", missing)
-        self.assertIn("removal's effect is unknown", missing)
-        self.assertLess(len("Action: " + action + "\n" + missing), 500)
 
     root: Path = Path()
     home: Path = Path()
@@ -120,7 +107,7 @@ class CiPointsTests(unittest.TestCase):
         self.bin.mkdir()
         self.doc = self.root / "example-production.md"
         self.log = self.checkout / "production.log"
-        for name in ("review_regime.py", "gh", "tmux", "claude",
+        for name in ("review_regime.py", "gh", "claude",
                      "systemd-run", "ssh", "nix", "cargo-berth"):
             self.stub(self.bin / name)
         for path in (self.bin / "validate_and_push.sh",
@@ -131,7 +118,7 @@ class CiPointsTests(unittest.TestCase):
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state),
+        self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "DAILIES_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
@@ -156,7 +143,7 @@ class CiPointsTests(unittest.TestCase):
 
     def stub(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.write(path, STUB.replace("__PYTHON__", sys.executable))
+        self.write(path, GH_STUB if path.name == "gh" else STUB.replace("__PYTHON__", sys.executable))
         path.chmod(0o755)
 
     def write(self, path: Path, text: str) -> None:
@@ -186,9 +173,8 @@ class CiPointsTests(unittest.TestCase):
         )))
 
     def run_ci(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *args, "--production", str(self.doc)],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True,
-                              check=False, timeout=25)
+        arguments = [*args, "--production", str(self.doc)]
+        return invoke_cli(ci_points, ci_points.main, arguments, self.env, self.checkout)
 
     def calls(self, name: str) -> list[list[str]]:
         path = self.stub_state / "calls.jsonl"
@@ -418,14 +404,14 @@ class CiPointsTests(unittest.TestCase):
         promoted = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
                                    str(self.doc), flag, value, "--smoke-passed", tip],
                                   cwd=self.checkout, env=self.env, capture_output=True,
-                                  text=True, check=False, timeout=25)
+                                  text=True, check=False, timeout=300)
         self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
         self.assertIn("ci: ok", promoted.stdout)
         _ = self.merge(2)
         held = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
                                str(self.doc), flag, value, "--smoke-passed", tip],
                               cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=25)
+                              text=True, check=False, timeout=300)
         self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
         self.assertIn("ci: held", held.stdout)
 
@@ -437,30 +423,69 @@ class CiPointsTests(unittest.TestCase):
         second = self.run_ci("watch", "--state-dir", str(self.state))
         self.assert_step(second, "watch", True)
         self.assertNotIn("| phases merged | 12 |", second.stdout)
-        self.assertEqual(self.calls("send.py"), [[
-            "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "On natedev, read the report. Choose acknowledge or discuss.",
-            "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed from merge review. The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
-            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended; work continues either way): rerun with ack instead of report to stop these report notices.\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.",
-        ]])
+        self.assertEqual(self.calls("send.py"), [])
+        self.assertIn("| phases merged | 12 |", self.log.read_text())
         self.assertEqual(len(self.calls("review_regime.py")), 3)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
     def test_simultaneous_watch_calls_claim_only_one_first_alert(self) -> None:
         _ = (self.stub_state / "watch-three").touch()
-        self.env["CI_POINTS_TEST_WATCH_DELAY"] = "0.5"
-        command = [sys.executable, str(SCRIPT), "watch", "--production", str(self.doc),
-                   "--state-dir", str(self.state)]
-        processes = [subprocess.Popen(command, cwd=self.checkout, env=self.env,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                     for _ in range(2)]
-        results = [process.communicate(timeout=25) for process in processes]
+        program = """import fcntl, os, runpy, sys
+ready = int(sys.argv.pop(1))
+sys.argv.pop(0)
+original = fcntl.flock
+def observed_lock(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            original(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.write(ready, b'blocked')
+        else:
+            raise RuntimeError('expected the parent to hold the review lock')
+        # Observe only the initial contention; later locks use their real path.
+        fcntl.flock = original
+    return original(fd, operation)
+fcntl.flock = observed_lock
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+        self.state.mkdir(exist_ok=True)
+        processes: list[subprocess.Popen[str]] = []
+        readiness: list[int] = []
+        try:
+            with (self.state / "review_watch.lock").open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                for _ in range(2):
+                    read_ready, write_ready = os.pipe()
+                    readiness.append(read_ready)
+                    try:
+                        processes.append(subprocess.Popen(
+                            [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
+                             "watch", "--production", str(self.doc), "--state-dir", str(self.state)],
+                            cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        ))
+                    finally:
+                        os.close(write_ready)
+                for fd, process in zip(readiness, processes, strict=True):
+                    readable, _, _ = select.select([fd], [], [], 300)
+                    self.assertEqual(readable, [fd], "watch never reached the held lock")
+                    if os.read(fd, 7) != b"blocked":
+                        stdout, stderr = process.communicate(timeout=300)
+                        self.fail("watch exited before observing the review lock: " + stdout + stderr)
+                self.assertTrue(all(process.poll() is None for process in processes))
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                results = [process.communicate(timeout=300) for process in processes]
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                _ = process.communicate(timeout=300)
+            for fd in readiness:
+                os.close(fd)
         self.assertTrue(all(process.returncode == 0 for process in processes), results)
         self.assertEqual(sum("| phases merged | 12 |" in stdout for stdout, _ in results), 1)
-        self.assertEqual(len(self.calls("send.py")), 1)
+        self.assertEqual(len(self.calls("send.py")), 0)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
     def test_notice_clear_names_waiting_unit_and_merge_hash(self) -> None:
@@ -479,6 +504,41 @@ class CiPointsTests(unittest.TestCase):
         self.assert_step(lifted, "notice lift", True)
         self.assertIn(f"send alpha-unit: From the showrunner: G1 lifted — your tests pass without beta-unit phase 2 ({log}). Continue.",
                       lifted.stdout)
+
+
+    def test_mixed_handoff_history_does_not_advance_the_ci_interval(self) -> None:
+        for number in range(1, 5):
+            _ = self.merge(number)
+        for subject in (
+            "Merge alpha-unit hand-off (aaaaaaa) into production",
+            "Merge style-child hand-off (bbbbbbb) into production",
+            "Merge alpha-unit phase 4 shrink (ccccccc) into production",
+            "chore(example): rename unit alpha-unit to renamed-unit",
+        ):
+            _ = self.git("commit", "--allow-empty", "-m", subject)
+        due = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(due, "due", True)
+        self.assertIn("4 of 5 code merges", due.stdout)
+        self.ci_result(self.git("rev-parse", "HEAD"))
+        _ = self.start_point()
+        self.assert_step(self.collect_point(), "ci collect", True)
+        record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
+        self.assertEqual(record["count"], 4)
+
+    def test_ci_fix_commit_label_uses_last_unit_phase_when_a_handoff_is_newest(self) -> None:
+        _ = self.merge(2)
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (aaaaaaa) into production")
+        _ = self.start_point()
+        command = (self.stub_state / "validate-calls").read_text()
+        self.assertIn("ci(example): validation fixes after alpha-unit phase 2", command)
+        self.assertNotIn("hand-off", command)
+
+    def test_notice_clear_cannot_treat_a_child_named_like_the_target_as_a_unit_phase(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Merge beta-unit hand-off (bbbbbbb) into production")
+        result = self.run_ci("notice", "clear", "G1")
+        self.assert_step(result, "notice clear", False)
+        self.assertIn("beta-unit phase 2 has no code merge", result.stdout)
+        self.assertNotIn("send alpha-unit", result.stdout)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,16 @@ to rediscover after a context compaction lives in the doc.
      it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
 > **Production: <name>** — unit `<unit>`; production doc `<path>`
 
+<!-- Optional; a standing plan never closes its run. <NextPhase/> refills it
+     through style_plan.py. Git-exclude the plan:
+     the ledger is its record; checkpoint and shrink never commit or shrink it. -->
+> **Standing:** style_plan.py
+
+<!-- Optional; the hanadocs issues whose work this plan builds (/showrunner:proposal).
+     Preserved verbatim by every command that edits this doc. /unit:direct marks each
+     active at run start; its end-of-run as-built pass closes each. -->
+> **Issues:** <issue path>[, <issue path>]
+
 ## Delegation Context
 <!-- Shared across all phases. /unit:direct prepends this to every dispatch. -->
 
@@ -47,21 +57,19 @@ to rediscover after a context compaction lives in the doc.
   `progress_history.py start-run` recorder; if absent, the recorder derives it
   from the oldest Git commit touching this plan and persists it>
 - **Stack:** <language + key frameworks/versions the work touches>
-- **Layout:** <only the dirs/files phases touch, as a short map>
+- **Layout:** <only the dirs/files phases touch, as a short map. Paths are
+  repository-relative; the plan never names its worktree or branch, which
+  /unit:direct reads from git at dispatch>
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Test lanes:** <for each crate a phase touches, its `tests/` directory or
-  `none` — what a Work Order's **Seats** opens the `test` seat against>
+  `none` — what a Work Order's **Workers** opens the `test` worker against>
 - **Build:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
   otherwise the project's exact build command>
 - **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
   otherwise the project's exact test command>
-- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
-  Never raw cargo commands and never the full `clippy` skill here — phase
-  verification is deliberately scoped; workspace breadth and the `clippy`
-  skill run once in /unit:direct's <FinalGate/> after the last phase>
-- **Style:** <for Rust use `run-end /clippy style-only auto-proceed`;
-  /unit:direct omits it from coding prompts and runs it once at <FinalGate/>,
-  over the whole branch diff rather than one phase; omit for non-Rust>
+- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`;
+  never raw cargo commands. <PhaseChecks/> defines scope and the phase's
+  style review in the unit director's main review; workers never load the guide>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases
@@ -100,12 +108,12 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
 - `<path>` — <what changes here>
 - ...
 
-**Seats:** <opening line: `1 writer + 1 tester` or `2 writers` — then the split
+**Workers:** <opening line: `1 writer + 1 tester` or `2 writers` — then the split
 (by crate, module, or file group) or why nothing splits>
 - `impl` — <files it owns>; hub: `<path>` (<why every writer needs it>)
 - `test` — <what it writes from the Spec alone, and where under `tests/`>
 <!-- A slot is an identity; the role it opens in is what its line says. A line
-     without `opens as` opens in its own name. A `test` seat with no test lane
+     without `opens as` opens in its own name. A `test` worker with no test lane
      reads `opens as impl`. Writers hold disjoint files; every hub file has
      exactly one owner. Rule 7. -->
 
@@ -229,8 +237,8 @@ Rules:
    a defect gets fixed where it lives, and an authored boundary that hides that is
    how a workaround gets built on purpose. See `~/.claude/docs/decision_criteria.md`
    → "Where a fix goes".
-7. **Seats decides the opening.** Every `todo` Work Order carries **Seats**;
-   `/unit:direct` opens its two seats from it and partitions files by it
+7. **Workers decides the opening.** Every `todo` Work Order carries **Workers**;
+   `/unit:direct` opens its two workers from it and partitions files by it
    instead of deciding at launch. `impl` always opens as `impl`. `test` opens
    as `test` wherever the phase has a **test lane** — a `tests/` directory in a
    touched crate (Delegation Context → **Test lanes**) and a Spec concrete
@@ -240,8 +248,8 @@ Rules:
    re-exports, `Cargo.toml`, plugin registration, a shared types file — sits
    on exactly one writer's line as `hub:`; the other writer messages that owner
    for the line it needs. A tester's line names what the Spec alone lets it
-   write; a Spec too thin for that is a reason to open the seat as a writer.
+   write; a Spec too thin for that is a reason to open the worker as a writer.
    When nothing splits, the opening line says so and `impl` takes every file.
-   A repair runs one seat whatever Seats says. An older three-seat field maps
+   A repair runs one worker whatever Workers says. An older three-worker field maps
    down per `/unit:direct` → `<PhaseTeam/>`.
 

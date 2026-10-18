@@ -90,9 +90,9 @@ AT_ZERO = (
 )
 TRIAGE = (
     "Codex wind-down, from the user (/codex_winddown triage in {sender}, {time}): \"you need to tell"
-    " all of the other seats to figure out which ones can be stopped now and added to a resume list vs"
+    " all of the other workers to figure out which ones can be stopped now and added to a resume list vs"
     " which really should finish right now\". Sort the Codex agents running under you: stop each one"
-    " that can stop, keep what it wrote, and put it on a resume list (the seat, its work order, what is"
+    " that can stop, keep what it wrote, and put it on a resume list (the worker, its work order, what is"
     " left); let the rest finish. With none running, there is nothing to do."
 )
 ALL_CLEAR = (
@@ -106,24 +106,11 @@ UNIT_CLEAR = (
 )
 
 
-def owner(
-    process: process_table.Process,
-    table: Mapping[int, process_table.Process],
-    names: Mapping[int, str],
-) -> str:
-    seen: set[int] = set()
-    current: process_table.Process | None = process
-    while current is not None and current.pid not in seen:
-        if current.pid in names:
-            return names[current.pid]
-        seen.add(current.pid)
-        current = table.get(current.parent)
-    return NO_SESSION
-
-
 def agent_counts(table: Mapping[int, process_table.Process], names: Mapping[int, str]) -> Counter[str]:
-    return Counter(owner(process, table, names) for process in table.values()
-                   if process_table.is_codex_agent(process))
+    return Counter(
+        NO_SESSION if (name := process_table.nearest_named(process, table, names)) is None else name
+        for process in table.values() if process_table.is_codex_agent(process)
+    )
 
 
 def current_counts() -> Counter[str]:
@@ -247,13 +234,22 @@ def announce_quiet(running: int) -> None:
     except FileExistsError:
         return
     machine = socket.gethostname()
-    text = (f"All Codex agents on {machine} have stopped, so a reset now will not interrupt their work. "
-            "New Codex work stays paused until you run the clear command.")
-    _ = broadcast.send(
-        "user", "codex-winddown", text,
-        "--summary", "Codex is ready for your reset", "--need", "decision",
-        "--action", f"Reset Codex, then run /codex_winddown clear in a Claude session on {machine}.",
-    )
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    from push_texts import render, user_send_argv
+    import review
+
+    push = render("codex.reset_ready", machine=machine)
+    command = user_send_argv(push)
+    command[1] = str(broadcast.SEND)
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, check=False,
+                              timeout=review.user_send_seconds() + 15)
+        if done.returncode:
+            (STATE / QUIET).unlink(missing_ok=True)
+            print(f"codex wind-down: reset alert failed: {done.stdout.strip() or done.stderr.strip()}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        (STATE / QUIET).unlink(missing_ok=True)
+        print(f"codex wind-down: reset alert failed: {error}", file=sys.stderr)
 
 
 def count(session: str) -> int:

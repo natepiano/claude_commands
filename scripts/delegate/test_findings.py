@@ -8,8 +8,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import cast, override
+from collections.abc import Callable
+from scripts.delegate import findings
 
 
 SCRIPT = Path(__file__).with_name("findings.py")
@@ -38,6 +41,7 @@ class FindingsLedgerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.session_dir = self.root / "session"
@@ -61,6 +65,25 @@ class FindingsLedgerTests(unittest.TestCase):
         # there.
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
         return environment
+
+    def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        self.write_progress_state("phase-probe")
+        append = cast(Callable[[Path, dict[str, object], dict[str, object]], None], vars(findings)["_append_event"])
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            self.assertTrue(self.history_file.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                append(self.session_dir, {}, {"event_type": "probe"})
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(self.events()[0]["event_type"], "probe")
+            self.history_file.unlink()
 
     def write_config(self, text: str) -> None:
         """Write the standard limits with `text` appended; a repeated key there wins."""
@@ -105,11 +128,11 @@ class FindingsLedgerTests(unittest.TestCase):
         passes: list[tuple[str, str, str]],
         slot_key: str = "team_slot",
     ) -> None:
-        """Stand in for the recorder's durable stream: (kind, seat, status) rows.
+        """Stand in for the recorder's durable stream: (kind, worker, status) rows.
 
         In the order the passes opened. An empty status leaves the pass open,
         which is the row a launcher still waiting on its agent contributes. An
-        empty `slot_key` writes no seat field at all, which is every pass the
+        empty `slot_key` writes no worker field at all, which is every pass the
         back corpus recorded.
         """
         path = self.root / "history" / "runs" / f"{self.session_dir.name}.jsonl"
@@ -170,6 +193,56 @@ class FindingsLedgerTests(unittest.TestCase):
 
         findings = cast(list[dict[str, object]], self.status()["findings"])
         self.assertEqual([finding["title"] for finding in findings], ["six's finding"])
+
+    def write_two_open_phases(self) -> None:
+        """Phase 15 started first and stays open while Phase 16 is the newest."""
+        state = {
+            "history_file": str(self.history_file),
+            "phase": {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
+            "open_phases": [{"instance_id": "phase-fifteen", "id": "15", "title": "15",
+                             "status": "active"}],
+        }
+        _ = (self.session_dir / "progress_history_state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+    def phase_status(self, phase: str) -> dict[str, object]:
+        return cast(dict[str, object], json.loads(self.run_command("status", "--phase", phase)))
+
+    def test_a_landed_repair_for_the_older_open_phase_touches_only_its_ledger(self) -> None:
+        self.write_two_open_phases()
+        fifteen = self.run_command("open", "--phase", "15", "--severity", "blocker",
+                                   "--title", "fifteen's finding", "--caught-by", "delegate")
+        sixteen = self.run_command("open", "--phase", "16", "--severity", "blocker",
+                                   "--title", "sixteen's finding", "--caught-by", "delegate")
+        _ = self.run_command("dispatch", "--phase", "15", "--covers", fifteen)
+        _ = self.run_command("dispatch", "--phase", "16", "--covers", sixteen)
+
+        self.assertEqual(self.run_command("landed", "--phase", "15"), f"round 1 landed: {fifteen}")
+
+        older = self.phase_status("15")
+        newer = self.phase_status("16")
+        self.assertEqual(older["in_flight"], [])
+        self.assertEqual(newer["in_flight"], [sixteen])
+        self.assertEqual([finding["title"] for finding in cast(list[dict[str, object]], newer["findings"])],
+                         ["sixteen's finding"])
+        live = cast(dict[str, object], json.loads(
+            (self.session_dir / "findings_state.json").read_text(encoding="utf-8")))
+        self.assertEqual(live["phase_id"], "16")
+
+    def test_a_ledger_call_naming_no_phase_is_refused_while_two_are_open(self) -> None:
+        self.write_two_open_phases()
+        result = self.run_failing_command("open", "--severity", "blocker", "--title", "which phase",
+                                          "--caught-by", "delegate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("2 phases are open (15, 16); name one with --phase", result.stderr)
+        self.assertEqual(list(self.session_dir.glob("findings_state*.json")), [])
+
+    def test_a_ledger_call_naming_a_closed_phase_is_refused(self) -> None:
+        self.write_two_open_phases()
+        result = self.run_failing_command("landed", "--phase", "14")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
 
     def test_ids_are_stable_across_rounds(self) -> None:
         self.assertEqual(self.open_finding("blocker", "first"), "F001")
@@ -481,12 +554,12 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertIsNone(payload["consecutive_same_kind"])
         self.assertEqual(payload["review_cancellations"], 0)
 
-    def test_three_seats_running_one_kind_each_do_not_trip_the_gate(self) -> None:
+    def test_three_workers_running_one_kind_each_do_not_trip_the_gate(self) -> None:
         """A phase team is one round with three workers, not three rounds.
 
         Every member records a pass of its own now, so the flat sequence reaches
         the same-kind limit on the first team phase that ever runs. The limit is
-        about one seat being handed the same work repeatedly.
+        about one worker being handed the same work repeatedly.
         """
         self.write_progress_state("phase-instance")
         self.write_pass_events(
@@ -503,8 +576,8 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertEqual(payload["consecutive_same_kind"], {"kind": "impl", "count": 1})
         self.assertIsNone(payload["advisory"])
 
-    def test_one_seat_repeating_a_kind_trips_the_gate_beside_busy_peers(self) -> None:
-        """The run is counted inside a seat, so its peers cannot hide it."""
+    def test_one_worker_repeating_a_kind_trips_the_gate_beside_busy_peers(self) -> None:
+        """The run is counted inside a worker, so its peers cannot hide it."""
         self.write_progress_state("phase-instance")
         self.write_pass_events(
             "phase-instance",
@@ -524,10 +597,10 @@ class FindingsLedgerTests(unittest.TestCase):
             "3 consecutive impl passes ran without the phase advancing",
         )
 
-    def test_passes_with_no_seat_are_counted_as_one_sequence(self) -> None:
+    def test_passes_with_no_worker_are_counted_as_one_sequence(self) -> None:
         """The back corpus and every solo phase keep today's answer exactly.
 
-        No pass recorded before seats existed carries one, so they share the
+        No pass recorded before workers existed carries one, so they share the
         empty bucket and the run is computed over the flat sequence.
         """
         self.write_progress_state("phase-instance")
@@ -548,7 +621,7 @@ class FindingsLedgerTests(unittest.TestCase):
             "3 consecutive impl passes ran without the phase advancing",
         )
 
-    def test_one_canceled_review_per_seat_is_not_a_review_that_cannot_finish(self) -> None:
+    def test_one_canceled_review_per_worker_is_not_a_review_that_cannot_finish(self) -> None:
         """Two reviewers interrupted once each is not one that never completes."""
         self.write_progress_state("phase-instance")
         self.write_pass_events(
@@ -563,7 +636,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertEqual(payload["review_cancellations"], 1)
         self.assertIsNone(payload["advisory"])
 
-    def test_repeated_cancellations_in_one_seat_still_trip_the_review_limit(self) -> None:
+    def test_repeated_cancellations_in_one_worker_still_trip_the_review_limit(self) -> None:
         self.write_progress_state("phase-instance")
         self.write_pass_events(
             "phase-instance",
@@ -581,12 +654,12 @@ class FindingsLedgerTests(unittest.TestCase):
             "the blind review was canceled 2 times, so it is never completing",
         )
 
-    def test_a_seat_recorded_before_the_field_was_renamed_stays_one_sequence(self) -> None:
-        """A phase that spans the rename must not read as two seats.
+    def test_a_worker_recorded_before_the_field_was_renamed_stays_one_sequence(self) -> None:
+        """A phase that spans the rename must not read as two workers.
 
         The field was `team_role` for a day. A launcher whose pass opened under
-        the old name and a peer opened under the new one are still two seats,
-        and the seat that repeated a kind is still the one that trips.
+        the old name and a peer opened under the new one are still two workers,
+        and the worker that repeated a kind is still the one that trips.
         """
         self.write_progress_state("phase-instance")
         self.write_pass_events(

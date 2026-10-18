@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
 import signal
+import selectors
 import subprocess
 import sys
 import threading
@@ -12,7 +15,7 @@ import time
 import unittest
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest import mock
@@ -24,6 +27,8 @@ from scripts.delegate import test_verify_mac_offload
 VERIFY = Path(__file__).with_name("verify.sh")
 TARGETS = VERIFY.parent.parent / "build_targets" / "build_targets.py"
 CYCLE_ID = "c" * 32
+# Completion depends on events; this deadline only diagnoses a hung fixture.
+HANG_GUARD_S = 300
 
 
 class WaitObservation(TypedDict):
@@ -83,7 +88,7 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
 
     def release() -> None:
         try:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + HANG_GUARD_S
             while not stop.wait(0.01) and time.monotonic() < deadline:
                 if not path.exists():
                     continue
@@ -100,7 +105,7 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
         yield
     finally:
         stop.set()
-        worker.join(timeout=2)
+        worker.join(timeout=HANG_GUARD_S)
         if worker.is_alive():
             raise AssertionError("Release fixture did not stop")
         if failures:
@@ -115,11 +120,13 @@ class VerifyHoldWaitTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.fixture = test_verify_mac_offload.VerifyMacOffloadTests("runTest")
+        self.wait_diagnostics: dict[int, str] = {}
+        self.wait_output: dict[int, str] = {}
 
     @override
     def setUp(self) -> None:
         self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.addCleanup(self.fixture_cleanups)
         root = self.fixture.root
         self.cycle_file = root / "release" / CYCLE_ID / "cycle.json"
         self.fixture.environment.update({
@@ -152,30 +159,67 @@ class VerifyHoldWaitTests(unittest.TestCase):
         }
         _ = self.cycle_file.write_text(json.dumps(cycle))
 
+    def fixture_cleanups(self) -> None:
+        # Outside a run, doCleanups keeps a failed cleanup to itself:
+        # a process the fixture found outliving the test fails this one.
+        self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed; a process may have outlived the test")
+
     def start(self, *arguments: str) -> subprocess.Popen[str]:
         process = self.fixture.start_verify(*arguments)
         self.addCleanup(self.stop_process, process)
         return process
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-        _ = process.communicate(timeout=3)
+        self.fixture.stop_verify(process)
 
-    def wait_for_call(self) -> build_hold.ReleaseEntry:
-        deadline = time.monotonic() + 5
+    def wait_for_call(self, process: subprocess.Popen[str]) -> build_hold.ReleaseEntry:
+        deadline = time.monotonic() + HANG_GUARD_S
         while time.monotonic() < deadline:
             if self.cycle_file.exists():
                 cycle = read_cycle_file(self.cycle_file)
                 for entry in cycle["entries"]:
                     if entry.get("calls", []):
+                        self.wait_for_waiting_diagnostic(process)
                         return entry
+            if process.poll() is not None:
+                code, output = self.finish(process)
+                self.fail(f"Verification exited {code} without registering its call: {output}")
             time.sleep(0.01)
         self.fail("Verification did not register its call")
 
+    def wait_for_waiting_diagnostic(self, process: subprocess.Popen[str]) -> None:
+        # Registration precedes the first waiting announcement. Releasing before
+        # that announcement can legitimately record zero waiting seconds.
+        assert process.stderr is not None
+        assert process.stdout is not None
+        deadline = time.monotonic() + HANG_GUARD_S
+        captured = self.wait_diagnostics.get(process.pid, "")
+        output = self.wait_output.get(process.pid, "")
+        with selectors.DefaultSelector() as events:
+            _ = events.register(process.stderr, selectors.EVENT_READ)
+            _ = events.register(process.stdout, selectors.EVENT_READ)
+            while "; waiting (tests that can run on the Mac" not in captured + output:
+                remaining = deadline - time.monotonic()
+                ready = events.select(max(0, remaining))
+                if remaining <= 0 or not ready:
+                    self.fail("Verification never announced its registered hold wait")
+                for key, _ in ready:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        _ = events.unregister(key.fd)
+                        if not events.get_map():
+                            self.fail(f"Verification exited before waiting: {output + captured}")
+                        continue
+                    if key.fd == process.stderr.fileno():
+                        captured += chunk.decode("utf-8")
+                        self.wait_diagnostics[process.pid] = captured
+                    else:
+                        output += chunk.decode("utf-8")
+                        self.wait_output[process.pid] = output
+
     def finish(self, process: subprocess.Popen[str]) -> tuple[int, str]:
-        output, errors = process.communicate(timeout=8)
-        return process.returncode, output + errors
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
     def test_unheld_local_call_needs_no_release(self) -> None:
         result = self.fixture.verify("test", "sample", "--local", "local admission test", "--filter", "smoke")
@@ -229,7 +273,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         starts = self.count_python_starts()
         observation = self.observe_waits()
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
-        _ = self.wait_for_call()
+        _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])
         grant_call(self.cycle_file)
         code, output = self.finish(process)
@@ -256,8 +300,9 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
 
     def test_held_call_registers_before_compiling_then_runs_on_release(self) -> None:
         self.hold()
+        self.fixture.environment["BUILD_TARGETS_POLL_S"] = "3600"
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
-        entry = self.wait_for_call()
+        entry = self.wait_for_call(process)
         self.assertTrue(entry["session_id"].startswith("verify:"))
         self.assertEqual(self.fixture.local_runs(), [])
         grant_call(self.cycle_file)
@@ -267,7 +312,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.assertEqual(len(self.fixture.local_runs()), 1)
         self.assertTrue((Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "hana").exists())
 
-    def test_seat_registers_and_marks_the_marker_owner(self) -> None:
+    def test_worker_registers_and_marks_the_marker_owner(self) -> None:
         self.hold()
         active = self.fixture.root / "active"
         active.mkdir()
@@ -276,7 +321,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         _ = (active / "owner").write_text(str(run))
         self.fixture.environment.update({"PLAN_DELEGATE_BOARD_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale-session"})
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
-        entry = self.wait_for_call()
+        entry = self.wait_for_call(process)
         self.assertEqual(entry["session_id"], "owner")
         grant_call(self.cycle_file)
         code, output = self.finish(process)
@@ -311,7 +356,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
                 )
                 self.addCleanup(self.stop_process, process)
-                _ = self.wait_for_call()
+                _ = self.wait_for_call(process)
                 def add_peer(cycle: build_hold.HoldCycle) -> None:
                     cycle["entries"][0]["calls"].append({
                         "call_id": "peer", "pid": os.getpid(),
@@ -335,7 +380,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
                 environment = {**self.fixture.environment, "BUILDLOG_CALLER": caller, "BUILDLOG_CALL_ID": "remote-call" if caller == "verify-mac" else ""}
                 result = subprocess.run(
                     ["bash", "-c", 'set -euo pipefail; source "$1"; sweep_after_step() { :; }; run_once cargo check', "bash", str(invoke)],
-                    cwd=self.fixture.root, env=environment, capture_output=True, text=True, check=False, timeout=5,
+                    cwd=self.fixture.root, env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_S,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.cycle_file.read_bytes(), before)
@@ -383,9 +428,8 @@ if arguments[:1] == ["metadata"]:''',
         self.hold_after_first_step()
         observation = self.observe_waits()
         process = self.start("final")
-        _ = self.wait_for_call()
+        _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])
-        time.sleep(0.05)
         grant_call(self.cycle_file)
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
@@ -400,7 +444,7 @@ if arguments[:1] == ["metadata"]:''',
     def test_one_admission_covers_all_steps_in_the_same_holder_generation(self) -> None:
         self.hold()
         process = self.start("final")
-        _ = self.wait_for_call()
+        _ = self.wait_for_call(process)
         grant_call(self.cycle_file)
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
@@ -414,8 +458,7 @@ if arguments[:1] == ["metadata"]:''',
         self.hold()
         observation = self.observe_waits()
         process = self.start("test", "sample", "--local", "local admission test", "--filter", "smoke")
-        _ = self.wait_for_call()
-        time.sleep(0.05)
+        _ = self.wait_for_call(process)
         process.send_signal(signal.SIGTERM)
         code, output = self.finish(process)
         self.assertEqual(code, 143, output)
@@ -425,6 +468,97 @@ if arguments[:1] == ["metadata"]:''',
         self.assertGreater(float(observed["total"]), 0)
         self.assertAlmostEqual(float(observed["total"]), sum(float(value) for value in observed["waits"]), places=5)
         self.assertFalse(Path(observed["directory"]).exists())
+
+    def test_signal_at_waiting_announcement_records_wait_and_removes_the_call(self) -> None:
+        from scripts.build_targets import build_targets
+
+        self.hold()
+        wait_file = self.fixture.root / "announced-wait"
+        started = datetime.fromisoformat("2026-10-14T00:00:00+00:00")
+
+        def interrupt_on_announcement(*messages: object, **_options: object) -> None:
+            if "; waiting (tests that can run on the Mac" in " ".join(str(message) for message in messages):
+                handler = signal.getsignal(signal.SIGTERM)
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+
+        with mock.patch.dict(os.environ, {**self.fixture.environment,
+                                          "BUILDLOG_HOLD_WAIT_FILE": str(wait_file)}), \
+             mock.patch.object(build_targets, "wait_clock", side_effect=[started, started + timedelta(seconds=7)]), \
+             mock.patch("builtins.print", side_effect=interrupt_on_announcement), \
+             self.assertRaises(SystemExit) as interrupted:
+            _ = build_targets.command_wait_local("announcement-call")
+        self.assertEqual(interrupted.exception.code, 143)
+        self.assertEqual(wait_file.read_text(), "7.000000\n")
+        self.assertEqual([call for entry in read_cycle_file(self.cycle_file)["entries"]
+                          for call in entry.get("calls", [])], [])
+
+    def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
+        from scripts.build_targets import build_targets
+        from scripts.delegate.local_release_wait import LocalReleaseEvents
+
+        self.hold()
+        def grant_on_notification(_seconds: float) -> None:
+            grant_call(self.cycle_file)
+
+        with mock.patch.dict(os.environ, self.fixture.environment), \
+             mock.patch.object(time, "sleep", side_effect=AssertionError("local admission must wake on release")), \
+             mock.patch.object(LocalReleaseEvents, "wait", side_effect=grant_on_notification) as waiting:
+            self.assertEqual(build_targets.command_wait_local("notification-call"), 0)
+        waiting.assert_called_once_with(0.01)
+
+    def test_local_admission_without_inotify_polls_until_release(self) -> None:
+        from scripts.build_targets import build_targets
+
+        self.hold()
+        def release_on_poll(_seconds: float) -> None:
+            grant_call(self.cycle_file)
+
+        with mock.patch.dict(os.environ, self.fixture.environment):
+            with mock.patch.object(ctypes, "CDLL", return_value=object()), \
+                 mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
+                self.assertEqual(build_targets.command_wait_local("polling-call"), 0)
+            polling.assert_called_once_with(0.01)
+            key = build_hold.waiter_key("polling-call")
+            self.assertIsInstance(build_hold.read_admission(key, "polling-call"), build_hold.AdmittedTurn)
+            build_hold.remove_call(key, "polling-call")
+        self.assertEqual([call for entry in read_cycle_file(self.cycle_file)["entries"]
+                          for call in entry.get("calls", [])], [])
+
+    def test_local_release_waiter_keeps_linux_notifications(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        holders = self.fixture.root / "event-holders"
+        release = self.fixture.root / "event-release"
+        holders.mkdir()
+        release.mkdir()
+        with mock.patch.object(time, "sleep", side_effect=AssertionError("Linux must use notifications")), \
+             local_release_wait.local_release_waiter(holders, release) as waiter:
+            self.assertIsInstance(waiter, local_release_wait.LocalReleaseEvents)
+            waiter.arm()
+            _ = (holders / "owner").write_text("released")
+            waiter.wait(HANG_GUARD_S)
+
+    def test_local_release_waiter_polls_when_kernel_lacks_inotify(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        for unavailable in (errno.ENOSYS, errno.ENOTSUP):
+            with self.subTest(errno=unavailable), \
+                 mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(unavailable, "unavailable")), \
+                 mock.patch.object(time, "sleep") as polling:
+                with local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root) as waiter:
+                    self.assertIsInstance(waiter, local_release_wait.IntervalReleasePolling)
+                    waiter.arm()
+                    waiter.wait(15)
+                polling.assert_called_once_with(15)
+
+    def test_local_release_waiter_does_not_hide_resource_errors(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        with mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
+             self.assertRaises(OSError) as failed:
+            _ = local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root)
+        self.assertEqual(failed.exception.errno, errno.EMFILE)
 
 
     def test_nextest_selects_its_width_after_the_hold_release(self) -> None:
@@ -455,7 +589,7 @@ run_nextest --package sample
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         self.addCleanup(self.stop_process, process)
-        _ = self.wait_for_call()
+        _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])
         _ = clock.write_text("6000")
         grant_call(self.cycle_file)
@@ -471,8 +605,7 @@ run_nextest --package sample
         observation = self.observe_waits()
         self.fixture.environment.update({"BUILDLOG_OFF": "0", "BUILDLOG_SYNC": "1"})
         process = self.start("final")
-        _ = self.wait_for_call()
-        time.sleep(0.05)
+        _ = self.wait_for_call(process)
         grant_call(self.cycle_file)
         entry = read_cycle_file(self.cycle_file)["entries"][0]
         release = datetime.fromisoformat(entry.get("released_at", "")).timestamp()
@@ -491,8 +624,7 @@ run_nextest --package sample
         self.hold_after_first_step()
         observation = self.observe_waits()
         process = self.start("final")
-        _ = self.wait_for_call()
-        time.sleep(0.05)
+        _ = self.wait_for_call(process)
         process.send_signal(signal.SIGTERM)
         code, output = self.finish(process)
         self.assertEqual(code, 143, output)
@@ -560,7 +692,7 @@ run_once cargo check
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         self.addCleanup(self.stop_process, process)
-        _ = self.wait_for_call()
+        _ = self.wait_for_call(process)
         self.assertFalse(compiled.exists())
         _ = memory_clock.write_text("200")
         grant_call(self.cycle_file)
@@ -595,7 +727,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"],''',
             "TEST_CYCLE_FILE": str(self.cycle_file), "BUILDLOG_OFF": "0", "BUILDLOG_SYNC": "1",
         })
         process = self.start("test", "sample", "--local", "memory admission test", "--filter", "smoke")
-        _ = self.wait_for_call()
+        _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])
         grant_call(self.cycle_file)
         release = datetime.fromisoformat(read_cycle_file(self.cycle_file)["entries"][0].get("released_at", "")).timestamp()

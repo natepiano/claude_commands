@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -15,22 +16,29 @@ import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 SCRIPTS = Path(__file__).parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "delegate"))
 
 import codex_daemon
 import process_table
-import remove_seats
+import remove_workers
 import roster
+import unit_lookup
+import unit_runs
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
-import unit_lookup
+if TYPE_CHECKING:
+    from ..whoami import account, agent_accounts
+else:
+    account = roster.account
+    agent_accounts = roster.agent_accounts
 
 
 ENTRY_FIELDS = {
@@ -47,7 +55,6 @@ class RosterTests(unittest.TestCase):
     sessions: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     notifier: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     delegate: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    tmux_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     ps_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     production_doc: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     director_run: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -56,6 +63,8 @@ class RosterTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # Fixture processes run as this test's own pid: never read the real account it runs on.
+        _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.sessions = self.root / "sessions"
@@ -68,7 +77,6 @@ class RosterTests(unittest.TestCase):
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
-        self.tmux_state = self.root / "tmux.json"
         self.ps_state = self.root / "ps.txt"
         fake_ps = binaries / "ps"
         _ = fake_ps.write_text(
@@ -114,8 +122,6 @@ class RosterTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
-            "UNIT_LOOKUP_TMUX": str(Path(__file__).parents[1] / "production" / "fake_tmux.py"),
-            "FAKE_TMUX_STATE": str(self.tmux_state),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "ROSTER_DELEGATE_ROOT": str(self.delegate),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
@@ -134,16 +140,22 @@ class RosterTests(unittest.TestCase):
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),
         ))
         _ = self.enterContext(mock.patch.object(
-            remove_seats, "shutdown_held_sessions",
+            remove_workers, "shutdown_held_sessions",
             return_value={"kind": "held sessions", "session_ids": set()},
         ))
         _ = self.enterContext(mock.patch.object(
             process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
         ))
-        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")))
+        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", return_value=self._herdr_fixture(self._herdr_sessions())))
+        running_session = sessions.running_session
+        def fixture_running(record: sessions.SessionRecord) -> bool:
+            return record["pid"] == 991100 or running_session(record)
+        _ = self.enterContext(mock.patch.object(sessions, "running_session", side_effect=fixture_running))
         self.environment["HERDR_PROC"] = str(self.root / "herdr-proc")
         os.environ["HERDR_PROC"] = self.environment["HERDR_PROC"]
         self._build_complete_roster()
+        self._herdr_process(991099, 0, ["herdr", "--session", "native", "server"])
+        self._herdr_process(991100, 991099, ["claude"], HERDR_PANE_ID="w1:p1", SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
 
     def _write_session(
         self,
@@ -158,17 +170,17 @@ class RosterTests(unittest.TestCase):
         pid: int | None = None,
         with_socket: bool = True,
         proc_start: str = "",
+        entrypoint: str = "cli",
     ) -> None:
         socket_path = self.sessions / f"{file_name}.sock"
         if with_socket:
             listener = socket.socket(socket.AF_UNIX)
             listener.bind(str(socket_path))
             self.addCleanup(listener.close)
-        record_pid = os.getpid() if pid is None else pid
+        record_pid = (991100 if file_name == "director" else os.getpid()) if pid is None else pid
         if not with_socket and not proc_start:
             started = sessions.process_start(record_pid)
-            assert started is not None
-            proc_start = started
+            proc_start = started or "fixture"
         _ = (self.sessions / f"{file_name}.json").write_text(json.dumps({
             "pid": record_pid,
             "sessionId": session_id,
@@ -179,6 +191,7 @@ class RosterTests(unittest.TestCase):
             "tmux": tmux,
             "cwd": str(cwd),
             "status": status,
+            "entrypoint": entrypoint,
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
@@ -219,14 +232,6 @@ class RosterTests(unittest.TestCase):
             f"| unit-one | docs/plan.md | {director_cwd} | unit-one | — | — |",
         )), encoding="utf-8")
         self._write_showrunner_timer()
-        _ = self.tmux_state.write_text(json.dumps({
-            "$1": {
-                "label": "unit-renamed",
-                "panes": ["%1"],
-                "env": {"SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "unit-one"},
-            },
-        }), encoding="utf-8")
-
         self._write_session(str(os.getpid()), "runner", "sid-runner", runner_cwd, status="ready")
         self._write_session(
             "director", "director", "sid-director", director_cwd,
@@ -244,7 +249,7 @@ class RosterTests(unittest.TestCase):
         _ = (self.delegate / "active" / "sid-director").write_text(
             str(self.director_run) + "\n", encoding="utf-8",
         )
-        _ = (self.director_run / "seats").write_text(
+        _ = (self.director_run / "workers").write_text(
             "12345678\talpha-test\n", encoding="utf-8",
         )
         self._write_mesh(self.director_run, {
@@ -402,6 +407,7 @@ class RosterTests(unittest.TestCase):
             director=roster.NoDirector(),
             assignment=roster.NotAWorker(),
             session=roster.ClaudeSession("sid-runner"),
+            account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["director"], roster.RosterEntry(
             machine=machine, kind="claude", role="unit director", name="director",
@@ -413,6 +419,7 @@ class RosterTests(unittest.TestCase):
             director=roster.DirectsUnit("unit-one"),
             assignment=roster.NotAWorker(),
             session=roster.ClaudeSession("sid-director"),
+            account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["claude-worker"].role, "worker")
         self.assertEqual(entries["claude-worker"].director, roster.UnderDirector(
@@ -445,7 +452,7 @@ class RosterTests(unittest.TestCase):
                     "alpha", "runner", "session:sid-runner",
                 ))
                 expected_reach: roster.MessageReach = (
-                    roster.Messageable(f"seat:director-run/{name}")
+                    roster.Messageable(f"worker:director-run/{name}")
                     if name in ("alpha-impl", "alpha-wait")
                     else roster.CannotReceiveMessages(
                         "between turns; its unit director resumes it"
@@ -471,7 +478,7 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn("contract reviewer", entries)
         self.assertEqual(entries["orphan-impl"].director, roster.NoDirector())
         self.assertNotIn("alpha-ended", entries)
-        self.assertNotIn("dead-impl", entries)
+        self.assertIn("dead-impl", entries)
         self.assertNotIn("stale-impl", entries)
 
         self.assertEqual(entries["Codex window"].role, "freestanding")
@@ -569,6 +576,32 @@ class RosterTests(unittest.TestCase):
                 if arguments:
                     self.assertIn("(context)", runners[0])
 
+    def test_roster_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
+        current = self.director_run / "workers"
+        previous = self.director_run / "seats"
+        _ = current.replace(previous)
+        old_time = 1_700_000_000
+        os.utime(previous, (old_time, old_time))
+        worker = self._entries()["claude-worker"]
+        self.assertEqual(worker.assignment, roster.WorkerAssignment("test", str(self.director_run)))
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime, old_time)
+        modified = current.stat().st_mtime_ns
+        self.assertEqual(self._entries()["claude-worker"].assignment, worker.assignment)
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self._write_session("late-worker", "late-worker", "late-worker-id", self.home / "late-project")
+        self.assertEqual(self._entries()["late-worker"].role, "freestanding")
+        with previous.open("a", encoding="utf-8") as ledger:
+            _ = ledger.write("late-worker-id\talpha-impl\n")
+        self.assertIn("late-worker-id", current.read_text(encoding="utf-8"))
+        modified = current.stat().st_mtime_ns
+        late_worker = self._entries()["late-worker"]
+        self.assertEqual(late_worker.role, "worker")
+        self.assertEqual(late_worker.assignment, roster.WorkerAssignment("impl", str(self.director_run)))
+        self.assertEqual(late_worker.director, worker.director)
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+
     def test_background_id_prefix_places_claude_worker_in_its_run(self) -> None:
         worker = self._entries()["claude-worker"]
         self.assertTrue(WORKER_SESSION_ID.startswith("12345678"))
@@ -638,7 +671,7 @@ class RosterTests(unittest.TestCase):
             ("unit-one", "", ""),
         )
 
-    def test_seat_between_turns_cannot_receive_messages(self) -> None:
+    def test_worker_between_turns_cannot_receive_messages(self) -> None:
         entry = self._entries()["alpha-fix"]
 
         self.assertEqual(entry.status, "idle")
@@ -656,7 +689,7 @@ class RosterTests(unittest.TestCase):
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["alpha-fix"]["address"], "")
 
-    def test_seat_between_turns_without_running_director_says_so(self) -> None:
+    def test_worker_between_turns_without_running_director_says_so(self) -> None:
         entry = self._entries()["orphan-fix"]
 
         self.assertEqual(entry.status, "idle")
@@ -675,7 +708,7 @@ class RosterTests(unittest.TestCase):
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["orphan-fix"]["address"], "")
 
-    def test_same_seat_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
+    def test_same_worker_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
         second_run = self.delegate / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         self._write_mesh(second_run, {
             "alpha-impl": {
@@ -688,14 +721,14 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
 
-        duplicate_seats = [entry for entry in found.entries if entry.name == "alpha-impl"]
-        self.assertEqual(len(duplicate_seats), 2)
+        duplicate_workers = [entry for entry in found.entries if entry.name == "alpha-impl"]
+        self.assertEqual(len(duplicate_workers), 2)
         self.assertEqual(
-            {entry.reach for entry in duplicate_seats},
+            {entry.reach for entry in duplicate_workers},
             {
-                roster.Messageable("seat:director-run/alpha-impl"),
+                roster.Messageable("worker:director-run/alpha-impl"),
                 roster.Messageable(
-                    "seat:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"
+                    "worker:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"
                 ),
             },
         )
@@ -705,6 +738,32 @@ class RosterTests(unittest.TestCase):
             if isinstance(entry.reach, roster.Messageable)
         ]
         self.assertEqual(len(addresses), len(set(addresses)))
+
+    def test_a_run_under_the_former_folder_name_is_still_listed(self) -> None:
+        former = self.root / "former"
+        second_run = former / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_mesh(second_run, {
+            "alpha-impl": {
+                "thread_id": "thread-other-run", "turn_id": "turn-other-run",
+                "status": "running", "launcher_pid": os.getpid(), "role": "impl",
+            },
+        })
+        (second_run / "heartbeat.log").touch()
+        environment = {name: value for name, value in os.environ.items() if name != "ROSTER_DELEGATE_ROOT"}
+
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(unit_runs, "RUN_ROOT", self.delegate), \
+                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+
+        self.assertEqual(
+            {entry.reach for entry in found.entries if entry.name == "alpha-impl"},
+            {
+                roster.Messageable("worker:director-run/alpha-impl"),
+                roster.Messageable("worker:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"),
+            },
+        )
 
     def test_newer_dead_record_does_not_supply_live_session_details(self) -> None:
         dead_cwd = self.home / "projects" / "dead-resume"
@@ -716,6 +775,15 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((entry.cwd, entry.status), (
             str(self.home / "projects" / "free"), "ready",
         ))
+
+    def test_a_relay_named_like_a_session_is_left_out_of_the_roster(self) -> None:
+        # send.py's relay is a newer `claude -p` run started with `-n free-claude`.
+        self._write_session("relay", "free-claude", "sid-relay", self.home / "projects" / "relay",
+                            status="relaying", updated=9, entrypoint="sdk-cli")
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        named = [entry.session for entry in found.entries if entry.name == "free-claude"]
+        self.assertEqual(named, [roster.ClaudeSession("sid-free")])
 
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
         self._write_session(
@@ -847,6 +915,78 @@ class RosterTests(unittest.TestCase):
         )
         self.assertNotIn("contract reviewer", entries)
 
+    def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
+        phase = self.director_run / "phases" / "4"
+        phase.mkdir(parents=True)
+        for name in ("review_status_adversary", "review_pid_adversary"):
+            _ = (self.director_run / name).rename(phase / name)
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        reviewer = entries["adversary reviewer"]
+        self.assertEqual(
+            (reviewer.kind, reviewer.assignment),
+            ("codex", roster.WorkerAssignment("review (adversary)", str(self.director_run))),
+        )
+
+    def test_review_markers_without_a_process_add_no_rows_or_unattributed_sessions(self) -> None:
+        _ = self.account_note(2)
+        processes = self.ps_state.read_text()
+        _ = self.ps_state.write_text("")
+        statuses = [self.director_run / "review_status", self.director_run / "review_status_adversary"]
+        for status in statuses:
+            _ = status.write_text("reviewed\n")
+        before = self._entries()
+
+        for status in statuses:
+            _ = status.write_text("reviewing\n")
+        reviewing = self._entries()
+        self.assertEqual(set(reviewing), set(before))
+        self.assertEqual(
+            {name for name, entry in reviewing.items() if isinstance(entry.account, roster.AccountUnread)},
+            {name for name, entry in before.items() if isinstance(entry.account, roster.AccountUnread)},
+        )
+        self.assertNotIn("blind reviewer", reviewing)
+        self.assertNotIn("adversary reviewer", reviewing)
+        self.assertIn("alpha-research", reviewing)
+
+        _ = self.ps_state.write_text(processes)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
+            running = self._entries()
+        for name in ("blind reviewer", "adversary reviewer"):
+            with self.subTest(reviewer=name):
+                self.assertEqual(running[name].status, "running")
+                self.assertEqual(running[name].account, roster.AccountLabel("codex2"))
+
+    def test_live_run_workers_survive_server_exit_but_ended_workers_and_dead_runs_do_not(self) -> None:
+        for liveness in ("active marker", "fresh heartbeat", "dead run"):
+            with self.subTest(liveness=liveness):
+                run = self.delegate / liveness.replace(" ", "-")
+                records: dict[str, dict[str, object]] = {
+                    f"{run.name}-{status}": {
+                        "thread_id": f"{run.name}-{status}-thread",
+                        "status": status,
+                        "launcher_pid": 999_999_999,
+                    }
+                    for status in ("running", "done", "failed", "ended")
+                }
+                self._write_mesh(run, records)
+                if liveness == "active marker":
+                    _ = (self.delegate / "active" / "sid-director").write_text(str(run) + "\n")
+                else:
+                    heartbeat = run / "heartbeat.log"
+                    heartbeat.touch()
+                    if liveness == "dead run":
+                        old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
+                        os.utime(heartbeat, (old, old))
+                before = self._entries()
+                self._write_mesh(run, records, server_pid=999_999_999)
+                after = self._entries()
+                expected: set[str] = set(records) - {f"{run.name}-ended"} if liveness != "dead run" else set()
+                self.assertEqual(set(before) & set(records), expected)
+                self.assertEqual(set(after) & set(records), expected)
+                for name in expected:
+                    self.assertEqual(after[name], before[name])
+
     def test_kind_codex_keeps_only_needed_claude_context(self) -> None:
         result, lines, errors = self._run_main("--kind", "codex")
         self.assertEqual((result, errors), (0, []))
@@ -891,7 +1031,7 @@ class RosterTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             result_value.entries = []  # pyright: ignore[reportAttributeAccessIssue]
 
-    def test_seat_and_daemon_threads_are_domain_states_and_json_ids(self) -> None:
+    def test_worker_and_daemon_threads_are_domain_states_and_json_ids(self) -> None:
         entries = self._entries()
         self.assertEqual(entries["alpha-impl"].thread, roster.CodexThread("thread-shared"))
         self.assertEqual(entries["Codex window"].thread, roster.CodexThread("thread-window"))
@@ -907,7 +1047,7 @@ class RosterTests(unittest.TestCase):
         for name in ("runner", "claude-worker", "alpha-no-thread"):
             self.assertIsNone(by_name[name]["thread"])
 
-    def test_codex_seat_identity_marks_the_seat_and_not_its_inherited_director(self) -> None:
+    def test_codex_worker_identity_marks_the_worker_and_not_its_inherited_director(self) -> None:
         with mock.patch.dict(os.environ, {
             "CODEX_THREAD_ID": "thread-shared", "CLAUDE_CODE_SESSION_ID": "sid-director",
         }):
@@ -945,10 +1085,10 @@ class RosterTests(unittest.TestCase):
     def test_marked_unit_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
         (self.sessions / "director.json").unlink()
         worktree = self.home / "projects" / "unit-one"
-        for name, pane in (("other-pane", "helper:@2.%2"), ("outside-tmux", "")):
+        for name, pane in (("other-pane", "helper:@2.%2"), ("outside-herdr", "")):
             self._write_session(name, name, f"sid-{name}", worktree, tmux=pane)
         entries = self._entries()
-        for name in ("other-pane", "outside-tmux"):
+        for name in ("other-pane", "outside-herdr"):
             with self.subTest(session=name):
                 self.assertEqual(entries[name].role, "freestanding")
                 self.assertEqual(entries[name].director, roster.NoDirector())
@@ -956,7 +1096,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(self.ssh_calls(), [])
 
     def test_unit_without_marked_session_does_not_claim_a_worktree_session(self) -> None:
-        _ = self.tmux_state.write_text("{}", encoding="utf-8")
+        _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p1\0")
         worktree = self.home / "projects" / "unit-one"
         worktree.mkdir(parents=True)
         _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
@@ -969,6 +1109,23 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(helper.director, roster.NoDirector())
         self.assertTrue(roster.is_top_level(helper))
         self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
+        read = unit_lookup.every_marked_unit
+
+        def with_duplicate() -> unit_lookup.MarkedProductions:
+            found = read()
+            return unit_lookup.MarkedProductions(
+                found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
+
+        with mock.patch.object(unit_lookup, "every_marked_unit", side_effect=with_duplicate), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(found.problems, [
+            "unit hosts left out under alpha: unit-two: its mark is on herdr sessions copy and first"])
+        director = next(entry for entry in found.entries if entry.name == "director")
+        self.assertEqual(director.role, "unit director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
 
     def test_socketless_director_in_marked_pane_keeps_unit_without_worktree_match(self) -> None:
         self._write_session(
@@ -1004,6 +1161,8 @@ class RosterTests(unittest.TestCase):
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
+        if argv[:2] == ["herdr", "--session"] and argv[3:] == ["server"]:
+            herdr_listener(path.parent, pid, argv[2], os.environ)
 
     def _herdr_sessions(self) -> dict[str, CommandResponse]:
         return {"--session default session list --json": {"code": 0, "stdout": json.dumps({
@@ -1011,11 +1170,12 @@ class RosterTests(unittest.TestCase):
                           "session_dir": "/fixture", "socket_path": "/fixture/socket"}]
         })}, "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'}}
 
-    def test_a_herdr_director_without_tmux_is_placed_without_resolving_tmux(self) -> None:
+    def test_socketless_herdr_director_is_placed_by_pid(self) -> None:
         # A socketless live record is deliberately excluded from _claudes; the
         # roster must join it by place rather than worktree ownership.
         (self.sessions / "director.json").unlink()
         self._write_session("director", "director", "sid-director", self.home / "elsewhere", with_socket=False, pid=991001, proc_start="fixture")
+        _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p2\0")
         self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
         self._herdr_process(991001, 991000, ["claude"], HERDR_PANE_ID="w1:p1",
                             SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
@@ -1026,17 +1186,15 @@ class RosterTests(unittest.TestCase):
             return record["pid"] == 991001 or running_session(record)
 
         with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
-                mock.patch.object(sessions, "running_session", side_effect=running), \
-                mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}), \
-                mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
+                mock.patch.object(sessions, "running_session", side_effect=running):
             director = self._entries()["director"]
-        resolver.assert_not_called()
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
         self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "runner", "session:sid-runner"))
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
 
     def test_interactive_codex_panes_are_appended_without_messaging_addresses(self) -> None:
+        old, current = self.account_note(1), self.account_note(2)
         responses = self._herdr_sessions()
         responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
             {"pane_id": "w1:p1", "agent": "codex", "agent_status": "working"},
@@ -1046,15 +1204,25 @@ class RosterTests(unittest.TestCase):
         ]}})
         self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
         self._herdr_process(991001, 991000, ["codex"], HERDR_PANE_ID="w1:p1")
+        self._herdr_process(991002, 991000, ["zsh"], HERDR_PANE_ID="w1:p1")
+        self._herdr_process(991003, 991000, ["zsh"], HERDR_PANE_ID="w1:p3")
+        def process_home(pid: int) -> account.ProcessCodexHome:
+            return account.ProcessCodexHome(old if pid == 991001 else current)
         binary = self._herdr_fixture(responses)
-        with mock.patch.object(herdr, "herdr_binary", return_value=binary):
+        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
+             mock.patch.object(account, "process_codex_home", side_effect=process_home) as read_home:
             entries = self._entries()
         pane = entries["herdr native:w1:p1"]
         self.assertEqual((pane.kind, pane.role, pane.status, pane.cwd), ("codex", "freestanding", "working", str(self.home)))
         self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
         self.assertEqual((pane.showrunner, pane.director, pane.assignment),
                          (roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker()))
-        self.assertEqual(entries["herdr native:w1:p3"].cwd, "")
+        self.assertEqual(pane.account, roster.AccountLabel("codex1"))
+        self.assertIsInstance(entries["herdr native:w1:p3"].account, roster.AccountUnread)
+        self.assertIn(mock.call(991001), read_home.call_args_list)
+        self.assertNotIn(mock.call(991002), read_home.call_args_list)
+        self.assertNotIn(mock.call(991003), read_home.call_args_list)
+        self.assertEqual(entries["herdr native:w1:p3"].cwd, str(self.home))
         self.assertNotIn("herdr native:w1:p2", entries)
 
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
@@ -1065,9 +1233,10 @@ class RosterTests(unittest.TestCase):
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertTrue(any(entry.name == "director" for entry in found.entries))
-        self.assertEqual(len(found.problems), 1)
-        self.assertIn("herdr sessions", found.problems[0])
-        self.assertIn("fixture herdr unavailable", found.problems[0])
+        self.assertEqual(len(found.problems), 2)
+        self.assertTrue(any("unit hosts for alpha" in problem for problem in found.problems))
+        self.assertTrue(any("herdr sessions" in problem for problem in found.problems))
+        self.assertTrue(all("fixture herdr unavailable" in problem for problem in found.problems))
 
     def test_an_unreadable_herdr_session_keeps_codex_rows_from_other_sessions(self) -> None:
         responses = self._herdr_sessions()
@@ -1086,33 +1255,13 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(found.problems), 1)
         self.assertIn("herdr session broken", found.problems[0])
 
-    def test_unreadable_tmux_keeps_worktree_directors_and_reports_the_problem(self) -> None:
-        broken_tmux = self.root / "bin" / "broken-tmux"
-        _ = broken_tmux.write_text(
-            "#!/bin/sh\necho 'fixture cannot list panes' >&2\nexit 2\n", encoding="utf-8",
-        )
-        broken_tmux.chmod(0o755)
-        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(broken_tmux)}), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            found = roster.roster(os.environ, roster.ThisMachine())
-        director = next(entry for entry in found.entries if entry.name == "director")
-        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
-        self.assertEqual(director.showrunner, roster.UnderShowrunner(
-            "alpha", "runner", "session:sid-runner",
-        ))
-        self.assertEqual(found.problems, [
-            "unit hosts for alpha were not read: tmux could not list panes: fixture cannot list panes; herdr is not installed",
-        ])
-        self.assertEqual(self.ssh_calls(), [])
 
-    def test_tmux_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
-        missing_tmux = self.root / "bin" / "missing-tmux"
+    def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
         _ = worker_path.write_text(json.dumps(worker), encoding="utf-8")
-        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(missing_tmux)}), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
@@ -1152,7 +1301,7 @@ class RosterTests(unittest.TestCase):
 
     def test_recent_heartbeat_is_live_but_an_old_one_is_not(self) -> None:
         orphan = self.delegate / "orphan-run" / "heartbeat.log"
-        old = time.time() - remove_seats.LIVE_HEARTBEAT_SECS - 5
+        old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
         os.utime(orphan, (old, old))
         entries = self._entries()
         self.assertNotIn("orphan-impl", entries)
@@ -1166,6 +1315,133 @@ class RosterTests(unittest.TestCase):
     def peer_snapshot(self, result: roster.Roster, *, status: int = 0) -> None:
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(result).encode()
         os.environ["SSH_STATUS"] = str(status)
+
+    def account_note(self, number: int, *, tool: str = "codex") -> Path:
+        notes = self.root / "agents"
+        notes.mkdir(exist_ok=True)
+        os.environ["AGENT_NOTES_DIR"] = str(notes)
+        self.environment["AGENT_NOTES_DIR"] = str(notes)
+        login = f"{tool}{number}@example.invalid"
+        _ = (notes / f"{tool}{number}.md").write_text(f"---\nlogin: {login}\n---\n")
+        home = self.home / (f".codex{number}" if tool == "codex" and number != 2 else ".codex" if tool == "codex" else f".claude{number}")
+        home.mkdir(exist_ok=True)
+        if tool == "codex":
+            claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+            _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        else:
+            _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
+        return home
+
+    def test_roster_keeps_one_home_identity_per_pass_and_refreshes_after_cutover(self) -> None:
+        _ = self.account_note(2, tool="claude")
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": "claude2@example.invalid"}}))
+
+        def cutover_during_process_read(_pid: int) -> account.NoAccountSetting:
+            _ = home_json.write_text("{}")
+            return account.NoAccountSetting()
+
+        with (mock.patch.object(account, "process_config_dir", side_effect=cutover_during_process_read),
+              mock.patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads):
+            before = self._entries()
+            after = self._entries()
+        for name in ("runner", "free-claude"):
+            self.assertEqual(before[name].account, roster.AccountLabel("claude2"))
+            self.assertIsInstance(after[name].account, roster.AccountUnread)
+        self.assertEqual(home_reads.call_count, 2)
+
+    def test_claude_roster_account_comes_from_its_process_configuration(self) -> None:
+        directory = self.account_note(3, tool="claude")
+        with mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(directory)):
+            entry = self._entries()["runner"]
+        self.assertEqual(entry.account, roster.AccountLabel("claude3"))
+
+    def test_working_workers_keep_their_serving_server_account_across_a_swap(self) -> None:
+        old, current = self.account_note(1), self.account_note(2)
+        _ = self.enterContext(mock.patch.object(agent_accounts, "workers_home", return_value=current))
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(), "codex_home": str(current),
+        }))
+        _ = (self.director_run / "mesh_retired.json").write_text(json.dumps({"servers": [{
+            "port": 45677, "pid": os.getpid(), "codex_home": str(old),
+        }]}))
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "old-impl": {"thread_id": "old-thread", "status": "running", "port": 45677, "launcher_pid": os.getpid()},
+            "new-test": {"thread_id": "new-thread", "status": "running", "port": 45678, "launcher_pid": os.getpid()},
+            "between-turns": {"thread_id": "waiting-thread", "status": "done", "launcher_pid": os.getpid()},
+            "missing-server": {"thread_id": "lost-thread", "status": "running", "port": 49999, "launcher_pid": os.getpid()},
+        }))
+        entries = self._entries()
+        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
+        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["missing-server"].account, roster.AccountLabel("codex2"))
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
+        entries = self._entries()
+        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
+
+    def test_live_workers_keep_their_account_when_idle_stop_deletes_server_metadata(self) -> None:
+        home = self.account_note(2)
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(), "codex_home": str(home),
+        }))
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "idle-worker": {"thread_id": "idle-thread", "status": "done", "port": 45678},
+            "legacy-worker": {"thread_id": "legacy-thread", "status": "done"},
+        }))
+        with mock.patch.object(agent_accounts, "workers_home", return_value=home):
+            before = self._entries()
+            (self.director_run / "mesh_server.json").unlink()
+            after = self._entries()
+        for name in ("idle-worker", "legacy-worker"):
+            with self.subTest(worker=name):
+                self.assertEqual(before[name].account, roster.AccountLabel("codex2"))
+                self.assertEqual(after[name], before[name])
+
+    def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
+        home = self.account_note(1)
+        _ = self.account_note(2)
+        with mock.patch.object(codex_daemon, "daemon_socket", return_value=home / "app-server-control" / "daemon.sock"):
+            entry = self._entries()["Codex window"]
+        self.assertEqual(entry.account, roster.AccountLabel("codex1"))
+
+    def test_reviewers_require_a_readable_environment_before_using_the_default_home(self) -> None:
+        _ = self.account_note(1)
+        _ = self.account_note(2)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
+            entries = self._entries()
+        self.assertEqual(entries["adversary reviewer"].account, roster.AccountLabel("codex2"))
+        with mock.patch.object(process_table, "snapshot", return_value={}):
+            missing = self._entries()
+        self.assertNotIn("blind reviewer", missing)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessEnvironmentUnread("access denied")):
+            entries = self._entries()
+        self.assertIsInstance(entries["adversary reviewer"].account, roster.AccountUnread)
+        assert isinstance(entries["adversary reviewer"].account, roster.AccountUnread)
+        self.assertIn("access denied", entries["adversary reviewer"].account.reason)
+
+    def test_snapshot_without_account_decodes_as_peer_attribution_unavailable(self) -> None:
+        row = replace(self._entry("Mac director", "unit director", "session:mac-id"),
+                      machine="mac", account=roster.AccountLabel("claude3"))
+        encoded = roster.RosterSnapshot(roster.Roster([row], [])).encode()
+        self.assertEqual(roster.RosterSnapshot.decode(encoded).result.entries[0].account,
+                         roster.AccountLabel("claude3"))
+        old = cast(dict[str, object], json.loads(encoded))
+        entries = cast(list[dict[str, object]], old["entries"])
+        del entries[0]["account"]
+        decoded = roster.RosterSnapshot.decode(json.dumps(old)).result.entries[0]
+        self.assertEqual(decoded.name, "Mac director")
+        self.assertIsInstance(decoded.account, roster.AccountAttributionUnavailable)
+
+    def test_peer_snapshot_timeout_keeps_the_machine_and_failure_reason(self) -> None:
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 20)):
+            peer = roster.peer_snapshot(os.environ)
+        self.assertIsInstance(peer, roster.PeerNotReached)
+        assert isinstance(peer, roster.PeerNotReached)
+        self.assertTrue(peer.host)
+        self.assertIn("timed out", peer.reason)
 
     def test_here_reads_only_this_machine_without_ssh(self) -> None:
         result, lines, errors = self._run_main("--json")
@@ -1216,7 +1492,7 @@ class RosterTests(unittest.TestCase):
             replace(base, showrunner=roster.UnderShowrunner("show", "runner", "session:runner"),
                     director=roster.DirectsUnit("unit"), reach=roster.CannotReceiveMessages("no messaging socket")),
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
-                    thread=roster.CodexThread("seat-thread"), reach=roster.Messageable("seat:run/impl"),
+                    thread=roster.CodexThread("worker-thread"), reach=roster.Messageable("worker:run/impl"),
                     showrunner=roster.ProductionWithoutRunningShowrunner("gone"),
                     director=roster.UnderDirector("unit", "base", "session:base"),
                     assignment=roster.WorkerAssignment("impl", "/remote/run")),
@@ -1268,6 +1544,12 @@ class RosterTests(unittest.TestCase):
         self.assertIn("not reached", result.problems[0])
         self.assertEqual(len(self.ssh_calls()), 1)
 
+    def test_peer_legacy_label_decodes_to_the_numbered_account_note(self) -> None:
+        row = replace(self._entry("Mac director", "unit director", "session:mac-id"),
+                      machine="mac", account=roster.AccountLabel("claude 1"))
+        decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(roster.Roster([row], [])).encode())
+        self.assertEqual(decoded.result.entries[0].account, roster.AccountLabel("claude1"))
+
     def test_peer_snapshot_timeout_is_twenty_seconds_and_sender_ids_are_not_forwarded(self) -> None:
         calls: list[list[str]] = []
         def timeout(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -1287,13 +1569,11 @@ class RosterTests(unittest.TestCase):
         self.assertIn("not reached: timed out after 20 s", result.problems[0])
         self.assertEqual(len(calls), 1)
 
-    def test_mac_without_hosts_keeps_worktree_directors_without_resolving_tmux(self) -> None:
+    def test_mac_without_hosts_keeps_worktree_directors(self) -> None:
         with (mock.patch.object(sys, "platform", "darwin"),
-              mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}),
-              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]),
-              mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver):
+              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
             result = roster.roster(os.environ, roster.ThisMachine())
-        resolver.assert_not_called()
         director = next(row for row in result.entries if row.name == "director")
         self.assertEqual(director.role, "unit director")
         self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in result.problems))

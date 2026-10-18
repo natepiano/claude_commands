@@ -3,7 +3,7 @@ description: Nightly read-only review with one proposal per mode. The timer runs
 argument-hint: config | rust | messages | config rust messages
 ---
 
-Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the local date when the session started, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
+Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the date the night's job message names (`NIGHT=<date>`), or the local date today when the command is run by hand, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
 
 <Rules>
 - Read-only: write nothing outside DIR except `review.jsonl` dry sample records. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after.
@@ -43,5 +43,5 @@ For each mode, pick the single change with the largest measurable gain for its c
 
 LEDGER gets one line for the proposal and one for each Also found item, with these gains, and `/nightly_next` and `/showrunner:nightly` rank by them. Write each gain as a week's worth in the form shown, so a script can read it. Anything that is no candidate (what was denied tonight, a note on the target choice) goes below the items under a plain line of its own, which closes the list.
 
-Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/nightly_next` reads every night's reports. After the last mode, stay open: the user may attach to ask about it.
+Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/nightly_next` reads every night's reports. After the last mode, stay open: the user may run `herdr session attach nightly-review` to ask about it.
 </Proposal>

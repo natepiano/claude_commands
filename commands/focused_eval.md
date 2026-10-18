@@ -33,7 +33,7 @@ Example:
 Run the read-only `focused-eval` helper — it does **not** touch the fix scheduler's pending or history state:
 
 ```bash
-python3 ~/.claude/scripts/fix/style_history.py focused-eval \
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_rules.py focused-eval \
     --project-root "<project-root>" \
     --guideline <guideline-1> \
     [--guideline <guideline-2> ...]
@@ -115,7 +115,7 @@ After the per-guideline sections, add one short closing paragraph only if the fi
 
 ## Rules
 
-- **Read-only.** Never edit source. Never touch `style_history` beyond the one `focused-eval` call.
+- **Read-only.** Never edit source. Use `style_rules.py focused-eval` only for rule metadata.
 - **No invented rules.** Only flag what the guideline's text supports.
 - **No budget.** The fix scheduler is bypassed entirely; evaluate every requested guideline.
 - **No EVALUATION.md.** This is ad hoc — findings live in chat, not on disk.

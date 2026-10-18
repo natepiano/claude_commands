@@ -20,12 +20,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO, Literal, cast, override
 
 # Direct execution from any directory uses this checkout's modules.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.usage.activity import (
+    RequestActivity, RequestEvidence, activity_name, claude_atoms, codex_atoms, decode_activity, wait_action,
+)
 from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, role_at, state_dir
 from scripts.usage.rollouts import (
     KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
@@ -34,6 +37,17 @@ from scripts.usage.rollouts import (
 
 
 MAC_HOST = "natemccoy@mac"
+
+
+class LedgerDurability(Enum):
+    """Durable production commits or disposable ledgers that need no disk sync."""
+
+    DURABLE = "full"
+    DISPOSABLE = "off"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True)
@@ -61,7 +75,9 @@ LogFamily = Literal["claude", "codex", "history"]
 SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "baseline_readings", "account_roles"]
 LOG_FAMILIES: tuple[LogFamily, ...] = ("claude", "codex", "history")
 FILE_NAMED_CODEX_KEYS_VERSION = 8
-STORE_VERSION = FILE_NAMED_CODEX_KEYS_VERSION
+WORKER_ACCOUNT_ROLES_VERSION = 9
+REQUEST_ACTIVITY_VERSION = 10
+STORE_VERSION = REQUEST_ACTIVITY_VERSION
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -162,6 +178,7 @@ class Turn:
     effort: Effort
     tokens: RawTokens
     before_first_edit: bool
+    activity: RequestActivity
 
 
 @dataclass(frozen=True)
@@ -264,6 +281,7 @@ class CodexContext:
     effort: Effort = field(default_factory=EffortNotReported)
     edit_seen: bool = False
     lifecycle: ThreadRolloutBuilder = field(default_factory=ThreadRolloutBuilder)
+    evidence: RequestEvidence = field(default_factory=RequestEvidence)
 
     def consume(self, line: str, offset: int) -> tuple[ThreadMeasurement, ...]:
         record = decode_rollout(line)
@@ -282,6 +300,8 @@ class CodexContext:
             self.effort = reported_effort(payload.get("effort"))
         edited = is_edit(record)
         self.edit_seen = self.edit_seen or edited
+        # A request's items precede its token count, also in the replayed prefix.
+        self.evidence.add(codex_atoms(cast(dict[str, object], cast(object, record))))
         at = parse_timestamp(record.get("timestamp"))
         if not isinstance(self.agent, CodexThread):
             return ()
@@ -300,12 +320,14 @@ class CodexContext:
         usage = token_usage(record)
         if usage is None:
             return tuple(values)
+        activity = self.evidence.result()
+        self.evidence = RequestEvidence()
         # Validate the reported input total before its cached portion is removed.
         _ = token_count(usage.uncached_input + usage.cached_input)
         values.append(Turn(self.agent, codex_key(self.file_name, offset), at, self.model, self.effort,
                            RawTokens(token_count(usage.uncached_input), 0, 0,
                                      token_count(usage.cached_input), token_count(usage.output)),
-                           not self.edit_seen))
+                           not self.edit_seen, activity))
         return tuple(values)
 
 
@@ -353,7 +375,7 @@ def claude_edit(record: dict[str, object]) -> bool:
 
 
 def claude_measurement(record: dict[str, object], agent: ClaudeSession | ClaudeSubagent,
-                       edit_seen: bool) -> Measurement:
+                       edit_seen: bool, activity: RequestActivity) -> Measurement:
     at = parse_timestamp(record.get("timestamp"))
     if at is None:
         return NoMeasurement()
@@ -375,7 +397,7 @@ def claude_measurement(record: dict[str, object], agent: ClaudeSession | ClaudeS
                 reported_effort(record.get("effort")),
                 RawTokens(token_count(usage.get("input_tokens")), five_minute, one_hour,
                           token_count(usage.get("cache_read_input_tokens")),
-                          token_count(usage.get("output_tokens"))), not edit_seen)
+                          token_count(usage.get("output_tokens"))), not edit_seen, activity)
 
 
 def claude_turn_key(record: dict[str, object]) -> str:
@@ -394,6 +416,7 @@ CREATE TABLE IF NOT EXISTS turns (
     cache_write_1h INTEGER NOT NULL, cache_read INTEGER NOT NULL, output INTEGER NOT NULL,
     before_first_edit INTEGER NOT NULL, role TEXT, lens TEXT,
     attribution TEXT NOT NULL, lens_state TEXT NOT NULL,
+    activity TEXT NOT NULL DEFAULT 'unclassified', wait_action TEXT,
     PRIMARY KEY (machine, family, parent_id, agent_id, turn_key)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS claude_message ON turns (machine, turn_key)
@@ -489,10 +512,27 @@ def check_store_key_version(db: sqlite3.Connection) -> int:
     return version
 
 
+# Columns added after the first stored version, in table order.
+ADDED_TURN_COLUMNS = (("activity", "TEXT NOT NULL DEFAULT 'unclassified'"), ("wait_action", "TEXT"))
+
+
 def migrate_store(db: sqlite3.Connection) -> None:
     version = check_store_key_version(db)
     if version < STORE_VERSION:
         with db:
+            if version < REQUEST_ACTIVITY_VERSION:
+                present = {cast(str, row[1]) for row in cast(Iterable[sqlite3.Row],
+                                                             db.execute("PRAGMA table_info(turns)"))}
+                for name, definition in ADDED_TURN_COLUMNS:
+                    if name not in present:
+                        _ = db.execute(f"ALTER TABLE turns ADD COLUMN {name} {definition}")
+            if version < WORKER_ACCOUNT_ROLES_VERSION:
+                _ = db.execute("""
+                    INSERT OR IGNORE INTO account_role_changes (machine, at, role, label)
+                    SELECT machine, at, 'workers', label FROM account_role_changes WHERE role = 'seats'
+                """)
+                _ = db.execute("DELETE FROM account_role_changes WHERE role = 'seats'")
+            # Every source is read again; a re-read row takes its request activity.
             _ = db.execute("DELETE FROM cursors")
             _ = db.execute(f"PRAGMA user_version = {STORE_VERSION}")
 
@@ -596,23 +636,31 @@ def save_measurement(db: sqlite3.Connection, value: Measurement, resolver: RoleR
                        (machine, family, parent_id, agent_id, value.at.isoformat()))
         return 0
     tokens = value.tokens
-    result = db.execute("INSERT OR IGNORE INTO turns VALUES (" + ",".join("?" for _ in range(19)) + ")",
+    activity, action = activity_name(value.activity), wait_action(value.activity)
+    result = db.execute("INSERT OR IGNORE INTO turns VALUES (" + ",".join("?" for _ in range(21)) + ")",
                         (machine, family, kind, parent_id, agent_id, value.key, value.at.isoformat(),
                          value.model.value if isinstance(value.model, ReportedModel) else "unreported",
                          value.effort.value if isinstance(value.effort, ReportedEffort) else None,
                          tokens.input, tokens.cache_write_5m, tokens.cache_write_1h,
                          tokens.cache_read, tokens.output, int(value.before_first_edit),
-                         *attribution_columns(resolver.resolve(value.agent, value.at))))
+                         *attribution_columns(resolver.resolve(value.agent, value.at)), activity, action))
     if result.rowcount == 0 and family == "claude":
+        # A later line of the message has seen at least the earlier lines' blocks.
         _ = db.execute("UPDATE turns SET input = MAX(input, ?), " +
                        "cache_write_5m = MAX(cache_write_5m, ?), " +
                        "cache_write_1h = MAX(cache_write_1h, ?), " +
                        "cache_read = MAX(cache_read, ?), output = MAX(output, ?), " +
-                       "before_first_edit = MIN(before_first_edit, ?) " +
+                       "before_first_edit = MIN(before_first_edit, ?), activity = ?, wait_action = ? " +
                        "WHERE machine = ? AND family = 'claude' AND turn_key = ?",
                        (tokens.input, tokens.cache_write_5m, tokens.cache_write_1h,
                         tokens.cache_read, tokens.output, int(value.before_first_edit),
-                        machine, value.key))
+                        activity, action, machine, value.key))
+    elif result.rowcount == 0:
+        # A re-read request sets its activity without counting as added.
+        _ = db.execute("UPDATE turns SET activity = ?, wait_action = ? " +
+                       "WHERE machine = ? AND family = ? AND parent_id = ? AND agent_id = ? AND turn_key = ? " +
+                       "AND (activity IS NOT ? OR wait_action IS NOT ?)",
+                       (activity, action, machine, family, parent_id, agent_id, value.key, activity, action))
     return result.rowcount
 
 
@@ -663,6 +711,9 @@ def read_file(machine: str, path: Path, family: Family,
     context = CodexContext(machine, path.name)
     agent = claude_identity(machine, path)
     edit_seen = False
+    # One Claude message spans a line per content block; user lines between them keep it open.
+    message_key = ""
+    evidence = RequestEvidence()
     opening_seen = False
     folder_seen = False
     completed = 0
@@ -680,6 +731,12 @@ def read_file(machine: str, path: Path, family: Family,
                         folder_seen = True
                     edited = claude_edit(record)
                     edit_seen = edit_seen or edited
+                    message_id = object_fields(record.get("message")).get("id")
+                    if record.get("type") == "assistant" and isinstance(message_id, str) and message_id:
+                        key = claude_turn_key(record)
+                        if key != message_key:
+                            message_key, evidence = key, RequestEvidence()
+                        evidence.add(claude_atoms(record))
                     at = parse_timestamp(record.get("timestamp"))
                     if at is not None:
                         if not opening_seen:
@@ -687,7 +744,7 @@ def read_file(machine: str, path: Path, family: Family,
                             opening_seen = True
                         if edited:
                             values.append(Edit(agent, claude_turn_key(record), at))
-                    value = (claude_measurement(record, agent, edit_seen)
+                    value = (claude_measurement(record, agent, edit_seen, evidence.result())
                              if offset >= previous else NoMeasurement())
                     if not isinstance(value, NoMeasurement):
                         values.append(value)
@@ -1045,7 +1102,8 @@ def measurement_record(value: ThreadMeasurement) -> dict[str, object]:
                       effort=value.effort.value if isinstance(value.effort, ReportedEffort) else None,
                       tokens={"input": tokens.input, "cache_write_5m": tokens.cache_write_5m,
                               "cache_write_1h": tokens.cache_write_1h, "cache_read": tokens.cache_read,
-                              "output": tokens.output}, before_first_edit=value.before_first_edit)
+                              "output": tokens.output}, before_first_edit=value.before_first_edit,
+                      activity=activity_name(value.activity), wait_action=wait_action(value.activity))
     return record
 
 
@@ -1221,10 +1279,16 @@ def remote_measurement(record: dict[str, object], machine: str, family: Family) 
     before = record.get("before_first_edit")
     if not isinstance(before, bool):
         raise RemoteReadFailed("remote first edit flag missing or invalid")
+    if "activity" not in record or "wait_action" not in record:
+        raise RemoteReadFailed("remote activity missing")
+    try:
+        activity = decode_activity(record["activity"], record["wait_action"])
+    except ValueError as error:
+        raise RemoteReadFailed(f"invalid remote activity: {error}") from error
     return Turn(agent, remote_string(record, "key"), at, model, effort,
                 RawTokens(remote_integer(tokens, "input"), remote_integer(tokens, "cache_write_5m"),
                           remote_integer(tokens, "cache_write_1h"), remote_integer(tokens, "cache_read"),
-                          remote_integer(tokens, "output")), before)
+                          remote_integer(tokens, "output")), before, activity)
 
 
 def remote_records(lines: Iterable[str]) -> Iterator[dict[str, object]]:
@@ -1390,7 +1454,9 @@ def consume_remote(db: sqlite3.Connection, lines: Iterable[str], machine: str, s
 
 def reader_payload(offsets: dict[str, int]) -> str:
     root = Path(__file__).resolve().parents[2]
+    # The bootstrap runs each module in this order, so collect comes after its imports.
     modules = {name: (root / relative).read_text(encoding="utf-8") for name, relative in (
+        ("scripts.usage.activity", "scripts/usage/activity.py"),
         ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.collect", "scripts/usage/collect.py"),
@@ -1473,6 +1539,7 @@ class CommandLine(argparse.Namespace):
     account_roles: Path
     claude_repo: Path
     production_docs: Path
+    durability: LedgerDurability
 
     def __init__(self, readings: Path, baseline_readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
         super().__init__()
@@ -1487,10 +1554,40 @@ class CommandLine(argparse.Namespace):
         self.account_roles = account_roles
         self.claude_repo = claude_repo
         self.production_docs = production_docs
+        self.durability = LedgerDurability.DURABLE
+
+
+WASTE_WATCH_TIMEOUT_SECONDS = 300
+
+
+def watch_waste(args: CommandLine) -> None:
+    """Run waste_watch.py as its own process after a good pass; its failure never fails the pass.
+
+    `USAGE_WASTE_WATCH_SCRIPT` names another script, for tests. A failure prints one
+    `waste_watch: <reason>` stderr line in place of the watch's own stderr.
+    """
+    script = os.environ.get("USAGE_WASTE_WATCH_SCRIPT") or str(Path(__file__).with_name("waste_watch.py"))
+    command = [sys.executable, script, "--db", str(args.db), "--production-docs", str(args.production_docs)]
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=WASTE_WATCH_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        reason = f"timed out after {WASTE_WATCH_TIMEOUT_SECONDS} s"
+    except OSError as error:
+        reason = " ".join(str(error).split()) or type(error).__name__
+    else:
+        _ = sys.stdout.write(result.stdout)
+        if result.returncode == 0:
+            _ = sys.stderr.write(result.stderr)
+            return
+        detail = " ".join(line.strip().removeprefix("waste_watch: ")
+                          for line in result.stderr.splitlines() if line.strip())
+        reason = f"exit {result.returncode}" + (f": {detail}" if detail else "")
+    print(f"waste_watch: {reason}", file=sys.stderr)
 
 
 def main(argv: Sequence[str] = ()) -> int:
-    # The Mac has only the three shipped modules; local sources never run there.
+    # The Mac has only the four shipped modules; local sources never run there.
     from scripts.usage import outcomes
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1505,6 +1602,8 @@ def main(argv: Sequence[str] = ()) -> int:
     _ = parser.add_argument("--account-roles", type=Path)
     _ = parser.add_argument("--claude-repo", type=Path)
     _ = parser.add_argument("--production-docs", type=Path)
+    _ = parser.add_argument("--durability", type=LedgerDurability, choices=list(LedgerDurability),
+                            help="full (default) syncs commits; off is for disposable ledgers")
     defaults = outcomes.default_paths()
     args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.baseline_readings, defaults.account_roles,
                                                        defaults.claude_repo, defaults.production_docs))
@@ -1518,7 +1617,10 @@ def main(argv: Sequence[str] = ()) -> int:
             print("usage collect: another pass is running")
             return 0
         try:
-            return collect_pass(args)
+            status = collect_pass(args)
+            if status == 0:
+                watch_waste(args)
+            return status
         finally:
             lock.close()
     except StorePredatesFileNamedCodexKeys as error:
@@ -1536,6 +1638,7 @@ def collect_pass(args: CommandLine) -> int:
     try:
         db.row_factory = sqlite3.Row
         _ = check_store_key_version(db)
+        _ = db.execute(f"PRAGMA synchronous={args.durability.value.upper()}")
         _ = db.execute("PRAGMA journal_mode=WAL")
         _ = db.executescript(SCHEMA)
         migrate_store(db)

@@ -1,202 +1,303 @@
 # herdr adoption
 
-How the production scripts start and drive Claude sessions under herdr. This
-doc grows as the adoption work lands; today it holds the Claude trust check
-every launcher runs before it starts a session, and the one path that reads and
-types into a session on either host, tmux or herdr.
+## What it is
 
-## Claude trust before every launch
+Every showrunner, unit director and standalone Claude session runs in its own named herdr session, on natedev and on the Mac. The user opens any of them with `herdr session attach <name>` (`hsa <name>`), or one on the other machine with `herdr_sessions.py attach-remote <host> <name>`. Codex workers stay headless as `codex app-server` threads. The one exception is crash recovery, which reopens an interactive Codex conversation in its own herdr session. tmux no longer hosts anything. Its only remaining traces are old shutdown records and snapshots, which parse into manual-restart states. Everything here sits in `scripts/herdr/`, with callers in `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. The trial evidence behind the design is in [herdr-trial.md](herdr-trial.md).
 
-### What it is
+## How it works
 
-A Claude session started in a folder the account has not trusted stops at the
-trust prompt, and a launcher that sends it a prompt or a slash command then
-waits on a session that never answers. Every launcher in `scripts/production/`
-and `scripts/nightly_review/` checks trust first and refuses with the one
-command the user runs to trust the folder, before it writes or launches
-anything.
+### Key files
 
-### How it works
+| File | Role |
+| --- | --- |
+| `scripts/herdr/herdr.py` | The library: `Herdr` client, session names, server start and stop per platform, panes and agents, process placement, attached clients, server environment, Claude trust. |
+| `scripts/herdr/herdr_sessions.py` | CLI: `list`, `attach`, `start`, `resume`, `list --on`, `attach-remote`. |
+| `scripts/herdr/trust_survey.py` | Read-only survey of trust keys in every account file. |
+| `scripts/herdr/fake_herdr.py` | Test double for the herdr CLI. |
+| `scripts/production/unit_lookup.py` | Units found by marks on herdr panes. |
+| `scripts/production/session_pane.py` | Read, type, send keys and locate a unit or session pane. |
+| `scripts/production/add_unit.py` | Starts and restores unit directors in herdr. |
+| `scripts/production/add_showrunner.py`, `promote_showrunner.py` | Start a lower showrunner in herdr; turn a unit into one. |
+| `scripts/production/fake_unit_host.py` | Production fixtures over the fake herdr CLI and a fake `/proc`. |
+| `scripts/message/roster.py` | Joins marked units and interactive Codex panes into the roster. |
+| `scripts/shutdown/session_types.py` | Host wire types, including the legacy tmux forms. |
+| `scripts/shutdown/inventory.py`, `stop.py`, `settle.py`, `restart.py` | Host detection, unit session stop, screen reads, herdr restarts. |
+| `scripts/lib/detached.py` | Detached starts on the Mac (herdr server, shutdown conductor, Remote Control fixer). |
 
-- `scripts/herdr/herdr.py` holds the one check:
-  `claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile`.
-  A folder is trusted when `projects[k].hasTrustDialogAccepted is True` in the
-  account's `.claude.json` for any key `k` in: the folder itself, its
-  `git rev-parse --show-toplevel`, and its main checkout
-  (`repository_trust_key`, the parent of `--git-common-dir`).
-  `repository_root` and `repository_trust_key` share `_repository_key`.
+Outside this repo, `/etc/nixos/modules/common/shell.nix` defines `herdr-claude` (runs `herdr_sessions.py start "$@"`) and the `hsa` alias. It also guards the `claude` alias with `HERDR_AGENT_PANE`. `/etc/nixos/modules/linux/memory.nix` puts `herdr` in earlyoom's `--avoid` list.
+
+### The herdr library
+
+**Binary and client.** `herdr_binary()` is `HERDR_BIN`, else `shutil.which("herdr")`, else `HerdrMissing`. `Herdr(session)` targets one session with `argv(*args) = [binary, "--session", session, *args]`. `run` returns stdout. `result` decodes the JSON `result` object. A non-zero exit raises `HerdrFailure(message, code)` carrying herdr's `error.code` and `error.message`, and a subprocess timeout (10 s default in `run_program`) becomes `HerdrFailure` too. Subclasses: `HerdrMissing`, `SessionTaken(name)`, `AgentBlocked` (herdr's `agent_blocked`, never retried), `AgentNotReady(screen)`, `AgentExited(session, pane)`, `MacDesktopUnavailable`, `MacDesktopTerminalRequired`. `Herdr` methods: `panes`, `lookup(label) -> PaneFound | NoPane | SeveralPanes`, `pane_id`, `pane_activity(pane) -> PaneAtShell | PaneRunning(commands)`, `open_pane`, `focus_workspace`, `close_startup_workspaces`, `start_agent`, `readiness`, `prompt`, `wait_until(pane, state, timeout_ms) -> ObservedAgentState | WaitTimedOut` (a `blocked` state raises `AgentBlocked`), `read(pane, lines, *, joined, ansi)` (`pane read --source recent|recent-unwrapped`), `send_keys`, `close_pane`, `agents`. Every herdr JSON schema has a `TypedDict`. Every timeout a caller passes is integer milliseconds. The library reads no account variables, so callers pass the pane environment.
+
+**Session names.** A name matches `[A-Za-z0-9_.-]{1,64}` and is never `.` or `..`. `_validate_session_name` raises `ValueError` before any server starts or stops. `server_unit(name)` is `herdr-<name>.service`. `generated_session_name(text, suffix="")` maps other characters to `-` and fits `-<suffix>` inside 64 bytes. A session's socket is `$XDG_CONFIG_HOME/herdr/herdr.sock` for `default`, else `.../herdr/sessions/<name>/herdr.sock`. `live_sessions() -> list[SessionEntry]` returns only running sessions from `herdr session list --json`.
+
+**Server start, exclusive or adopting.** A server is answering when `herdr --session <n> status server` exits 0 and prints `status: running`.
+
+- `start_new_server(name, timeout_ms, *, session_kind=...) -> None` is exclusive. It raises `SessionTaken` when a server already answers. It also raises it when systemd says the unit already exists or is loaded, and when a server answers but our unit is not active (another launch won).
+- `start_server(name, timeout_ms, *, session_kind=...) -> ServerCreated | ServerAdopted` adopts a server that already answers.
+- On Linux both submit `systemd-run --user --unit=herdr-<n>.service --collect herdr --session <n> server` (`SYSTEMD_RUN`), poll every 0.1 s, and judge ownership by `systemctl --user is-active` (`SYSTEMCTL`).
+- On Darwin both go through `_start_darwin_server`. It starts `herdr --session <n> server` with `detached.start_detached`. The readiness check is that the server answers and the only holder of the session socket (from `lsof`) is our own child, within `min(10 s, timeout)`. A different holder means our child gets SIGTERM, and the start raises `SessionTaken` (exclusive) or returns `ServerAdopted`. Outside the desktop it raises `MacDesktopTerminalRequired` before starting anything.
+- Every server this code spawns has its restored workspaces closed at once (`_clear_restored_workspaces`). herdr reopens the panes saved in `session.json` when a server starts, and a new server holds no live work.
+- A start that fails names `herdr-server.log` beside the socket when it exists.
+
+**Restore and the Mac desktop rule.** `security_session() -> DesktopSession | NonDesktopSession | SessionKindUnreadable | NotMacSession` runs `launchctl managername` (`LAUNCHCTL`) once per command. `Aqua` is the desktop, an unreadable answer counts as non-desktop, and off the Mac it is `NotMacSession`. Callers carry the value through, and `SessionKindNotRead` is the default that makes the library read it. `restore_server(name, timeout_ms, *, session_kind, exclusive) -> ServerCreated | ServerAdopted | WindowServerCreated` starts directly off the Mac or on the desktop. A Mac outside the desktop takes these steps instead:
+
+1. Within `min(15 s, timeout)`, an answering server is taken or adopted, and a listener that has not answered yet counts as taken.
+2. A timeout or failure while checking raises `HerdrFailure("herdr session <n>: could not check existing listener: ...")`.
+3. It opens `open -na "/Applications/Nix Apps/Ghostty.app" --args -e <herdr> session attach <n>` (`SHUTDOWN_OPEN`) and waits for that window's client to start the server. Success clears the restored workspaces and returns `WindowServerCreated`. Failure raises `MacDesktopUnavailable`, whose text is `MAC_DESKTOP_REQUIRED`: `the Mac desktop is locked or signed out: unlock it and restart`.
+
+Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refuse with `MAC_DESKTOP_TERMINAL_REQUIRED`: `herdr must start from the Mac desktop: run this from a Mac terminal`.
+
+**Stop.** `stop_session(name)` runs `herdr --session <n> server stop`. On Linux, if the unit is still active, it then runs `systemctl --user stop herdr-<n>.service`. `stop_created_server(name, ownership)` stops only a `ServerCreated` server, never `ServerAdopted` or `WindowServerCreated`.
+
+**Panes and agents.**
+
+- `open_pane(name, label, cwd, environment) -> pane_id` runs `workspace create --label --cwd --env K=V ... --no-focus`, then renames the root pane to the label. Every pane also gets `HERDR_AGENT_PANE=1`. herdr 0.9.0 sets these variables in each pane: `HERDR_PANE_ID`, `HERDR_SESSION`, `HERDR_SOCKET_PATH`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_BIN_PATH`, `HERDR_ENV=1`.
+- `start_agent(name, pane, kind, agent_arguments, opening: OpeningPrompt | NoOpeningPrompt, timeout_ms)` exists as a module function, which uses the pane label as the agent name, and as a `Herdr` method. It runs `agent start <agent name> --kind <kind> --pane <pane> --timeout <ms> -- <agent_arguments>`. herdr adds the binary itself, so an `agent_arguments` whose first element equals `kind` raises `ValueError` before any herdr call. Agent names are lowercased, other characters become `-`, `a-` is added in front when the name does not start with a letter, and the result is cut to 32 characters.
+- `agent_pane_busy` is retried every 0.1 s against one shared deadline. A retry never passes a per-try timeout at or below `_AGENT_START_TIMEOUT_MINIMUM_MS` (3000).
+- While the CLI waits, the library finds the pane shell (`pane process-info`) and walks its process tree on Linux (per-thread `children`). It follows the agent by pid plus start ticks across exec and reparenting. An agent that was seen and is gone, or herdr's `agent_start_failed` with `process exited`, raises `AgentExited`. When `/proc` cannot be read it falls back to herdr observations at most twice a second.
+- `agent_not_ready` reads the visible screen and raises `AgentNotReady(screen)`. No key is sent.
+- After a ready start, `OpeningPrompt(text)` is sent once with `agent prompt`. `NoOpeningPrompt` sends nothing.
+
+**Placement.** `HerdrPlace(session, pane)` is where a process lives. `NotInHerdr` means the process has no place.
+
+- Linux: `_live_server_processes` reads listening sockets (`00010000`) at herdr socket paths in `/proc/net/unix` (`HERDR_PROC`). It maps each one to its single holder through `/proc/<pid>/fd`. The socket names the session, never the argv. `_process_sessions` then gives each server's descendants that session. It also catches handoff survivors: members of the server's own `herdr-<n>.service` cgroup, and, in a shared scope, the pane shell pids the server reports (`pane list` plus `pane process-info`) with their descendants.
+- `herdr_place_of(pid) -> HerdrPlace | NotInHerdr` reads that pid's environment for `HERDR_PANE_ID` and needs no cwd. `herdr_processes() -> list[HerdrProcess(pid, place, marks, command, working_directory)]` lists this user's pane processes. `marks` holds only `SHOWRUNNER_UNIT` and `SHOWRUNNER_UNIT_ID`. A Linux process whose cwd no longer resolves, or that vanishes mid-read, is skipped.
+- A process with a non-empty `TMUX_PANE` (a tmux the user runs by hand) is never a herdr place, even when it inherited herdr variables. An empty `TMUX_PANE` excludes nothing.
+- Darwin: processes come from `ps -U <uid>` (`HERDR_PS`), and each row's uid is checked again. Arguments come from a separate `command=` column split after the `comm=` executable; unreadable arguments are `UnreadableProcessArguments`. Listeners come from `lsof -n -P -a -U -u <uid> -F pfn` (`HERDR_LSOF`). `darwin_process_environment(pid)` reads `ps -o command=`, then `ps eww`, then the command again, and parses only the text after a stable argv prefix. cwd comes from `lsof -d cwd`; an unreadable one is `UnreadableCwd` and keeps placement and marks. A failed `ps` with empty output whose pid `os.kill(pid, 0)` confirms gone raises the private `_DarwinProcessGone`, and that process is skipped. `darwin_process_identity(pid)` (`lstart`, `tty`) and `darwin_open_files(pid)` serve the shutdown snapshot.
+- `_PLATFORM = sys.platform` is read once at import.
+
+**Clients and server environment.** `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)` counts this user's `herdr session attach <name>` clients and bare `herdr` TUI clients for that session. The session comes from argv `--session` first, then the client's `HERDR_SESSION`, else `default`. A client that exits mid-read counts as gone. `server_environment(name)` returns the environment of the single process holding the session's listening socket. Callers refuse when it holds a variable that must be unset, since panes inherit the server's environment.
+
+**Workspaces and focus.** `Herdr.focus_workspace(id)` runs `workspace focus`. `Herdr.close_startup_workspaces(restored_workspace)` closes every other workspace that is still herdr's untouched startup shell, and lists workspaces and panes again before each close. Untouched means a workspace labelled `~` with one tab, one pane and `agent_status` `unknown`, whose pane has no agent, `agent_status` `unknown`, cwd and foreground cwd equal to home, `revision` 0, and `scroll.max_offset_from_bottom` 0. `_StartupShellEvidence` is `UNTOUCHED` or `PRESERVE`. Missing or mistyped evidence keeps the workspace.
+
+### Session commands
+
+`scripts/herdr/herdr_sessions.py`:
+
+- `list` prints `<name>\t<role>\t<claude name>` per running session. Role is `unit <slug>/<unit>` from pane marks, `showrunner` when the Claude name is a registered showrunner session, else `standalone`. The Claude name is the newest live session record that `herdr_place_of` places there. Exit 0 done, 1 not found, 2 usage, 3 herdr unreadable.
+- `attach <name>` execs `herdr session attach <name>`. A name that is not running exits 1 and lists the running ones.
+- `list --on <host>` runs `ssh <host> ~/.claude/scripts/lib/py ~/.claude/scripts/herdr/herdr_sessions.py list` within `REMOTE_LIST_TIMEOUT` (15 s). A timeout, `OSError` or non-zero ssh exit prints one stderr line naming the host and returns 1. `attach-remote <host> <name>` execs `herdr --remote <host> --session <name>`. `RemoteHost(target)` refuses an empty, `-`-leading or whitespace-bearing target with `ValueError`, exit 2. Nothing is saved or synced between machines.
+- `start [--name N] [--cwd D] [-- <claude args>]` and `resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]` run these steps:
+  1. Refuse outside the Mac desktop.
+  2. Resolve the folder and validate the name.
+  3. Pick the account with `accounts.account_for_unscoped_launch`. A `LegacyHomeLaunch` uses `~/.claude.json` and unsets the named-account variables. Otherwise the pane gets `named_account_environment(dir)`.
+  4. Check trust.
+  5. Take `launch_permission.launch_barrier()` and `launch_permission(...)` with `NewWorkLaunchPurpose`, or `RecordedSessionRestoreLaunchPurpose(session_id)` under `--restore`.
+  6. Run `start_new_server(name, 90_000)`. Without `--name`, the name is `generated_session_name(<folder>, "1")`, and the suffix rises on each `SessionTaken`.
+  7. Open the pane and refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` (or the named-account variables for a legacy home).
+  8. Run `start_agent` with `[--resume ID] -n <name>` and an `OpeningPrompt` from `--prompt-file`, else `NoOpeningPrompt`.
+  9. `start` and `--attach` then exec the attach.
+
+  Failures print one line and exit 1. Ctrl-C prints `herdr_sessions: stopped` and exits 130.
+
+### Claude trust before every launch
+
+A Claude session started in a folder the account has not trusted stops at the trust prompt. A launcher that sends it a prompt then waits on a session that never answers. Every launcher checks trust first and refuses with the one command the user runs, before it writes or launches anything.
+
+- `herdr.claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile` is the one check. A folder is trusted when `projects[k].hasTrustDialogAccepted is True` in the account's `.claude.json` for a key `k` in: the folder itself, its `git rev-parse --show-toplevel` (`repository_root`), and its main checkout (`repository_trust_key`, the parent of `--git-common-dir`). Both git helpers share `_repository_key`, which strips inherited `GIT_*` variables and runs git with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`.
   - `Untrusted` carries `keys_tried`.
-  - `UnreadableTrustFile` prints
-    `cannot read <file> to check Claude trust (<ErrorClass>)`: the path and the
-    error's class name, never the file's contents.
-- `trust_command(folder, account: ClaudeLaunchAccount) -> str` is the line the
-  user runs, accepts the prompt in, then leaves with `/exit`:
-  `cd <folder> && <account prefix> claude`. The default account's prefix is
-  `env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR`, so an inherited
-  account directory never redirects it; a named account uses `account_prefix`.
-- Callers, each refusing with
-  `<unit | child slug | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`
-  or `<prefix>: <UnreadableTrustFile text>`:
-  - `scripts/production/add_unit.py` `preflight(request, selected)` exits 2
-    before any stub, table row or worktree is written. A worktree that does
-    not exist yet is checked by its main checkout's key, and its trust command
-    runs in the main checkout.
-  - `scripts/production/add_showrunner.py` `checked`, and through it
-    `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` overrides the account
-    file in tests.
-  - `scripts/nightly_review/nightly_review.py`, on the account its spawn uses.
-- Launchers pick their account by room; each check reads that account's file:
-  `~/.claude.json` for the default account, `<CLAUDE_CONFIG_DIR>/.claude.json`
-  for a named one.
-- `scripts/herdr/trust_survey.py` is a read-only survey. Per account file
-  (`~/.claude.json` and every `~/.claude[0-9]/.claude.json`) it prints
-  `<account> <key> <accepted> <kind>`, the kind being main checkout, worktree
-  of `<main>`, plain folder, or ancestor of `<n>` repositories, nested
-  repositories included. Then, per `~/worktrees` folder, it prints whether its
-  own, toplevel or main-checkout key is accepted.
-- `pyrightconfig.json` puts `.` in the `scripts/herdr` environment and
-  `scripts/herdr` in the `scripts/nightly_review` environment, for the
-  `scripts.accounts` and `herdr` imports.
+  - `UnreadableTrustFile` prints `cannot read <file> to check Claude trust (<ErrorClass>)`: the path and the error's class name, never the file's contents.
+- `accounts.trust_command(folder, selected: ClaudeLaunchAccount) -> str` is the line the user runs, accepts the prompt in, then leaves with `/exit`: `cd <folder> && <account prefix> claude`. The prefix is `named_account_prefix`, the numbered `CLAUDE_CONFIG_DIR` plus the shared memory directory. A legacy home launch in `herdr_sessions.py` prints `cd <folder> && env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude` instead.
+- Callers. Each refuses with `<unit | child slug | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`, or `<prefix>: <UnreadableTrustFile text>`:
+  - `add_unit.preflight(request, selected)` exits 2 before any stub, table row or worktree is written. A worktree that does not exist yet is checked by its main checkout's key, and its trust command runs in the main checkout.
+  - `add_showrunner.checked`, and through it `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` sets the account file in tests.
+  - `herdr_sessions.py start` and `resume`. An untrusted folder prints one paste line, the trust command `&&` the same invocation rebuilt by `_launch_rerun` (with `--cwd` resolved, claude arguments kept after `--`, and paths with spaces quoted), and exits 1. Nothing writes `hasTrustDialogAccepted`.
+  - `restart._herdr_launch`, on the trust file in the launch environment's `CLAUDE_CONFIG_DIR`, before any server starts.
+  - The nightly review launches through `add_unit.py --permanent` on the units account, so `preflight` covers it.
+- Launchers use the configured group account. Each check reads `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder. `~/.claude.json` stays the seed and MCP baseline.
+- `scripts/herdr/trust_survey.py` is a read-only survey. For the seed and each account file (`~/.claude.json` and every `~/.claude[0-9]/.claude.json`) it prints `<account> <key> <accepted> <kind>`. The kind is main checkout, worktree of `<main>`, plain folder, or ancestor of `<n>` repositories (nested repositories included). Then, for each `~/worktrees` folder, it prints whether its own, toplevel or main-checkout key is accepted.
+- `pyrightconfig.json` gives `scripts/herdr` an environment with `.` and the message, production and lib paths. It puts `scripts/herdr` in the production, message, shutdown and nightly review environments.
 
-### Invariants
+### Pane access
 
-- Trust counts only on an exact key: the folder, its toplevel, or its main
-  checkout. An accepted ancestor folder never counts.
-- A refusal happens before any write or launch, and the refusal names the exact
-  command that fixes it.
-- The survey prints only the key, accepted and kind fields of `.claude.json`,
-  never any other field.
-- Tests use temporary folders and fake account files; they never start real
-  herdr, tmux, Claude or Codex, and nothing answers a trust prompt.
-- New herdr launchers call `claude_trust` and `trust_command`, not a check of
-  their own.
+`session_pane.py` reads and types through `HerdrPlace(session, pane)`. `read_place(place, lines=60, *, joined=False, ansi=False)` uses herdr's recent pane text. `type_place` sends an agent prompt, `keys_place` sends keys, and `where_place` prints `herdr:<session>:<pane>`. `record_place(record)` resolves the registry pid through `herdr_place_of`. `session_place(id)` first picks the newest live record for that id.
 
-### Gotchas
+The CLI takes `read|type|keys|where` and either `unit <slug> <unit>` or `session <id>` (`read` also takes `--lines N --joined --ansi`). A trust, permission or question prompt refuses typing with exit 4 and `blocked at a prompt; nothing typed`. A missing target exits 1, usage 2 and host failure 3.
 
-- Measured 2026-10-13 on all three accounts: 22 of 23 worktrees are covered by
-  their main checkout's key, none by their own or toplevel key. Worktrees are
-  trusted through the main checkout.
-- An absent key alone does not show that a folder launched without a prompt;
-  that needs runtime evidence such as a Claude project directory. The one
-  uncovered worktree in the survey had none, so it never ran.
-- When `nightly_review.py` picks the default account but inherits
-  `CLAUDE_CONFIG_DIR`, it checks trust on the inherited directory, the one the
-  spawned session reads.
+These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`settle._screen`, 60 lines), and the Remote Control fixer. `settle._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
 
-### Ruled out
+### Unit lookup and marks
 
-- Ancestor keys as trust: the 2026-10-13 live check refused them.
-- `trusted_by_claude`, `ProjectTrust` and `add_showrunner._project_keys`:
-  replaced by `claude_trust`.
-- A Codex trust check: no launcher starts interactive Codex.
+`unit_lookup.py` has one source, herdr. `Place = HerdrPlace`. `MarkedUnit(unit, claude, place)` is frozen, and its session name is `place.session`. `Claude = LiveClaude(name, session_id, socket, pid) | ClaudeNotRunning | ClaudeUnknown(reason)`.
 
-## Typing into and reading sessions on either host
+- `_claudes(processes)` joins every live session record to a place by pid through `herdr_processes()`. A live pid missing from that list (a deleted cwd) falls back to `herdr_place_of(pid)`. It returns `RecordsRead | RecordsPartlyUnread(reason)`, and a partial read makes unplaced units `ClaudeUnknown`.
+- `_herdr_marked` yields each running pane carrying both marks, once per place.
+- `every_marked_unit() -> MarkedProductions(units, faults)` reads all units once and raises `OSError` when herdr cannot be read. Two sessions carrying one unit's mark is a fault, and that production is left out. `marked_units(slug)` raises the fault as `OSError`. Slugs resolve through `canonical_slug`.
+- CLI: `list <slug>` prints `unit, herdr:<session>:<pane>, session, live|unknown|stopped, name, session id, socket`. `pane <slug> <unit>` prints `place_text(place)`. Exit 0, 1 no such unit, 2 usage, 3 cannot tell.
 
-### What it is
+Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). They are set only in the pane environment when a unit launches, so an existing session cannot be adopted as a unit later.
 
-Relays, `/compact`, the go-ahead, effort changes, the stall watch,
-`unit_status.sh`, promotion and the shutdown screen check all read or type into
-a Claude session. `scripts/production/session_pane.py` is the one path they
-use, and it works the same for a session in a tmux pane and one in a herdr
-pane. A relay to a herdr session blocked at a trust, permission or question
-prompt is refused with a line saying so; nothing is typed into the prompt.
+### Launchers
 
-### How it works
+**Units.** `add_unit.launch_session(request, director, prompt, selected, *, target="", model="")` starts every new or restored unit in its own herdr session:
 
-- A place is `unit_lookup.Place = TmuxPlace(pane) | HerdrPlace(session, pane)`.
-  `MarkedUnit(unit, label, claude, place)` carries it; `label` is the tmux
-  session label or the herdr session name. Every caller dispatches on
-  `unit.place`, never on a pane string.
-- Library, each function branching once on the place's type:
-  - `read_place(place, lines=60, *, joined=False, ansi=False) -> str` — tmux
-    `capture-pane -p [-J] [-e]`; herdr `Herdr.read`
-    (`pane read --source recent|recent-unwrapped --lines N [--format ansi]`).
-    `lines` is the last N lines of output on both hosts; tmux trims its
-    `capture-pane -S -N` output to the last N lines.
-  - `type_place(place, text)` — tmux `send-keys -l <text>` then `send-keys Enter`,
-    two calls; herdr `Herdr.prompt` (`agent prompt`).
-  - `keys_place(place, *keys)` — tmux `send-keys`; herdr `Herdr.send_keys`.
-  - `where_place(place) -> str` — `tmux:<pane>` or `herdr:<session>:<pane>`.
-  - `session_place(session_id) -> Place` — the newest live session record with
-    that id. On Linux the pane is `TMUX_PANE` from `/proc/<pid>/environ`
-    (`HERDR_PROC` overrides the root); on Darwin it is the `%N` at the end of the
-    record's `tmux` field. With no tmux pane it is `herdr.herdr_place_of(pid)`.
-  - Errors: `TmuxFailure(OSError)` for tmux, `HerdrFailure` and its subclass
-    `AgentBlocked` for herdr, `NoSuchTarget` when no live session or marked unit
-    matches.
-- CLI: `session_pane.py read|type|keys|where <target>`, the target being
-  `unit <slug> <unit>` (through `unit_lookup.marked_units`) or `session <id>`.
-  `read` takes `--lines N`, `--joined` and `--ansi`; `type` takes one text
-  argument; `keys` one or more keys; `where` nothing. Exits: 0 done, 1 no such
-  target, 2 usage, 3 host failure, 4 blocked at a prompt
-  (`<target>: blocked at a prompt; nothing typed`, from herdr's `agent_blocked`
-  refusal).
-- Callers:
-  - `commands/showrunner/produce.md`, `dailies.md` and `promote_unit.md` run
-    the CLI for relays, the `/compact` idle check, the go-ahead, pane reads and
-    stopping a session (`type session <id> /exit`).
-  - `unit_effort.py` reads with `ansi=True`, judges the screen with `verdict`,
-    then `type_place`s `/effort <level>`.
-  - `stall_watch.py` hashes `read_place(place, 400, joined=True)`.
-  - `add_unit.wait_for_remote_control` polls `read_place` for
-    `/remote-control is active`. Its resume path stops a tmux unit with
-    `kill-session` and a herdr unit with `herdr.stop_session(label)`.
-  - `live_units.py` prints `unit_lookup.place_text(place)`: the bare pane id
-    for tmux, `herdr:<session>:<pane>` for herdr. `adopt.py` refuses a unit not
-    in tmux.
-  - `unit_status.sh` takes each unit's text from
-    `session_pane.py read unit <slug> <unit> --lines 400 --joined`, and its
-    Claude state and session id from `unit_lookup.py list` (column 4 the state,
-    column 6 the session id). An unreadable state prints
-    `CLAUDE STATE UNKNOWN`.
-  - `scripts/shutdown/settle.py` `_screen` reads a herdr host through
-    `read_place` (60 lines), a tmux or unit host by the pane id in its session
-    record, and returns `ScreenUnreadable("no pane host")` for any other host.
-- `promote_showrunner.py` refuses before anything stops when `read_place`
-  fails or `unit_effort.verdict` skips the screen. `stop` types `/exit` with
-  `type_place`, waits for the pid to exit, then ends the host session: tmux
-  `kill-session`, herdr `herdr.stop_session(label)`. The account directory for
-  the resume is the tmux session's `@claude_config_dir` option for a tmux unit,
-  and `scripts.whoami.account.process_config_dir(pid)` of the live Claude for a
-  herdr unit; no directory refuses with
-  `<unit>: cannot read its live Claude's account environment`.
+- Pane environment: both marks, `ENABLE_TOOL_SEARCH=true`, and the account variables. A resume uses `accounts.prepared_account(selected.label, resume=True)` variables minus its `remove` names, and refuses a `target` other than the selected group account. Other launches use `named_account_environment(selected.dir)`. `PROBE_ENV=1` is added only for a `--probe` restore. The caller's `CLAUDE_*` never reaches the pane.
+- Claude arguments: `--model`, `--effort` when set, `--resume <id>` on a resume, `--remote-control <session name> -n <session name>`, then the profile's flags or `--settings '{"disableAgentView": true}'`.
+- The host name is `host_session_name(request)`: `generated_session_name` of `--host-session` on a restore when it leads with `<slug>-`, else `<slug>-<session name>` (a session name already leading with `<slug>-` is not prefixed twice). Each production's `review-unit` gets its own session (`build-followups-review`, `hana-review`), and a record from before the prefix cannot reach another production's live session.
+- It runs `start_new_server(name, --timeout * 1000)` (default 90 s), `open_pane(name, name, session_cwd, env)`, and `start_agent(..., opening=OpeningPrompt(prompt))`. On `AgentExited` it runs `stop_session(name)`.
 
-### Invariants
+`add_unit.main` does this:
 
-- Callers read and type only through `session_pane.py`. The exceptions are
-  `settle._screen`'s tmux branch, the one direct `capture-pane` left, and
-  `herdr.py` itself, which reads the visible screen when `agent start` reports
-  `agent_not_ready`.
-- A herdr session blocked at a prompt is never typed into; `type` exits 4. A
-  tmux pane has no such refusal: `type` sends whatever the screen shows, so a
-  caller that must not land in a form (effort, promotion) checks
-  `unit_effort.verdict` first.
-- One account reader: a herdr unit's account comes from
-  `account.process_config_dir`, never a second process-environment reader.
-- A herdr unit's name never exempts a tmux session from promotion's name
-  collision check: only a tmux unit passes its label as `ending`.
+- It picks the account with `accounts.account_for_group_launch("unit", ...)`, checks it with `accounts.check`, and takes the launch barrier and permission (`RecordedSessionRestoreLaunchPurpose` for a restore). Then it runs `preflight`.
+- On a resume of a marked unit, `ClaudeUnknown` refuses, and `ClaudeNotRunning` ends that place's session with `stop_session` before the relaunch.
+- A live herdr session of the destination name that is not marked as this unit refuses.
+- A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
+- A new unit waits until `read_place` shows `/remote-control is active`.
+- It prints `<unit> started: herdr session attach <session>` or `<unit> restore launched: herdr session attach <session>`.
+- Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal or `SessionTaken`, 1 on other failures.
 
-### Gotchas
+**Lower showrunners.** `add_showrunner.launch(child, model, effort, resume, cwd, selected)` uses no marks. The pane gets `ENABLE_TOOL_SEARCH=true` and the account variables. Arguments are `--model --effort [--resume] --remote-control <slug> -n <slug> --settings '{"disableAgentView": true}'`. It runs `start_new_server(slug, 90_000)` and sends the prompt `/showrunner:produce <doc>[ resume]`. `checked` refuses a live herdr session named for the slug. Exit 2 on `SessionTaken`, 3 (`SESSION_NOT_READY`) on `AgentNotReady`. It prints `started <slug>: herdr session attach <slug>`, then waits up to `ADD_SHOWRUNNER_WAIT_S` (180 s, poll 2 s) for the showrunner to appear before attaching it to the caller.
 
-- On Darwin the pane id comes only from the session record's `tmux` field; `ps`
-  output is never read for it.
-- `herdr agent start … -- claude` adds the binary to argv itself; callers pass
-  only the extra arguments.
-- Trust checks go only through `herdr.claude_trust` and `trust_command`, exact
-  keys only (see "Claude trust before every launch").
-- `read --ansi` dimmed-suggestion detection (`\e[2m` after `❯`, which
-  `unit_effort.verdict` treats as no draft) is confirmed live on tmux. Its check
-  on herdr belongs to the live run with a herdr-hosted Claude in the herdr
-  adoption plan's standalone-sessions phase.
-- `add_unit.account_for_launch`, resuming a unit with no shutdown record and
-  no `--account` or `--config-dir`, still reads the tmux `@claude_config_dir`
-  option, herdr units included; a herdr unit's resume account is later work in
-  the herdr adoption plan.
+**Promotion.** `promote_showrunner.stop` types `/exit` with `type_place`. It waits up to `PROMOTE_STOP_WAIT_S` (60 s) for the Claude pid to go, then runs `stop_session(place.session)`. `add_showrunner.main --resume <id> --cwd <worktree> --config-dir <showrunners account dir>` then resumes the same conversation as the child's showrunner. A failed start prints the `add_unit.py --resume` line that brings the unit back.
 
-### Ruled out
+### Roster
 
-- Parsing Darwin `ps eww` for `TMUX_PANE`: argv tokens read as environment
-  entries.
-- A second process-environment reader for a unit's account: replaced by
-  `account.process_config_dir`.
-- `MarkedUnit.pane`: replaced by `place`.
+`roster.py` reads every production's marks once (`_every_marked_unit`). A director with a `LiveClaude` joins by session id. A director with no messaging socket joins when `herdr_place_of(record pid) == marked.place`. Worktree ownership is the fallback only when the marks cannot be read. `_herdr_codex_panes` runs one `herdr agent list` per live session and lists each interactive Codex pane as a freestanding row named `herdr <session>:<pane>`, with `CannotReceiveMessages("interactive Codex in a herdr pane")`. `HerdrMissing` lists nothing, and any other herdr failure is a problem line.
+
+### Shutdown, restart and crash recovery
+
+[shutdown-and-restart.md](shutdown-and-restart.md) covers records, `ResumeParts`, snapshots, holds and the restart pass. The herdr parts:
+
+- **Hosts.** `inventory._host` checks `TMUX_PANE` first (non-empty means `UnknownHost`). A marked unit with a live Claude is `UnitHost{production, unit, doc, session_name, session_host: "herdr", plan}`. A placed pid is `HerdrHost{herdr_session, pane_id, presentation}`, where `presentation` is `"attached window"` when `attached_clients` finds one and `"detached"` otherwise (a record without it reads as detached). Everything else is a window or terminal host. The snapshot pass (`_snapshot_host`) fails when a `HERDR_PANE_ID` process cannot be placed or a session's clients are unreadable. On Darwin, inventory reads environments through `herdr.darwin_process_environment` and the snapshot reads no `/proc`.
+- **Stop.** `stop._stop_unit_session` runs `herdr.stop_session(<session_name>)` after the Claude exits. It judges the session stopped only when `live_sessions()` no longer lists it. Otherwise the record keeps `unit session left running{host: "herdr", session_name, cause}`.
+- **Restart destinations.** `_herdr_launch(parts: ResumeParts, destination: NewHerdrSession(name) | RecordedHerdrPane(name, pane_id), session, *, dry_run, session_kind) -> ServerCreated | ServerAdopted | WindowServerCreated`.
+  - Units restart only through `add_unit.py ... --host-session <session_name>` (`_unit_argv`), never `_herdr_launch`.
+  - A `HerdrHost` restarts into `RecordedHerdrPane`.
+  - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `NewHerdrSession(generated_session_name(<Claude name>))`, with no suffix retry. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <name>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window.
+- **`_herdr_launch` steps.**
+  1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
+  2. Check trust.
+  3. Call `restore_server(name, 90_000, exclusive=<NewHerdrSession>)`.
+  4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
+  5. Refuse a live agent: any agent for a new session, or one in the recorded pane. A recorded pane left at its shell is closed; one running a command is refused.
+  6. Record the scheduled prompt, open a pane, and start Claude with `OpeningPrompt(parts.opening_prompt)`. `AgentExited` stops only a created server.
+  7. An adopted or window-started server gets its restored workspace focused. After a successful focus, a window-started server also gets `close_startup_workspaces`. A failed focus or close prints `<name> restart issue: ...` and the restore stands.
+  8. `StartFreshConversation` prints `<name>: no conversation to resume; started a new one`.
+
+  `SessionTaken` becomes `HerdrDestinationTaken`, and `MacDesktopUnavailable` passes through.
+- **Windows after launch.** A `WindowServerCreated` restore needs nothing more. An `"attached window"` host gets a window only when `attached_clients` is `NoClientAttached`. Unreadable clients, or a `"detached"` host, print `herdr session attach <name>`. A failed window open appends to the record's `restart_issues` and leaves the agent running. Mac windows open `Ghostty.app` with `-e herdr session attach <name>`, spaced `WINDOW_DELAY_SECONDS` (1.2 s) apart.
+- **Codex snapshots.** `_launch_codex_snapshot` uses `generated_session_name(<cwd name>-codex, <16 hex of sha256(session id)>)`, `restore_server(..., exclusive=True)`, a pane with `CODEX_HOME`, and `start_agent(kind="codex", ["resume", <id>?], NoOpeningPrompt())`. A failed start stops a created server.
+- **Detached starts on the Mac.** `detached.start_detached(argv, *, ready, within, output: DiscardOutput | AppendLog, environment: InheritEnvironment | ExplicitEnvironment) -> pid` starts the child in its own session with stdin closed. It returns only once `ready()` passes while the child lives, and leaves a thread to reap it. Failure raises `DetachedChildExited(pid)` or `DetachedStartFailure`, and a child that never became ready has its process group stopped (SIGTERM, then SIGKILL after 0.5 s). The conductor and the fixer start this way, with the caller's environment plus `DETACHED_STARTUP_SIGNAL=1` (`ExplicitEnvironment`). Each is ready when its log holds `shutdown conductor started` or `Remote Control fixer started`, within 15 s. They print that line only when `DETACHED_STARTUP_SIGNAL=1` is in their environment, and they pop it at once. Their start errors end `; log: <path>`, with logs under `shutdown_state_root()/logs`. Linux uses systemd.
+
+### Legacy tmux records
+
+Old records and snapshots still parse, and they never become herdr destinations. Do not remove this parsing.
+
+- `session_types._parse_host`:
+  - A unit host whose `session_host` is absent or `"tmux"`, or whose kind is `legacy tmux unit`, becomes `LegacyTmuxUnitHost{kind: "legacy tmux unit", production, unit, doc, session_name}`. The old key `tmux_session` is read.
+  - A `tmux` or `legacy tmux` host becomes `LegacyTmuxHost{kind: "legacy tmux", session_name}`.
+  - Any `session_host` other than `tmux` or `herdr` raises `InvalidInventory`. `UnitHost.session_host` is `Literal["herdr"]`.
+- `record.py`: the old left-running kinds parse as `LegacyTmuxSessionLeftRunning{kind, at, session_name, cause}`. `legacy_tmux_leftovers(record)` returns every one, whatever its cause.
+- `restart.py`: a legacy host is `ManualRestartRequired(legacy_resume_command(record))`, which is `tmux kill-session -t =<name>` per leftover, `&&` the resume shell from `_resume_command`. A legacy Codex entry prints `legacy_codex_command(entry)` (`cd <cwd> && CODEX_HOME=<home> codex resume [<id>]`) and stays unacknowledged. Such records are never archived (`clear_running_on_target` refuses first) and never retried as cleanup. `status`, `now` and restart show them as manual restarts. They count in `MachineRestartResult.manual_sessions`, so restart reports `partial` and exits 1.
+- Other `tmux` text that stays on purpose: `sessions.SessionRecord.tmux`, the `/exit` guard in `pre-tool-use-showrunner-move-guard.py`, the old log line form in `waiting.py`, and user quotes in commands and `herdr-trial.md`.
+
+### Test doubles
+
+- `fake_herdr.py`: `HERDR_BIN` points at it. It appends each argv to `FAKE_HERDR_LOG` as a JSON line. It answers from `FAKE_HERDR_RESPONSES`, keyed by the space-joined argv without the executable, else `"default"`. Fields: `stdout`, `code`, `stderr`, `write_files`, `require_paths` (a missing path exits 98) and `remove_paths`. A list replays in order and keeps the last entry. It refuses an `agent start` whose name fails `[a-z][a-z0-9_-]{0,31}` with `invalid_agent_name`. `herdr_listener(proc, pid, name, environment)` gives a fake server the session's listening socket in a fake `/proc/net/unix` plus an fd link.
+- `fake_unit_host.py`: `environment(root)` sets `HERDR_BIN`, `HERDR_PROC`, `FAKE_HERDR_LOG` and `FAKE_HERDR_RESPONSES` for an empty host. `HostedUnit(session, pane, marks, screen)`. `write(env, units)` publishes a server process (pid `991000 + 2i`), its listener, a marked `zsh` pane shell, the session list, and pane reads (`recent` and `recent-unwrapped`; 3, 60 and 400 lines; with and without ANSI). `place_process(env, pid, pane)` puts a registry process under that pane's shell. `calls(env)` returns logged argv. `live_pid(test)` gives a real live pid for registry checks.
+- Darwin cases fake `LAUNCHCTL`, `HERDR_PS`, `HERDR_LSOF`, `SHUTDOWN_OPEN` and `SHUTDOWN_SYSCTL`, and pin `herdr._PLATFORM`. Linux `/proc` cases use `scripts/shutdown/test_support.linux_process_fixture`, which pins `sys.platform` and `herdr._PLATFORM`.
+
+## Invariants
+
+- Tests never start real herdr, Claude or Codex. They use `fake_herdr.py`, `fake_unit_host.py`, a fake `/proc` and fake session records, in temporary folders.
+- Nothing answers a trust, permission or question prompt. Launchers refuse an untrusted folder before any write or launch, and the refusal names the exact command that fixes it. `agent_not_ready` reports the screen and sends no key. New launchers call `claude_trust` and `accounts.trust_command`, not a check of their own.
+- Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
+- The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
+- One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
+- `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
+- `start_new_server` is exclusive and raises `SessionTaken` on a taken name. Launchers that create a session use it. Adopting starts are only for restoring into a recorded server.
+- Restored workspaces are cleared on every server spawn. Restart closes only workspaces that pass the untouched startup-shell test, never one it did not create.
+- Kill nothing by pattern. Stop a named herdr session, a systemd unit by its recorded name, or, on the Mac, only our own detached child. `stop_created_server` never stops an adopted or window-started server.
+- Session identity comes from the listening socket's owner. Handoff survivors come from the server's unit cgroup or the shell pids it reports. Never use argv or an inherited `HERDR_SESSION` for server identity, and never match pane ids across environments.
+- A non-empty `TMUX_PANE` means the process is never a herdr place.
+- Unit marks are set only at launch. There is no adoption of existing sessions.
+- Every unit restarts through `add_unit.py --host-session <name>`, which is restart's only restore flag for units.
+- Callers refuse a server whose inherited environment holds a must-be-unset variable (`CLAUDE_CODE_OAUTH_TOKEN`, the named-account variables for a legacy home, or `PreparedAccount.remove`).
+- Every pane carries `HERDR_AGENT_PANE=1`. The shell's `claude` alias depends on it.
+- Restart reads `attached_clients` before opening any window, and records a failed window in `restart_issues` without undoing the launch.
+- Mac servers start only from the desktop session. Text quoting the refusals uses `MAC_DESKTOP_REQUIRED` and `MAC_DESKTOP_TERMINAL_REQUIRED` exactly. In herdr and shutdown code, `launchctl managername` is the only launchctl call.
+- `start_detached` callers pass `DiscardOutput | AppendLog` and `InheritEnvironment | ExplicitEnvironment`, never raw `subprocess` arguments. Readiness lines are requested by `DETACHED_STARTUP_SIGNAL`, never by a platform check.
+- Legacy tmux hosts and leftovers never become herdr destinations, are never archived, and always print a manual command.
+- Edits to `/etc/nixos` (shell functions, earlyoom, packages) are outside this repo. Name them for the user.
+- Python: basedpyright reports 0 errors and 0 warnings, with no file-level ignores, a `TypedDict` for every herdr JSON schema, and no `Any`.
+- Tests that fake Linux process state use `linux_process_fixture`. Darwin tests pin `herdr._PLATFORM`. Temp roots are `.resolve()`d. Fakes of herdr JSON come from captured herdr output.
+
+## Calibration and gotchas
+
+**Numbers.**
+
+- herdr rejects an agent-start timeout at or below 3000 ms (`_AGENT_START_TIMEOUT_MINIMUM_MS`).
+- A new pane's zsh takes about 2.3 s to start (direnv, `gpg-connect-agent` in the foreground). `agent start` before then fails `agent_pane_busy`, which is retried every 0.1 s, on that error only.
+- Each try's CLI subprocess gets 10 s of grace past its timeout, so the shared deadline can overrun by up to 10 s. `wait_until` has the same 10 s grace.
+- `run_program` defaults to a 10 s timeout. Darwin `ps` reads use 5 s.
+- Launch timeouts are 90 s (`90_000` ms) in `add_showrunner`, `herdr_sessions` and restart. `add_unit --timeout` defaults to 90 s.
+- Darwin server readiness waits `min(10 s, timeout)`. `restore_server`'s Mac window waits `min(15 s, timeout)`. Conductor and fixer readiness is 15 s. `list --on` is 15 s.
+- Agent exit detection polls the CLI every 0.05 s and asks herdr at most every 0.5 s.
+- Session names are at most 64 bytes. Agent names are at most 32 characters.
+- `add_showrunner` waits 180 s and polls every 2 s. Promotion waits 60 s for `/exit`. Mac restart windows are spaced 1.2 s apart.
+- `fake_herdr.py` startup can pass 100 ms under load, so tests that bound a herdr call need at least 10 000 ms. Prove that launches overlap with a barrier, never a wall-clock bound.
+
+**herdr behavior.**
+
+- `herdr agent start --kind <kind>` adds the binary itself. An `agent_arguments` starting with it would reach Claude as a stray first prompt.
+- herdr refuses multi-line start arguments, which is why the prompt is sent separately.
+- A failed `herdr server stop` does not mean the session still runs. Read `live_sessions()`.
+- An attach-started server's argv says `default`, so only the socket names its session. `HERDR_SESSION` is inherited and only selects a bare client's session.
+- systemd adds `.service` to a bare unit name, so the suffix is explicit, or `a` and `a.service` would share a unit.
+- herdr's `launch_pending` can stay true after the agent exits. A name-based `/proc` watch reports a false exit on a healthy start, because the Nix wrapper execs and forks. Follow the pid and its start ticks instead.
+- herdr reopens `session.json` panes when a server starts. A window still attached through `server stop` gets a new empty shell workspace in front, so anything restored afterwards sits behind it until focused. The attach client makes its `~` workspace after the server answers, so `_clear_restored_workspaces` never sees it, which is why `close_startup_workspaces` exists.
+- herdr 0.9.0 and 0.9.5 nest the scroll offset under `scroll`, and 0.9.5 omits `scroll` when unset. Fakes in the flat form passed while the real run failed.
+- Linux discovery skips a process whose cwd no longer resolves, so callers that hold a registry pid place it with `herdr_place_of`.
+- natedev's `claude` alias adds `--remote-control` and `--settings`. herdr types a bare `claude` at the pane prompt, so without the `HERDR_AGENT_PANE` guard every session would get those flags twice.
+- An account move cannot run `accounts.py exec` inside herdr, since it removes credentials and checks readiness, which pane variables cannot do. Moves pass `prepared_account(target, resume=True)` variables and removals instead.
+
+**Mac.**
+
+- `launchctl submit` and launchd plists ran nothing on this Mac when tried for herdr: no pid, no output, exit status 0, even for `/bin/sh`. `scripts/message/notifier.sh` still uses `launchctl submit` for Mac run-only jobs.
+- A herdr server started from an ssh login cannot read the login keychain, so Claude in it comes back signed out. A natedev-driven restart of Mac sessions over ssh hits the same trap, which is why the window bootstraps the server. A locked or signed-out Mac makes Ghostty start with no child, so the window never starts the server.
+- Mac start readiness is "the socket listener is our own child", not "a socket exists". Otherwise an exclusive start adopts a concurrent launch's server.
+- macOS `ps -o command=` prints arguments unquoted, so `/Applications/Nix Apps/Ghostty.app/...` splits at its space, and `comm=` is the executable. `(codex)` means macOS cannot read the arguments: liveness is unknown, never absent.
+- macOS `ps -p <gone pid>` exits 1 with no output.
+- `/tmp` is `/private/tmp`, so compare resolved paths.
+- Patching `sys.platform` after import does not change `herdr._PLATFORM`.
+- `test_support.py` sets the import path before importing `herdr`. Importing first breaks other suites.
+- `merge_gate.py` refuses on the Mac (no `/dev/shm`). Run Mac suites as `PYTHONPATH=<clone> ~/.claude/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`.
+- `list --on` runs the other machine's installed `~/.claude` code, so both machines need the promoted code before a remote list shows a change.
+
+**Trust.**
+
+- A survey of the account files found that worktrees are trusted through their main checkout's key, never their own or toplevel key.
+- An absent key alone does not show that a folder launched without a prompt. That needs runtime evidence such as a Claude project directory.
+
+## Ruled out
+
+- Interactive Codex panes for workers. They stalled at the trust screen, lost Work Orders and hid from the roster, while headless workers ask nothing and the roster already finds them.
+- One shared herdr session with many panes. An attached window keeps its own view, so attach could not open a given session.
+- Installing herdr's Claude integration. It writes `~/.claude` hooks and settings that every session loads.
+- Ancestor folder keys as trust, and a trusted default start folder. Nothing records which folder the user last worked in, and a session opened somewhere unasked is worse than one prompt.
+- A Codex trust check. No launcher starts new Codex work in herdr, and crash restore only resumes a Codex session in the folder it already ran in.
+- Probing pane process info to detect shell readiness, because herdr sends no field that tells them apart. Killing an in-flight `agent start` at the deadline, because it leaves a half-started agent.
+- Copying the caller's environment into a pane. Only named marks and account variables pass.
+- A store-path fallback in `herdr_binary`, because a garbage-collected path fails late.
+- Matching pane ids from environments, because sessions sharing one scope can reuse ids.
+- Opening a window on every attached herdr restart, because the existing client already shows the session.
+- A herdr form of unit adoption, because marks are set only at launch.
+- launchd plist bootstrap and `launchctl submit` on the Mac, because launchd never starts herdr there.
+- An ownership token for a window-started server. Such a server is never stopped instead.
+- herdr's `machine add` registry, which changes the remote server, and any two-way session sync.
+- Clearing a legacy leftover by its cause. Every leftover holds until the user runs the printed cleanup.
+
+## Why
+
+- **One herdr session per Claude session.** Attach should open exactly the session the user names, from any terminal, and stopping one session should touch nothing else. Session names are the launch names, so `list` and attach lines need no lookup table.
+- **Codex workers stay headless.** App-server threads ask for no trust and already report through the worker ledger. Only Claude sessions, which the user watches, need a terminal.
+- **Trust is checked, never answered.** Answering grants trust the user never gave. Sending a prompt into a trust screen waits forever. A refusal with one paste line costs the user one prompt, once per repository.
+- **Exclusive starts.** Two launches that chose the same name must never share one server. A taken name refuses, or for generated names moves to the next suffix. Adoption is kept for restoring into a server a record names.
+- **Socket ownership as identity.** Argv and `HERDR_SESSION` both mislead (attach-started servers, inherited variables). The process holding the listening socket cannot.
+- **Resume from our own ids.** Shutdown records and recovery snapshots already hold session ids, accounts and cwds. herdr's Claude integration would add hooks to every session to learn the same thing.
+- **Server environment check.** Panes inherit the server's environment. An adopted server started from a shell with another account's variables would launch Claude on the wrong account.
+- **No client window from Linux launchers.** Launchers start only the server, as a systemd user unit, and print the attach command. Restart opens a window only for a session that had one and has no client now.
+- **The Mac starts servers from the desktop.** The keychain is only readable in the Aqua session. Outside it, the Ghostty window starts the server, or the restart refuses with an instruction rather than bringing Claude back signed out.
+- **Legacy records stay parseable.** A crash or an old shutdown record can still name a tmux host. Turning it into a manual command keeps the conversation recoverable without bringing tmux back as a host.

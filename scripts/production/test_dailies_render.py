@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import json
+import sys
+import signal
+import dailies_render
+from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, cast, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
@@ -97,7 +103,7 @@ def holder(release: str = "unknown", name: str = "frame-time", since: str = "202
     return {"holder": name, "since": since, "for": purpose, "release_eta": release}
 
 
-def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None) -> Run:
+def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None, *, subprocess_cli: bool = False) -> Run:
     # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
     (Path(scratch) / "rust/hanadocs/agents").mkdir(parents=True, exist_ok=True)
     (Path(scratch) / ".local/state/agent-notes").mkdir(parents=True, exist_ok=True)
@@ -105,14 +111,15 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     hold_dir.mkdir(exist_ok=True)
     for index, record in enumerate(holders or []):
         _ = (hold_dir / f"holder-{index}").write_text(json.dumps(record) + "\n")
-    result = subprocess.run(
-        ["python3", str(SCRIPT), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
-             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")},
-    )
+    environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
+                   "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
+    if subprocess_cli:
+        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+    else:
+        result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
+                            environment, Path(scratch), production_state=True)
+
     return Run(result.returncode, result.stdout.splitlines(), result.stderr)
 
 
@@ -140,6 +147,57 @@ def timeline(lines: list[str]) -> list[str]:
 
 
 class ReportFooterTests(unittest.TestCase):
+    def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
+        question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            _ = path.write_text(json.dumps([
+                {"since": AT, "text": "reminder"},
+                {"since": AT, "text": "facts needed", "question": question},
+                {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+                {"since": AT, "text": "review failed", "question": question,
+                 "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+            ]))
+            items = dailies_render.read_outstanding(path)
+            self.assertIsInstance(items[0], dailies_render.OutstandingReminder)
+            awaiting = items[1]
+            self.assertIsInstance(awaiting, dailies_render.OutstandingQuestion)
+            assert isinstance(awaiting, dailies_render.OutstandingQuestion)
+            self.assertEqual(awaiting.question, question)
+            reviewed = items[2]
+            self.assertIsInstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            assert isinstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            self.assertEqual(reviewed.reviewed, "Use the short route?")
+            unavailable = items[3]
+            self.assertIsInstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            assert isinstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            self.assertEqual(unavailable.question, question)
+            self.assertEqual(unavailable.reason, "reviewer unavailable")
+            self.assertEqual(dailies_render.due(items, datetime.fromisoformat(AT)), items[:3])
+            self.assertEqual(dailies_render.due(items, datetime(2026, 10, 4, 12)), items)
+            output = self.lines(footer("--nothing-needed", "--outstanding", str(path)))
+            self.assertFalse(output[-1].endswith(" - nothing needed"))
+            self.assertFalse(any("Which route?" in line for line in output))
+
+    def test_outstanding_reader_refuses_conflicting_or_incomplete_review_evidence(self) -> None:
+        cases: list[dict[str, object]] = [
+            {"reviewed": "Choose now?"},
+            {"question": "Choose now?", "reviewed": "Choose now?", "review_unavailable": "offline"},
+            {"question": ""},
+            {"question": "Choose now?", "reviewed": 42},
+            {"question": "Choose now?", "review_unavailable": 42},
+            {"question": None},
+            {"question": "Choose now?", "reviewed": None},
+            {"question": "Choose now?", "review_unavailable": None},
+        ]
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            for fields in cases:
+                with self.subTest(fields=fields):
+                    _ = path.write_text(json.dumps([{"since": AT, "text": "route", **fields}]))
+                    with self.assertRaises(dailies_render.InputError):
+                        _ = dailies_render.read_outstanding(path)
+
     def lines(self, result: Run) -> list[str]:
         self.assertEqual(result.code, 0, result.error)
         return result.lines
@@ -150,6 +208,71 @@ class ReportFooterTests(unittest.TestCase):
 
     def tail(self, result: Run) -> list[str]:
         return after_timeline(self.lines(result))
+
+    def test_render_calls_keep_home_configuration_separate_and_restore_the_caller(self) -> None:
+        caller_environment = os.environ.copy()
+        caller_directory = Path.cwd()
+        caller_arguments = sys.argv.copy()
+        caller_path = sys.path.copy()
+        caller_chart = dailies_render.CHART_CONF
+        caller_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for home, chart in ((first, "ascii"), (second, "default")):
+                result = run(["--chart", chart], home)
+                self.assertEqual(result.code, 0, result.error)
+                self.assertIn(str(Path(home) / ".local/state/showrunner/dailies.conf"), result.error)
+            self.assertIn("ascii", (Path(first) / ".local/state/showrunner/dailies.conf").read_text())
+            self.assertIn("default", (Path(second) / ".local/state/showrunner/dailies.conf").read_text())
+        self.assertEqual(os.environ, caller_environment)
+        self.assertEqual(Path.cwd(), caller_directory)
+        self.assertEqual(sys.argv, caller_arguments)
+        self.assertEqual(sys.path, caller_path)
+        self.assertEqual(dailies_render.CHART_CONF, caller_chart)
+        self.assertEqual({sig: signal.getsignal(sig) for sig in caller_signals}, caller_signals)
+
+    def test_cold_imported_production_paths_return_to_the_callers_home_after_each_case(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            caller = Path(scratch) / "caller"
+            caller.mkdir()
+            environment = {**os.environ, "HOME": str(caller)}
+            for name in ("SHOWRUNNERS_CONFIG", "NOTIFIER_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+                         "SHOWRUNNER_STATE_DIR", "SHOWRUNNERS_SESSIONS", "SHOWRUNNERS_SEND"):
+                _ = environment.pop(name, None)
+            program = '''import os, sys
+from pathlib import Path
+from types import ModuleType
+sys.path.insert(0, str(Path.cwd()))
+from cli_fixture import invoke_cli
+assert "showrunners" not in sys.modules
+assert "dailies_render" not in sys.modules
+caller = Path.home()
+caller_path = sys.path.copy()
+command = ModuleType("fixture_command")
+command.__file__ = "fixture_command.py"
+def paths(home):
+    import dailies_render, showrunners, note_file
+    assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
+    assert note_file.notes_dir() == home / "rust/hanadocs/agents"
+    assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
+    assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
+    assert showrunners.SESSIONS_DIR == home / ".claude/sessions"
+    assert showrunners.SHOWRUNNER_STATE_DIR == home / ".local/state/showrunner"
+for name in ("first", "second"):
+    home = caller.parent / name
+    home.mkdir()
+    def main():
+        paths(home)
+        return 0
+    result = invoke_cli(command, main, [], {**os.environ, "HOME": str(home)}, home,
+                        production_state=True)
+    assert result.returncode == 0, result.stderr
+    assert Path.home() == caller
+    assert sys.path == caller_path
+    paths(caller)
+'''
+            result = subprocess.run([sys.executable, "-c", program], env=environment,
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:
         counts = [{"label": "nightly queue", "count": 8}, {"label": "proposals", "not_found": True}]
@@ -266,6 +389,20 @@ class ReportFooterTests(unittest.TestCase):
         self.assertEqual(unread, [*FOOTER_HEAD, *AGENT_LINES, "* grandkid: needs-user list unreadable",
                                   "* next dailies: 11:30 PDT"])
         self.assertEqual(quiet, [*FOOTER_HEAD, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
+
+    def test_the_counts_line_follows_the_header_in_footer_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            ledger = Path(folder) / "ledger.md"
+            _ = ledger.write_text("- 2026-10-16 One (one.md) — proposed\n- 2026-10-16 Two (two.md) — accepted 2026-10-16\n")
+            doc = Path(folder) / "production.md"
+            _ = doc.write_text(f"# Production\n\n- **Improvement queue:** {ledger}\n")
+            head = [*FOOTER_HEAD[:-1], "For you: 2 projects", ""]
+            self.assertEqual(self.lines(footer("--doc", str(doc))), [*head, *AGENT_LINES, "* no dailies scheduled"])
+            tail = after_timeline(self.lines(render({**report(False), "doc": str(doc)})))
+            self.assertEqual(tail, ["", *head, *AGENT_LINES, "* next dailies: 11:30 PDT - nothing needed"])
+            # A doc with nothing counted adds no line.
+            _ = doc.write_text("# Production\n")
+            self.assertEqual(self.lines(footer("--doc", str(doc))), [*FOOTER_HEAD, *AGENT_LINES, "* no dailies scheduled"])
 
     def test_lower_showrunner_footer_names_its_root(self) -> None:
         self.assertEqual(self.lines(footer("--next-run", "11:30", "--reports-to", "build-followups")),
@@ -494,7 +631,7 @@ class TimelineWindowTests(unittest.TestCase):
             _ = input_path.write_text(json.dumps(fields))
             for chart, marker in (("default", "🟦"), ("ascii", "● ")):
                 with self.subTest(chart=chart):
-                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch)
+                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch, subprocess_cli=True)
                     self.assertEqual(result.code, 0, result.error)
                     row = next(line for line in timeline(result.lines) if line.startswith("widget"))
                     self.assertIn(marker, row)
@@ -1113,7 +1250,7 @@ class LowerProductionTests(unittest.TestCase):
         middle = {**report(False), "children": [child("leaf", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1),
                                                       expand=True)]}
         with tempfile.TemporaryDirectory() as scratch:
-            summary = last_report(middle, Path(scratch) / "none.json", AT, 30)
+            summary = last_report(middle, Path(scratch) / "none.json", AT, dailies_render.ReportsEvery(30))
         self.assertEqual({key: summary[key] for key in ("written", "zone", "interval", "units", "held")},
                          {"written": AT, "zone": ZONE, "interval": 30, "units": 4, "held": 1})
         self.assertEqual(summary["rows"], [
@@ -1135,6 +1272,145 @@ class LowerProductionTests(unittest.TestCase):
                      child("kid", saved("2026-10-04T10:40", zone="Mars/Base")))
         self.refused("children[0].report.rows[0].eta: required",
                      child("kid", saved("2026-10-04T10:40", {"name": "fps", "started": "2026-10-04T09:10"})))
+
+
+class StyleSummaryFields(TypedDict):
+    rules_done: int
+    rules_total: int
+    unclassified_rules: int
+    cells_current_pct: float
+    stale: int
+    proposals: int
+    waiting_to_merge_back: int
+    oldest_waiting: str | None
+    synced_at: str
+    synced_tip: str
+
+
+def style_summary(**changed: object) -> dict[str, object]:
+    fields: StyleSummaryFields = {
+        "rules_done": 21, "rules_total": 51, "unclassified_rules": 0,
+        "cells_current_pct": 62.0, "stale": 1402, "proposals": 3,
+        "waiting_to_merge_back": 0, "oldest_waiting": None,
+        "synced_at": "2026-10-04T17:05:00+00:00", "synced_tip": "a" * 40,
+    }
+    return {**fields, **changed}
+
+
+@final
+class StyleChildReportTests(unittest.TestCase):
+    def saved_style(self, **changed: object) -> dict[str, object]:
+        return {**saved("2026-10-04T10:40", saved_row("names-unit")),
+                "style": style_summary(**changed)}
+
+    def parsed(self, fields: dict[str, object]) -> dailies_render.ChildReport:
+        return dailies_render.parse_child_report(fields, "report", ZoneInfo(ZONE))
+
+    def rendered(self, fields: dict[str, object], *, expand: bool = False) -> list[str]:
+        result = render({**report(False), "children": [child("hana-style", fields, expand=expand)]})
+        self.assertEqual(result.code, 0, result.error)
+        return result.lines
+
+    def test_legacy_report_has_no_style_line_and_keeps_its_child_row(self) -> None:
+        fields = saved("2026-10-04T10:40", saved_row("names-unit"))
+        self.assertIsInstance(self.parsed(fields).style, dailies_render.NoStyleSummary)
+        lines = self.rendered(fields)
+        self.assertEqual([line for line in lines if line.startswith("hana-style")],
+                         ["hana-style ?  2 units, 0 held"])
+        self.assertFalse(any("rules done" in line or "style summary" in line for line in lines))
+
+    def test_unavailable_summary_is_printed_directly_under_the_child_row(self) -> None:
+        fields = {**saved("2026-10-04T10:40", saved_row("names-unit")),
+                  "style": {"unavailable": "ledger database is locked"}}
+        parsed = self.parsed(fields).style
+        self.assertIsInstance(parsed, dailies_render.StyleSummaryUnavailable)
+        assert isinstance(parsed, dailies_render.StyleSummaryUnavailable)
+        self.assertEqual(parsed.reason, "ledger database is locked")
+        lines = self.rendered(fields)
+        row = next(index for index, line in enumerate(lines) if line.startswith("hana-style "))
+        self.assertEqual(lines[row + 1], "hana-style  style summary unavailable: ledger database is locked")
+
+    def test_summary_without_pending_handoffs_has_no_waiting_flag(self) -> None:
+        fields = self.saved_style()
+        parsed = self.parsed(fields).style
+        self.assertIsInstance(parsed, dailies_render.StyleSummary)
+        assert isinstance(parsed, dailies_render.StyleSummary)
+        self.assertIsInstance(parsed.waiting, dailies_render.NoPendingHandoffs)
+        self.assertEqual(parsed.synced_tip, "a" * 40)
+        self.assertEqual(parsed.synced_at, datetime(2026, 10, 4, 10, 5))
+        lines = self.rendered(fields)
+        row = next(index for index, line in enumerate(lines) if line.startswith("hana-style "))
+        self.assertEqual(lines[row + 1],
+                         "hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 10:05")
+        self.assertFalse(any("hand-off waiting" in line for line in lines))
+
+    def test_pending_handoff_is_flagged_only_after_four_hours(self) -> None:
+        for created, flag in (("2026-10-04T14:00:00+00:00", ""),
+                              ("2026-10-04T12:00:00+00:00", " · hand-off waiting 6h")):
+            with self.subTest(created=created):
+                fields = self.saved_style(waiting_to_merge_back=1, oldest_waiting=created)
+                parsed = self.parsed(fields).style
+                assert isinstance(parsed, dailies_render.StyleSummary)
+                self.assertIsInstance(parsed.waiting, dailies_render.PendingHandoffs)
+                assert isinstance(parsed.waiting, dailies_render.PendingHandoffs)
+                self.assertEqual(parsed.waiting.count, 1)
+                lines = self.rendered(fields)
+                summary = next(line for line in lines if "rules done" in line)
+                self.assertEqual(summary,
+                                 "hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 10:05" + flag)
+
+    def test_unclassified_rules_add_the_pull_instruction(self) -> None:
+        lines = self.rendered(self.saved_style(unclassified_rules=7))
+        self.assertIn("hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 10:05"
+                      + " · unclassified 7 — pull nate_style", lines)
+
+    def test_pending_handoff_age_is_elapsed_time_across_both_daylight_saving_changes(self) -> None:
+        for stamp in ("2026-03-08T08:30:00+00:00", "2026-11-01T07:30:00+00:00"):
+            with self.subTest(created=stamp):
+                created = datetime.fromisoformat(stamp)
+                at = (created + timedelta(hours=5, minutes=1)).astimezone(ZoneInfo(ZONE))
+                fields = self.saved_style(waiting_to_merge_back=1, oldest_waiting=stamp)
+                result = render({**report(False), "children": [child("hana-style", fields)]},
+                                at=at.strftime("%Y-%m-%dT%H:%M"))
+                self.assertEqual(result.code, 0, result.error)
+                summary = next(line for line in result.lines if "rules done" in line)
+                self.assertTrue(summary.endswith(" · hand-off waiting 5h"), summary)
+
+    def test_sync_from_an_earlier_day_names_its_weekday(self) -> None:
+        lines = self.rendered(self.saved_style(synced_at="2026-10-01T17:05:00+00:00"))
+        summary = next(line for line in lines if "rules done" in line)
+        self.assertTrue(summary.endswith(" · synced Thu 10:05"), summary)
+
+    def test_cells_percent_is_floored_and_reaches_one_hundred_only_when_complete(self) -> None:
+        for percentage, expected in ((99.6, 99), (100.0, 100), (0.5, 0)):
+            with self.subTest(percentage=percentage):
+                lines = self.rendered(self.saved_style(cells_current_pct=percentage, stale=1))
+                summary = next(line for line in lines if "rules done" in line)
+                self.assertIn(f" · cells {expected}% · stale 1 · ", summary)
+
+    def test_unknown_key_inside_the_style_summary_is_refused(self) -> None:
+        with self.assertRaisesRegex(dailies_render.InputError, r"report\.style.*unknown.*invented"):
+            _ = self.parsed(self.saved_style(invented=1))
+
+    def test_style_child_expansion_keeps_all_four_unit_rows(self) -> None:
+        names = ("names-unit", "types-unit", "modules-unit", "structure-unit")
+        fields = {**saved("2026-10-04T10:40", *(saved_row(name) for name in names), units=4),
+                  "style": style_summary()}
+        lines = self.rendered(fields, expand=True)
+        self.assertEqual([line.split()[0] for line in lines if line.startswith("hana-style/")],
+                         [f"hana-style/{name}" for name in names])
+        self.assertEqual(sum("rules done" in line for line in lines), 1)
+
+    def test_saved_cadence_variants_preserve_the_legacy_json_bytes(self) -> None:
+        for interval, cadence in ((None, dailies_render.ReportsOnDemand()),
+                                  (30, dailies_render.ReportsEvery(30))):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as scratch:
+                legacy = saved(AT, units=0, interval=interval)
+                parsed = self.parsed(legacy)
+                self.assertEqual(parsed.cadence, cadence)
+                current = last_report({"length": "simple", "zone": ZONE, "units": []},
+                                      Path(scratch) / "none.json", AT, cadence)
+                self.assertEqual(json.dumps(current, indent=2).encode(), json.dumps(legacy, indent=2).encode())
 
 
 if __name__ == "__main__":

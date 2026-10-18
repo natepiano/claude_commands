@@ -30,11 +30,17 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
-COUNTED_FAILURE = "status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)"
+# A Mac "no tests to run" (status 4) and a natedev nextest step stopped because
+# a Mac copy of its call finished first keep their raw status without counting.
+COUNTED_FAILURE = (
+    "status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)"
+    + " AND NOT (host IS 'natedev' AND step IS 'nextest'"
+    + " AND call_id IN (SELECT id FROM calls WHERE copy = 'won'))"
+)
 
 Column = tuple[str, str, str]
 
@@ -71,7 +77,7 @@ STEP_COLUMNS: list[Column] = [
     ),
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
-    ("seat", "TEXT", "delegate seat (PLAN_DELEGATE_TEAM_ROLE)"),
+    ("worker", "TEXT", "delegate worker (PLAN_DELEGATE_TEAM_ROLE)"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
     ("call_id", "TEXT", "calls.id of the verify.sh call that ran this step"),
@@ -134,7 +140,7 @@ CALL_COLUMNS: list[Column] = [
     ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
     ("wait_s", "INTEGER", "seconds from script start until the run began"),
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
-    ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
+    ("mac", "TEXT", "passed (natedev confirmed it; before 2026-10-16), passed_filter, passed_full (ended the call), failed, lost or declined when Mac offload ran or was considered"),
     ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
     ("mac_holder", "TEXT", "busy decline: the claim what, leftovers or unreadable; NULL in old rows"),
     (
@@ -145,6 +151,15 @@ CALL_COLUMNS: list[Column] = [
     ("mac_s", "REAL", "seconds spent deciding or running on the Mac"),
     ("target", "TEXT", "where the call was when it ended: mac, natedev, or empty"),
     ("hold_wait_s", "REAL", "seconds waited on a held target, each declined Mac retry included; memory waits are not counted"),
+    (
+        "copy",
+        "TEXT",
+        "Mac copy of a still-compiling natedev test: won, natedev_won, gave_way, declined or lost (passed_full before 2026-10-16)"
+        + " (the last copy's outcome); empty when no copy started, NULL in old rows",
+    ),
+    ("copy_s", "REAL", "seconds Mac copies of this call held the Mac, every copy summed"),
+    ("copy_count", "INTEGER", "Mac copies started for this call"),
+    ("copy_natedev_s", "REAL", "seconds the natedev nextest step had run (from its first cargo line) when the result was decided"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
@@ -159,7 +174,7 @@ CALL_COLUMNS: list[Column] = [
     ("worktree_name", "TEXT", "worktree folder name"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "short commit"),
-    ("seat", "TEXT", "delegate seat"),
+    ("worker", "TEXT", "delegate worker"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session or Codex thread"),
     ("backfilled", "INTEGER", "1 when copied from the old events.jsonl ledger"),
@@ -575,8 +590,39 @@ def marks(handle: BinaryIO, offset: int) -> str:
     return head.hex() + ":" + handle.read(offset - start).hex()
 
 
+def migrate_worker_fields(path: Path) -> None:
+    """Rename old step/call fields once under the same lock as appenders."""
+    with path.open("r+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        data = handle.read()
+        end = data.rfind(b"\n") + 1
+        lines: list[bytes] = []
+        changed = False
+        for raw in data[:end].splitlines(keepends=True):
+            try:
+                value = cast(object, json.loads(raw))
+            except ValueError:
+                lines.append(raw)
+                continue
+            if isinstance(value, dict):
+                fields = cast(dict[str, object], value)
+                if fields.get("kind") in ("step", "call") and "seat" in fields:
+                    _ = fields.setdefault("worker", fields["seat"])
+                    del fields["seat"]
+                    raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
+                    changed = True
+            lines.append(raw)
+        if changed:
+            _ = handle.seek(0)
+            _ = handle.write(b"".join(lines) + data[end:])
+            _ = handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None) -> int:
     """Index the complete lines past the stored offset; returns the lines read."""
+    migrate_worker_fields(path)
     with path.open("rb") as handle:
         size = os.fstat(handle.fileno()).st_size
         offset = 0

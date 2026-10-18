@@ -13,7 +13,7 @@ holds the local time, source, priority, posted title and message, and outcome.
 
 Messages without --action or --no-action are refused before sending. Exit 0
 sent, 1 Pushover refused it or could not be reached, 2 refused before sending,
-usage, or keys missing; 4 held for review. --answerable permits one revision.
+usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent after failed review. Registry and emergency pushes still send.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,8 +31,10 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 import review
+import push_texts
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
-                         ActionUnstated, UserAction, first_line, parse_user_action, refused_at)
+                         ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
+                         NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
 API_URL = "https://api.pushover.net/1/messages.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
@@ -61,6 +62,11 @@ class Reply(TypedDict, total=False):
 
 
 class ReviewedPushRecord(review.MessageRecord):
+    held: NotRequired[bool]
+    text_id: NotRequired[str]
+    failed_rules: NotRequired[list[str]]
+    findings: NotRequired[list[review.RuleFailureRecord]]
+    sent_despite_failed_review: NotRequired[bool]
     held_source: NotRequired[str]
     held_identity: NotRequired[str]
 
@@ -145,6 +151,8 @@ class Arguments(TypedDict):
     answerable: bool
     title: str
     message: str
+    text_id: str
+    session: NotificationSession
 
 
 def parse(argv: list[str]) -> Arguments | None:
@@ -154,6 +162,8 @@ def parse(argv: list[str]) -> Arguments | None:
     action: str | None = None
     no_action = False
     answerable = False
+    text_id = ""
+    values: dict[str, str] = {}
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
         option = argv[index]
@@ -165,7 +175,7 @@ def parse(argv: list[str]) -> Arguments | None:
             no_action = True
             index += 1
             continue
-        if option not in ("--priority", "--source", "--action") or index + 1 >= len(argv):
+        if option not in ("--priority", "--source", "--action", "--text-id", "--value") or index + 1 >= len(argv):
             return None
         value = argv[index + 1]
         if option == "--priority":
@@ -176,13 +186,39 @@ def parse(argv: list[str]) -> Arguments | None:
             if not value.strip():
                 return None
             source = value
+        elif option == "--text-id":
+            text_id = value
+        elif option == "--value":
+            key, separator, item = value.partition("=")
+            if not separator or key in values:
+                return None
+            values[key] = item
         else:
             action = value
         index += 2
+    session: NotificationSession = NO_SESSION_LINE
     positionals = argv[index:]
+    if text_id:
+        try:
+            rendered = push_texts.render(text_id, **values)
+        except ValueError:
+            return None
+        if positionals or action is not None or no_action:
+            return None
+        source = source or rendered.sender
+        priority = "2" if priority == "2" else {"note": "0", "decision": "1", "blocked": "2"}[rendered.need]
+        action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
+        no_action = action is None
+        positionals = [rendered.title, rendered.body]
+        session = rendered.session
+    elif values:
+        return None
     if len(positionals) != 2 or not all(value.strip() for value in positionals):
         return None
+    if not text_id:
+        session, positionals[1] = split_session(positionals[1])
     return {
+        "session": session,
         "priority": priority,
         "source": source,
         "action": action,
@@ -190,16 +226,17 @@ def parse(argv: list[str]) -> Arguments | None:
         "answerable": answerable,
         "title": positionals[0],
         "message": positionals[1],
+        "text_id": text_id,
     }
 
 
-def trimmed_body(action: UserAction, message: str) -> str:
-    body_limit = max(MESSAGE_MAX - len(first_line(action)) - 1, 0)
+def trimmed_body(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE) -> str:
+    body_limit = max(MESSAGE_MAX - len(first_line(action, session)) - 1, 0)
     return message[:body_limit]
 
 
-def posted_message(action: UserAction, message: str) -> str:
-    return f"{first_line(action)}\n{trimmed_body(action, message)}"
+def posted_message(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE) -> str:
+    return f"{first_line(action, session)}\n{trimmed_body(action, message, session)}"
 
 
 def refuse(source: str, priority: str, title: str, message: str, reason: str) -> int:
@@ -223,20 +260,23 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         return refuse(source, priority, title, message, action.reason)
     if isinstance(action, ActionUnstated):
         return refuse(source, priority, title, message, "no action stated")
-    if isinstance(action, ActionRequired) and len(action.text) > ACTION_TEXT_MAX:
+    action_limit = max(ACTION_TEXT_MAX - len(session_prefix(arguments["session"])), 0)
+    if isinstance(action, ActionRequired) and len(action.text) > action_limit:
         return refuse(source, priority, title, message,
-                      f"--action may hold at most {ACTION_TEXT_MAX} characters")
+                      f"--action may hold at most {action_limit} characters")
+    if len(first_line(action, arguments["session"])) + 1 > MESSAGE_MAX:
+        return refuse(source, priority, title, message, "Session and action exceed the message limit")
     match refused_at(action, int(priority)):
         case ActionRefused(reason):
             return refuse(source, priority, title, message, reason)
         case ActionAllowed():
             pass
     draft = review.Draft(source, priority, title, action,
-                         trimmed_body(action, arguments["message"]),
-                         arguments["answerable"])
+                         trimmed_body(action, arguments["message"], arguments["session"]),
+                         arguments["answerable"], arguments["session"])
     claimed = False
     try:
-        found = review.held_for(source)
+        found = review.NoHold() if arguments["text_id"] else review.held_for(source)
         if isinstance(found, review.LiveHold):
             claimed = review.claim(source)
             if not claimed:
@@ -255,26 +295,35 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         version = review.best_version(draft, outcome)
         if isinstance(outcome, review.Unreviewed):
             detail = "unreviewed: " + outcome.why
-        elif isinstance(outcome, review.Questions):
-            if draft.answerable:
-                try:
-                    review.hold(review.Held(source, time.time(), draft, version, outcome.questions))
-                except (OSError, subprocess.SubprocessError) as error:
-                    detail = f"hold failed: {error}"
-                else:
-                    review.log_review(draft, outcome)
-                    print("pushover: held for review: answer these in a revised push within 5 minutes; " +
-                          "otherwise the reviewer's version is sent:", file=sys.stderr)
-                    for index, question in enumerate(outcome.questions, 1):
-                        print(f"{index}. {question}", file=sys.stderr)
-                    return 4
-            else:
-                detail = "rewritten, script text failed: " + ", ".join(outcome.failed_rules)
+    if isinstance(outcome, review.Questions):
+        outcome = review.Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures)
+    rejected = isinstance(outcome, (review.Failed, review.Withheld))
+    send_anyway = rejected and (priority == "2" or bool(arguments["text_id"]))
+    if send_anyway:
+        if arguments["text_id"]:
+            version = draft
+        detail = "sent despite failed review: " + ", ".join(outcome.failed_rules if isinstance(outcome, (review.Failed, review.Withheld)) else [])
     record: ReviewedPushRecord = {**review.message_record(version)}
+    if arguments["text_id"]:
+        record["text_id"] = arguments["text_id"]
+    if rejected:
+        assert isinstance(outcome, (review.Failed, review.Withheld))
+        record["failed_rules"] = outcome.failed_rules
+        record["findings"] = [{"rule": failure.rule, "quote": failure.quote} for failure in outcome.failures]
+        record["held"] = not send_anyway
+        record["sent_despite_failed_review"] = send_anyway
     if claimed and isinstance(found, review.LiveHold):
         record["held_source"] = source
         record["held_identity"] = review.hold_identity(found.hold)
+    if rejected and not send_anyway and claimed and isinstance(found, review.LiveHold):
+        review.retire_claim(found.hold)
     print("pushover: reviewed JSON: " + json.dumps(record), flush=True)
+    if rejected and not send_anyway:
+        review.log_review(draft, outcome, detail="not sent, failed review", text_id=arguments["text_id"])
+        assert isinstance(outcome, (review.Failed, review.Withheld))
+        why = outcome.why if isinstance(outcome, review.Withheld) else ", ".join(outcome.failed_rules)
+        print("pushover: not sent: " + why, file=sys.stderr)
+        return 6
     if claimed:
         if not isinstance(found, review.LiveHold):
             completion: review.ClaimDelivery = review.ClaimCancelled()
@@ -288,20 +337,36 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     else:
         code = deliver(version, keys_file, post, detail=detail)
     delivery = review.Sent(version) if code == 0 else review.NotSent()
-    review.log_review(draft, outcome, delivery, detail=detail)
+    review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
+    if code == 0 and send_anyway:
+        print("pushover: " + detail)
+        if arguments["text_id"]:
+            request_template_fix(record)
     if code == 0 and isinstance(outcome, (review.Rewritten, review.Questions)):
         print("pushover: sent as rewritten:")
         print(version.title)
-        print(first_line(version.action))
+        print(first_line(version.action, version.session))
         print(version.body)
     return code
+
+
+def request_template_fix(record: ReviewedPushRecord) -> None:
+    """Direct timer callers use the sender's daily repair-notice handler too."""
+    sender = Path(__file__).resolve().parents[1] / "message/send.py"
+    try:
+        _ = subprocess.Popen([sys.executable, str(sender), "template-fix", json.dumps(record)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as error:
+        print(f"pushover: template fix notice failed: {error}", file=sys.stderr)
+        log("template fix", "0", record["title"], record["body"], f"notice failed: {error}")
 
 
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             post: Post = http_post, *, detail: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again."""
     source, priority, title = draft.source, draft.priority, draft.title
-    message = posted_message(draft.action, draft.body)
+    message = posted_message(draft.action, draft.body, draft.session)
     suffix = f", {detail}" if detail else ""
     keys = read_keys(keys_file)
     if keys is None:

@@ -39,9 +39,12 @@ DIMENSIONS = {
         Dimension("effort", "coalesce(t.effort, 'unreported')"),
         Dimension("machine", "t.machine"),
         Dimension("unit", "coalesce(u.unit, 'unknown')"),
+        Dimension("activity", "t.activity"),
     )
 }
 ALL_DIMENSIONS = tuple(DIMENSIONS.values())
+# An outcome taken from a thread's turn context has no request activity of its own.
+CONTEXT_DIMENSIONS = tuple(dimension for dimension in ALL_DIMENSIONS if dimension.name != "activity")
 RUN_DIMENSIONS = tuple(DIMENSIONS[name] for name in ("day", "machine", "unit"))
 
 
@@ -94,7 +97,7 @@ OUTCOMES = {
                 ORDER BY p.at, p.rowid LIMIT 1))
             LEFT JOIN folders f ON (f.machine, f.family, f.parent_id, f.agent_id)
                 = (c.machine, c.family, c.parent_id, c.agent_id)
-        """, ALL_DIMENSIONS),
+        """, CONTEXT_DIMENSIONS),
         QueryOutcome("compaction_reread", """
             SELECT t.at, t.machine, f.folder, t.role, t.lens, t.lens_state, t.attribution,
                    t.model, t.effort,
@@ -113,8 +116,8 @@ OUTCOMES = {
             LEFT JOIN (
         """ + weights.sql_weights("t.model", "t.at").entries + ") w ON w.weight_entry = "
             + weights.sql_weights("t.model", "t.at").active_entry,
-            ALL_DIMENSIONS, "coalesce(sum(t.reread_weighted), 0)", "t.attribution = 'recorded'"),
-        TurnGroupOutcome("threads", ALL_DIMENSIONS,
+            CONTEXT_DIMENSIONS, "coalesce(sum(t.reread_weighted), 0)", "t.attribution = 'recorded'"),
+        TurnGroupOutcome("threads", CONTEXT_DIMENSIONS,
                          "count(DISTINCT json_array(machine, family, parent_id, agent_id))"),
         QueryOutcome("account_switches", """
             SELECT at, machine FROM (
@@ -150,6 +153,7 @@ class TurnValue(Enum):
     OUTPUT = "output"
     WEIGHTED = "weighted"
     OUTPUT_WEIGHTED = "output_weighted"
+    CACHE_READ_WEIGHTED = "cache_read_weighted"
     TURNS = "turns"
 
 
@@ -165,7 +169,8 @@ class TurnSum:
 
     @property
     def weighted(self) -> bool:
-        return any(value in (TurnValue.WEIGHTED, TurnValue.OUTPUT_WEIGHTED) for value in self.values)
+        return any(value in (TurnValue.WEIGHTED, TurnValue.OUTPUT_WEIGHTED, TurnValue.CACHE_READ_WEIGHTED)
+                   for value in self.values)
 
     @property
     def expression(self) -> str:
@@ -223,6 +228,13 @@ METRICS = {
                OutcomeCount(OUTCOMES["review_rounds"]), ReportFormat.RATE),
         Metric("account_switches", "Account switches", OutcomeCount(OUTCOMES["account_switches"]),
                format=ReportFormat.COUNT),
+        Metric("wait_share", "Share of weighted tokens spent on requests that only waited",
+               TurnSum("wait", (TurnValue.WEIGHTED,), condition="activity = 'wait'"), WEIGHTED, ReportFormat.SHARE),
+        Metric("status_share", "Share of weighted tokens spent on requests that only posted a status",
+               TurnSum("status", (TurnValue.WEIGHTED,), condition="activity = 'status'"), WEIGHTED,
+               ReportFormat.SHARE),
+        Metric("context_share", "Cache reads at their weight as a share of weighted tokens",
+               TurnSum("cache_read_weighted", (TurnValue.CACHE_READ_WEIGHTED,)), WEIGHTED, ReportFormat.SHARE),
     )
 }
 
@@ -270,39 +282,49 @@ class UnitWorktree:
     worktree: Path
 
 
-def unit_worktrees(production_docs: Path) -> tuple[UnitWorktree, ...]:
+def document_units(path: Path) -> tuple[UnitWorktree, ...]:
+    """The rows of one production doc's `## Units` table that name a unit and its worktree."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ()
     found: list[UnitWorktree] = []
-    for document in sorted(production_docs.glob("*-production.md")):
-        try:
-            lines = document.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
+    in_units = False
+    headings: list[str] = []
+    for line in lines:
+        if line.strip() == "## Units":
+            in_units = True
             continue
-        in_units = False
-        headings: list[str] = []
-        for line in lines:
-            if line.strip() == "## Units":
-                in_units = True
-                continue
-            if not in_units:
-                continue
-            if line.startswith("## "):
+        if not in_units:
+            continue
+        if line.startswith("## "):
+            break
+        if not line.lstrip().startswith("|"):
+            if headings:
                 break
-            if not line.lstrip().startswith("|"):
-                if headings:
-                    break
-                continue
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-            if not headings:
-                headings = cells
-                continue
-            if all(set(cell) <= {"-", ":", " "} for cell in cells):
-                continue
-            row = dict(zip(headings, cells, strict=False))
-            unit = outcomes.cell_value(row.get("Unit", ""))
-            worktree = outcomes.cell_value(row.get("Worktree", ""))
-            if unit and worktree:
-                found.append(UnitWorktree(unit, Path(worktree).expanduser()))
-    return tuple(sorted(found, key=lambda row: len(row.worktree.parts), reverse=True))
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not headings:
+            headings = cells
+            continue
+        if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            continue
+        row = dict(zip(headings, cells, strict=False))
+        unit = outcomes.cell_value(row.get("Unit", ""))
+        worktree = outcomes.cell_value(row.get("Worktree", ""))
+        if unit and worktree:
+            found.append(UnitWorktree(unit, Path(worktree).expanduser()))
+    return tuple(found)
+
+
+def longest_first(worktrees: Iterable[UnitWorktree]) -> tuple[UnitWorktree, ...]:
+    """Order worktrees so a nested one is tried before the one containing it."""
+    return tuple(sorted(worktrees, key=lambda row: len(row.worktree.parts), reverse=True))
+
+
+def unit_worktrees(production_docs: Path) -> tuple[UnitWorktree, ...]:
+    return longest_first(row for document in sorted(production_docs.glob("*-production.md"))
+                         for row in document_units(document))
 
 
 def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...]) -> None:
@@ -441,7 +463,7 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
     predicate, parameters = request.window.predicate("t.at")
     exact = " AND t.attribution = 'recorded'" if request.exact else ""
     raw_columns = [*("t." + column for column in AGENT_COLUMNS), "t.attribution", "t.model",
-                   "t.role", "t.lens", "t.lens_state", "t.before_first_edit"]
+                   "t.role", "t.lens", "t.lens_state", "t.before_first_edit", "t.activity"]
     if DIMENSIONS["effort"] in dimensions:
         raw_columns.append("t.effort")
     if DIMENSIONS["day"] in dimensions:
@@ -461,13 +483,17 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
     normalized = [f"{dimension.expression} AS {dimension.name}" for dimension in dimensions]
     normalized.extend("t." + column for column in AGENT_COLUMNS
                       if column != "machine" or DIMENSIONS["machine"] not in dimensions)
+    if DIMENSIONS["activity"] not in dimensions:
+        normalized.append("t.activity")
     normalized.extend(["t.attribution", "t.weight_entry", "t.before_first_edit",
                        "e.first_edit IS NOT NULL AS edited", *("t." + column for column in TOKEN_CLASSES)])
     if DIMENSIONS["unit"] in dimensions:
         normalized.append("f.folder")
-    output_weighted = "CASE WHEN w.weight_entry IS NULL THEN NULL ELSE t.output * w.output END"
-    ctes.append(f"turn_groups AS MATERIALIZED (SELECT {', '.join(normalized)}, t.turns, "
-                + f"{weighted_sql('t')} AS weighted, {output_weighted} AS output_weighted "
+    weighted_parts = (f"{weighted_sql('t')} AS weighted, "
+                      + "CASE WHEN w.weight_entry IS NULL THEN NULL ELSE t.output * w.output END AS output_weighted, "
+                      + "CASE WHEN w.weight_entry IS NULL THEN NULL ELSE t.cache_read * w.cached END "
+                      + "AS cache_read_weighted")
+    ctes.append(f"turn_groups AS MATERIALIZED (SELECT {', '.join(normalized)}, t.turns, {weighted_parts} "
                 + f"FROM turn_grain t{lookup_joins} LEFT JOIN weight_entries w ON w.weight_entry = t.weight_entry)")
     for outcome in outcomes.values():
         if isinstance(outcome, TurnGroupOutcome):
@@ -480,7 +506,7 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
     if general:
         # An arbitrary aggregate always receives individual turns and every relation column.
         individual = [*("t." + column for column in AGENT_COLUMNS), "t.at", "t.attribution", "t.model",
-                      "t.role", "t.lens", "t.lens_state", "t.effort", "t.before_first_edit",
+                      "t.role", "t.lens", "t.lens_state", "t.effort", "t.before_first_edit", "t.activity",
                       *(f"CAST(t.{column} AS REAL) AS {column}" for column in TOKEN_CLASSES),
                       weight_sql.active_entry + " AS weight_entry", day_sql("t", offsets) + " AS day"]
         predicate, bounds = request.window.predicate("t.at")
@@ -488,14 +514,13 @@ def turn_relation(db: sqlite3.Connection, request: ReportRequest) -> tuple[str, 
                     + f"WHERE {predicate}{exact})")
         parameters = (*parameters, *bounds)
         ctes.append(f"turn_relation AS MATERIALIZED (SELECT {', '.join(normalized)}, t.at, 1 AS turns, "
-                    + f"{weighted_sql('t')} AS weighted, {output_weighted} AS output_weighted "
-                    + f"FROM individual_counts t{lookup_joins} LEFT JOIN weight_entries w ON w.weight_entry = t.weight_entry)")
-        coverage_columns = [dimension.name for dimension in dimensions] + ["attribution", "weight_entry", "edited", "before_first_edit"]
+                    + f"{weighted_parts} FROM individual_counts t{lookup_joins} LEFT JOIN weight_entries w ON w.weight_entry = t.weight_entry)")
+        coverage_columns = list(dict.fromkeys([*(dimension.name for dimension in dimensions), "attribution",
+                                               "weight_entry", "edited", "before_first_edit", "activity"]))
         summed = [*coverage_columns, "count(*) AS turns", *(f"total({column}) AS {column}" for column in TOKEN_CLASSES)]
         ctes.append(f"coverage_counts AS MATERIALIZED (SELECT {', '.join(summed)} FROM turn_relation "
                     + f"WHERE {turn_scope(request.metric)} GROUP BY {', '.join(coverage_columns)})")
-        ctes.append(f"turn_totals AS MATERIALIZED (SELECT t.*, {weighted_sql('t')} AS weighted, "
-                    + f"{output_weighted} AS output_weighted FROM coverage_counts t "
+        ctes.append(f"turn_totals AS MATERIALIZED (SELECT t.*, {weighted_parts} FROM coverage_counts t "
                     + "LEFT JOIN weight_entries w ON w.weight_entry = t.weight_entry)")
     else:
         ctes.append("turn_totals AS MATERIALIZED (SELECT * FROM turn_groups WHERE " + turn_scope(request.metric) + ")")
@@ -596,6 +621,8 @@ def report_data(db: sqlite3.Connection, request: ReportRequest) -> dict[str, lis
                     "GROUP BY model ORDER BY model"),
         ReportQuery("review", ("turns",), "SELECT coalesce(sum(turns), 0) AS turns FROM turn_totals WHERE " +
                     "role = 'review' AND lens = 'unrecorded'"),
+        ReportQuery("unclassified", ("turns",), "SELECT coalesce(sum(turns), 0) AS turns FROM turn_totals WHERE " +
+                    "activity = 'unclassified'"),
     ))
     for side in metric_sides(request.metric):
         if isinstance(side, OutcomeCount) and DIMENSIONS["unit"] in side.outcome.dimensions:
@@ -748,6 +775,7 @@ def coverage(request: ReportRequest, data: dict[str, list[dict[str, object]]]) -
     else:
         lines.extend(["Unweighted: none", ""])
     lines.append(f"Review turns with unrecorded lens: {data['review'][0]['turns']}.")
+    lines.append(f"Turns with unclassified activity: {data['unclassified'][0]['turns']}.")
     for side in metric_sides(request.metric):
         if not isinstance(side, OutcomeCount) or DIMENSIONS["unit"] not in side.outcome.dimensions:
             continue

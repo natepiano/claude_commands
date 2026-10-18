@@ -22,16 +22,19 @@ import asyncio
 import base64
 import binascii
 import http.client
+import hashlib
 import json
 import os
 import math
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
@@ -71,67 +74,154 @@ class StoredCodexAccount(TypedDict):
 
 
 def codex_account(home: Path) -> RefusingCodexAccount:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import read_notes
 
     login = codex_email_on_disk(home)
     if not login:
         return UnknownCodexAccount(home, "the home's sign-in cannot be read")
-    notes = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    for path in sorted(notes.glob("*.md")):
-        if not path.stem.casefold().startswith("codex"):
-            continue
-        note = read_note(path)
-        if note is not None and (note.get("login") or "").casefold() == login.casefold():
-            return KnownCodexAccount(home, login, path.stem)
+    for note in read_notes():
+        if note.tool == "codex" and (note.get("login") or "").casefold() == login.casefold():
+            return KnownCodexAccount(home, login, note.label)
     return UnknownCodexAccount(home, "the signed-in account has no named note")
 
 
+@dataclass(frozen=True)
+class CreditsOn:
+    """This account may pay for work after its allowance is used."""
+    warning: str = ""
+
+
+@dataclass(frozen=True)
+class CreditsOff:
+    """Only this account's included allowance may pay for work."""
+
+
+CodexCreditsSetting = CreditsOn | CreditsOff
+
+
+def codex_credits_setting(label: str) -> CodexCreditsSetting:
+    from scripts.whoami.note_file import Note, note_path, read_note
+
+    try:
+        path = note_path(label)
+    except ValueError:
+        # An unnamed home's display label has no account note or explicit setting.
+        return CreditsOn()
+    note = read_note(path)
+    value = note.get("use_credits") if isinstance(note, Note) else None
+    if value == "off":
+        return CreditsOff()
+    if value is None or value == "on":
+        return CreditsOn()
+    return CreditsOn(f"{label}: use_credits must be on or off; reading it as on")
+
+
+@dataclass(frozen=True)
+class CodexHomeHoldingLogin:
+    label: str
+    home: Path
+    login: str
+
+
+@dataclass(frozen=True)
+class CodexSetupHome:
+    """No existing home holds this account's login yet."""
+    label: str
+    home: Path
+
+
+def codex_account_home(label: str) -> CodexHomeHoldingLogin | CodexSetupHome:
+    from scripts.whoami.note_file import Note, NumberedAccountLabel, parse_account_label, note_path, read_note
+
+    parsed = parse_account_label(label)
+    if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
+        raise ValueError(f"accounts: {label} is not a codexN label")
+    label = parsed.label
+    note = read_note(note_path(label))
+    login = (note.get("login") or "") if isinstance(note, Note) else ""
+    if login:
+        for home in codex_homes(Path.home() / ".codex"):
+            if home.is_symlink() or (home / "auth.json").is_symlink():
+                continue
+            held = codex_email_on_disk(home)
+            if held and held.casefold() == login.casefold():
+                return CodexHomeHoldingLogin(label, home, held)
+    return CodexSetupHome(label, Path.home() / f".codex{parsed.number}")
+
+
 def codex_home_role_label(home: Path) -> str:
-    """The seats command's label for a default or numbered home."""
-    return "default" if home == Path.home() / ".codex" else f"codex {home.name.removeprefix('.codex')}"
+    """A signed-in account's note number, or its folder when unnamed."""
+    identity = codex_account(home)
+    return identity.label if isinstance(identity, KnownCodexAccount) else codex_home_display(home)
+
+
+def codex_home_matches_label(home: Path, label: str) -> bool:
+    """Match only a numbered account label to the home holding its login."""
+    from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
+
+    parsed = parse_account_label(label)
+    if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
+        return False
+    return (parsed.label == codex_home_role_label(home)
+            or codex_account_home(parsed.label).home == home)
 
 
 ClaudeRole = Literal["showrunners", "unit directors"]
 
 
 @dataclass(frozen=True)
-class KnownClaudeAccount:
-    """The login and note label stored for a readable Claude directory."""
+class NumberedAccount:
+    """A readable login with an account note, fit to name a destination."""
 
-    login: str
     label: str
+    home: Path
+    login: str
 
 
 @dataclass(frozen=True)
-class UnreadableClaudeAccount:
-    """A directory with no readable logged-in Claude identity."""
+class UnnotedLogin:
+    """A signed-in home whose login has no numbered account note."""
+
+    home: Path
+    login: str
+
+
+@dataclass(frozen=True)
+class UnreadableIdentity:
+    """A home whose signed-in identity cannot be read."""
+
+    home: Path
+    reason: str
+
+
+AccountIdentity = NumberedAccount | UnnotedLogin | UnreadableIdentity
 
 
 @dataclass(frozen=True)
 class CheckedNamedClaudeAccount:
-    """A named directory fit to read, with its resolved login and note label."""
+    """A named directory fit to read, with its numbered identity."""
 
     label: str
     directory: Path
-    identity: KnownClaudeAccount
+    identity: NumberedAccount
 
 
 @dataclass(frozen=True)
 class ClaudeAccountsInUse:
     """One run's readable accounts and local sessions' logins."""
 
-    default_account: KnownClaudeAccount | UnreadableClaudeAccount
+    home_directory_account: AccountIdentity
     multiple_accounts: bool
     named_accounts: tuple[CheckedNamedClaudeAccount, ...]
     live_logins: frozenset[str]
     live_directories: tuple[Path, ...] = ()
 
-    def is_default_login(self, login: str) -> bool:
-        return (isinstance(self.default_account, KnownClaudeAccount)
-                and login.casefold() == self.default_account.login.casefold())
+    def is_home_directory_login(self, login: str) -> bool:
+        return (isinstance(self.home_directory_account, (NumberedAccount, UnnotedLogin))
+                and login.casefold() == self.home_directory_account.login.casefold())
 
     def is_in_use(self, login: str) -> bool:
-        return self.is_default_login(login) or login.casefold() in self.live_logins
+        return self.is_home_directory_login(login) or login.casefold() in self.live_logins
 
 
 WEEK_MINUTES = 7 * 24 * 60
@@ -202,6 +292,16 @@ class CodexStartupFailure:
 CodexStartupStatus = NoCodexStartupFailure | CodexStartupFailure
 
 
+@dataclass(frozen=True)
+class StaleTokenSkip:
+    """The weekly read was skipped because only a Claude session can renew the login."""
+
+
+@dataclass(frozen=True)
+class NoWeeklyReadSkip:
+    """The read was not skipped for an expired login token."""
+
+
 @dataclass
 class Report:
     """One tool's account. `problem` replaces the account lines; `quota_problem` follows them."""
@@ -221,6 +321,7 @@ class Report:
     credit_balance: str | None = None
     source: ClaudeDirectorySource | CodexHomeSource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
     codex_startup: CodexStartupStatus = field(default_factory=NoCodexStartupFailure)
+    weekly_read_skip: StaleTokenSkip | NoWeeklyReadSkip = field(default_factory=NoWeeklyReadSkip)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -380,6 +481,25 @@ def claude_config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
 
+def claude_config_value(folder: Path) -> str:
+    """The exact directory value passed to Claude Code when selecting a folder."""
+    return str(folder)
+
+
+def claude_keychain_service(config_dir: Path | None = None) -> str:
+    """Claude Code's service for the selected folder, without reading its entry."""
+    if config_dir is None:
+        value = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not value:
+            return "Claude Code-credentials"
+    elif config_dir == Path.home() / ".claude":
+        return "Claude Code-credentials"
+    else:
+        value = claude_config_value(config_dir)
+    digest = hashlib.sha256(unicodedata.normalize("NFC", value).encode("utf-8")).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
 def claude_config_file(config_dir: Path | None = None) -> Path:
     """Claude Code's `.claude.json`: inside CLAUDE_CONFIG_DIR when set, else in home."""
     if config_dir is not None:
@@ -395,22 +515,46 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 
 
-def seats_home() -> Path:
-    """Resolve the shared seats role without using this process's CODEX_HOME."""
-    path = Path.home() / ".claude" / "config" / "accounts.json"
+def workers_home() -> Path:
+    """Resolve only the authoritative workers account, never the caller's home."""
+    from scripts.accounts.role_map import read_role_map, RoleAccountUnavailable
+
+    label = read_role_map().workers
+    if not label:
+        raise RoleAccountUnavailable("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
+    if label == "default":
+        # Read old explicit selections without inventing a missing selection.
+        label = codex_home_role_label(Path.home() / ".codex")
     try:
-        decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return Path.home() / ".codex"
-    if not isinstance(decoded, dict):
-        raise ValueError(f"accounts: {path} must contain an object")
-    values = cast(dict[str, object], decoded)
-    if "seats" not in values:
-        return Path.home() / ".codex"
-    label = values["seats"]
-    if not isinstance(label, str) or re.fullmatch(r"codex [1-9][0-9]*", label) is None:
-        raise ValueError(f"accounts: {path} has an invalid seats account")
-    return Path.home() / f".codex{label.removeprefix('codex ')}"
+        selected = codex_account_home(label)
+    except ValueError as error:
+        raise RoleAccountUnavailable(str(error)) from error
+    if isinstance(selected, CodexHomeHoldingLogin):
+        return selected.home
+    state = "not logged in" if selected.home.is_dir() else "not set up"
+    step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
+            else f"run accounts.py setup {label}")
+    raise RoleAccountUnavailable(f"accounts: workers is on {label}, which is {state} on this machine; {step}")
+
+
+@dataclass(frozen=True)
+class NoWorkersHome:
+    reason: str
+
+
+def observe_workers_home() -> Path | NoWorkersHome:
+    """Observe a mapped home even when signed out; never choose a replacement."""
+    from scripts.accounts.role_map import read_role_map
+
+    try:
+        label = read_role_map().workers
+        if not label:
+            return NoWorkersHome("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
+        if label == "default":
+            label = codex_home_role_label(Path.home() / ".codex")
+        return codex_account_home(label).home
+    except ValueError as error:
+        return NoWorkersHome(str(error))
 
 
 def codex_home_display(home: Path) -> str:
@@ -421,7 +565,7 @@ def codex_home_display(home: Path) -> str:
     return f"~/{home.relative_to(user_home)}" if home.is_relative_to(user_home) else str(home)
 
 
-def codex_homes(seats_home: Path) -> list[Path]:
+def codex_homes(workers_home: Path | NoWorkersHome) -> list[Path]:
     """The default home, existing numbered homes, and any other home in use."""
     default = Path.home() / ".codex"
     numbered: list[tuple[int, Path]] = []
@@ -433,18 +577,18 @@ def codex_homes(seats_home: Path) -> list[Path]:
     except OSError:
         pass
     homes = [default, *(home for _, home in sorted(numbered))]
-    if seats_home not in homes:
-        homes.append(seats_home)
+    if isinstance(workers_home, Path) and workers_home not in homes:
+        homes.append(workers_home)
     return homes
 
 
-def codex_report_in_use(report: Report, seats_home: Path) -> bool:
-    """Select the seats' home; an older report without a source needs a single home."""
-    if report.tool.lower() != "codex":
+def codex_report_in_use(report: Report, workers_home: Path | NoWorkersHome) -> bool:
+    """Select the workers' home; an older report without a source needs a single home."""
+    if report.tool.lower() != "codex" or isinstance(workers_home, NoWorkersHome):
         return False
     if isinstance(report.source, CodexHomeSource):
-        return report.source.home == seats_home
-    return isinstance(report.source, AccountSourceUnspecified) and len(codex_homes(seats_home)) == 1
+        return report.source.home == workers_home
+    return isinstance(report.source, AccountSourceUnspecified) and len(codex_homes(workers_home)) == 1
 
 
 @dataclass(frozen=True)
@@ -467,18 +611,18 @@ class CodexWorkUnknown:
 CodexWorkReadiness = CodexWorkAvailable | CodexWorkExhausted | CodexWorkUnknown
 
 
-def codex_can_work(report: Report, now: datetime) -> CodexWorkReadiness:
+def codex_can_work(report: Report, now: datetime, credits: CodexCreditsSetting) -> CodexWorkReadiness:
     """Decide from this live reading; an expired window supplies no allowance."""
     if report.problem or report.tool.lower() != "codex":
         return CodexWorkUnknown(report.problem or "not a Codex reading")
-    credits = report.credit_balance
-    if credits == "unlimited":
+    balance_text = report.credit_balance
+    if isinstance(credits, CreditsOn) and balance_text == "unlimited":
         return CodexWorkAvailable()
     try:
-        balance = float(credits) if credits is not None else math.nan
+        balance = float(balance_text) if balance_text is not None else math.nan
     except ValueError:
         balance = math.nan
-    if math.isfinite(balance) and balance > 0:
+    if isinstance(credits, CreditsOn) and math.isfinite(balance) and balance > 0:
         return CodexWorkAvailable()
     weekly = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
     windows = (report.five_hour, weekly)
@@ -488,7 +632,7 @@ def codex_can_work(report: Report, now: datetime) -> CodexWorkReadiness:
             return CodexWorkUnknown("current 5-hour and weekly usage is unavailable; refresh and try again")
     if all(window is not None and (window.remaining_percent or 0) > 0 for window in windows):
         return CodexWorkAvailable()
-    if credits == "null" or math.isfinite(balance) and balance == 0:
+    if isinstance(credits, CreditsOff) or balance_text == "null" or math.isfinite(balance) and balance == 0:
         return CodexWorkExhausted()
     return CodexWorkUnknown("credit balance is unavailable; refresh and try again")
 
@@ -500,13 +644,12 @@ def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
     path = (claude_config_dir() if config_dir is None else config_dir) / ".credentials.json"
     if path.exists():
         return cast(ClaudeCredentials, json.loads(path.read_text()))
-    # Claude Code uses the macOS login keychain for its default configuration.
-    if sys.platform == "darwin" and (
-        config_dir == Path.home() / ".claude"
-        or (config_dir is None and "CLAUDE_CONFIG_DIR" not in os.environ)
-    ):
-        return cast(ClaudeCredentials, command_json(
-            "security", "find-generic-password", "-s", "Claude Code-credentials", "-w"))
+    if sys.platform == "darwin":
+        try:
+            return cast(ClaudeCredentials, command_json(
+                "security", "find-generic-password", "-s", claude_keychain_service(config_dir), "-w"))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            raise RuntimeError("usage credentials unavailable") from error
     raise RuntimeError("usage credentials unavailable")
 
 
@@ -543,7 +686,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
         else:
             environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
             if config_dir != Path.home() / ".claude":
-                environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
+                environment["CLAUDE_CONFIG_DIR"] = claude_config_value(config_dir)
             status = command_json("claude", "auth", "status", environment=environment)
         account = cast(ClaudeAuthStatus, status)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
@@ -566,6 +709,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
             # Only a Claude session refreshes a stored token, so an idle account's goes stale.
             # The service answers a stale one with 429 or 401; asking with it only adds refused calls.
             if token and isinstance(expires, int) and expires / 1000 <= time.time():
+                report.weekly_read_skip = StaleTokenSkip()
                 report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
                 return report
         if not token:
@@ -861,7 +1005,7 @@ async def codex_live(home: Path) -> Report:
         numbered = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
         if not initialized and home.parent == Path.home() and numbered is not None:
             report.codex_startup = CodexStartupFailure(
-                home, f'/showrunner:accounts setup "codex {numbered.group(1)}"',
+                home, f"/showrunner:accounts setup codex{numbered.group(1)}",
             )
             report.problem = report.codex_startup.problem
         elif report.email is None:
@@ -899,13 +1043,15 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports(selection: ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
+async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[Report]:
     """Live Claude directories and every Codex home, fetched concurrently."""
-    homes = codex_homes(seats_home)
+    homes = codex_homes(workers_home)
     directories = list(dict.fromkeys([
-        Path.home() / ".claude", *(named.directory for named in selection.named_accounts),
+        *(named.directory for named in selection.named_accounts),
         *selection.live_directories,
     ]))
+    if claude_on_disk(Path.home() / ".claude").email and Path.home() / ".claude" not in directories:
+        directories.append(Path.home() / ".claude")
     return list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
         *(codex_live(home) for home in homes),

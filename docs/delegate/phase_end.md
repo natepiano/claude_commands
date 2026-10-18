@@ -11,14 +11,26 @@ Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
 `commands/plan/phase_review.md`.
 
 <PhaseEnd>
+Standing plans (`**Standing:** style_plan.py`) run <StandingPlanRefill/> at the
+next boundary instead of closing, even with no todo phase. Skip step 7 (shrink,
+shrink commit and notice); never stage, commit or shrink the excluded plan or
+pinned rule files. A no-change ticket follows <CheckpointCommit/> step 6's
+ancestry-checked HEAD path with no code commit, push or merge request, then
+refills; other tickets checkpoint the code commit before marking the phase done.
+
 Run these steps in order for each completed loop or verbose phase:
 
 1. **Code commit.** Run <CheckpointCommit/> for the phase's code, tests, and
    plan doc with `status: done` and its Work Order still in place. Its
    reservation release, <PushCheckpoint/>, `review-trial` line and
    `phase_table.py parallel` line happen here.
-2. **Code ready notice.** Send <ProductionUnit/> item 3's checkpoint notice.
-   Its hash is mergeable now; `Phase <next> ETA` counts from this commit.
+2. **Code ready notice.** Before sending <ProductionUnit/> item 3's checkpoint
+   notice, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
+   `<HH:MM>` means today in the user's zone; an ETA on a later day takes
+   `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed. Its hash is
+   mergeable now;
+   `Phase <next> ETA` counts from this commit.
    Outside a production, report
    `Checkpoint <short hash> — phase N: <title>.`.
 3. **Plan review.** Run <RunPhaseReview/> before the next phase's Work Order is
@@ -26,28 +38,28 @@ Run these steps in order for each completed loop or verbose phase:
    inserted next under `/plan:to_phased_plan` → <PhaseNumbering/> and runs next.
    A source-comment edit made by the review stays in the tree for the next
    phase's checkpoint commit; with no todo phase left, <FinalGateCommit/>
-   carries it.
+   carries it. The review launches with `--phase <id>`, which needs the phase
+   open: its `finish-phase` in step 5 waits until this review has finished,
+   also beside a running phase.
 4. **Add-on check.** Run <ConsiderNextItems/>.
 5. **Worker cleanup and completion.** Run the worker half of <PhaseCleanup/>:
-   `remove_seats.py`, helpers, launchers, and apps. Run it before the next
-   launch. Per <LongLivedSeats/>, Codex turns finish but their threads remain
-   open until `end_session.sh`; Claude seats keep their existing cleanup.
-   When the production doc names a review pool, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py end-lease --production <slug> --unit <unit> --phase <phase>`
-   in this worker cleanup. Then
+   `remove_workers.py`, helpers, launchers, and apps. Run it before the next
+   launch. Per <LongLivedWorkers/>, Codex turns finish but their threads remain
+   open until `end_session.sh`; Claude workers keep their existing cleanup.
+   A pooled reviewer belongs to the unit, not the phase, and stays. Then
    run <RecordPhaseCompletion/>, including `finish-phase` and deletion of the
    inactive reservation state file before the next phase writes its own.
 6. **Next launch.** In loop mode or an active auto window with a next phase,
    run <NextPhase/> through that phase's <LaunchImplementation/>. The review has
-   settled its Work Order; the phase's seats do not edit the plan doc.
-7. **Shrink beside the seats.** Open a `progress_history.py` activity labelled
+   settled its Work Order; the phase's workers do not edit the plan doc.
+7. **Shrink beside the workers.** Open a `progress_history.py` activity labelled
    `shrink`. In an enrolled repository, make the shrink's first plan-doc
    write with the Edit tool, so the edit hook claims the plan doc for the
    running phase's reservation; a write from a script is never claimed. Run
    <RunPhaseShrink/> on the completed phase, then <ShrinkCommit/>,
    then <ProductionUnit/> item 3's shrink notice when applicable. Run the
    review-prose half of <PhaseCleanup/> (`clear_phase_review.sh`), close the
-   activity with `--status completed`, and, when seats are running, end the
+   activity with `--status completed`, and, when workers are running, end the
    turn holding on them. <DispatchContract/> allows this synchronous work after
    launch besides the main review.
 
@@ -60,7 +72,7 @@ When a todo phase remains but verbose mode is outside an auto window, run step
 `continue` or a new auto control.
 
 A failed structural check in <RunPhaseShrink/> blocks only <ShrinkCommit/>.
-Close the activity with `--status error`, keep the seats running and the review
+Close the activity with `--status error`, keep the workers running and the review
 prose intact, and repair the shrink before the next checkpoint. That checkpoint
 refuses an earlier `done` phase with a Work Order. The shrink owns no
 reservation and never releases the next phase's.

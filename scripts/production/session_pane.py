@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""Read or send input to a production unit or live Claude session on either host."""
+"""Read or send input to a production unit or live Claude session in herdr."""
 from __future__ import annotations
 
-import os
-import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -12,86 +9,35 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "message"))
 import herdr  # noqa: E402
-from herdr import AgentBlocked, Herdr, HerdrPlace  # noqa: E402
+from herdr import AgentBlocked, Herdr  # noqa: E402
 from herdr import HerdrFailure as HerdrFailure  # noqa: E402
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from unit_lookup import Place, TmuxPlace, marked_units, sessions_dir, tmux_binary  # noqa: E402
+from unit_lookup import Place, marked_unit, sessions_dir  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <slug> <unit>|session <id>> "
          "[--lines N --joined --ansi | <text> | <key>...]")
-
-
-class TmuxFailure(OSError):
-    """The tmux host could not complete the requested pane operation."""
 
 
 class NoSuchTarget(Exception):
     """No live session or marked unit identifies the requested pane."""
 
 
-def _tmux(*arguments: str) -> str:
-    try:
-        result = subprocess.run([tmux_binary(), *arguments], capture_output=True, text=True,
-                                check=False, timeout=10)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise TmuxFailure(f"tmux: {error}") from error
-    if result.returncode:
-        raise TmuxFailure(f"tmux: {result.stderr.strip() or f'exit {result.returncode}'}")
-    return result.stdout
-
-
-def _trim_tmux_output(text: str, lines: int, *, ansi: bool) -> str:
-    """Discard screen padding before retaining the requested written rows."""
-    rows = text.split("\n")
-    while rows:
-        last = rows[-1]
-        if ansi:
-            # CSI, OSC and other ESC sequences affect presentation, not row content.
-            last = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]*[@-~])", "", last)
-        if last.strip():
-            break
-        _ = rows.pop()
-    return "\n".join(rows[-lines:]) + "\n" if rows else ""
-
-
 def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: bool = False) -> str:
     if lines <= 0:
         raise ValueError("lines must be positive")
-    if isinstance(place, HerdrPlace):
-        return Herdr(place.session).read(place.pane, lines, joined=joined, ansi=ansi)
-    options = ["capture-pane", "-p"]
-    if joined:
-        options.append("-J")
-    if ansi:
-        options.append("-e")
-    captured = _tmux(*options, "-S", f"-{lines}", "-t", place.pane)
-    return _trim_tmux_output(captured, lines, ansi=ansi)
+    return Herdr(place.session).read(place.pane, lines, joined=joined, ansi=ansi)
 
 
 def type_place(place: Place, text: str) -> None:
-    if isinstance(place, HerdrPlace):
-        Herdr(place.session).prompt(place.pane, text)
-    else:
-        _ = _tmux("send-keys", "-t", place.pane, "-l", text)
-        _ = _tmux("send-keys", "-t", place.pane, "Enter")
+    Herdr(place.session).prompt(place.pane, text)
 
 
 def keys_place(place: Place, *keys: str) -> None:
-    if isinstance(place, HerdrPlace):
-        Herdr(place.session).send_keys(place.pane, *keys)
-    else:
-        _ = _tmux("send-keys", "-t", place.pane, *keys)
+    Herdr(place.session).send_keys(place.pane, *keys)
 
 
 def where_place(place: Place) -> str:
-    return (f"herdr:{place.session}:{place.pane}" if isinstance(place, HerdrPlace)
-            else f"tmux:{place.pane}")
-
-
-def _session_environment(pid: int) -> dict[str, str]:
-    process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
-    entries = process.joinpath("environ").read_bytes().decode(errors="replace").split("\0")
-    return dict(entry.split("=", 1) for entry in entries if "=" in entry)
+    return f"herdr:{place.session}:{place.pane}"
 
 
 def session_place(session_id: str) -> Place:
@@ -109,20 +55,14 @@ def session_place(session_id: str) -> Place:
         if unread:
             raise OSError("one or more session records could not be read")
         raise NoSuchTarget(session_id)
-    record = max(records, key=lambda record: record["updatedAt"])
-    if sys.platform == "darwin":
-        # ps combines argv and environment without a reliable boundary. The live
-        # registry's pane id stays true when its recorded tmux session name changes.
-        pane = record["tmux"].rpartition(".")[2]
-        if re.fullmatch(r"%[0-9]+", pane):
-            return TmuxPlace(pane)
-    else:
-        environment = _session_environment(record["pid"])
-        if pane := environment.get("TMUX_PANE", ""):
-            return TmuxPlace(pane)
+    return record_place(max(records, key=lambda record: record["updatedAt"]))
+
+
+def record_place(record: SessionRecord) -> Place:
+    """Resolve the pane owned by this specific registry process."""
     place = herdr.herdr_place_of(record["pid"])
     if isinstance(place, herdr.NotInHerdr):
-        raise NoSuchTarget(session_id)
+        raise NoSuchTarget(record["sessionId"])
     return place
 
 
@@ -159,7 +99,7 @@ def main(arguments: list[str]) -> int:
               or verb == "where" and rest):
             raise ValueError(USAGE)
         if kind == "unit":
-            unit = marked_units(slug).get(name)
+            unit = marked_unit(slug, name)
             if unit is None:
                 raise NoSuchTarget(target)
             place = unit.place

@@ -438,6 +438,8 @@ run_style_agent() {
 
     case "$STYLE_AGENT" in
         claude)
+            source "$SCRIPT_DIR/../agents/claude_account.sh"
+            claude_launch_environment || return 1
             local claude_args=()
             if [[ -n "$STYLE_AGENT_MODEL" ]]; then
                 claude_args+=("--model" "$STYLE_AGENT_MODEL")

@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Deterministic style guideline admin operations."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import cast
+
+from style_rules import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow
+
+RUST_STYLE_DIR = NATE_STYLE_DIR / "rust"
+
+
+def replace_wikilinks_for_rename(text: str, old_stem: str, new_stem: str) -> str:
+    return text.replace(f"[[{old_stem}]]", f"[[{new_stem}]]").replace(f"[[{old_stem}|", f"[[{new_stem}|")
+
+
+def replace_wikilinks_for_delete(text: str, stem: str) -> str:
+    text = re.sub(rf"\[\[{re.escape(stem)}\|([^\]]+)\]\]", r"\1", text)
+    text = re.sub(rf"\[\[{re.escape(stem)}\]\]", stem, text)
+    return text
+
+
+def resolve_source_name(name: str) -> str:
+    """Resolve a style filename, auto-appending .md if missing and that file exists."""
+    as_given = RUST_STYLE_DIR / name
+    if as_given.exists():
+        return name
+    if not name.endswith(".md"):
+        with_suffix = f"{name}.md"
+        if (RUST_STYLE_DIR / with_suffix).exists():
+            return with_suffix
+    raise SystemExit(f"Source style file not found: {name}")
+
+
+def ensure_md_suffix(name: str) -> str:
+    """Append .md to a target name if it isn't already there."""
+    return name if name.endswith(".md") else f"{name}.md"
+
+
+def strip_frontmatter_see_also(text: str, stem: str) -> tuple[str, int]:
+    """Remove `see_also` references to `stem` from the frontmatter only.
+    Handles both single-value (`see_also: "[[stem]]"`) and list-item
+    (`  - "[[stem]]"`) forms. Returns (new_text, references_removed).
+    Body content is not touched — callers do that separately."""
+    if not text.startswith("---"):
+        return text, 0
+    # Split into [pre-fm, frontmatter, rest]
+    parts = text.split("---\n", 2)
+    if len(parts) < 3:
+        return text, 0
+    _, frontmatter, rest = parts
+
+    single_re = re.compile(
+        rf'^see_also:\s*"?\[\[{re.escape(stem)}(\|[^\]]+)?\]\]"?\s*$'
+    )
+    list_item_re = re.compile(
+        rf'^\s*-\s*"?\[\[{re.escape(stem)}(\|[^\]]+)?\]\]"?\s*$'
+    )
+    key_re = re.compile(r"^[a-z_]+:")
+
+    removed = 0
+    new_lines: list[str] = []
+    in_see_also_list = False
+    for line in frontmatter.splitlines():
+        if single_re.match(line):
+            removed += 1
+            in_see_also_list = False
+            continue
+        if in_see_also_list and list_item_re.match(line):
+            removed += 1
+            continue
+        if re.match(r"^see_also:\s*$", line):
+            in_see_also_list = True
+        elif key_re.match(line):
+            in_see_also_list = False
+        new_lines.append(line)
+
+    if removed == 0:
+        return text, 0
+    new_frontmatter = "\n".join(new_lines)
+    if not new_frontmatter.endswith("\n"):
+        new_frontmatter += "\n"
+    new_text = f"---\n{new_frontmatter}---\n{rest}"
+    return new_text, removed
+
+
+def remove_see_also_references(stem: str) -> tuple[int, int]:
+    """Strip see_also references to `stem` from every style file's frontmatter."""
+    files_updated = 0
+    references_removed = 0
+    for path in sorted(NATE_STYLE_DIR.rglob("*.md")):
+        original = path.read_text()
+        rewritten, removed = strip_frontmatter_see_also(original, stem)
+        if removed:
+            _ = path.write_text(rewritten)
+            files_updated += 1
+            references_removed += removed
+    return files_updated, references_removed
+
+
+def load_jsonl(path: Path) -> list[HistoryRow]:
+    rows: list[HistoryRow] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parsed: object = json.loads(line)  # pyright: ignore[reportAny]
+        rows.append(cast("HistoryRow", parsed))
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[HistoryRow]) -> None:
+    if not rows:
+        path.unlink(missing_ok=True)
+        return
+    with path.open("w") as handle:
+        for row in rows:
+            _ = handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def update_history_for_rename(old_guideline_id: str, new_guideline_id: str) -> tuple[int, int]:
+    files_changed = 0
+    entries_updated = 0
+    for path in sorted(HISTORY_DIR.glob("*.jsonl")):
+        rows = load_jsonl(path)
+        changed = False
+        for row in rows:
+            for reviewed in row.get("reviewed_units", []):
+                if reviewed.get("guideline_id") == old_guideline_id:
+                    reviewed["guideline_id"] = new_guideline_id
+                    entries_updated += 1
+                    changed = True
+        if changed:
+            write_jsonl(path, rows)
+            files_changed += 1
+    return files_changed, entries_updated
+
+
+def update_history_for_delete(guideline_id: str) -> tuple[int, int, int]:
+    files_changed = 0
+    entries_removed = 0
+    runs_removed = 0
+    for path in sorted(HISTORY_DIR.glob("*.jsonl")):
+        rows = load_jsonl(path)
+        new_rows: list[HistoryRow] = []
+        changed = False
+        for row in rows:
+            reviewed_units = row.get("reviewed_units", [])
+            kept_units = [reviewed for reviewed in reviewed_units if reviewed.get("guideline_id") != guideline_id]
+            removed_here = len(reviewed_units) - len(kept_units)
+            if removed_here:
+                entries_removed += removed_here
+                changed = True
+            if kept_units:
+                row["reviewed_units"] = kept_units
+                new_rows.append(row)
+            else:
+                if removed_here:
+                    runs_removed += 1
+                    changed = True
+        if changed:
+            write_jsonl(path, new_rows)
+            files_changed += 1
+    return files_changed, entries_removed, runs_removed
+
+
+def update_markdown_wikilinks_for_rename(old_stem: str, new_stem: str) -> int:
+    updated = 0
+    for path in sorted(NATE_STYLE_DIR.rglob("*.md")):
+        original = path.read_text()
+        rewritten = replace_wikilinks_for_rename(original, old_stem, new_stem)
+        if rewritten != original:
+            _ = path.write_text(rewritten)
+            updated += 1
+    return updated
+
+
+def update_markdown_wikilinks_for_delete(stem: str) -> int:
+    updated = 0
+    for path in sorted(NATE_STYLE_DIR.rglob("*.md")):
+        original = path.read_text()
+        rewritten = replace_wikilinks_for_delete(original, stem)
+        if rewritten != original:
+            _ = path.write_text(rewritten)
+            updated += 1
+    return updated
+
+
+def run_rename(old_name: str, new_name: str) -> None:
+    old_name = resolve_source_name(old_name)
+    new_name = ensure_md_suffix(new_name)
+    source = RUST_STYLE_DIR / old_name
+    target = RUST_STYLE_DIR / new_name
+    if target.exists():
+        raise SystemExit(f"Target style file already exists: {new_name}")
+
+    old_guideline_id = f"rust/{old_name}"
+    new_guideline_id = f"rust/{new_name}"
+    _ = source.rename(target)
+    history_files, entries_updated = update_history_for_rename(old_guideline_id, new_guideline_id)
+    wikilink_files = update_markdown_wikilinks_for_rename(Path(old_name).stem, Path(new_name).stem)
+
+    print(f"Renamed: {old_name} -> {new_name}")
+    print(f".history files updated: {history_files}")
+    print(f".history entries updated: {entries_updated}")
+    print(f"Obsidian files updated: {wikilink_files} (covers see_also frontmatter)")
+
+
+def run_delete(style_name: str) -> None:
+    style_name = resolve_source_name(style_name)
+    source = RUST_STYLE_DIR / style_name
+
+    guideline_id = f"rust/{style_name}"
+    stem = Path(style_name).stem
+    see_also_files, see_also_refs = remove_see_also_references(stem)
+
+    source.unlink()
+    history_files, entries_removed, runs_removed = update_history_for_delete(guideline_id)
+    wikilink_files = update_markdown_wikilinks_for_delete(stem)
+
+    print(f"Deleted: {style_name}")
+    print(f".history files updated: {history_files}")
+    print(f".history entries removed: {entries_removed}")
+    print(f"Run records removed: {runs_removed}")
+    print(f"see_also frontmatter cleaned: {see_also_files} file(s), {see_also_refs} reference(s)")
+    print(f"Obsidian files updated: {wikilink_files}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    rename = subparsers.add_parser("rename")
+    _ = rename.add_argument("old_name")
+    _ = rename.add_argument("new_name")
+
+    delete = subparsers.add_parser("delete")
+    _ = delete.add_argument("style_name")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    command: str = str(args.command)  # pyright: ignore[reportAny]
+    if command == "rename":
+        old_name: str = str(args.old_name)  # pyright: ignore[reportAny]
+        new_name: str = str(args.new_name)  # pyright: ignore[reportAny]
+        run_rename(old_name, new_name)
+        return
+    style_name: str = str(args.style_name)  # pyright: ignore[reportAny]
+    run_delete(style_name)
+
+
+if __name__ == "__main__":
+    main()

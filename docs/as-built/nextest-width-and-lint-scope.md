@@ -2,7 +2,7 @@
 
 ## What it is
 
-Two policies in the cargo layer that every session's builds go through. First, every `cargo nextest run` that `scripts/lint/invoke.sh` starts names its test width (`--test-threads N`), chosen by one mode line. The memory gate keys its measured reservation by that width, and `scripts/buildlog/width_trial.py` scores a switchback trial between one test process per physical core and one per logical core. Width `logical` is the setting: a 72-hour trial found no memory-wait gain at physical width and slower hana runs. Second, `verify.sh lint` runs the same clippy command as CI's Clippy job (`--workspace --all-targets --all-features`) and checks TOML formatting with taplo, so a lint that passes locally passes CI's Clippy job and the push gate's taplo check.
+Two policies in the cargo layer that every session's builds go through. First, every `cargo nextest run` that `scripts/lint/invoke.sh` starts names its test width (`--test-threads N`), chosen by one mode line and divided among the local runs in flight. The memory gate keys its measured reservation by that width, and `scripts/buildlog/width_trial.py` scores a switchback trial between one test process per physical core and one per logical core. Width `logical` is the setting: a 72-hour trial found no memory-wait gain at physical width and slower hana runs. Second, `verify.sh lint` runs the same clippy command as CI's Clippy job (`--workspace --all-targets --all-features`) and checks TOML formatting with taplo, so a lint that passes locally passes CI's Clippy job and the push gate's taplo check.
 
 ## How it works
 
@@ -21,9 +21,19 @@ Two policies in the cargo layer that every session's builds go through. First, e
 - `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`. `trial` mode passes `${EPOCHSECONDS:-$(date +%s)}`.
 - `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
 
+### Shared width (`scripts/lint/nextest_budget.py`)
+
+In `physical` and `logical` mode, local runs share the mode's width. `run_nextest_shared WIDTH ARGS...` opens fd 9 on `<name>.new` in `${BUILDLOG_DIR:-~/.local/state/buildlog}/admission/nextest/` and runs `nextest_budget.py claim DIR NAME WIDTH 9`. Under the directory's `lock`, the claim flocks fd 9, renames the marker to `<name>.run`, counts the `.run` markers still locked (itself included), unlinks the unlocked ones, and prints `shared_width(full, runs) = min(full, max(FLOOR, full // runs))`, `FLOOR` 4. The run then goes through `run` with `--test-threads <shared>` and fd 9 closed for the step, and the marker is removed after it.
+
+- The lock belongs to the file the shell opened, so it ends with the shell: a killed run's marker is unlocked, and the next claim neither counts it nor keeps it. A `.new` older than `PENDING_GRACE_S` (600 s) is a shell killed before it claimed.
+- On natedev: alone 32, 2 runs 16, 3 runs 10, 4 runs 8, 8 or more 4. On the Mac (12): alone 12, 2 runs 6, 3 or more 4.
+- A width is fixed when the run starts; runs that start later do not narrow it, and a run that outlives the others does not widen.
+- Any failure (no directory, the helper failing or printing a non-number) runs at the full width.
+- `trial` mode is not shared: `width_trial.py` names the arm by width (16 physical, 32 logical), and a shared 16 would read as physical.
+
 natedev has 16 physical and 32 logical cores. The Mac reads 12 for both and has no memory gate. GitHub CI and hand-run `cargo nextest` do not go through `invoke.sh` and keep nextest's default width.
 
-A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry.
+A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A shared run records the width it ran at.
 
 ### Per-width reservation (`scripts/lint/memory_admit.py`)
 
@@ -66,8 +76,9 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 ## Invariants
 
 - `invoke.sh` is the only place nextest policy flags are composed; callers own scope.
-- The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing.
-- Width selection never fails, prints or changes a status; an unreadable core count adds no flag.
+- The caller's width wins: a width flag before `--`, or `NEXTEST_TEST_THREADS`, means `invoke.sh` adds nothing. Such a run takes no marker and is not counted by others.
+- No counter: a run is in flight while its marker is locked, and nothing a killed run leaves behind is counted.
+- Width selection never fails, prints or changes a status; an unreadable core count adds no flag, and a failed claim runs at the full width.
 - `invoke.sh` adds its width before the caller's arguments, and `memory_admit.test_threads` and `width_trial` read the first width in argv. Change both or neither.
 - The trial block in `nextest_width_arm` (6000 s) equals `BLOCK_S` in `width_trial.py`.
 - `invoke.sh`'s ungated set (`buildlog_step_compiles`) and `width_trial._uses_memory_gate` decide which steps count as gated; they must agree. Both exempt `cargo [+tc] fmt`, `*/sweep.py` and `taplo`, so none of those counts in the all-steps gated-wait row.
