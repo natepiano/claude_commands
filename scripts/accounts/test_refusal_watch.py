@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from importlib import import_module
@@ -267,6 +268,139 @@ class RefusalWatchTests(unittest.TestCase):
     def hold_rule(self, name: str = "units-low", *, target: str = "claude2",
                   minutes: float = 10) -> next_moves.ClaudeGroupMove:
         return next_moves.ClaudeGroupMove(name, "units", 1, minutes, target, NOW)
+
+    def test_list_keeps_the_runners_started_minutes_after_restart_and_changed_pace(self) -> None:
+        _ = self.groups()
+        entry = next_moves.ClaudeGroupMove("display-half", "units", 1.234567,
+                                           next_moves.HalfPointHold(), "claude2", NOW)
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(run_out, "weighted_rate", return_value=1 / 3600):
+            self.assertEqual(self.cli()[0], 0)
+        before = (self.home / ".local/state/accounts/refusal_watch.json").read_bytes()
+        WatchTime.at = NOW + timedelta(minutes=18, seconds=1)
+        self.reading(SOURCE_LOGIN, 1, at=WatchTime.at)
+        # A new runner invocation reloads the receipt, even with a different pace.
+        with patch.object(run_out, "weighted_rate", return_value=6 / 3600) as changed_pace:
+            self.assertEqual(self.cli()[0], 0)
+            with (patch.object(next_moves, "render_time", return_value=WatchTime.at) as clock,
+                  patch.object(refusal_watch, "_load_state", wraps=refusal_watch._load_state) as read,  # pyright: ignore[reportPrivateUsage]
+                  patch.object(refusal_watch, "_watch_lock", side_effect=AssertionError("render took watch lock"))):
+                self.assertEqual(next_moves.list_next_moves(),
+                    "units 1: at 1.234567% → claude2, hold half a point (30 min at 1 points/hour, 12 min left)")
+            clock.assert_called_once_with()
+            read.assert_called_once_with()
+            changed_pace.assert_not_called()
+        self.assertEqual((self.home / ".local/state/accounts/refusal_watch.json").read_bytes(), before)
+        with patch.object(next_moves, "render_time", return_value=NOW + timedelta(minutes=30)):
+            self.assertIn("30 min at 1 points/hour, hold over", next_moves.list_next_moves())
+
+    def test_same_mode_hold_reply_keeps_the_started_row_without_reentering_the_watch_lock(self) -> None:
+        _ = self.groups()
+        entry = next_moves.ClaudeGroupMove("same-mode", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
+        self.next_entries(entry)
+        held = refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1,
+            next_moves.ResolvedHold(30, next_moves.PaceEstimate(1)))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={entry.id: held}))
+        before = (self.home / ".local/state/accounts/refusal_watch.json").read_bytes()
+        entries = 0
+
+        @contextmanager
+        def one_watch_lock() -> Generator[None]:
+            nonlocal entries
+            self.assertEqual(entries, 0, "render must not reacquire the editing lock")
+            entries += 1
+            yield
+
+        with (patch.object(next_moves, "render_time", return_value=NOW + timedelta(minutes=18, seconds=1)),
+              patch.object(refusal_watch, "_watch_lock", side_effect=one_watch_lock)):
+            reply = next_moves.update_next_move_hold("units", next_moves.GroupPosition(1), next_moves.HalfPointHold())
+        self.assertEqual(entries, 1)
+        self.assertEqual(reply,
+            "units 1: at 1% → claude2, hold half a point (30 min at 1 points/hour, 12 min left)")
+        self.assertEqual((self.home / ".local/state/accounts/refusal_watch.json").read_bytes(), before)
+        reply = next_moves.update_next_move_hold("units", next_moves.GroupPosition(1), next_moves.FixedHold(10))
+        self.assertEqual(reply, "units 1: at 1% → claude2, hold 10 min")
+        self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(next_moves.read_next_moves()[0].id, entry.id)
+
+    def test_only_current_resolved_head_holds_are_shown_and_render_does_not_write_state(self) -> None:
+        groups = self.groups()
+        head = next_moves.ClaudeGroupMove("head", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
+        later = next_moves.ClaudeGroupMove("later", "units", 1, next_moves.HalfPointHold(), "claude3", NOW)
+        duration = next_moves.ResolvedHold(30, next_moves.PaceEstimate(1))
+        held = refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1, duration)
+        self.next_entries(head, later)
+        # Only the current head is eligible, even if the queued entry has a receipt.
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={head.id: held, later.id: held}))
+        estimate = next_moves.ResolvedHold(5, next_moves.PaceEstimate(6))
+        with (patch.object(next_moves, "render_time", return_value=NOW + timedelta(minutes=18)),
+              patch.object(accounts, "group_half_point_hold", return_value=estimate)):
+            self.assertEqual(next_moves.list_next_moves(),
+                "units 1: at 1% → claude2, hold half a point (30 min at 1 points/hour, 12 min left)\n"
+                + "units 2: at 1% → claude3, hold half a point (≈5 min)")
+        cases = (
+            ("account moved", replace(held, account="claude3")),
+            ("transition moved away and back", replace(held, move_id="previous-selection")),
+            ("threshold changed", replace(held, percent=2)),
+            ("legacy duration", replace(held, duration=refusal_watch.LegacyHoldDuration())))
+        for reason, stale in cases:
+            with self.subTest(reason=reason):
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+                    auto_move_holds={head.id: stale, later.id: held}))
+                before = (self.home / ".local/state/accounts/refusal_watch.json").read_bytes()
+                with (patch.object(next_moves, "render_time", return_value=NOW),
+                      patch.object(accounts, "group_half_point_hold", return_value=estimate),
+                      patch.object(refusal_watch, "_watch_lock", side_effect=AssertionError("render took watch lock"))):
+                    self.assertEqual(next_moves.list_next_moves(),
+                        "units 1: at 1% → claude2, hold half a point (≈5 min)\n"
+                        + "units 2: at 1% → claude3, hold half a point (≈5 min)")
+                self.assertEqual((self.home / ".local/state/accounts/refusal_watch.json").read_bytes(), before)
+        # A changed current selection, rather than a changed saved receipt, is stale too.
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={head.id: held}))
+        _ = groups.write_text(json.dumps({"units": "claude3", "showrunners": "claude3"}))
+        with patch.object(accounts, "group_half_point_hold", return_value=estimate):
+            self.assertEqual(next_moves.list_next_moves(),
+                "units 1: at 1% → claude2, hold half a point (≈5 min)\n"
+                + "units 2: at 1% → claude3, hold half a point (≈5 min)")
+
+    def test_missing_state_and_zero_minute_heads_do_not_claim_a_started_hold(self) -> None:
+        _ = self.groups()
+        entry = next_moves.ClaudeGroupMove("missing", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
+        self.next_entries(entry)
+        state_path = self.home / ".local/state/accounts/refusal_watch.json"
+        self.assertFalse(state_path.exists())
+        with patch.object(accounts, "group_half_point_hold", return_value=next_moves.ResolvedHold(5, next_moves.PaceEstimate(6))):
+            self.assertEqual(next_moves.list_next_moves(), "units 1: at 1% → claude2, hold half a point (≈5 min)")
+        self.assertFalse(state_path.exists())
+        zero = replace(entry, hold_mode=next_moves.FixedHold(0))
+        self.next_entries(zero)
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={entry.id: refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1,
+                next_moves.ResolvedHold(30, next_moves.FixedHold(30)))}))
+        self.assertEqual(next_moves.list_next_moves(), "units 1: at 1% → claude2")
+
+    def test_full_list_uses_one_state_read_and_one_clock_for_all_group_heads(self) -> None:
+        _ = self.groups()
+        unit = self.hold_rule("units", minutes=30)
+        runner = next_moves.ClaudeGroupMove("runners", "showrunners", 1, 30, "claude2", NOW)
+        worker = next_moves.WorkersMove("workers", 1, next_moves.DelegateToClaude(), NOW)
+        self.next_entries(unit, runner, worker)
+        duration = next_moves.ResolvedHold(30, next_moves.FixedHold(30))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={unit.id: refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1, duration),
+                             runner.id: refusal_watch.HoldStarted("claude3", NOW, accounts.NoGroupTransition(), 1, duration)}))
+        with (patch.object(next_moves, "render_time", return_value=NOW + timedelta(minutes=18, seconds=1)) as clock,
+              patch.object(refusal_watch, "_load_state", wraps=refusal_watch._load_state) as read,  # pyright: ignore[reportPrivateUsage]
+              patch.object(refusal_watch, "_watch_lock", side_effect=AssertionError("render took watch lock"))):
+            self.assertEqual(next_moves.list_next_moves(),
+                "showrunners 1: at 1% → claude2, hold 30 min (12 min left)\n\n"
+                + "units 1: at 1% → claude2, hold 30 min (12 min left)\n\nworkers 1: at 1% → claude")
+        clock.assert_called_once_with()
+        read.assert_called_once_with()
 
     def test_half_point_hold_keeps_its_start_pace_and_duration_after_a_restart(self) -> None:
         path = self.groups()

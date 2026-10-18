@@ -105,6 +105,29 @@ class ResolvedHold:
     source: FixedHold | PaceEstimate | NoUsablePace
 
 
+@dataclass(frozen=True)
+class StartedHold:
+    at: datetime
+    duration: ResolvedHold
+
+
+@dataclass(frozen=True)
+class HoldNotStarted:
+    """This entry has no current resolved hold."""
+
+
+HOLD_NOT_STARTED = HoldNotStarted()
+
+
+@dataclass(frozen=True)
+class WatchStateUnreadable:
+    """Started holds cannot be shown because their state could not be read."""
+
+
+class StartedHoldReader(Protocol):
+    def started_next_move_holds(self, entries: tuple[NextMove, ...]) -> dict[str, StartedHold] | WatchStateUnreadable: ...
+
+
 class GroupHoldResolver(Protocol):
     def group_half_point_hold(self, group: Literal["units", "showrunners"], now: datetime) -> ResolvedHold: ...
 
@@ -410,15 +433,35 @@ def format_next_move_percent(percent: float) -> str:
     return repr(float(percent)).removesuffix(".0")
 
 
-def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSITION) -> str:
+def render_time() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSITION, *,
+                     started_hold: StartedHold | HoldNotStarted = HOLD_NOT_STARTED) -> str:
+    return _render_next_move(entry, position, started_hold, render_time())
+
+
+def _render_next_move(entry: NextMove, position: GroupPosition,
+                      started_hold: StartedHold | HoldNotStarted, now: datetime) -> str:
     hold = ""
     if isinstance(entry, ClaudeGroupMove):
-        if isinstance(entry.hold_mode, FixedHold):
+        if isinstance(started_hold, StartedHold):
+            duration = started_hold.duration
+            left = math.ceil(duration.minutes - (now - started_hold.at).total_seconds() / 60)
+            remaining = f"{left} min left" if left > 0 else "hold over"
+            if isinstance(duration.source, FixedHold):
+                hold = f", hold {duration.minutes:g} min ({remaining})"
+            else:
+                source = (f"at {round(duration.source.points_per_hour, 2):g} points/hour"
+                          if isinstance(duration.source, PaceEstimate) else "default: no pace history")
+                hold = f", hold half a point ({duration.minutes:g} min {source}, {remaining})"
+        elif isinstance(entry.hold_mode, FixedHold):
             if entry.hold_mode.minutes:
                 hold = f", hold {entry.hold_mode.minutes:g} min"
         else:
             resolver = cast(GroupHoldResolver, cast(object, import_module("scripts.accounts.accounts")))
-            duration = resolver.group_half_point_hold(entry.group, datetime.now(timezone.utc))
+            duration = resolver.group_half_point_hold(entry.group, now)
             estimate = (f"{duration.minutes:g} min default: no pace history" if isinstance(duration.source, NoUsablePace)
                         else f"≈{duration.minutes:g} min")
             hold = f", hold half a point ({estimate})"
@@ -426,10 +469,22 @@ def render_next_move(entry: NextMove, position: GroupPosition = FIRST_GROUP_POSI
 
 
 def render_next_moves(entries: tuple[NextMove, ...]) -> str:
-    sections = ["\n".join(render_next_move(entry, GroupPosition(index))
+    if not entries:
+        return "nothing set up"
+    now = render_time()
+    watcher = cast(StartedHoldReader, cast(object, import_module("scripts.accounts.refusal_watch")))
+    holds = watcher.started_next_move_holds(entries)
+    current = {} if isinstance(holds, WatchStateUnreadable) else holds
+    sections = ["\n".join(_render_next_move(entry, GroupPosition(index), current.get(entry.id, HOLD_NOT_STARTED), now)
                           for index, entry in enumerate((entry for entry in entries if entry.group == group), 1))
                 for group in ("showrunners", "units", "workers")]
-    return "\n\n".join(section for section in sections if section) or "nothing set up"
+    return _with_watch_state_notice("\n\n".join(section for section in sections if section), holds)
+
+
+def _with_watch_state_notice(text: str, holds: dict[str, StartedHold] | WatchStateUnreadable) -> str:
+    if isinstance(holds, WatchStateUnreadable):
+        return text + "\nstarted holds not shown: watch state unreadable"
+    return text
 
 
 def list_next_moves() -> str:
@@ -485,7 +540,12 @@ def update_next_move_hold(group: NextMoveGroup, position: GroupPosition, mode: H
             if not isinstance(entry, ClaudeGroupMove):
                 raise NextMoveError("next: workers entries cannot hold")
             changed = replace(entry, hold_mode=mode)
-            edit.commit(tuple(changed if saved.id == entry.id else saved for saved in entries))
-            return render_next_move(changed, position)
+            updated = tuple(changed if saved.id == entry.id else saved for saved in entries)
+            edit.commit(updated)
+            reader = cast(StartedHoldReader, cast(object, watcher))
+            holds = reader.started_next_move_holds(updated)
+            current = {} if isinstance(holds, WatchStateUnreadable) else holds
+            reply = render_next_move(changed, position, started_hold=current.get(changed.id, HOLD_NOT_STARTED))
+            return _with_watch_state_notice(reply, holds)
     except OSError as error:
         raise NextMoveError(f"next: cannot update hold: {error}") from error

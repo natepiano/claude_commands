@@ -4151,7 +4151,7 @@ def main(argv: list[str]) -> int:
                     validate_next_move_target(candidate)
                 _ = next_moves.add_next_move(options.group, options.percent, options.label,
                                              options.hold_mode, insertion=options.insertion)
-                print(next_moves.render_next_moves(next_moves.read_next_moves()) if role_map.is_role_map_host()
+                print(next_moves.list_next_moves() if role_map.is_role_map_host()
                       else f"added {options.group} next move")
             elif options.next_action == "remove":
                 next_moves.remove_next_move(options.group, options.next_position)

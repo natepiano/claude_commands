@@ -6,12 +6,12 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.accounts import next_moves, role_map
+from scripts.accounts import accounts, next_moves, role_map
 from scripts.whoami import run_out
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 import quota_alert
@@ -214,6 +214,48 @@ class NextMovesTests(unittest.TestCase):
                 with self.assertRaises(next_moves.NextMoveError):
                     _ = next_moves.read_next_moves()
                 self.assertEqual(path.read_text(), original)
+
+    def test_started_rows_show_stored_minutes_source_and_rounded_time_remaining(self) -> None:
+        half = next_moves.ClaudeGroupMove("half", "units", 1.234567, next_moves.HalfPointHold(), "claude4", NOW)
+        fixed = next_moves.ClaudeGroupMove("fixed", "units", 1, 30, "claude4", NOW)
+        cases = (
+            (half, next_moves.ResolvedHold(34, next_moves.PaceEstimate(0.901)),
+             "units 1: at 1.234567% → claude4, hold half a point (34 min at 0.9 points/hour, 12 min left)"),
+            (half, next_moves.ResolvedHold(40, next_moves.NoUsablePace()),
+             "units 1: at 1.234567% → claude4, hold half a point (40 min default: no pace history, 18 min left)"),
+            (fixed, next_moves.ResolvedHold(30, next_moves.FixedHold(30)),
+             "units 1: at 1% → claude4, hold 30 min (8 min left)"))
+        for entry, duration, expected in cases:
+            with (self.subTest(source=duration.source),
+                  patch.object(next_moves, "render_time", return_value=NOW + timedelta(minutes=22, seconds=1)) as clock,
+                  patch.object(accounts, "group_half_point_hold", side_effect=AssertionError("started hold read fresh pace"))):
+                self.assertEqual(next_moves.render_next_move(entry,
+                    started_hold=next_moves.StartedHold(NOW, duration)), expected)
+                clock.assert_called_once_with()
+
+    def test_started_hold_at_or_past_its_deadline_reads_hold_over(self) -> None:
+        entry = next_moves.ClaudeGroupMove("half", "units", 1, next_moves.HalfPointHold(), "claude4", NOW)
+        held = next_moves.StartedHold(NOW, next_moves.ResolvedHold(30, next_moves.PaceEstimate(1)))
+        for elapsed, remaining in ((timedelta(minutes=29, seconds=59), "1 min left"),
+                                   (timedelta(minutes=30), "hold over"),
+                                   (timedelta(minutes=31), "hold over")):
+            with self.subTest(elapsed=elapsed), patch.object(next_moves, "render_time", return_value=NOW + elapsed):
+                self.assertEqual(next_moves.render_next_move(entry, started_hold=held),
+                    f"units 1: at 1% → claude4, hold half a point (30 min at 1 points/hour, {remaining})")
+
+    def test_unstarted_rows_keep_the_current_estimate_and_fixed_hold_forms(self) -> None:
+        half = next_moves.ClaudeGroupMove("half", "units", 1, next_moves.HalfPointHold(), "claude4", NOW)
+        for duration, expected in ((next_moves.ResolvedHold(30, next_moves.PaceEstimate(1)), "≈30 min"),
+                                   (next_moves.ResolvedHold(40, next_moves.NoUsablePace()),
+                                    "40 min default: no pace history")):
+            with (self.subTest(source=duration.source), patch.object(next_moves, "render_time", return_value=NOW),
+                  patch.object(accounts, "group_half_point_hold", return_value=duration) as estimate):
+                self.assertEqual(next_moves.render_next_move(half, started_hold=next_moves.HoldNotStarted()),
+                                 f"units 1: at 1% → claude4, hold half a point ({expected})")
+                estimate.assert_called_once_with("units", NOW)
+        fixed = next_moves.ClaudeGroupMove("fixed", "units", 1, 30, "claude4", NOW)
+        self.assertEqual(next_moves.render_next_move(fixed, started_hold=next_moves.HoldNotStarted()),
+                         "units 1: at 1% → claude4, hold 30 min")
 
     def test_listed_percent_round_trips_for_claude_and_workers_entries(self) -> None:
         for percent, displayed in ((1.234567, "1.234567"), (1, "1"), (0, "0"), (100, "100"),
