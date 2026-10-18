@@ -1599,7 +1599,7 @@ class SettleTests(ShutdownTestCase):
                 if isinstance(observed, restart_work.SessionLive):
                     self.assertEqual(summary,
                         "Unit is back on claude3; its restart prompt was not confirmed — check it, " +
-                        "then close its record: " + settle.shutdown_command("forget", "unit", "--account", LOGIN))
+                        "then close its record in a terminal on natedev: " + settle.shutdown_command("forget", "unit", "--account", LOGIN))
                     self.assertEqual(text, summary)
                     self.assertNotIn("shutdown.py restart", text)
                     self.assertEqual(current.get("showrunner_told"), settle.SHOWRUNNER_TOLD_BACK)
@@ -1630,7 +1630,7 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(len(back), 1)
         self.assertEqual(back[0].args[1],
                          "Unit is back on claude3; its restart prompt was not confirmed — check it, " +
-                         "then close its record: " + settle.shutdown_command("forget", "unit", "--account", LOGIN))
+                         "then close its record in a terminal on natedev: " + settle.shutdown_command("forget", "unit", "--account", LOGIN))
         self.assertNotIn("shutdown.py restart", cast(str, back[0].args[2]))
         current = record.find_session(LOGIN, "unit")
         assert current is not None
@@ -3296,7 +3296,7 @@ class SettleTests(ShutdownTestCase):
                 if isinstance(observed, restart_work.SessionLive):
                     self.assertEqual(summary, f"{LABEL} is back")
                     self.assertIn("  Slow owner: restart prompt not confirmed; session is running — check it, " +
-                                  "then close its record: " + settle.shutdown_command("forget",
+                                  "then close its record in a terminal on natedev: " + settle.shutdown_command("forget",
                                       failed["session"]["session_id"], "--account", LOGIN), text)
                     self.assertNotIn("  Slow owner: restart prompt not submitted", text)
                     self.assertNotIn("shutdown.py restart", text)
