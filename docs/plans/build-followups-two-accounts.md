@@ -1774,7 +1774,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** a client-side read-modify-write of the log on the Mac (it races natedev's runner); accepting ids from the user beside positions.
 
-### Phase 62 — A half-point hold from pace history  · status: todo
+### Phase 62 — A half-point hold from pace history  · status: done
 
 **Depends on:** Phase 61
 

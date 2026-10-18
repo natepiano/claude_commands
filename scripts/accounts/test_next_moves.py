@@ -12,6 +12,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.accounts import next_moves, role_map
+from scripts.whoami import run_out
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 import quota_alert
 
@@ -28,6 +29,7 @@ class NextMovesTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.home / "quota_alert.json"))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
+        _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
 
     def test_add_and_remove_keep_entry_order_and_preserve_the_other_groups_plan(self) -> None:
         self.assertEqual(next_moves.read_next_moves(), ())
@@ -212,3 +214,44 @@ class NextMovesTests(unittest.TestCase):
                 with self.assertRaises(next_moves.NextMoveError):
                     _ = next_moves.read_next_moves()
                 self.assertEqual(path.read_text(), original)
+
+    def test_half_point_and_legacy_fixed_entries_round_trip_without_losing_the_mode(self) -> None:
+        half = next_moves.ClaudeGroupMove("half", "units", 1, next_moves.HalfPointHold(), "claude2", NOW)
+        fixed = next_moves.ClaudeGroupMove("fixed", "showrunners", 1, next_moves.FixedHold(17), "claude3", NOW)
+        encoded = next_moves.encode_next_moves((half, fixed))
+        self.assertEqual(next_moves.decode_next_moves(encoded), (half, fixed))
+        legacy = json.dumps([{"id": "legacy", "group": "units", "at_percent": 1,
+                              "hold_minutes": 9, "to": "claude2", "added_at": NOW.isoformat()}])
+        entry, = next_moves.decode_next_moves(legacy)
+        assert isinstance(entry, next_moves.ClaudeGroupMove)
+        self.assertEqual(entry.hold_mode, next_moves.FixedHold(9))
+        for group, mode in (("units", "unknown-future-mode"), ("workers", "half-point")):
+            document = json.dumps([{"id": "invalid", "group": group, "at_percent": 1,
+                "hold_mode": mode, "to": "claude" if group == "workers" else "claude2",
+                "added_at": NOW.isoformat()}])
+            with self.subTest(group=group, mode=mode), self.assertRaises(next_moves.NextMoveError):
+                _ = next_moves.decode_next_moves(document)
+
+    def test_half_point_duration_uses_selected_accounts_pace_in_points_per_second(self) -> None:
+        path = self.home / "pace.jsonl"
+        _ = path.write_text("\n".join(json.dumps({"account": label, "at": NOW.isoformat(), "remaining": left})
+                                    for label, left in (("claude1", 1), ("claude2", 80))))
+        readings = run_out.read_readings(path)
+        with (patch.object(run_out, "READINGS_LOG", path),
+              patch.object(run_out, "weighted_rate", return_value=1 / 3600) as pace):
+            resolved = next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW)
+        pace.assert_called_once_with(readings["claude1"], NOW.timestamp())
+        self.assertEqual(resolved, next_moves.ResolvedHold(30, next_moves.PaceEstimate(1)))
+        with (patch.object(run_out, "READINGS_LOG", path),
+              patch.object(run_out, "weighted_rate", return_value=0.7 / 3600)):
+            self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW).minutes, 43)
+
+    def test_unusable_pace_uses_the_named_default_and_fixed_holds_do_not_read_history(self) -> None:
+        for rate in (None, 0, -1):
+            with (self.subTest(rate=rate), patch.object(run_out, "READINGS_LOG", self.home / "missing-history"),
+                  patch.object(run_out, "weighted_rate", return_value=rate)):
+                self.assertEqual(next_moves.resolve_hold(next_moves.HalfPointHold(), "claude1", NOW),
+                                 next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+        with patch.object(run_out, "read_readings", side_effect=AssertionError("fixed hold read pace")):
+            self.assertEqual(next_moves.resolve_hold(next_moves.FixedHold(7.5), "claude1", NOW),
+                             next_moves.ResolvedHold(7.5, next_moves.FixedHold(7.5)))

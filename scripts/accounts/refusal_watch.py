@@ -134,6 +134,8 @@ class HoldStartedDocument(TypedDict):
     at: str
     move_id: str
     percent: float
+    minutes: NotRequired[float]
+    source: NotRequired[dict[str, object]]
 
 
 class WatchStateDocument(TypedDict):
@@ -144,11 +146,17 @@ class WatchStateDocument(TypedDict):
 
 
 @dataclass(frozen=True)
+class LegacyHoldDuration:
+    """A pre-duration hold still uses its entry's fixed minutes."""
+
+
+@dataclass(frozen=True)
 class HoldStarted:
     account: str
     at: datetime
     move_id: str | accounts.NoGroupTransition
     percent: float
+    duration: next_moves.ResolvedHold | LegacyHoldDuration = LegacyHoldDuration()
 
     def __post_init__(self) -> None:
         if self.at.utcoffset() is None:
@@ -158,7 +166,7 @@ class HoldStarted:
 @dataclass(frozen=True)
 class LeftAtMost:
     percent: float
-    hold_minutes: float = 0
+    hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
 
 
 @dataclass(frozen=True)
@@ -177,7 +185,7 @@ class UnreadableNextMoveLog:
 def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
     try:
         return tuple(AutoMoveRule(entry.id, entry.group, entry.to,
-                                  LeftAtMost(entry.at_percent, entry.hold_minutes))
+                                  LeftAtMost(entry.at_percent, entry.hold_mode))
                      for entry in next_moves.read_next_moves() if isinstance(entry, next_moves.ClaudeGroupMove))
     except next_moves.NextMoveError as error:
         return (UnreadableNextMoveLog(str(error)),)
@@ -244,11 +252,45 @@ def _load_state() -> WatchState:
                     and 0 <= percent <= 100 and math.isfinite(percent)):
                 try:
                     holds[name] = HoldStarted(label, datetime.fromisoformat(at),
-                                             move_id if move_id else accounts.NoGroupTransition(), float(percent))
+                                             move_id if move_id else accounts.NoGroupTransition(), float(percent),
+                                             _decode_hold_duration(fields))
                 except ValueError:
                     continue
         result["auto_move_holds"] = holds
     return result
+
+
+def _decode_hold_duration(fields: dict[str, object]) -> next_moves.ResolvedHold | LegacyHoldDuration:
+    if "minutes" not in fields:
+        return LegacyHoldDuration()
+    minutes, source = fields.get("minutes"), fields.get("source")
+    if (not isinstance(minutes, (int, float)) or isinstance(minutes, bool)
+            or minutes < 0 or not math.isfinite(minutes) or not isinstance(source, dict)):
+        raise ValueError("invalid hold duration")
+    details = cast(dict[str, object], source)
+    kind = details.get("kind")
+    if kind == "fixed":
+        return next_moves.ResolvedHold(float(minutes), next_moves.FixedHold(float(minutes)))
+    if kind == "no usable pace":
+        return next_moves.ResolvedHold(float(minutes), next_moves.NoUsablePace())
+    pace = details.get("points_per_hour")
+    if (kind == "pace" and isinstance(pace, (int, float)) and not isinstance(pace, bool)
+            and pace > 0 and math.isfinite(pace)):
+        return next_moves.ResolvedHold(float(minutes), next_moves.PaceEstimate(float(pace)))
+    raise ValueError("invalid hold source")
+
+
+def _hold_document(hold: HoldStarted) -> HoldStartedDocument:
+    document = HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
+                                   move_id=hold.move_id if isinstance(hold.move_id, str) else "", percent=hold.percent)
+    if isinstance(hold.duration, next_moves.ResolvedHold):
+        document["minutes"] = hold.duration.minutes
+        source = hold.duration.source
+        document["source"] = ({"kind": "pace", "points_per_hour": source.points_per_hour}
+                              if isinstance(source, next_moves.PaceEstimate) else
+                              {"kind": "no usable pace"} if isinstance(source, next_moves.NoUsablePace)
+                              else {"kind": "fixed"})
+    return document
 
 
 def _state_document(state: WatchState) -> WatchStateDocument:
@@ -257,9 +299,7 @@ def _state_document(state: WatchState) -> WatchStateDocument:
         document["auto_move_notices"] = state["auto_move_notices"]
     if "auto_move_holds" in state:
         document["auto_move_holds"] = {
-            name: HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
-                                     move_id=hold.move_id if isinstance(hold.move_id, str) else "",
-                                     percent=hold.percent)
+            name: _hold_document(hold)
             for name, hold in state["auto_move_holds"].items()
         }
     return document
@@ -294,18 +334,23 @@ class LockedNextMoveEdit:
             _ = new_heads.setdefault(entry.group, entry.id)
         discarded = {entry.id for entry in self.before} - {entry.id for entry in entries}
         discarded.update(entry_id for group, entry_id in heads.items() if new_heads.get(group) != entry_id)
-        if discarded:
+        prior_modes = {entry.id: entry.hold_mode for entry in self.before if isinstance(entry, next_moves.ClaudeGroupMove)}
+        changed_modes = {entry.id for entry in entries if isinstance(entry, next_moves.ClaudeGroupMove)
+                         and entry.id in prior_modes and prior_modes[entry.id] != entry.hold_mode}
+        if discarded or changed_modes:
             state = _load_state()
             original = deepcopy(state)
-            for entry_id in discarded:
+            for entry_id in discarded | changed_modes:
                 _ = state.get("auto_move_holds", {}).pop(entry_id, None)
+            for entry_id in discarded:
                 _ = state.get("auto_move_notices", {}).pop(entry_id, None)
             if state != original:
                 _save_state(state)
-            import quota_alert
-            with quota_alert.state_file() as quota_state:
-                for entry_id in discarded:
-                    _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
+            if discarded:
+                import quota_alert
+                with quota_alert.state_file() as quota_state:
+                    for entry_id in discarded:
+                        _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
         next_moves.write_next_moves(entries)
 
 
@@ -958,11 +1003,19 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         if source.weekly.left > rule.when.percent:
             _ = holds.pop(rule.entry_id, None)
             continue
-        if rule.when.hold_minutes > 0:
+        if isinstance(rule.when.hold_mode, next_moves.HalfPointHold) or rule.when.hold_mode.minutes > 0:
             if rule.entry_id not in holds:
-                holds[rule.entry_id] = HoldStarted(source_label, now, selection_id, rule.when.percent)
+                holds[rule.entry_id] = HoldStarted(source_label, now, selection_id, rule.when.percent,
+                                                  next_moves.resolve_hold(rule.when.hold_mode, source_label, now))
                 state["auto_move_holds"] = holds
-            if (now - holds[rule.entry_id].at).total_seconds() / 60 < rule.when.hold_minutes:
+            started = holds[rule.entry_id]
+            if isinstance(started.duration, LegacyHoldDuration):
+                started = HoldStarted(started.account, started.at, started.move_id, started.percent,
+                                      next_moves.resolve_hold(rule.when.hold_mode, source_label, now))
+                holds[rule.entry_id] = started
+                state["auto_move_holds"] = holds
+            if (isinstance(started.duration, next_moves.ResolvedHold)
+                    and (now - started.at).total_seconds() / 60 < started.duration.minutes):
                 continue
         if source_label == rule.to:
             lines.append(_record_blocked_head(state, rule, TargetIsCurrentAccount(), now, dry_run))
