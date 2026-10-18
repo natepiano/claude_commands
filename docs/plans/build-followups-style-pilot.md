@@ -21,7 +21,7 @@ Pending entries have no measurement yet.
 | Step 1c: types crate | pass | Selected **cargo-port**; types cells not current: `crates/cargo-port` 3,529; `tui_pane` 2,301; `cargo-mend` 1,681; `cargo-berth` 1,462; `cargo-handler` 699; `cargo-tile` 559; `cargo-berth-test-support` 71. Status universe: 42,552 cells | `style_ledger.py status --repo ~/rust/cargo-liner --json`, group cells by crate and family, count types not current |
 | Bootstrap scoped units | pass | 2026-10-17; check and create both exit 0; `style/main` from `d1ced22c`; names, types and modules rows only; four sessions running, no values session | Cargo-liner's showrunner: `add_style.py --production /home/natepiano/rust/cargo-liner/docs/cargo-port/remove-running-section-production.md --model claude-opus-5-5 --effort xhigh --pilot modules-unit --pilot names-unit=cargo-handler --pilot types-unit=cargo-port`, first with `--check`, then without |
 | Queue respects the real board | partial | Exit 0 in 33.9 s (saved timing 33.953 s); seven structure tickets, then one values listed ticket; no unavailable-board error. The reserved-file check is unverified from the saved file and waits on a live board read. | `style_plan.py queue --repo ~/rust/cargo-liner`; saved `pilot/queue.txt` |
-| First proposal resolves its issue base | pending | No `no issue base for` line; project and return link resolve to cargo-liner's base | `style_proposals.py file --repo <style checkout> --proposals <current folder> --parent <current parent>` |
+| First proposal resolves its issue base | pass | First filed issue, 2026-10-17 12:52Z, `style crate 825516b4.md` (a root `Cargo.toml` finding from modules-unit-1): project `cargo-liner`, return link `issues - cargo-liner.base`. All 279 style issues name a base that exists: a crate with its own base files there (cargo-port 228, cargo-berth 1, cargo-mend 2), and the rest file under cargo-liner (48). Two defects in the filed text, recorded under Fix AH below | `style_proposals.py file --repo <style checkout> --proposals <current folder> --parent <current parent>` |
 | Coverage report rows | pass | Exit 0 in 1.39 s (saved timing 1.386 s); 62 rows: A 14, B 20, C 14, D 14; 64 catalog rules less E 2 | `coverage_report.py --repo ~/rust/cargo-liner`; saved `pilot/coverage.txt` |
 
 The bootstrap created checkout `/home/natepiano/rust/cargo-liner-style` and
@@ -48,8 +48,16 @@ the saved file contains ticket paths and timing, with no board status or
 reservation list to independently reconstruct the excluded paths.
 
 The first ledger ticket was `modules-unit-1`, kind `structure`, crate
-`crates/cargo-berth`, base `d1ced22c` (dispatch evidence). Names/types first
-assignments and the out-of-scope approved-proposal case remain pending.
+`crates/cargo-berth`, base `d1ced22c` (dispatch evidence). The first names
+ticket was `names-unit-1` at 13:14Z, crate `crates/cargo-handler`; the first
+types ticket was `types-unit-1` at 13:59Z, crate `crates/cargo-port`. Both had
+base `d1ced22c`. All 45 names tickets and all 102 types tickets stay in their
+scope crate, and every file they list is inside it. Modules, with no scope
+line, took all seven crates. The one approved proposal, `style cargo-handler
+30d569f3.md`, is inside the names scope and was built as `names-unit-12`. No
+proposal outside a scope was approved during the pilot, so the live run did
+not reach `waiting <issue>: outside pilot scope`. Phase 16's tests cover that
+branch.
 
 The recorded summary keys are `cells_current_pct`, `oldest_waiting`, `proposals`,
 `rules_done`, `rules_total`, `stale`, `synced_at`, `synced_tip`,
@@ -62,11 +70,53 @@ against the union of one-rule findings using the same model.
 
 | Family | Result | Numbers | Source command |
 | --- | --- | --- | --- |
-| modules | FAIL | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. Re-sample with fix L's batches (one blind judge per batch): 30 of 36, 83.3%; split-by-type-ownership 7/8, module-structure 9/12, when-to-split 2/4 (`resample_modules_table.md`). Two blind judges per batch, findings combined: 32 of 36, 88.9%, still below the bar; module-structure 11/12, when-to-split 2/4. The four defects neither judge found sit in the three largest files, two of them when-to-split (`resample2_modules_table.md`). | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
+| modules | PASS | modules-unit-8 (cargo-tile, crate-level pass) found 21 of 36 one-rule findings on 20 files: 58.3%, 16 fully covered. By rule: module-roots 1/1, module-structure 10/12, types-live-with-their-behavior 4/6, name-submodules 3/5, when-to-split 2/4, split-by-type-ownership 1/8. Seven of the 15 misses are on four files where the unit held nothing. Re-sample with fix L's batches (one blind judge per batch): 30 of 36, 83.3%; split-by-type-ownership 7/8, module-structure 9/12, when-to-split 2/4 (`resample_modules_table.md`). Two blind judges per batch, findings combined: 32 of 36, 88.9%, still below the bar; module-structure 11/12, when-to-split 2/4. The four defects neither judge found sit in the three largest files, two of them when-to-split (`resample2_modules_table.md`). Fix AC corrects the reference to 35 and asks the when-to-split question of every file. After it, one blind judge per batch finds 34 of 35, 97.1%, which meets the bar. The one miss is a reciprocal sibling dependency in birth_stamp (split-by-type-ownership). A blind check rules all 15 findings outside the reference real (`rerunac_modules_*.json`). | Six fresh one-rule blind passes at the ticket base `d1ced22c`, scored against the unit's held findings in the ledger (read only) |
 | names | PASS | names-unit-6 and names-unit-11 (cargo-handler, 20 files) found 37 of 117 one-rule findings: 31.6%. By rule: comments-name-code-constructs 18/43, prefer-type-named-fields-and-bindings 18/66, name-bindings-to-match-parameters 0/6, dont-repeat-enum-domain-in-variant-names 1/1, spell-out-names 0/1; the two field-affix rules found nothing on the sample. The unit holds the first defects of a file and stops: misses cluster in long files (render.rs, accounts.rs, terminal.rs) and in test files. Each read file already has its own cell, so the gap is depth within a file, not files skipped. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 63 of 117, 53.8%, below the 100 of 117 a windowed pass reached before fixes P to X; type-named bindings 30/66 and comments 29/43 fell as the name-bindings paragraph drew the judges (`resample_names_table.md`). Rerun 7, after fixes Y and Z, on the six rules left in the names ticket (111 findings; name-bindings moved to its own ticket and met its own bar, 36 of 37): runs of 104, 99 and 104, a median of 104 of 111, 93.7%; comments 36 to 40 of 43, type-named 62 to 64 of 66 (`rerun7_names_table.md`). Two runs' findings together reach 108 to 109 of 111 in every pairing, and a blind re-judging of every finding outside the reference found 0.6% to 0.8% of a two-run union false, against a bar of 10% (`rerun7_names_precision_table.md`); fix AA gives the names read ticket two blind judges, so the family passes on that union. | Seven fresh one-rule blind passes at each ticket's commit (`d1ced22c`, `8d6e25d1`), scored against the unit's 67 held findings in the ledger (read only) |
 | types | PASS | types-unit (cargo-port, 20 files) found 50 of 61 in-scope one-rule findings: 82.0% (50 of 71, 70.4%, counting ten `pub` items of a binary crate that the rule exempts). By rule: enums-over-bool-for-owned-booleans 39/43, if-else-chains-signal-missing-types 7/13, prefer-from-impl-over-named-constructors 3/4, public-failures-return-named-errors 1/11; the other three rules found nothing on the sample, and the five Bevy rules cannot apply to cargo-port. Re-sample with the current read-ticket text (fixes O to X, two blind judges, windows): 55 of 61, 90.2%; owned bools 43/43, if-else 8/13, From 3/4, public failures 1/1, and none of the ten out-of-scope `pub` sites flagged (`resample_types_table.md`). Rerun 7, after fixes Y and Z: 59 of 61, 96.7%, which meets the bar; if-else 12/13, From 3/4 (`rerun7_types_table.md`). | Seven fresh one-rule blind passes at the commits the unit judged (`d2a10b35`, `28db0785`, `ec3297e9`), scored against the unit's held findings in the ledger (read only) |
 
-Per-rule recall and candidate file-local rules: pending.
+### Per-rule recall
+
+The last pass of each family, one row per rule that has one-rule findings.
+
+| Family | Rule | Found | Recall |
+| --- | --- | --- | --- |
+| modules | module-roots-as-table-of-contents | 1 of 1 | 100% |
+| modules | module-structure | 12 of 12 | 100% |
+| modules | name-submodules-after-anchor-types | 5 of 5 | 100% |
+| modules | split-by-type-ownership | 6 of 7 | 85.7% |
+| modules | types-live-with-their-behavior | 6 of 6 | 100% |
+| modules | when-to-split-a-module | 4 of 4 | 100% |
+| names | comments-name-code-constructs | 36 to 40 of 43 | 83.7% to 93.0% |
+| names | prefer-type-named-fields-and-bindings | 62 to 64 of 66 | 93.9% to 97.0% |
+| names | dont-repeat-enum-domain-in-variant-names | 1 of 1 | 100% |
+| names | spell-out-names | 0 of 1 | 0% |
+| names | name-bindings-to-match-parameters (own ticket) | 36 of 37 | 97.3% |
+| types | enums-over-bool-for-owned-booleans | 43 of 43 | 100% |
+| types | if-else-chains-signal-missing-types | 12 of 13 | 92.3% |
+| types | prefer-from-impl-over-named-constructors | 3 of 4 | 75.0% |
+| types | public-failures-return-named-errors | 1 of 1 | 100% |
+
+Names ranges are the three single-judge runs of rerun 7. The names read
+ticket runs two blind judges (fix AA), and every pairing of two runs finds 108
+or 109 of 111. No family is shrunk: each family passes as a whole. The rules
+under 95% have few findings each, except comments-name-code-constructs, whose
+misses do not repeat between judges. The one names miss that every run repeats
+is `CONFIG_DIRNAME` in `constants.rs` (spell-out-names).
+
+### Candidate file-local rules
+
+Thirteen rules judge one file at a time, but they read `input_scope: crate`.
+So an edit anywhere in a crate makes every one of their verdicts in that crate
+stale. On cargo-liner this reissued cells that were already judged and
+unchanged: names-unit-33 relisted 17 forbidden-word sites that five earlier
+tickets had judged clean. The 13 are `forbidden-words`,
+`dont-repeat-type-name-in-fields`, `dont-repeat-enum-domain-in-variant-names`,
+`avoid-repeated-field-affixes`, `spell-out-names`, `prefer-events-over-messages`,
+`extract-observer-run-conditions`, `enums-over-bool-for-owned-booleans`,
+`if-else-chains-signal-missing-types`, `prefer-from-impl-over-named-constructors`,
+`name-bindings-to-match-parameters`, `prefer-type-named-fields-and-bindings` and
+`comments-name-code-constructs`. The change sets `input_scope: file` on each,
+in `~/rust/nate_style`. It waits on the user's go.
 
 ## Hold time
 
@@ -120,7 +170,7 @@ without a lost or doubled ticket; each checkpoint is integrated once.
 
 | Result | Numbers | Source command |
 | --- | --- | --- |
-| pending | Started PIDs, ticket id, restart records and merge count pending | `/shutdown` for pilot-started sessions; startup `style_sync.py resume` reconcile lines; `git log main` for `Merge <slug> hand-off (<hash7>)` |
+| pass, one defect | The style showrunner restarted at 15:51Z (modules-unit-8 open), 18:32Z (modules-unit-14 open) and 04:38Z. The units restarted after the account move at 04:33Z. names-unit-15 was open across it, then checkpointed as `82493d60` and merged once as `8f9e8260`. No ticket was lost or doubled. On main's first-parent line, 8 hand-off merges carry 8 distinct checkpoints and match the 8 ledger rows. One checkpoint, `0c01c6c`, was merged twice; see Fix AI | Ledger `tickets` and `handoffs`; `git log main --grep hand-off`; showrunner and unit transcripts |
 
 ## Yielding
 
@@ -151,14 +201,38 @@ how many tickets changed code, not only how many merged.
 
 ## Ticket-gate evidence
 
-Pending: approved proposal non-mechanical edit passes both gates and reaches a
-recorded checkpoint; an equivalent coverage-selected edit returns to repair.
-Record ticket ids, gate output and checkpoint evidence.
+Pass. names-unit-12 is the approved proposal `style cargo-handler 30d569f3.md`.
+Its edit is not mechanical. It passed the candidate gate as `approved proposal`
+at 16:18:26Z on 2026-10-17. The 411 cargo-handler tests passed at 16:23:33Z.
+It passed the final gate at 16:24:04Z, and the scope audit matched the nine
+approved paths. It checkpointed as `96da4419` with 9 `fixed` judgments, and it
+reached main as `ac95d94d` through hand-off `f091ed48`.
+
+A coverage-selected edit went back to repair. names-unit-24 got gate exit 1 at
+09:49:38Z on 2026-10-18 (`review: check 6`). Its director reverted two test
+files and kept the four renames. The rerun passed as `mechanical` at
+09:49:47Z, checkpointed as `4f5b749d`, and reached main as `48d41365`.
+modules-unit-19 exited 1 with `unjudged:` and was dropped. names-unit-21 was
+held, then failed a merge test, then merged as `0c01c6c9`.
 
 ## Phase 10 live evidence
 
-Pending: standing refill, fast-forward synchronization, reservation target,
-checkpoint release confirmation and merge-wait wake-up traces.
+Partial. Seen live:
+
+- Refill exit 3 many times: `waiting for sync`, `waiting for structure:
+  crates/cargo-handler` (17:43:43Z), and `main 5db7f52 is not in the synced tip`.
+- Refill exit 5 (`waiting for merge`) five times in names.
+- The scripted sync notify reached the style showrunner nine times, from
+  12:33Z on 2026-10-17 to 12:18Z on 2026-10-18.
+- Scripted merge wakes (`ticket <id> merged; refill.`) reached names for 161
+  tickets, types for 12 and modules for 3. One wake to names, at 17:58:06Z,
+  did not arrive.
+- One refused `--ff-only`, in names at 06:52:06Z on 2026-10-18. Its director
+  merged with `--no-ff` as `54a9f18d`.
+
+Not seen live: refill exit 4 (board not available), and a lint step that exits
+1 while the run continues. All 39 recorded lint runs passed. The style
+showrunner ran the fast-forward steps by hand, not as a script.
 
 The Fix C dispatch records names-unit returning exit 3 (`waiting for sync`)
 at about 08:31 EDT, then returning exit 3 again after the `d1ced22` sync woke
@@ -190,12 +264,27 @@ nonzero hand-off counts remain pending; the first hand-off, `28db0785`, merged a
 
 ## --from-child trace
 
-Pending: parent receipt, review, merge, push, promotion and acknowledgment;
-record the checkpoint, merge commit and reconcile evidence.
+Pass. All 8 hand-offs went through `--from-child`. The trace of hand-off
+`852380e8` (UTC, 2026-10-18):
+
+| Step | Time | Evidence |
+| --- | --- | --- |
+| Style side merges the checkpoint | 09:54:47Z | `852380e8` on style/main |
+| Parent receives the hand-off | 09:55:03Z | parent transcript |
+| Parent reviews the diff | 09:55:08Z | parent transcript |
+| `merge_checkpoint.py --from-child` starts | 09:55:14Z | log: tests ok, 0 red |
+| Push | before 10:02:42Z | `48d41365` on origin main |
+| Promotion | — | `promote: ok — no promotion configured` |
+| Scripted notify, ledger row merged | 10:02:42Z, 10:02:46Z | ledger `handoffs` |
+| Acknowledgment | 10:02:52Z scripted, 10:03:07Z by hand | style showrunner transcript |
+| Style side fast-forwards, sets the tip | 10:03:36Z | `852380e8..48d41365` |
 
 ## Dailies
 
-Pending: parent's saved style child summary and rendered style line.
+Not run. Both productions registered `on demand: no scheduled dailies`, and no
+dailies run happened during the pilot. The parent's last saved dailies are from
+2026-10-16 and carry no style entry. This criterion needs one dailies run on
+demand.
 
 ## Fixes
 
@@ -661,9 +750,34 @@ Pending: parent's saved style child summary and rendered style line.
   cells no longer hold other families back. Two other reported reissues
   (clean forbidden-word and census cells) trace to crate-scope rules and
   wait on the input_scope change. Seven tests; four fail before the fix.
+- **Fix AG — a ticket's checkpoint re-stamps its own family's verdicts on files only it changed** (commit `ceef89b6`):
+  on cargo-liner names-unit-34 reissued agent_cell.rs cells that
+  names-unit-15 had judged, because names-unit-15's own checkpoint edited
+  one comment in that file after the verdicts. At checkpoint, the ticket's
+  own family's verdicts are now re-stamped when every change to the file
+  since the verdict is the ticket's own work after its start. An outside
+  edit still reissues, and another family's verdict on the same file stays
+  stale: a names edit can break forbidden-words. Three tests, one per case.
+- **Fix AH — style issues propose a ranking, and a root-crate issue has a title** (commit `260e4550`):
+  all 279 style issues on cargo-liner had an empty `Proposed ranking:` line,
+  so the user had no values to confirm at review. A finding in the root crate
+  got the title `# Style restructure: ` with no name. The filer now derives
+  the five values from each batch, and a root-crate batch takes the
+  repository name. After the fix merges, the same writer fills the open
+  issues in one vault commit. The showrunner approved the fix and the backfill.
+- **Fix AI — style tools read the pushed branch point, not the local one** (pending):
+  refill, reconcile and the hand-off merge check read the local `main` ref.
+  The checkouts share one repository, so that ref holds the parent's merge
+  while its gate runs. On 2026-10-18 at 07:01Z, the parent merged hand-off
+  `0c01c6c` as `b194ce45`, and its tests failed. While they ran, two units
+  reported `b194ce4` as the tip to sync. The style showrunner fast-forwarded
+  style/main to it at 07:15Z and pushed. The parent's second merge,
+  `a779ebde`, then reached main beside it. The trees are equal, so no code is
+  wrong, but main holds two merges of one hand-off. The showrunner approved the fix and keeps the merge already on
+  main, because the trees are equal.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`, fix AH as `053fa900`.
 Live verification of the fixes and subsequent measurements remain pending.

@@ -1887,9 +1887,43 @@ class HerdrTests(unittest.TestCase):
             {"workspace_id": "w1", "label": "boss"}]}}))
         tab = ["tab", "create", "--workspace", "w1", "--label", "alpha", "--cwd", "/wt", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(tab, json.dumps({"result": {"root_pane": {"pane_id": "w1:p2"}}}))
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "prod-alpha", "/wt", {}), "w1:p2")
-        self.assertEqual(self.commands()[-2:], [["--session", "fixture", *tab],
-                                                ["--session", "fixture", "pane", "rename", "w1:p2", "prod-alpha"]])
+        self.assertEqual(self.commands()[-4:], [["--session", "fixture", *tab],
+                                                ["--session", "fixture", "pane", "rename", "w1:p2", "prod-alpha"],
+                                                ["--session", "fixture", "workspace", "list"],
+                                                ["--session", "fixture", "tab", "list", "--workspace", "w1"]])
+
+    def test_order_tabs_puts_the_showrunner_first_then_moves_each_tab_out_of_place(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "boss", "focused": False, "active_tab_id": "w1:t2"},
+            {"workspace_id": "w2", "label": "other", "focused": True, "active_tab_id": "w2:t1"}]}}))
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "delta", "pane_count": 1},
+            {"tab_id": "w1:t3", "label": "alpha", "pane_count": 1}]}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"},
+            {"pane_id": "w1:p3", "tab_id": "w1:t3"}, {"pane_id": "w2:p1", "tab_id": "w2:t1"}]}}))
+        for pane, tab in (("w1:p3", "w1:t4"), ("w1:p2", "w1:t5")):
+            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
+                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
+        self.assertEqual(herdr.Herdr("fixture").order_tabs("w1"), {"w1:p3": "w1:p3", "w1:p2": "w1:p2"})
+        acted = [command[2:] for command in self.commands() if command[2:4] not in (["workspace", "list"], ["tab", "list"],
+                                                                                     ["pane", "list"])]
+        self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
+                                 ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "delta"],
+                                 ["tab", "focus", "w1:t5"], ["workspace", "focus", "w2"]])
+
+    def test_order_tabs_leaves_a_tab_with_several_panes_and_an_ordered_space_alone(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
+        for tabs in ([{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "zed", "pane_count": 1},
+                      {"tab_id": "w1:t3", "label": "alpha", "pane_count": 2}],
+                     [{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]):
+            self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": tabs}}))
+            self.assertEqual(herdr.Herdr("fixture").order_tabs("w1"), {})
+        self.assertEqual({tuple(command[2:4]) for command in self.commands()}, {("workspace", "list"), ("tab", "list")})
 
     def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
         self.share()

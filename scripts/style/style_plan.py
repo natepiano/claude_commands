@@ -818,7 +818,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         standing = standing_style_production(repo)
         if not isinstance(standing, StandingStyleProduction):
             raise style_ledger.LedgerError(f"no standing style production: {standing.slug}")
-        branch_tip = git(repo, "rev-parse", "--verify", f"{standing.branch_point}^{{commit}}").strip()
+        branch_tip = style_ledger.pushed_branch_point_tip(repo, standing.branch_point)
         ancestry = subprocess.run(
             ["git", "-C", str(repo), "merge-base", "--is-ancestor", branch_tip, tip],
             capture_output=True, text=True, check=False,

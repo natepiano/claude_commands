@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -133,6 +134,98 @@ class StyleProposalsTests(unittest.TestCase):
         ledger.ticket_add(ticket, unit, "read", "names", "alpha", ["alpha/src/lib.rs"], [self.rename])
         ledger.ticket_assign(ticket, "main")
         return ticket
+
+    def hold_root_structure(self, ledger: style_ledger.Ledger, count: int) -> None:
+        self.write("Cargo.toml", (self.repo / "Cargo.toml").read_text()
+                   + '[package]\nname = "root-package"\nversion = "0.1.0"\n')
+        self.write("src/lib.rs", "fn root() {}\n")
+        _ = self.git("add", "--all")
+        _ = self.git("commit", "-qm", "Root package")
+        self.tip = self.git("rev-parse", "HEAD")
+        ledger.set_tip(self.tip, "style/main")
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.structure)
+        for line in range(1, count + 1):
+            _ = ledger.hold(self.structure, "src/lib.rs", line, f"root site {line}", "rename",
+                            "before", "after", blob, "outside")
+
+    def test_proposed_ranking_sets_all_values_for_each_kind_and_effort_boundary(self) -> None:
+        for kind, impact in (("rename", "⭐"), ("type", "⭐⭐"), ("restructure", "⭐⭐")):
+            for count, effort in ((1, "⭐"), (3, "⭐"), (4, "⭐⭐"), (15, "⭐⭐"), (16, "⭐⭐⭐")):
+                with self.subTest(kind=kind, findings=count):
+                    self.assertEqual(style_proposals.proposed_ranking(cast(style_ledger.FindingKind, kind), count),
+                                     f"goal 1 - Ship Hana · alignment ⭐⭐ · impact {impact} · urgency ⭐ · effort {effort}")
+
+    def test_root_crate_restructure_uses_repository_name_in_title_and_filename_with_ranking(self) -> None:
+        with self.ledger() as ledger:
+            self.hold_root_structure(ledger, 4)
+            issue = self.file(ledger)[0]
+        self.assertRegex(issue.name, r"^style sample [0-9a-f]{8}\.md$")
+        self.assertIn("# Style restructure: sample\n", issue.read_text())
+        self.assertIn("Proposed ranking: goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐⭐ · urgency ⭐ · effort ⭐⭐\n",
+                      issue.read_text())
+        self.assertIn("--proposed-ranking", self.calls[0])
+
+    def test_root_crate_rename_keeps_rule_stem_in_title_and_filename(self) -> None:
+        self.write("Cargo.toml", (self.repo / "Cargo.toml").read_text()
+                   + '[package]\nname = "root-package"\nversion = "0.1.0"\n')
+        self.write("src/lib.rs", "fn value() {}\n")
+        _ = self.git("add", "--all")
+        _ = self.git("commit", "-qm", "Root package")
+        with self.ledger() as ledger:
+            ledger.set_tip(self.git("rev-parse", "HEAD"), "style/main")
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
+            _ = ledger.hold(self.rename, "src/lib.rs", 1, "root name", "rename",
+                            "value", "count", blob, "outside")
+            issue = self.file(ledger)[0]
+        self.assertRegex(issue.name, r"^style names [0-9a-f]{8}\.md$")
+        self.assertIn("# Style rename: names\n", issue.read_text())
+
+    def test_rank_fills_only_empty_ranking_and_root_title_preserving_other_bytes_and_is_idempotent(self) -> None:
+        with self.ledger() as ledger:
+            self.hold_root_structure(ledger, 4)
+            root_issue = self.file(ledger)[0]
+            _ = self.hold(ledger)
+            filled = self.file(ledger)[0]
+            _ = self.hold(ledger, crate="beta")
+            closed = self.file(ledger)[0]
+            _ = self.hold(ledger, rule=self.propose, line=5, kind="type")
+            propose_issue = self.file(ledger)[0]
+        # CRLF, frontmatter dates, trailing whitespace and file names must all survive.
+        expected = root_issue.read_text().replace("\n", "\r\n").encode()
+        ranking = b"Proposed ranking: " + "goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐⭐ · urgency ⭐ · effort ⭐⭐".encode()
+        _ = root_issue.write_bytes(expected.replace(ranking, b"Proposed ranking: ")
+                                  .replace(b"# Style restructure: sample\r\n", b"# Style restructure: \r\n"))
+        filled_text = filled.read_text()
+        _ = filled.write_text(re.sub(r"Proposed ranking: .*", "Proposed ranking: confirmed by user", filled_text))
+        _ = closed.write_text(re.sub(r"Proposed ranking: .*", "Proposed ranking: ", closed.read_text())
+                              .replace("status: open\n", "status: closed\n"))
+        propose_expected = propose_issue.read_bytes()
+        _ = propose_issue.write_bytes(re.sub(rb"Proposed ranking: [^\n]*", b"Proposed ranking: ", propose_expected))
+        untagged = self.proposals / "not-style.md"
+        _ = untagged.write_bytes(root_issue.read_bytes().replace(b'"style"', b'"other"'))
+        unknown = self.proposals / "unknown.md"
+        _ = unknown.write_text('---\nstatus: open\ntags: [style]\nstyle_findings: [missing]\n---\nProposed ranking: \n')
+        untouched = {path: path.read_bytes() for path in (filled, closed, untagged, unknown)}
+        names = sorted(path.name for path in self.proposals.iterdir())
+        output, errors = io.StringIO(), io.StringIO()
+        arguments = ["rank", "--repo", str(self.repo), "--proposals", str(self.proposals)]
+        with redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(style_proposals.main(arguments), 0)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(root_issue.read_bytes(), expected)
+        self.assertEqual(propose_issue.read_bytes(), propose_expected)
+        self.assertEqual({path: path.read_bytes() for path in untouched}, untouched)
+        self.assertEqual(sorted(path.name for path in self.proposals.iterdir()), names)
+        self.assertIn(f"ranked {root_issue}\n", output.getvalue())
+        self.assertIn(f"ranked {propose_issue}\n", output.getvalue())
+        self.assertIn(f"skipped {unknown}: {unknown}: unknown or absent style_findings\n", output.getvalue())
+        self.assertTrue(output.getvalue().endswith("ranked 2 issues\n"))
+        stamps = {path: path.stat().st_mtime_ns for path in self.proposals.iterdir()}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_proposals.main(arguments), 0)
+        self.assertTrue(output.getvalue().endswith("ranked 0 issues\n"))
+        self.assertEqual({path: path.stat().st_mtime_ns for path in stamps}, stamps)
 
     def test_assigned_ticket_findings_wait_while_closed_ticket_findings_are_filed(self) -> None:
         with self.ledger() as ledger:
