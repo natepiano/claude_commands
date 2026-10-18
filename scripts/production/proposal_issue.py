@@ -157,7 +157,7 @@ def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
 
 
 def create(path: Path, project: str, short: str, proposed_by: str, tags: list[str],
-           findings: list[str], body: str, template: Path, today: date) -> bool:
+           findings: list[str], body: str, template: Path, today: date, proposed_ranking: str = "") -> bool:
     """Create once; the finding identities protect crash recovery from overwriting an issue."""
     identities = sorted(set(findings))
     if not identities:
@@ -178,7 +178,7 @@ def create(path: Path, project: str, short: str, proposed_by: str, tags: list[st
         span = _key_span(lines, end, key)
         start, stop = span if span is not None else (end, end)
         lines[start:stop] = [f"{key}: {json.dumps(value, ensure_ascii=False)}\n"]
-    text = "".join(lines).rstrip() + "\n\nProposed ranking: \n\n" + body.rstrip() + "\n"
+    text = "".join(lines).rstrip() + f"\n\nProposed ranking: {proposed_ranking}\n\n" + body.rstrip() + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive create keeps a concurrent filer from replacing an issue after approval.
     with path.open("x", encoding="utf-8") as stream:
@@ -203,6 +203,7 @@ def main(argv: list[str]) -> int:
     for name in ("project", "short", "proposed-by", "findings"):
         _ = creation.add_argument(f"--{name}", required=True)
     _ = creation.add_argument("--extra-tags", nargs="+", default=[])
+    _ = creation.add_argument("--proposed-ranking", default="")
     _ = creation.add_argument("--body-file", type=Path, required=True)
     _ = creation.add_argument("--template", type=Path, default=Path.home() / "rust/hanadocs/.claude/templates/issue.yaml")
     stars = verbs.add_parser("stars", help="set the five ranking values")
@@ -219,7 +220,8 @@ def main(argv: list[str]) -> int:
         if cast(str, args.verb) == "create":
             created = create(path, cast(str, args.project), cast(str, args.short), cast(str, args.proposed_by),
                              cast(list[str], args.extra_tags), cast(str, args.findings).split(","),
-                             cast(Path, args.body_file).read_text(), cast(Path, args.template), today)
+                             cast(Path, args.body_file).read_text(), cast(Path, args.template), today,
+                             cast(str, args.proposed_ranking))
             print(f"create {path.name}: {'created' if created else 'unchanged'}")
             return 0
         changed = edit(path, fields_for(args, today), today)

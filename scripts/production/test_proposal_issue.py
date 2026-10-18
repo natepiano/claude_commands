@@ -74,8 +74,17 @@ class ProposalIssueTests(unittest.TestCase):
         issue = self.root / "new style issue.md"
         arguments = ["create", str(issue), "--project", "alpha", "--short", "alpha", "--proposed-by", "sample-style",
                      "--extra-tags", "style", "--findings", "b,a,a", "--body-file", str(body), "--template", str(template)]
-        code, _, err = self.run_cli(*arguments)
-        self.assertEqual(code, 0, err)
+        ranking = "goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐⭐ · urgency ⭐ · effort ⭐"
+        for label, flags, expected in (("new style issue", [], ""),
+                                       ("ranked style issue", ["--proposed-ranking", ranking], ranking)):
+            with self.subTest(ranking=expected):
+                destination = self.root / (label + ".md")
+                command = [*arguments]
+                command[1] = str(destination)
+                code, _, err = self.run_cli(*command, *flags)
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"\n\nProposed ranking: {expected}\n\n# Findings\nBefore and after.\n",
+                              destination.read_text())
         from issues import frontmatter
         fields = frontmatter(issue)
         self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
