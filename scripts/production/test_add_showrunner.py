@@ -70,7 +70,7 @@ class AddShowrunnerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state = self.root / "stub"
         self.state.mkdir()
         bin_path = self.root / "bin"
@@ -113,6 +113,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.processes = []
         self.addCleanup(self.close_processes)
         self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")},
+                    "HERDR_PLATFORM": "linux",
                     "HOME": str(self.root / "home"), "STUB_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "HERDR_BIN": str(fake),

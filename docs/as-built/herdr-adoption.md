@@ -201,6 +201,29 @@ Old records and snapshots still parse, and they never become herdr destinations.
 - `fake_unit_host.py`: `environment(root)` sets `HERDR_BIN`, `HERDR_PROC`, `FAKE_HERDR_LOG` and `FAKE_HERDR_RESPONSES` for an empty host. `HostedUnit(session, pane, marks, screen)`. `write(env, units)` publishes a server process (pid `991000 + 2i`), its listener, a marked `zsh` pane shell, the session list, and pane reads (`recent` and `recent-unwrapped`; 3, 60 and 400 lines; with and without ANSI). `place_process(env, pid, pane)` puts a registry process under that pane's shell. `calls(env)` returns logged argv. `live_pid(test)` gives a real live pid for registry checks.
 - Darwin cases fake `LAUNCHCTL`, `HERDR_PS`, `HERDR_LSOF`, `SHUTDOWN_OPEN` and `SHUTDOWN_SYSCTL`, and pin `herdr._PLATFORM`. Linux `/proc` cases use `scripts/shutdown/test_support.linux_process_fixture`, which pins `sys.platform` and `herdr._PLATFORM`.
 
+Use these fixture rules on Linux and macOS:
+
+- Resolve the temporary root in `test_add_unit.py` and `test_add_showrunner.py`. On macOS, `/tmp` points to `/private/tmp`. Trust keys and worktree paths must use the same resolved root as the code under test.
+- Set `HERDR_PLATFORM=linux` in each Linux launcher fixture's environment. Do not set it for the whole run. Darwin tests must still select the Darwin path.
+- Keep `HERDR_BIN=/nonexistent/herdr` in `PromptSubmissionTests`' cleared environment. Its fake pane calls do not need herdr on `PATH`.
+
+Run the nine suites on the Mac with a scratch home. Remove that home when the run ends:
+
+```sh
+(
+  test_home=$(mktemp -d) || exit
+  trap 'rm -rf "$test_home"' EXIT
+  env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
+    HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+    scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
+    scripts.shutdown.test_restart scripts.shutdown.test_account_move \
+    scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle \
+    scripts.production.test_add_unit scripts.production.test_add_showrunner \
+    scripts.notify.test_push_texts
+)
+```
+
 ## Invariants
 
 - Tests never start real herdr, Claude or Codex. They use `fake_herdr.py`, `fake_unit_host.py`, a fake `/proc` and fake session records, in temporary folders.

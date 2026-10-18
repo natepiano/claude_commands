@@ -2026,3 +2026,40 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Binds later work:** "Readout of the moves" names this text (`, then close its record in a terminal on <machine>: <command>`); the readout reads only the journal and records, never the line.
 
 **Gotchas:** `shutdown forget` takes only local records, so any new line that prints a record command names `saved["machine"]`.
+
+### Phase 73 — The herdr and production suites pass on macOS  · status: done
+
+**Depends on:** Phase 72
+
+#### Work Order
+
+**Goal:** the herdr, shutdown and production suites pass on the Mac with a scratch HOME. Today 103 tests fail and up to 52 error there, all from test fixtures that work only on Linux. No real path is broken on macOS. The showrunner cleared `test_add_unit.py`, `test_add_showrunner.py` and `test_herdr.py` for this unit (2026-10-18).
+
+**Constraints from prior phases:**
+- On macOS `/tmp` is a symlink to `/private/tmp`. Production resolves paths: `herdr.claude_trust` does `folder.resolve()` (`scripts/herdr/herdr.py` ~1315), and git returns `/private/tmp/...`. The fixtures build `self.root` from an unresolved `tempfile.TemporaryDirectory()` and write `/tmp/...` trust keys and Worktree cells: `scripts/production/test_add_unit.py` ~117, `scripts/production/test_add_showrunner.py` ~73. This causes 83 test_add_unit failures and about 4 test_add_showrunner failures.
+- `herdr._platform()` (~46) returns `HERDR_PLATFORM`, else `_PLATFORM`. On darwin, `security_session()` (~143) runs `launchctl managername`. Over ssh that is not Aqua, so a launch refuses with `MacDesktopTerminalRequired`, which is correct. The add_unit and add_showrunner fixtures are for Linux (`SYSTEMD_RUN`, `HERDR_PROC`, systemd-run argv checks), but their env (`test_add_unit.py` ~166 `self.env`, `test_add_showrunner.py` ~115 `self.env`) does not pin the platform. This causes about 16 test_add_showrunner failures and 1 test_add_unit error (~912).
+- `PromptSubmissionTests.setUp` (`scripts/herdr/test_herdr.py` ~118) patches `os.environ` with `clear=True`, then calls `herdr.Herdr("agents")` (~137). With no `PATH`, `shutil.which` uses the system's default path. NixOS has `/run/current-system/sw/bin` in it and macOS does not, so on the Mac every test in the class errors in setUp with `HerdrMissing`. This causes all the growing errors (11 at phase 60, 51 at phase 69), so the phase 69 transcript, composer and re-type tests never ran their bodies on the Mac.
+- Setting `HERDR_PLATFORM` on the run command breaks test_restart's `_PLATFORM="darwin"` patches, because the variable takes precedence. Set it in the fixture env only.
+
+**Spec:**
+1. `test_add_unit.py` and `test_add_showrunner.py` resolve their temporary root (`Path(...).resolve()`), so every path a fixture writes matches what production resolves.
+2. Their fixture env pins `"HERDR_PLATFORM": "linux"`, so the Linux fixtures run as Linux on every machine.
+3. `PromptSubmissionTests.setUp`'s cleared env carries `"HERDR_BIN": "/nonexistent/herdr"`, so the class never needs a real herdr on PATH.
+4. `docs/as-built/herdr-adoption.md` "Test doubles" gains the Mac run command and these three fixture rules, so the next Mac run needs no rediscovery: `TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr python3 -m unittest <suites>` with a scratch HOME.
+5. Test-only: no production file changes.
+
+**Files:**
+- `scripts/production/test_add_unit.py` — resolved root, pinned platform.
+- `scripts/production/test_add_showrunner.py` — resolved root, pinned platform.
+- `scripts/herdr/test_herdr.py` — `HERDR_BIN` in the cleared env.
+- `docs/as-built/herdr-adoption.md` — the Mac run command and fixture rules.
+
+**Workers:** 1 tester. test owns all four files.
+
+**Verification:** scratch-HOME suites `scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions scripts.shutdown.test_restart scripts.shutdown.test_account_move scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle scripts.production.test_add_unit scripts.production.test_add_showrunner scripts.notify.test_push_texts`, run twice on natedev: once as usual, and once with `TMPDIR` set to a symlink to a scratch directory, which gives Linux the Mac's `/tmp` condition. basedpyright 0/0 on the changed files. No tests on the Mac in this phase.
+
+**Acceptance gate:**
+- **Symlinked tmp:** on natedev with `TMPDIR` a symlink, test_add_unit and test_add_showrunner pass. Without fix 1 they fail.
+- **Cleared env:** `PromptSubmissionTests` passes with `PATH` holding no herdr. Without fix 3 it errors with `HerdrMissing`.
+- **Suites:** all nine pass as usual on natedev, basedpyright reports 0/0, and the merge gate on natedev passes.
+- **Mac (after the demo frees the Mac, slot from hana):** the documented run command passes the nine suites on the Mac.
