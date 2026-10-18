@@ -1979,6 +1979,37 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         self.assertTrue(self.advance()[0])
         self.assertEqual(self.sent(), ["owner"])
 
+    def test_a_silent_session_holds_the_release_one_limit_however_many_calls_it_queued(self) -> None:
+        """Queued calls that never reach their memory gate end with the first lapse, not one lapse each."""
+        self.begin("owner", "peer", calls=(("owner", "first"), ("owner", "second"), ("owner", "third")))
+        started = self.now
+        _ = self.advance()
+        self.assertEqual(self.entry("owner")["active_call_id"], "first")
+        _ = self.mark("peer", "MemoryGateReturned")
+        self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+        self.assertTrue(self.advance()[0])
+        self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
+        for call_id in ("second", "third"):
+            self.assertIsInstance(build_hold.read_admission("owner", call_id), build_hold.AdmittedTurn)
+        self.assertEqual(self.sent(), ["owner", "peer"])
+
+    def test_nothing_to_build_ends_a_turn_whose_call_never_started(self) -> None:
+        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
+        _ = self.advance()
+        self.assertEqual(self.entry("owner")["active_call_id"], "first")
+        self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("owner"))
+        self.assertTrue(self.advance()[0])
+        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
+
+    def test_a_session_build_ends_a_turn_whose_call_never_started(self) -> None:
+        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
+        _ = self.advance()
+        self.assertEqual(self.entry("owner")["active_call_id"], "first")
+        self.assertIn("WaitingForMemory", self.mark("owner", "WaitingForMemory"))
+        self.assertIn("MemoryGateReturned", self.mark("owner", "MemoryGateReturned"))
+        self.assertTrue(self.advance()[0])
+        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
+
     def test_session_wait_after_the_release_began_adds_no_entry(self) -> None:
         self.begin("owner")
         before = self.record_bytes()
@@ -3730,15 +3761,19 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         with mock.patch.object(build_hold, "process_start_time", return_value=""):
             self.assertFalse(build_hold.call_is_live(call))
 
-    def test_session_mark_and_nothing_to_build_do_not_complete_active_call(self) -> None:
-        self.register("owner", "worker-call")
+    def test_session_mark_and_nothing_to_build_end_the_turn_and_keep_the_calls_admission(self) -> None:
+        self.register("marks", "worker-call")
+        self.register("answers", "worker-call")
         self.advance()
-        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted")
-        _ = build_hold.answer_nothing_to_build("owner")
-        entry = self.cycle()["entries"][0]
-        self.assertEqual(entry["active_call_id"], "worker-call")
-        self.assertNotEqual(entry["state"], "MemoryGateReturned")
-        self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
+        _ = build_hold.mark_gate("marks", "MemoryGateReturned", "Granted")
+        _ = build_hold.answer_nothing_to_build("answers")
+        for key, state in (("marks", "MemoryGateReturned"), ("answers", "NothingToBuild")):
+            with self.subTest(key=key):
+                entry = next(entry for entry in self.cycle()["entries"] if entry["session_id"] == key)
+                self.assertEqual(entry["active_call_id"], "")
+                self.assertEqual(entry["state"], state)
+                self.assertIsInstance(build_hold.read_admission(key, "worker-call"), build_hold.AdmittedTurn)
+                self.assertIsInstance(build_hold.read_admission(key), build_hold.AdmittedTurn)
 
     def test_wrong_call_or_cycle_cannot_mark_an_active_turn(self) -> None:
         self.register("owner", "call-a")

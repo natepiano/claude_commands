@@ -1195,6 +1195,11 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
                  or state == "MemoryGateReturned" and outcome in {"Granted", "TimedOut", "MeminfoUnavailable"})
                 and confirm_delivery(entry, cycle.get("holder_generation", 1))):
                 save_cycle(cycle)
+            if (not call_id and entry["active_call_id"]
+                    and isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued))):
+                # The session builds on its own while a queued call has not reached its memory
+                # gate: the build takes the session's turn, and the queued calls wait only on their gates.
+                end_session_turn(entry, cycle.get("holder_generation", 1))
             if entry["active_call_id"] != call_id:
                 continue
             previous = read_release_state(entry)
@@ -1243,9 +1248,11 @@ def answer_nothing_to_build(session_id: str) -> str:
         if ((not cycle.get("holder_signature", "") or cycle.get("holder_signature", "") == holders_signature())
             and confirm_delivery(entry, cycle.get("holder_generation", 1))):
             save_cycle(cycle)
-        if entry["active_call_id"] or not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
+        if not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
             return f"nothing-to-build ignored: {entry_text(entry)}"
-        entry["session_pending"] = False
+        # An active call that has not reached its memory gate does not hold the answer back:
+        # the session's turn ends, and its queued calls each wait only on their own memory gate.
+        end_session_turn(entry, cycle.get("holder_generation", 1))
         store_release_state(entry, NothingToBuild(datetime.now(timezone.utc)))
         save_cycle(cycle)
         return f"{entry_text(entry)}; the release stops waiting for this session"
@@ -1345,8 +1352,21 @@ def not_reached_detail(cycle: HoldCycle) -> str:
     return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
 
 
-def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime) -> None:
-    """A released turn that outlives its limit, or whose session left, ends; it never holds another session."""
+def end_session_turn(entry: ReleaseEntry, generation: int) -> None:
+    """The session's turn ends: each call it queued is admitted now and waits only on its own memory gate."""
+    for call in entry["calls"]:
+        call["admitted_generation"] = generation
+    entry["active_call_id"] = ""
+    entry["session_pending"] = False
+    entry["session_admitted_generation"] = generation
+
+
+def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime, generation: int) -> None:
+    """A released turn that outlives its limit, or whose session left, ends; it never holds another session.
+
+    A lapse ends the session's whole turn, not just the active call, so a session with queued
+    calls that never start holds the release one limit, not one limit per call.
+    """
     state = read_release_state(entry)
     match state:
         case RecipientGone() | DeliveryFailed() if entry["active_call_id"]:
@@ -1361,8 +1381,7 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime)
         case _:
             return
     if now >= deadline:
-        entry["active_call_id"] = ""
-        entry["session_pending"] = False
+        end_session_turn(entry, generation)
         store_release_state(entry, NoAdmissionAck(released_at))
     elif (not entry["active_call_id"] and not isinstance(state, (RecipientGone, DeliveryFailed))
           and isinstance(socket_for(entry["session_id"]), RecipientGone)):
@@ -1427,7 +1446,7 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
     queue_told_sessions(cycle)
     for entry in entries:
         prune_calls(entry)
-        end_lapsed_turn(entry, now, release_start)
+        end_lapsed_turn(entry, now, release_start, generation)
         if not in_progress(entry) and (has_pending_call(entry, generation) or entry["session_pending"]):
             store_release_state(entry, AwaitingRelease())
         if isinstance(read_release_state(entry), AwaitingRelease):
