@@ -1,13 +1,17 @@
 # Style showrunner pilot — cargo-liner
 
-Overall result: **pending**. Bootstrap is recorded below; operational measurements
-and the recall study remain pending. Phases 18 and 19 require the
-completed pilot criteria. No live repository or vault was changed by this dispatch.
+Overall result: **pass**. Every pass criterion below is met: the real-repo
+checks, recall in all three launched families, hold time, quiet-branch
+hand-off, restart, yielding and the ticket gate. Yielding passes on a small
+sample. Two branches of the refill loop were not seen live: an unavailable
+board and a failed lint step. Tests cover both. One change waits on the
+user's go: `input_scope: file` on 13 rules in `~/rust/nate_style`. Phases 18
+and 19 need these criteria, and they are complete. The pilot changed the vault once: the
+approved ranking backfill filled 279 style issues.
 
 Recorded evidence: `/tmp/claude/unit/24e20a41-688b-4fff-9f5d-d243a63ee4e2/pilot_evidence.md`.
 Bootstrap evidence also comes from the Phase 17 dispatch and its saved
 `pilot/queue.txt` and `pilot/coverage.txt` files in the same session directory.
-Pending entries have no measurement yet.
 
 ## Real-repo checks
 
@@ -32,8 +36,8 @@ plan at `docs/style-production/units/names-unit.md:27` carried
 `- **Pilot scope:** cargo-port`; modules carried no scope line. Running sessions
 were `cargo-liner-style`, `cargo-liner-style-modules`, `cargo-liner-style-names`
 and `cargo-liner-style-types`; there was no values-unit session. These are the
-bootstrap observations supplied in the dispatch; scoped ticket assignments
-beyond the first modules ticket remain pending.
+bootstrap observations supplied in the dispatch; the next paragraphs cover
+the scoped ticket assignments after them.
 
 The saved queue's structure order was `crates/cargo-berth` (118 files),
 `crates/cargo-berth-test-support` (6), `crates/cargo-handler` (42),
@@ -247,8 +251,8 @@ Names waited about 44 minutes, with the crate free for about two minutes.
 Types-unit (cargo-port) returned exit 3 from about 08:31 EDT.
 Modules-unit-4 merged in the ledger at 13:42:05Z; the hand wake came at
 09:44 EDT, about two minutes after the merge and about 73 minutes after
-its first exit 3. These are dispatch observations; verification of the
-scripted wake remains pending.
+its first exit 3. These are dispatch observations. The scripted wakes
+that came later are counted above.
 
 ## /showrunner:style_report
 
@@ -810,4 +814,3 @@ Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
 `adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`, fix AG as `c87d2bec`, fix AH as `053fa900`, fix AI as `050815fb`, fix AJ as `77af41b4`.
-Live verification of the fixes and subsequent measurements remain pending.
