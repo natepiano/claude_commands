@@ -224,6 +224,21 @@ def record_admission(admission: build_hold.AdmittedTurn) -> None:
         _ = Path(destination).write_text(f"{admission.cycle_id} {admission.generation}\n")
 
 
+def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
+    try:
+        holds = build_hold.natedev_holds(directory)
+        key = build_hold.holder_path(directory, owner.session_id).name
+    except ValueError:
+        return False
+    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
+
+
+def caller_holds_only_own() -> bool:
+    """The calling session's hold is the only one in force, so natedev is held for it, not against it."""
+    owner = build_hold.owning_session()
+    return isinstance(owner, build_hold.OwningSession) and holds_only_own(owner, build_hold.holder_directory())
+
+
 def register_local_call(key: str, call_id: str, pid: int) -> build_hold.Admission:
     """Register the waiting verify process and remember its actual cycle."""
     progress = os.environ.get("BUILDLOG_HOLD_STARTED_FILE", "")
@@ -244,7 +259,7 @@ def command_register_local(call_id: str, *, pid: int) -> int:
         if isinstance(state, StateUnreadable):
             print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
             return 12
-        if not isinstance(state, Held):
+        if not isinstance(state, Held) or caller_holds_only_own():
             return 0
         key = build_hold.waiter_key(call_id)
         admission = build_hold.read_admission(key, call_id)
@@ -309,7 +324,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> i
             if isinstance(state, StateUnreadable):
                 print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
                 return 12
-            if not isinstance(state, Held):
+            if not isinstance(state, Held) or caller_holds_only_own():
                 return 0
             if not key:
                 key = build_hold.waiter_key(call_id)
@@ -403,7 +418,7 @@ def command_check_admission(call_id: str) -> int:
         if isinstance(state, StateUnreadable):
             print(wait_diagnostic(state.reason), file=sys.stderr)
             return 12
-        if not isinstance(state, Held):
+        if not isinstance(state, Held) or caller_holds_only_own():
             return 0
         admission = build_hold.read_admission(build_hold.waiter_key(call_id), call_id)
         if isinstance(admission, build_hold.AdmissionReadError):
@@ -416,15 +431,6 @@ def command_check_admission(call_id: str) -> int:
     except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
         print(wait_diagnostic(str(error)), file=sys.stderr)
         return 12
-
-
-def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
-    try:
-        holds = build_hold.natedev_holds(directory)
-        key = build_hold.holder_path(directory, owner.session_id).name
-    except ValueError:
-        return False
-    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
 
 
 def command_check_local() -> int:
