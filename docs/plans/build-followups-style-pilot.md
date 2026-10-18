@@ -107,7 +107,11 @@ criterion is then judged from three points.
 | --- | --- | --- | --- | --- |
 | `28db0785` | names-unit-6 `c2a3160a` | 0.48 h | yes, `d2a10b35` | yes: `8d6e25d1` merges the ticket onto `d2a10b35`, and its tree equals the automatic merge |
 | `ac95d94d` | names-unit-12 `96da4419` at 16:26:13Z, merged to main at 16:31:20Z | 0.09 h | no: main's last product merge, `ec3297e9`, landed at 15:16:13Z, before the checkpoint | yes: `f091ed48` merges the ticket onto `ec3297e9`, and its tree equals the automatic merge |
-| third | pending | pending | pending | pending |
+| `8f9e8260` | names-unit-15 `82493d60` at 05:01:50Z, merged to main at 05:15:25Z | 0.23 h | no: main's last product merge, `d0d35e1b`, landed at 04:43:22Z, before the checkpoint | yes: `d9795213` merges the ticket onto `d0d35e1b`, and its tree equals the automatic merge |
+
+Judged from three points: every hand-off reached main within an hour, and
+`style/main` took each in cleanly. Two of three had no product merge between;
+the one that did merged without conflict. The criterion passes.
 
 ## Restart
 
@@ -661,5 +665,5 @@ Pending: parent's saved style child summary and rendered style line.
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
 `a8ae4d2a`, fix N as `5f63b4cf`, fix O as `e4906bb9`, fixes P, Q and R as
-`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`.
+`adfa7c47`, fixes S and T as `b2714928`, fix U as `ede97508`, fix V as `6d67a552`, fixes W and X as `2eb57a74`, fixes Y and Z as `0cb8edca`, fix AA as `cf8f044e`, fix AB as `50e72f7f`, fixes AC and AD as `d988aa8a`, fixes AE and AF as `cf738406`.
 Live verification of the fixes and subsequent measurements remain pending.
