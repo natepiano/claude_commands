@@ -1,0 +1,42 @@
+---
+description: Retire one unit of this production. It stops everything the unit owns, marks its Units row retired, and removes its worktree and branch.
+argument-hint: "<unit> [--dry-run]"
+---
+
+# Retire unit
+
+Run from the showrunner session. `<unit>` is the unit's id or its stem. Run it in the background:
+a stop can wait up to 20 minutes for the unit director to reach its ready mark.
+
+```sh
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <slug> <unit> [--dry-run]
+```
+
+When it finishes, print its output exactly as it comes, with nothing added.
+
+It refuses, and changes nothing, when the unit's worktree has uncommitted work or its branch (here
+or on origin) has a commit the merge branch does not have. The refusal names each one.
+
+Then it stops everything the unit owns. It finds each thing by its own record, never by a name
+pattern, and prints one line for each thing it stops and for each thing it leaves running, with
+the reason:
+
+1. Each Claude session that works in the worktree, the unit director and its Claude seats, stops
+   through `shutdown.py down`: it pauses and stops at its ready mark. Its restore is then forgotten,
+   so no restart brings it back.
+2. Each run of the worktree with an app-server stops it and ends its Codex seats.
+3. The unit's review-pool reviewers retire. A reviewer still reviewing stays.
+4. The build holds of the unit's sessions release, its berth reservations release, and the process
+   of each Mac claim on the worktree stops.
+5. Each process still working inside the worktree, a build or a test, gets SIGTERM.
+
+When nothing is left running, the Units row's Plan cell gets `(retired <date>, worktree removed)`,
+committed on the merge branch (the next merge push takes it out). Then the worktree, the local
+branch and the origin branch are removed. When something still runs, nothing is marked or removed:
+the output says what, and a rerun resumes.
+
+`--dry-run` prints each refusal and everything it would stop and remove, and changes nothing.
+
+Exit 0 means the unit is retired. Exit 1 is a refusal, or something still runs.
+
+Never stop a unit's session by hand: no `/exit` into its pane, no `shutdown.py now`, no kill.
