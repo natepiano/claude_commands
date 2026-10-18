@@ -507,12 +507,33 @@ def _screen(session: Session) -> ScreenText | ScreenUnreadable:
         return ScreenUnreadable("capture failed")
 
 
-def _showing_form(session: Session) -> bool:
-    screen = _screen(session)
-    if isinstance(screen, ScreenUnreadable):
+# A prompt that waits for the user replaces the input box with numbered choices, one selected, and a key footer.
+_PROMPT_CHOICE = re.compile(r"^\s*❯\s*\d+\.")
+_PROMPT_FOOTERS = ("esc to cancel", "enter to confirm", "enter to select")
+_INPUT_RULE = "──"
+_PROMPT_LINES = 25
+
+
+def waits_on_prompt(text: str) -> bool:
+    """Whether the bottom of this pane text is a prompt that waits for the user.
+
+    Words in the transcript never count: the prompt needs its selected choice and its key footer,
+    and an input box on screen means the session is at its own prompt instead.
+    """
+    lines = [line for line in text.splitlines() if line.strip()][-_PROMPT_LINES:]
+    if any(line.lstrip().startswith("❯") and not _PROMPT_CHOICE.match(line)
+           and previous.lstrip().startswith(_INPUT_RULE) for previous, line in zip(lines, lines[1:])):
         return False
-    pane = screen.text.casefold()
-    return "form" in pane or "esc to cancel" in pane
+    return (any(_PROMPT_CHOICE.match(line) for line in lines)
+            and any(footer in line.casefold() for line in lines for footer in _PROMPT_FOOTERS))
+
+
+def _showing_form(session: Session) -> bool:
+    # A busy session is working, so nothing on its screen waits for the user.
+    if session["status"] == "busy":
+        return False
+    screen = _screen(session)
+    return isinstance(screen, ScreenText) and waits_on_prompt(screen.text)
 
 
 def _held_by_usage_limit(screen: ScreenText | ScreenUnreadable) -> bool:
