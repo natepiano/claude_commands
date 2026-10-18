@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
@@ -187,8 +187,20 @@ class PromptInputTimedOut:
 
 
 @dataclass(frozen=True)
+class PromptRecipientProcess:
+    pid: int
+    started_at: str
+
+
+@dataclass(frozen=True)
+class PromptRecipientUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
 class PromptSubmitted:
     at: datetime
+    process: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("prompt recipient was not identified")
 
 
 @dataclass(frozen=True)
@@ -268,9 +280,30 @@ def submitted_prompt(transcript: SessionTranscript, text: str, launched_at: date
     return PromptNotSubmitted("no matching non-meta user turn after launch")
 
 
+def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
+    """Identify the process receiving input, including before its socket opens."""
+    import sessions
+
+    try:
+        identities = {PromptRecipientProcess(row["pid"], row.get("procStart", ""))
+                      for row in sessions.running_sessions() if row["sessionId"] == session_id}
+    except (OSError, ValueError) as error:
+        return PromptRecipientUnavailable(str(error))
+    if len(identities) != 1:
+        return PromptRecipientUnavailable("prompt recipient is missing or ambiguous")
+    process = identities.pop()
+    if not process.started_at:
+        return PromptRecipientUnavailable("prompt recipient start is unrecorded")
+    return process
+
+
 def encode_prompt_outcome(outcome: PromptSubmitOutcome) -> str:
-    return json.dumps({"kind": "submitted", "at": outcome.at.isoformat()} if isinstance(outcome, PromptSubmitted)
-                      else {"kind": "not submitted", "reason": outcome.reason})
+    if isinstance(outcome, PromptNotSubmitted):
+        return json.dumps({"kind": "not submitted", "reason": outcome.reason})
+    process = outcome.process
+    return json.dumps({"kind": "submitted", "at": outcome.at.isoformat(),
+                       "process": {"pid": process.pid, "started_at": process.started_at}
+                       if isinstance(process, PromptRecipientProcess) else {}})
 
 
 def decode_prompt_outcome(text: str) -> PromptSubmitOutcome:
@@ -281,6 +314,12 @@ def decode_prompt_outcome(text: str) -> PromptSubmitOutcome:
             if row.get("kind") == "submitted" and isinstance(row.get("at"), str):
                 at = datetime.fromisoformat(cast(str, row["at"]))
                 if at.tzinfo is not None:
+                    process = row.get("process")
+                    if isinstance(process, dict):
+                        fields = cast(dict[str, object], process)
+                        pid, started_at = fields.get("pid"), fields.get("started_at")
+                        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(started_at, str) and started_at:
+                            return PromptSubmitted(at, PromptRecipientProcess(pid, started_at))
                     return PromptSubmitted(at)
             if row.get("kind") == "not submitted" and isinstance(row.get("reason"), str):
                 return PromptNotSubmitted(cast(str, row["reason"]))
@@ -925,15 +964,25 @@ class Herdr:
         borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
         if len(borders) < 2:
             return False
-        if any(re.match(r"^\s*[❯>]", line) for line in lines[borders[-1] + 1:]):
+        # Anything after the closing rule must be composer chrome. Assistant
+        # output below an old composer makes that composer scrollback, even if
+        # the next input marker has not appeared yet.
+        footer = (r"(?:\? for shortcuts|esc to interrupt|esc to cancel|ctrl\+c to interrupt|"
+                  r"ctrl\+c to cancel|ctrl\+c to exit|"
+                  r"⏵⏵ (?:accept edits|bypass permissions) on \(shift\+tab to cycle\))")
+        if any(line.strip() and not re.fullmatch(rf"\s*{footer}(?:\s+·\s+{footer})*\s*", line)
+               for line in lines[borders[-1] + 1:]):
             return False
         region = lines[borders[-2] + 1:borders[-1]]
         if not region or not re.match(r"^\s*[❯>]", region[0]):
             return False
         region[0] = re.sub(r"^\s*[❯>]\s?", "", region[0])
-        def compact(value: str) -> str:
-            return " ".join(value.split())
-        return compact(text) in compact("\n".join(region))
+        # Physical screen wraps can split a word or path without a space.
+        # Inside a word only a screen newline may intervene; between words the
+        # prompt still requires whitespace, so different input cannot match by
+        # dropping all of its spaces.
+        pattern = r"\s+".join(r"\n?".join(re.escape(char) for char in word) for word in text.split())
+        return bool(pattern) and re.search(pattern, "\n".join(line.strip() for line in region)) is not None
 
     def _wait_for_submit(self, opening: OpeningPrompt, launched_at: datetime,
                          deadline: float) -> PromptSubmitOutcome:
@@ -956,23 +1005,39 @@ class Herdr:
         ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at, timeout_ms)
         if isinstance(ready, PromptInputTimedOut):
             return PromptNotSubmitted("destination never became ready for input")
+        recipient = (prompt_recipient_process(opening.transcript.session_id)
+                     if isinstance(opening.transcript, SessionTranscript)
+                     else PromptRecipientUnavailable("transcript identity not supplied"))
+
+        def bound_outcome(outcome: PromptSubmitOutcome) -> PromptSubmitOutcome:
+            if isinstance(outcome, PromptNotSubmitted):
+                return outcome
+            if (isinstance(recipient, PromptRecipientProcess)
+                    and isinstance(opening.transcript, SessionTranscript)
+                    and prompt_recipient_process(opening.transcript.session_id) != recipient):
+                return PromptNotSubmitted("prompt recipient changed during submission")
+            return PromptSubmitted(outcome.at, recipient)
+
         try:
             try:
                 self.prompt(pane, opening.text)
             except HerdrFailure as error:
                 if error.code != "agent_prompt_stalled":
-                    return (submitted_prompt(opening.transcript, opening.text, launched_at)
+                    return (bound_outcome(submitted_prompt(opening.transcript, opening.text, launched_at))
                             if isinstance(opening.transcript, SessionTranscript) else PromptNotSubmitted(str(error)))
             if not isinstance(opening.transcript, SessionTranscript):
                 return PromptNotSubmitted("caller did not identify the transcript; submit is unproven")
             for attempt in range(4):
                 result = self._wait_for_submit(opening, launched_at, min(deadline, time.monotonic() + 5))
                 if isinstance(result, PromptSubmitted):
-                    return result
+                    return bound_outcome(result)
                 if attempt == 3 or time.monotonic() >= deadline:
                     return PromptNotSubmitted("no user turn after three Enter retries")
                 if not self.prompt_in_input(pane, opening.text):
                     return PromptNotSubmitted("opening prompt is not in the destination input")
+                if (isinstance(recipient, PromptRecipientProcess)
+                        and prompt_recipient_process(opening.transcript.session_id) != recipient):
+                    return PromptNotSubmitted("prompt recipient changed before Enter retry")
                 self.send_keys(pane, "Enter")
         except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
             return PromptNotSubmitted(str(error))

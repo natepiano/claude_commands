@@ -1390,11 +1390,12 @@ def report_stop(records: list[SessionShutdown]) -> None:
         due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
         for machine in dict.fromkeys(saved["machine"] for saved in due):
             items = [saved for saved in due if saved["machine"] == machine]
-            push = (render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
-                           stopped=stopped_sessions_text(len(items))) if stop_due else
+            pushes = ((render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
+                           stopped=stopped_sessions_text(len(items))),) if stop_due else
                     restart_work.restart_push(first["label"], [saved["session"]["name"] for saved in items],
                                               machine=machine))
-            alert_user(push, machine=route)
+            for push in pushes:
+                alert_user(push, machine=route)
             if not stop_due:
                 for saved in items:
                     mark_not_back_pushed(saved)

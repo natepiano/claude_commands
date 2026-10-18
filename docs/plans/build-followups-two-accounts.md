@@ -1801,7 +1801,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** a half-point hold's minutes come from the pace at hold start and stay fixed; fixed holds unchanged; the list shows natedev's would-be minutes on both machines; the in-place update keeps ids and order and restarts that entry's hold, and with `--expect` refuses a shifted position without changing anything; the Mac forwards the hold verbs and never loses the hold mode; merge gate and Mac suites pass.
 
-### Phase 63 — Submit proof holds at its edges  · status: todo
+### Phase 63 — Submit proof holds at its edges  · status: done
 
 **Depends on:** Phase 60
 
