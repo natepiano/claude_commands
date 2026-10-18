@@ -392,12 +392,17 @@ class StylePlanTests(unittest.TestCase):
         baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != split),
                                          self.plan, context)
         self.assertNotIn("type clusters", baseline)
+        ownership_guidance = (
+            "A split finding names the split alone: each test, type or function that belongs with an owner "
+            + "in another file is its own finding under the rule that places it, even when the split moves it."
+        )
+        self.assertNotIn(ownership_guidance, baseline)
         guidance = (
             "For every file, name its type clusters (each type with the impls and functions that serve it) "
             + "and its test domains (groups of tests that exercise separate behaviour), then decide against "
             + "`when-to-split-a-module` whether the file should split, and hold a finding when it should. "
             + "Ask this of every file, also one where other rules already hold findings: moving or reordering "
-            + "code under another rule does not answer whether the file should split."
+            + "code under another rule does not answer whether the file should split. " + ownership_guidance
         )
         for suffix in ("", "#uncovered"):
             with self.subTest(surface=suffix):
@@ -405,6 +410,7 @@ class StylePlanTests(unittest.TestCase):
                              if pin.rule_id == split else pin for pin in texts)
                 text = style_plan.phase_text(ticket, pins, self.plan, context)
                 self.assertEqual(text.count(guidance), 1)
+                self.assertEqual(text.count(ownership_guidance), 1)
                 self.assertIn(
                     "Hold every distinct defect as its own finding. Never fold several defects into one crate-level finding, "
                     + "and never stop at a file's first finding.\n" + guidance + "\n", text)

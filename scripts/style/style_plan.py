@@ -555,7 +555,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                + "and its test domains (groups of tests that exercise separate behaviour), then decide against "
                + "`when-to-split-a-module` whether the file should split, and hold a finding when it should. "
                + "Ask this of every file, also one where other rules already hold findings: moving or reordering "
-               + "code under another rule does not answer whether the file should split."]
+               + "code under another rule does not answer whether the file should split. "
+               + "A split finding names the split alone: each test, type or function that belongs with an owner "
+               + "in another file is its own finding under the rule that places it, even when the split moves it."]
               if any(_is_when_to_split_rule(pinned.rule_id) for pinned in texts) else []),
             "A defect that spans files is held once, under the file that should change. A defect several rules name is held once, "
             + "under the rule it breaks most directly, naming the others in its text.",
