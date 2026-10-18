@@ -541,7 +541,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** a manual launch hold in place of an `add_style` flag.
 
-### Phase 17 — Live pilot under cargo-liner's showrunner  · status: todo
+### Phase 17 — Live pilot under cargo-liner's showrunner  · status: done
 **Depends on:** Phase 16
 **Blocked by:** Phase 16's checkpoint on `~/.claude` main — cargo-liner's showrunner runs `/showrunner:add_style --pilot` from main.
 
