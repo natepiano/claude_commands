@@ -1579,6 +1579,45 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
 
+    def test_refill_selects_work_despite_an_unpushed_local_branch_point_merge(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "main")
+        _ = (self.style / "README.md").write_text("Style checkpoint.\n")
+        _ = self.git("add", "README.md", cwd=self.style)
+        _ = self.git("commit", "-qm", "Style checkpoint", cwd=self.style)
+        _ = self.git("merge", "--no-ff", "-qm", "Unpushed integration", "style/main")
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+
+        self.assertEqual(self.count_tickets(), 1)
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_refill_waits_for_sync_after_the_local_branch_point_merge_is_pushed(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "main")
+        _ = (self.style / "README.md").write_text("Style checkpoint.\n")
+        _ = self.git("add", "README.md", cwd=self.style)
+        _ = self.git("commit", "-qm", "Style checkpoint", cwd=self.style)
+        _ = self.git("merge", "--no-ff", "-qm", "Integration", "style/main")
+        branch_tip = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "-q", "origin", "main")
+        before = self.plan.read_bytes()
+
+        self.assertEqual(self.run_next(), (
+            3, f"waiting for sync: main {branch_tip[:7]} is not in the synced tip {self.tip[:7]}\n", ""))
+
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.plan.read_bytes(), before)
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+
     def test_refill_selects_work_after_sync_merges_the_branch_point_into_a_distinct_style_tip(self) -> None:
         _ = self.rule("read")
         self.sync()
