@@ -284,7 +284,7 @@ The 96-hour window after T_reach, 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z)
 
 **Ruled out:** rewriting inside macro bodies, whose suggestions clippy marks `MaybeIncorrect`.
 
-### Phase 10 — Re-measure the rewrite rounds  · status: todo
+### Phase 10 — Re-measure the rewrite rounds  · status: done
 
 **Depends on:** Phase 9
 **Blocked by:** G6, G7

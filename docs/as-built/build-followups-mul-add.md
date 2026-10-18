@@ -127,6 +127,94 @@ FMA improves runtime by eliminating the fallback calls and allowing vectorizatio
 
 ## Measured outcome
 
+**Rewrite rounds, re-measure.** The window starts at **T_rounds = 2026-10-17 16:59:51 EDT (2026-10-17T20:59:51Z)**. It ends at **2026-10-18 16:59:51 EDT (2026-10-18T20:59:51Z)**. These times use America/New_York, UTC-04:00. The start is included. The end is excluded. The span is 24 hours.
+
+| Measure | Rewrite rounds, re-measure | Limit / verdict | Source |
+| --- | --- | --- | --- |
+| Final clippy verdicts | **147 total; 42 failed; 0 failed with `suboptimal_flops`** | — | `measurements.json`: `verdict_steps`, `failed_verdicts`, `suboptimal_verdicts` |
+| Target failures per 100 verdicts | **0 / 147 × 100 = 0.000** | ≤1.979: **PASS** | `failed_per_100`, `failed_verdict` |
+| Sole-cause seat-hours per day | **(0 + 0) / 3,600 / 1 = 0.000**; no sole-cause failures | ≤0.100: **PASS** | `wall_seconds`, `gap_seconds`, `span_days`, `seat_verdict` |
+| Same window, earlier per-step rule | **184 clippy steps; 76 failed; 26 with the target: 26 / 184 × 100 = 14.130** | Includes JSON replay diagnostics | `total_steps`, `failed_steps`, `per_step_suboptimal` |
+| Complete selected call sequences | **185 clippy steps; 159 judging steps; 12 judgments with the target** | Includes a final judgment after the window end | `cohort_clippy_steps`, `judging_steps`, `judging_suboptimal` |
+| JSON replay cost and result | **26 replays in 12 calls; 37 recorded fixes; 2,285.385 s added clippy time** | **3 calls** ended with a passing clippy verdict; those calls contain **6 replays** | `rewrite_steps`, `rewrite_calls`, `rewrite_fixes`, `rewrite_clippy_seconds`, `rewrite_passing_calls`, `rewrite_passing_verdicts` |
+| Applied rounds and cap stops | **14 rounds: 10 calls with one round; 2 calls with two rounds; 0 cap stops; 0 unknown round counts** | All 12 count logs are available | `rewrite_rounds`, `rounds_per_call`, `cap_stops`, `rewrite_missing_count_logs` |
+| Earlier single-replay result | **5 / 124 × 100 = 4.032; (956 + 657.026) / 3,600 / 1 = 0.448 seat-hours/day** | Both FAIL | “Lint-step rewrite, re-measure” below |
+
+Both limits **PASS**. No final failed verdict contains the target lint. Thus, no remaining target cause has a failed verdict to rank (`commits.json`: empty `causes` and `diagnostic_groups`; `remaining_warnings` is empty). The other 42 failed verdicts do not contain this lint. There are no sole-cause call times or follow-up intervals to sample. The call-wall median, interval median and interval p75 are unavailable. Their sums are zero. These results support a proposal to retire the edit hook. This phase removes nothing. The showrunner must decide on the proposal.
+
+The count logs give these applied rounds and fixes. The total sums each saved count line once. A fix can be one stage of a chained expression's rewrite.
+
+| Call ID | Applied rounds | Recorded fixes |
+| --- | ---: | ---: |
+| `v20261017T214057-354858-16777` | 1 | 1 |
+| `v20261017T232129-2960842-22` | 1 | 2 |
+| `v20261017T234353-416992-2893` | 2 | 8 |
+| `v20261018T020451-517360-16995` | 2 | 3 |
+| `v20261018T083822-549247-14928` | 1 | 1 |
+| `v20261018T091812-2139493-11979` | 1 | 6 |
+| `v20261018T114747-905865-29270` | 1 | 2 |
+| `v20261018T151118-961065-30865` | 1 | 3 |
+| `v20261018T163123-3605214-502` | 1 | 1 |
+| `v20261018T190237-4074915-16270` | 1 | 2 |
+| `v20261018T194506-1016913-20905` | 1 | 3 |
+| `v20261018T202042-2903290-354` | 1 | 5 |
+| **Total** | **14** | **37** |
+
+The last call's first judgment started at **2026-10-18 16:42:39.178 EDT (2026-10-18T20:42:39.178Z)**. Its final judgment started at **2026-10-18 17:10:09.085 EDT (2026-10-18T21:10:09.085Z)**. The final judgment failed on other errors. It had no target warning. The cohort includes that final judgment even though it started after the window end.
+
+The final pipeline completed after every selected call had a completion record. **`audit.json` reports PASS**. It agrees on the selected verdict IDs, both limit verdicts, cost sums, rounds, fixes, replay times and cap stops. The synthetic checks report **PASS**. All four copied or new Python files report **0 errors, 0 warnings, 0 notes** under basedpyright.
+
+The source scripts and JSON are in `~/.local/state/mul-add-hook/lint-rounds/`. They are copies of the earlier `lint-rewrite/` scripts with the changes below. A call enters the cohort when its first judging clippy step starts inside the window. The scripts read all steps in that call, including steps after the window ends. They use its last judging step as the verdict. JSON replay steps are not verdicts. A step with no call ID stands alone. Both the measurement and the audit reject a selected call with no completion record.
+
+Run `python3 -B ~/.local/state/mul-add-hook/lint-rounds/synthetic_checks.py` for the synthetic checks. Then run `measure.py`, `commits.py` and `audit.py` from that folder with `python3 -B`. `measure.py` writes `measurements.json` and `warnings.json`. `commits.py` reads them and writes `commits.json`. It keeps each call's full replay history in order. It does not match Git commits. The rewrite enters the calling tree before any commit. `audit.py` reads the index, gzip logs and count logs again. It uses its own SQL window ranks and count parser. It writes `audit.json`.
+
+Each script opens the buildlog index in read-only mode. Each reads saved count logs from `~/.local/state/mul-add-hook/lint-rewrite/`. The scripts do not change those inputs. The measurement reads each call's count log once. It sums the fixes in all saved lines. Each line counts as one applied round. A replay with no saved line adds no known round. A missing log makes that call's round count unknown. Five saved lines count as one cap stop. Four lines and a failed fifth replay do not count as a cap stop. Replay duration is the added JSON clippy cost. The scripts sum it apart from judgment duration.
+
+The synthetic checks use a temporary SQLite index, gzip logs and count logs. They run all three copied scripts. They check two applied rounds and an empty replay, five applied rounds, and four applied rounds with a failed fifth replay. They keep a round-one rewrite with a later failure apart from a call with no recorded rewrite. They select a final judgment after the window end when its first judgment starts inside. They also check missing counts, separate steps with no call ID, both bounds, and open or missing call records. The checks delete their temporary inputs.
+
+The SQL below selects the cohort and its complete clippy sequences. Bind each placeholder pair to the UTC start and exclusive end above. `measure.py` orders judgments by precise start time and step ID. It keeps the last judgment per call. `commits.py` uses the same query without `s.step='clippy'` to read all stages. The independent audit query is in `audit.json`.
+
+```sql
+WITH first_judgments AS (
+ SELECT CASE WHEN COALESCE(call_id,'')='' THEN 'step:'||id
+             ELSE 'call:'||call_id END AS cohort_key,
+        MIN(julianday(started_at)) AS first_start
+ FROM steps
+ WHERE repo='hana' AND step='clippy'
+   AND argv NOT LIKE '%--message-format=json%'
+ GROUP BY cohort_key
+), cohort AS (
+ SELECT cohort_key FROM first_judgments
+ WHERE datetime(first_start)>=datetime(?)
+   AND datetime(first_start)<datetime(?)
+)
+SELECT s.* FROM steps s JOIN cohort c ON c.cohort_key=
+ CASE WHEN COALESCE(s.call_id,'')='' THEN 'step:'||s.id
+      ELSE 'call:'||s.call_id END
+WHERE s.repo='hana' AND s.step='clippy'
+ORDER BY julianday(s.started_at),s.id;
+```
+
+For call costs, use the same CTE and replace its final `SELECT` with this query. This query has a second pair of bounds. It also reads selected calls whose call start precedes the window. The follow-up rule stays the same as before. The next lint call must share worktree, worker and session. It must start inside the window. Its end must fall within 1,800 seconds after the failed call's end.
+
+```sql
+SELECT * FROM calls WHERE repo='hana'
+ AND ('call:'||id IN (SELECT cohort_key FROM cohort)
+      OR (tool='verify.sh' AND verb='lint'
+          AND datetime(started_at)>=datetime(?)
+          AND datetime(started_at)<datetime(?)))
+ORDER BY julianday(started_at),id;
+```
+
+The earlier per-step comparison uses its own bounded query. It counts each step whose start is inside the window, including JSON replays.
+
+```sql
+SELECT * FROM steps WHERE repo='hana' AND step='clippy'
+ AND datetime(started_at)>=datetime(?)
+ AND datetime(started_at)<datetime(?)
+ORDER BY datetime(started_at),id;
+```
+
 **Lint-step rewrite, re-measure.** The complete 24-hour window is **2026-10-16 16:09:48 EDT (2026-10-16T20:09:48Z) ≤ start < 2026-10-17 16:09:48 EDT (2026-10-17T20:09:48Z)**, in America/New_York, UTC-04:00. It starts at T_lint, including the calls before the first passing rewrite. The verdict unit is the last judging clippy step in each `call_id`; JSON replay steps are excluded, and a step without a call ID stands alone. Sources in this subsection are the adapted scripts and generated JSON in `~/.local/state/mul-add-hook/lint-rewrite/`.
 
 | Measure | Lint-step rewrite, re-measure | Limit / verdict | Source |
