@@ -2012,33 +2012,17 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 72 — The closing command names the machine that holds the record  · status: done
 
-**Depends on:** Phase 71
+#### As-built
 
-#### Work Order
-
-**Goal:** every line that tells the user to close a running session's unconfirmed restart names the machine whose terminal runs the `forget` command, so the printed command closes the record wherever the line is read.
-
-**Constraints from prior phases:**
-- `settle.running_restart_line(saved, *, for_showrunner=False)` (`scripts/shutdown/settle.py` ~609) is the one source of the running line: `<name>: restart prompt not confirmed; session is running — check it, then close its record: <command>`, and for the showrunner `<name> is back on <target>; its restart prompt was not confirmed — check it, then close its record: <command>`, where `<command>` is `shutdown_command("forget", <session id>, "--account", <login>)`. Its callers: `shutdown._shutdown_record_lines` (`scripts/shutdown/shutdown.py` ~396), `shutdown._follow_action` (~773), `settle.report_stop` (~1384) and `settle.tell_showrunners_outcome` (~1515).
-- `shutdown status` without `--here` also draws the peer machine's records (`_remote_shutdown_records`, ~369) through `_shutdown_record_lines`, and `_restart_failed_liveness` (~674) reads a peer record as `SessionLive` from the peer's inventory. So natedev's status prints the running line for a Mac record, and the reverse.
-- `shutdown forget` (`_forget`, ~576) takes only records and snapshots whose `machine` is the local machine (~600, ~605); for a peer record it prints `forget: <id> matches no local session` and exits 2. The line's command is therefore wrong for every peer record, and a showrunner on the other machine gets a command its own terminal cannot run.
-- Every other command line in `settle.py` for a record names its machine: `in a terminal on {saved['machine']}: <command>` (`report_stop`'s `restart_line` ~1363 and the `now` line ~1396, `tell_showrunners_outcome`'s not-back text ~1528).
-- Phase 71's move archive (`record.forget_failed_restart`, `accounts._prepare_move_shutdown`) is unchanged by this phase.
-
-**Spec:**
-1. `running_restart_line` ends `— check it, then close its record in a terminal on <machine>: <command>`, with `<machine>` the record's `saved["machine"]`, for both the user line and the showrunner line. It stays the one source; no caller builds its own text.
-2. Nothing else changes: the command, the liveness reads, which surfaces print the line, and the move archive.
+- `settle.running_restart_line(saved, *, for_showrunner=False)` ends `— check it, then close its record in a terminal on <saved["machine"]>: <command>` in both forms: `<name>: restart prompt not confirmed; session is running — check it, then close its record in a terminal on <machine>: <command>` and, for the showrunner, `<name> is back on <target>; its restart prompt was not confirmed — check it, then close its record in a terminal on <machine>: <command>`. `<command>` is unchanged (`shutdown_command("forget", <session id>, "--account", <login>)`).
+- It stays the one source for `shutdown status`, `follow`, the stop report and the showrunner message; the liveness reads, the printing surfaces and the Phase 71 move archive are unchanged.
+- `shutdown status` without `--here` reading a live peer record names the peer machine, so the printed `forget` runs where `_forget` accepts the record; a local record names the local machine.
 
 **Files:**
 - `scripts/shutdown/settle.py` — `running_restart_line` names the record's machine.
-- `scripts/shutdown/test_settle.py` — the stop report and showrunner message expectations (~1602, ~1633, ~3299) name the machine.
-- `scripts/shutdown/test_shutdown_cli.py` — the status/follow expectation (~1066) and the printed-command test (~1086) split on the new text; a new case: `shutdown status` without `--here`, with a scratch peer record whose session the peer inventory lists, prints the peer machine in the line.
+- `scripts/shutdown/test_settle.py` — stop report and showrunner message expectations name the machine.
+- `scripts/shutdown/test_shutdown_cli.py` — the status/follow expectation, the printed-command archive test, and `test_status_names_the_peer_terminal_for_a_running_sessions_closing_command` (natedev reading a Mac record and the reverse; peer liveness comes from the peer inventory only).
 
-**Workers:** 1 writer + 1 tester. impl owns `settle.py`; test owns `test_settle.py` and `test_shutdown_cli.py`, written from the Spec's exact text.
+**Binds later work:** "Readout of the moves" names this text (`, then close its record in a terminal on <machine>: <command>`); the readout reads only the journal and records, never the line.
 
-**Verification:** scratch-HOME suites `scripts.shutdown.test_settle scripts.shutdown.test_shutdown_cli scripts.shutdown.test_restart scripts.accounts.test_moves`; basedpyright 0/0 on the changed files.
-
-**Acceptance gate:**
-- **Local:** for a local live `restart failed` record, `shutdown status --here`, `follow`, the stop report and the showrunner message each read `… then close its record in a terminal on <local machine>: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py forget <id> --account <login>`, and running that command closes the record.
-- **Peer:** `shutdown status` reading a live peer record prints `in a terminal on <peer machine>:` before the command; on today's code it prints the bare command, which fails on the reading machine with `matches no local session`.
-- **Suites:** they pass, basedpyright reports 0/0, and the merge gate on natedev passes.
+**Gotchas:** `shutdown forget` takes only local records, so any new line that prints a record command names `saved["machine"]`.
