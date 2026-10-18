@@ -775,6 +775,18 @@ demand.
   `a779ebde`, then reached main beside it. The trees are equal, so no code is
   wrong, but main holds two merges of one hand-off. The showrunner approved the fix and keeps the merge already on
   main, because the trees are equal.
+- **Fix AJ — style proposals read the crate layout once per run** (commit `6b246818`):
+  the filer and the ranker read the crate layout again for each finding, at
+  3.7 seconds a read on cargo-liner. The backfill over about 4,000 held
+  findings would have taken about four hours. Each run now reads the layout
+  and the held findings once. With the fix, the backfill dry run took 19
+  seconds. The showrunner approved the fix.
+- **Ranking backfill:** on 2026-10-18, the ranker filled all 279 open style
+  issues in the vault and skipped none. Only the empty `Proposed ranking:`
+  lines changed, and one empty root title became `# Style restructure:
+  cargo-liner`. No vault commit was made: no style issue was ever committed,
+  so a commit would add all 279 files for the first time. That choice went
+  to the showrunner.
 
 Fixes A and B are merged to `~/.claude` main as `b8b8e74c`, fix G as `31e7bae8`,
 fix I as `89f24e01`, fix J as `9b71ca5b`, fix K as `598232d8`, fixes L and M as
