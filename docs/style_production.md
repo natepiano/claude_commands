@@ -360,8 +360,9 @@ Run from the unit worktree, using the ticket's recorded start commit:
 ```
 
 Exit 0 means every finding is `mechanical`; exit 1 prints `review: <reasons>`
-for anything the filter cannot clear. Without `--finding-map`, the whole diff
-is one finding. An optional JSON map assigns finding ids to file lists, or to
+for anything the filter cannot clear. Exit 2 prints `error: <reason>` when the
+check could not run: a git failure, such as a missing revision, or a file
+error. Without `--finding-map`, the whole diff is one finding. An optional JSON map assigns finding ids to file lists, or to
 objects with `files` and `hunks` lists. A hunk is identified by its `path`,
 `old_start` and `new_start` from a zero-context diff; every changed hunk must
 have one owner. The gate folds merged-in parents into the comparison base so

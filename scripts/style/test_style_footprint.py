@@ -163,9 +163,16 @@ class StyleFootprintTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--worktree"])
-        self.assertEqual((code, output.getvalue()), (1, "review: snapshot failed\n"))
+        self.assertEqual((code, output.getvalue()), (2, "error: snapshot failed\n"))
         self.assertTrue(indexes)
         self.assertTrue(all(not path.exists() for path in indexes))
+
+    def test_missing_base_revision_is_an_error_not_a_review(self) -> None:
+        self.write("src/lib.rs", "fn value() {}\n")
+        _ = self.commit()
+        result = self.check("0" * 40)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("error: "), result.stdout)
 
     def test_head_and_worktree_are_required_mutually_exclusive_options(self) -> None:
         self.write("src/lib.rs", "fn value() {}\n")
@@ -1392,7 +1399,7 @@ class StyleFootprintTests(unittest.TestCase):
             with redirect_stdout(output):
                 code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--head", head])
         self.assertEqual((code, output.getvalue()),
-                         (1, "review: git merge-tree: fatal: merge-tree unavailable (exit 128)\n"))
+                         (2, "error: git merge-tree: fatal: merge-tree unavailable (exit 128)\n"))
 
     def test_incomplete_rename_with_old_uses_remaining_requires_review(self) -> None:
         base = self.rename_fixture()

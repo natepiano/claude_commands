@@ -667,6 +667,32 @@ class StylePlanTests(unittest.TestCase):
         ledger.ticket_checkpoint("modules-unit-1", self.tip)
         self.assertEqual(ledger.ticket_open("modules-unit")[0]["state"], "checkpointed")
 
+    def test_gate_reports_a_locked_ledger_as_an_error_and_a_rerun_gives_the_review(self) -> None:
+        database = self.ledger().database
+        _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.05))
+        with closing(sqlite3.connect(database)) as holder:
+            _ = holder.execute("BEGIN EXCLUSIVE")
+            self.assertEqual(self.reference_gate("names-unit-9"), (2, "error: database is locked\n"))
+            holder.rollback()
+        self.assertEqual(self.reference_gate("names-unit-9"), (1, "review: unknown ticket names-unit-9\n"))
+
+    def test_gate_passes_a_footprint_error_through_as_exit_two(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.tip)
+        path = self.sources[0]
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          [path], [rule], cells=((rule, path),))
+        ledger.ticket_assign("modules-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("modules-unit-1")
+        self.record(rule, path, self.tip, "modules-unit-1")
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", ("0" * 40, "modules-unit-1"))
+        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("error: "), result.stdout)
+
     def test_structure_batches_cover_pending_files_once_keep_directories_and_isolate_large_files(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         expected = set(self.sources[:2])
