@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Where unit runs keep their folders, under the new name and the former one.
 
-A /unit:direct run keeps its files in `/tmp/claude/unit/<run id>/`, marks its Claude session
-in `/tmp/claude/unit/active/<session id>`, and gets the notifier instance `unit-<run id>`.
-Runs started before 2026-10-15 used `delegate` in all three places and keep their folders
+A /unit:direct run keeps its files in `/tmp/claude/unit/<run id>/` and marks its Claude session
+in `/tmp/claude/unit/active/<session id>`.
+Runs started before 2026-10-15 used `delegate` in both places and keep their folders
 until they end, so every reader takes both names. The former name is read until a removal
 step, on or after 2026-10-22, drops it; that step runs only while `unit_runs.py removal-check`
 passes, since a run started before the rename may stay open past that date.
@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 RUN_ROOT = Path("/tmp/claude/unit")
 FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
+# Notifier instances a unit run once had; conversation_pause names them "status reports".
 INSTANCE_PREFIXES = ("unit-", "delegate-")
 # A run's shared liveness log, beaten every 60 s per worker while one runs.
 HEARTBEAT = "heartbeat.log"
@@ -54,11 +55,6 @@ def marker(session_id: str, override: str | Path | None = None) -> Path:
     """The session's run marker: the first that exists, else where a new run writes it."""
     candidates = [directory / session_id for directory in active_dirs(override)]
     return next((path for path in candidates if path.is_file()), candidates[0])
-
-
-def instance(run_dir: Path) -> str:
-    """The run's notifier instance: `delegate-<run id>` for a folder under the former name."""
-    return f"{'delegate' if run_dir.parent.name == FORMER_RUN_ROOT.name else 'unit'}-{run_dir.name}"
 
 
 def record_director(run: Path, session_id: str) -> None:

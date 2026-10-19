@@ -409,6 +409,22 @@ was. The other decisions still file. When it skips one or more decisions,
 `file` again. A `skipped <finding>: rule changed since judged` line names one
 finding, not a decision, and does not change the exit status.
 
+Filing first withdraws each filed finding whose site has an `exception` as the
+newest judgment under its rule's current text, when the finding was judged
+under an older text. `withdrawn` is its own state, not `waived`, and the
+finding records that judgment's row. A finding that an open ticket builds is
+kept. The judgment must also be newer than the finding's own judgment. A
+decision whose findings are all withdrawn closes with a reason that names them
+and the judgment rows. A decision that keeps other findings shows only those,
+and `complete` closes it when they are built or waived.
+`style_proposals.py withdraw --repo <style checkout> --proposals <folder>
+[--dry-run]` runs this step alone. It prints
+`withdraw <finding> <rule> <path>:<line>: judgment <row> exception under <blob>`,
+a `kept` line with the ticket, a `close` line per decision and a `totals` line.
+The dry run prints the same lines and writes nothing. A decision that it cannot
+close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
+go on, and `withdraw` exits 1 as `file` does.
+
 One style decision covers one rule and crate under one rule blob. An answer
 also covers later findings under that rule text. A new rule blob needs a new
 answer. Each decision shows counts and up to three examples from different

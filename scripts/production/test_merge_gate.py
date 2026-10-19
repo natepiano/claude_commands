@@ -444,7 +444,7 @@ class MergeGateTests(unittest.TestCase):
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Look across the floor\n"
+                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                             + "Change-Review: none — the gate script")
         # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
         before = change_review.today()
@@ -453,7 +453,7 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
-        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Look across the floor |" for day in days}
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away |" for day in days}
         self.assertIn(written, rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
@@ -466,8 +466,8 @@ class MergeGateTests(unittest.TestCase):
         self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
                    + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Look across the floor\n"
-                                            + "Change-Review: The sky dims | Look up")
+                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
+                                            + "Change-Review: The sky dims | Run `hana` in a natedev terminal | The sky turns darker")
         result = self.run_gate(checkpoint=checkpoint, callers_production=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"Change review: 2 row(s) added to {review}: C8–C9", result.stdout)
@@ -476,7 +476,7 @@ class MergeGateTests(unittest.TestCase):
 
     def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Look across the floor")
+                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away")
         result = self.run_gate(checkpoint=checkpoint, callers_production=True)
         self.assert_refused_before_gate(result)
         self.assertIn("pass --production <doc>: the gate adds this merge's change-review rows to its list",

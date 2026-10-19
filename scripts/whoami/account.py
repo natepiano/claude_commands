@@ -229,7 +229,7 @@ class MacProcessRecord:
     executable: Path
 
 
-def _kern_procargs2(pid: int) -> bytes:
+def kern_procargs2(pid: int) -> bytes:
     """Read one kernel argument record, without exposing it in diagnostics."""
     query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
     buffer = ctypes.create_string_buffer(1024 * 1024)
@@ -250,7 +250,7 @@ def mac_process_record(pid: int) -> MacProcessRecord | ProcessEnvironmentUnread:
     """Separate exactly argc arguments from the following environment strings."""
     unread = ProcessEnvironmentUnread("process argument record could not be read")
     try:
-        payload = _kern_procargs2(pid)
+        payload = kern_procargs2(pid)
     except OSError:
         return unread
     if len(payload) < 5 or not payload.endswith(b"\0"):

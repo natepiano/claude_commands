@@ -85,5 +85,9 @@ A finding is built only when its change is in the code. Repair a decision
 or an old issue that closed too early with `style_proposals.py reopen --repo
 <style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
 lines first.
+Filing withdraws a filed finding that an `exception` under its rule's newer
+text supersedes, and closes a decision left with no filed finding. Run that step
+alone with `style_proposals.py withdraw --repo <style checkout> --proposals
+<folder>`; add `--dry-run` to see the lines first.
 For other proposals, `/unit:direct` marks plan issues active, and its final
 as-built pass closes them with the as-built doc.

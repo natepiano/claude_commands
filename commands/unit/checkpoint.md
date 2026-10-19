@@ -138,13 +138,18 @@ Loop/verbose only:
 
    <what the phase built>
 
-   Change-Review: <what you see change> | <how to check it>
+   Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>
    Claude-Session: <session url>
    ```
 
    Every `checkpoint(...)` commit that changes more than Markdown carries
-   `Change-Review: <what you see change> | <how to check it>`, one line per
-   visible change, or `Change-Review: none — <why nothing visible changes>`.
+   `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
+   `Change-Review: none — <why nothing visible changes>`. Write each line for a
+   person with no context. "Where" names the machine (natedev or the Mac) and
+   the session (a terminal, a showrunner session, a unit session, any Claude
+   session). Example:
+   `Change-Review: The unit board shows each unit's phase | In a showrunner session on natedev, type /showrunner:unit_board | Each row has a Phase column`.
+   A line without all three parts is refused.
    A change the user can check outside the app counts as visible too: a
    table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;

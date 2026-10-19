@@ -95,15 +95,6 @@ if (( ${#RUNS[@]} > 0 )); then
 fi
 
 if [[ -f "${MARKER}" ]]; then
-  if [[ -n "${SESSION_DIR}" ]]; then
-    # A run folder under delegate/ keeps the instance name it started with.
-    INSTANCE="unit-$(basename "${SESSION_DIR}")"
-    if [[ "$(basename "$(dirname "${SESSION_DIR}")")" == delegate ]]; then
-      INSTANCE="delegate-$(basename "${SESSION_DIR}")"
-    fi
-    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "${INSTANCE}" \
-      >/dev/null 2>&1 || true
-  fi
   rm -f "${MARKER}"
   echo "Unit run ended; marker cleared."
 else

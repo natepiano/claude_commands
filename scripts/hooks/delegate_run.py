@@ -124,16 +124,3 @@ def running_work(session_dir: Path) -> str | None:
                 return label if isinstance(label, str) and label else "an activity"
     return None
 
-
-def check(claude_session_id: str, session_dir: Path) -> int:
-    """Return 2 for a replaced run, 0 for running work, or 1 while idle."""
-    if _text(marker_path(claude_session_id)) != str(session_dir):
-        return 2
-    return 0 if running_work(session_dir) is not None else 1
-
-
-if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[1] != "check":
-        print("usage: delegate_run.py check <claude_session_id> <session_dir>", file=sys.stderr)
-        raise SystemExit(3)
-    raise SystemExit(check(sys.argv[2], Path(sys.argv[3])))

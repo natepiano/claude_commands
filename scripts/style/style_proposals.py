@@ -14,7 +14,7 @@ import tomllib
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from contextlib import redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -65,7 +65,9 @@ def approved_decisions(folder: Path, unit: str) -> tuple[Issue, ...]:
 
 
 def issue_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
-    return ledger.proposal_findings(issue)
+    """The findings the issue shows: each finding filed to it, but not one a newer verdict withdrew."""
+    return tuple(finding for finding in ledger.proposal_findings(issue)
+                 if not isinstance(finding.state, style_ledger.Withdrawn))
 
 
 def repository_name(repo: Path) -> str:
@@ -305,7 +307,7 @@ class DecisionWriter:
     def refresh(self, decision: Issue) -> None:
         """Write the decision's count, examples and open ranking only when its bytes change."""
         key = DecisionKey(decision.value("style_rule"), decision.value("style_crate"), decision.value("style_rule_blob"))
-        findings = self.ledger.proposal_findings(decision.path)
+        findings = issue_findings(self.ledger, decision.path)
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings),
                                    self.goal(plain(decision.value("project"))))
         _ = refresh_decision(decision.path, len(findings), self.text(key, findings), ranking,
@@ -403,6 +405,7 @@ def file_decision(writer: DecisionWriter, key: DecisionKey, items: tuple[style_l
 
 def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> FilingResult:
     writer = decision_writer(ledger, proposals, parent)
+    skipped = list(run_withdrawal(writer, dry_run=False))
     directories = workspace_directories(ledger)
     waiting = ledger.held_findings(style_ledger.UnfiledFindingsFromOpenTickets())
     for ticket, count in sorted(Counter(finding.ticket for finding in waiting).items()):
@@ -418,7 +421,6 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
         else:
             batches[decision_key(finding, directories)].append(finding)
     written: list[Path] = []
-    skipped: list[Path] = []
     for key, items in sorted(batches.items()):
         issue = proposals / batch_name(key)
         try:
@@ -431,7 +433,7 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     # Also finish a refresh interrupted after all ledger moves reached disk.
     # Only an open decision can get new findings, so a closed one needs no repair.
     for decision in open_issues(proposals, "style"):
-        if decision.path not in skipped and is_decision(decision) and ledger.proposal_findings(decision.path):
+        if decision.path not in skipped and is_decision(decision) and issue_findings(ledger, decision.path):
             try:
                 writer.refresh(decision)
             except (style_ledger.LedgerError, Refusal) as error:
@@ -481,9 +483,11 @@ def files_at(repo: Path, tip: str, paths: tuple[str, ...]) -> frozenset[str]:
 
 
 def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
-    """Close an open, approved decision when every one of its findings is built or waived. True when it closes.
+    """Close an open, approved decision when every one of its findings is built, waived or withdrawn. True when it closes.
 
-    A legacy proposal issue is not a decision, so it stays open for migrate.
+    The findings it reads leave out the withdrawn ones, so they count as resolved, and a decision whose findings
+    are all withdrawn is left to the withdrawal, whose reason names the judgment rows. A legacy proposal issue is
+    not a decision, so it stays open for migrate.
     """
     if not issue.is_file():
         return False
@@ -532,15 +536,10 @@ def decline(ledger: style_ledger.Ledger, issue: Path, words: str) -> None:
     renumber()
 
 
-def state_name(finding: style_ledger.HeldFinding) -> str:
-    return ("filed" if isinstance(finding.state, style_ledger.Filed) else
-            "built" if isinstance(finding.state, style_ledger.Built) else
-            "waived" if isinstance(finding.state, style_ledger.Waived) else "unfiled")
-
-
 def sites(ledger: style_ledger.Ledger, issue: Path) -> None:
-    for finding in issue_findings(ledger, issue):
-        print(f"{finding.finding_id} {state_name(finding)} {finding.path}:{finding.line}\nBefore: {finding.before}\nAfter: {finding.after}")
+    """Print every finding filed to the issue with its state, the withdrawn ones too."""
+    for finding in ledger.proposal_findings(issue):
+        print(f"{finding.finding_id} {style_ledger.held_state_name(finding.state)} {finding.path}:{finding.line}\nBefore: {finding.before}\nAfter: {finding.after}")
 
 
 def candidates(ledger: style_ledger.Ledger) -> None:
@@ -673,7 +672,7 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
                     keys[finding.finding_id] = decision_key(finding, directories)
                     origin[finding.finding_id] = issue
                 else:
-                    lines.append(f"kept {finding.finding_id}: {state_name(finding)}, not filed to {issue.path}")
+                    lines.append(f"kept {finding.finding_id}: {style_ledger.held_state_name(finding.state)}, not filed to {issue.path}")
             moved_before.update(moved)
             sources.append(LegacyIssue(issue, tuple(owned)))
             continue
@@ -822,6 +821,108 @@ def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bo
         renumber()
 
 
+PARENT_LINE = re.compile(r"^Parent: (.+)$", re.MULTILINE)
+
+
+def decision_parent(issue: Path) -> str:
+    """The parent that the decision's generated body names."""
+    match = PARENT_LINE.search(issue.read_text())
+    if match is None:
+        raise style_ledger.LedgerError(f"{issue}: no Parent line")
+    return match[1]
+
+
+@dataclass(frozen=True)
+class EmptiedDecisionClose:
+    """An open decision that withdrawal leaves with no filed finding, and the reason it closes."""
+    issue: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class WithdrawalPlan:
+    """What a withdrawal writes to the decisions. Making the plan writes nothing."""
+    closes: tuple[EmptiedDecisionClose, ...]
+    # The open decisions that keep a finding that is not withdrawn. Each refreshes its findings list.
+    refreshes: tuple[Path, ...]
+
+
+def plan_withdrawal(ledger: style_ledger.Ledger, withdrawal: style_ledger.Withdrawal) -> WithdrawalPlan:
+    """Plan the close or refresh of each open issue that holds a withdrawn finding, as if withdrawal were written.
+
+    An issue closes only when every one of its findings is withdrawn; one that keeps another finding is refreshed,
+    and complete closes it when the rest are resolved. Findings that an earlier run withdrew count too, so a run
+    that stopped before its closes ends on a rerun.
+    """
+    verdicts = {item.finding.finding_id: item.verdict.judgment_id for item in withdrawal.withdrawn}
+    issues = {item.finding.state.proposal for item in withdrawal.withdrawn if isinstance(item.finding.state, style_ledger.Filed)}
+    issues.update(finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn"))
+                  if isinstance(finding.state, style_ledger.Withdrawn))
+    closes: list[EmptiedDecisionClose] = []
+    refreshes: list[Path] = []
+    for issue in sorted(issues):
+        if not issue.is_file():
+            continue
+        fields = frontmatter(issue)
+        if fields.get("status") != ["open"]:
+            continue
+        findings = ledger.proposal_findings(issue)
+        if any(not isinstance(finding.state, style_ledger.Withdrawn) and finding.finding_id not in verdicts for finding in findings):
+            if is_decision(Issue(issue, fields)):
+                refreshes.append(issue)
+            continue
+        rows = {finding.finding_id: finding.state.judgment_id for finding in findings
+                if isinstance(finding.state, style_ledger.Withdrawn)}
+        rows.update((finding.finding_id, verdicts[finding.finding_id]) for finding in findings if finding.finding_id in verdicts)
+        withdrawn = ", ".join(f"{finding_id} (judgment {row})" for finding_id, row in sorted(rows.items()))
+        closes.append(EmptiedDecisionClose(issue, f"{NOTHING_LEFT_REASON}withdrawn by an exception: {withdrawn}"))
+    return WithdrawalPlan(tuple(closes), tuple(refreshes))
+
+
+def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingException) -> str:
+    return (f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: "
+            + f"judgment {verdict.judgment_id} exception under {verdict.rule_blob[:8]}")
+
+
+def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]:
+    """Withdraw each filed finding that an exception under its rule's newer text supersedes, then close or refresh its decision.
+
+    Print one line per withdrawn and kept finding and per closed decision, then the totals. A dry run prints the
+    same lines and writes nothing. A refresh keeps the parent that the decision names. A decision that cannot
+    close or refresh prints a skip line and the others go on; returns those decisions.
+    """
+    ledger = writer.ledger
+    withdrawal = (ledger.superseded_findings(writer.definitions) if dry_run
+                  else ledger.withdraw_superseded(writer.definitions))
+    plan = plan_withdrawal(ledger, withdrawal)
+    for item in withdrawal.withdrawn:
+        print(f"withdraw {superseded_line(item.finding, item.verdict)}")
+    for kept in withdrawal.kept:
+        print(f"kept {superseded_line(kept.finding, kept.verdict)}; open ticket {kept.ticket} builds it")
+    skipped: list[Path] = []
+    closed = False
+    for close in plan.closes:
+        print(f"close {close.issue}: {close.reason}")
+        if not dry_run:
+            try:
+                proposal_command("close", str(close.issue), "--reason", close.reason)
+                closed = True
+            except (style_ledger.LedgerError, Refusal) as error:
+                skipped.append(close.issue)
+                print(skip_line(close.issue, error))
+    if not dry_run:
+        for issue in plan.refreshes:
+            try:
+                replace(writer, parent=decision_parent(issue)).refresh(Issue(issue, frontmatter(issue)))
+            except (style_ledger.LedgerError, Refusal) as error:
+                skipped.append(issue)
+                print(skip_line(issue, error))
+    if closed:
+        renumber()
+    print(f"totals: withdraw {len(withdrawal.withdrawn)}, kept {len(withdrawal.kept)}, close {len(plan.closes)}")
+    return tuple(skipped)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -840,6 +941,9 @@ def main(argv: list[str]) -> int:
     _ = reopening.add_argument("--issue", type=Path, required=True)
     _ = reopening.add_argument("--parent", required=True)
     _ = reopening.add_argument("--dry-run", action="store_true")
+    withdrawing = sub.add_parser("withdraw")
+    _ = withdrawing.add_argument("--proposals", type=Path, required=True)
+    _ = withdrawing.add_argument("--dry-run", action="store_true")
     migration = sub.add_parser("migrate")
     _ = migration.add_argument("--proposals", type=Path, required=True)
     _ = migration.add_argument("--parent", required=True)
@@ -853,7 +957,7 @@ def main(argv: list[str]) -> int:
         _ = command.add_argument("--repo", type=Path, default=Path.cwd())
     args = cast(ProposalArguments, parser.parse_args(argv))
     try:
-        source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen") and args.dry_run
+        source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen", "withdraw") and args.dry_run
                   else style_ledger.open_ledger(args.repo))
         with source as ledger:
             if args.command == "file":
@@ -875,6 +979,12 @@ def main(argv: list[str]) -> int:
                 drop_candidate(ledger, args.idea)
             elif args.command == "migrate":
                 migrate(ledger, args.proposals.expanduser().resolve(), args.parent, dry_run=args.dry_run)
+            elif args.command == "withdraw":
+                # Each refresh keeps the parent its decision names, so the writer takes none.
+                skipped = run_withdrawal(decision_writer(ledger, args.proposals.expanduser().resolve(), ""), dry_run=args.dry_run)
+                if skipped:
+                    print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
+                    return 1
             elif args.command == "reopen":
                 reopen(ledger, args.issue.expanduser().resolve(), args.parent, dry_run=args.dry_run)
             else:

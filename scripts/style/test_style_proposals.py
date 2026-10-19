@@ -441,7 +441,7 @@ class StyleProposalsTests(unittest.TestCase):
                         self.assertEqual(len(tuple(self.proposals.glob("style *.md"))), 2)
                     with redirect_stdout(io.StringIO()):
                         style_proposals.migrate(ledger, self.proposals, "parent")
-                    states = {item.finding_id: (style_proposals.state_name(item),
+                    states = {item.finding_id: (style_ledger.held_state_name(item.state),
                                                 item.state.proposal.name if isinstance(item.state, style_ledger.Filed) else "")
                               for item in ledger.held_findings(style_ledger.AllHeldFindings())}
                 results.append(({path.name: path.read_bytes() for path in self.proposals.glob("*.md")}, states))
@@ -1286,7 +1286,7 @@ class StyleProposalsTests(unittest.TestCase):
             with redirect_stdout(output):
                 paths = style_proposals.file_proposals(ledger, self.proposals, "parent").filed
             self.assertEqual(paths, ())
-            self.assertEqual(output.getvalue(), f"held for open ticket {ticket}: 1 findings\n")
+            self.assertEqual(output.getvalue(), "totals: withdraw 0, kept 0, close 0\n" + f"held for open ticket {ticket}: 1 findings\n")
             self.assertEqual(self.calls, [])
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")), (finding,))
 
@@ -1668,6 +1668,215 @@ class StyleProposalsTests(unittest.TestCase):
             _ = ledger.ticket_merge("names-unit-1")
             style_proposals.complete(ledger)
             self.assertEqual(len(self.calls), calls)
+
+    def newer_rule_text(self) -> str:
+        rule = self.catalog / "names.md"
+        _ = rule.write_text(rule.read_text() + "Newer rule text.\n")
+        return next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
+
+    def newer_verdict(self, ledger: style_ledger.Ledger, blob: str, verdict: style_ledger.Verdict,
+                      path: str = "alpha/src/lib.rs") -> int:
+        ledger.record(self.rename, path, self.tip, blob, verdict, ticket="newer", worker="test",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return cast(tuple[int], connection.execute("SELECT MAX(id) FROM judgments").fetchone())[0]
+
+    def withdraw(self, ledger: style_ledger.Ledger) -> str:
+        with redirect_stdout(io.StringIO()) as output:
+            skipped = style_proposals.run_withdrawal(style_proposals.decision_writer(ledger, self.proposals, "parent"), dry_run=False)
+        self.assertEqual(skipped, ())
+        return output.getvalue()
+
+    def test_an_exception_under_a_newer_rule_text_withdraws_its_filed_findings_and_closes_their_decision(self) -> None:
+        with self.ledger() as ledger:
+            first, second = self.hold(ledger), self.hold(ledger, line=2)
+            issue = self.file(ledger)[0]
+            blob = self.newer_rule_text()
+            row = self.newer_verdict(ledger, blob, "exception")
+            output = self.withdraw(ledger)
+            for finding in (first, second):
+                self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:{finding.line}: "
+                              + f"judgment {row} exception under {blob[:8]}", output)
+            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)}, {style_ledger.Withdrawn(issue, row)})
+            self.assertEqual(frontmatter(issue)["status"], ["closed"])
+            reason = frontmatter(issue)["reason"][0]
+            self.assertTrue(reason.startswith(style_proposals.NOTHING_LEFT_REASON))
+            for finding in (first, second):
+                self.assertIn(f"{finding.finding_id} (judgment {row})", reason)
+            self.assertIn(f"close {issue}: {reason}", output)
+            self.assertIn("totals: withdraw 2, kept 0, close 1", output)
+            closed = issue.read_bytes()
+            self.assertIn("totals: withdraw 0, kept 0, close 0", self.withdraw(ledger))
+            self.assertEqual(issue.read_bytes(), closed)
+
+    def test_a_newer_clean_or_held_verdict_or_an_exception_at_another_site_withdraws_nothing(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            before = issue.read_bytes()
+            blob = self.newer_rule_text()
+            verdicts: tuple[tuple[style_ledger.Verdict, str], ...] = (
+                ("clean", finding.path), ("held", finding.path), ("exception", "beta/src/lib.rs"))
+            for verdict, path in verdicts:
+                _ = self.newer_verdict(ledger, blob, verdict, path)
+                self.assertIn("totals: withdraw 0, kept 0, close 0", self.withdraw(ledger))
+                self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+            self.assertEqual(issue.read_bytes(), before)
+
+    def test_a_finding_that_an_open_ticket_builds_is_kept_and_listed(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
+            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
+                              proposal=str(issue), finding_ids=(finding.finding_id,))
+            blob = self.newer_rule_text()
+            row = self.newer_verdict(ledger, blob, "exception")
+            output = self.withdraw(ledger)
+            self.assertIn(f"kept {finding.finding_id} {self.rename} {finding.path}:1: judgment {row} exception under "
+                          + f"{blob[:8]}; open ticket names-unit-1 builds it", output)
+            self.assertIn("totals: withdraw 0, kept 1, close 0", output)
+            self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+
+    def test_a_decision_with_a_withdrawn_and_a_filed_finding_stays_open_and_shows_only_the_filed_one(self) -> None:
+        with self.ledger() as ledger:
+            withdrawn = self.hold(ledger)
+            filed = ledger.hold(self.rename, "alpha/src/other.rs", 3, "other site", "rename", "Kind::Other", "Kind::Size",
+                                withdrawn.rule_blob, "outside")
+            issue = self.file(ledger)[0]
+            self.assertEqual(frontmatter(issue)["style_count"], ["2"])
+            blob = self.newer_rule_text()
+            row = self.newer_verdict(ledger, blob, "exception")
+            self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
+            self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
+                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, row), filed.finding_id: style_ledger.Filed(issue)})
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            self.assertEqual(frontmatter(issue)["style_count"], ["1"])
+            body = issue.read_text()
+            self.assertIn("Parent: parent", body)
+            self.assertEqual(re.findall(r"^Site: (.*)$", body, re.MULTILINE), ["alpha/src/other.rs:3"])
+
+    def test_withdraw_dry_run_prints_the_same_lines_and_writes_nothing(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            _ = self.newer_verdict(ledger, self.newer_rule_text(), "exception")
+            state = ledger.database.parent.parent
+        before = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+        issue_bytes = issue.read_bytes()
+        arguments = ["withdraw", "--repo", str(self.repo), "--proposals", str(self.proposals)]
+        with redirect_stdout(io.StringIO()) as dry:
+            self.assertEqual(style_proposals.main([*arguments, "--dry-run"]), 0)
+        self.assertEqual({path: path.read_bytes() for path in state.rglob("*") if path.is_file()}, before)
+        self.assertEqual(issue.read_bytes(), issue_bytes)
+        with redirect_stdout(io.StringIO()) as written:
+            self.assertEqual(style_proposals.main(arguments), 0)
+        self.assertEqual(dry.getvalue(), written.getvalue())
+        self.assertIn("totals: withdraw 1, kept 0, close 1", written.getvalue())
+        self.assertEqual(frontmatter(issue)["status"], ["closed"])
+
+    def test_the_filing_run_withdraws_before_it_files(self) -> None:
+        with self.ledger() as ledger:
+            old = self.hold(ledger)
+            old_issue = self.file(ledger)[0]
+            _ = self.newer_verdict(ledger, self.newer_rule_text(), "exception")
+            _ = self.hold(ledger, crate="beta")
+            with redirect_stdout(io.StringIO()) as output:
+                filed = style_proposals.file_proposals(ledger, self.proposals, "parent").filed
+            text = output.getvalue()
+            self.assertEqual(len(filed), 1)
+            self.assertLess(text.index(f"withdraw {old.finding_id}"), text.index(f"filed {filed[0]}"))
+            self.assertEqual(frontmatter(old_issue)["status"], ["closed"])
+
+    def test_an_older_exception_under_a_restored_rule_text_withdraws_no_finding_judged_after_it(self) -> None:
+        with self.ledger() as ledger:
+            names = self.catalog / "names.md"
+            original = names.read_text()
+            old_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
+            _ = self.newer_verdict(ledger, old_blob, "exception")
+            _ = self.newer_rule_text()
+            finding = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            _ = names.write_text(original)
+            self.assertIn("totals: withdraw 0, kept 0, close 0", self.withdraw(ledger))
+            self.assertEqual([(item.finding_id, item.state) for item in ledger.proposal_findings(issue)],
+                             [(finding.finding_id, style_ledger.Filed(issue))])
+
+    def test_withdrawal_leaves_a_decision_with_a_built_finding_to_complete(self) -> None:
+        self.write("alpha/src/other.rs", APPLIED)
+        _ = self.git("add", "--all")
+        _ = self.git("commit", "-qm", "Other file")
+        self.tip = self.git("rev-parse", "HEAD")
+        _ = self.git("branch", "-f", "style/main", self.tip)
+        with self.ledger() as ledger:
+            ledger.set_tip(self.tip, "style/main")
+            built = self.hold(ledger)
+            withdrawn = ledger.hold(self.rename, "alpha/src/other.rs", 1, "other site", "rename", "Kind::Value", "Kind::Count",
+                                    built.rule_blob, "outside")
+            ledger.record(self.rename, withdrawn.path, self.tip, built.rule_blob, "held", ticket="outside", worker="test",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
+            issue = self.approved_decision(ledger, withdrawn, built)
+            self.assertEqual(self.merge_ticket(ledger, "names-unit-1", issue, built), ())
+            row = self.newer_verdict(ledger, self.newer_rule_text(), "exception", withdrawn.path)
+            self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
+            self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
+                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, row), built.finding_id: style_ledger.Built()})
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            with redirect_stdout(io.StringIO()):
+                style_proposals.complete(ledger)
+            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], ["built in names-unit-1"]))
+
+    def test_a_decision_that_withdrawal_cannot_close_or_refresh_is_skipped_and_the_others_still_file(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            _ = self.hold(ledger, crate="beta")
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
+            _ = ledger.hold(self.rename, "alpha/Cargo.toml", 1, "manifest site", "rename", "Kind::Value", "Kind::Count",
+                            blob, "outside")
+            refreshed, closed = sorted(self.file(ledger), key=lambda issue: frontmatter(issue)["style_crate"])
+            _ = refreshed.write_text(refreshed.read_text().replace("Parent: parent\n", ""))
+            refreshed_bytes = refreshed.read_bytes()
+            newer = self.newer_rule_text()
+            for path in ("alpha/src/lib.rs", "beta/src/lib.rs"):
+                _ = self.newer_verdict(ledger, newer, "exception", path)
+            later = self.hold(ledger, line=5, record=False)
+
+            def refuse_close(*args: str) -> None:
+                if args[:2] == ("close", str(closed)):
+                    raise style_ledger.LedgerError(f"{closed}: close refused")
+                self.issue_command(*args)
+
+            with (mock.patch.object(style_proposals, "proposal_command", side_effect=refuse_close),
+                  redirect_stdout(io.StringIO()) as output):
+                result = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertIn(f"skipped {closed}: close refused", output.getvalue().splitlines())
+            self.assertIn(f"skipped {refreshed}: no Parent line", output.getvalue().splitlines())
+            self.assertEqual(set(result.skipped), {refreshed, closed})
+            filed, = result.filed
+            self.assertEqual(ledger.proposal_findings(filed)[0].finding_id, later.finding_id)
+            self.assertEqual(frontmatter(closed)["status"], ["open"])
+            self.assertEqual(refreshed.read_bytes(), refreshed_bytes)
+
+    def test_withdrawal_renumbers_once_when_it_closes_decisions_and_never_on_a_dry_run(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            _ = self.hold(ledger, crate="beta")
+            issues = self.file(ledger)
+            self.assertEqual(len(issues), 2)
+            blob = self.newer_rule_text()
+            for path in ("alpha/src/lib.rs", "beta/src/lib.rs"):
+                _ = self.newer_verdict(ledger, blob, "exception", path)
+            with mock.patch.object(style_proposals, "renumber") as renumber:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(style_proposals.run_withdrawal(
+                        style_proposals.decision_writer(ledger, self.proposals, "parent"), dry_run=True), ())
+                self.assertEqual(renumber.call_count, 0)
+                self.assertIn("totals: withdraw 2, kept 0, close 2", self.withdraw(ledger))
+                self.assertEqual(renumber.call_count, 1)
+                self.assertIn("totals: withdraw 0, kept 0, close 0", self.withdraw(ledger))
+                self.assertEqual(renumber.call_count, 1)
+            self.assertEqual({frontmatter(issue)["status"][0] for issue in issues}, {"closed"})
 
 
 if __name__ == "__main__":

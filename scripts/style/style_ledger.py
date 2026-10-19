@@ -157,12 +157,17 @@ CoverageScope = WholeRepository | CrateCoverage
 _WHOLE_REPOSITORY = WholeRepository()
 
 
+def _finding_cell(definition: Rule, path: str, tip: RepositoryTip) -> str:
+    """The judgment cell of a finding's site: its crate for a manifest structure rule, else its file."""
+    return tip.crate(path) if definition.tier == "D" and definition.input_scope == "manifest" else path
+
+
 def _crate_filter(scope: CoverageScope) -> str | None:
     return scope.crate if isinstance(scope, CrateCoverage) else None
 
 
 FindingKind = Literal["rename", "type", "restructure"]
-HeldStateName = Literal["unfiled", "filed", "waived", "built"]
+HeldStateName = Literal["unfiled", "filed", "waived", "built", "withdrawn"]
 TicketKind = Literal["read", "listed", "structure", "proposal"]
 TicketState = Literal["queued", "assigned", "checkpointed", "merged", "dropped"]
 # A ticket in one of these states never changes again.
@@ -187,6 +192,31 @@ class Waived:
 @dataclass(frozen=True)
 class Built:
     """The approved finding has merged into the style branch."""
+
+
+@dataclass(frozen=True)
+class Withdrawn:
+    """A judgment under the rule's newer text found the finding's site an exception, so the finding left its decision."""
+
+    proposal: Path
+    judgment_id: int
+
+
+HeldState = Unfiled | Filed | Waived | Built | Withdrawn
+
+
+def held_state_name(state: HeldState) -> HeldStateName:
+    match state:
+        case Unfiled():
+            return "unfiled"
+        case Filed():
+            return "filed"
+        case Waived():
+            return "waived"
+        case Built():
+            return "built"
+        case Withdrawn():
+            return "withdrawn"
 
 
 @dataclass(frozen=True)
@@ -299,8 +329,39 @@ class HeldFinding:
     after: str
     rule_blob: str
     ticket: str
-    state: Unfiled | Filed | Waived | Built
+    state: HeldState
     build_ticket: NoBuildTicket | BuildTicket
+
+
+@dataclass(frozen=True)
+class SupersedingException:
+    """The judgment with the verdict exception under the rule's current text that is newest at a finding's cell, also newer than its own."""
+
+    judgment_id: int
+    rule_blob: str
+
+
+@dataclass(frozen=True)
+class WithdrawnFinding:
+    finding: HeldFinding
+    verdict: SupersedingException
+
+
+@dataclass(frozen=True)
+class KeptForBuild:
+    """A finding the newer verdict would withdraw, kept because a ticket that is not final builds it."""
+
+    finding: HeldFinding
+    verdict: SupersedingException
+    ticket: str
+
+
+@dataclass(frozen=True)
+class Withdrawal:
+    """The filed findings that an exception under their rule's newer text withdraws, and those an open build keeps."""
+
+    withdrawn: tuple[WithdrawnFinding, ...]
+    kept: tuple[KeptForBuild, ...]
 
 
 @dataclass(frozen=True)
@@ -703,6 +764,8 @@ MIGRATIONS = {
     """,
     # The old issue a migration moved the finding from, so a rerun credits it to that issue.
     12: "ALTER TABLE held_findings ADD COLUMN moved_from TEXT NOT NULL DEFAULT '';",
+    # The judgment whose exception under a newer rule text withdrew the finding; 0 while it is not withdrawn.
+    13: "ALTER TABLE held_findings ADD COLUMN withdrawn_by INTEGER NOT NULL DEFAULT 0;",
 }
 
 
@@ -1360,13 +1423,24 @@ class Ledger:
         return self._held(finding_id)
 
     def _held(self, finding_id: str) -> HeldFinding:
-        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str]], self._connection.execute(
-            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket FROM held_findings WHERE finding_id=?", (finding_id,),
+        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int]], self._connection.execute(
+            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by FROM held_findings WHERE finding_id=?", (finding_id,),
         ).fetchall())
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
         row = rows[0]
-        state = Filed(Path(row[11])) if row[10] == "filed" else Waived() if row[10] == "waived" else Built() if row[10] == "built" else Unfiled()
+        state: HeldState
+        match row[10]:
+            case "filed":
+                state = Filed(Path(row[11]))
+            case "waived":
+                state = Waived()
+            case "built":
+                state = Built()
+            case "withdrawn":
+                state = Withdrawn(Path(row[11]), row[13])
+            case "unfiled":
+                state = Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket())
 
     def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
@@ -1467,9 +1541,10 @@ class Ledger:
 
         def attempt() -> dict[str, DeclineOutcome]:
             findings = tuple(self._held(finding_id) for finding_id in ids)
-            built = next((finding for finding in findings if isinstance(finding.state, Built)), None)
-            if built is not None:
-                raise LedgerError(f"{built.finding_id}: finding already built")
+            # A newer verdict withdrew a withdrawn finding, so a decline does not make it waived.
+            resolved = next((finding for finding in findings if isinstance(finding.state, (Built, Withdrawn))), None)
+            if resolved is not None:
+                raise LedgerError(f"{resolved.finding_id}: finding already {held_state_name(resolved.state)}")
             if not findings:
                 return {}
             commit = self.synced_commit()
@@ -1482,15 +1557,12 @@ class Ledger:
                 except LedgerError:
                     definitions[rule] = UnknownRule()
 
-            def cell_path(definition: Rule, path: str) -> str:
-                return tip.crate(path) if definition.tier == "D" and definition.input_scope == "manifest" else path
-
             def still_held() -> set[tuple[str, str]]:
                 """The cells that a finding outside this decline still holds."""
                 remaining = cast(list[tuple[str, str, str]], self._connection.execute(
-                    "SELECT finding_id,rule,path FROM held_findings WHERE state NOT IN ('waived','built')",
+                    "SELECT finding_id,rule,path FROM held_findings WHERE state NOT IN ('waived','built','withdrawn')",
                 ).fetchall())
-                return {(rule, cell_path(definition, path)) for finding_id, rule, path in remaining
+                return {(rule, _finding_cell(definition, path, tip)) for finding_id, rule, path in remaining
                         if finding_id not in ids and rule in definitions and isinstance(definition := definitions[rule], Rule)}
 
             cells: dict[tuple[str, str], tuple[Rule, list[HeldFinding]]] = {}
@@ -1500,7 +1572,7 @@ class Ledger:
                 if isinstance(definition, UnknownRule):
                     outcomes[finding.finding_id] = InputChangedSinceJudged()
                 else:
-                    cells.setdefault((finding.rule, cell_path(definition, finding.path)), (definition, []))[1].append(finding)
+                    cells.setdefault((finding.rule, _finding_cell(definition, finding.path, tip)), (definition, []))[1].append(finding)
             held_by_others = still_held() & cells.keys()
             reads = {cell: self.newest_held_judgment(*cell) for cell in cells}
             decisions = {cell: self.decline_outcome(reads[cell], cell[1], definition, tip, members, cell in held_by_others)
@@ -1567,9 +1639,79 @@ class Ledger:
             if isinstance(finding.state, Filed) and finding.state.proposal == proposal:
                 return
             if not isinstance(finding.state, Unfiled):
-                state = "filed" if isinstance(finding.state, Filed) else "built" if isinstance(finding.state, Built) else "waived"
-                raise LedgerError(f"{finding_id}: cannot file finding in state {state}")
+                raise LedgerError(f"{finding_id}: cannot file finding in state {held_state_name(finding.state)}")
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
+
+    def _changed_rule_findings(self, definitions: Mapping[str, Rule]) -> tuple[tuple[HeldFinding, Rule], ...]:
+        """Each filed finding whose rule's current text is not the text it was judged under, with that rule.
+
+        Filing skips an unfiled finding by the same lookup.
+        """
+        changed: list[tuple[HeldFinding, Rule]] = []
+        for finding in self.held_findings(HeldFindingsInState("filed")):
+            definition = definitions.get(finding.rule.removesuffix("#uncovered"))
+            if definition is not None and definition.blob != finding.rule_blob:
+                changed.append((finding, definition))
+        return tuple(changed)
+
+    def _superseded(self, definitions: Mapping[str, Rule], tip: RepositoryTip) -> Withdrawal:
+        withdrawn: list[WithdrawnFinding] = []
+        kept: list[KeptForBuild] = []
+        for finding, definition in self._changed_rule_findings(definitions):
+            # The verdict must also be newer than the finding's own judgment, so an old exception under a text
+            # that the rule returned to never withdraws a finding judged after it.
+            rows = cast(list[tuple[int, Verdict, str]], self._connection.execute(
+                "SELECT id,verdict,rule_blob FROM judgments WHERE rule=? AND path=? AND rule_blob IN (?,?) "
+                + "ORDER BY recorded_at DESC,id DESC LIMIT 1",
+                (finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
+            ).fetchall())
+            if not rows or rows[0][1:] != ("exception", definition.blob):
+                continue
+            verdict = SupersedingException(rows[0][0], definition.blob)
+            if isinstance(finding.build_ticket, BuildTicket):
+                ticket = self._ticket(finding.build_ticket.ticket)
+                if ticket["state"] not in FINAL_TICKET_STATES:
+                    kept.append(KeptForBuild(finding, verdict, ticket["id"]))
+                    continue
+            withdrawn.append(WithdrawnFinding(finding, verdict))
+        return Withdrawal(tuple(withdrawn), tuple(kept))
+
+    def superseded_findings(self, definitions: Mapping[str, Rule]) -> Withdrawal:
+        """What withdraw_superseded withdraws and keeps; it writes nothing.
+
+        definitions maps each rule id to its current catalog rule. The synced tip loads only when a filed
+        finding's rule text changed.
+        """
+        if not self._changed_rule_findings(definitions):
+            return Withdrawal((), ())
+        return self._superseded(definitions, self._synced_tip())
+
+    def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
+        """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text.
+
+        A finding that a ticket which is not final builds stays filed and is returned as kept. The plan comes
+        before the write lock; if the rows it read change before the lock, the withdrawal starts again.
+        """
+
+        def attempt() -> Withdrawal:
+            if not self._changed_rule_findings(definitions):
+                return Withdrawal((), ())
+            tip = self._synced_tip()
+            plan = self._superseded(definitions, tip)
+            if not plan.withdrawn:
+                return plan
+            with self._connection:
+                _ = self._connection.execute("BEGIN IMMEDIATE")
+                if self.synced_commit() != tip.commit or self._superseded(definitions, tip) != plan:
+                    raise ChangedBeforeLock("the findings or their judgments changed while they were withdrawn; rerun")
+                now = _now()
+                _ = self._connection.executemany(
+                    "UPDATE held_findings SET state='withdrawn',withdrawn_by=?,updated_at=? WHERE finding_id=?",
+                    [(item.verdict.judgment_id, now, item.finding.finding_id) for item in plan.withdrawn],
+                )
+            return plan
+
+        return retry_on_change(attempt)
 
     def mark_built(self, finding_id: str) -> None:
         """Mark a filed finding built after a person checked that its change is in the code.
@@ -1581,8 +1723,7 @@ class Ledger:
         def merged_build_ticket(finding: HeldFinding) -> TicketRecord:
             """The finding's merged build ticket; refuses a finding that is not filed or has none."""
             if not isinstance(finding.state, Filed):
-                state = "waived" if isinstance(finding.state, Waived) else "unfiled"
-                raise LedgerError(f"{finding_id}: cannot mark a {state} finding built")
+                raise LedgerError(f"{finding_id}: cannot mark a {held_state_name(finding.state)} finding built")
             if not isinstance(finding.build_ticket, BuildTicket):
                 raise LedgerError(f"{finding_id}: no merged build ticket")
             ticket = self._ticket(finding.build_ticket.ticket)
@@ -1627,7 +1768,8 @@ class Ledger:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             finding = self._held(finding_id)
-            if isinstance(finding.state, Waived):
+            # A withdrawn finding keeps the verdict that withdrew it.
+            if isinstance(finding.state, (Waived, Withdrawn)):
                 return
             _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
 
@@ -2156,9 +2298,11 @@ def _json_sites(serialized: str) -> list[dict[str, object]]:
 def _held_json(finding: HeldFinding) -> dict[str, object]:
     result: dict[str, object] = asdict(finding)
     result["build_ticket"] = finding.build_ticket.ticket if isinstance(finding.build_ticket, BuildTicket) else ""
-    result["state"] = "filed" if isinstance(finding.state, Filed) else "waived" if isinstance(finding.state, Waived) else "built" if isinstance(finding.state, Built) else "unfiled"
-    if isinstance(finding.state, Filed):
+    result["state"] = held_state_name(finding.state)
+    if isinstance(finding.state, (Filed, Withdrawn)):
         result["proposal"] = str(finding.state.proposal)
+    if isinstance(finding.state, Withdrawn):
+        result["withdrawn_by"] = finding.state.judgment_id
     return result
 
 
@@ -2258,7 +2402,7 @@ def main() -> None:
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
             elif action == "list":
-                _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built"), default=None)
+                _ = command.add_argument("--state", choices=("unfiled", "filed", "waived", "built", "withdrawn"), default=None)
                 _ = command.add_argument("--json", action="store_true")
             else:
                 _ = command.add_argument("--id", required=True)

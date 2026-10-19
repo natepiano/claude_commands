@@ -304,15 +304,21 @@ review records its pass under the slot `pool_<reviewer>`
 `progress` writes the event and prints a short report under a line naming the
 worktree, and the branch when it differs: the phase heading, one ETA line, the
 verification block's gate notes when there is one, one `- **Agent N**` line per
-worker, the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
+worker, less a worker whose stretch is `done` with its window and board line both
+over 10 minutes old (`FINISHED_WORKER_SECONDS`), the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
 In the dual layout the clocks table prints above the phase heading in every
 report. `--tables` adds the round table with its `Earlier:` line under the ETA
 line. The legacy layout prints the clocks table only under `--tables`.
-`/unit:report tables` passes `--tables`; ordinary reports and notifier ticks do
+`/unit:report tables` passes `--tables`; ordinary reports do
 not. The
 worktree line carries no position: how far through the plan the run is belongs
 to the clocks table's Phases column, and a plan with deferred earlier phases or
 retired ids puts the active phase at an ordinal that matches neither number.
+The Phases count adds the run's active phase when the run's own plan has no
+heading for it, so "Phase 32" never sits beside "of 31". `start-phase` refuses
+such a phase: an id other than `ad hoc` that the run's plan does not list exits
+and names the heading to add. hana cables, 2026-10-19: Phase 32's heading was
+only in a scratch clone, and the report read "19 of 31 done" beside "Phase 32".
 
 The ETA line comes from `_phase_eta_line(session_dir, phase_number)`, which
 reads only the reported phase's own row and gate from
@@ -551,9 +557,8 @@ the round table is the phase's windows as they stand, and a phase with none yet
 draws one `no stage yet` row. In place of the stage line goes `No pass or activity
 is open.` and the warning that the records say nothing about whether a worker
 is still running. The percent options are neither required nor checked. The
-call appends no event and opens no window; like every `progress` call it
-restarts the notifier clock, and it writes state only to resolve a missing
-project clock.
+call appends no event and opens no window, and it writes state only to resolve
+a missing project clock.
 A missing phase, or a closed phase with no open activity, is refused with
 `No active phase to report`. When the last phase is closed and an activity is
 still open, `progress` prints the short report from that phase's last recorded
@@ -565,24 +570,12 @@ the run, and needs no open window. It answers the questions asked after the
 fact — how many fix passes a phase took, how long each review ran — without
 reading the event stream by hand.
 
-The last line is the wall clock: `now <local timestamp>` and, when it can be
-resolved, `next report <time>` — the date is repeated there only when the next
-tick lands on a later day. The elapsed and unchanged columns are durations, which
-say how long but never when, and an ETA says when the work lands rather than when
-this report was made; this line is what tells a reader whether the report in
-front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `unit-<run id>` notifier instance (`delegate-<run id>` for a run started before the folder rename): every `progress`
-call runs `notifier.sh restart` on it as its first act, before it reads state,
-and a rendered report names the `next_due` that restart prints. A refused call
-(no active phase, a failed percent check, a missing override reason or
-`--cap-stage`) keeps its message and exit status but still restarts the clock,
-so the next tick lands one interval after the call. With no instance, or a
-restart that fails, the recorder falls
-back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
-plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
-the Codex poll timeout and the default interval of a Claude unit's notifier
-instance; `/unit:report_interval` changes one run's interval. An unusable interval
-drops the clause instead of stopping the header.
+The last line is the wall clock: `now <local timestamp>`. The elapsed and
+unchanged columns are durations, which say how long but never when, and an ETA
+says when the work lands rather than when this report was made; this line is what
+tells a reader whether the report in front of them is current. Until 2026-10-19
+it also named the next scheduled report; reports now come only when asked, so the
+recorder restarts no notifier and names no next report.
 
 `aggregate` calibrates phase estimates by
 raw percentage and pass kind and emits raw/suggested/reported error plus
