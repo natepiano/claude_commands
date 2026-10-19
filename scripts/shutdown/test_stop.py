@@ -713,6 +713,27 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(report['stop_issues'], [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
+    def test_forced_stop_signals_a_busy_entry(self) -> None:
+        stored = top_level('busy', 101)
+        current = top_level('busy', 101, status='busy')
+        self.create(records_for_test([entry(stored)]))
+        killed: list[int] = []
+        report = stop.stop_session(self.stored_record(), forced=True, kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([current]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(killed, [101])
+        self.assertEqual(report['stop_issues'], [])
+
+    def test_forced_stop_signals_an_account_unreadable_entry_only_when_its_process_is_unchanged(self) -> None:
+        for session_id, pid, running_start, expected in (('same', 101, 'start-same', [101]), ('replaced', 102, 'a later process', [])):
+            with self.subTest(session_id=session_id):
+                self.create(records_for_test([entry(top_level(session_id, pid))]))
+                unattributed = inventory.UnattributedSession(pid=pid, name=session_id, reason='account unreadable')
+                saved = record.find_session(LOGIN, session_id)
+                assert saved is not None
+                killed: list[int] = []
+                with patch.object(sessions, 'process_start', return_value=running_start):
+                    _ = stop.stop_session(saved, forced=True, kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([], unattributed=[unattributed]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+                self.assertEqual(killed, expected)
+
     def test_now_pauses_codex_run_without_ending_busy_workers(self) -> None:
         run_dir = str(self.root / 'run')
         owned_server = server(run_dir, 900, busy_workers=['impl', 'test'])

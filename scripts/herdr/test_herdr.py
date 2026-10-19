@@ -2935,6 +2935,29 @@ class HerdrTests(unittest.TestCase):
                 _ = config.write_text(json.dumps({"projects": {str(key): {"hasTrustDialogAccepted": True}}}))
                 self.assertEqual(herdr.claude_trust(folder, config), herdr.Trusted(folder, config, key))
 
+    def test_trust_copy_adds_only_the_source_grant_and_keeps_the_rest_of_the_target(self) -> None:
+        folder = self.root / "worktree" / "nested"
+        main = self.root / "main"
+        self.trust_git(folder, folder.parent, main)
+        source, target = self.root / "source.json", self.root / "target.json"
+        _ = source.write_text(json.dumps({"projects": {str(main): {"hasTrustDialogAccepted": True},
+                                                       str(self.root / "other"): {"hasTrustDialogAccepted": True}}}))
+        _ = target.write_text(json.dumps({"theme": "dark", "projects": {str(main): {"history": ["kept"]}}}))
+        self.assertEqual(herdr.copy_claude_trust(folder, source, target), herdr.Trusted(folder, target, main))
+        self.assertEqual(json.loads(target.read_text()),
+                         {"theme": "dark", "projects": {str(main): {"history": ["kept"], "hasTrustDialogAccepted": True}}})
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_trust_copy_never_adds_trust_the_source_lacks(self) -> None:
+        folder = self.root / "worktree"
+        main = self.root / "main"
+        self.trust_git(folder, folder, main)
+        source, target = self.root / "source.json", self.root / "target.json"
+        _ = source.write_text(json.dumps({"projects": {}}))
+        _ = target.write_text(json.dumps({"projects": {}}))
+        self.assertIsInstance(herdr.copy_claude_trust(folder, source, target), herdr.Untrusted)
+        self.assertEqual(json.loads(target.read_text()), {"projects": {}})
+
     def test_ancestor_trust_does_not_authorize_child_repository(self) -> None:
         folder = self.root / "worktree" / "nested"
         main = self.root / "main"

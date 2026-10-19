@@ -3166,6 +3166,18 @@ class RestartTests(ShutdownTestCase):
                 if owner["kind"] == "unit":
                     self.assertIn("/unit:direct", note)
 
+    def test_a_move_note_names_the_step_a_mid_turn_stop_cut_off(self) -> None:
+        for cut_off, step in (("Bash: Run the tests", "; your last step was Bash: Run the tests."), ("", ".")):
+            with self.subTest(cut_off=cut_off):
+                saved = entry(top_level("cut-off"), where=record.WhereNotSaid(kind="not said"))
+                saved["target"], saved["source_label"], saved["why"] = "claude2", "claude3", "weekly limit reached"
+                saved["cut_off"] = cut_off
+                note = restart.restart_note(saved, RESTARTED)
+                self.assertIn(f"The move stopped you in the middle of a turn{step} Check whether that step finished", note)
+        unbroken = entry(top_level("between-turns"), where=record.WhereNotSaid(kind="not said"))
+        unbroken["target"] = "claude2"
+        self.assertNotIn("middle of a turn", restart.restart_note(unbroken, RESTARTED))
+
     def test_notes_use_the_stop_dates_zone_and_explain_a_missing_where(self) -> None:
         october = entry(top_level('october'), where=record.WhereSaid(kind='said', text="quoted 'work' and $()", at=STOPPED))
         october_note = restart.restart_note(records_for_test([october])[0], RESTARTED)
