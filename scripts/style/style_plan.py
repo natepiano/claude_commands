@@ -1381,7 +1381,7 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                      for path in ticket["files"]} if ticket["kind"] == "read" else {})
     held = (tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
                   if finding.path in ticket["files"] and finding.rule in ticket["rules"]
-                  and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
+                  and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built, style_ledger.Withdrawn)))
             if ticket["kind"] == "structure" and ticket["cells"] else ())
     if ticket["kind"] == "proposal":
         identities = set(ticket["finding_ids"])
