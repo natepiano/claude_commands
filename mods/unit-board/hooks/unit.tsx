@@ -95,8 +95,10 @@ export function UnitView(elements: PaneElements, columns: number, bodyRows: numb
       <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {heading}</Text>
       <Button key="back" label="board" plain onPress={back} />
     </Box>, 'navigation')];
-    if (unit.phase?.title || unit.plan) overview.push(row(<Text bold wrap="truncate-end">{unit.phase?.title || unit.plan}</Text>));
-    if (unit.phase && unit.plan) overview.push(row(<Text color="subtle" wrap="truncate-end">{unit.plan}</Text>));
+    if (unit.phase?.title) overview.push(row(<Text bold wrap="truncate-end">{unit.phase.title}</Text>));
+    if (unit.plan) overview.push(row(unit.phase
+      ? <Text color="subtle" wrap="truncate-end">{unit.plan}</Text>
+      : <Text bold wrap="truncate-end">{unit.plan}</Text>));
     overview.push(...wrappedLines(unit.summary, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
     overview.push(row(<Text color="subtle" wrap="truncate-end">as of {data.as_of.text}</Text>));
     const timing: UnitRow[] = [];

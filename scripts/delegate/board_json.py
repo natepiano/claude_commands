@@ -47,6 +47,22 @@ def read_object(path: Path) -> dict[str, object]:
 
 
 @dataclass(frozen=True)
+class TicketInProgress:
+    id: str
+
+
+@dataclass(frozen=True)
+class NoTicketInProgress:
+    pass
+
+
+@dataclass(frozen=True)
+class UnitTicketProgress:
+    merged: int = 0
+    open_ticket: TicketInProgress | NoTicketInProgress = NoTicketInProgress()
+
+
+@dataclass(frozen=True)
 class BoardClock:
     zone: ZoneInfo
     now: float
@@ -207,7 +223,7 @@ def phase_steps(events: list[dict[str, object]], clock: BoardClock, current: pha
     return result
 
 
-def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase) -> str:
+def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
     events = [event for event in events if isinstance(current, phase_table.OpenPhase)
               and event.get("phase_instance_id") == current.instance_id]
     open_passes: dict[str, dict[str, object]] = {}
@@ -241,7 +257,7 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
     if isinstance(step, units_table.OpenStep):
         return step.label
     if isinstance(current, phase_table.OpenPhase):
-        return f"Phase {current.phase} running"
+        return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
     if state == "run-finished":
         return "Run done"
     for row in rows:
@@ -259,27 +275,30 @@ def is_standing_plan(plan: Path) -> bool:
         return False
 
 
-def merged_tickets(worktree: Path, unit_name: str, sources: set[Path]) -> int:
+def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> UnitTicketProgress:
     try:
         common = subprocess.run(
             ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True, text=True, check=False, timeout=10,
         )
         if common.returncode or not common.stdout.strip():
-            return 0
+            return UnitTicketProgress()
         main_repo = Path(common.stdout.rstrip("\n")).parent
         state = Path(os.environ.get("STYLE_LEDGER_STATE_DIR", str(Path.home() / ".local/state/style"))).expanduser()
         database = state / main_repo.name / "ledger.sqlite"
         if not database.exists():
-            return 0
+            return UnitTicketProgress()
         sources.add(database)
         with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0)) as connection:
-            row = cast(tuple[int], connection.execute(
-                "SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'", (unit_name,),
+            row = cast(tuple[int, str | None], connection.execute(
+                """SELECT
+                    (SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'),
+                    (SELECT id FROM tickets WHERE unit = ? AND state IN ('assigned', 'checkpointed')
+                     ORDER BY created_at DESC LIMIT 1)""", (unit_name, unit_name),
             ).fetchone())
-            return row[0]
+            return UnitTicketProgress(row[0], TicketInProgress(row[1]) if row[1] else NoTicketInProgress())
     except (OSError, UnicodeError, subprocess.TimeoutExpired, sqlite3.Error):
-        return 0
+        return UnitTicketProgress()
 
 
 def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[str, object]:
@@ -318,17 +337,23 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     current = record.current
     unit_name = value(cells.get("Unit", ""))
     standing = is_standing_plan(record.plan)
-    merged = merged_tickets(worktree, unit_name, sources) if standing else 0
+    tickets = unit_ticket_progress(worktree, unit_name, sources) if standing else UnitTicketProgress()
+    ticket = tickets.open_ticket
     current_phase: dict[str, object] | None = None
     if isinstance(current, phase_table.OpenPhase):
-        current_phase = {"kind": "ticket", "id": current.phase, "title": current.title, "merged": merged} if standing else {
-            "kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title,
-        }
+        if standing:
+            if isinstance(ticket, NoTicketInProgress):
+                title_id = re.match(rf"{re.escape(unit_name)}-\d+(?=\s|$)", current.title)
+                ticket = TicketInProgress(title_id[0] if title_id else current.phase)
+            title = re.sub(rf"^{re.escape(ticket.id)}(?:\s+—(?:\s+|$)|\s+|$)", "", current.title, count=1)
+            current_phase = {"kind": "ticket", "id": ticket.id, "title": title, "merged": tickets.merged}
+        else:
+            current_phase = {"kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title}
     summary = next((text(event.get("activity")) for event in reversed(events) if event.get("event_type") == "progress_reported"), "")
     return {"key": unit_name.removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
             "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
-            "stage": stage(events, state, record.phases, current), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
+            "stage": stage(events, state, record.phases, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
 
 

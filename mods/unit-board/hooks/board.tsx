@@ -158,7 +158,7 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
       </Box>}
       {blocks.map(({ unit, strip, eta, gate, finish, workers, detailRows, compact }) => {
         const heading = !unit.phase ? `  ${unit.stage}` : unit.phase.kind === 'ticket'
-          ? `  Ticket ${unit.phase.id} · ${unit.phase.merged} merged  ${unit.phase.title}`
+          ? `  Ticket ${unit.phase.id} · ${unit.phase.merged} merged${unit.phase.title ? `  ${unit.phase.title}` : ''}`
           : `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}`;
         return <Box flexDirection="column" flexShrink={0} marginTop={gap}>
           <Box justifyContent="space-between">
