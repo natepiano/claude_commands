@@ -2072,33 +2072,22 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 75 — A failed read shows a star and a footnote  · status: done
 
-**Depends on:** Phase 74
+#### As-built
 
-#### Work Order
-
-**Goal:** the accounts status table's Read column tells the user when the latest usage read failed. The user (via the showrunner, 2026-10-19): "i think it hould say login token expired but that's too long - i don't want a column for that - so we should show the read time for everytning that worked and maybe an * footnote for when it wasn't read and why with a succinct description". Today claude4 showed "20:15 EDT" from 10-17, because its login token expired and the 2-minute timer skips it on purpose.
-
-**Constraints from prior phases:**
-- The timer skips a login with a stale token: `StaleTokenSkip` (`scripts/whoami/agent_accounts.py` ~709-714). The store records it as `weekly_read_skip: "stale_token"` and keeps the old reading times (`scripts/whoami/usage_store.py` ~42-50, ~167). `accounts.py` reads it at ~3679 and ~3791.
-- HTTP 401 and 429 errors also keep the old numbers and record no cause today.
-- The status table columns are at `accounts.py` ~200 ("Read" is the last column). No new column.
-
-**Spec:**
-1. The store records the outcome of the latest read attempt for each login: ok, stale token skipped, refused 401, rate-limited 429, or another error. Use a closed set of values, decoded into a domain type. A successful read clears the failure.
-2. Read shows the time of the last successful read. When the latest attempt failed, Read shows that time with the date when it is not today (for example `10-17 20:15 EDT`) plus `*`.
-3. Under the table, print one footnote line per failed account, short, in Simplified Technical English, for example `* claude4: login token expired; start a session on it to refresh` and `* claude2: usage read refused (rate limit); the next read is in 2 minutes`. No footnote when every read succeeded.
-4. Tests pin each cause's star and footnote, the date form, and that a later successful read removes both. `docs/accounts.md` names the star and the footnote.
+- The Read cell of the accounts status table shows the last good read. When the latest attempt failed, it adds `*`. An old read also shows its month and day (`10-17 20:15 EDT*`). An account with no good read shows `—*`. There is no new column. The user asked for this through the showrunner (2026-10-19): claude4 showed a 10-17 time because its login token expired.
+- Under the table there is one footnote per failed account: `* <label>: login token expired; start a session on it to refresh`, `usage read refused (401); start a session on it to check its login`, `usage read refused (rate limit); the next read is in 2 minutes`, `usage read failed; the next read is in 2 minutes`. The same lines go to the JSON problems list. A good read clears the star and the footnote.
+- `agent_accounts.UsageReadOutcome` is a closed enum: ok, stale_token, refused_401, rate_limited_429, error. The live Claude read classifies the HTTP status where it catches the error. `usage_store` saves `read_outcome` for each login and keeps the last good numbers and times on a failure.
+- `usage_store.UsageReadings` links each tool directory to its login (`directory_logins`, saved as `_directory_logins` in `usage.json`). A failed read that returns no login uses that link, then the caller's `KnownUsageLogin` (status passes the identities it read; the timer passes its named Claude selection and the default identity). With neither, it records nothing. It never takes a login from error text or credentials.
 
 **Files:**
-- `scripts/whoami/agent_accounts.py`, `scripts/whoami/usage_store.py` — record the attempt outcome.
-- `scripts/accounts/accounts.py` — the Read cell and the footnote.
-- `scripts/whoami/test_usage_store.py`, `scripts/accounts/test_accounts.py` — tests.
-- `docs/accounts.md` — the star and footnote.
+- `scripts/whoami/agent_accounts.py` — the outcome enum, the HTTP status classification, `KnownUsageLogin`/`UnknownUsageLogin`.
+- `scripts/whoami/usage_store.py` — the saved outcome, the directory links, old-store decoding.
+- `scripts/accounts/accounts.py` — the Read cell and the footnotes.
+- `scripts/whoami/test_usage_store.py`, `scripts/accounts/test_accounts.py` — each cause's star and footnote, the date form, clearing on a good read, the old-store and shared-login cases.
+- `docs/accounts.md` — the star and the footnote.
 
-**Workers:** 1 writer. impl owns all files.
-
-**Verification:** `scripts.accounts.test_accounts scripts.whoami.test_usage_store scripts.whoami.test_agent_accounts scripts.whoami.test_quota_alert` with a scratch HOME (use the test files that exist); basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **Star:** a stale-token, 401 or 429 attempt gives Read `<old time>*` and one footnote line; a later good read clears both.
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- Only `usage_store` reads `usage.json`. Code from before this phase would load `_directory_logins` as an empty login entry. Both machines promote together, so this lasts only until the promotion.
+- `load()` seeds the links from the old `read_source_directory` and `weekly_read_skip_directory` fields. It writes only the directory map.
+- A failed identity read stays unmarked when its directory has no link and the caller knows no login, for example a first failed Codex identity read on an old store. The next good read makes the link.
+- The one pool review found a blocker: a failed read with no login was dropped on a store written before this phase, and also when two directories shared a login. The directory links fixed it.
