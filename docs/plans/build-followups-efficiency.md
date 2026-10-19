@@ -82,7 +82,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Gotchas:** the usage store holds only `.claude` checkpoints, so checkpoints come from each production repository's git history. Codex logs record no cache writes: Claude cache write and Codex uncached input are the same kind of cost.
 
-### Phase 3 — The fixed cost of every request  · status: todo
+### Phase 3 — The fixed cost of every request  · status: done
 **Depends on:** Phase 2
 
 #### Work Order
