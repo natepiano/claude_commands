@@ -798,22 +798,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
-    def test_an_idle_review_unit_is_not_bumped_while_a_unit_beside_it_is(self) -> None:
-        import stall_watch
-        self.configure_registered({"showrunner": [("review-unit", "running"), ("hook-unit", "running")]},
-                                  review_pool=True)
-        for name in ("review-unit", "hook-unit"):
-            _ = self.unit(name)
-
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 600).returncode, 0)
-        sent = self.sent()
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith("stall-watch:hook-unit:") for item in sent), sent)
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "review-unit").name).exists())
-
-    def test_a_unit_named_review_unit_with_no_review_pool_is_bumped(self) -> None:
-        self.configure_registered({"showrunner": [("review-unit", "running")]})
+    def test_a_unit_named_review_unit_beside_a_review_pool_is_bumped(self) -> None:
+        self.configure_registered({"showrunner": [("review-unit", "running")]}, review_pool=True)
         _ = self.unit("review-unit")
 
         self.assertEqual(self.tick(START).returncode, 0)

@@ -140,7 +140,6 @@ class UnitRenameTests(unittest.TestCase):
             name: {"type": "codex", "thread_id": f"thread-{name}", "prime_hash": "h",
                    "lease": {"unit": unit, "ordinal": 3}, "busy_pid": None, "reviews": 2}
             for name, unit in (("r1", "alpha-unit"), ("r2", "mul_add-unit"))}}))
-        self.write(self.root / "state/review-pool/demo/memory/alpha-unit.md", "alpha memory\n")
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),
@@ -256,7 +255,6 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "gamma-unit", "ordinal": 3})
         self.assertEqual(pool["reviewers"]["r1"]["thread_id"], "thread-r1")
         self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
-        self.assertTrue((self.root / "state/review-pool/demo/memory/gamma-unit.md").exists())
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
         self.assertEqual((started["working_dir"], started["branch"], started["plan_doc"]),
                          (str(new), "demo-gamma", f"{new}/docs/plans/alpha.md"))
@@ -419,7 +417,7 @@ class UnitRenameTests(unittest.TestCase):
 
     def test_refusals(self) -> None:
         cases = [
-            (("alpha", "review-unit"), "is known to code"),
+            (("alpha", "nightly-review-unit"), "is known to code"),
             (("alpha", "mul_add"), "already in the Units table"),
             (("alpha", "bad name"), "letters, numbers"),
             (("missing", "gamma"), "expected one Units row"),

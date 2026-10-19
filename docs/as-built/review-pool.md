@@ -10,19 +10,17 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 
 | File | Role |
 | --- | --- |
-| `scripts/delegate/review_pool.py` | The pool CLI: templates, reviewers, unit leases, re-pointing, retire, migrate, unit memory lookup, stop |
+| `scripts/delegate/review_pool.py` | The pool CLI: templates, reviewers, unit leases, re-pointing, retire, migrate, stop, and the standing prompt each template is primed from |
 | `scripts/delegate/review.sh` | The review launcher; its `--pool` path allocates, runs and records one review turn |
 | `scripts/delegate/review_pool_report.py` | The cost and quality report over turn records, and `--shadow` |
 | `scripts/agents/codex_mesh.py` | The Codex mesh; `prime`, `fork`, `set-instructions` and three `follow` flags exist for the pool |
-| `scripts/production/add_unit.py` | Opens `/review:direct` for the review unit |
 | `config/review_pool/code.md` | Standing instructions of the code reviewer |
 | `config/review_pool/ui.md` | Standing instructions of the UI reviewer |
-| `commands/review/direct.md` | `/review:direct`, the review unit director's command |
 | `commands/unit/direct.md` | The unit director's side: pool form of each review launch, <UXReview/> |
 | `docs/delegate/dual_review.md` | Pool prompt opening, pool launch call, cancel through the slot file |
 | `docs/delegate/phase_end.md` | States that a pooled reviewer belongs to the unit and stays at phase end |
-| `docs/production_format.md` | Words, the `**Review pool:**` line, the `review-unit` row, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |
-| `commands/showrunner/produce.md` | Launch of the review unit, the merge line, `retire` for a retired unit, `stop` at wrap |
+| `docs/production_format.md` | Words, the `**Review pool:**` line, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |
+| `commands/showrunner/produce.md` | `retire` for a retired unit, `stop` at wrap |
 
 ### State
 
@@ -35,8 +33,6 @@ A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug
 | `prime/<sha256>.md` | Copies of standing prompts, named by content hash |
 | `cwd/` | The templates' working directory, empty |
 | `mesh/<generation>/` | One mesh session directory per pool lifetime |
-| `standing/<type>.md` | The standing prompt the review director builds and primes from |
-| `memory/repository.md`, `memory/<unit>.md` | Review memory |
 | `ui_adopted` | The UI pool's adoption marker; present only after the user creates it |
 
 `pool.json`:
@@ -53,25 +49,24 @@ A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug
 
 A new file starts with `generation: 0`. `stopping` is present only while a stop is unfinished. A file without `next_index` reads each counter as 1. A file written before reviewers became permanent may still hold `split`, a lease `phase` or a reviewer's `served`; they load and the next write drops them. Types are `code` and `ui`; reviewer names are `<type><n>` (`code1`, `ui2`); a template is named `<type>-template-<hash8>`. In code a lease is `Unleased` or `UnitLease(unit, ordinal)`, and a reviewer's ownership is `IdleReviewer` or `ClaimedReviewer`; `null` appears only where `pool.json` is read and written. A lease's `ordinal` counts the reviews the reviewer has carried on its current thread.
 
-`<history root>` is `PLAN_DELEGATE_HISTORY_DIR`, or `~/.local/state/plan-delegate`. Review turn records and UI verdict pairs live in its `review_turns/<session dir name>/`; the review director's own recorder state is its `review_units/review-<slug>`.
+`<history root>` is `PLAN_DELEGATE_HISTORY_DIR`, or `~/.local/state/plan-delegate`. Review turn records and UI verdict pairs live in its `review_turns/<session dir name>/`.
 
 ### `review_pool.py` verbs
 
 Every verb takes `--production <slug>`. A failure prints `review_pool: <reason>` on stderr and exits 1. Every mesh call runs outside the lock: a verb reads `generation` before the call and publishes the result only when it is unchanged; otherwise it drops the result and exits 1 with `pool was stopped during the mesh call; result dropped`. `REVIEW_POOL_MESH` names another script to run in place of `codex_mesh.py`.
 
 - **`prime --type T --instructions-file F`** copies `F` to `prime/<sha256>.md` and prints the hash. When the hash differs from the type's template, it calls `codex_mesh.py prime` as `<type>-template-<hash8>` with that copy's absolute path and `cwd/`, and records the template. An unchanged hash makes no mesh call. Then it re-points every idle reviewer of the type whose `prime_hash` differs from the template's (Re-pointing). A `prime/` file is deleted once no template or reviewer carries its hash and no process holds a shared lock on it, and not before.
-- **`allocate --type T --unit U --phase P --pass N [--lens L] --pid PID`** takes the first match under the lock:
+- **`allocate --type T --unit U --phase P --pass N [--lens L] --pid PID`** first builds the type's standing prompt (Priming) and primes it as `prime` does; with no change that makes no mesh call. When the build fails, a primed template keeps its prompt and the cause goes to stderr; with no template, allocate exits 1 with `no primed <type> template: <cause>`. An unfinished stop is reported before the build. Then it takes the first match under the lock:
   1. the unit's most recently allocated idle reviewer of the type;
   2. when the unit has no reviewer of the type, an idle unleased reviewer carrying the template's hash (a pool written before leases were per unit can hold one);
   3. a new reviewer: a name reserved under the lock with `busy_pid` and no thread id, then `codex_mesh.py fork` outside the lock, the thread id recorded under the lock. The fork's source is the unit's most recently allocated reviewer of the type when the unit has one (every one of them is busy), so the fork starts with the unit's context and inherits its lease count and hash; otherwise the template. When the fork of the unit's reviewer fails, the pool prints `review_pool: fork of <source> failed (<reason>); forking the template` on stderr and forks the template instead.
 
-  A reviewer forked from the template takes the template's hash and lease count 1, so its first turn carries the unit memory. A reviewer is idle when `busy_pid` is null or names a dead process; a reservation with no thread id is never a candidate. The chosen reviewer gets `busy_pid`, its lease set to `U` with `ordinal` raised by 1, and `last_allocated` set. When its `prime_hash` is no longer the template's, allocate re-points it before returning. The verb prints one JSON line `{"reviewer", "thread_id", "mesh_dir", "lease_ordinal", "prime_hash"}`, where `mesh_dir` is the current `mesh/<generation>/`. It exits 1 with `no primed <type> template` or `fork <name> failed: <reason>`; a failed fork removes its reservation. `--phase` and `--pass` are required and only describe the turn: the lease names the unit alone. `--fresh` is accepted from a launcher older than permanent reviewers and changes nothing.
+  A reviewer forked from the template takes the template's hash and lease count 1, and starts the unit's reviews again. A reviewer is idle when `busy_pid` is null or names a dead process; a reservation with no thread id is never a candidate. The chosen reviewer gets `busy_pid`, its lease set to `U` with `ordinal` raised by 1, and `last_allocated` set. When its `prime_hash` is no longer the template's, allocate re-points it before returning. The verb prints one JSON line `{"reviewer", "thread_id", "mesh_dir", "lease_ordinal", "prime_hash"}`, where `mesh_dir` is the current `mesh/<generation>/`. It exits 1 with `no primed <type> template: <cause>` or `fork <name> failed: <reason>`; a failed fork removes its reservation. `--phase` and `--pass` are required and only describe the turn: the lease names the unit alone. `--fresh` is accepted from a launcher older than permanent reviewers and changes nothing.
 - **`release --reviewer R --pid PID [--thread-id ID]`** clears `busy_pid` when it is `PID` and adds 1 to `reviews`; the lease stays. With a `--thread-id` that differs from the stored one it stores the new id and sets the lease count to 0: the mesh replaced a thread it could not resume, and the new thread holds none of the unit's history, so the next review carries the unit memory again.
 - **`retire --unit U`** ends the unit's reviewers of both types. `trunk` and `trunk-unit` name the same unit, because lease names predate one spelling. An idle reviewer is claimed and ended with `codex_mesh.py end`, removed, and its name printed on stdout, with `review_pool: retired <name>: <unit> retired` on stderr. A reservation with no thread id is removed and printed. One still reviewing is left in place with `review_pool: <name> is reviewing; left in place` on stderr; run `retire` again once its review ends.
 - **`migrate [--apply]`** reads the production's running units from `unit_lookup.marked_units(slug)`; a unit whose state is unknown counts as running. It prints one tab-separated line per reviewer, `keep` or `retire`, name and reason, newest first: a busy reviewer and a fork in flight are kept; an unleased reviewer retires (`no unit`), as does one whose unit is not running (`trunk` matches `trunk-unit`); each running unit keeps its newest reviewer per type and retires the rest (`<unit> keeps a newer <type> reviewer`). With `--apply` it retires each `retire` line whose reviewer is unchanged and idle, and names any other on stderr with `changed since the plan; left in place`. The showrunner runs `--apply`.
 - **`end-lease --unit U [--phase P]`** is accepted and ends nothing, so a director still running the old phase-end step leaves its reviewer in place.
 - **`status`** prints one tab-separated line per reviewer: name, type, lease (`unleased` or `<unit>:<ordinal>`), `idle` or `busy`, reviews.
-- **`unit-memory --unit U`** prints `memory/<unit>.md` byte for byte, or nothing when it is absent. A unit name with a directory component exits 1 with `unit must name one memory file`.
 - **`stop`** removes `ui_adopted` when present (printing `review_pool: ui adoption cleared` on stderr), raises `generation`, empties `templates` and `reviewers`, sets each name counter back to 1, and runs `codex_mesh.py stop` on the ended lifetime's directory. When that call fails, `stop` exits 1 with the mesh's reason and leaves `stopping` set: `prime`, `allocate`, `retire` and `migrate` then exit 1 with `pool stop did not finish; run stop again` until a `stop` succeeds, and a repeated `stop` runs against the same ended directory.
 
 ### Re-pointing
@@ -115,7 +110,6 @@ Lens `ux` with no pool is accepted. From there the launcher:
 3. For `ui`, reads `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, one path per line, into `--image` arguments. An unreadable file (`ERROR: UI shots file is unreadable: <path>.`) or one with no paths (`ERROR: UI shots file has no paths: <path>.`) exits 1 before allocation.
 4. Runs `review_pool.py allocate --production <slug> --type <type> --unit <unit> --phase <phase> --pass <pass_index> [--lens L] --pid $$`. A failure prints `ERROR: pool allocation failed: <the pool's last stderr line>; see <log>.` and exits 1 with no turn; the log is `review_agent_<N>[_<lens>]-pool.log`.
 5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `PLAN_DELEGATE_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
-6. When `lease_ordinal` is 1, for both types, prepends the unit's memory (`review_pool.py unit-memory`): the reviewer's thread holds it from then on. It writes `${SESSION_DIR}/review_message_<pass><suffix>.XXXXXX` (the memory, a blank line, the prompt), sends that file as the prompt and removes it at exit. With no memory the prompt goes unchanged.
 7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000 in `config/delegate.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
 8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path; it checks for the file every `PLAN_DELEGATE_EARLY_POLL_SECS` (default 5 s; tests set it small).
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
@@ -150,7 +144,7 @@ A `--pool` launch and a `--to` launch each write one new file per attempt, inclu
 
 ### Switching the pool on
 
-`**Review pool:** code` (or `code, ui`) in a production doc's Production Context switches the pool on for that production, once `/review:direct` has primed each type. Every code review of every unit then goes to the unit's reviewer with `--pool code --lease <slug>/<unit>/<phase>`; the UI pool is used on every design check. Without the line, reviews go to the unit's own workers with `--to`.
+`**Review pool:** code` (or `code, ui`) in a production doc's Production Context switches the pool on for that production; the first review of each type primes it. Every code review of every unit then goes to the unit's reviewer with `--pool code --lease <slug>/<unit>/<phase>`; the UI pool is used on every design check. Without the line, reviews go to the unit's own workers with `--to`.
 
 ### Prompts
 
@@ -160,33 +154,20 @@ On every design check the unit director writes two prompts (<UXReview/> step 3):
 
 A pool code review prompt opens with the pooled-reviewer line (unit, phase, `Re-read the tree; trust nothing from memory about its state`, and `git -C <worktree> rev-parse HEAD` as the first command, reporting an error when it is not the expected head), and its Three Gods and Type Design Contract sections each hold `As in your standing instructions.` <TeamReview/>'s worker choice and role reassignment do not apply.
 
-### Review unit director and review memory
+### Priming
 
-`/review:direct <production doc>` dispatches no review and answers no allocation. It keeps two jobs: priming and memory curation. `add_unit.py` opens it, in place of `/unit:direct`, for the unit named `review-unit` when the doc has a `- **Review pool:** ` line. The Units table carries the review unit as an ordinary row (worktree, branch, plan, Port `—`, Owns `—`); its plan has one standing phase that stays `todo`, and `/review:direct` writes that plan when it is absent.
+No unit runs the pool, and no file holds review memory. Each permanent reviewer keeps its own thread of the reviews it did (user, 2026-10-19: "each individual reviewer needs to manage it's own reviews"). `review_pool.standing_prompt` builds a type's prompt on every allocate, from `REVIEW_POOL_CONFIG` (default `config/review_pool/`):
 
-At start and on resume the director:
+- `code`: `code.md`.
+- `ui`, in order:
+  1. `ui.md`;
+  2. `## Rules`, then `UX guide: <absolute guide path>`, then each `.md` in the guide root with a non-empty frontmatter `test:`, in file-name order, as `### <file name>` and its text; the selection is `scripts/ux_style/load-ux-style.sh`'s, so README and notes are left out;
+  3. when present, `docs/design-decisions.md` of the repository that holds the production doc, under `## Design decisions`;
+  4. when present, that repository's `docs/hana/targets.md`, under `## Targets`.
 
-- records one standing phase (`progress_history.py start-run`, then `start-phase --phase-id 1`) in `<history root>/review_units/review-<slug>`; both calls reuse an existing run;
-- builds each type's standing prompt into `<pool dir>/standing/<type>.md` and runs `review_pool.py prime` on it (below);
-- removes the hourly `review-health-<slug>` timer an older version of the command registered (`notifier.sh remove`, errors ignored). A `Scheduled review health` message from such a timer gets the same removal and an idle turn end.
+The ui build finds the production doc through `showrunners.timer_docs()` and the guide from its `- **UX guide:** ` line. With no doc or no guide it fails, and a ui review falls back as allocate says. A changed base prompt or rule changes the hash, so the next allocate primes a new template and re-points the idle reviewers.
 
-`standing/code.md` is `config/review_pool/code.md` plus the `code` section of `memory/repository.md`. `standing/ui.md` is, in order:
-
-1. `config/review_pool/ui.md`;
-2. `## Rules`, then `UX guide: <absolute guide path>`, then each `.md` in the guide root with a non-empty frontmatter `test:`, in file-name order, as `### <file name>` and its text; the selection is `scripts/ux_style/load-ux-style.sh`'s, so README and notes are left out;
-3. when present, `docs/design-decisions.md` of the repository that holds the production doc, under `## Design decisions`: the file the helper's `ux_eval.md` reads from a unit's worktree;
-4. when present, that repository's targets file (`docs/hana/targets.md` in hana), under `## Targets`;
-5. the `ui` section of `memory/repository.md`.
-
-A production doc with no **UX guide** primes no `ui`, and the director reports `UI pool not primed: production has no UX guide` to the showrunner. An unreadable guide or rule fails the prime; an incomplete UI prompt is never primed. The prompt is rebuilt at start and on resume, so a changed rule's text changes the prompt hash, and the prime re-points the live reviewers.
-
-On each showrunner line `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>` (the showrunner takes the session directory's name from `unit_run.py`, `docs/as-built/showrunner-automation.md`) it reads `<history root>/runs/<session dir name>.jsonl` (local, else the Mac's over ssh at `collect.MAC_HOST`), joins the merged phase's `finding_opened` and `finding_verdict` events by `finding_id` and `phase_instance_id`, and records in memory a defect class seen in two or more findings, a ruling by a unit director or the showrunner, and a defect that got past review. A finding with no verdict is open and is processed with the rest; only a `session dir unavailable` line or an unreadable history file keeps a merge pending, and the director reports the cause to the showrunner.
-
-Memory lives under `<pool dir>/memory/`: `repository.md` with `code` and `ui` sections, and `<unit>.md`. Each entry carries a date and its sources. After a repository section changes, the director primes that type again, which makes a new template and re-points the reviewers. A turn record's `prime_hash` names the memory a reviewer received; no separate version count exists. Unit memory reaches a reviewer through the launcher on its first turn on a thread, not through the standing prompt. Memory is the one input a permanent reviewer cannot gather from its own thread: patterns across units and across repositories.
-
-When the showrunner ends the production, the director finishes pending memory work and runs `progress_history.py finish-run --status completed`. An idle director ends its turn with `— holding: waiting for review requests`.
-
-The showrunner launches the review unit first, sends the merge line after each merged code checkpoint (a shrink sends none), runs `review_pool.py retire` for a unit before marking it `retired`, and at wrap tells the review unit to end, waits for its acknowledgment, then runs `review_pool.py stop`, repeating it until it succeeds.
+The showrunner runs `review_pool.py retire` for a unit before marking it `retired`, and `review_pool.py stop` at wrap, repeating it until it succeeds.
 
 ### Cost and quality report
 
@@ -268,7 +249,6 @@ A rule stated with its mechanism above is not repeated here.
 - Every caller reads `mesh_dir` from the allocation line and never builds the path.
 - A change to `review.sh` keeps `TURN_RECORD_STATUS`, the slot file and `release --thread-id`.
 - A reviewer's `prime_hash` changes only after `set-instructions` succeeded for it.
-- Only the review director writes memory. It stores rules and defect classes, never diffs, code, shots or complete review output.
 - A caller of `stop` reports a nonzero exit and runs `stop` again.
 
 ## Calibration and gotchas
@@ -278,7 +258,6 @@ A rule stated with its mechanism above is not repeated here.
 - The prompt cache is per thread. First request after a new fork: 12,372 uncached / 11,392 cached / 8 output = 12,982 weighted tokens; on a thread that already held the prompt, 212 / 23,552 / 9 = 1,435. A fork took 0.189 s. This is one measured pair (2026-10-12, Codex CLI 0.162.1, `gpt-6.1-sol` weights uncached 1, cached 0.05, output 5; the run is recorded in `docs/as-built/review-pool-probes.md`), not a standing guarantee of cache behavior.
 - `config/review_pool/code.md` stays under 7 KB. `ui.md` holds the whole judging procedure and measures 8,376 bytes; `standing/ui.md` adds every rule's full text.
 - A pooled UI turn with the rules in its standing prompt (2026-10-13: scratch pool, hana guide, 30 rules, one stored shot) read neither `ux_eval.md` nor a rule file, `--shadow` gave `pool missed defects: 0`, and it cost 79,903 weighted tokens in 6 requests against 102,264 in 8 for a turn that read them.
-- Repository memory: at most 4,000 tokens for `code` and 3,000 for `ui`, counted as UTF-8 bytes divided by four, rounded up; the least-cited entry is pruned at the cap.
 
 **Mesh**
 
@@ -308,10 +287,6 @@ A rule stated with its mechanism above is not repeated here.
 - `read_events` returns `[]` for a missing file, so `local_sources` stores a history only when `is_file()` holds: an absent entry in `sources.histories` is what tells a missing history (`history file unavailable`) apart from an empty one (`no run_started event`). Symlinks in plan paths are not resolved.
 - A live check of the UI pool belongs in a scratch `REVIEW_POOL_STATE` and a scratch `PLAN_DELEGATE_HISTORY_DIR`; the real pool state and history then hold no record of it.
 
-**Review director**
-
-- The director's session directory lives under the history root, never under `/tmp`: no `prepare_session.sh`, no run-active marker, no report timer.
-- `start-run` returns early when the session's state file exists, so a resume from another session is safe. With no `--main-*` flags the recorder detects the director's model and effort itself, so the director does not read them from its transcript.
 - `--shadow` reads only this machine's verdict pairs. Reading a second machine's pairs waits until a unit on the Mac runs design checks.
 
 ## Why
@@ -320,8 +295,8 @@ A reason given beside its mechanism above is not repeated here.
 
 - **One permanent reviewer per unit.** User, 2026-10-15: reviewers should never restart; each unit keeps its own reviewer, which builds up context about the unit's work, and the pool grows only when a unit needs two reviews at once. Under the earlier design a lease was keyed by `(unit, phase)`, so a new phase never matched the unit's own reviewer: hana's tool-based-ui pool reached 22 reviewer records, names up to `code81`, and 20 idle reviewers still leased to finished phases.
 - **A concurrent review forks the unit's reviewer, not the template.** The fork starts with the unit's context, and its first request reads that context as cached input from the source thread's prefix.
-- **A changed prompt re-points instead of retiring.** Retiring a reviewer on every memory change would throw away the unit context the design keeps it for; `_resume_params` already sends the roster's file on every resume, so pointing the roster at the new copy is enough.
-- **A replaced thread's lease count goes to 0.** The new thread holds none of the unit's turns, so its next review must carry the unit memory as a first turn does.
+- **A changed prompt re-points instead of retiring.** Retiring a reviewer on every prompt change would throw away the unit context the design keeps it for; `_resume_params` already sends the roster's file on every resume, so pointing the roster at the new copy is enough.
+- **A replaced thread's lease count goes to 0.** The new thread holds none of the unit's turns, so its next review counts as the first.
 - **No trial, no arm split.** The trial that divided phases between the pool and a unit's own workers by a hash of unit and phase ended with the user's rule; `arm`, `split`, `REVIEW_LEASE`, `--fresh`, the phase-end `end-lease` reset and `health`'s stale-lease ending went with it, and `/review:direct` lost its hourly health timer and the dailies report.
 - **Allocation is a script with no queue, and each production has its own pool.** The user's rules: a review never waits in line (a new reviewer is forked instead), no tokens go to allocation, and each showrunner has its own reviewer pool.
 - **One mesh directory per pool lifetime.** With one shared `mesh/`, a fork that finishes after `stop` writes into the roster the next lifetime reads.
@@ -330,7 +305,6 @@ A reason given beside its mechanism above is not repeated here.
 - **The launcher leaves its pass open on a signal.** If it closed the pass, the unit director's cancel call would fail on a closed pass.
 - **The pool prompt says `As in your standing instructions.` and names no file.** A reviewer holds the text it was last pointed at, which `config/review_pool/code.md` may no longer match.
 - **Cost comes from the usage store.** It already holds every request with its model, time and compactions for both machines, so reading rollout files through `scripts/usage/rollouts.py` was ruled out.
-- **The director reads run history, not `findings.py status`.** By merge time the unit has usually moved on, and that command shows only the active phase.
 - **The pooled UI reviewer's standing prompt holds the rule texts.** A prompt that names `commands/ux_eval.md` and the rule files has them read again on every turn; with the texts standing, the turn reads none and cost about 22% fewer weighted tokens (Numbers).
 - **Design decisions come from the production's repository, never from the guide.** It is the file the helper's `ux_eval.md` reads; taking it from the guide would make the helper and the pool judge against different exceptions.
 
@@ -338,9 +312,9 @@ A reason given beside its mechanism above is not repeated here.
 
 | Risk | What contains it |
 | --- | --- |
-| Standing context cost per request | Prefix tokens are re-billed on every request. Standing prompts are capped (7 KB code; repository memory 4,000 and 3,000 tokens), the launcher compacts a thread above the configured limit, and the report's cost tables and lease-ordinal rows show what a review costs as a thread ages. |
-| One unit's details in another unit's review | A reviewer belongs to one unit for good and never serves another. Per-unit memory is sent only to that unit's reviewer. The repository memory holds classes and rulings, never diffs; its writer is the director, who applies that rule. |
-| Stale context | The prompt says to re-read the tree each review and checks the head hash first. Memory entries carry a date and source and are pruned when a ruling changes. A changed prompt re-points every reviewer. |
+| Standing context cost per request | Prefix tokens are re-billed on every request. Standing prompts are capped (7 KB code), the launcher compacts a thread above the configured limit, and the report's cost tables and lease-ordinal rows show what a review costs as a thread ages. |
+| One unit's details in another unit's review | A reviewer belongs to one unit for good and never serves another. Its thread holds only that unit's reviews. |
+| Stale context | The prompt says to re-read the tree each review and checks the head hash first. A changed prompt re-points every reviewer. |
 | One point of failure | The request path is the unit's own `review.sh` plus one app-server. A dead server is restarted on the next call, and its threads resume. If the pool cannot open a thread at all, `review.sh --pool` exits `error`, and the unit director retries on its own worker with `--to` under <DelegateLaunchFailure/>. |
 | Sandbox reads of every worktree | Codex `readOnly` reads the whole filesystem, so it needs no grant per worktree. It also cannot stop a reviewer reading a sibling unit's tree. All trees are the user's own, so this is a correctness risk, not a privacy one. The prompt names the worktree and head hash. |
 | Writer independence | A pool reviewer never wrote what it reads. |
@@ -349,13 +323,13 @@ A reason given beside its mechanism above is not repeated here.
 
 - **2026-10-10 to 2026-10-13: built as a trial** (`docs/plans/proposal-review-unit.md`, removed once built). Leases were per phase and reset with `thread/revert` at phase end; a hash of unit and phase sent half of the phases to the pool and half to the unit's own workers, and the report compared the two. The four directors asked then (hana, organon, widget, trunk) wanted no queue in front of a review, findings in the unit's own files with triage kept by its director, the guides and rulings kept, and each diff and tree belief forgotten; the user's rule replaced queueing with forking, and the review memory holds what they asked to keep.
 - **2026-10-16: permanent reviewers** (`docs/plans/build-followups-review-pool-permanent.md`, removed once built). Phase 1 made leases per unit and added `migrate`; Phase 2 removed the arm, the split and the resets, and added `retire` and re-pointing; Phase 3 removed `health`, the director's timer and dailies report, and the report's arm comparison.
+- **2026-10-19: no review unit** (user: "each individual reviewer needs to manage it's own reviews"). `/review:direct`, the review unit, its merge lines and review memory (`unit-memory`, `memory/`) were removed; allocate primes the pool.
 
 ## Tests
 
-- `scripts/delegate/test_review_pool.py` (56 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and re-pointing (idle reviewers at prime, a busy one at its next allocate, a refused re-point keeping the old hash), allocation across phases of one unit, forks from the unit's reviewer and the template fallback, name issue, `release --thread-id` and the replaced-thread lease count, `retire`, `migrate` on a copy of the tool-based-ui layout, an old `split` key, `end-lease` ending nothing and `health` gone, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or retire, `unit-memory` and the adoption marker. `UIStandingPromptTests` pins `ui.md`'s verdict line, its table header and `measure_text.py`, and the absence of the old instructions to follow `ux_eval.md` and read a rule's full text.
-- `scripts/delegate/test_review_launcher.py` (65 tests) covers `review.sh`: the pool path with no reset, unit memory on the first turn for both types, the slot file, turn records of both launch paths and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the assigned and fresh paths.
+- `scripts/delegate/test_review_pool.py` (56 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and re-pointing (idle reviewers at prime, a busy one at its next allocate, a refused re-point keeping the old hash), allocation across phases of one unit, forks from the unit's reviewer and the template fallback, name issue, `release --thread-id` and the replaced-thread lease count, `retire`, `migrate` on a copy of the tool-based-ui layout, an old `split` key, `end-lease` ending nothing and `health` gone, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or retire, priming on allocate from the base prompt and the UX rules, and the adoption marker. `UIStandingPromptTests` pins `ui.md`'s verdict line, its table header and `measure_text.py`, and the absence of the old instructions to follow `ux_eval.md` and read a rule's full text.
+- `scripts/delegate/test_review_launcher.py` (65 tests) covers `review.sh`: the pool path with no reset, the prompt sent as written on a first turn, the slot file, turn records of both launch paths and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the assigned and fresh paths.
 - `scripts/delegate/test_review_pool_report.py` (73 tests) runs the report as subprocesses. `populate_usage_store` collects fixture rollouts into a fixture store, and `USAGE_STATE_DIR` points the script at it. It covers request attribution, every incomplete reason, compaction counts, outcome lines, records of both launch paths counted together, the quality table with merge holds, each merge-hold match case and the `merge holds unmatched` warning, plan normalization, Mac rows and histories, an absent and an unreadable store, the Mac source warning, and `--shadow` with its `Machine:` line. These tests call the collector's `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver`; a rename in `scripts/usage/collect.py` breaks them. The fixtures prefix the collector's request key with the file path.
 - `scripts/agents/test_codex_mesh.py`, with a fake app-server, covers `prime`, `fork`, `set-instructions`, `reset`, the three `follow` flags, and standing instructions restored on resume, fork, compact and a replaced thread.
-- `scripts/production/test_add_unit.py` covers the review unit's opening message: `/review:direct` with a pool line, `/unit:direct` without one.
 - `scripts/production/test_review_unit_phase.py` (3 tests): the standing phase reads as `1 of 1`, running; a resume adds no run and no phase; shutdown finishes the run while the plan heading stays `todo`.
 - `scripts/delegate/test_progress_history.py` covers the `UX review` activity's time.
