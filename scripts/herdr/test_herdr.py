@@ -1810,14 +1810,22 @@ class HerdrTests(unittest.TestCase):
             {"stdout": "status: running\n", "code": 0},
         ]
         _ = self.responses_path.write_text(json.dumps(self.responses))
-        _ = herdr.start_server("fixture", 10_000)
-        self.assertEqual(self.commands(), [
+        started = [
             ["--session", "fixture", "status", "server"],
             ["--user", "show", "-p", "FragmentPath", "--value", "herdr-fixture.service"],
             ["--user", "start", "herdr-fixture.service"],
             ["--session", "fixture", "status", "server"],
             ["--user", "is-active", "herdr-fixture.service"],
-        ])
+        ]
+        # While herdr resumes agents itself, the restored layout is cleared as for any session.
+        _ = herdr.start_server("fixture", 10_000)
+        self.assertEqual(self.commands(), [*started, ["--session", "fixture", "workspace", "list"]])
+        _ = shared.with_name("config.toml").write_text("[session]\nresume_agents_on_restore = false\n")
+        self.log.unlink()
+        _ = self.responses_path.write_text(json.dumps(self.responses | {"--session fixture status server": [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]}))
+        _ = herdr.start_server("fixture", 10_000)
+        self.assertEqual(self.commands(), started)
 
     def test_spawned_servers_report_session_and_workspace_when_close_fails(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({

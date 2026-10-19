@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
@@ -1543,12 +1544,23 @@ def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_Pan
             and members[0].evidence is _StartupShellEvidence.UNTOUCHED)
 
 
+def _herdr_resumes_agents() -> bool:
+    """False only when herdr's config sets `[session] resume_agents_on_restore = false`."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "config.toml"
+    try:
+        session = tomllib.loads(path.read_text(encoding="utf-8")).get("session")
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return not (isinstance(session, dict) and cast(dict[str, object], session).get("resume_agents_on_restore") is False)
+
+
 def _clear_restored_workspaces(client: Herdr) -> None:
     """A server we just spawned holds restored layout, never live work.
 
-    The shared session keeps its layout: `pane_restore.py` resumes each pane on its own account.
+    The shared session keeps its layout for `pane_restore.py` only when herdr resumes no agent
+    itself: else herdr would resume each pane on the server's account (herdr review, 2026-10-19).
     """
-    if client.session == shared_session():
+    if client.session == shared_session() and not _herdr_resumes_agents():
         return
     result = client.result("workspace", "list")
     workspaces = [json_text(json_object(item, "herdr workspace").get("workspace_id"),
