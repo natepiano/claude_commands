@@ -1535,7 +1535,6 @@ raise SystemExit(offload.main())
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
             ".local/state/mac-test/mirror/hana",
-            "pmset -g batt",
             'df -g "$HOME"',
             "hostname -s",
         ):
@@ -1543,6 +1542,7 @@ raise SystemExit(offload.main())
         self.assertNotIn("loadavg", probe_script)
         self.assertNotIn("pgrep", probe_script)
         self.assertNotIn("procs", probe_script)
+        self.assertNotIn("pmset", probe_script)
 
         copy = events[1]
         exclude_argument = next(
