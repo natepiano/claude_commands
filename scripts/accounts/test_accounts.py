@@ -25,7 +25,7 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterator
-from typing import Self, TextIO, cast, final, override
+from typing import Literal, Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -313,7 +313,7 @@ class AccountsTests(unittest.TestCase):
             self.assertNotIn(line, summary[1])
             self.assertIn(line, detail[1])
         self.assertEqual(detail[1].splitlines()[:len(summary[1].splitlines())], summary[1].splitlines())
-        self.assertEqual(self.run_cli("--detail", "pick", "claude"), (1, "", "--detail goes only with no action\n"))
+        self.assertEqual(self.run_cli("--detail", "placement"), (1, "", "--detail goes only with no action\n"))
 
     def status_rows(self) -> list[tuple[str, ...]]:
         """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
@@ -4803,6 +4803,10 @@ class PickerTime(datetime):
 ZERO_AGE = timedelta()
 
 
+NO_PICK_EXCLUSIONS: frozenset[str] = frozenset()
+NO_PICK_KEEP = accounts.NoKeep()
+
+
 class PickerTests(unittest.TestCase):
     home: Path = Path()
     now: datetime = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
@@ -4864,14 +4868,31 @@ class PickerTests(unittest.TestCase):
         file.parent.mkdir(parents=True, exist_ok=True)
         _ = file.write_text(json.dumps(saved))
 
-    def cli(self, *options: str, tool: str = "claude") -> tuple[int, str, str]:
-        output, error = io.StringIO(), io.StringIO()
-        with patch.object(accounts, "datetime", PickerTime), redirect_stdout(output), redirect_stderr(error):
-            result = accounts.main(["pick", tool, *options])
-        return result, output.getvalue(), error.getvalue()
+    def selection(self, *, tool: Literal["claude", "codex"] = "claude",
+                  exclude: frozenset[str] = NO_PICK_EXCLUSIONS,
+                  keep: accounts.KeepAccount | accounts.NoKeep = NO_PICK_KEEP,
+                  explain: bool = False) -> tuple[int, str, str]:
+        chosen = accounts.pick(tool, self.now, exclude=exclude, keep=keep)
+        lines = [chosen.label if isinstance(chosen, accounts.PickedAccount) else accounts.no_room_line(tool, chosen)]
+        if explain:
+            lines.extend(accounts._pick_explanation(reason) for reason in chosen.reasons)  # pyright: ignore[reportPrivateUsage]
+        return (0 if isinstance(chosen, accounts.PickedAccount) else 1), "\n".join(lines) + "\n", ""
 
-    def assert_picked(self, label: str, *options: str, tool: str = "claude") -> None:
-        self.assertEqual(self.cli(*options, tool=tool), (0, label + "\n", ""))
+    def assert_picked(self, label: str, *, tool: Literal["claude", "codex"] = "claude",
+                      exclude: frozenset[str] = NO_PICK_EXCLUSIONS,
+                      keep: accounts.KeepAccount | accounts.NoKeep = NO_PICK_KEEP) -> None:
+        chosen = accounts.pick(tool, self.now, exclude=exclude, keep=keep)
+        self.assertIsInstance(chosen, accounts.PickedAccount)
+        assert isinstance(chosen, accounts.PickedAccount)
+        self.assertEqual(chosen.label, label)
+
+    def test_pick_is_not_a_command(self) -> None:
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error), self.assertRaises(SystemExit) as rejected:
+            _ = accounts.main(["pick", "claude"])
+        self.assertEqual(rejected.exception.code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("invalid choice: 'pick'", error.getvalue())
 
     def groups(self, units: str = "claude1", showrunners: str = "claude3") -> Path:
         path = self.home / ".local/state/accounts/groups.json"
@@ -5009,9 +5030,7 @@ class PickerTests(unittest.TestCase):
         expected = "accounts: name the account by number (~/.claude is claude2; ~/.codex is codex1)"
         commands = (("move", "some-session", "default"), ("move", "units", "default"),
                     ("move", "showrunners", "default"), ("set-role", "workers", "default"),
-                    ("swap", "workers", "default"), ("exec", "default"), ("check", "default"),
-                    *( ("pick", tool, option, "default") for tool in ("claude", "codex")
-                       for option in ("--exclude", "--keep") ))
+                    ("swap", "workers", "default"), ("exec", "default"), ("check", "default"))
         with (patch.object(agent_accounts, "codex_home_matches_label",
                            side_effect=AssertionError("matcher receives forbidden default")),
               patch.object(os, "execvpe") as launch):
@@ -5072,18 +5091,20 @@ class PickerTests(unittest.TestCase):
                 self.assertFalse(accounts.roles_history_file().exists())
 
     def test_picker_rejects_non_numbered_and_wrong_tool_filters_before_reading_candidates(self) -> None:
-        for tool, invalid in (("claude", ("~/.codex", "claude", "codex1")),
-                              ("codex", ("~/.codex", "claude", "claude1"))):
+        for tool, invalid in (("claude", ("default", "~/.codex", "claude", "codex1")),
+                              ("codex", ("default", "~/.codex", "claude", "claude1"))):
             for option in ("--exclude", "--keep"):
                 for label in invalid:
                     with (self.subTest(tool=tool, option=option, label=label),
                           patch.object(accounts, "checked_named_accounts") as named,
                           patch.object(agent_accounts, "codex_homes") as homes,
                           patch.object(agent_accounts, "codex_home_matches_label") as matcher):
-                        code, output, error = self.cli(option, label, tool=tool)
-                        self.assertNotEqual(code, 0)
-                        self.assertEqual(output, "")
-                        self.assertIn(label, error)
+                        with self.assertRaises(accounts.AccountsError) as rejected:
+                            _ = accounts.pick(cast(Literal["claude", "codex"], tool), self.now,
+                                exclude=frozenset({label}) if option == "--exclude" else frozenset(),
+                                keep=accounts.KeepAccount(label) if option == "--keep" else accounts.NoKeep())
+                        message = "name the account by number" if label == "default" else label
+                        self.assertIn(message, str(rejected.exception))
                         named.assert_not_called()
                         homes.assert_not_called()
                         matcher.assert_not_called()
@@ -5224,8 +5245,7 @@ class PickerTests(unittest.TestCase):
             {"at": "2026-10-13T00:00:00Z", "tool": "codex", "kind": "requested", "subject": "workers",
              "move_id": "old-codex", "from": "default", "to": "codex2", "why": "quota", "window": "unknown"})))
         original = journal.read_bytes()
-        for command in (("--detail", "status"), ("placement", "--explain"), ("pick", "claude", "--explain"),
-                        ("pick", "codex", "--explain"), ("move", "units", "claude99"),
+        for command in (("--detail", "status"), ("placement", "--explain"), ("move", "units", "claude99"),
                         ("swap", "workers", "codex99")):
             with self.subTest(command=command):
                 _, stdout, stderr = self.group_cli(*command)
@@ -5243,8 +5263,7 @@ class PickerTests(unittest.TestCase):
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"workers": "codex 2"}')
-        for arguments in (("status",), ("placement", "--explain"), ("pick", "claude", "--explain"),
-                          ("pick", "codex", "--explain"), ("role", "workers"),
+        for arguments in (("status",), ("placement", "--explain"), ("role", "workers"),
                           ("move", "units", "claude 99"), ("swap", "workers", "codex 99")):
             with self.subTest(arguments=arguments):
                 code, stdout, stderr = self.group_cli(*arguments)
@@ -5371,7 +5390,7 @@ class PickerTests(unittest.TestCase):
 
     def test_picker_without_saved_readings_keeps_unrefused_accounts_eligible(self) -> None:
         usage_store.store_file().unlink()
-        code, output, error = self.cli("--explain")
+        code, output, error = self.selection(explain=True)
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(output.splitlines()[0], "claude1")
         self.assertIn("no fresh readings", output)
@@ -5379,11 +5398,11 @@ class PickerTests(unittest.TestCase):
     def test_picker_without_fresh_readings_keeps_candidate_despite_stale_zero_room(self) -> None:
         for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
             self.reading("Claude", login, 0, 2, age=timedelta(minutes=11), five_left=0)
-        self.assert_picked("claude3", "--keep", "claude3")
-        self.assert_picked("claude1", "--keep", "claude3", "--exclude", "claude3")
+        self.assert_picked("claude3", keep=accounts.KeepAccount("claude3"))
+        self.assert_picked("claude1", keep=accounts.KeepAccount("claude3"), exclude=frozenset({"claude3"}))
         self.reading("Claude", "main@example.invalid", 50, 7)
         self.reading("Claude", "first@example.invalid", 90, 5)
-        code, output, error = self.cli("--explain")
+        code, output, error = self.selection(explain=True)
         self.assertEqual((code, error), (0, ""))
         explanation = next(line for line in output.splitlines() if line.startswith("claude3:"))
         self.assertTrue(explanation.endswith("; has room; no reading in the last 10 minutes"), explanation)
@@ -5397,8 +5416,8 @@ class PickerTests(unittest.TestCase):
         usage_store.store_file().unlink()
         refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
-        self.assert_picked("claude1", "--keep", "claude3")
-        _, output, _ = self.cli("--keep", "claude3", "--explain")
+        self.assert_picked("claude1", keep=accounts.KeepAccount("claude3"))
+        _, output, _ = self.selection(keep=accounts.KeepAccount("claude3"), explain=True)
         self.assertIn("refused at", output)
 
     def test_picker_without_fresh_readings_never_falls_back_to_refused_default(self) -> None:
@@ -5410,7 +5429,7 @@ class PickerTests(unittest.TestCase):
     def test_picker_fresh_zero_candidate_is_ineligible_even_with_missing_other_readings(self) -> None:
         usage_store.store_file().unlink()
         self.reading("Claude", "third@example.invalid", 0, 2)
-        self.assert_picked("claude2", "--keep", "claude2")
+        self.assert_picked("claude2", keep=accounts.KeepAccount("claude2"))
         self.assert_picked("claude1")
 
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
@@ -5425,32 +5444,32 @@ class PickerTests(unittest.TestCase):
         self.assert_picked("claude1")
 
     def test_picker_keeps_current_account_with_room_despite_a_sooner_reset(self) -> None:
-        self.assert_picked("claude1", "--keep", "claude1")
+        self.assert_picked("claude1", keep=accounts.KeepAccount("claude1"))
 
     def test_picker_does_not_keep_a_fresh_zero_percent_account_without_a_refusal(self) -> None:
         self.reading("Claude", "first@example.invalid", 0, 2)
-        self.assert_picked("claude3", "--keep", "claude1")
+        self.assert_picked("claude3", keep=accounts.KeepAccount("claude1"))
 
     def test_picker_has_no_minimum_remaining_percentage(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five_left=1)
         self.assert_picked("claude3")
 
     def test_picker_excludes_each_explicit_label(self) -> None:
-        self.assert_picked("claude2", "--exclude", "claude3", "--exclude", "claude1")
+        self.assert_picked("claude2", exclude=frozenset({"claude3", "claude1"}))
 
     def test_picker_exclude_overrides_keep(self) -> None:
-        self.assert_picked("claude1", "--keep", "claude3", "--exclude", "claude3")
+        self.assert_picked("claude1", keep=accounts.KeepAccount("claude3"), exclude=frozenset({"claude3"}))
 
     def test_picker_explains_fresh_zero_weekly_or_five_hour_as_no_room_and_placement_agrees(self) -> None:
         for weekly, five_hour in ((0, 90), (90, 0)):
             with self.subTest(weekly=weekly, five_hour=five_hour):
                 self.reading("Claude", "third@example.invalid", weekly, 2, five_left=five_hour)
-                code, output, error = self.cli("--explain")
+                code, output, error = self.selection(explain=True)
                 self.assertEqual((code, error), (0, ""))
                 self.assertEqual(output.splitlines()[0], "claude1")
                 explanation = next(line for line in output.splitlines() if line.startswith("claude3:"))
                 self.assertTrue(explanation.endswith("; no room"), explanation)
-                self.assert_picked("claude1", "--keep", "claude3")
+                self.assert_picked("claude1", keep=accounts.KeepAccount("claude3"))
                 for group in accounts.CLAUDE_GROUPS:
                     with self.subTest(group=group):
                         result = accounts.placement(group, self.now)
@@ -5467,7 +5486,7 @@ class PickerTests(unittest.TestCase):
                 for login, days in (("main@example.invalid", 7), ("first@example.invalid", 5),
                                     ("third@example.invalid", 2)):
                     self.reading("Claude", login, weekly, days, five_left=five_hour, five=five)
-                code, output, error = self.cli("--explain")
+                code, output, error = self.selection(explain=True)
                 self.assertEqual(code, 1, output + error)
                 self.assertIn("no claude account has room; the earliest reset is " + reset_text, output + error)
                 self.assertEqual(sum(line.endswith("; no room") for line in output.splitlines()), 3)
@@ -5484,7 +5503,7 @@ class PickerTests(unittest.TestCase):
 
     def test_picker_skips_readings_older_than_ten_minutes_with_the_cause(self) -> None:
         self.reading("Claude", "third@example.invalid", 90, 2, age=timedelta(minutes=10, microseconds=1))
-        code, output, error = self.cli("--explain")
+        code, output, error = self.selection(explain=True)
         self.assertEqual((code, error), (0, ""))
         self.assertIn("has room", output)
         self.assertEqual(output.splitlines()[0], "claude1")
@@ -5495,7 +5514,7 @@ class PickerTests(unittest.TestCase):
 
     def test_picker_skips_an_account_with_no_saved_reading(self) -> None:
         self.claude("claude4", "unread@example.invalid")
-        _, output, _ = self.cli("--explain")
+        _, output, _ = self.selection(explain=True)
         self.assertIn("claude4", output)
         self.assertIn("has room", output)
         self.assert_picked("claude3")
@@ -5515,7 +5534,7 @@ class PickerTests(unittest.TestCase):
         missing = self.home / "missing-shared-projects"
         target.symlink_to(missing, target_is_directory=True)
 
-        code, output, error = self.cli("--keep", "claude3")
+        code, output, error = self.selection(keep=accounts.KeepAccount("claude3"))
 
         self.assertEqual(code, 1)
         self.assertIn("no claude account has room", output)
@@ -5551,7 +5570,7 @@ class PickerTests(unittest.TestCase):
         self.codex("codex2", "spare@example.invalid")
         self.reading("Codex", "main@example.invalid", 80, 1)
         self.reading("Codex", "spare@example.invalid", 50, 3)
-        self.assert_picked("codex2", "--exclude", "codex1", tool="codex")
+        self.assert_picked("codex2", exclude=frozenset({"codex1"}), tool="codex")
 
     def test_codex_keep_home_number_retains_the_numbered_home_account(self) -> None:
         """F003: keeping the home number outranks the spare's earlier reset."""
@@ -5559,8 +5578,8 @@ class PickerTests(unittest.TestCase):
         self.codex("codex2", "spare@example.invalid")
         self.reading("Codex", "main@example.invalid", 80, 3)
         self.reading("Codex", "spare@example.invalid", 50, 1)
-        self.assert_picked("codex1", "--keep", "codex1", tool="codex")
-        self.assert_picked("codex2", "--keep", "codex1", "--exclude", "codex1", tool="codex")
+        self.assert_picked("codex1", keep=accounts.KeepAccount("codex1"), tool="codex")
+        self.assert_picked("codex2", keep=accounts.KeepAccount("codex1"), exclude=frozenset({"codex1"}), tool="codex")
 
     def test_codex_exclude_home_number_cannot_reselect_a_duplicate_home_login(self) -> None:
         """F002/F003: a duplicate folder cannot bypass exclusion of the canonical destination."""
@@ -5571,16 +5590,16 @@ class PickerTests(unittest.TestCase):
         self.codex("codex2", "spare@example.invalid")
         self.reading("Codex", "main@example.invalid", 80, 1)
         self.reading("Codex", "spare@example.invalid", 50, 3)
-        self.assert_picked("codex2", "--exclude", "codex1", tool="codex")
+        self.assert_picked("codex2", exclude=frozenset({"codex1"}), tool="codex")
 
     def test_codex_picker_without_fresh_readings_keeps_candidate_or_uses_the_home_account(self) -> None:
         self.codex("default", "workers@example.invalid")
         self.codex("codex2", "other@example.invalid")
         self.assert_picked("codex1", tool="codex")
-        self.assert_picked("codex2", "--keep", "codex2", tool="codex")
+        self.assert_picked("codex2", keep=accounts.KeepAccount("codex2"), tool="codex")
         refusals.write_refusal(refusals.AccountRefusal("codex", "other@example.invalid",
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
-        self.assert_picked("codex1", "--keep", "codex2", tool="codex")
+        self.assert_picked("codex1", keep=accounts.KeepAccount("codex2"), tool="codex")
 
     def test_picker_codex_credits_allow_work_after_both_windows_are_exhausted(self) -> None:
         self.codex("default", "workers@example.invalid")
@@ -5604,7 +5623,7 @@ class PickerTests(unittest.TestCase):
     def test_picker_codex_without_credits_requires_both_windows_with_room(self) -> None:
         self.codex("default", "workers@example.invalid")
         self.reading("Codex", "workers@example.invalid", 80, 2, five_left=0)
-        code, output, error = self.cli(tool="codex")
+        code, output, error = self.selection(tool="codex")
         self.assertEqual(code, 1)
         self.assertIn("no codex account has room", output + error)
 
@@ -5618,8 +5637,8 @@ class PickerTests(unittest.TestCase):
         assert isinstance(selected, accounts.NoAccountWithRoom)
         self.assertEqual(selected.earliest_reset, accounts.EarliestReset(self.now + timedelta(hours=3)))
         self.assertEqual(len(selected.reasons), 3)
-        self.assertEqual(self.cli()[0], 1)
-        self.assertIn("earliest reset", "".join(self.cli()[1:]))
+        self.assertEqual(self.selection()[0], 1)
+        self.assertIn("earliest reset", "".join(self.selection()[1:]))
 
     def test_picker_no_room_without_any_reset_uses_no_reset_known(self) -> None:
         for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
@@ -5631,14 +5650,14 @@ class PickerTests(unittest.TestCase):
         assert isinstance(selected, accounts.NoAccountWithRoom)
         self.assertIsInstance(selected.earliest_reset, refusals.NoResetKnown)
         self.assertEqual(len(selected.reasons), 3)
-        self.assertEqual(self.cli()[0], 1)
-        self.assertIn("no claude account has room", "".join(self.cli()[1:]))
+        self.assertEqual(self.selection()[0], 1)
+        self.assertIn("no claude account has room", "".join(self.selection()[1:]))
 
     def test_picker_unresolved_refusal_beats_positive_saved_room_and_keep(self) -> None:
         refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
             refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
-        self.assert_picked("claude1", "--keep", "claude3")
-        code, output, error = self.cli("--explain")
+        self.assert_picked("claude1", keep=accounts.KeepAccount("claude3"))
+        code, output, error = self.selection(explain=True)
         self.assertEqual((code, error), (0, ""))
         self.assertIn("refused at", output)
 
@@ -5649,7 +5668,7 @@ class PickerTests(unittest.TestCase):
             refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
         selected = accounts.pick("codex", self.now, keep=accounts.KeepAccount("codex1"))
         self.assertIsInstance(selected, accounts.NoAccountWithRoom)
-        code, output, error = self.cli("--explain", tool="codex")
+        code, output, error = self.selection(explain=True, tool="codex")
         self.assertEqual(code, 1)
         self.assertIn("refused at", output + error)
 

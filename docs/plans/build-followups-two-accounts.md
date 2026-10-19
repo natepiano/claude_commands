@@ -97,7 +97,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 5. **Move any one session (Phase 8), when the user says go.**
    - `/showrunner:accounts move <session> "claude N"` moves one showrunner, unit director or top-level session to any account. It stops safely, as `/shutdown` does it, and resumes the same conversation on the target in herdr: its recorded herdr pane, or a new herdr session, attached in a window for a Ghostty session.
    - Undo: move it back.
-6. **Accounts by room (Phases 14–25).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (`accounts.py pick`). When an account refuses a session or the Codex workers, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 18 replaces the picker with two groups (showrunners, units), each on one account and moved together. Phase 19 makes every group move pause first. Phase 20 adds a per-Codex-account credits setting and one alert when the workers' account reaches 0%; Phase 21 renames the account notes by number and gives each note its roles, live session count and session table; Phase 22 spells every label without a space (`claude4`, `codex2`); Phase 23 names every account by its number, never "default"; Phase 24 keeps a proof refusal with its session; Phase 25 proves the moves live on throwaway probe sessions.
+6. **Accounts by room (Phases 14–25).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (the ranking function; Phase 74 removed the command verb). When an account refuses a session or the Codex workers, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 18 replaces the picker with two groups (showrunners, units), each on one account and moved together. Phase 19 makes every group move pause first. Phase 20 adds a per-Codex-account credits setting and one alert when the workers' account reaches 0%; Phase 21 renames the account notes by number and gives each note its roles, live session count and session table; Phase 22 spells every label without a space (`claude4`, `codex2`); Phase 23 names every account by its number, never "default"; Phase 24 keeps a proof refusal with its session; Phase 25 proves the moves live on throwaway probe sessions.
 7. **A week later (Phase 9).** A readout gives the moves, their causes, any time with no eligible destination, and points per account per day.
 
 ## Delegation Context
@@ -614,13 +614,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 - `accounts.pick` chooses among `default` plus checked named accounts (Claude) or checked worker homes (Codex), one candidate per login (`default` first, then lowest number). Order: `keep` while it has room, else soonest weekly reset, then most weekly left, then label. Room is more than 0% left in the weekly and 5-hour windows (Codex: `agent_accounts.codex_can_work`'s shared rule, credits included); there is no minimum.
 - Readings come from the usage store through `stored_reading`; a reading older than 10 minutes skips the candidate. An unresolved refusal in `~/.local/state/accounts/refusals.json` excludes the account whatever the saved percentages say.
-- The verb `accounts.py pick claude|codex [--exclude '<label>']... [--keep '<label>'] [--explain]` prints the label (exit 0) or `no <tool> account has room; the earliest reset is <time>` (exit 1); `--explain` adds a line per candidate with `picked`, `has room`, `refused at <time>` or its reason.
+- Phase 74 removed the account-picking command verb. The `pick` function, its ranking and its reasons remain for automatic moves; `placement --explain` shows the Claude account reasons.
 - The unit role is gone: `role_account("unit")`, `role`/`env`/`exec unit` call `pick("claude", now)` and store nothing; a `unit` key in `config/accounts.json` is ignored. The `seats` role is unchanged.
 - `add_unit.py`, `add_showrunner.py` and `nightly_review.py` launch on the picked account (no 10% gate) and record `@claude_config_dir`/`@claude_model`. A showrunner resume keeps its account: `--account`, else `--config-dir` (resolved against the invoking cwd), else tmux `@claude_config_dir`, else a one-line refusal; promotion passes the unit's recorded dir. Superseded by herdr-adoption Phase 7: `add_unit.py` and `add_showrunner.py` launch in herdr and record neither option, `nightly_review.py` launches through `add_unit.py`, and a showrunner resume takes the showrunners group account; `--account` or `--config-dir` must name it.
-- Whoami, notes and quota alerts cover every login a live session runs on; `unit_swap_line` is a move line with no swap command; the status table marks the account `pick claude` chooses now with `next`.
+- Whoami, notes and quota alerts cover every login a live session runs on; `unit_swap_line` is a move line with no swap command; the status table marked the ranking's next account with `next`. Phase 74 removed the command verb.
 
 **Files:**
-- `scripts/accounts/accounts.py` — `pick`, its types and verb, `stored_reading`, `role_account`, the status table, `claude_account_selection`.
+- `scripts/accounts/accounts.py` — `pick`, its types (the verb was removed in Phase 74), `stored_reading`, `role_account`, the status table, `claude_account_selection`.
 - `scripts/accounts/refusals.py` — the refusal store and its resolution rule.
 - `scripts/production/add_unit.py`, `add_showrunner.py`, `promote_showrunner.py` — launch on the picked account; showrunner resume keeps its account.
 - `scripts/nightly_review/nightly_review.py` — launches on the picked account.
@@ -943,8 +943,8 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 #### As-built
 
-- `accounts.py pick` reads a fresh Claude reading at 0% weekly or five-hour left as "no room", as Codex already does; when no account has room it names the earliest reset. `placement` goes through `pick`, so `pick --explain` and `placement --explain` agree. Pinned by `test_picker_explains_fresh_zero_weekly_or_five_hour_as_no_room_and_placement_agrees` and `test_picker_all_fresh_zero_candidates_refuses_with_the_soonest_reset_and_placement_agrees`.
-- `accounts.py status` prints Folder, Label, Login, Role, Weekly left, Weekly resets, On credits, Credits left, Read: no 5-hour column. The 5-hour reading still decides in `pick` and `placement` and still appears in their `--explain`. Pinned by `test_status_hides_five_hour_cells_and_keeps_weekly_and_read`.
+- The `pick` function reads a fresh Claude reading at 0% weekly or five-hour left as "no room", as Codex already does; when no account has room it names the earliest reset. `placement` goes through `pick` and shows its reasons with `placement --explain`; Phase 74 removed the command verb. Pinned by `test_picker_explains_fresh_zero_weekly_or_five_hour_as_no_room_and_placement_agrees` and `test_picker_all_fresh_zero_candidates_refuses_with_the_soonest_reset_and_placement_agrees`.
+- `accounts.py status` prints Folder, Label, Login, Role, Weekly left, Weekly resets, On credits, Credits left, Read: no 5-hour column. The 5-hour reading still decides in `pick` and `placement` and still appears in `placement --explain`; Phase 74 removed the account-picking command verb. Pinned by `test_status_hides_five_hour_cells_and_keeps_weekly_and_read`.
 - Proven live on 2026-10-15 with throwaway probes (started on claude2 in `~/rust/two-accounts-probe`, each checked by a code word asked through `send.py`): a tmux weekly move claude2 → claude1 (one `requested`, one `confirmed` on `~/.claude1`, `account.py --pid` reads claude1); a Ghostty weekly move that reuses the same KWin window with position, size and desktop unchanged; a two-probe `--proof-group` move under one move id, no other session in it; a five-hour wait (`waited`, then `wait ended` with no `requested`, one "Continue where you stopped." delivered and answered, account unchanged, assumed refusal file removed). `accounts.py --detail status` lists each with its outcome. Each probe row leaves claude2's note and appears on claude1's, group roles stay unchanged, no account refusal is written, and `~/.claude/.credentials.json` is not written.
 - Unproven live, standing on tests: `/shutdown status` during the shutdown hold (the hold lasts about 17 s); the Codex workers move, its mid-turn continuation and a Codex five-hour wait; every credits-off path (the hold, the swap, the Claude switch, the routing outcomes), since no Codex account reached 0% weekly.
 - T0 = 2026-10-15 11:47 EDT. G3 opens the readout at T0 + 7 d, 2026-10-22 11:47 EDT.
@@ -2049,3 +2049,23 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Ruled out:** `HERDR_PLATFORM` on the run command — it takes precedence over test_restart's `_PLATFORM="darwin"` patches and breaks them.
 
 **Live check passed 2026-10-18:** the documented run command passed the nine suites on the Mac from a copy of main at ae28d4fd: 1054 tests OK in 194 s. Change-review row C51.
+
+### Phase 74 — The pick verb leaves the accounts command line  · status: done
+
+#### As-built
+
+- `accounts.py` has no `pick` verb; `accounts.py pick …` exits 2 with argparse's invalid-choice error. `/showrunner:accounts` lists no `pick`. The user asked for this through the showrunner (2026-10-18): they read `/showrunner:accounts` and never run `pick`.
+- `pick()`, `KeepAccount`, `PickedAccount`, `PickReason`, `no_room_line` and `_pick_explanation` stay. The automatic moves (`refusal_watch.py`), `placement --explain` and `quota_alert.py` call them.
+- `check_move_target` refuses a target that is out of usage with `accounts: <target> is out of usage (<window> <n>% left, resets <time>); <label> has room`. It gets `<label>` from `pick("claude", now, exclude={target}, keep=NoKeep())`. When no account has room, it ends with `no_room_line` (`no claude account has room; the earliest reset is <time>`).
+- `docs/accounts.md` "Picking an account" gives the ranking (soonest weekly reset, then most weekly room, then label) and points at `placement --explain` for each account's reason.
+
+**Files:**
+- `scripts/accounts/accounts.py` — no verb; the refusal names the account with room.
+- `scripts/accounts/test_accounts.py` — the picker tests call `pick()` directly; `test_pick_is_not_a_command`.
+- `scripts/shutdown/test_account_move.py` — both refusal texts, for a hand move and a group move.
+- `commands/showrunner/accounts.md`, `docs/accounts.md` — no verb; the new refusal text.
+
+**Gotchas:**
+- `test_launch_accounts.py`'s shell-launch guard still rejects `accounts.py pick` in a launcher script. It guards against the verb coming back, so it stays.
+- The refusal now runs the ranking. A defect in a candidate home that makes `pick()` raise changes the refusal into that error. The move is still refused.
+- C4 (0% means no room in pick) stays closed under the room-until-refusal rule. This phase did not change it.
