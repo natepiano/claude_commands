@@ -20,6 +20,7 @@ from unittest import mock
 
 import rules
 import style_ledger
+from approved_renames import AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
 import style_plan
 import style_rules
 import berth_board
@@ -260,6 +261,68 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIsInstance(built.state, style_ledger.Built)
         self.assertEqual(unbuilt.state, style_ledger.Filed(issue))
         self.assertIsInstance(unbuilt.build_ticket, style_ledger.NoBuildTicket)
+
+    def file_rename_finding(self) -> tuple[style_ledger.HeldFinding, Path]:
+        """A filed file rename of crates/alpha/src/ledger/lock.rs to mutation_lock.rs, and its decision."""
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")})))
+        rule = self.rule("file-rename")
+        self.write("crates/alpha/src/ledger/lock.rs", "pub struct MutationLock;\n")
+        _ = self.commit("Add the lock module")
+        ledger = self.ledger()
+        issue = self.root / "decision.md"
+        finding = ledger.hold(rule, "crates/alpha/src/ledger/lock.rs", 1, "pub struct MutationLock;", "rename",
+                              "The file contains MutationLock.",
+                              "Rename ledger/lock.rs to ledger/mutation_lock.rs; update ledger/mod.rs",
+                              self.blob(rule), "outside")
+        ledger.file_held(finding.finding_id, issue)
+        return finding, issue
+
+    def test_a_file_rename_check_reads_which_file_is_at_the_commit(self) -> None:
+        finding, _ = self.file_rename_finding()
+        old, new = "crates/alpha/src/ledger/lock.rs", "crates/alpha/src/ledger/mutation_lock.rs"
+        unapplied = self.git("rev-parse", "HEAD")
+        _ = self.git("mv", old, new)
+        applied = self.commit("Rename the lock module")
+        self.write(old, "pub struct MutationLock;\n")
+        both = self.commit("Copy the lock module back")
+        _ = self.git("rm", "-q", old, new)
+        neither = self.commit("Remove both files")
+        ledger = self.ledger()
+        self.assertEqual(ledger.applied_check(finding, unapplied), RenameNotApplied(old))
+        self.assertEqual(ledger.applied_check(finding, applied), AppliedInCode())
+        self.assertEqual(ledger.applied_check(finding, both), NoAppliedCheck("rename"))
+        self.assertEqual(ledger.applied_check(finding, neither), NoAppliedCheck("rename"))
+        # A commit git cannot read is an error, never a missing file.
+        with self.assertRaises(style_ledger.CheckCouldNotRun):
+            _ = ledger.applied_check(finding, "0" * 40)
+
+    def test_a_folder_at_the_commit_reads_as_a_folder(self) -> None:
+        self.write("ledger/lock/guard.rs", "pub struct Guard;\n")
+        commit = self.commit("Add the guard module")
+        self.assertEqual(self.ledger()._file_at(commit, "ledger/lock"), Folder())  # pyright: ignore[reportPrivateUsage]
+
+    def test_decision_merge_builds_a_file_rename_only_when_it_is_applied(self) -> None:
+        finding, issue = self.file_rename_finding()
+        ledger = self.ledger()
+        for ticket in ("names-1", "names-2"):
+            ledger.ticket_add(ticket, "names", "proposal", "names", "crates/alpha", [finding.path], [finding.rule],
+                              proposal=str(issue), finding_ids=(finding.finding_id,))
+            ledger.ticket_assign(ticket, "main")
+            if ticket == "names-2":
+                _ = self.git("mv", finding.path, "crates/alpha/src/ledger/mutation_lock.rs")
+                _ = self.commit("Rename the lock module")
+            checkpoint = self.git("rev-parse", "HEAD")
+            ledger.set_tip(checkpoint, "main")
+            ledger.ticket_checkpoint(ticket, checkpoint)
+            output = self.cli("ticket", "merge", "--id", ticket).stdout
+            held, = self.ledger().proposal_findings(issue)
+            if ticket == "names-1":
+                self.assertEqual(output, f"not built {finding.finding_id}: rename not applied in {finding.path}\n")
+                self.assertEqual(held.state, style_ledger.Filed(issue))
+                self.assertIsInstance(held.build_ticket, style_ledger.NoBuildTicket)
+            else:
+                self.assertEqual(output, "")
+                self.assertIsInstance(held.state, style_ledger.Built)
 
     def test_decision_merge_leaves_a_type_finding_filed_until_a_person_marks_it_built(self) -> None:
         rule, issue, _ = self.decision_findings()

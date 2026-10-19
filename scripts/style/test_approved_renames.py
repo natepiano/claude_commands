@@ -5,12 +5,21 @@ from __future__ import annotations
 import unittest
 
 import style_footprint
-from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, Declarations, NoAppliedCheck, RenameNotApplied,
-                              UncertainScan, applied_check, approved_rename, declaration_sites)
+from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, Declarations, FileReader, FileRename, Folder,
+                              MissingFile, NoAppliedCheck, NoFileRename, RenameNotApplied, UncertainScan, applied_check,
+                              approved_rename, declaration_sites, file_rename)
+
+
+def files(sources: dict[str, str]) -> FileReader:
+    def read(path: str) -> bytes | Folder | MissingFile:
+        if path in sources:
+            return sources[path].encode()
+        return Folder() if any(source.startswith(path + "/") for source in sources) else MissingFile()
+    return read
 
 
 def check(before: str, after: str, path: str, source: str) -> AppliedCheck:
-    return applied_check("rename", before, after, path, source.encode())
+    return applied_check("rename", before, after, path, files({path: source}))
 
 
 def sites(before: str, after: str, path: str, source: str, name: str) -> Declarations | UncertainScan:
@@ -161,9 +170,57 @@ class AppliedCheckTests(unittest.TestCase):
         self.assertEqual(check("b::Kind::Old", "b::Kind::New", "src/lib.rs", other_module), AppliedInCode())
 
     def test_a_finding_that_is_not_a_qualified_rename_has_no_check(self) -> None:
-        self.assertEqual(applied_check("type", "u32", "u64", "src/lib.rs", b"fn work() -> u64 { 1 }\n"),
+        self.assertEqual(applied_check("type", "u32", "u64", "src/lib.rs", files({"src/lib.rs": "fn work() -> u64 { 1 }\n"})),
                          NoAppliedCheck("type"))
         self.assertEqual(check("old_name", "new_name", "src/lib.rs", "fn new_name() {}\n"), NoAppliedCheck("rename"))
+
+
+class FileRenameTests(unittest.TestCase):
+    def test_a_file_rename_is_read_from_the_finding_path_and_the_paths_its_after_names(self) -> None:
+        path = "crates/cargo-berth/src/ledger/lock.rs"
+        accepted = (
+            ("Rename ledger/lock.rs to ledger/mutation_lock.rs; update ledger/mod.rs and all super::lock paths",
+             "crates/cargo-berth/src/ledger/mutation_lock.rs"),
+            ("Rename ledger/lock.rs to ledger/mutation_lock.rs (the type it holds).",
+             "crates/cargo-berth/src/ledger/mutation_lock.rs"),
+            ("Rename src/ledger/lock.rs to src/ledger/guard.rs.", "crates/cargo-berth/src/ledger/guard.rs"),
+            ("Rename lock.rs to guard.rs", "crates/cargo-berth/src/ledger/guard.rs"),
+            ("Rename ledger/lock.rs to ledger/mutation_lock.rs, update the mod and pub use",
+             "crates/cargo-berth/src/ledger/mutation_lock.rs"),
+        )
+        for after, new in accepted:
+            with self.subTest(after=after):
+                self.assertEqual(file_rename("rename", path, after), FileRename(path, new))
+        refused = (
+            ("rename", "Rename ledger/lock.rs to ledger/mutation_lock.rs", "src/other/lock.rs"),
+            ("rename", "Rename ledger/lock.rs to ledger/mutation_lock.rs", "src/my_ledger/lock.rs"),
+            ("type", "Rename ledger/lock.rs to ledger/mutation_lock.rs", path),
+            ("rename", "Move ledger/lock.rs to ledger/mutation_lock.rs", path),
+            ("rename", "Rename ledger/lock.rs to store/lock.rs", path),
+            ("rename", "Rename ledger/lock.rs to ledger/lock.rs", path),
+            ("rename", "Rename ledger/lock.rs to ledger/mod.rs", path),
+            ("rename", "Rename ledger/lock.rs to ledger/mutation_lock.rs.bak", path),
+            ("rename", "Rename ledger/lock.rs to ledger/1lock.rs", path),
+            ("rename", "Rename lock.rs to ../lock_guard.rs", path),
+            ("rename", "MutationLock::lock", path),
+            ("rename", "Rename ledger/lock.rs to ledger/mutation_lock.rs and move LockError into ledger/error.rs", path),
+            ("rename", "Rename ledger/lock.rs to ledger/mutation_lock.rs, ledger/guard.rs to ledger/mutation_guard.rs",
+             path),
+            ("rename", "Rename ledger/lock.rs to ledger/type.rs", path),
+            ("rename", "Rename ledger/type.rs to ledger/kind.rs", "crates/cargo-berth/src/ledger/type.rs"),
+        )
+        for kind, after, finding_path in refused:
+            with self.subTest(after=after, path=finding_path):
+                self.assertEqual(file_rename(kind, finding_path, after), NoFileRename())
+
+    def test_a_file_rename_with_a_folder_of_child_modules_has_no_check(self) -> None:
+        old, new = "src/ledger/lock.rs", "src/ledger/mutation_lock.rs"
+        after = "Rename ledger/lock.rs to ledger/mutation_lock.rs"
+        self.assertEqual(applied_check("rename", "", after, old, files({new: "mod guard;\n"})), AppliedInCode())
+        for folder in ("src/ledger/lock/guard.rs", "src/ledger/mutation_lock/guard.rs"):
+            with self.subTest(folder=folder):
+                self.assertEqual(applied_check("rename", "", after, old, files({new: "mod guard;\n", folder: ""})),
+                                 NoAppliedCheck("rename"))
 
 
 if __name__ == "__main__":

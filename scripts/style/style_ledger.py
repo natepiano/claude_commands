@@ -26,7 +26,7 @@ from typing import Literal, TypedDict, cast
 
 import rules as rule_catalog
 import style_rules
-from approved_renames import AppliedCheck, AppliedInCode, NoAppliedCheck, RenameNotApplied, applied_check
+from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
@@ -921,12 +921,22 @@ class Ledger:
             _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
 
     def applied_check(self, finding: HeldFinding, commit: str) -> AppliedCheck:
-        """Whether the finding's change is in its file at commit."""
-        # A file that is not at the commit declares neither name.
-        shown = subprocess.run(["git", "-C", str(self.repo), "show", f"{commit}:{finding.path}"],
-                               capture_output=True, check=False)
-        source = b"" if shown.returncode else shown.stdout
-        return applied_check(finding.kind, finding.before, finding.after, finding.path, source)
+        """Whether the finding's change is in the code at commit."""
+        return applied_check(finding.kind, finding.before, finding.after, finding.path,
+                             lambda path: self._file_at(commit, path))
+
+    def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
+        """What is at path in commit: a file's bytes, a folder or nothing. A git error raises, so it never reads as nothing."""
+        entry = _git(self.repo, "ls-tree", commit, "--", path)
+        if not entry:
+            return MissingFile()
+        # An entry reads `<mode> <type> <object>\t<path>`.
+        if entry.split()[1] == "tree":
+            return Folder()
+        shown = subprocess.run(["git", "-C", str(self.repo), "show", f"{commit}:{path}"], capture_output=True, check=False)
+        if shown.returncode:
+            raise CheckCouldNotRun(shown.stderr.decode(errors="replace").strip() or f"git show {commit}:{path} failed")
+        return shown.stdout
 
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> tuple[FindingNotBuilt, ...]:
         """Move the ticket to target. A proposal merge returns each of its findings that stays filed."""
