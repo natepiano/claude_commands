@@ -3846,7 +3846,7 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
     phase_id = _string(phase.get("id")) if phase is not None else ""
     order = counts.get("order")
     if (phase is None or phase_id in ("", "ad hoc") or not isinstance(order, list)
-            or phase_id in order or _run_plan_path(state) != counted):
+            or _run_plan_path(state) != counted or _plan_lists_phase(counted, phase_id)):
         return counts
     finished = _string(phase.get("status")) == "completed"
     done, todo = _integer(counts.get("done")), _integer(counts.get("todo"))
@@ -3859,13 +3859,23 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
     }
 
 
+def _plan_lists_phase(plan: Path, phase_id: str) -> bool:
+    """Whether a heading names `phase_id` by its number or, as a standing plan writes
+    `### Phase 201 — types-unit-201`, by the first word of its title."""
+    try:
+        phases, _ = plan_history.plan_phase_details(plan)
+    except OSError:
+        return False
+    return any(phase_id in (phase["id"], *phase["title"].split()[:1]) for phase in phases)
+
+
 def _phase_missing_from_plan(state: dict[str, object], phase_id: str) -> Path | None:
     """The run's plan when it lists phases and none of them is `phase_id`."""
     plan = _run_plan_path(state)
     if plan is None or phase_id == "ad hoc":
         return None
-    order = _count_plan_phases(plan).get("order")
-    return plan if isinstance(order, list) and phase_id not in order else None
+    listed = _count_plan_phases(plan).get("available") is not True or _plan_lists_phase(plan, phase_id)
+    return None if listed else plan
 
 
 def _reported_window(

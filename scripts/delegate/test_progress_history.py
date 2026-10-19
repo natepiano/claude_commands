@@ -4303,6 +4303,24 @@ print('two homes isolated; recorder lock retained; caller restored')
         ))
         self.assertIsNone(state["phase"])
 
+    def test_start_phase_finds_a_standing_plan_phase_by_its_title_id(self) -> None:
+        session_dir = self.start_run("standing", 0)
+        plan_path = self.working_dir / "docs" / "standing.md"
+        # style_plan.py next-phase writes the ticket id as the title, not the number.
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8") + "### Phase 201 — types-unit-201  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "types-unit-201",
+            "--phase-title", "types-unit-201", at=70_000,
+        )
+        state = cast(dict[str, object], json.loads(
+            (session_dir / "progress_history_state.json").read_text(encoding="utf-8")
+        ))
+        phase = cast(dict[str, object], state["phase"])
+        self.assertEqual(phase["id"], "types-unit-201")
+
     def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,
     ) -> None:
