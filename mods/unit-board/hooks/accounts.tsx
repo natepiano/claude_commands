@@ -1,5 +1,6 @@
 import type { PaneElements } from './board';
 import type { StoredAccount, StoredAccountsStatus } from '../types/accounts';
+import { cellWidth } from './geometry';
 
 export type AccountReading<Value> = { kind: 'available'; value: Value } | { kind: 'unavailable' };
 export type CreditBalance = { kind: 'finite'; amount: number } | { kind: 'unlimited' } | { kind: 'unavailable' };
@@ -12,6 +13,20 @@ export interface AccountDisplay {
   credits: CreditBalance;
   onCredits: boolean;
   read: AccountReading<string>;
+}
+
+export interface AccountsTable {
+  headings: string[];
+  rows: string[][];
+  widths: number[];
+  width: number;
+}
+
+type LeftTone = 'error' | 'warning' | 'normal';
+
+function leftTone(weekly: AccountReading<number>): LeftTone {
+  if (weekly.kind === 'unavailable') return 'normal';
+  return weekly.value < 10 ? 'error' : weekly.value < 25 ? 'warning' : 'normal';
 }
 
 function reading<Value>(value: Value | null | undefined): AccountReading<Value> {
@@ -29,39 +44,45 @@ export function accountDisplay(account: StoredAccount): AccountDisplay {
 }
 
 function dateText(value: AccountReading<string>, zone: string): string {
-  if (value.kind === 'unavailable') return 'unavailable';
+  if (value.kind === 'unavailable') return '—';
   const date = new Date(value.value);
-  if (!Number.isFinite(date.getTime())) return 'unavailable';
+  if (!Number.isFinite(date.getTime())) return '—';
   return new Intl.DateTimeFormat('en-US', {
-    timeZone: zone, weekday: 'short', month: 'short', day: '2-digit',
+    timeZone: zone, month: 'short', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).format(date);
+  }).format(date).replace(/,/g, '');
+}
+
+export function accountsTable(rows: AccountDisplay[], zone: string): AccountsTable {
+  const headings = ['Label', 'Login', 'Roles', 'Left', 'Resets', 'Credits', 'Read'];
+  const cells = rows.map(row => [row.label,
+    row.login.kind === 'available' ? row.login.value : '—', row.roles.join(', '),
+    row.weekly.kind === 'available' ? `${Math.round(row.weekly.value)}%` : '—',
+    dateText(row.resets, zone),
+    row.credits.kind === 'unavailable' ? '—'
+      : `${row.credits.kind === 'finite' ? row.credits.amount : 'unlimited'}${row.onCredits ? ' in use' : ''}`,
+    dateText(row.read, zone)]);
+  const widths = headings.map((heading, index) => Math.max(cellWidth(heading), ...cells.map(row => cellWidth(row[index]!))));
+  const width = widths.reduce((total, column) => total + column, 0) + 2 * (headings.length - 1);
+  return { headings, rows: cells, widths, width };
 }
 
 export function AccountsView(elements: PaneElements, status: StoredAccountsStatus, zone: string) {
   const { Box, Text } = elements;
   const rows = status.accounts.map(accountDisplay);
   const assignments = (...roles: string[]) => rows.filter(row => roles.some(role => row.roles.includes(role))).map(row => row.label).join(', ') || 'unassigned';
-  const headings = ['Label', 'Login', 'Roles', 'Weekly left', 'Weekly resets', 'On credits', 'Credits left', 'Read'];
-  const contents = rows.map(row => [row.label,
-    row.login.kind === 'available' ? row.login.value : 'unavailable', row.roles.join(', '),
-    row.weekly.kind === 'available' ? `${Math.round(row.weekly.value)}%` : 'unavailable',
-    dateText(row.resets, zone), row.onCredits ? 'yes' : 'no',
-    row.credits.kind === 'finite' ? String(row.credits.amount) : row.credits.kind,
-    dateText(row.read, zone)]);
-  const widths = headings.map((heading, index) => Math.max(heading.length, ...contents.map(row => row[index]!.length)));
-  const line = (cells: string[]) => cells.map((cell, index) => cell.padEnd(widths[index]!)).join('  ');
+  const table = accountsTable(rows, zone);
+  const line = (cells: string[]) => cells.map((cell, index) => index < cells.length - 1
+    ? cell + ' '.repeat(table.widths[index]! - cellWidth(cell)) : cell).join('  ');
   return <Box flexDirection="column">
     <Text bold>units: {assignments('units', 'unit directors')}, showrunners: {assignments('showrunners')}</Text>
     <Box flexDirection="column" marginTop={1}>
-      <Text bold>{line(headings)}</Text>
-      {contents.map((cells, index) => {
-        const weekly = rows[index]!.weekly;
-        const tone = weekly.kind === 'available' && weekly.value < 10 ? 'error'
-          : weekly.kind === 'available' && weekly.value < 25 ? 'warning' : 'subtle';
+      <Text bold>{line(table.headings)}</Text>
+      {table.rows.map((cells, index) => {
+        const tone = leftTone(rows[index]!.weekly);
         return <Text wrap="wrap">{cells.map((cell, column) => [
-          <Text color={column === 3 ? tone : 'subtle'}>{cell}</Text>,
-          <Text>{' '.repeat(widths[column]! - cell.length)}{column < cells.length - 1 ? '  ' : ''}</Text>,
+          column === 3 && tone !== 'normal' ? <Text color={tone}>{cell}</Text> : <Text>{cell}</Text>,
+          column < cells.length - 1 ? <Text>{' '.repeat(table.widths[column]! - cellWidth(cell))}{'  '}</Text> : null,
         ])}</Text>;
       })}
     </Box>
