@@ -96,16 +96,21 @@ describe("unit board commands and lifetime", () => {
       const ui = await mount($, surface);
       let text = drawnText(await ui.drawn());
       expect(text).toContain("show");
-      expect(text).toMatch(/as of\s+18:00/);
+      expect(text).toMatch(/as of\s+14:00/);
       expect(text).toContain("alpha");
-      expect(text).toContain("18:42");
+      expect(text).toContain("run ends 14:42");
+      expect(text).toContain("ETA 14:30 · in 30m");
+      expect(text).not.toContain("first 17:15");
+      expect(text).not.toContain("moved 2×");
+      expect(text).not.toContain("+1:15 late");
+      expect(text).not.toContain("│");
+      expect(text).toContain("1 + 1 running");
+      await press(ui, "alpha");
+      text = drawnText(await ui.drawn());
+      expect(text).toContain("Finishing the retry path");
       expect(text).toContain("first 17:15");
       expect(text).toContain("moved 2×");
       expect(text).toContain("+1:15 late");
-      expect(text).toContain("1 + 1 running");
-      await press(ui, "open");
-      text = drawnText(await ui.drawn());
-      expect(text).toContain("Finishing the retry path");
       expect(text).toContain("17:15 said 16:30");
       expect(text).toContain("Check retry path");
       expect(text).toContain("Fixing the retry case");
@@ -153,7 +158,7 @@ describe("unit board commands and lifetime", () => {
       expect(text).toContain("show");
       expect(text).toContain("second");
       expect(text).not.toContain("Finishing the retry path");
-      expect((await ui.findAll({ type: "Button" })).map(button => button.text)).toEqual(["open", "open"]);
+      expect((await ui.findAll({ type: "Button" })).map(button => button.text)).toEqual(["alpha", "alpha"]);
     });
   }
 
@@ -282,9 +287,11 @@ describe("unit board commands and lifetime", () => {
     await fake.clock.advance(2 * 60_000);
     const after = drawnText(await ui.drawn());
     expect(after).not.toBe(before);
-    expect(after).toContain("14:31");
-    expect(after).toContain("18:30");
-    expect(after).toMatch(/as of\s+18:00/);
+    expect(before).toContain("ETA 14:30 · in 1m");
+    expect(after).toContain("ETA 14:30 · late 1m");
+    expect(after).toMatch(/1 late/);
+    expect(after).toMatch(/as of\s+14:00/);
+    expect(after).not.toContain("│");
     expect(fake.processes).toEqual([]);
     expect(fake.reads).toEqual([]);
     expect(fake.stats).toContain(RUN);
@@ -336,10 +343,12 @@ describe("unit board commands and lifetime", () => {
       await $.command.run(command());
       const ui = await mount($, "desktop");
       const text = drawnText(await ui.drawn());
-      if (kind === "none") expect(text).not.toContain("gated");
+      if (kind === "none") expect(text).not.toContain("waits on G3");
       else {
-        expect(text).toContain(kind === "timed" ? "gated until Wed 22 Oct 11:47" : "gated by G3");
-        expect(text).toContain("renderer review");
+        expect(text).toContain(kind === "timed"
+          ? "Phase 3 waits on G3 until 16:00: renderer review"
+          : "Phase 3 waits on G3: renderer review");
+        expect(text).not.toContain("Wed 22 Oct 11:47");
       }
       await $.command.run(command("close"));
       await ui.unmount();
@@ -352,9 +361,9 @@ describe("unit board commands and lifetime", () => {
       await $.command.run(command());
       const ui = await mount($, "terminal");
       const text = drawnText(await ui.drawn());
-      if (kind === "unknown") expect(text).not.toContain("done by");
-      else expect(text).toContain(kind === "predicted" ? "done by 19:10"
-        : kind === "finished" ? "finished 19:10" : "after G3");
+      if (kind === "unknown") expect(text).not.toMatch(/run ends|run ended/);
+      else expect(text).toContain(kind === "predicted" ? "run ends 15:10"
+        : kind === "finished" ? "run ended 15:10" : "run ends after G3");
       await $.command.run(command("close"));
       await ui.unmount();
     }
@@ -407,7 +416,7 @@ describe("unit board commands and lifetime", () => {
       expect(text).toContain("second");
       expect(text).not.toContain("Second namesake");
       const buttons = await ui.findAll({ type: "Button" });
-      expect(buttons.some(button => button.text === "open")).toBe(true);
+      expect(buttons.some(button => button.text === "alpha")).toBe(true);
     });
   }
 
@@ -485,7 +494,7 @@ describe("unit board commands and lifetime", () => {
     expect(fake.processes.length).toBe(1);
   });
 
-  test("board workers are counted by role and state while the unit retains individual rows", async ($, on) => {
+  test("board workers are counted by state while the unit retains roles and individual rows", async ($, on) => {
     const fake = engineFiles(on);
     const data = fixture();
     const worker = data.units[0]!.workers[0]!;
@@ -496,12 +505,17 @@ describe("unit board commands and lifetime", () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($, "terminal");
-    expect(drawnText(await ui.drawn())).toContain("1 fix running · 2 review idle · 1 fix idle");
-    await press(ui, "open");
+    const board = drawnText(await ui.drawn()).replace(/\s+/g, " ");
+    expect(board).toContain("workers 1 running · 3 idle");
+    expect(board).not.toContain("review");
+    expect(board).not.toContain("fix running");
+    await press(ui, "alpha");
     const text = drawnText(await ui.drawn());
     expect(text).toContain("Review worker two");
     expect(text).toContain("Review worker three");
     expect(text).toContain("Idle repair worker");
+    expect(text).toContain("review");
+    expect(text).toContain("fix");
   });
 
 });

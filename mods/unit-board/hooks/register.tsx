@@ -259,7 +259,7 @@ export const register: Register = on => {
     const state = (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined;
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (!state || state.kind === 'loading') return <Text color="subtle">Loading accounts…</Text>;
+    if (!state || state.kind === 'loading') return <Text color="inactive">Loading accounts…</Text>;
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
     return AccountsView(elements, state.data, state.zone);
   });
@@ -267,7 +267,7 @@ export const register: Register = on => {
     const state = await readPane($, PANE);
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (!state || state.kind === 'loading') return <Text color="subtle">Loading unit board…</Text>;
+    if (!state || state.kind === 'loading') return <Text color="inactive">Loading unit board…</Text>;
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
     if (state.kind === 'unit') {
       const data = state.data.boards.find(board => board.production === state.production);
