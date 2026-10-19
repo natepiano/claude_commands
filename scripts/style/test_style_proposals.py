@@ -335,6 +335,40 @@ class StyleProposalsTests(unittest.TestCase):
         return [line for line in output.getvalue().splitlines()
                 if line.split(" ", 1)[0] in {"kept", "refused", "create", "move", "waive", "reopen", "close", "totals:"}]
 
+    def off_rule_folder(self, ledger: style_ledger.Ledger) -> tuple[Path, Path]:
+        """A decision, an old style issue, an off-rule issue and an issue from another proposer."""
+        decision, = self.file(ledger)
+        legacy = self.legacy_issue(ledger, "old", self.hold(ledger, line=2))
+        off_rule = self.proposals / "tidy names.md"
+        _ = off_rule.write_text('---\nproposed_by: "types-unit (sample-style)"\nstatus: open\ntags: [issue]\n---\n# Tidy names\n')
+        _ = (self.proposals / "other.md").write_text(off_rule.read_text().replace("sample-style", "other-style"))
+        self.assertEqual(frontmatter(decision)["proposed_by"], ["sample-style"])
+        return legacy, off_rule
+
+    def skipped_lines(self, ledger: style_ledger.Ledger, *, dry_run: bool) -> list[str]:
+        with redirect_stdout(io.StringIO()) as output:
+            style_proposals.migrate(ledger, self.proposals, "parent", dry_run=dry_run)
+        lines = output.getvalue().splitlines()
+        return [line for line in lines if line.startswith("skipped:")] + [lines[-1].rsplit(", ", 1)[1]]
+
+    def test_migration_moves_an_old_issue_and_lists_an_off_rule_issue_without_writing_it(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            legacy, off_rule = self.off_rule_folder(ledger)
+            before = off_rule.read_bytes()
+            self.assertEqual(self.skipped_lines(ledger, dry_run=False), [f"skipped: off-rule {off_rule}", "off-rule 1"])
+            self.assertEqual(frontmatter(legacy)["status"], ["closed"])
+            self.assertEqual(off_rule.read_bytes(), before)
+            self.assertEqual([call for call in self.calls if str(off_rule) in call], [])
+
+    def test_migration_dry_run_lists_the_same_off_rule_issues(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            _, off_rule = self.off_rule_folder(ledger)
+            before = {path: path.read_bytes() for path in self.proposals.glob("*.md")}
+            self.assertEqual(self.skipped_lines(ledger, dry_run=True), [f"skipped: off-rule {off_rule}", "off-rule 1"])
+            self.assertEqual({path: path.read_bytes() for path in self.proposals.glob("*.md")}, before)
+
     def test_migration_takes_only_findings_filed_to_the_issue(self) -> None:
         with self.ledger() as ledger:
             owned, elsewhere, waived = self.hold(ledger), self.hold(ledger, line=2), self.hold(ledger, line=3)
@@ -354,7 +388,7 @@ class StyleProposalsTests(unittest.TestCase):
                 f"kept {waived.finding_id}: waived, not filed to {old}",
                 f"create {decision}", f"move 1 findings to {decision}",
                 f"close {empty}: no filed findings", f"close {old}: merged into {decision.name}",
-                "totals: create 1, move 1, close 2",
+                "totals: create 1, move 1, close 2, off-rule 0",
             ]
             before = {path: path.read_bytes() for path in self.proposals.glob("*.md")}
             self.assertEqual(self.migration_lines(ledger, dry_run=True), expected)
@@ -378,7 +412,7 @@ class StyleProposalsTests(unittest.TestCase):
                 _ = connection.execute("UPDATE held_findings SET build_ticket=''")
             before = old.read_bytes()
             self.assertEqual(self.migration_lines(ledger, dry_run=False),
-                             [f"refused {old}: live build ticket names-unit-1 (queued)", "totals: create 0, move 0, close 0"])
+                             [f"refused {old}: live build ticket names-unit-1 (queued)", "totals: create 0, move 0, close 0, off-rule 0"])
             self.assertEqual(old.read_bytes(), before)
             self.assertEqual(ledger.proposal_findings(old)[0].finding_id, finding.finding_id)
 
@@ -414,7 +448,7 @@ class StyleProposalsTests(unittest.TestCase):
             later = self.hold(ledger, line=2)
             old = self.legacy_issue(ledger, "old", later)
             expected = [f"move 1 findings to {decision}", f"waive 1 findings in {decision}: declined: No",
-                        f"close {old}: merged into {decision.name}", "totals: create 0, move 1, close 1"]
+                        f"close {old}: merged into {decision.name}", "totals: create 0, move 1, close 1, off-rule 0"]
             self.assertEqual(self.migration_lines(ledger, dry_run=True), expected)
             self.assertEqual(self.migration_lines(ledger, dry_run=False), expected)
             moved = next(item for item in ledger.proposal_findings(decision) if item.finding_id == later.finding_id)
