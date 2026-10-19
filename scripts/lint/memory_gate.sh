@@ -38,6 +38,8 @@ build_hold_mark() {
     [[ -f "$holder" ]] || return 0
     local arguments=(mark --state "$1") cycle_id="" generation=""
     if [[ -n "${2:-}" ]]; then arguments+=(--outcome "$2"); fi
+    # An app launch is no build: it never ends a turn a queued run holds.
+    if [[ "${3:-}" == launch ]]; then arguments+=(--launch); fi
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
         arguments+=(--call-id "$BUILDLOG_CALL_ID")
         if [[ -n "${BUILDLOG_HOLD_ADMISSION_FILE:-}" && -r "$BUILDLOG_HOLD_ADMISSION_FILE" ]]; then
@@ -67,8 +69,11 @@ build_hold_nothing_held() {
 build_hold_wait_local() {
     [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
     if build_hold_nothing_held; then return 0; fi
-    local waiter_pid status=0
-    python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}" &
+    local waiter_pid status=0 arguments=(wait-local --call-id "$BUILDLOG_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}")
+    # A held natedev cannot start the step, so the leave hook also runs here:
+    # status 75 (LINT_LEFT_QUEUE_STATUS) means another machine is free.
+    if [[ -n "${LINT_QUEUE_LEAVE_HOOK:-}" ]]; then arguments+=(--leave-hook "$LINT_QUEUE_LEAVE_HOOK"); fi
+    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}" &
     waiter_pid=$!
     wait "$waiter_pid" || status=$?
     return "$status"

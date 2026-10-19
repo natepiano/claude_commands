@@ -10,17 +10,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownTestCase
-from test_restart import pane_display, top_level
+from test_support import ShutdownTestCase, linux_process_fixture
+from test_restart import entry, top_level
+import record
 import inventory
+import conversation_pause
+import unit_runs
 import account
-import fake_tmux
 import herdr
 import sessions
 import showrunners
@@ -28,7 +32,7 @@ import unit_lookup
 import restart
 import shutdown
 import stop
-from fake_tmux import FakeSession
+from fake_herdr import CommandResponse, herdr_listener
 
 
 TARGET_LOGIN = "owner@example.com"
@@ -47,7 +51,6 @@ UNKNOWN_PID = 41_006
 DIRECTOR_SHELL_PID = 51_001
 DESKTOP_SHELL_PID = 51_004
 CURRENT_PROCESS_START = "current-process-start"
-FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
 class TranscriptReadCounter(io.BufferedReader):
@@ -72,6 +75,74 @@ class TranscriptReadCounter(io.BufferedReader):
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
+        run = self.root / "paused run"
+        run.mkdir()
+        command = ["bash", "/config/scripts/delegate/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/delegate/implement.sh", "outer arguments"]
+        self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
+        self.herdr_process(811, 812, command, {})
+        self.herdr_process(812, 1, outer, {})
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "busy": {"role": "review", "thread_id": "busy-thread", "turn_id": "turn", "status": "running", "launcher_pid": 810},
+            "idle": {"role": "impl", "thread_id": "idle-thread", "status": "done"},
+            "orphan": {"role": "impl", "thread_id": "orphan-thread", "status": "starting", "launcher_pid": 99999999},
+            "ended": {"role": "impl", "thread_id": "ended-thread", "status": "ended"},
+        }))
+        def launcher_alive(pid: int) -> bool:
+            return pid in {810, 811, 812}
+
+        with patch.object(inventory, "_pid_alive", side_effect=launcher_alive):
+            found = inventory.codex_seats([run])
+        seats = {seat["seat"]: seat for seat in found}
+        self.assertEqual(set(seats), {"busy", "idle", "orphan"})
+        self.assertEqual(seats["busy"], record.PausedSeat(run_dir=str(run), seat="busy", role="review", thread_id="busy-thread", turn_live=True, launcher_command=command))
+        self.assertEqual(seats["idle"], record.PausedSeat(run_dir=str(run), seat="idle", role="impl", thread_id="idle-thread", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["orphan"]["launcher_command"], [])
+
+    def test_old_shutdown_record_reads_back_without_codex_seats_and_new_seats_survive_wire_roundtrip(self) -> None:
+        saved = entry(top_level("legacy-director"))
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        _ = document.pop("codex_seats", None)
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertNotIn("codex_seats", parsed)
+        seats = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="thread-kept", turn_live=True, launcher_command=["bash", "/scripts/implement.sh", "argument with spaces"])]
+        document["codex_seats"] = seats
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed.get("codex_seats"), seats)
+        document["codex_seats"] = [{**seats[0], "turn_live": "true"}]
+        with self.assertRaisesRegex(record.InvalidRecord, "turn_live"):
+            _ = record.parse_session_records(json.dumps([document]))
+
+    def test_updated_at_preserves_registry_milliseconds_through_inventory_wire_parse(self) -> None:
+        timestamp = 1_791_563_350_123
+        self.write_session(DESKTOP_PID, DESKTOP_ID, "notes", self.root / "plain", updated_at=timestamp)
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual(found["sessions"][0]["updated_at"], timestamp)
+        decoded = inventory.parse_inventory(json.dumps(found))
+        self.assertEqual(decoded["sessions"][0]["updated_at"], timestamp)
+
+    def test_updated_at_is_required_and_must_be_an_integer_in_fresh_inventory(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        values = cast(dict[str, object], cast(object, found["sessions"][0]))
+        for invalid in (True, 12.5, "123", None):
+            with self.subTest(updated_at=invalid):
+                values["updated_at"] = invalid
+                with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
+                    _ = inventory.parse_inventory(json.dumps(found))
+        del values["updated_at"]
+        with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
+            _ = inventory.parse_inventory(json.dumps(found))
+
+    def test_shutdown_record_without_updated_at_remains_readable(self) -> None:
+        saved = entry(top_level("legacy-owner"))
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        owner = cast(dict[str, object], document["session"])
+        del owner["updated_at"]
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed["session"]["updated_at"], 0)
+        self.assertEqual(parsed["session"]["session_id"], "legacy-owner")
+
     def test_last_model_skips_trailing_metadata_and_invalid_json(self) -> None:
         transcript = self.root / "metadata.jsonl"
         entries: list[dict[str, object]] = [
@@ -86,6 +157,20 @@ class InventoryTests(ShutdownTestCase):
             with self.subTest(ending=repr(ending)):
                 _ = transcript.write_text(contents + "\nmalformed-json" + ending, encoding="utf-8")
                 self.assertEqual(inventory.last_model(transcript), "latest-model")
+
+    def test_run_markers_under_either_folder_name_map_their_directors(self) -> None:
+        for name in ("unit", "delegate"):
+            (self.root / name / "active").mkdir(parents=True, exist_ok=True)
+            _ = (self.root / name / "active" / f"{name}-director").write_text(f"/runs/{name}\n", encoding="utf-8")
+        environment = {key: value for key, value in os.environ.items() if key != "SHUTDOWN_DELEGATE_ROOT"}
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(unit_runs, "RUN_ROOT", self.root / "unit"), \
+                patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"):
+            found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(
+            (found.get("unit-director"), found.get("delegate-director")),
+            ([Path("/runs/unit")], [Path("/runs/delegate")]),
+        )
 
     def test_last_model_reassembles_lines_across_tail_blocks(self) -> None:
         transcript = self.root / "split-line.jsonl"
@@ -136,7 +221,7 @@ class InventoryTests(ShutdownTestCase):
                     )
                     self.assertEqual({session["session_id"] for session in found["sessions"]}, expected)
                     for session in found["sessions"]:
-                        if session["kind"] == "seat":
+                        if session["kind"] == "worker":
                             self.assertEqual(session["owner"], {"kind": "director", "session_id": DIRECTOR_ID})
 
     def test_inventory_only_builds_expensive_fields_for_selected_ids(self) -> None:
@@ -178,6 +263,29 @@ class InventoryTests(ShutdownTestCase):
                     self.assertEqual(light.production, session["host"]["production"])
                     self.assertEqual(light.doc, session["host"]["doc"])
 
+    def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
+        stale = self.notifier / "showrunner-stale"
+        stale.mkdir()
+        stale_doc = self.root / "stale-production.md"
+        _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
+        _ = (stale / "conf").write_text(
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            encoding="utf-8")
+        with (patch.object(showrunners, "socket_for", side_effect=AssertionError("listing probed a messaging socket")),
+              patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
+              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked):
+            registrations = inventory.showrunner_registrations()
+            listed = inventory.listing(registrations=registrations)
+            missing = inventory.unregistered_showrunners(listed, registrations=registrations)
+        self.assertEqual(checked.call_count, 2, "membership and missing-target check must share the timer read")
+        director = next(item for item in listed if item.session_id == DIRECTOR_ID)
+        self.assertEqual((director.kind, director.production, director.doc),
+            ("showrunner", "build-followups", str(self.root / "build-followups-production.md")))
+        unit = next(item for item in listed if item.session_id == UNIT_ID)
+        self.assertEqual((unit.kind, unit.production, unit.doc),
+            ("unit", "build-followups", director.doc))
+        self.assertEqual([(runner["slug"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
+
     def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
         for path in self.records.glob("*.json"):
             path.unlink()
@@ -191,7 +299,7 @@ class InventoryTests(ShutdownTestCase):
                 _ = stream.write(padding)
             _ = stream.write(b'{"type":"assistant","message":{"model":"large-file-model"}}\n')
             _ = stream.write(b'{"type":"last-prompt","content":"after the reply"}\n')
-        with patch.object(account, "process_config_dir", return_value=self.target_config):
+        with patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.target_config)):
             listed = inventory.listing(TARGET_LOGIN)
         self.assertEqual({session.session_id for session in listed}, identities)
         self.assertGreaterEqual(transcript.stat().st_size, 50 * 1024 * 1024)
@@ -230,8 +338,8 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(inventory.last_model(transcript), "claude-opus-real")
         self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
         owner = top_level("refused", model=model)
-        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
-        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude 3"))
+        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude3"))
+        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude3"))
 
     def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
         transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
@@ -251,7 +359,6 @@ class InventoryTests(ShutdownTestCase):
         self.checkout = Path()
         self.origin = Path()
         self.bin = Path()
-        self.tmux_state = Path()
         self.proc = Path()
         self.herdr_log = Path()
         self.target_config = Path()
@@ -263,7 +370,8 @@ class InventoryTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        linux_process_fixture(self)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home"
         self.notes = self.root / "agents"
         self.records = self.root / "sessions"
@@ -273,7 +381,6 @@ class InventoryTests(ShutdownTestCase):
         self.checkout = self.root / "checkout"
         self.origin = self.root / "origin.git"
         self.bin = self.root / "bin"
-        self.tmux_state = self.root / "tmux.json"
         self.proc = self.root / "proc"
         self.herdr_log = self.root / "herdr.jsonl"
         responses = self.root / "herdr-responses.json"
@@ -303,10 +410,9 @@ class InventoryTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.history),
             "SHUTDOWN_DELEGATE_ROOT": str(self.delegate),
-            "UNIT_LOOKUP_TMUX": str(FAKE_TMUX),
-            "FAKE_TMUX_STATE": str(self.tmux_state),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
             "HERDR_PROC": str(self.proc),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
             "FAKE_HERDR_LOG": str(self.herdr_log),
             "FAKE_HERDR_RESPONSES": str(responses),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -347,8 +453,8 @@ class InventoryTests(ShutdownTestCase):
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
-        _ = (self.notes / "claude 2.md").write_text(
-            f"---\nlogin: {TARGET_LOGIN.upper()}\nstate: active\n---\n",
+        _ = (self.notes / "claude2.md").write_text(
+            f"---\nlogin: {TARGET_LOGIN.upper()}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         config_by_pid: dict[int, Path | None] = {
@@ -359,8 +465,9 @@ class InventoryTests(ShutdownTestCase):
             OTHER_PID: self.other_config,
             UNKNOWN_PID: None,
         }
-        def config_dir_for_pid(pid: int) -> Path | None:
-            return config_by_pid.get(pid)
+        def config_dir_for_pid(pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
+            directory = config_by_pid.get(pid)
+            return account.ConfiguredClaudeFolder(directory) if directory is not None else account.ProcessEnvironmentUnread("unreadable")
 
         _account_context: object = self.enterContext(
             patch.object(
@@ -387,13 +494,24 @@ class InventoryTests(ShutdownTestCase):
 
     def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
         process = self.proc / str(pid)
-        process.mkdir()
+        process.mkdir(exist_ok=True)
         _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
         _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         _ = (process / "environ").write_bytes(
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
         )
+        (process / "cwd").unlink(missing_ok=True)
         (process / "cwd").symlink_to(self.checkout)
+        if arguments and Path(arguments[0]).name == "herdr" and arguments[-1] == "server":
+            name = arguments[arguments.index("--session") + 1] if "--session" in arguments else "default"
+            config = self.home / ".config/herdr"
+            directory = config if name == "default" else config / "sessions" / name
+            sockets = self.proc / "net/unix"
+            sockets.parent.mkdir(exist_ok=True)
+            previous = sockets.read_text() if sockets.exists() else ""
+            _ = sockets.write_text(previous + f"000: 00000002 00000000 00010000 0001 01 {pid} {directory}/herdr.sock\n")
+            (process / "fd").mkdir()
+            (process / "fd/3").symlink_to(f"socket:[{pid}]")
 
     def herdr_sessions(self, names: list[str]) -> None:
         entries = [herdr.SessionEntry(name=name, running=True, default=False,
@@ -428,6 +546,10 @@ class InventoryTests(ShutdownTestCase):
             )
             _ = self.git("add", f"ahead-{number}.txt")
             _ = self.git("commit", "-m", f"ahead {number}")
+        # A snapshot commit is pushed by its own job, so the ahead count leaves it out.
+        _ = (self.checkout / "snapshot.md").write_text("sessions\n", encoding="utf-8")
+        _ = self.git("add", "snapshot.md")
+        _ = self.git("commit", "-m", "agent-sessions-snapshot: update agent sessions")
         _ = (self.checkout / "dirty.txt").write_text("changed\n", encoding="utf-8")
         self.head = self.git("rev-parse", "HEAD")
 
@@ -571,19 +693,12 @@ elif "comm=" in joined:
         other_timer.mkdir()
         _ = (other_timer / "conf").write_text(f"TARGET=session:{OTHER_ID}\n", encoding="utf-8")
 
-        fake_tmux.write(
-            self.tmux_state,
-            {
-                "$1": FakeSession(
-                    label="unit-renamed",
-                    panes=["%4"],
-                    env={
-                        "SHOWRUNNER_UNIT": "build-followups",
-                        "SHOWRUNNER_UNIT_ID": "shutdown-unit",
-                    },
-                )
-            },
-        )
+        self.herdr_sessions(["unit-renamed"])
+        self.herdr_process(72_001, 1, ["/fixture/herdr", "--session", "unit-renamed", "server"], {})
+        self.herdr_process(UNIT_PID, 72_001, ["/bin/claude"], {
+            "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
+            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+        })
         for name, started_at, plan in (
             ("newer", 20, "docs/shutdown-plan.md"),
             ("older", 10, "docs/old-plan.md"),
@@ -661,7 +776,7 @@ elif "comm=" in joined:
         found = inventory.inventory(TARGET_LOGIN)
 
         self.assertEqual(found["login"], TARGET_LOGIN)
-        self.assertEqual(found["label"], "claude 2")
+        self.assertEqual(found["label"], "claude2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         self.assertTrue(
@@ -722,7 +837,7 @@ elif "comm=" in joined:
                 "doc": str(self.root / "build-followups-production.md"),
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
                 "session_name": "unit-renamed",
-                "session_host": "tmux",
+                "session_host": "herdr",
             },
         )
         self.assertEqual(
@@ -736,8 +851,8 @@ elif "comm=" in joined:
             },
         )
 
-        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
-        self.assertEqual(worker["kind"], "seat")
+        worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
+        self.assertEqual(worker["kind"], "worker")
         self.assertEqual(
             worker["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
         )
@@ -748,6 +863,7 @@ elif "comm=" in joined:
                 "kind": "ghostty",
                 "desktop": {"kind": "named", "name": "Writing"},
                 "window_shell": DESKTOP_SHELL_PID,
+                "supervisor": {"kind": "no supervisor"},
             },
         )
 
@@ -769,21 +885,7 @@ elif "comm=" in joined:
             {"kind": "named", "name": "Production"},
         )
 
-    def test_unit_host_carries_live_tmux_session_name(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
 
-        self.assertEqual(unit["host"].get("session_name"), "unit-renamed")
-        self.assertEqual(unit["host"].get("session_host"), "tmux")
-        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit")  # pyright: ignore[reportPrivateUsage]
-
-    def test_empty_herdr_unit_name_does_not_fall_back_to_a_tmux_record(self) -> None:
-        session = inventory.SessionFile(sessionId="unit", tmux="unrelated:0.0")
-        for host in ("tmux", "herdr"):
-            marks = inventory.UnitMarks(production="build", unit="one", doc="/tmp/build.md",
-                                        session_name="", session_host=host)
-            recorded = inventory._host(session, marks, {}, {})  # pyright: ignore[reportPrivateUsage]
-            self.assertEqual(recorded.get("session_name"), "unrelated" if host == "tmux" else "")
 
     def test_herdr_host_comes_from_the_process_server_ancestor(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
@@ -792,13 +894,42 @@ elif "comm=" in joined:
         self.assertEqual(herdr.herdr_place_of(DESKTOP_PID), herdr.HerdrPlace("writing", "w1:p1"))
         found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1"})
+        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
         self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
 
+    def test_herdr_inventory_records_attached_clients_and_defaults_unreadable_clients_to_detached(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        for clients, expected in ((herdr.ClientsAttached(2), "attached window"),
+                                  (herdr.NoClientAttached(), "detached"),
+                                  (herdr.ClientsUnreadable("cannot read processes"), "detached")):
+            with self.subTest(clients=clients), patch.object(herdr, "attached_clients", return_value=clients):
+                found = inventory.inventory(TARGET_LOGIN)
+            desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+            self.assertEqual(desktop["host"].get("presentation"), expected)
+            parsed = inventory.parse_inventory(json.dumps(found))
+            self.assertEqual(parsed, found)
+
+    def test_old_herdr_inventory_reads_detached_and_rejects_invalid_presentation(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        found = inventory.inventory(TARGET_LOGIN)
+        wire = cast(dict[str, object], json.loads(json.dumps(found)))
+        owners = cast(list[dict[str, object]], wire["sessions"])
+        host = cast(dict[str, object], next(owner for owner in owners if owner["session_id"] == DESKTOP_ID)["host"])
+        _ = host.pop("presentation")
+        parsed = inventory.parse_inventory(json.dumps(wire))
+        desktop = next(owner for owner in parsed["sessions"] if owner["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"].get("presentation"), "detached")
+        for invalid in ("window", 3, {"kind": "invalid"}, None):
+            with self.subTest(invalid=invalid):
+                host["presentation"] = invalid
+                with self.assertRaises(inventory.InvalidInventory):
+                    _ = inventory.parse_inventory(json.dumps(wire))
+
     def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
         self.herdr_sessions(["unit-herdr"])
-        fake_tmux.write(self.tmux_state, {})
         path = self.records / f"{UNIT_PID}.json"
         record = cast(dict[str, object], json.loads(path.read_text()))
         record["tmux"] = ""
@@ -821,138 +952,24 @@ elif "comm=" in joined:
         session = cast(inventory.TopLevelSession, next(
             item for item in inventory.inventory(TARGET_LOGIN)["sessions"] if item["session_id"] == DESKTOP_ID
         ))
-        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1")
-        with patch.object(stop, "_stop_unit_tmux") as tmux_cleanup, patch.object(stop, "_close_ghostty_window"):
+        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")
+        with patch.object(stop, "_stop_unit_session") as cleanup, patch.object(stop, "_close_ghostty_window"):
             issues = stop._stop_owner_resources(  # pyright: ignore[reportPrivateUsage]
                 session, kill=lambda _pid, _signal: self.fail("unexpected kill"), is_alive=lambda _pid: False,
                 codex_mesh=lambda _argv: self.fail("unexpected Codex stop"),
-                tmux=lambda _argv: self.fail("unexpected tmux call"), clock=datetime.now,
+                clock=datetime.now,
                 claim=stop.StopClaim(TARGET_LOGIN, DESKTOP_ID, "fixture", "fixture"),
             )
         self.assertEqual(issues, [])
-        tmux_cleanup.assert_not_called()
+        cleanup.assert_not_called()
 
-    def test_tmux_host_takes_precedence_over_inherited_herdr_environment(self) -> None:
+    def test_user_tmux_is_unknown_despite_inherited_herdr_environment(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
-        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9"}), patch(
-            "inventory._tmux_session", return_value=(
-                "inner", inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
-                inventory.TmuxServerNotRecorded(kind="not recorded"), inventory.PaneNotRecorded(kind="not recorded"),
-            ),
-        ):
+        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9", "HERDR_PANE_ID": "w1:p1"}):
             found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"]["kind"], "tmux")
-        self.assertEqual(desktop["host"].get("tmux_session"), "inner")
-
-    def test_tmux_hosts_record_the_pane_or_an_explicit_absence(self) -> None:
-        def process_environment(pid: int) -> dict[str, str]:
-            if pid == self.director_pid:
-                return {"TMUX_PANE": "%8"}
-            if pid == DESKTOP_PID:
-                return {"TMUX_PANE": "%9"}
-            return {}
-
-        def tmux_details(
-            pane: str,
-        ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded, inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
-            if pane == "%8":
-                return "production work", inventory.TmuxSessionId(kind="session id", session_id="$8"), inventory.TmuxServer(kind="server", pid=34500, started_at=1700000000), {
-                    "kind": "pane",
-                    "pane_id": "%8",
-                    "pane_pid": 62_008,
-                }
-            if pane == "%9":
-                return "writing", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
-            return "", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
-
-        with (
-            patch("inventory._process_environment", side_effect=process_environment),
-            patch("inventory._tmux_session", side_effect=tmux_details),
-        ):
-            found = inventory.inventory(TARGET_LOGIN)
-
-        by_id = {session["session_id"]: session for session in found["sessions"]}
-        self.assertEqual(
-            by_id[DIRECTOR_ID]["host"],
-            {
-                "kind": "tmux",
-                "tmux_session": "production work",
-                "session_ref": {"kind": "session id", "session_id": "$8"},
-                "server": {"kind": "server", "pid": 34500, "started_at": 1700000000},
-                "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
-            },
-        )
-        self.assertEqual(
-            by_id[DESKTOP_ID]["host"],
-            {
-                "kind": "tmux",
-                "tmux_session": "writing",
-                "session_ref": {"kind": "not recorded"},
-                "server": {"kind": "not recorded"},
-                "pane": {"kind": "not recorded"},
-            },
-        )
-
-    def discover_tmux(
-        self, name: str, session_id: str, pid: str, started_at: str = "1700000000",
-        *, include_start: bool = True, server_pid: str = "34500", include_pid: bool = True,
-    ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded,
-               inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
-        calls: list[tuple[str, ...]] = []
-        def probe(argv: tuple[str, ...], *, capture_output: bool, text: bool, timeout: int, check: bool) -> subprocess.CompletedProcess[str]:
-            del capture_output, text, timeout, check
-            calls.append(argv)
-            self.assertEqual(argv[:5], ("/test/tmux", "display", "-p", "-t", "%8"))
-            self.assertCountEqual(argv[-1].split("\t"), ["#{session_name}", "#{session_id}", "#{pane_pid}", "#{start_time}", "#{pid}"])
-            format_text = argv[-1]
-            if not include_start:
-                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{start_time}")
-            if not include_pid:
-                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{pid}")
-            return subprocess.CompletedProcess(argv, 0,
-                pane_display(format_text, name, session_id, pid, "", started_at, server_pid), "")
-        with patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
-            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(len(calls), 1)
-        return found
-
-    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
-        self.assertEqual(self.discover_tmux("production work", "$8", "62008"),
-            ("production work", {"kind": "session id", "session_id": "$8"},
-             {"kind": "server", "pid": 34500, "started_at": 1700000000},
-             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
-
-    def test_tmux_discovery_preserves_spaces_in_session_name(self) -> None:
-        self.assertEqual(self.discover_tmux(" work ", "$8", "62008"),
-            (" work ", {"kind": "session id", "session_id": "$8"},
-             {"kind": "server", "pid": 34500, "started_at": 1700000000},
-             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
-
-    def test_tmux_discovery_keeps_session_when_pane_pid_is_unusable(self) -> None:
-        self.assertEqual(self.discover_tmux("writing", "$9", "not-a-pid"),
-            ("writing", {"kind": "session id", "session_id": "$9"},
-             {"kind": "server", "pid": 34500, "started_at": 1700000000}, {"kind": "not recorded"}))
-
-    def test_tmux_discovery_records_missing_session_id_without_losing_pane(self) -> None:
-        self.assertEqual(self.discover_tmux("writing", "", "62009"),
-            ("writing", {"kind": "not recorded"}, {"kind": "server", "pid": 34500, "started_at": 1700000000},
-             {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
-
-    def test_tmux_discovery_records_missing_or_invalid_server_without_losing_ids(self) -> None:
-        for started_at, include_start in (("1700000000", False), ("", True), ("not-an-integer", True)):
-            with self.subTest(started_at=started_at, include_start=include_start):
-                self.assertEqual(self.discover_tmux("writing", "$9", "62009", started_at, include_start=include_start),
-                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
-                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
-
-    def test_tmux_discovery_records_missing_or_invalid_server_pid_without_losing_ids(self) -> None:
-        for server_pid, include_pid in (("34500", False), ("", True), ("not-an-integer", True)):
-            with self.subTest(server_pid=server_pid, include_pid=include_pid):
-                self.assertEqual(self.discover_tmux("writing", "$9", "62009", server_pid=server_pid, include_pid=include_pid),
-                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
-                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
+        self.assertEqual(desktop["host"], {"kind": "unknown"})
 
     def test_ghostty_host_carries_window_shell_between_terminal_and_claude(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -961,6 +978,80 @@ elif "comm=" in joined:
         )
 
         self.assertEqual(director["host"].get("window_shell"), DIRECTOR_SHELL_PID)
+
+    def test_ghostty_supervisor_identity_is_discovered_with_cached_desktops(self) -> None:
+        supervisor_pid = 99_999_999
+        rows = cast(dict[str, list[object]], json.loads(os.environ["SHUTDOWN_TEST_PARENT_ROWS"]))
+        rows[str(self.director_pid)] = [supervisor_pid, "claude"]
+        rows[str(supervisor_pid)] = [DIRECTOR_SHELL_PID, "python3"]
+        def cmdline(path: Path) -> bytes:
+            if path == Path(f"/proc/{supervisor_pid}/cmdline"):
+                return b"python3\0/tmp/relaunch.py\0run\0--\0claude\0"
+            raise FileNotFoundError(path)
+        for refresh in (True, False):
+            with (
+                self.subTest(refresh=refresh),
+                patch.dict(os.environ, {"SHUTDOWN_TEST_PARENT_ROWS": json.dumps(rows)}),
+                patch.object(Path, "read_bytes", autospec=True, side_effect=cmdline),
+            ):
+                found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}),
+                    refresh_desktops=refresh)
+                owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
+                host = owner["host"]
+                assert host["kind"] == "ghostty"
+                self.assertEqual(host["window_shell"], DIRECTOR_SHELL_PID)
+                self.assertEqual(host.get("supervisor"), {"kind": "supervisor", "pid": supervisor_pid,
+                    "proc_start": CURRENT_PROCESS_START})
+
+    def test_mac_ghostty_inventory_preserves_supervisor_and_legacy_terminal_host(self) -> None:
+        rows = {
+            101: "902 claude", 902: "901 python3", 901: "900 zsh",
+            900: "1 /Applications/Ghostty.app/Contents/MacOS/ghostty",
+        }
+        def process(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            pid = int(argv[-1])
+            output = ("python3 /tmp/relaunch.py run -- claude" if argv[2] == "args="
+                      else rows[pid])
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
+              patch.object(subprocess, "run", side_effect=process),
+              patch.object(inventory, "_process_start", return_value="supervisor-start")):
+            host = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(host, {"kind": "terminal", "supervisor": {
+                "kind": "supervisor", "pid": 902, "proc_start": "supervisor-start"}})
+            owner = top_level("mac-supervised", host=host)
+            saved = entry(owner)
+            parsed = record.parse_session_records(json.dumps([saved]))[0]
+            self.assertEqual(parsed["session"]["host"], host)
+            rows[101] = "901 claude"
+            with patch.object(inventory, "_supervisor_process", return_value=inventory.NoSupervisor(kind="no supervisor")):
+                legacy = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(legacy, {"kind": "terminal"})
+
+    def test_ghostty_shell_parent_is_not_a_supervisor(self) -> None:
+        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}),
+                refresh_desktops=False)
+        owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
+        host = owner["host"]
+        assert host["kind"] == "ghostty"
+        self.assertEqual(host.get("supervisor"), {"kind": "no supervisor"})
+
+    def test_pre_supervisor_window_inventory_and_record_read_as_no_supervisor(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        owner = found["sessions"][0]
+        host = owner["host"]
+        assert host["kind"] == "ghostty"
+        _ = host.pop("supervisor", None)
+        decoded = inventory.parse_inventory(json.dumps(found))["sessions"][0]["host"]
+        assert decoded["kind"] == "ghostty"
+        self.assertEqual(decoded.get("supervisor"), {"kind": "no supervisor"})
+        saved = entry(owner)
+        parsed = record.parse_session_records(json.dumps([saved]))[0]
+        legacy_host = parsed["session"]["host"]
+        assert legacy_host["kind"] == "ghostty"
+        self.assertEqual(legacy_host.get("supervisor"), {"kind": "no supervisor"})
 
     def test_running_codex_worker_without_launcher_is_busy_but_dead_launcher_is_not(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -1026,11 +1117,11 @@ elif "comm=" in joined:
         _ = current.replace(previous)
         found = inventory.inventory(TARGET_LOGIN)
         worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
-        self.assertEqual(worker["kind"], "seat")
-        self.assertEqual(cast(inventory.SeatSession, worker)["owner"],
+        self.assertEqual(worker["kind"], "worker")
+        self.assertEqual(cast(inventory.WorkerSession, worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"], {"kind": "no director"})
+        self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"], {"kind": "no director"})
         self.assertTrue(previous.samefile(current))
         self.assertEqual(current.stat().st_mtime_ns, modified)
         _ = inventory.inventory(TARGET_LOGIN)
@@ -1041,8 +1132,8 @@ elif "comm=" in joined:
         modified = current.stat().st_mtime_ns
         found = inventory.inventory(TARGET_LOGIN)
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(late_worker["kind"], "seat")
-        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"],
+        self.assertEqual(late_worker["kind"], "worker")
+        self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
         self.assertTrue(previous.samefile(current))
         self.assertEqual(current.stat().st_mtime_ns, modified)
@@ -1056,7 +1147,7 @@ elif "comm=" in joined:
             [
                 (session["session_id"], session["owner"])
                 for session in found["sessions"]
-                if session["kind"] == "seat"
+                if session["kind"] == "worker"
             ],
             [(WORKER_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
         )
@@ -1083,7 +1174,8 @@ elif "comm=" in joined:
         by_id = {session["session_id"]: session for session in found["sessions"]}
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
-        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
+        worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
+        assert unit["host"]["kind"] == "unit"
         self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
         self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
         self.assertEqual(worker["owner"], {"kind": "no director"})
@@ -1116,19 +1208,59 @@ elif "comm=" in joined:
             encoding="utf-8",
         )
 
-        with patch.object(account, "process_config_dir", return_value=default_dir):
+        with patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(default_dir)):
             found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
 
         self.assertEqual(len(found["sessions"]), 1)
         self.assertEqual(found["sessions"][0].get("config_dir"), str(default_dir))
 
+    def test_process_without_an_account_setting_is_attributed_only_until_home_cutover(self) -> None:
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+        with patch.object(account, "process_config_dir", return_value=account.NoAccountSetting()):
+            before = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+            _ = home_json.write_text("{}")
+            after = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual([item["session_id"] for item in before["sessions"]], [DESKTOP_ID])
+        self.assertEqual(before["sessions"][0].get("config_dir"), str(self.home / ".claude"))
+        self.assertEqual(after["sessions"], [])
+        self.assertEqual(after["unattributed"], [{"pid": DESKTOP_PID, "name": "notes", "reason": "account unreadable"}])
+
+    def test_listing_and_inventory_share_home_identity_until_the_next_pass(self) -> None:
+        identities = frozenset({DESKTOP_ID, UNIT_ID})
+        owners = [record for record in sessions.live_sessions() if record["sessionId"] in identities]
+        self.assertEqual(len(owners), 2)
+        home_json = self.home / ".claude.json"
+
+        def cutover_during_process_read(_pid: int) -> account.NoAccountSetting:
+            _ = home_json.write_text("{}")
+            return account.NoAccountSetting()
+
+        for consumer in ("listing", "inventory"):
+            with self.subTest(consumer=consumer):
+                _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+                with (patch.object(sessions, "live_sessions", return_value=owners),
+                      patch.object(account, "process_config_dir", side_effect=cutover_during_process_read),
+                      patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads):
+                    if consumer == "listing":
+                        before = inventory.listing(TARGET_LOGIN)
+                        after = inventory.listing(TARGET_LOGIN)
+                        found_ids = {item.session_id for item in before}
+                    else:
+                        found = inventory.inventory(TARGET_LOGIN, only=identities)
+                        found_ids = {item["session_id"] for item in found["sessions"]}
+                        after = inventory.inventory(TARGET_LOGIN, only=identities)["sessions"]
+                self.assertEqual(found_ids, identities)
+                self.assertEqual(after, [])
+                self.assertEqual(home_reads.call_count, 2)
+
     def test_account_identity_and_config_dir_share_one_process_lookup(self) -> None:
         """F007: capture the account and directory from the same environment read."""
         looked_up: list[int] = []
 
-        def config_dir_for_pid(pid: int) -> Path:
+        def config_dir_for_pid(pid: int) -> account.ConfiguredClaudeFolder:
             looked_up.append(pid)
-            return self.target_config if len(looked_up) == 1 else self.other_config
+            return account.ConfiguredClaudeFolder(self.target_config if len(looked_up) == 1 else self.other_config)
 
         with patch.object(account, "process_config_dir", side_effect=config_dir_for_pid):
             found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
@@ -1142,7 +1274,7 @@ elif "comm=" in joined:
         for reader in ("process_config_dir", "claude_account"):
             with (
                 self.subTest(reader=reader),
-                patch.object(account, reader, return_value=None),
+                patch.object(account, reader, return_value=account.ProcessEnvironmentUnread("unreadable") if reader == "process_config_dir" else None),
             ):
                 found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
 
@@ -1172,7 +1304,7 @@ elif "comm=" in joined:
 
         self.assertEqual(decoded, found)
 
-    def test_parse_inventory_treats_a_legacy_tmux_host_as_pane_not_recorded(self) -> None:
+    def test_parse_inventory_normalizes_a_legacy_tmux_host_to_manual_recovery(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
         session_values = cast(list[object], document["sessions"])
@@ -1190,55 +1322,7 @@ elif "comm=" in joined:
             if session["session_id"] == DESKTOP_ID
         )
 
-        self.assertEqual(
-            parsed["host"],
-            {
-                "kind": "tmux",
-                "tmux_session": "legacy",
-                "session_ref": {"kind": "not recorded"},
-                "server": {"kind": "not recorded"},
-                "pane": {"kind": "not recorded"},
-            },
-        )
-
-    def test_parse_inventory_restores_session_reference_and_preserves_legacy_pane(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        owner = cast(dict[str, object], session_values[0])
-        host: dict[str, object] = {"kind": "tmux", "tmux_session": "old name",
-            "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 700},
-            "session_ref": {"kind": "session id", "session_id": "$4"},
-            "server": {"kind": "server", "pid": 34500, "started_at": 1700000000}}
-        owner["host"] = host
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, host)
-        host["server"] = {"kind": "server", "started_at": 1700000000}
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
-        del host["server"]
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
-        del host["session_ref"]
-        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
-        self.assertEqual(parsed, {**host, "session_ref": {"kind": "not recorded"}, "server": {"kind": "not recorded"}})
-
-    def test_parse_inventory_validates_a_recorded_tmux_pane(self) -> None:
-        found = inventory.inventory(TARGET_LOGIN)
-        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
-        session_values = cast(list[object], document["sessions"])
-        first = cast(dict[str, object], session_values[0])
-        first["host"] = {
-            "kind": "tmux",
-            "tmux_session": "work",
-            "pane": {"kind": "pane", "pane_id": "%2", "pane_pid": "invalid"},
-        }
-
-        with self.assertRaisesRegex(
-            inventory.InvalidInventory,
-            r"inventory\.sessions\[0\]\.host\.pane\.pane_pid must be an integer",
-        ):
-            _ = inventory.parse_inventory(json.dumps(document))
+        self.assertEqual(parsed["host"], {"kind": "legacy tmux", "session_name": "legacy"})
 
     def test_parse_inventory_rejects_unknown_kind_and_missing_variant_field(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -1282,9 +1366,9 @@ class ProcessEnvironmentTests(unittest.TestCase):
         ]) as probe:
             environment = inventory._process_environment(42)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(environment, {"HERDR_PANE_ID": "w1:p1", "REAL_ENTRY": "value=with=equals"})
-        self.assertEqual(probe.call_args_list[0].args[0], ("ps", "-o", "command=", "-p", "42"))
-        self.assertEqual(probe.call_args_list[1].args[0], ("ps", "eww", "-o", "command=", "-p", "42"))
-        self.assertEqual(probe.call_args_list[2].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[0].args[0], ["ps", "-o", "command=", "-p", "42"])
+        self.assertEqual(probe.call_args_list[1].args[0], ["ps", "eww", "-o", "command=", "-p", "42"])
+        self.assertEqual(probe.call_args_list[2].args[0], ["ps", "-o", "command=", "-p", "42"])
         self.assertEqual(probe.call_count, 3)
 
     def test_darwin_environment_refuses_arguments_added_between_reads(self) -> None:
@@ -1343,6 +1427,707 @@ class ProcessEnvironmentTests(unittest.TestCase):
             })
         read_environment.assert_called_once_with()
         probe.assert_not_called()
+
+
+class RecoveryInventoryTests(unittest.TestCase):
+    root: Path = Path()
+    proc: Path = Path()
+    registry: Path = Path()
+    config: Path = Path()
+    notifier: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        linux_process_fixture(self)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.proc = self.root / "proc"
+        self.registry = self.root / "registry"
+        self.config = self.root / "claude"
+        self.notifier = self.root / "notifier"
+        for directory in (self.proc, self.registry, self.config, self.notifier, self.root / "runs/active"):
+            directory.mkdir(parents=True)
+        _ = (self.config / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+        boot = self.proc / "sys/kernel/random/boot_id"
+        boot.parent.mkdir(parents=True)
+        _ = boot.write_text("boot-one\n")
+        _ = (self.proc / "stat").write_text("btime 1792065600\n")  # 2026-10-15 12:00 UTC
+        fake_responses = self.root / "herdr-responses.json"
+        _ = fake_responses.write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions":[]}'}}))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "HERDR_PROC": str(self.proc), "NOTIFIER_SESSIONS_DIR": str(self.registry),
+            "NOTIFIER_STATE_DIR": str(self.notifier), "AGENT_NOTES_DIR": str(self.root / "notes"),
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_DELEGATE_ROOT": str(self.root / "runs"),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pauses"),
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
+            "FAKE_HERDR_RESPONSES": str(fake_responses), "FAKE_HERDR_LOG": str(self.root / "herdr-log"),
+        })))
+        _ = self.enterContext(patch.object(inventory, "_terminal_host", return_value=inventory.TerminalHost(kind="terminal")))
+
+    def process(self, pid: int, *, command: str = "claude", arguments: list[str] | None = None,
+                environment: dict[str, str] | None = None, terminal: int = 7) -> Path:
+        directory = self.proc / str(pid)
+        directory.mkdir()
+        _ = (directory / "comm").write_text(command + "\n")
+        fields = ["S", "1", "1", "1", str(terminal), *("0" for _ in range(14)), "12345"]
+        _ = (directory / "stat").write_text(f"{pid} (fixture) " + " ".join(fields))
+        _ = (directory / "cmdline").write_bytes(("\0".join(arguments or [command]) + "\0").encode())
+        _ = (directory / "environ").write_bytes(("\0".join(f"{key}={value}" for key, value in
+            (environment or {}).items()) + "\0").encode())
+        (directory / "cwd").symlink_to(self.root)
+        (directory / "fd").mkdir()
+        return directory
+
+    def claude(self, pid: int = 1001, *, config: Path | None = None, identity: str = "owner-id") -> None:
+        _ = self.process(pid, environment={"CLAUDE_CONFIG_DIR": str(config or self.config)})
+        _ = (self.registry / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "procStart": "12345", "sessionId": identity, "name": identity,
+            "messagingSocketPath": str(self.root / "unused.sock"), "updatedAt": 123,
+            "tmux": "", "cwd": str(self.root), "status": "idle", "kind": "interactive",
+        }))
+
+    def darwin_snapshot(self) -> dict[str, CommandResponse]:
+        """A Mac process tree whose external readers all use the shared fake."""
+        self.claude()
+        registered = self.registry / "1001.json"
+        data = cast(dict[str, object], json.loads(registered.read_text()))
+        data["procStart"] = "Thu Oct 15 12:00:00 2026"
+        _ = registered.write_text(json.dumps(data))
+        fake = str(Path(__file__).parents[1] / "herdr/fake_herdr.py")
+        _ = cast(object, self.enterContext(patch.object(sys, "platform", "darwin")))
+        _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "darwin")))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HERDR_PS": fake, "HERDR_LSOF": fake, "SHUTDOWN_SYSCTL": fake,
+            "XDG_CONFIG_HOME": str(self.root / ".config"),
+        })))
+        # Unit lookup's registry liveness is independent of this synthetic PID.
+        _ = self.enterContext(patch.object(unit_lookup, "live_session", return_value=True))
+        responses: dict[str, CommandResponse] = {
+            "default": {"code": 97, "stdout": "", "stderr": "unconfigured external read"},
+            "-n kern.bootsessionuuid": {"code": 0, "stdout": "boot-mac-one\n"},
+            "--session default session list --json": {"code": 0, "stdout": json.dumps({"sessions": [{
+                "name": "writing", "running": True, "default": False,
+                "session_dir": "", "socket_path": "", } ]})},
+            "--session writing pane list": {"code": 0, "stdout": '{"result":{"panes":[]}}'},
+            "-n -P -a -U -u " + str(os.getuid()) + " -F pfn": {"code": 0,
+                "stdout": f"p500\nf3\nn{self.root}/.config/herdr/sessions/writing/herdr.sock\n"},
+        }
+        commands = {400: (1, "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", ""),
+                    300: (400, "zsh", ""), 500: (1, "herdr", " --session writing server"),
+                    501: (500, "zsh", ""), 1001: (501, "claude", " --name owner"),
+                    2001: (300, "codex", " resume"), 2002: (300, "codex", " app-server")}
+        responses["-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="] = {
+            "code": 0, "stdout": "".join(f"{pid} {parent} {os.getuid()} {executable}\n"
+                for pid, (parent, executable, _) in commands.items())}
+        responses["-U " + str(os.getuid()) + " -o pid=,command="] = {
+            "code": 0, "stdout": "".join(f"{pid} {executable}{arguments}\n"
+                for pid, (_, executable, arguments) in commands.items())}
+        for pid, (_, executable, arguments) in commands.items():
+            command = executable + arguments
+            environment = (f"CLAUDE_CONFIG_DIR={self.config} HERDR_PANE_ID=w1:p1" if pid == 1001 else
+                           "HERDR_PANE_ID=w1:p1" if pid == 501 else
+                           f"CODEX_HOME={self.root}/.codex" if pid == 2001 else "")
+            responses[f"-o command= -p {pid}"] = {"code": 0, "stdout": command + "\n"}
+            responses[f"eww -o command= -p {pid}"] = {"code": 0, "stdout": command + " " + environment + "\n"}
+            responses[f"-o lstart=,tty= -p {pid}"] = {"code": 0, "stdout": "Thu Oct 15 12:00:00 2026 ttys001\n"}
+            responses[f"-a -p {pid} -d cwd -Fn"] = {"code": 0, "stdout": f"p{pid}\nn{self.root}\n"}
+        responses["-a -p 2001 -Fn"] = {"code": 0,
+            "stdout": f"p2001\nf8\nn{self.root}/.codex/sessions/2026/rollout-date-{OTHER_ID}.jsonl\n"}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        # Fail on even an attempted proc read, including swallowed fallback reads.
+        read_bytes, read_text, iterdir = Path.read_bytes, Path.read_text, Path.iterdir
+
+        def forbid_proc(path: Path) -> None:
+            if path.is_relative_to(self.proc) or path.is_relative_to(Path("/proc")):
+                self.fail(f"Darwin observation tried to read {path}")
+
+        def checked_bytes(path: Path) -> bytes:
+            forbid_proc(path)
+            return read_bytes(path)
+
+        def checked_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            forbid_proc(path)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        def checked_iterdir(path: Path) -> Iterator[Path]:
+            forbid_proc(path)
+            return iterdir(path)
+
+        _ = self.enterContext(patch.object(Path, "read_bytes", checked_bytes))
+        _ = self.enterContext(patch.object(Path, "read_text", checked_text))
+        _ = self.enterContext(patch.object(Path, "iterdir", checked_iterdir))
+        return responses
+
+    def test_darwin_snapshot_reads_claude_codex_and_socket_host_without_proc(self) -> None:
+        _ = self.darwin_snapshot()
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        self.assertEqual(found.boot, inventory.KnownBoot("boot-mac-one"))
+        owner = found.sessions[TARGET_LOGIN][0]
+        self.assertEqual(owner["session"]["host"], inventory.HerdrHost(kind="herdr",
+            herdr_session="writing", pane_id="w1:p1", presentation="detached"))
+        self.assertEqual(owner.get("host_process"), inventory.RecoveryHostProcess(
+            kind="process", pid=500, proc_start="Thu Oct 15 12:00:00 2026"))
+        codex = found.sessions["codex-.codex"]
+        self.assertEqual(len(codex), 1)
+        self.assertEqual(codex[0]["session"]["host"], {"kind": "terminal"})
+        self.assertEqual(codex[0].get("host_process"), inventory.RecoveryHostProcess(
+            kind="process", pid=400, proc_start="Thu Oct 15 12:00:00 2026"))
+        codex_entry = codex[0]
+        assert codex_entry["agent"] == "codex"
+        self.assertEqual(codex_entry["codex"]["resume"], inventory.CodexSessionId(kind="session id", session_id=OTHER_ID))
+        self.assertEqual(inventory.codex_liveness(codex_entry), inventory.CodexLive(2001))
+        calls = [cast(list[str], json.loads(line)) for line in (self.root / "herdr-log").read_text().splitlines()]
+        self.assertIn(["-n", "kern.bootsessionuuid"], calls)
+        self.assertFalse(any("server" in call and "stop" in call for call in calls))
+
+    def test_darwin_without_path_binaries_still_observes_native_sessions(self) -> None:
+        _ = self.darwin_snapshot()
+        with patch.object(shutil, "which", return_value=None):
+            found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        self.assertEqual(set(found.sessions), {TARGET_LOGIN, "codex-.codex"})
+
+    def test_darwin_spaced_ghostty_executable_records_window_loss_for_recovery(self) -> None:
+        responses = self.darwin_snapshot()
+        for response in responses.values():
+            response["stdout"] = response["stdout"].replace(
+                "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+                "/Applications/Nix Apps/Ghostty.app/Contents/MacOS/ghostty")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        codex = first.sessions["codex-.codex"][0]
+        self.assertEqual(codex["session"]["host"], inventory.TerminalHost(kind="terminal"))
+        self.assertEqual(codex.get("host_process"), inventory.RecoveryHostProcess(
+            kind="process", pid=400, proc_start="Thu Oct 15 12:00:00 2026"))
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
+        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
+            if not line.startswith(("400 ", "300 ", "2001 ", "2002 ")))
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        lost = inventory.snapshot_inventory()
+        assert isinstance(lost, inventory.CompleteInventory), lost
+        self.assertIn(("codex-.codex", OTHER_ID), lost.gone_hosts)
+        _ = record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")
+        saved = record.read_snapshot("codex-.codex")
+        assert isinstance(saved, dict), saved
+        self.assertEqual([(item["state"], item.get("crash")) for item in saved["sessions"]],
+            [("unresolved", "host gone")])
+
+    def test_darwin_unreadable_codex_arguments_preserve_the_previous_snapshot(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        saved = record.read_snapshot("codex-.codex")
+        key = "-U " + str(os.getuid()) + " -o pid=,command="
+        responses[key]["stdout"] = responses[key]["stdout"].replace("2001 codex resume\n", "2001 (codex)\n")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.PartialInventory), found
+        self.assertIn("process 2001: arguments are unreadable", "; ".join(found.failures))
+        self.assertEqual(record.merge_snapshots(found, "2026-10-15T12:01:00+00:00"), [])
+        self.assertEqual(record.read_snapshot("codex-.codex"), saved)
+
+    def test_darwin_unreadable_codex_arguments_leave_liveness_unknown(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        codex = first.sessions["codex-.codex"][0]
+        assert codex["agent"] == "codex"
+        key = "-U " + str(os.getuid()) + " -o pid=,command="
+        responses[key]["stdout"] = responses[key]["stdout"].replace("2001 codex resume\n", "2001 (codex)\n")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        found = inventory.codex_liveness(codex)
+        assert isinstance(found, inventory.CodexLivenessUnknown), found
+        self.assertIn("process 2001: arguments are unreadable", found.reason)
+
+    def test_darwin_server_loss_retains_recovery_but_clean_exit_drops_it(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
+        # Claude exits but its listening herdr server remains: this is clean.
+        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
+            if not line.startswith("1001 "))
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        clean = inventory.snapshot_inventory()
+        assert isinstance(clean, inventory.CompleteInventory), clean
+        self.assertEqual(clean.gone_hosts, frozenset())
+        saved = record.merge_snapshots(clean, "2026-10-15T12:01:00+00:00")
+        self.assertFalse(any(item["session"]["session_id"] == "owner-id"
+            for snapshot in saved for item in snapshot["sessions"]))
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
+            if not line.startswith(("500 ", "501 ")))
+        responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
+        responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        lost = inventory.snapshot_inventory()
+        assert isinstance(lost, inventory.CompleteInventory), lost
+        self.assertEqual(lost.gone_hosts, frozenset({(TARGET_LOGIN, "owner-id")}))
+        saved = record.merge_snapshots(lost, "2026-10-15T12:02:00+00:00")
+        retained = [item for snapshot in saved for item in snapshot["sessions"]
+            if item["session"]["session_id"] == "owner-id"]
+        self.assertEqual([(item["state"], item.get("crash")) for item in retained], [("unresolved", "host gone")])
+
+    def test_darwin_reboot_retains_missing_sessions_with_crash_evidence(self) -> None:
+        responses = self.darwin_snapshot()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        responses["-n kern.bootsessionuuid"]["stdout"] = "boot-mac-two\n"
+        responses["-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="]["stdout"] = ""
+        responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
+        responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        second = inventory.snapshot_inventory()
+        assert isinstance(second, inventory.CompleteInventory), second
+        saved = record.merge_snapshots(second, "2026-10-15T12:01:00+00:00")
+        self.assertEqual({item.get("crash") for snapshot in saved for item in snapshot["sessions"]}, {"reboot"})
+        self.assertEqual(sum(len(snapshot["sessions"]) for snapshot in saved), 2)
+        self.assertTrue(all(item["state"] == "unresolved" for snapshot in saved for item in snapshot["sessions"]))
+
+    def test_darwin_unreadable_required_program_prevents_snapshot_replacement(self) -> None:
+        responses = self.darwin_snapshot()
+        keys = ("-n kern.bootsessionuuid", "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm=",
+                "-U " + str(os.getuid()) + " -o pid=,command=",
+                "-n -P -a -U -u " + str(os.getuid()) + " -F pfn", "eww -o command= -p 1001",
+                "-a -p 1001 -d cwd -Fn", "-a -p 2001 -d cwd -Fn", "-a -p 2001 -Fn", "-o lstart=,tty= -p 1001")
+        for key in keys:
+            original = responses[key]
+            responses[key] = {"code": 1, "stdout": "", "stderr": "fixture source denied"}
+            _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+            with self.subTest(source=key):
+                found = inventory.snapshot_inventory()
+                self.assertIsInstance(found, inventory.PartialInventory)
+                assert isinstance(found, inventory.PartialInventory)
+                self.assertIn("fixture source denied", "; ".join(found.failures))
+                self.assertEqual(record.merge_snapshots(found, "2026-10-15T12:00:00+00:00"), [])
+                self.assertFalse((self.root / "shutdown/snapshots").exists())
+            responses[key] = original
+
+    def test_complete_snapshot_collects_shared_sources_once_across_accounts_without_mutations(self) -> None:
+        self.claude()
+        other = self.root / "other-claude"
+        other.mkdir()
+        _ = (other / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": OTHER_LOGIN}}))
+        self.claude(1002, config=other, identity="other-id")
+        timer = self.notifier / "reminder"
+        timer.mkdir()
+        _ = (timer / "conf").write_text("TARGET=session:owner-id\n")
+        _ = (timer / "state").write_text("ENABLED=0\n")
+        pause = conversation_pause.PauseRecord("owner-id", ("reminder",), conversation_pause.Quiet(1, 2))
+        conversation_pause.write_record(pause)
+        before = conversation_pause.record_path("owner-id").read_bytes()
+        with (patch.object(inventory, "_snapshot_timers", wraps=inventory._snapshot_timers) as timers,  # pyright: ignore[reportPrivateUsage]
+              patch.object(inventory, "_snapshot_units", wraps=inventory._snapshot_units) as units,  # pyright: ignore[reportPrivateUsage]
+              patch.object(inventory, "_snapshot_desktops", wraps=inventory._snapshot_desktops) as desktops,  # pyright: ignore[reportPrivateUsage]
+              patch.object(conversation_pause, "release", side_effect=AssertionError("released pause")),
+              patch.object(conversation_pause, "run_notifier", side_effect=AssertionError("changed timer"))):
+            found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.CompleteInventory)
+        assert isinstance(found, inventory.CompleteInventory)
+        self.assertEqual(set(found.sessions), {TARGET_LOGIN, OTHER_LOGIN})
+        self.assertEqual(found.sessions[TARGET_LOGIN][0]["timers"], [
+            record.TimerRestore(instance="reminder", was_enabled=True)])
+        self.assertEqual(conversation_pause.record_path("owner-id").read_bytes(), before)
+        self.assertEqual((timer / "state").read_text(), "ENABLED=0\n")
+        self.assertEqual((timers.call_count, units.call_count), (1, 1))
+        desktops.assert_called_once_with(refresh=False)
+        self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["cwd"], str(self.root))
+
+    def test_user_tmux_with_inherited_herdr_is_unknown_in_a_complete_snapshot(self) -> None:
+        self.claude()
+        _ = (self.proc / "1001/environ").write_bytes(
+            (f"CLAUDE_CONFIG_DIR={self.config}\0TMUX_PANE=%9\0HERDR_PANE_ID=w1:p1\0").encode())
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["host"], {"kind": "unknown"})
+
+    def test_snapshot_without_account_setting_keeps_home_identity_only_until_cutover(self) -> None:
+        self.claude()
+        self.claude(1002, identity="second-owner")
+        for pid in (1001, 1002):
+            _ = (self.proc / str(pid) / "environ").write_bytes(b"HOME=fixture\0")
+        seed = self.root / ".claude.json"
+        _ = seed.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+        with patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads:
+            before = inventory.snapshot_inventory()
+            _ = seed.write_text("{}")
+            after = inventory.snapshot_inventory()
+        assert isinstance(before, inventory.CompleteInventory), before
+        self.assertEqual({entry["session"]["session_id"] for entry in before.sessions[TARGET_LOGIN]},
+                         {"owner-id", "second-owner"})
+        self.assertTrue(all(entry["session"].get("config_dir") == str(self.root / ".claude")
+                            for entry in before.sessions[TARGET_LOGIN]))
+        assert isinstance(after, inventory.PartialInventory), after
+        self.assertEqual(sum("account attribution" in failure for failure in after.failures), 2)
+        self.assertEqual(home_reads.call_count, 2)
+
+    def test_snapshot_explicit_config_home_without_a_login_is_not_an_account(self) -> None:
+        self.claude(config=self.root / ".claude")
+        _ = (self.root / ".claude.json").write_text("{}")
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.PartialInventory), found
+        self.assertTrue(any("account attribution" in failure for failure in found.failures))
+
+    def test_snapshot_reports_unreadable_registry_and_account_instead_of_absence(self) -> None:
+        self.claude()
+        _ = (self.registry / "broken.json").write_text("broken")
+        _ = (self.config / ".claude.json").write_text("broken")
+        found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.PartialInventory)
+        assert isinstance(found, inventory.PartialInventory)
+        self.assertTrue(any("broken.json" in failure for failure in found.failures))
+        self.assertTrue(any("account attribution" in failure for failure in found.failures))
+
+    def test_faulted_production_marks_cannot_turn_a_unit_into_a_standalone(self) -> None:
+        self.claude()
+        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {"show": {"one-unit": "duplicate unit marks"}})) as marks:
+            found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.PartialInventory)
+        assert isinstance(found, inventory.PartialInventory)
+        self.assertIn("duplicate unit marks", "; ".join(found.failures))
+        marks.assert_called_once_with()
+
+    def test_each_required_shared_source_failure_refuses_a_complete_snapshot(self) -> None:
+        self.claude()
+        for source in ("_snapshot_timers", "_snapshot_units", "_snapshot_native_hosts"):
+            with self.subTest(source=source), patch.object(inventory, source, side_effect=OSError(source + " denied")):
+                found = inventory.snapshot_inventory()
+                self.assertIsInstance(found, inventory.PartialInventory)
+                assert isinstance(found, inventory.PartialInventory)
+                self.assertIn(source + " denied", "; ".join(found.failures))
+
+    def test_unreadable_process_liveness_is_partial_but_confirmed_absence_is_empty(self) -> None:
+        self.claude()
+        process = self.proc / "1001"
+        _ = (process / "stat").write_text("broken")
+        found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.PartialInventory)
+        shutil.rmtree(process)
+        absent = inventory.snapshot_inventory()
+        self.assertIsInstance(absent, inventory.CompleteInventory)
+        assert isinstance(absent, inventory.CompleteInventory)
+        self.assertEqual(absent.sessions, {})
+
+    def test_unreadable_production_registration_is_a_source_failure(self) -> None:
+        self.claude()
+        production = self.notifier / "showrunner-show"
+        production.mkdir()
+        _ = (production / "conf").write_text("TARGET=session:owner-id\nCHECK=invalid\n")
+        found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.PartialInventory)
+        assert isinstance(found, inventory.PartialInventory)
+        self.assertIn("production registration", "; ".join(found.failures))
+
+    def test_interactive_codex_uses_open_rollout_identity_and_excludes_headless_workers(self) -> None:
+        home = self.root / "codex-work"
+        process = self.process(2001, command="codex", arguments=["codex", "--model", "exec"], environment={"CODEX_HOME": str(home)})
+        session_id = "12345678-1234-1234-1234-123456789abc"
+        (process / "fd/3").symlink_to(home / f"sessions/2026/10/15/rollout-date-{session_id}.jsonl")
+        _ = self.codex_rollout(home, OTHER_ID)
+        for pid, command in enumerate(("exec", "app-server", "mcp", "mcp-server", "proto"), start=2002):
+            _ = self.process(pid, command="codex", arguments=["codex", "--config", "model=x", command])
+        _ = self.process(2007, command="codex", terminal=0)
+        found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.CompleteInventory)
+        assert isinstance(found, inventory.CompleteInventory)
+        self.assertEqual(set(found.sessions), {"codex-codex-work"})
+        entries = found.sessions["codex-codex-work"]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        assert entry["agent"] == "codex"
+        self.assertEqual(entry["codex"], record.CodexLaunch(home=str(home),
+            resume=record.CodexSessionId(kind="session id", session_id=session_id)))
+        self.assertEqual((entry["session"]["pid"], entry["session"]["cwd"], entry["session"]["host"]),
+                         (2001, str(self.root), inventory.TerminalHost(kind="terminal")))
+
+    def codex_rollout(self, home: Path, session_id: str, *, timestamp: str = "2026-10-15T12:05:00Z",
+                      day: str = "2026/10/15", cwd: str = "") -> Path:
+        path = home / "sessions" / day / f"rollout-date-{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": session_id, "cwd": cwd or str(self.root), "timestamp": timestamp}}) +
+            "\nnot session metadata: later conversation lines must not be read\n")
+        return path
+
+    def observed_codex_resume(self) -> inventory.CodexSessionId | inventory.CodexResumePicker:
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.CompleteInventory), found
+        entry = found.sessions["codex-.codex"][0]
+        assert entry["agent"] == "codex"
+        return entry["codex"]["resume"]
+
+    def test_codex_closed_rollout_identifies_the_conversation_from_its_first_line(self) -> None:
+        _ = self.process(2001, command="codex")
+        _ = self.codex_rollout(self.root / ".codex", OTHER_ID)
+        self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
+
+    def test_codex_without_a_rollout_keeps_the_resume_picker(self) -> None:
+        _ = self.process(2001, command="codex")
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_multiple_closed_conversations_in_the_same_cwd_keep_the_picker(self) -> None:
+        _ = self.process(2001, command="codex")
+        for identity in (OTHER_ID, UNKNOWN_ID):
+            _ = self.codex_rollout(self.root / ".codex", identity)
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_evening_start_finds_its_local_day_and_keeps_ambiguity_after_midnight(self) -> None:
+        self.addCleanup(time.tzset)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"TZ": "America/New_York"})))
+        time.tzset()
+        process = self.process(2001, command="codex")
+        # 20:30 EDT on October 15 is already October 16 in UTC.
+        started = datetime.fromisoformat("2026-10-16T00:30:00+00:00")
+        _ = (self.proc / "stat").write_text(f"btime {int(started.timestamp())}\n")
+        stat = process / "stat"
+        _ = stat.write_text(stat.read_text().rsplit(" ", 1)[0] + " 0")
+        home = self.root / ".codex"
+        _ = self.codex_rollout(home, OTHER_ID, day="2026/10/15", timestamp="2026-10-16T00:31:00Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
+        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T04:01:00Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_unreadable_session_folders_make_the_snapshot_partial_instead_of_picking_an_id(self) -> None:
+        _ = self.process(2001, command="codex")
+        home = self.root / ".codex"
+        hidden = self.codex_rollout(home, OTHER_ID)
+        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T00:00:00Z")
+        scandir = os.scandir
+        for unreadable in (home / "sessions", hidden.parent.parent.parent, hidden.parent.parent, hidden.parent):
+            def readable_directories(path: str | os.PathLike[str]):
+                if Path(path) == unreadable:
+                    raise PermissionError(f"{unreadable}: directory denied")
+                return scandir(path)
+
+            with self.subTest(unreadable=unreadable), patch.object(os, "scandir", readable_directories):
+                found = inventory.snapshot_inventory()
+            self.assertIsInstance(found, inventory.PartialInventory)
+            assert isinstance(found, inventory.PartialInventory)
+            self.assertIn("directory denied", "; ".join(found.failures))
+
+    def test_codex_closed_rollout_before_process_birth_or_in_another_cwd_is_ignored(self) -> None:
+        process = self.process(2001, command="codex")
+        # Born two seconds after boot; a one-second-old session predates this process.
+        stat = process / "stat"
+        _ = stat.write_text(stat.read_text().rsplit(" ", 1)[0] + f" {2 * os.sysconf('SC_CLK_TCK')}")
+        _ = self.codex_rollout(self.root / ".codex", OTHER_ID, timestamp="2026-10-15T12:00:01Z")
+        _ = self.codex_rollout(self.root / ".codex", UNKNOWN_ID, cwd=str(self.root / "other"))
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_disk_lookup_does_not_visit_days_before_process_birth(self) -> None:
+        _ = self.process(2001, command="codex")
+        home = self.root / ".codex"
+        old = self.codex_rollout(home, OTHER_ID, day="2026/10/14")
+        _ = self.codex_rollout(home, UNKNOWN_ID, day="2026/10/16", timestamp="2026-10-16T00:00:00Z")
+        iterdir = Path.iterdir
+
+        def relevant_days(path: Path) -> Iterator[Path]:
+            self.assertNotEqual(path, old.parent, "scanned a day before process birth")
+            return iterdir(path)
+
+        with patch.object(Path, "iterdir", relevant_days):
+            self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=UNKNOWN_ID))
+
+    def test_darwin_codex_closed_rollouts_use_process_birth_and_refuse_ambiguity(self) -> None:
+        responses = self.darwin_snapshot()
+        responses["-a -p 2001 -Fn"] = {"code": 0, "stdout": ""}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+        home = self.root / ".codex"
+        _ = self.codex_rollout(home, OTHER_ID, timestamp="2026-10-15T11:59:59Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+        _ = self.codex_rollout(home, OTHER_ID, timestamp="2026-10-15T12:00:00Z")
+        self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
+        _ = self.codex_rollout(home, UNKNOWN_ID)
+        self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
+
+    def test_codex_unreadable_fd_list_uses_picker_without_file_time_identity(self) -> None:
+        process = self.process(2001, command="codex")
+        rollout = self.root / ".codex/sessions/rollout-newest-12345678-1234-1234-1234-123456789abc.jsonl"
+        rollout.parent.mkdir(parents=True)
+        _ = rollout.write_text("not held open")
+        original = Path.iterdir
+
+        def paths(path: Path) -> Iterator[Path]:
+            if path == process / "fd":
+                raise PermissionError("fd denied")
+            return original(path)
+
+        with patch.object(Path, "iterdir", paths):
+            found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.CompleteInventory)
+        assert isinstance(found, inventory.CompleteInventory)
+        entry = found.sessions["codex-.codex"][0]
+        assert entry["agent"] == "codex"
+        self.assertEqual(entry["codex"], record.CodexLaunch(home=str(self.root / ".codex"),
+            resume=record.CodexResumePicker(kind="picker")))
+
+    def test_codex_unreadable_environment_makes_the_observation_partial(self) -> None:
+        process = self.process(2001, command="codex")
+        (process / "environ").unlink()
+        found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.PartialInventory)
+        assert isinstance(found, inventory.PartialInventory)
+        self.assertIn("Codex observation", "; ".join(found.failures))
+
+    def test_pause_intent_restores_timers_but_kept_off_remains_off_without_changing_pause(self) -> None:
+        self.claude()
+        timer = self.notifier / "showrunner-show"
+        timer.mkdir()
+        doc = self.root / "production.md"
+        _ = doc.write_text("# Production\n")
+        _ = (timer / "conf").write_text(f"TARGET=session:owner-id\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        _ = (timer / "state").write_text("ENABLED=0\n")
+        for phase in (conversation_pause.Quiet(1, 2), conversation_pause.KeptOff()):
+            with self.subTest(phase=phase):
+                pause = conversation_pause.PauseRecord("owner-id", ("showrunner-show",), phase)
+                conversation_pause.write_record(pause)
+                path = conversation_pause.record_path("owner-id")
+                before = path.read_bytes()
+                found = inventory.snapshot_inventory()
+                assert isinstance(found, inventory.CompleteInventory), found
+                restore = not isinstance(phase, conversation_pause.KeptOff)
+                self.assertEqual(found.sessions[TARGET_LOGIN][0]["timers"], [record.TimerRestore(
+                    instance="showrunner-show", was_enabled=restore)])
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual((timer / "state").read_text(), "ENABLED=0\n")
+
+    def test_codex_liveness_follows_rollout_to_another_home_and_refuses_unreadable_evidence(self) -> None:
+        home = self.root / "first"
+        process = self.process(2001, command="codex", environment={"CODEX_HOME": str(home)})
+        identity = "12345678-1234-1234-1234-123456789abc"
+        (process / "fd/3").symlink_to(home / f"sessions/rollout-date-{identity}.jsonl")
+        observed = inventory.snapshot_inventory()
+        assert isinstance(observed, inventory.CompleteInventory), observed
+        saved = observed.sessions["codex-first"][0]
+        assert saved["agent"] == "codex"
+        self.assertEqual(inventory.codex_liveness(saved), inventory.CodexLive(2001))
+        shutil.rmtree(process)
+        self.assertIsInstance(inventory.codex_liveness(saved), inventory.CodexGone)
+        moved_home = self.root / "second"
+        moved = self.process(2002, command="codex", environment={"CODEX_HOME": str(moved_home)})
+        (moved / "fd/3").symlink_to(moved_home / f"sessions/rollout-date-{identity}.jsonl")
+        self.assertEqual(inventory.codex_liveness(saved), inventory.CodexLive(2002))
+        _ = (moved / "stat").write_text("malformed")
+        self.assertIsInstance(inventory.codex_liveness(saved), inventory.CodexLivenessUnknown)
+
+    def test_live_marked_unit_without_a_messaging_socket_is_not_a_standalone(self) -> None:
+        self.claude()
+        row = unit_lookup.MarkedUnit("unit", unit_lookup.ClaudeNotRunning(),
+                                   herdr.HerdrPlace("unit-host", "w1:p1"))
+        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({"show": {"unit": row}}, {})):
+            observed = inventory.snapshot_inventory()
+        self.assertIsInstance(observed, inventory.PartialInventory)
+        assert isinstance(observed, inventory.PartialInventory)
+        self.assertIn("marked host", "; ".join(observed.failures))
+
+    def test_unknown_host_is_observed_and_boot_identity_is_saved(self) -> None:
+        self.claude()
+        with patch.object(inventory, "_terminal_host", return_value=inventory.UnknownHost(kind="unknown")):
+            observed = inventory.snapshot_inventory()
+        assert isinstance(observed, inventory.CompleteInventory), observed
+        saved = record.merge_snapshots(observed, "2026-10-15T12:00:00+00:00")[0]
+        self.assertEqual(saved["sessions"][0]["session"]["host"], {"kind": "unknown"})
+        self.assertEqual((saved.get("boot_id"), saved["sessions"][0].get("boot_id")), ("boot-one", "boot-one"))
+
+    def test_snapshot_boot_read_failure_prevents_replacing_recovery(self) -> None:
+        self.claude()
+        (self.proc / "sys/kernel/random/boot_id").unlink()
+        observed = inventory.snapshot_inventory()
+        self.assertIsInstance(observed, inventory.PartialInventory)
+        self.assertEqual(record.merge_snapshots(observed, "2026-10-15T12:00:00+00:00"), [])
+        self.assertFalse((self.root / "shutdown/snapshots").exists())
+
+    def test_absence_after_reboot_is_retained_but_a_clean_exit_is_dropped(self) -> None:
+        self.claude()
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        shutil.rmtree(self.proc / "1001")
+        clean = inventory.snapshot_inventory()
+        assert isinstance(clean, inventory.CompleteInventory), clean
+        self.assertEqual(record.merge_snapshots(clean, "2026-10-15T12:01:00+00:00")[0]["sessions"], [])
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        _ = (self.proc / "sys/kernel/random/boot_id").write_text("boot-two\n")
+        rebooted = inventory.snapshot_inventory()
+        assert isinstance(rebooted, inventory.CompleteInventory), rebooted
+        retained = record.merge_snapshots(rebooted, "2026-10-15T12:02:00+00:00")[0]["sessions"]
+        self.assertEqual([(item["state"], item.get("crash"), item["last_seen"]) for item in retained],
+                         [("unresolved", "reboot", "2026-10-15T12:00:00+00:00")])
+
+    def test_lost_herdr_server_retains_a_missing_owner_with_host_loss_evidence(self) -> None:
+        self.claude()
+        with patch.object(inventory, "_terminal_host", return_value=inventory.HerdrHost(
+                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
+            first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
+        shutil.rmtree(self.proc / "1001")
+        with patch.object(inventory, "_snapshot_native_hosts", return_value=({}, {"writing": "detached"})):
+            clean = inventory.snapshot_inventory()
+        assert isinstance(clean, inventory.CompleteInventory), clean
+        self.assertEqual(clean.gone_hosts, frozenset())
+        lost = inventory.snapshot_inventory()
+        assert isinstance(lost, inventory.CompleteInventory), lost
+        saved = record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")[0]
+        self.assertEqual((saved["sessions"][0]["state"], saved["sessions"][0].get("crash")), ("unresolved", "host gone"))
+
+    def test_terminal_process_loss_retains_recovery_but_agent_exit_alone_does_not(self) -> None:
+        self.claude()
+        terminal = self.process(3001, command="ghostty")
+        agent = self.proc / "1001/stat"
+        _ = agent.write_text(agent.read_text().replace("S 1 ", "S 3001 ", 1))
+        first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        saved = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")[0]
+        self.assertEqual(saved["sessions"][0].get("host_process"),
+                         {"kind": "process", "pid": 3001, "proc_start": "12345"})
+        shutil.rmtree(self.proc / "1001")
+        clean = inventory.snapshot_inventory()
+        assert isinstance(clean, inventory.CompleteInventory), clean
+        self.assertEqual(clean.gone_hosts, frozenset())
+        shutil.rmtree(terminal)
+        lost = inventory.snapshot_inventory()
+        assert isinstance(lost, inventory.CompleteInventory), lost
+        restored = record.merge_snapshots(lost, "2026-10-15T12:01:00+00:00")[0]
+        self.assertEqual(restored["sessions"][0].get("crash"), "host gone")
+
+    def test_git_checkout_observations_disable_optional_index_locks(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+            observed = inventory._checkout(str(checkout))  # pyright: ignore[reportPrivateUsage]
+        assert observed["kind"] == "git"
+        self.assertEqual(observed["path"], str(checkout))
+        self.assertTrue(run.call_args_list)
+        environments = [cast(dict[str, str], call.kwargs["env"]) for call in run.call_args_list]
+        self.assertEqual({env.get("GIT_OPTIONAL_LOCKS") for env in environments}, {"0"})
+
+
+    def test_same_name_herdr_replacement_cannot_hide_the_original_server_loss(self) -> None:
+        self.claude()
+        old = self.process(3001, command="herdr", arguments=["herdr", "server"])
+        herdr_listener(self.proc, 3001, "writing", {"HOME": str(self.root)})
+        with patch.object(inventory, "_terminal_host", return_value=inventory.HerdrHost(
+                kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
+            first = inventory.snapshot_inventory()
+        assert isinstance(first, inventory.CompleteInventory), first
+        saved = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")[0]
+        self.assertEqual(saved["sessions"][0].get("host_process"),
+                         {"kind": "process", "pid": 3001, "proc_start": "12345"})
+        shutil.rmtree(self.proc / "1001")
+        shutil.rmtree(old)
+        _ = self.process(3002, command="herdr", arguments=["herdr", "server"])
+        herdr_listener(self.proc, 3002, "writing", {"HOME": str(self.root)})
+        with patch.object(inventory, "_snapshot_native_hosts", return_value=({}, {"writing": "detached"})):
+            replacement = inventory.snapshot_inventory()
+        assert isinstance(replacement, inventory.CompleteInventory), replacement
+        restored = record.merge_snapshots(replacement, "2026-10-15T12:01:00+00:00")[0]
+        self.assertEqual(restored["sessions"][0].get("crash"), "host gone")
 
 
 if __name__ == "__main__":

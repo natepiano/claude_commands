@@ -1,4 +1,4 @@
-"""Relay five-hour usage warnings to the quota alert list, once per low spell."""
+"""Log Codex five-hour warnings and relay Claude warnings once per low spell."""
 from __future__ import annotations
 
 import sys
@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount
-from agent_accounts import Report, seats_home
+from agent_accounts import Report, observe_workers_home
 from quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
@@ -46,10 +46,10 @@ def cancel_outgoing_notices(key: str, names: list[str]) -> None:
 
 def watch(reports: list[Report], *,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
-    """One line per session told and per alert closed."""
+    """One line per Codex warning, Claude session told and alert closed."""
     lines: list[str] = []
     now = datetime.now(timezone.utc)
-    readings = (codex_alert_pass(seats_home(), reports, now)
+    readings = (codex_alert_pass(observe_workers_home(), reports, now)
                 if isinstance(codex_readings, ReadCurrentCodexReadings) else codex_readings)
     selected = readings.selected_account
     if isinstance(selected, KnownCodexAccount):
@@ -87,7 +87,6 @@ def watch(reports: list[Report], *,
         swap_line = codex_swap_line(readings, now) if report.tool.lower() == "codex" else ""
         if swap_line:
             news += "\n" + swap_line
-        names = recipients(config)
         STATE.mkdir(parents=True, exist_ok=True)
         try:
             with marker.open("x", encoding="utf-8") as output:
@@ -96,6 +95,10 @@ def watch(reports: list[Report], *,
             continue
         if old_hold_closed:
             continue
+        if report.tool.lower() == "codex":
+            lines.append(f"5-hour limit: {news}")
+            continue
+        names = recipients(config)
         text = (f"5-hour limit: {news}\nTell the user in one line and change nothing else."
                 + f"\nProtocol: {PROTOCOL}")
         with ThreadPoolExecutor() as pool:

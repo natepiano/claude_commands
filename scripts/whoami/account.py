@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shlex
@@ -11,11 +12,20 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from agent_accounts import claude_config_dir, claude_on_disk, codex_email_on_disk, codex_home
-import note_file
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.whoami.agent_accounts import claude_config_dir, claude_config_value, claude_on_disk, codex_email_on_disk, codex_home  # noqa: E402
+from scripts.whoami import note_file  # noqa: E402
+
+# Package and sibling callers share process readers and identity outcomes.
+if __name__ == "account":
+    _ = sys.modules.setdefault("scripts.whoami.account", sys.modules[__name__])
+elif __name__ == "scripts.whoami.account":
+    _ = sys.modules.setdefault("account", sys.modules[__name__])
 
 
 @dataclass(frozen=True)
@@ -23,6 +33,16 @@ class Account:
     tool: Literal["claude", "codex"]
     login: str
     label: str
+
+
+@dataclass(frozen=True)
+class ResolvedHistoryLabel:
+    label: str
+
+
+@dataclass(frozen=True)
+class HistoricalAccountUnresolved:
+    """This record contains no evidence of its home's numbered account."""
 
 
 class UnreadableAccount(Exception):
@@ -50,16 +70,12 @@ class CommandLine(argparse.Namespace):
 
 
 def label_for(tool: str, login: str) -> str:
-    """The matching hanadocs note stem, or the login when no note matches."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
+    """The matching hanadocs account label, or the login when no note matches."""
     folded_tool = tool.casefold()
     folded_login = login.casefold()
-    for path in sorted(notes_dir.glob("*.md")):
-        if not path.stem.casefold().startswith(folded_tool):
-            continue
-        note = note_file.read_note(path)
-        if note is not None and (note.get("login") or "").casefold() == folded_login:
-            return path.stem
+    for note in note_file.read_notes():
+        if note.tool == folded_tool and (note.get("login") or "").casefold() == folded_login:
+            return note.label
     return login
 
 
@@ -81,16 +97,13 @@ def own_claude_account() -> Account:
 
 def named_claude_account(text: str) -> Account:
     """Resolve a Claude note label or accept an explicit login."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
-    folded = text.casefold()
-    for path in sorted(notes_dir.glob("*.md")):
-        stem = path.stem.casefold()
-        if not stem.startswith("claude") or stem != folded:
+    parsed = note_file.parse_account_label(text.casefold())
+    for note in note_file.read_notes():
+        if note.tool != "claude" or not isinstance(parsed, note_file.NumberedAccountLabel) or note.label != parsed.label:
             continue
-        note = note_file.read_note(path)
-        login = None if note is None else note.get("login")
-        if isinstance(login, str) and login:
-            return Account("claude", login, path.stem)
+        login = note.get("login")
+        if login:
+            return Account("claude", login, note.label)
     if (
         "@" in text
         and "/" not in text
@@ -100,7 +113,7 @@ def named_claude_account(text: str) -> Account:
     ):
         return Account("claude", text, label_for("claude", text))
     raise UnknownAccountName(
-        f"unknown account {text}: give a note label such as claude 2, or a login"
+        f"unknown account {text}: give a note label such as claude2, or a login"
     )
 
 
@@ -126,7 +139,7 @@ NAMED_ACCOUNT_VARIABLES = ("CLAUDE_CONFIG_DIR", MEMORY_BASE_VARIABLE)
 def named_account_environment(config_dir: Path) -> dict[str, str]:
     """The variables that start Claude Code on a named account's directory."""
     return {
-        "CLAUDE_CONFIG_DIR": str(config_dir),
+        "CLAUDE_CONFIG_DIR": claude_config_value(config_dir),
         MEMORY_BASE_VARIABLE: str(_default_claude_config_dir()),
     }
 
@@ -139,25 +152,35 @@ def named_account_prefix(config_dir: Path) -> str:
     )
 
 
-def parse_darwin_config_dir(output: str, expected_uid: int) -> Path | None:
+@dataclass(frozen=True)
+class ConfiguredClaudeFolder:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoAccountSetting:
+    """The readable environment does not select a Claude account folder."""
+
+
+def parse_darwin_config_dir(output: str, expected_uid: int) -> ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread:
     """Extract a config dir when `ps eww` exposed our process environment."""
     fields = output.split(maxsplit=1)
     if len(fields) != 2 or fields[0] != str(expected_uid):
-        return None
+        return ProcessEnvironmentUnread("process environment could not be read")
 
     process_text = fields[1]
     if not any(token.startswith("HOME=") for token in process_text.split()):
-        return None
+        return ProcessEnvironmentUnread("process environment could not be read")
 
     prefix = "CLAUDE_CONFIG_DIR="
     for token in reversed(process_text.split()):
         if token.startswith(prefix):
-            return Path(token.removeprefix(prefix))
-    return _default_claude_config_dir()
+            return ConfiguredClaudeFolder(Path(token.removeprefix(prefix))) if token.removeprefix(prefix) else NoAccountSetting()
+    return NoAccountSetting()
 
 
-def process_config_dir(pid: int) -> Path | None:
-    """A process's Claude config directory, or None when its environment is unreadable."""
+def process_config_dir(pid: int) -> ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread:
+    """Keep an absent account setting distinct from an unreadable environment."""
     if sys.platform == "darwin":
         try:
             result = subprocess.run(
@@ -167,31 +190,159 @@ def process_config_dir(pid: int) -> Path | None:
                 timeout=5,
             )
             if result.returncode:
-                return None
+                return ProcessEnvironmentUnread("process environment could not be read")
             return parse_darwin_config_dir(result.stdout, os.getuid())
         except (OSError, subprocess.TimeoutExpired):
-            return None
+            return ProcessEnvironmentUnread("process environment could not be read")
 
     try:
         environment = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
-        return None
+        return ProcessEnvironmentUnread("process environment could not be read")
     prefix = b"CLAUDE_CONFIG_DIR="
     for entry in environment.split(b"\0"):
         if entry.startswith(prefix):
-            return Path(os.fsdecode(entry.removeprefix(prefix)))
-    return _default_claude_config_dir()
+            return ConfiguredClaudeFolder(Path(os.fsdecode(entry.removeprefix(prefix)))) if entry.removeprefix(prefix) else NoAccountSetting()
+    return NoAccountSetting()
 
 
-def account_of(pid: int) -> Account | None:
-    """The Claude account of a process whose environment can be read."""
-    config_dir = process_config_dir(pid)
-    return None if config_dir is None else claude_account(config_dir)
+
+@dataclass(frozen=True)
+class ProcessCodexHome:
+    home: Path
+
+
+@dataclass(frozen=True)
+class ProcessWithoutCodexHome:
+    """A readable environment has no CODEX_HOME; it uses the default home."""
+
+
+@dataclass(frozen=True)
+class ProcessEnvironmentUnread:
+    reason: str
+
+
+@dataclass(frozen=True)
+class MacProcessRecord:
+    arguments: tuple[str, ...]
+    setting: ProcessCodexHome | ProcessWithoutCodexHome
+    executable: Path
+
+
+def _kern_procargs2(pid: int) -> bytes:
+    """Read one kernel argument record, without exposing it in diagnostics."""
+    query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    size = ctypes.c_size_t(ctypes.sizeof(buffer))
+    try:
+        sysctl = cast(Callable[[object, int, object, object, object, int], int],
+                      ctypes.CDLL(None, use_errno=True).sysctl)
+    except AttributeError as error:
+        raise OSError("kernel process reader unavailable") from error
+    if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "kernel process record unavailable")
+    if size.value > ctypes.sizeof(buffer):
+        raise OSError("kernel process record exceeds buffer")
+    return buffer.raw[:size.value]
+
+
+def mac_process_record(pid: int) -> MacProcessRecord | ProcessEnvironmentUnread:
+    """Separate exactly argc arguments from the following environment strings."""
+    unread = ProcessEnvironmentUnread("process argument record could not be read")
+    try:
+        payload = _kern_procargs2(pid)
+    except OSError:
+        return unread
+    if len(payload) < 5 or not payload.endswith(b"\0"):
+        return unread
+    count = int.from_bytes(payload[:4], sys.byteorder, signed=True)
+    executable_end = payload.find(b"\0", 4)
+    if count <= 0 or executable_end <= 4:
+        return unread
+    offset = executable_end + 1
+    while offset < len(payload) and payload[offset] == 0:
+        offset += 1
+    words = payload[offset:].split(b"\0")
+    if len(words) <= count or not words[0]:
+        return unread
+    arguments = tuple(os.fsdecode(word) for word in words[:count])
+    setting: ProcessCodexHome | ProcessWithoutCodexHome = ProcessWithoutCodexHome()
+    for entry in words[count:]:
+        if not entry:
+            continue
+        key, separator, value = entry.partition(b"=")
+        if not separator or not key:
+            return unread
+        if key == b"CODEX_HOME":
+            setting = ProcessCodexHome(Path(os.fsdecode(value))) if value else ProcessWithoutCodexHome()
+    return MacProcessRecord(arguments, setting, Path(os.fsdecode(payload[4:executable_end])))
+
+
+def process_codex_home(pid: int) -> ProcessCodexHome | ProcessWithoutCodexHome | ProcessEnvironmentUnread:
+    """Distinguish an absent variable from an unreadable process environment."""
+    if sys.platform == "darwin":
+        record = mac_process_record(pid)
+        return record.setting if isinstance(record, MacProcessRecord) else record
+    try:
+        environment = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError as error:
+        return ProcessEnvironmentUnread(str(error))
+    for entry in environment.split(b"\0"):
+        if entry.startswith(b"CODEX_HOME="):
+            return ProcessCodexHome(Path(os.fsdecode(entry.removeprefix(b"CODEX_HOME="))))
+    return ProcessWithoutCodexHome()
+
+
+@dataclass(frozen=True)
+class LegacyHomeLogin:
+    """The shared home still holds this login for a process-attribution pass."""
+
+    account: Account
+
+
+@dataclass(frozen=True)
+class ConfigOnlyHome:
+    """The shared configuration home has no readable account login."""
+
+
+@dataclass(frozen=True)
+class HomeAccountUnchecked:
+    """A single-process caller has not read the shared home's state yet."""
+
+
+_HOME_ACCOUNT_UNCHECKED = HomeAccountUnchecked()
+
+
+def home_account_state() -> LegacyHomeLogin | ConfigOnlyHome:
+    """Read the legacy home once for a pass that attributes several processes."""
+    identity = claude_account(_default_claude_config_dir())
+    return LegacyHomeLogin(identity) if identity is not None else ConfigOnlyHome()
+
+
+def process_account_directory(setting: ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread, *,
+                              home_state: LegacyHomeLogin | ConfigOnlyHome | HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED
+                              ) -> ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread:
+    """Retain a legacy home session only until this machine has cut over."""
+    if isinstance(setting, NoAccountSetting):
+        state = home_account_state() if isinstance(home_state, HomeAccountUnchecked) else home_state
+        if isinstance(state, LegacyHomeLogin):
+            return ConfiguredClaudeFolder(_default_claude_config_dir())
+    return setting
+
+
+def account_of(pid: int, *, home_state: LegacyHomeLogin | ConfigOnlyHome | HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED) -> Account | None:
+    """The login selected by a readable process, including pre-cutover sessions."""
+    setting = process_config_dir(pid)
+    state = home_account_state() if isinstance(setting, NoAccountSetting) and isinstance(home_state, HomeAccountUnchecked) else home_state
+    setting = process_account_directory(setting, home_state=state)
+    if isinstance(setting, ConfiguredClaudeFolder) and setting.path == _default_claude_config_dir() and isinstance(state, LegacyHomeLogin):
+        return state.account
+    return claude_account(setting.path) if isinstance(setting, ConfiguredClaudeFolder) else None
 
 
 def write_label(config_dir: Path, account: Account) -> None:
     """Atomically refresh a config directory's cheap status-line label cache."""
-    expected = account.label + "\n"
+    expected = note_file.canonical_label(account.label) + "\n"
     destination = config_dir / "account-label"
     try:
         if destination.read_text(encoding="utf-8") == expected:

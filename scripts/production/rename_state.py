@@ -10,6 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+import tidy_wrapped
+
 JsonObject = dict[str, object]
 
 
@@ -21,34 +23,59 @@ class RenameRefused(ValueError):
         self.reason: str = reason
 
 
-def _read_json(path: Path) -> object:
+def read_json(path: Path) -> object:
     try:
         return cast(object, json.loads(path.read_text(encoding="utf-8")))
     except (OSError, UnicodeError, ValueError) as error:
         raise RenameRefused(f"cannot parse {path}: {error}") from error
 
 
-def _write_json(path: Path, value: object) -> None:
-    temporary_name = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as temporary:
-            temporary_name = temporary.name
-            _ = temporary.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
-        os.replace(temporary_name, path)
-    finally:
-        if temporary_name:
-            Path(temporary_name).unlink(missing_ok=True)
+def _fields(path: Path) -> JsonObject:
+    value = read_json(path)
+    if not isinstance(value, dict):
+        raise RenameRefused(f"{path}: expected a JSON object")
+    return cast(JsonObject, value)
+
+
+def unfinished(path: Path) -> bool:
+    """Whether a rename journal exists and its rename has not finished."""
+    return path.exists() and _fields(path).get("done") is not True
+
+
+def production_journal(slug: str) -> Path:
+    return tidy_wrapped.owned_paths(slug)[-1] / "rename.json"
+
+
+def unit_journal(slug: str) -> Path:
+    return tidy_wrapped.owned_paths(slug)[-1] / "rename_unit.json"
+
+
+def rename_claim(slug: str) -> frozenset[str]:
+    """Both ids of a unit whose rename is unfinished: only the rename may launch it.
+
+    The claim ends once the unit's shutdown record names the new id, so the rename's own relaunch
+    goes through.
+    """
+    path = unit_journal(slug)
+    if not unfinished(path):
+        return frozenset()
+    fields = _fields(path)
+    if fields.get("claimed") is False:
+        return frozenset()
+    return frozenset(value for value in (fields.get("old"), fields.get("new")) if isinstance(value, str) and value)
+
+
+def write_json(path: Path, value: object) -> None:
+    write_text(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
 
 def _rename_json(path: Path, update: Callable[[object], bool]) -> bool:
     if not path.exists():
         return False
-    value = _read_json(path)
+    value = read_json(path)
     if not update(value):
         return False
-    _write_json(path, value)
+    write_json(path, value)
     return True
 
 
@@ -102,14 +129,15 @@ def _rename_top_level_key(value: object, old: str, new: str) -> bool:
     return True
 
 
-def _write_lines(path: Path, lines: list[str]) -> None:
+def write_text(path: Path, text: str) -> None:
+    """Replace a file atomically: a reader sees the old text or the new, never a part."""
     temporary_name = ""
     try:
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
         ) as temporary:
             temporary_name = temporary.name
-            _ = temporary.write("".join(lines))
+            _ = temporary.write(text)
         os.replace(temporary_name, path)
     finally:
         if temporary_name:
@@ -135,7 +163,7 @@ def _rename_lines(path: Path, old_prefix: str, new_prefix: str) -> bool:
         if replacement not in emitted:
             output.append(replacement)
             emitted.add(replacement)
-    _write_lines(path, output)
+    write_text(path, "".join(output))
     return True
 
 
@@ -152,8 +180,13 @@ def _rename_blocks_open(path: Path, old: str, new: str) -> bool:
         output = [line for line in lines if not line.startswith(old_prefix)]
     else:
         output = [new_prefix + line[len(old_prefix):] if line.startswith(old_prefix) else line for line in lines]
-    _write_lines(path, output)
+    write_text(path, "".join(output))
     return True
+
+
+# The showrunner state files (showrunners.session_state_dir) _rename_scratch rewrites; verify reads them for a stale unit id.
+SCRATCH_FILES = ("dailies_input_state/eta_seen.json", "unit_status/decisions_seen", "unit_status/blocks_open",
+                 "showrunner_state.json", "dailies_judgment.json", "dailies_state.json")
 
 
 def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:

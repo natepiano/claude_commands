@@ -17,7 +17,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import conversation_pause
-import showrunner_footer
 
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
@@ -43,7 +42,7 @@ RETURN_SCHEDULE = "They return 20 minutes after my last reply; I ask you first a
 ASK_AGAIN = "If you write again, I ask about them 15 minutes after my reply."
 PAUSE_CONTEXT = (
     "Automatic updates for this session are paused while the user talks to you: "
-    "dailies, footer. Leave them off; the session asks the user before they return. "
+    "dailies. Leave them off; the session asks the user before they return. "
     f"If the user asks for them back sooner, run: {RESUME}"
 )
 OTHER_ANSWER_CONTEXT = (
@@ -303,39 +302,27 @@ print("SENT: delivered")
             f"ENABLED={int(enabled)}\n{mark}NEXT_DUE=12000\n"
         )
 
-    def footer_off(self, slug: str, *, by_hand: bool = False) -> Path:
-        """Turn a footer off as a pause does, or as `/showrunner:footer off` does when `by_hand`."""
-        switch = self.showrunner_root / "footers-off" / slug
-        switch.parent.mkdir(parents=True, exist_ok=True)
-        _ = switch.write_text("" if by_hand else showrunner_footer.PAUSE_MARK)
-        return switch
-
     def write_record(
         self,
         phase: dict[str, object],
         *,
         instances: tuple[str, ...] = (),
-        footers: tuple[str, ...] = (),
         session_id: str = SESSION,
         scheduled: bool = True,
     ) -> Path:
         # A paused item is one whose schedule still exists; `scheduled=False` writes a record
         # naming schedules removed since, as switching a production to on demand does. An item
         # the test has not set up yet is set up as the pause leaves it: stopped and marked.
-        for name in (*instances, *(f"showrunner-{slug}" for slug in footers)) if scheduled else ():
+        for name in instances if scheduled else ():
             (self.notifier_root / name).mkdir(exist_ok=True)
         for name in instances if scheduled else ():
             if not (self.notifier_root / name / "state").exists():
                 self.set_enabled(self.notifier_root / name, False, paused=True)
-        for slug in footers:
-            if not (self.showrunner_root / "footers-off" / slug).exists():
-                _ = self.footer_off(slug)
         self.pause_root.mkdir(parents=True, exist_ok=True)
         path = self.pause_root / f"{session_id}.json"
         _ = path.write_text(json.dumps({
             "session_id": session_id,
             "instances": list(instances),
-            "footers": list(footers),
             "phase": phase,
         }))
         return path
@@ -360,7 +347,7 @@ print("SENT: delivered")
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()]
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + TEST_WALL
         while time.monotonic() < deadline and not path.exists():
             time.sleep(0.01)
         self.assertTrue(path.exists(), f"timed out waiting for {path}")
@@ -606,12 +593,12 @@ print("SENT: delivered")
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
-    def test_typed_showrunner_prompt_pauses_dailies_and_footer_once(self) -> None:
+    def test_typed_showrunner_prompt_pauses_dailies_once(self) -> None:
         instance = self.create_instance("showrunner-demo")
         first = self.parsed_reply(self.run_prompt("hello", now=100))
         self.assertEqual(first, {
             "systemMessage": (
-                f"Automatic updates paused while we talk: dailies, footer. {RETURN_SCHEDULE}"
+                f"Automatic updates paused while we talk: dailies. {RETURN_SCHEDULE}"
             ),
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -619,11 +606,10 @@ print("SENT: delivered")
             },
         })
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue((self.showrunner_root / "footers-off" / "demo").exists())
+        self.assertFalse((self.showrunner_root / "footers-off").exists())
         self.assertEqual(self.record(), {
             "session_id": SESSION,
             "instances": ["showrunner-demo"],
-            "footers": ["demo"],
             "phase": {"kind": "replying", "user_wrote_at": 100},
         })
         calls_after_first = self.calls(self.notifier_log)
@@ -638,10 +624,11 @@ print("SENT: delivered")
             {"kind": "replying", "user_wrote_at": 120},
         )
 
-    def test_report_names_for_unit_and_build_instances(self) -> None:
+    def test_report_names_for_unit_and_other_instances(self) -> None:
         for name, words in (
+            ("unit-abc", "status reports"),
             ("delegate-abc", "status reports"),
-            ("report-builds", "build report"),
+            ("report-nightly", "report-nightly"),
         ):
             with self.subTest(name=name):
                 instance = self.create_instance(name)
@@ -676,29 +663,29 @@ print("SENT: delivered")
         self.assertTrue((stopped / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_a_stopped_showrunner_timer_is_never_recorded_or_resumed(self) -> None:
-        # A production on demand keeps its showrunner timer stopped. The pause still turns its footer
-        # off, but never records the timer, so a resume leaves it stopped.
+        # A production on demand keeps its showrunner timer stopped. The pause has nothing to stop,
+        # so it writes no record, and a resume leaves the timer stopped.
         showrunner = self.create_instance("showrunner-show", enabled=False)
         result = self.run_prompt("hello")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.record()["instances"], [])
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
         _ = self.run_cli("resume")
         self.assertTrue((showrunner / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_existing_pause_adds_a_report_that_was_turned_on_later(self) -> None:
         first = self.create_instance("delegate-abc")
         _ = self.parsed_reply(self.run_prompt("first", now=100))
-        build = self.create_instance("report-builds")
+        later = self.create_instance("report-nightly")
         reply = self.parsed_reply(self.run_prompt("second", now=120))
         self.assertEqual(
             reply["systemMessage"],
-            f"Automatic updates paused while we talk: build report. {RETURN_SCHEDULE}",
+            f"Automatic updates paused while we talk: report-nightly. {RETURN_SCHEDULE}",
         )
         self.assertEqual(
-            self.record()["instances"], ["delegate-abc", "report-builds"]
+            self.record()["instances"], ["delegate-abc", "report-nightly"]
         )
         self.assertTrue((first / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue((build / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue((later / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_failed_watcher_creation_stops_nothing_and_writes_no_record(self) -> None:
         instance = self.create_instance("delegate-abc")
@@ -1016,6 +1003,7 @@ print("SENT: delivered")
 
     def test_tick_releases_record_lock_during_session_lookup(self) -> None:
         marker = self.root / "lookup-started"
+        release = self.root / "lookup-release"
         sessions = self.root / "sessions-slow.py"
         _ = sessions.write_text(
             "".join((
@@ -1023,7 +1011,10 @@ print("SENT: delivered")
                 "import os, time\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['LOOKUP_MARKER']).touch()\n",
-                "time.sleep(2)\n",
+                "release = Path(os.environ['LOOKUP_RELEASE'])\n",
+                f"deadline = time.monotonic() + {TEST_WALL}\n",
+                "while not release.exists() and time.monotonic() < deadline:\n",
+                "    time.sleep(0.01)\n",
                 "print(os.environ['SESSION_SOCKET'])\n",
             ))
         )
@@ -1036,6 +1027,8 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SESSIONS": str(sessions),
             "CONVERSATION_PAUSE_NOW_EPOCH": "200",
             "LOOKUP_MARKER": str(marker),
+            # The lookup holds until the lock is tried, so a loaded machine cannot finish it first.
+            "LOOKUP_RELEASE": str(release),
         }
         process = subprocess.Popen(
             [sys.executable, str(LIBRARY), "tick"],
@@ -1050,6 +1043,7 @@ print("SENT: delivered")
                 fcntl.flock(
                     lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
+            release.touch()
             _, stderr = process.communicate(timeout=TEST_WALL)
         finally:
             if process.poll() is None:
@@ -1079,29 +1073,25 @@ print("SENT: delivered")
             )
             self.assertIsInstance(context, conversation_pause.ContextOnly)
 
-    def test_cli_resume_skips_missing_instance_restores_footer_and_deletes_record(self) -> None:
+    def test_cli_resume_skips_missing_instance_and_deletes_record(self) -> None:
         instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
-        switch = self.footer_off("demo")
         record_path = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
-            instances=("showrunner-demo", "delegate-gone"),
-            footers=("demo",), scheduled=False,
+            instances=("showrunner-demo", "delegate-gone"), scheduled=False,
         )
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "automatic updates on: dailies, footer\n")
+        self.assertEqual(result.stdout, "automatic updates on: dailies\n")
         self.assertEqual(self.calls(self.notifier_log), [["unpause", "showrunner-demo"]])
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
         self.assertFalse(record_path.exists())
 
-    def test_a_timer_and_footer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
+    def test_a_timer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
         dailies = self.create_instance("showrunner-demo")
         unit_report = self.create_instance("delegate-abc")
         _ = self.run_prompt("hello", now=100)
-        # The showrunner stops its dailies and footer on purpose while the user talks.
+        # The showrunner stops its dailies on purpose while the user talks.
         self.set_enabled(dailies, False)
-        switch = self.footer_off("demo", by_hand=True)
 
         result = self.run_cli("resume")
 
@@ -1109,16 +1099,13 @@ print("SENT: delivered")
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue(switch.exists())
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
-    def test_a_timer_and_footer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
+    def test_a_timer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
         dailies = self.create_instance("showrunner-demo", enabled=False)
-        switch = self.footer_off("demo", by_hand=True)
         unit_report = self.create_instance("delegate-abc")
         _ = self.run_prompt("hello", now=100)
         self.assertEqual(self.record()["instances"], ["delegate-abc"])
-        self.assertEqual(self.record()["footers"], [])
 
         result = self.run_cli("resume")
 
@@ -1126,15 +1113,13 @@ print("SENT: delivered")
         self.assertEqual(result.stdout, "automatic updates on: status reports\n")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue(switch.exists())
 
     def test_the_timeout_return_leaves_what_was_stopped_during_the_pause(self) -> None:
         dailies = self.create_instance("showrunner-demo", enabled=False)
         unit_report = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
-        switch = self.footer_off("demo", by_hand=True)
         _ = self.write_record(
-            asked_read(100, 1), instances=("showrunner-demo", "delegate-abc"), footers=("demo",),
+            asked_read(100, 1), instances=("showrunner-demo", "delegate-abc"),
         )
 
         tick = self.run_cli("tick", now=400)
@@ -1143,7 +1128,6 @@ print("SENT: delivered")
         self.assertEqual(self.record()["phase"], {"kind": "returned", "returned_at": 400})
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue(switch.exists())
 
     def test_a_tick_drops_what_was_stopped_by_hand_from_the_pause_record(self) -> None:
         dailies = self.create_instance("showrunner-demo")
@@ -1151,39 +1135,32 @@ print("SENT: delivered")
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.run_prompt("hello", now=100)
         self.set_enabled(dailies, False)
-        switch = self.footer_off("demo", by_hand=True)
 
         tick = self.run_cli("tick", now=150)
 
         self.assertEqual(tick.returncode, 0, tick.stderr)
         self.assertEqual(self.record()["instances"], ["delegate-abc"])
-        self.assertEqual(self.record()["footers"], [])
-        self.assertTrue(switch.exists())
 
     def test_a_record_from_before_the_pause_marks_restarts_nothing(self) -> None:
-        # Records written before `notifier.sh pause` existed name timers stopped with no mark and
-        # footer switches that are empty files; nothing tells them from ones stopped on purpose.
+        # Records written before `notifier.sh pause` existed name timers stopped with no mark;
+        # nothing tells them from ones stopped on purpose.
         instance = self.create_instance("showrunner-demo", enabled=False)
-        switch = self.footer_off("demo", by_hand=True)
         record_path = self.write_record(
-            {"kind": "replying", "user_wrote_at": 1}, instances=("showrunner-demo",), footers=("demo",),
+            {"kind": "replying", "user_wrote_at": 1}, instances=("showrunner-demo",),
         )
 
         result = self.run_cli("resume")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
-        self.assertTrue(switch.exists())
         self.assertFalse(record_path.exists())
 
     def test_resume_verb_keeps_only_failed_items_for_retry(self) -> None:
         failed = self.create_instance("delegate-alpha", enabled=False, paused=True)
         restored = self.create_instance("delegate-beta", enabled=False, paused=True)
-        switch = self.footer_off("demo")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 100},
             instances=(failed.name, restored.name),
-            footers=("demo",),
         )
         first = self.run_cli(
             "resume", extra_env={"FAIL_RESUME_FOR": failed.name}
@@ -1194,12 +1171,10 @@ print("SENT: delivered")
         self.assertEqual(self.record(), {
             "session_id": SESSION,
             "instances": [failed.name],
-            "footers": [],
             "phase": {"kind": "replying", "user_wrote_at": 100},
         })
         self.assertTrue((failed / "state").read_text().startswith("ENABLED=0\n"))
         self.assertTrue((restored / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
 
         second = self.run_cli("resume")
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -1214,11 +1189,10 @@ print("SENT: delivered")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
             instances=("delegate-abc", "showrunner-demo"),
-            footers=("demo",),
         )
         self.assertEqual(
             self.run_cli("status").stdout,
-            "paused: dailies, footer, status reports (replying)\n",
+            "paused: dailies, status reports (replying)\n",
         )
         kept = self.run_cli("keep")
         self.assertEqual(kept.returncode, 0, kept.stderr)
@@ -1375,7 +1349,7 @@ print("SENT: delivered")
     def test_tick_asks_nothing_when_no_paused_schedule_still_exists(self) -> None:
         path = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
-            instances=("showrunner-example",), footers=("example",), scheduled=False,
+            instances=("showrunner-example",), scheduled=False,
         )
         result = self.run_cli("tick", now=1_000)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1552,6 +1526,7 @@ print("SENT: delivered")
 
     def test_delivery_does_not_overwrite_newer_replying_phase(self) -> None:
         marker = self.root / "send-started"
+        release = self.root / "send-release"
         send = self.root / "send-slow.py"
         _ = send.write_text(
             "".join((
@@ -1559,7 +1534,10 @@ print("SENT: delivered")
                 "import os, time\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['SEND_MARKER']).touch()\n",
-                "time.sleep(2)\n",
+                "release = Path(os.environ['SEND_RELEASE'])\n",
+                f"deadline = time.monotonic() + {TEST_WALL}\n",
+                "while not release.exists() and time.monotonic() < deadline:\n",
+                "    time.sleep(0.01)\n",
                 "print('SENT: delivered')\n",
             ))
         )
@@ -1575,6 +1553,8 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SEND": str(send),
             "CONVERSATION_PAUSE_NOW_EPOCH": "150",
             "SEND_MARKER": str(marker),
+            # The send holds until the typed prompt is done, however slowly a loaded machine runs it.
+            "SEND_RELEASE": str(release),
         }
         process = subprocess.Popen(
             [sys.executable, str(LIBRARY), "tick"],
@@ -1586,6 +1566,7 @@ print("SENT: delivered")
         try:
             self.wait_for_path(marker)
             typed = self.run_prompt("new topic", now=160)
+            release.touch()
             self.assertEqual(
                 (typed.returncode, typed.stdout, typed.stderr), (0, "", "")
             )
@@ -1963,11 +1944,9 @@ print("SENT: delivered")
         instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
         unit_report = self.create_instance("delegate-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
-        switch = self.footer_off("demo")
         _ = self.write_record(
             asked_read(100, 1),
             instances=("showrunner-demo", "delegate-abc"),
-            footers=("demo",),
         )
         tick = self.run_cli("tick", now=400)
         self.assertEqual(tick.returncode, 0, tick.stderr)
@@ -1976,13 +1955,11 @@ print("SENT: delivered")
             {
                 "session_id": SESSION,
                 "instances": [],
-                "footers": [],
                 "phase": {"kind": "returned", "returned_at": 400},
             },
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
         self.assertIn(["unpause", "showrunner-demo"], self.calls(self.notifier_log))
         self.assertIn(["unpause", "delegate-abc"], self.calls(self.notifier_log))
         self.assertNotIn(["remove", "conversation-pause"], self.calls(self.notifier_log))
@@ -1998,11 +1975,9 @@ print("SENT: delivered")
         failed = self.create_instance("delegate-alpha", enabled=False, paused=True)
         restored = self.create_instance("delegate-beta", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
-        switch = self.footer_off("demo")
         _ = self.write_record(
             asked_read(100, 1),
             instances=(failed.name, restored.name),
-            footers=("demo",),
         )
         first = self.run_cli(
             "tick", now=400, extra_env={"FAIL_RESUME_FOR": failed.name}
@@ -2013,12 +1988,10 @@ print("SENT: delivered")
         self.assertEqual(self.record(), {
             "session_id": SESSION,
             "instances": [failed.name],
-            "footers": [],
             "phase": asked_read(100, 1),
         })
         self.assertTrue((failed / "state").read_text().startswith("ENABLED=0\n"))
         self.assertTrue((restored / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
         self.assertTrue(watcher.exists())
 
         second = self.run_cli("tick", now=401)
@@ -2062,12 +2035,10 @@ print("SENT: delivered")
 
     def test_kept_off_session_end_restores_items_and_removes_watcher(self) -> None:
         instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
-        switch = self.footer_off("demo")
         watcher = self.create_instance("conversation-pause", run="tick")
         record_path = self.write_record(
             {"kind": "kept_off"},
             instances=("showrunner-demo",),
-            footers=("demo",),
         )
         running = self.run_cli("tick", now=100)
         self.assertEqual(running.returncode, 0, running.stderr)
@@ -2077,7 +2048,6 @@ print("SENT: delivered")
         gone = self.run_cli("tick", now=101, extra_env={"SESSION_RUNNING": "0"})
         self.assertEqual(gone.returncode, 0, gone.stderr)
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
         self.assertFalse(record_path.exists())
         self.assertFalse(watcher.exists())
 
@@ -2085,11 +2055,9 @@ print("SENT: delivered")
         failed = self.create_instance("delegate-alpha", enabled=False, paused=True)
         restored = self.create_instance("delegate-beta", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
-        switch = self.footer_off("demo")
         path = self.write_record(
             {"kind": "kept_off"},
             instances=(failed.name, restored.name),
-            footers=("demo",),
         )
         first = self.run_cli(
             "tick",
@@ -2102,12 +2070,10 @@ print("SENT: delivered")
         self.assertEqual(self.record(), {
             "session_id": SESSION,
             "instances": [failed.name],
-            "footers": [],
             "phase": {"kind": "kept_off"},
         })
         self.assertTrue(path.exists())
         self.assertTrue((restored / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
 
         second = self.run_cli("tick", now=101, extra_env={"SESSION_RUNNING": "0"})
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -2119,11 +2085,9 @@ print("SENT: delivered")
 
     def test_missing_session_returns_updates_and_deletes_record(self) -> None:
         instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
-        switch = self.footer_off("demo")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 10},
             instances=("showrunner-demo",),
-            footers=("demo",),
         )
         result = self.run_cli(
             "tick", now=20, extra_env={"SESSION_RUNNING": "0"}
@@ -2131,7 +2095,6 @@ print("SENT: delivered")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
-        self.assertFalse(switch.exists())
 
     def test_first_pause_creates_one_watcher_with_exact_arguments(self) -> None:
         _ = self.create_instance("delegate-abc")
@@ -2285,27 +2248,21 @@ print("SENT: delivered")
         returned_instance = self.create_instance(
             "showrunner-returned", session_id="returned-session", enabled=False, paused=True
         )
-        _ = self.footer_off("asked")
-        _ = self.footer_off("quiet")
-        _ = self.footer_off("returned")
         _ = self.create_instance("conversation-pause", run="tick")
         paths = {
             "asked": self.write_record(
                 asked_read(100, 1),
                 instances=(asked_instance.name,),
-                footers=("asked",),
                 session_id="asked-session",
             ),
             "quiet": self.write_record(
                 {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
                 instances=(quiet_instance.name,),
-                footers=("quiet",),
                 session_id="quiet-session",
             ),
             "returned": self.write_record(
                 {"kind": "returned", "returned_at": 100},
                 instances=(returned_instance.name,),
-                footers=("returned",),
                 session_id="returned-session",
             ),
         }
@@ -2409,11 +2366,9 @@ print("SENT: delivered")
     def test_release_leaves_out_what_was_stopped_by_hand_since_the_pause(self) -> None:
         paused = self.create_instance("delegate-abc", enabled=False, paused=True)
         stopped = self.create_instance("showrunner-demo", enabled=False)
-        _ = self.footer_off("demo", by_hand=True)
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
             instances=(paused.name, stopped.name),
-            footers=("demo",),
         )
 
         with patch.dict(os.environ, self.environment, clear=True):
@@ -2422,9 +2377,16 @@ print("SENT: delivered")
         self.assertEqual(
             released,
             conversation_pause.PauseRecord(
-                SESSION, (paused.name,), (), conversation_pause.Replying(1),
+                SESSION, (paused.name,), conversation_pause.Replying(1),
             ),
         )
+
+    def test_a_record_written_while_footers_existed_still_loads(self) -> None:
+        path = self.write_record({"kind": "kept_off"}, instances=("delegate-abc",))
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        _ = path.write_text(json.dumps({**fields, "footers": ["demo"]}))
+        self.assertEqual(conversation_pause.read_record(path), conversation_pause.PauseRecord(
+            SESSION, ("delegate-abc",), conversation_pause.KeptOff()))
 
     def test_release_returns_record_and_later_tick_resumes_nothing(self) -> None:
         instance = self.create_instance("delegate-abc", enabled=False, paused=True)
@@ -2432,7 +2394,6 @@ print("SENT: delivered")
         path = self.write_record(
             {"kind": "kept_off"},
             instances=(instance.name,),
-            footers=("demo",),
         )
 
         with patch.dict(os.environ, self.environment, clear=True):
@@ -2443,7 +2404,6 @@ print("SENT: delivered")
             conversation_pause.PauseRecord(
                 SESSION,
                 (instance.name,),
-                ("demo",),
                 conversation_pause.KeptOff(),
             ),
         )

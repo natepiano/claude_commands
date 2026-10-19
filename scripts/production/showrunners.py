@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,8 @@ NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / 
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+# Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
+SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 PARENT_FILE = "parent"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -227,35 +231,138 @@ def production_slug(doc: str) -> str:
     return slug
 
 
+def session_state_dir(slug: str) -> Path:
+    """The showrunner's own state, which a new session id, a restart and a reboot keep; a wrap deletes it."""
+    return SHOWRUNNER_STATE_DIR / slug / "session"
+
+
+# The showrunner state a scratchpad held before session_state_dir.
+SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", "dailies_judgment.json",
+                 "dailies_state.json")
+
+
+def copy_session_state(slug: str, scratch: Path) -> list[str]:
+    """Copy each state file the scratchpad holds and the state directory does not; a copy never replaces one."""
+    target = session_state_dir(slug)
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for name in SESSION_STATE:
+        source, destination = scratch / name, target / name
+        if destination.exists() or not source.exists():
+            continue
+        if source.is_dir():
+            _ = shutil.copytree(source, destination)
+        else:
+            _ = shutil.copy2(source, destination)
+        copied.append(name)
+    return copied
+
+
+def timer_scratch(slug: str) -> Path | None:
+    """The scratchpad of the session the production's update timer is addressed to, when it exists."""
+    try:
+        target = _fields(NOTIFIER_STATE_DIR / f"showrunner-{slug}" / "conf").get("TARGET", "")
+    except (OSError, UnicodeError):
+        return None
+    session_id = target.removeprefix("session:")
+    if not session_id or session_id == target:
+        return None
+    return next((path for path in sorted(SCRATCH_ROOT.glob(f"claude-*/*/{session_id}/scratchpad"))
+                 if path.is_dir()), None)
+
+
+def adopt_session_state(slug: str) -> list[str]:
+    """Bring a showrunner's scratchpad state into its state directory once, with no step by anyone.
+
+    Only the state files the directory lacks are looked for, so a showrunner that has moved costs one
+    stat per file.
+    """
+    target = session_state_dir(slug)
+    if all((target / name).exists() for name in SESSION_STATE):
+        return []
+    scratch = timer_scratch(slug)
+    return copy_session_state(slug, scratch) if scratch is not None else []
+
+
+def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
+    """Map a former production name to its current slug; leave other slugs unchanged."""
+    timers: list[Timer] = []
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+        try:
+            timer = _timer(instance)
+        except (OSError, KeyError, ValueError, UnicodeError):
+            continue
+        if timer.slug == slug:
+            return slug
+        timers.append(timer)
+    for timer in timers:
+        try:
+            text = timer.doc.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        # Only Production Context carries the line; an example elsewhere in the doc claims nothing.
+        context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+        formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
+        if formerly and slug in re.findall(r"`([^`]+)`", formerly[1]):
+            return timer.slug
+    return slug
+
+
 def current_name(slug: str) -> str:
     """The name now of the production's showrunner. Empty while it is not running or has no update timer."""
+    slug = canonical_slug(slug)
     return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+
+
+def herdr_space(slug: str, doc: str) -> str:
+    """The shared herdr session's workspace for a production, named for its showrunner.
+
+    The doc's `Showrunner session:` line names it, else the slug. The name never depends on whether
+    the showrunner runs, so a unit restarted before its showrunner finds the same workspace.
+    """
+    try:
+        text = Path(doc).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        text = ""
+    line = re.search(r"^- \*\*Showrunner session:\*\*\s*`?([^`\s]+)`?\s*$", text, re.MULTILINE)
+    return line[1] if line else slug
 
 
 def current_address(slug: str) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""
+    slug = canonical_slug(slug)
     socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
     return f"uds:{socket}" if socket else ""
 
 
 def named(showrunner: str) -> Showrunner:
     """The showrunner called `showrunner` now, or whose production has that slug."""
-    for runner in registered_showrunners():
-        if showrunner and showrunner in (runner["session"], runner["slug"]):
-            return runner
+    slug = canonical_slug(showrunner)
+    runners = registered_showrunners()
+    # The production a slug resolves to wins over a session that happens to share the name.
+    found = (next((runner for runner in runners if runner["slug"] == slug), None)
+             or next((runner for runner in runners if runner["session"] == showrunner), None))
+    if showrunner and found:
+        return found
     raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
+
+
+def timer_docs(state_dir: Path | None = None) -> dict[str, Path]:
+    """Each production with a complete update timer, by slug, with its doc, whether or not its showrunner runs."""
+    found: dict[str, Path] = {}
+    for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
+        try:
+            timer = _timer(instance)
+        except (OSError, KeyError, ValueError, UnicodeError):
+            continue
+        found[timer.slug] = timer.doc
+    return found
 
 
 def timer_slugs(state_dir: Path | None = None) -> set[str]:
     """Every production with a complete update timer, whether or not its showrunner runs."""
-    found: set[str] = set()
-    for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
-        try:
-            found.add(_timer(instance).slug)
-        except (OSError, KeyError, ValueError, UnicodeError):
-            continue
-    return found
+    return set(timer_docs(state_dir))
 
 
 def _stored_parent(child: str) -> str:
@@ -387,6 +494,8 @@ def own_slug() -> str:
 
 def attach(child: str, parent: str) -> None:
     """Store that `child` reports to `parent`. Raises ValueError naming why it cannot."""
+    child = canonical_slug(child)
+    parent = canonical_slug(parent)
     known = timer_slugs()
     for slug in (child, parent):
         if slug not in known:
@@ -411,6 +520,7 @@ def attach(child: str, parent: str) -> None:
 
 def detach(child: str) -> str:
     """Remove `child`'s parent file and return the parent it named. Raises ValueError when it has none."""
+    child = canonical_slug(child)
     parent = _stored_parent(child)
     if not parent:
         raise ValueError(f"{child} reports to no one")
@@ -503,7 +613,7 @@ def main(argv: list[str]) -> int:
                 raise ValueError(f"the showrunner of {slug} is not running")
             print(found)
         elif action in ("parent", "children", "root"):
-            slug = cast(str, args.slug)
+            slug = canonical_slug(cast(str, args.slug))
             if slug not in timer_slugs():
                 raise ValueError(f"{slug} has no update timer")
             # A root prints no parent and no children: an empty answer is the answer.
@@ -515,10 +625,11 @@ def main(argv: list[str]) -> int:
             for line in tree_lines(registered_showrunners()):
                 print(line)
         elif action == "attach":
-            child = cast(str, args.child)
+            child = canonical_slug(cast(str, args.child))
             parent = cast(str | None, args.parent) or own_slug()
             if not parent:
                 raise ValueError("name the parent: this session runs no production")
+            parent = canonical_slug(parent)
             attach(child, parent)
             top = root_of(parent)
             print(f"{child} now reports to {parent}")
@@ -529,7 +640,7 @@ def main(argv: list[str]) -> int:
             }, f"showrunner-tree:{child}"):
                 print(line)
         elif action == "detach":
-            child = cast(str, args.child)
+            child = canonical_slug(cast(str, args.child))
             parent = detach(child)
             print(f"{child} no longer reports to {parent}")
             text = f"{child} no longer reports to {parent}. {child} is a root again."

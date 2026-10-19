@@ -10,7 +10,7 @@ and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer and prints one Markdown table,
 `| Unit | Session | Phase | Task |`, one row per live unit:
 
-- **Session**: the unit's session name now, or `gone` (no tmux session carries
+- **Session**: the unit's session name now, or `gone` (no herdr session carries
   its mark), `not running` (Claude has stopped in it) or `unknown`.
 - **Phase**: `<n> of <total> · <title>` for the open phase; otherwise
   `between phases, <done> of <total> done`, `not started`, `plan done`,
@@ -18,5 +18,5 @@ production from this session's update timer and prints one Markdown table,
 - **Task**: the step the unit's newest run has open in that phase, as
   `<step>: <what it does>`, or `—`.
 
-It reads only run records and tmux marks, never a pane. When it exits non-zero,
+It reads only run records and session marks, never a pane. When it exits non-zero,
 report its error in one line.

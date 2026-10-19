@@ -30,8 +30,9 @@ State:
   reuse it on every resume.
 
 Apply <ReviewPoolStart/> at start or resume. Handle merge lines with
-<ReviewMemory/>, hourly messages with <ReviewPoolHealth/>, and dailies
-requests with <ReviewPoolDailies/>. Apply <ReviewTurnEnd/> after each turn.
+<ReviewMemory/>. Apply <ReviewTurnEnd/> after each turn. A `Scheduled review
+health` message comes from a timer an older version of this command set: remove
+it as <ReviewPoolStart/> does and end idle.
 
 <ReviewPoolStart>
 Read the production doc and your Units row at start, on resume and after
@@ -65,20 +66,21 @@ commands in order; they reuse the existing run and open phase:
 ```
 
 Report a recorder failure to the showrunner and end blocked. Do not run
-`prepare_session.sh`, create a marker under `/tmp/claude/delegate/active/`,
+`prepare_session.sh`, create a marker under `/tmp/claude/unit/active/`,
 or register a `/unit:report` notifier. Read the existing memory, then apply
 <PrimeReviewMemory/> for each type named in **Review pool**.
 
-At start and on resume, retarget the hourly health message:
+Reviewers are permanent, so nothing ages out and no timer runs. At start and
+on resume, remove the hourly health timer an older version of this command set:
 
 ```sh
-zsh ~/.claude/scripts/message/notifier.sh new "review-health-${SLUG}" \
-  --to "session:${CLAUDE_CODE_SESSION_ID}" --every 60 \
-  --from "review-health-${SLUG}" \
-  --command "Scheduled review health for ${PRODUCTION_DOC}: read ~/.claude/commands/review/direct.md, apply <ReviewPoolHealth/> and <ReviewTurnEnd/>."
+zsh ~/.claude/scripts/message/notifier.sh remove "review-health-${SLUG}" >/dev/null 2>&1 || true
 ```
 
-Report a failed prime or timer registration to the showrunner with its reason.
+Report a failed prime to the showrunner with its reason. When a pool command
+says a stop did not finish, report it and run
+`~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop
+--production <slug>` again; do not prime while stop keeps failing.
 </ReviewPoolStart>
 
 <PrimeReviewMemory>
@@ -98,7 +100,9 @@ With a guide, concatenate in this order:
 3. `docs/design-decisions.md` of the repository that holds the production
    doc, when present, under `## Design decisions`: the file the helper reads
    from a unit's worktree.
-4. The `ui` section of `${POOL_DIR}/memory/repository.md`.
+4. That repository's targets file (`docs/hana/targets.md` in hana), when
+   present, under `## Targets`.
+5. The `ui` section of `${POOL_DIR}/memory/repository.md`.
 
 An absent memory section contributes no text. A missing base prompt is a
 failure to report, never another type's prompt. An unreadable guide or rule
@@ -109,8 +113,9 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py prime
 --production <slug> --type <type> --instructions-file <absolute standing file>`.
 It prints the prompt hash. Never edit or remove the copies under `prime/`.
 A turn record's `prime_hash` names the memory the reviewer received; keep no
-separate version count. A changed prompt starts a new template; leased
-reviewers keep their earlier prompt through closure and retire at lease end.
+separate version count. A changed prompt starts a new template and points
+every idle reviewer at it, so each one's next turn carries it; a reviewer busy
+at prime time gets it at its next allocation.
 </PrimeReviewMemory>
 
 <ReviewMemory>
@@ -144,55 +149,22 @@ fits.
 Store rules and defect classes, never diffs, code, shots or complete review
 output.
 After each repository section changes, apply <PrimeReviewMemory/> for that
-type. The launcher sends the unit file at lease ordinal 1 for `code` and on
-every `ui` turn, through
+type. The launcher sends the unit file on a reviewer's first turn, for both
+types, through
 `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py unit-memory
 --production <slug> --unit <unit>`; that prints the file, or nothing when absent.
 </ReviewMemory>
-
-<ReviewPoolHealth>
-Each hour run `~/.claude/scripts/lib/py
-~/.claude/scripts/delegate/review_pool.py health --production <slug>`.
-`health` prints each reviewer whose lease it ended on its own stdout line;
-it reports busy reviewers on stderr with `lease left intact`. Message the
-showrunner only when it ended a lease or a command failed; say nothing
-otherwise.
-When a pool command says a stop did not finish, report it and run
-`~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop
---production <slug>` again; do not prime while stop keeps failing.
-</ReviewPoolHealth>
-
-<ReviewPoolDailies>
-At each dailies, read the production's start date, the day its doc entered
-Git:
-
-```sh
-git -C "$(dirname "${PRODUCTION_DOC}")" log --diff-filter=A --follow --format=%as -- "$(basename "${PRODUCTION_DOC}")" | tail -n 1
-```
-
-If it prints nothing, report the missing start date to the showrunner. With
-that date, run on natedev
-`~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool_report.py
---since <production start date> --quality` and send its tables, outcome counts,
-incomplete costs and source warnings to the showrunner. The hourly
-`usage-collect` job builds the shared usage store for both machines. If the
-store is absent, give its warning with the tables; an empty cost cell means
-unavailable, never zero. Report a failed command with its reason.
-</ReviewPoolDailies>
 
 <ReviewTurnEnd>
 Process runnable merge messages, memory changes and due reports before ending
 the turn. Every turn ends with one of these lines:
 
-- Idle, including after a health or dailies message:
-  `— holding: waiting for review requests`.
+- Idle: `— holding: waiting for review requests`.
 - A missing input or failed operation needs the showrunner:
   `— blocked: waiting on the showrunner: <cause>`.
 - A choice only the user can make, routed through the showrunner:
   `— decision: <question>`.
-- The showrunner ends the production: remove the timer with
-  `zsh ~/.claude/scripts/message/notifier.sh remove review-health-<slug>`,
-  finish pending memory work, and close the standing phase and run with
+- The showrunner ends the production: finish pending memory work, and close the standing phase and run with
   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/progress_history.py finish-run --session-dir "${REVIEW_SESSION_DIR}" --status completed`.
   On failure, report it and end blocked. Otherwise acknowledge that no more
   primes will run and end

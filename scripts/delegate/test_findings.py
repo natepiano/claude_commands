@@ -194,6 +194,56 @@ class FindingsLedgerTests(unittest.TestCase):
         findings = cast(list[dict[str, object]], self.status()["findings"])
         self.assertEqual([finding["title"] for finding in findings], ["six's finding"])
 
+    def write_two_open_phases(self) -> None:
+        """Phase 15 started first and stays open while Phase 16 is the newest."""
+        state = {
+            "history_file": str(self.history_file),
+            "phase": {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
+            "open_phases": [{"instance_id": "phase-fifteen", "id": "15", "title": "15",
+                             "status": "active"}],
+        }
+        _ = (self.session_dir / "progress_history_state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+    def phase_status(self, phase: str) -> dict[str, object]:
+        return cast(dict[str, object], json.loads(self.run_command("status", "--phase", phase)))
+
+    def test_a_landed_repair_for_the_older_open_phase_touches_only_its_ledger(self) -> None:
+        self.write_two_open_phases()
+        fifteen = self.run_command("open", "--phase", "15", "--severity", "blocker",
+                                   "--title", "fifteen's finding", "--caught-by", "delegate")
+        sixteen = self.run_command("open", "--phase", "16", "--severity", "blocker",
+                                   "--title", "sixteen's finding", "--caught-by", "delegate")
+        _ = self.run_command("dispatch", "--phase", "15", "--covers", fifteen)
+        _ = self.run_command("dispatch", "--phase", "16", "--covers", sixteen)
+
+        self.assertEqual(self.run_command("landed", "--phase", "15"), f"round 1 landed: {fifteen}")
+
+        older = self.phase_status("15")
+        newer = self.phase_status("16")
+        self.assertEqual(older["in_flight"], [])
+        self.assertEqual(newer["in_flight"], [sixteen])
+        self.assertEqual([finding["title"] for finding in cast(list[dict[str, object]], newer["findings"])],
+                         ["sixteen's finding"])
+        live = cast(dict[str, object], json.loads(
+            (self.session_dir / "findings_state.json").read_text(encoding="utf-8")))
+        self.assertEqual(live["phase_id"], "16")
+
+    def test_a_ledger_call_naming_no_phase_is_refused_while_two_are_open(self) -> None:
+        self.write_two_open_phases()
+        result = self.run_failing_command("open", "--severity", "blocker", "--title", "which phase",
+                                          "--caught-by", "delegate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("2 phases are open (15, 16); name one with --phase", result.stderr)
+        self.assertEqual(list(self.session_dir.glob("findings_state*.json")), [])
+
+    def test_a_ledger_call_naming_a_closed_phase_is_refused(self) -> None:
+        self.write_two_open_phases()
+        result = self.run_failing_command("landed", "--phase", "14")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
+
     def test_ids_are_stable_across_rounds(self) -> None:
         self.assertEqual(self.open_finding("blocker", "first"), "F001")
         self.assertEqual(self.open_finding("minor", "second"), "F002")

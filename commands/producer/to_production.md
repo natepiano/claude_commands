@@ -73,6 +73,8 @@ and merged units.
    - title `# <source title> — <unit>`, the delegate-ready status line, and the
      source's `As-built disposition` line when it has one;
    - the **Production line** from the production format;
+   - the source's **Issues** line when it has one, naming only the issues whose
+     phases this unit takes;
    - **Delegation Context** copied from the source. Narrow **Layout**, **Key
      files**, **Test lanes** and the **Build / Test / Lint** lines to this unit's
      files and packages. Keep **Invariants** whole. Leave out **Project
@@ -89,7 +91,8 @@ and merged units.
      \`<merge branch>\``;
    - every phase number mentioned in moved text is rewritten to its new number,
      or to the other unit's name and number. Substitute highest-first.
-4. **Header line.** Add the Production line to the kept source plan too.
+4. **Header line.** Add the Production line to the kept source plan too, and
+   narrow its Issues line to the issues whose phases it keeps.
 </WriteUnitPlans>
 
 ---
@@ -101,17 +104,22 @@ production format, with status `planned`:
 - **Units:**
   - **Worktree:** `<parent of ${REPO}>/<name>-<area>`, with a branch of the
     same name.
-  - **Session:** the unit name. If a tmux session with that name already
+  - **Session:** the unit name. If a herdr session with that name already
     exists, add the production name as a prefix.
   - **Port:** a distinct app port per unit, only when the project launches an
     app for smoke tests. Never the user's default port. The repository's
     memory names the default.
   - **Owns:** the files greenlight gave the unit.
 - **Hub files** and **Gates** are copied from the greenlight result.
-- **Merge tests:** the app package whose tests catch cross-crate breaks, if
-  one exists.
+- **Merge tests:** the command that runs the app package's tests, which catch
+  cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,
+  never a bare package name.
 - **Log:** `docs/handoff/<name>-production-log.md`.
 - **Updates:** every 15 minutes (user, 2026-09-28).
+- **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,
+  named for the top-level showrunner that will run it (a child production uses
+  its root's list); `change_review.py showrunner --production <doc>` prints the
+  name once the showrunner runs.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
   saved-state migrations, checks on other machines, final validation.

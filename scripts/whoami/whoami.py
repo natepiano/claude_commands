@@ -11,7 +11,7 @@ from pathlib import Path
 from account import label_for
 from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Quota, Report,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
-                            seats_home as resolve_seats_home)
+                            observe_workers_home as resolve_workers_home, NoWorkersHome)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
@@ -28,13 +28,13 @@ def quota_line(quota: Quota) -> str:
     return f"  {quota.label}: {remaining}; resets {reset_time(quota.resets_at)}"
 
 
-def render(report: Report, selection: ClaudeAccountsInUse, seats_home: Path) -> list[str]:
-    multiple_codex_homes = report.tool == "Codex" and len(codex_homes(seats_home)) > 1
-    codex_seats = multiple_codex_homes and codex_report_in_use(report, seats_home)
+def render(report: Report, selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[str]:
+    multiple_codex_homes = report.tool == "Codex" and len(codex_homes(workers_home)) > 1
+    codex_workers = multiple_codex_homes and codex_report_in_use(report, workers_home)
     header = report.tool
     if (multiple_codex_homes and (report.problem or report.email is None)
             and isinstance(report.source, CodexHomeSource)):
-        role = ", seats" if codex_seats else ""
+        role = ", workers" if codex_workers else ""
         header += f" ({codex_home_display(report.source.home)}{role})"
     lines = [header]
     if report.problem:
@@ -47,8 +47,8 @@ def render(report: Report, selection: ClaudeAccountsInUse, seats_home: Path) -> 
         roles: tuple[str, ...] = ()
         if report.tool == "Claude" and selection.multiple_accounts:
             roles = ("in use",) if selection.is_in_use(email) else ()
-        elif codex_seats:
-            roles = ("seats",)
+        elif codex_workers:
+            roles = ("workers",)
         role = f" ({', '.join(roles)})" if roles else ""
         lines.append(f"  Account: {label}{role} — {email}" if label != email else f"  Account: {email}{role}")
     lines.append(f"  Plan: {report.plan or 'unavailable'}")
@@ -70,11 +70,13 @@ async def main() -> None:
     from scripts.accounts import accounts
 
     selection = accounts.claude_account_selection()
-    seats_home = resolve_seats_home()
-    reports = await live_reports(selection, seats_home)
+    workers_home = resolve_workers_home()
+    if isinstance(workers_home, NoWorkersHome):
+        print(workers_home.reason, file=sys.stderr)
+    reports = await live_reports(selection, workers_home)
     reports = [report for report in reports
                if report.tool != "Claude" or report.email is None or selection.is_in_use(report.email)]
-    print("\n\n".join("\n".join(render(report, selection, seats_home)) for report in reports))
+    print("\n\n".join("\n".join(render(report, selection, workers_home)) for report in reports))
 
 
 if __name__ == "__main__":

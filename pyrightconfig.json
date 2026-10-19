@@ -20,6 +20,16 @@
       ]
     },
     {
+      "root": "scripts/delegate",
+      "extraPaths": [
+        ".",
+        "scripts/production",
+        "scripts/message",
+        "scripts/herdr",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
@@ -45,16 +55,21 @@
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
+        "scripts/delegate",
         "scripts/message",
         "scripts/notify",
         "scripts/production",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/shutdown",
+        "scripts/herdr"
       ]
     },
     {
-      "root": "scripts/fix",
+      "root": "scripts/style",
       "extraPaths": [
-        "scripts/fix",
+        ".",
+        "scripts/style",
+        "scripts/production",
         "scripts/lib"
       ]
     },
@@ -197,6 +212,19 @@
       "extraPaths": [
         "scripts/bevy_migration_plan",
         "scripts/bevy_upgrade"
+      ]
+    },
+    {
+      "root": "scripts/statusline",
+      "extraPaths": [
+        ".",
+        "scripts/statusline",
+        "scripts/hooks",
+        "scripts/delegate",
+        "scripts/message",
+        "scripts/notify",
+        "scripts/production",
+        "scripts/lib"
       ]
     },
     {

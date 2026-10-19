@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -13,21 +14,32 @@ import unittest
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from zoneinfo import ZoneInfo
 
-if TYPE_CHECKING:
-    from herdr import SessionListResult
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+
+import fake_unit_host
+from fake_unit_host import HostedUnit
+
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
 PANE = "— holding: waiting on a decision\n"
+EDIT_PROMPT = ("— holding: waiting on the seats\n\n Edit file\n scripts/herdr/panes.py\n"
+               + " Do you want to make this edit to panes.py?\n ❯ 1. Yes\n   2. No\n")
+BASH_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n\n"
+               + " Do you want to proceed?\n ❯ 1. Yes\n   3. No, and tell Claude what to do differently (esc)\n")
 
 
 def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
     path.chmod(0o755)
 
+
+# A marked worker is python, not sleep: the Mac hides a system binary's environment from ps.
+MARKED_SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
@@ -46,14 +58,13 @@ class StallWatchTests(unittest.TestCase):
         self.projects: Path = Path()
         self.state: Path = Path()
         self.ps_file: Path = Path()
-        self.tmux_file: Path = Path()
         self.send_log: Path = Path()
         self.fail_file: Path = Path()
         self.environment: dict[str, str] = {}
         self.panes: dict[str, dict[str, str | int]] = {}
         self.process_rows: list[str] = []
         self.children: list[subprocess.Popen[bytes]] = []
-        # A unit's Plan cell and the state mark on its tmux session, where a test sets one.
+        # A unit's Plan cell and the state mark on its herdr pane, where a test sets one.
         self.plans: dict[str, str] = {}
         self.states: dict[str, str] = {}
 
@@ -95,37 +106,20 @@ raise SystemExit(1)
         self.projects.mkdir()
         self.state = self.root / "stall-state"
         self.ps_file = self.root / "ps.txt"
-        self.tmux_file = self.root / "tmux.json"
         self.send_log = self.root / "sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
         self.config = self.root / "showrunners.json"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
-        # Each pane is one tmux session marked as the unit it is keyed by.
-        executable(self.bin / "tmux", """#!/usr/bin/env python3
-import json, os, sys
-panes = json.load(open(os.environ['STALL_TEST_TMUX_FILE']))
-args = sys.argv[1:]
-if args[0] == 'list-panes':
-    for unit, data in panes.items():
-        print(f"${data['id']}\\t%{data['id']}\\t{data['label']}")
-    raise SystemExit(0)
-target = args[args.index('-t') + 1]
-matches = [unit for unit, data in panes.items() if target in (f"${data['id']}", f"%{data['id']}")]
-if len(matches) != 1:
-    raise SystemExit(1)
-data = panes[matches[0]]
-if args[0] == 'show-environment':
-    print(f"SHOWRUNNER_UNIT={data['slug']}\\nSHOWRUNNER_UNIT_ID={matches[0]}")
-else:
-    print(data['pane'])
-""")
         executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
         executable(self.bin / "send.py", """#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
-record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text')}
+record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
+          if '--' + name in args}
+if '--value' in args:
+    record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
 line = (json.dumps(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
@@ -151,16 +145,16 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_WATCH_STATE_DIR": str(self.state),
             "STALL_WATCH_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_PROJECTS_DIR": str(self.projects),
-            "STALL_WATCH_TMUX": "tmux",
-            "UNIT_LOOKUP_TMUX": str(self.bin / "tmux"),
             "STALL_WATCH_PS": "ps",
             "STALL_WATCH_SEND": str(self.bin / "send.py"),
-            "STALL_TEST_TMUX_FILE": str(self.tmux_file),
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
+            # herdr reads a Mac process's marks with the real ps; the fake one answers only the watcher's list.
+            "HERDR_PS": shutil.which("ps") or "ps",
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }
@@ -231,9 +225,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
         child = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(child)
         pane_pid = 10_000 + len(self.panes)
-        self.process_rows += [f"{pane_pid} 1 tmux pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
+        self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
-        self.panes[name] = {"pane": PANE, "id": pane_id, "slug": "showrunner", "label": f"label-of-{name}"}
+        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "slug": "showrunner", "label": f"label-of-{name}"}
         socket_path = self.record_session(child.pid, f"sid-{name}", "different-remote-name")
         # The lookup reads the record itself: it needs the pane the session runs in, and a real socket.
         held = socket.socket(socket.AF_UNIX)
@@ -241,7 +235,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.addCleanup(held.close)
         record_path = self.sessions / f"{child.pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
-        _ = record_path.write_text(json.dumps({**record, "tmux": f"name-at-start:@1.%{pane_id}"}))
+        _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
         transcript = self.projects / "project" / f"sid-{name}.jsonl"
         transcript.parent.mkdir(exist_ok=True)
         _ = transcript.write_text("{}\n")
@@ -250,8 +244,14 @@ raise SystemExit(1 if record['to'] in fail else 0)
 
     def tick(self, at: int, *, together: int = 0) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
-        _ = self.tmux_file.write_text(json.dumps({
-            name: dict(pane) for name, pane in self.panes.items()}))
+        units = [
+            HostedUnit(str(data["label"]), f"w{data['id']}:p1",
+                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]),
+                       str(data.get("agent_status", "idle")))
+            for name, data in self.panes.items()]
+        fake_unit_host.write(self.environment, units)
+        for unit, data in zip(units, self.panes.values()):
+            fake_unit_host.place_process(self.environment, int(data["pid"]), unit.pane)
         # A unit's run state is read from the record of the newest /unit:direct run in its worktree.
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
@@ -277,32 +277,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
 
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
-        pid = self.children[0].pid
-        record_path = self.sessions / f"{pid}.json"
-        record = cast(dict[str, object], json.loads(record_path.read_text()))
-        _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
-        # Keep the fixture's unit for its run record, but remove its tmux mark from this production.
-        self.panes["unit-one"]["slug"] = "other"
-        for process_pid, parent, argv, environment in (
-            (991000, 0, ["herdr", "--session", "native", "server"], {}),
-            (pid, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "showrunner",
-                                      "SHOWRUNNER_UNIT_ID": "unit-one"}),
-        ):
-            path = self.root / "proc" / str(process_pid)
-            path.mkdir(parents=True)
-            _ = (path / "stat").write_text(f"{process_pid} (fixture) S {parent} 0 0")
-            _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
-            _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
-            (path / "cwd").symlink_to(self.root)
-        sessions: SessionListResult = {"sessions": [{
-            "name": "native", "running": True, "default": False,
-            "session_dir": "/fixture", "socket_path": "/fixture/socket"}]}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
-            "--session default session list --json": {"code": 0, "stdout": json.dumps(sessions)},
-            "--session native pane read w1:p1 --source recent-unwrapped --lines 400": {
-                "code": 0, "stdout": PANE},
-            "default": {"code": 1, "stdout": "unexpected herdr command"},
-        }))
+        self.panes["unit-one"]["label"] = "native"
         first = self.tick(START)
         second = self.tick(START + 300)
         self.assertEqual((first.returncode, second.returncode), (0, 0), first.stderr + second.stderr)
@@ -315,7 +290,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 300).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
-        # A rename changes the tmux label and the Claude name. The mark, and so the unit, stays.
+        # A rename changes the herdr label and the Claude name. The mark, and so the unit, stays.
         self.panes["unit-one"]["label"] = "renamed-by-the-user"
         record_path = self.sessions / f"{self.children[0].pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
@@ -373,6 +348,47 @@ raise SystemExit(1 if record['to'] in fail else 0)
         second = self.sent()[2:]
         self.assertEqual(len(second), 2)
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
+
+    def test_a_unit_at_a_permission_prompt_alerts_the_user_once_and_is_not_bumped(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        # A failed alert is sent again on the next tick.
+        _ = self.fail_file.write_text('["user"]')
+        failed = self.tick(START + 60)
+        self.assertIn("alert", failed.stderr)
+        _ = self.fail_file.write_text("[]")
+        self.assertEqual(self.tick(START + 120).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        alerts = self.sent()
+        self.assertEqual(len(alerts), 2, alerts)
+        self.assertEqual(alerts[-1]["to"], "user")
+        self.assertEqual(alerts[-1]["text-id"], "stall_watch.permission_prompt")
+        self.assertEqual(alerts[-1]["need"], "blocked")
+        values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
+        self.assertEqual((values["unit"], values["request"], values["since"]), ("unit-one", "edit panes.py", "12:00 PDT"))
+        # No bump and no tell while it waits on the user.
+        self.assertNotIn("uds:", " ".join(item["to"] for item in alerts))
+        # The prompt is answered: the idle clock starts again, and a new prompt alerts again.
+        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"]["pane"] = "— holding: ready for next step\n"
+        self.assertEqual(self.tick(START + 960).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.assertEqual(self.tick(START + 1000).returncode, 0)
+        self.assertEqual(self.tick(START + 1060).returncode, 0)
+        self.assertEqual([item["to"] for item in self.sent()[2:]], ["user"])
+
+    def test_the_request_is_read_from_the_prompt_at_the_bottom_of_the_pane(self) -> None:
+        import stall_watch
+        self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT), "edit panes.py")
+        self.assertEqual(stall_watch.prompt_request(BASH_PROMPT),
+                         "run a shell command to read lines 5 to the end of a saved output")
+        self.assertEqual(stall_watch.prompt_request(" Do you want to create notes.md?\n ❯ 1. Yes\n"), "create notes.md")
+        self.assertEqual(stall_watch.prompt_request("Bash command\n\n   ls\n\n Do you want to proceed?\n"),
+                         "run a shell command")
+        self.assertEqual(stall_watch.prompt_request("— holding: waiting\n"), "go on with its work")
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
@@ -437,6 +453,43 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 for path in self.state.glob("*.json"):
                     path.unlink()
 
+    def compacted(self, *entries: dict[str, object]) -> None:
+        """The pane after an idle compaction, and a transcript whose last turn holds `entries`."""
+        self.panes["unit-one"]["pane"] = "✻ Conversation compacted (ctrl+o for history)\n"
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        after = [{"type": "system", "subtype": "compact_boundary"},
+                 {"type": "user", "message": {"content": "summary: the unit was holding: on the user"}},
+                 {"type": "attachment"}]
+        _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in (*entries, *after)))
+        os.utime(transcript, (START - 3600, START - 3600))
+
+    @staticmethod
+    def said(*blocks: dict[str, str]) -> dict[str, object]:
+        return {"type": "assistant", "message": {"content": list(blocks)}}
+
+    def test_a_compacted_pane_reads_a_blocked_turn_end_from_the_transcript(self) -> None:
+        self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
+                       self.said({"type": "thinking", "thinking": ""}),
+                       self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}))
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 3600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_compacted_pane_bumps_when_the_transcript_turn_holds_or_went_on(self) -> None:
+        for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
+                              "— holding: waiting on the tests"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen")):
+            with self.subTest(status=status):
+                self.compacted(*last)
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                tell = next(item for item in self.sent() if item["key"].endswith(":tell"))
+                self.assertIn(f"Last status: {status}", tell["text"])
+                self.send_log.unlink()
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+
     def test_holding_turn_end_still_bumps_idle_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         self.panes["unit-one"]["pane"] = "— holding: waiting on a decision\n"
@@ -444,6 +497,39 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
+
+    def test_a_hold_that_states_its_end_is_not_bumped_before_then(self) -> None:
+        """START is 12:00 PDT: a hold ending at 14:00, dated or not, bumps only once 14:00 is past."""
+        for status in ("— holding: waiting on the re-measure window, which ends 2026-10-06 14:00 PDT",
+                       "— holding: waiting on the re-measure window until 14:00 PDT",
+                       "— holding: waiting on the window until 21:00 UTC",
+                       "— holding: waiting on the window, which opens Tue 10-06 14:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                for at in (START, START + 300, START + 7199):
+                    self.assertEqual(self.tick(at).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 7199 + 300).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_a_hold_naming_a_past_time_still_bumps(self) -> None:
+        """A time without a date is the nearest one: 11:50 read at 12:00 is this morning, not tonight."""
+        for status in ("— holding: waiting on the tests since 11:50 PDT",
+                       "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT",
+                       "— holding: waiting on the window, which closed Mon 10-05 14:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                self.assertEqual(len(self.sent()), 2)
 
     def test_shell_seen_then_gone_starts_a_new_idle_stretch(self) -> None:
         _ = self.tick(START)
@@ -520,13 +606,47 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.send_log.unlink(missing_ok=True)
                 _ = self.tick(START)
                 marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
-                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           env={**os.environ, **marks})
                 self.children.append(worker)
                 self.process_rows.append(f"{worker.pid} 1 sleep 60")
                 _ = self.tick(START + 300)
                 self.assertEqual(len(self.sent()), bumps)
                 _ = self.process_rows.pop()
+
+    def test_detached_work_with_a_former_production_mark_prevents_a_bump(self) -> None:
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
+        self.panes["unit-one"]["slug"] = "old-showrunner"
+        worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
+                                       "SHOWRUNNER_UNIT_ID": "unit-one"})
+        self.children.append(worker)
+        self.process_rows.append(f"{worker.pid} 1 sleep 60")
+        for at in (START, START + 300):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sent(), [])
+        _ = self.process_rows.pop()
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_detached_processes_share_one_slug_resolution_per_work_check(self) -> None:
+        import stall_watch
+        import showrunners
+
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
+        rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
+                stall_watch.Process(21, 1, "build")]
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(stall_watch, "unit_marks", return_value=("old-showrunner", "unit-one")),
+              mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads):
+            self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
+            self.assertEqual(reads.call_count, 1)
+            self.assertTrue(stall_watch.work_running(10, rows, ("showrunner", "unit-one")))
+            self.assertEqual(reads.call_count, 2)
 
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)
@@ -718,7 +838,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             json.dumps({"pid": "unreadable", "sessionId": "", "name": "", "running": False}))
         result = self.tick(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("stall-watch: unit-one: one or more session records could not be read", result.stderr)
+        self.assertIn(f"stall-watch: unit-one: the session record of pid {self.children[0].pid} could not be read", result.stderr)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
 

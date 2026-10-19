@@ -206,7 +206,9 @@ not codebase searching.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
      placement names a worktree, the Delegation Context's paths and `verify.sh`
      package names refer to *that* checkout, not the primary — getting this wrong
-     sends every delegate to the wrong tree.
+     sends every delegate to the wrong tree. Write those paths relative to the
+     repository, never the worktree's absolute path or its branch: /unit:direct
+     reads both from git at dispatch, so a renamed worktree needs no plan edit.
    - **Open questions in the placement become phases or blockers**, never silent
      assumptions. A gate that reads "decide publish vs git-rev pin" is a decision
      the plan must surface, not resolve on its own.
@@ -349,7 +351,8 @@ status line, done phases, untouched todo phases, links) exactly as found. Then g
    across verbatim when it has one. `/plan:to_as_built` reads it there at the end
    of the run, so it survives this rewrite rather than going out with the
    stripped narrative. A source doc without one leaves the line absent, which
-   that command reads as `create`.
+   that command reads as `create`. Carry its `Issues:` line across the same
+   way (`~/.claude/docs/delegate_plan_format.md`).
 2. `## Delegation Context` = ${DELEGATION_CONTEXT}.
 3. `## Phases` — each phase with its `#### Work Order`. Completed phases keep their
    archive form (status `done`, Work Order, Retrospective) below or after the live

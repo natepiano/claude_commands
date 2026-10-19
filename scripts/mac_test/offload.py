@@ -43,12 +43,10 @@ NonBusyMacDeclineReason = Literal[
     "state",
     "unreachable",
     "mac_busy",
-    "battery",
     "disk",
     "copy",
 ]
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
-MacPower = Literal["ac", "battery"]
 
 
 @dataclass(frozen=True)
@@ -64,6 +62,14 @@ class UnknownRepository:
 
 RepositoryIdentity = KnownRepository | UnknownRepository
 UNKNOWN_REPOSITORY = UnknownRepository()
+
+
+class AllMirrors:
+    """Every repository's mirror on the Mac."""
+
+
+MirrorScope = KnownRepository | AllMirrors
+ALL_MIRRORS = AllMirrors()
 
 
 @dataclass(frozen=True)
@@ -245,13 +251,13 @@ class OffloadRequest:
     result: ResultDestination
     nextest_words: tuple[str, ...]
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE
+    copy: bool = False
 
 
 @dataclass(frozen=True)
 class ProbeSnapshot:
     """Mac availability values returned by one remote probe."""
 
-    power: MacPower
     free_gib: float
     hostname: str
 
@@ -482,6 +488,7 @@ class CliArguments(argparse.Namespace):
         self.result: str | None = None
         self.settings: str = ""
         self.last_decline: str = ""
+        self.copy: bool = False
         self.nextest_words: list[str] = []
 
 
@@ -815,11 +822,9 @@ def probe_script(repository: KnownRepository) -> str:
     return "\n".join(
         (
             f'mkdir -p "$HOME"/{mirror} || exit 1',
-            "case \"$(pmset -g batt | head -1)\" in "
-            + "*\"AC Power\"*) power=ac ;; *) power=battery ;; esac",
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'power=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$power" "$free_gib" "$(hostname -s)"',
+            "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
+            + '"$free_gib" "$(hostname -s)"',
         )
     )
 
@@ -834,20 +839,16 @@ def parse_probe(output: str) -> ProbeResult:
         return UNAVAILABLE_PROBE
     try:
         free_gib = float(values["free_gib"])
-        power = values["power"]
         hostname = values["host"]
     except (KeyError, ValueError):
         return UNAVAILABLE_PROBE
-    if (
-        not math.isfinite(free_gib)
-        or power not in ("ac", "battery")
-        or not hostname
-    ):
+    if not math.isfinite(free_gib) or not hostname:
         return UNAVAILABLE_PROBE
-    return ProbeSnapshot(power, free_gib, hostname)
+    return ProbeSnapshot(free_gib, hostname)
 
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
+    copy_words = ["--copy"] if request.copy else []
     return [
         sys.executable,
         str(Path(__file__).with_name("mac_test.py")),
@@ -860,6 +861,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         str(request.repo_root),
         "--remote",
         config.host,
+        *copy_words,
     ]
 
 
@@ -1077,23 +1079,54 @@ def remote_test_command(
     )
 
 
-def mirror_selector_script() -> str:
-    return r'''select_leftovers() {
-    if command_pids=$(pgrep -u "$(id -u)" -f '[.]local/state/mac-test/mirror/'); then
+def extended_regex_literal(text: str) -> str:
+    """Match text literally in pgrep's and awk's extended regular expressions.
+
+    A character that is special inside a bracket (`]`, `^`, `\\`) matches any
+    character instead, which can only widen the selection by that position.
+    """
+    return "".join(
+        character if character.isalnum() or character in "_-"
+        else "." if character in "]^\\"
+        else f"[{character}]"
+        for character in text
+    )
+
+
+def mirror_selector_script(scope: MirrorScope) -> str:
+    """Define select_leftovers: the user's processes running from the scoped mirrors.
+
+    A repository's scope stops at its own mirror, so its leftover check never
+    reaches another repository's run. The `[.]` keeps each pattern from
+    matching this script's own text.
+    """
+    if isinstance(scope, KnownRepository):
+        name = extended_regex_literal(scope.name)
+        command_pattern = f"[.]local/state/mac-test/mirror/{name}([/'\"[:space:]]|$)"
+        cwd_pattern = f"^n.*/[.]local/state/mac-test/mirror/{name}(/|$)"
+    else:
+        command_pattern = "[.]local/state/mac-test/mirror/"
+        cwd_pattern = "^n.*/[.]local/state/mac-test/mirror(/|$)"
+    return (
+        f"mirror_command_pattern={shlex.quote(command_pattern)}\n"
+        + f"mirror_cwd_pattern={shlex.quote(cwd_pattern)}\n"
+        + r'''select_leftovers() {
+    if command_pids=$(pgrep -u "$(id -u)" -f "$mirror_command_pattern"); then
         :
     else
         selector_result=$?
         [ "$selector_result" -eq 1 ] || return 1
     fi
     cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn) || return 1
-    cwd_pids=$(printf '%s\n' "$cwd_records" | awk '/^p/ { pid = substr($0, 2) } /^n.*\/[.]local\/state\/mac-test\/mirror(\/|$)/ { print pid }') || return 1
+    cwd_pids=$(printf '%s\n' "$cwd_records" | awk -v pattern="$mirror_cwd_pattern" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }') || return 1
     printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
 }
 '''
+    )
 
 
-def leftover_check_script() -> str:
-    return mirror_selector_script() + r'''
+def leftover_check_script(repository: KnownRepository) -> str:
+    return mirror_selector_script(repository) + r'''
 leftover_pids=$(select_leftovers) || exit 1
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
@@ -1122,11 +1155,11 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
     return LeftoversEnded() if count == 0 else LeftoversRemain(count)
 
 
-def check_leftovers(config: OffloadConfig, host: str) -> LeftoverCheckResult:
-    """End and count mirror work without exposing the check to a second signal."""
+def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepository) -> LeftoverCheckResult:
+    """End and count one mirror's work without exposing the check to a second signal."""
     try:
         result = subprocess.run(
-            ["ssh", *ssh_options(config), host, leftover_check_script()],
+            ["ssh", *ssh_options(config), host, leftover_check_script(repository)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1158,15 +1191,15 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_taken_over_claim(
-    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable
+    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository
 ) -> LeftoverCheckResult:
     if isinstance(claim, TakenOverMacClaim):
-        return check_leftovers(config, claim.host)
+        return check_leftovers(config, claim.host, repository)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
 def claim_for_run(
-    controller: ProcessController, config: OffloadConfig, request: OffloadRequest
+    controller: ProcessController, config: OffloadConfig, request: OffloadRequest, repository: KnownRepository
 ) -> MacClaimAnswer:
     attempt = LocalClaimAttempt()
     try:
@@ -1179,7 +1212,7 @@ def claim_for_run(
         if isinstance(claim, FreshMacClaim):
             release_claim(controller)
         elif isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-            checked = check_taken_over_claim(config, claim)
+            checked = check_taken_over_claim(config, claim, repository)
             report_leftover_check(checked, request)
             if isinstance(checked, LeftoversEnded):
                 release_claim(controller)
@@ -1199,8 +1232,6 @@ def claimed_run(
         if isinstance(probe, UnavailableProbe):
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
-        if probe.power == "battery":
-            return declined("battery", started)
         if probe.free_gib < config.free_floor_gib:
             return declined("disk", started)
 
@@ -1209,11 +1240,12 @@ def claimed_run(
         if isinstance(copied, TreeCopyFailed):
             return declined("copy", started)
         copy_seconds = elapsed_seconds(copy_started)
-        print(
-            "mac_test: running on the Mac "
-            + f"(macOS, host {probe.hostname}); tree copied in {copy_seconds:.1f} s",
-            flush=True,
+        running = (
+            f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
+            if request.copy
+            else f"running on the Mac (macOS, host {probe.hostname})"
         )
+        print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         release_allowed = False
         remote_status = controller.stream_mac_run(
             [
@@ -1223,13 +1255,13 @@ def claimed_run(
         )
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MissingMacStatus):
-            checked = check_leftovers(config, config.host)
+            checked = check_leftovers(config, config.host, repository)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
             return LostMacRun(elapsed_seconds(started))
         report_cleanup(remote_status.cleanup)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            checked = check_leftovers(config, config.host)
+            checked = check_leftovers(config, config.host, repository)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
         else:
@@ -1241,7 +1273,7 @@ def claimed_run(
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
         if not release_allowed:
-            checked = check_leftovers(config, config.host)
+            checked = check_leftovers(config, config.host, repository)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
         raise
@@ -1271,9 +1303,9 @@ def run_offload(
     if isinstance(backoff, ActiveBackoff):
         return declined("backoff", started)
 
-    claim = claim_for_run(controller, config, request)
+    claim = claim_for_run(controller, config, request, repository)
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-        checked = check_taken_over_claim(config, claim)
+        checked = check_taken_over_claim(config, claim, repository)
         report_leftover_check(checked, request)
         if isinstance(checked, LeftoverCheckFailed):
             write_backoff(time.time() + config.unreachable_backoff_s)
@@ -1281,7 +1313,7 @@ def run_offload(
         if isinstance(checked, LeftoversRemain):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         release_claim(controller)
-        claim = claim_for_run(controller, config, request)
+        claim = claim_for_run(controller, config, request, repository)
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     if isinstance(claim, MacClaimNotConfirmed):
@@ -1333,6 +1365,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
+    _ = run.add_argument("--copy", action="store_true")
     _ = run.add_argument("--result")
     _ = run.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
@@ -1354,6 +1387,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         result=result_destination(arguments.result),
         nextest_words=tuple(words),
         last_decline=last_decline,
+        copy=arguments.copy,
     )
 
 

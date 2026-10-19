@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Allocate production reviewers immediately and retain their context for a phase."""
+"""Keep one reviewer per unit for a production and grow it only for concurrent reviews."""
 from __future__ import annotations
 
 import argparse
@@ -17,19 +17,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production.showrunners import canonical_slug  # noqa: E402
+
 ReviewerType = Literal["code", "ui"]
-Split = Literal["hash", "all", "off"]
 
 
 @dataclass(frozen=True)
 class Unleased:
-    """Available to take a new phase lease."""
+    """Available to take a new unit lease."""
 
 
 @dataclass(frozen=True)
-class PhaseLease:
+class UnitLease:
+    """The unit this reviewer belongs to; `ordinal` counts the reviews it has carried."""
     unit: str
-    phase: str
     ordinal: int
 
 
@@ -45,7 +47,6 @@ class ClaimedReviewer:
 
 class LeaseJson(TypedDict):
     unit: str
-    phase: str
     ordinal: int
 
 
@@ -61,13 +62,11 @@ class ReviewerJson(TypedDict):
     prime_hash: str
     lease: LeaseJson | None
     busy_pid: int | None
-    served: list[list[str]]
     reviews: int
     last_allocated: NotRequired[float]
 
 
 class PoolJson(TypedDict):
-    split: Split
     generation: int
     templates: dict[str, TemplateJson]
     reviewers: dict[str, ReviewerJson]
@@ -95,16 +94,14 @@ class Reviewer:
     type: ReviewerType
     thread_id: str
     prime_hash: str
-    lease: Unleased | PhaseLease
+    lease: Unleased | UnitLease
     ownership: IdleReviewer | ClaimedReviewer
-    served: list[tuple[str, str]] = field(default_factory=list)
     reviews: int = 0
     last_allocated: float = 0.0
 
 
 @dataclass
 class Pool:
-    split: Split = "hash"
     generation: int = 0
     stopping: bool = False
     next_index: dict[ReviewerType, int] = field(default_factory=lambda: {"code": 1, "ui": 1})
@@ -123,9 +120,7 @@ class PoolArguments(argparse.Namespace):
     pass_number: str = ""
     lens: str = ""
     pid: int = 0
-    fresh: bool = False
-    set: Split = "hash"
-    stale_hours: float = 12.0
+    apply: bool = False
     verb: str = ""
 
 
@@ -150,7 +145,7 @@ def _idle(reviewer: Reviewer) -> bool:
 
 
 def _decode(data: PoolJson) -> Pool:
-    pool = Pool(split=data.get("split", "hash"), generation=data.get("generation", 0),
+    pool = Pool(generation=data.get("generation", 0),
                 stopping=data.get("stopping", False))
     pool.next_index.update(data.get("next_index", {}))
     for name, record in data.get("templates", {}).items():
@@ -160,9 +155,9 @@ def _decode(data: PoolJson) -> Pool:
         pid = record["busy_pid"]
         pool.reviewers[name] = Reviewer(
             type=record["type"], thread_id=record["thread_id"], prime_hash=record["prime_hash"],
-            lease=Unleased() if lease is None else PhaseLease(**lease),
+            # A lease written before unit leases also names a phase; the unit is all it keeps.
+            lease=Unleased() if lease is None else UnitLease(lease["unit"], lease["ordinal"]),
             ownership=IdleReviewer() if pid is None else ClaimedReviewer(pid),
-            served=[(pair[0], pair[1]) for pair in record["served"]],
             reviews=record["reviews"], last_allocated=record.get("last_allocated", 0.0),
         )
     return pool
@@ -175,15 +170,12 @@ def _encode(pool: Pool) -> PoolJson:
         owner = reviewer.ownership
         reviewers[name] = {
             "type": reviewer.type, "thread_id": reviewer.thread_id, "prime_hash": reviewer.prime_hash,
-            "lease": None if isinstance(lease, Unleased) else {
-                "unit": lease.unit, "phase": lease.phase, "ordinal": lease.ordinal,
-            },
+            "lease": None if isinstance(lease, Unleased) else {"unit": lease.unit, "ordinal": lease.ordinal},
             "busy_pid": None if isinstance(owner, IdleReviewer) else owner.pid,
-            "served": [[number, lens] for number, lens in reviewer.served],
             "reviews": reviewer.reviews, "last_allocated": reviewer.last_allocated,
         }
     encoded: PoolJson = {
-        "split": pool.split, "generation": pool.generation,
+        "generation": pool.generation,
         "next_index": pool.next_index,
         "templates": {name: {
             "name": template.name, "thread_id": template.thread_id, "prime_hash": template.prime_hash,
@@ -266,6 +258,7 @@ def _production(value: str) -> ProductionPool:
     slug = Path(value).name.removesuffix("-production.md")
     if slug in ("", ".", ".."):
         raise PoolError("production must name a production or slug")
+    slug = canonical_slug(slug)
     root = Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
     return ProductionPool((root / slug).resolve())
 
@@ -323,7 +316,7 @@ def command_prime(args: PoolArguments) -> int:
             with production.locked() as pool:
                 _generation(pool, generation)
                 pool.templates[reviewer_type] = Template(name, _thread_id(result), prime_hash)
-            _retire_unleased(production, reviewer_type, generation)
+        _repoint_idle(production, reviewer_type, generation)
     finally:
         prompt.close()
         with production.locked(write=False) as pool:
@@ -335,6 +328,32 @@ def command_prime(args: PoolArguments) -> int:
     return 0
 
 
+def rename_unit(production: str, old: str, new: str) -> int:
+    """Carry a renamed unit's reviewers and memory to its new id; returns the leases moved.
+
+    Thread ids and ordinals stay, so the unit keeps the reviewers that already know it.
+    """
+    pool_dir = _production(production)
+    if not pool_dir.directory.exists():
+        return 0
+    moved = 0
+    with pool_dir.locked() as pool:
+        for reviewer in pool.reviewers.values():
+            lease = reviewer.lease
+            if isinstance(lease, UnitLease) and lease.unit == new:
+                raise PoolError(f"a reviewer is already leased to {new}")
+            if isinstance(lease, UnitLease) and lease.unit == old:
+                reviewer.lease = UnitLease(new, lease.ordinal)
+                moved += 1
+        memory = pool_dir.directory / "memory"
+        source, destination = memory / f"{old}.md", memory / f"{new}.md"
+        if source.exists():
+            if destination.exists():
+                raise PoolError(f"memory for {new} already exists")
+            _ = source.rename(destination)
+    return moved
+
+
 def command_unit_memory(args: PoolArguments) -> int:
     if not args.unit or Path(args.unit).name != args.unit or args.unit in (".", ".."):
         raise PoolError("unit must name one memory file")
@@ -344,23 +363,6 @@ def command_unit_memory(args: PoolArguments) -> int:
     except FileNotFoundError:
         return 0
     _ = sys.stdout.buffer.write(content)
-    return 0
-
-
-def command_arm(args: PoolArguments) -> int:
-    production = _production(str(args.production))
-    with production.locked(write=False) as pool:
-        enabled = "code" in pool.templates and (
-            pool.split == "all" or (pool.split == "hash" and
-                hashlib.sha256(f"{args.unit}\n{args.phase}".encode()).digest()[0] % 2 == 0)
-        )
-    print("pool" if enabled else "own")
-    return 0
-
-
-def command_split(args: PoolArguments) -> int:
-    with _production(str(args.production)).locked() as pool:
-        pool.split = args.set
     return 0
 
 
@@ -382,7 +384,33 @@ def _retire(production: ProductionPool, name: str, reviewer: Reviewer, generatio
     print(f"review_pool: retired {name}: {reason}{suffix}", file=sys.stderr)
 
 
-def _retire_unleased(production: ProductionPool, reviewer_type: ReviewerType, generation: int) -> None:
+def _repoint(production: ProductionPool, name: str, thread_id: str, prime_hash: str, generation: int,
+             pid: int) -> None:
+    """Point a reviewer this process claims at the copy of `prime_hash`; its next turn sends that prompt."""
+    path = production.directory / "prime" / f"{prime_hash}.md"
+    try:
+        prompt = path.open("rb")
+    except FileNotFoundError:
+        print(f"review_pool: {name} keeps its standing prompt: {path.name} was collected", file=sys.stderr)
+        return
+    with prompt:
+        # A shared lock keeps prompt collection off the file until the pool names it.
+        fcntl.flock(prompt, fcntl.LOCK_SH)
+        result = production.mesh("set-instructions", "--to", name, "--instructions-file", str(path),
+                                 generation=generation, mesh_generation=generation)
+        if result.returncode:
+            print(f"review_pool: {name} keeps its standing prompt: {_failure(result)}", file=sys.stderr)
+            return
+        with production.locked() as pool:
+            _generation(pool, generation)
+            current = pool.reviewers.get(name)
+            if current is not None and _owns(current, pid, thread_id):
+                current.prime_hash = prime_hash
+                production.collect_prompts(pool)
+
+
+def _repoint_idle(production: ProductionPool, reviewer_type: ReviewerType, generation: int) -> None:
+    """Give every idle reviewer of the type the current standing prompt; a busy one gets it at its next allocate."""
     pid = os.getpid()
     with production.locked(write=False) as pool:
         _generation(pool, generation)
@@ -392,98 +420,128 @@ def _retire_unleased(production: ProductionPool, reviewer_type: ReviewerType, ge
             _generation(pool, generation)
             reviewer = pool.reviewers.get(name)
             template = pool.templates.get(reviewer_type)
-            if (reviewer is None or template is None or reviewer.type != reviewer_type
-                    or reviewer.prime_hash == template.prime_hash
-                    or not isinstance(reviewer.lease, Unleased) or not _idle(reviewer)):
+            if (reviewer is None or template is None or reviewer.type != reviewer_type or not reviewer.thread_id
+                    or reviewer.prime_hash == template.prime_hash or not _idle(reviewer)):
                 continue
             reviewer.ownership = ClaimedReviewer(pid)
-        _retire(production, name, reviewer, generation, pid, "old prime hash")
+            thread_id = reviewer.thread_id
+            prime_hash = template.prime_hash
+        try:
+            _repoint(production, name, thread_id, prime_hash, generation, pid)
+        finally:
+            with production.locked() as pool:
+                current = pool.reviewers.get(name)
+                if current is not None and _owns(current, pid, thread_id):
+                    current.ownership = IdleReviewer()
 
 
-def _choose(pool: Pool, reviewer_type: ReviewerType, unit: str, phase: str, number: str,
-            lens: str, pid: int) -> tuple[str, Reviewer, Template]:
+def _unit_reviewers(pool: Pool, reviewer_type: ReviewerType, unit: str) -> list[tuple[str, Reviewer]]:
+    """The unit's reviewers of one type, most recently allocated first."""
+    owned = [(name, reviewer) for name, reviewer in pool.reviewers.items()
+             if reviewer.type == reviewer_type and reviewer.thread_id
+             and isinstance(reviewer.lease, UnitLease) and reviewer.lease.unit == unit]
+    return sorted(owned, key=lambda entry: (entry[1].last_allocated, entry[0]), reverse=True)
+
+
+def _choose(pool: Pool, reviewer_type: ReviewerType, unit: str, pid: int) -> tuple[str, Reviewer, str]:
+    """Pick the unit's idle reviewer, or reserve a new one and name the thread it forks from."""
     template = pool.templates.get(reviewer_type)
     if template is None:
         raise PoolError(f"no primed {reviewer_type} template")
-    candidates = [(name, reviewer) for name, reviewer in pool.reviewers.items()
-                  if reviewer.type == reviewer_type and reviewer.thread_id and _idle(reviewer)]
-    for name, reviewer in candidates:
-        lease = reviewer.lease
-        if (isinstance(lease, PhaseLease) and (lease.unit, lease.phase) == (unit, phase)
-                and not any(served_pass == number and served_lens != lens for served_pass, served_lens in reviewer.served)):
+    owned = _unit_reviewers(pool, reviewer_type, unit)
+    source = ""
+    for name, reviewer in owned:
+        if _idle(reviewer):
             break
     else:
-        for name, reviewer in candidates:
-            if isinstance(reviewer.lease, Unleased) and reviewer.prime_hash == template.prime_hash:
-                break
+        spare = [(name, reviewer) for name, reviewer in pool.reviewers.items()
+                 if reviewer.type == reviewer_type and reviewer.thread_id and _idle(reviewer)
+                 and isinstance(reviewer.lease, Unleased) and reviewer.prime_hash == template.prime_hash]
+        if spare and not owned:
+            name, reviewer = spare[0]
         else:
             index = pool.next_index[reviewer_type]
             while f"{reviewer_type}{index}" in pool.reviewers:
                 index += 1
             name = f"{reviewer_type}{index}"
             pool.next_index[reviewer_type] = index + 1
-            reviewer = Reviewer(reviewer_type, "", template.prime_hash, Unleased(), IdleReviewer())
+            # Every reviewer of the unit is busy: a fork of the newest starts with the unit's context.
+            if owned:
+                source, parent = owned[0]
+                reviewer = Reviewer(reviewer_type, "", parent.prime_hash, parent.lease, IdleReviewer())
+            else:
+                source = template.name
+                reviewer = Reviewer(reviewer_type, "", template.prime_hash, Unleased(), IdleReviewer())
             pool.reviewers[name] = reviewer
-    ordinal = reviewer.lease.ordinal if isinstance(reviewer.lease, PhaseLease) else 0
-    reviewer.lease = PhaseLease(unit, phase, ordinal + 1)
+    ordinal = reviewer.lease.ordinal if isinstance(reviewer.lease, UnitLease) else 0
+    reviewer.lease = UnitLease(unit, ordinal + 1)
     reviewer.ownership = ClaimedReviewer(pid)
-    reviewer.served.append((number, lens))
     reviewer.last_allocated = time.time()
-    return name, reviewer, template
+    return name, reviewer, source
 
 
 def command_allocate(args: PoolArguments) -> int:
     production = _production(str(args.production))
     pid = int(args.pid)
-    while True:
-        with production.locked() as pool:
-            generation = pool.generation
-            _require_finished_stop(pool)
-            name, reviewer, template = _choose(pool, args.type, str(args.unit),
-                                               str(args.phase), str(args.pass_number), str(args.lens), pid)
-        newly_forked = not reviewer.thread_id
-        if newly_forked:
-            result = production.mesh("fork", "--from", template.name, "--name", name,
+    with production.locked() as pool:
+        generation = pool.generation
+        _require_finished_stop(pool)
+        name, reviewer, source = _choose(pool, args.type, str(args.unit), pid)
+        template_name = pool.templates[args.type].name
+    newly_forked = not reviewer.thread_id
+    if newly_forked:
+        result = production.mesh("fork", "--from", source, "--name", name,
+                                 generation=generation, mesh_generation=generation)
+        if result.returncode and source != template_name:
+            # The unit's reviewer could not be forked; a template fork still serves the review.
+            print(f"review_pool: fork of {source} failed ({_failure(result)}); forking the template",
+                  file=sys.stderr)
+            result = production.mesh("fork", "--from", template_name, "--name", name,
                                      generation=generation, mesh_generation=generation)
-            with production.locked() as pool:
-                _generation(pool, generation)
-                current = pool.reviewers.get(name)
-                if current is None or not _owns(current, pid, ""):
-                    raise PoolError(f"{name} allocation ownership changed")
-                fork_error = ""
-                try:
-                    thread_id = _thread_id(result)
-                except PoolError as exc:
-                    fork_error = str(exc)
-                    del pool.reviewers[name]
-                    production.collect_prompts(pool)
-                    # Commit removal before reporting a failed fork.
-                    thread_id = ""
-                if thread_id:
-                    current.thread_id = thread_id
-                    reviewer.thread_id = thread_id
-            if not thread_id:
-                raise PoolError(f"fork {name} failed: {fork_error}")
-        if args.fresh and not newly_forked:
-            result = production.mesh("reset", "--to", name, generation=generation, mesh_generation=generation)
-            with production.locked(write=False) as pool:
-                _generation(pool, generation)
-            if result.returncode:
-                _retire(production, name, reviewer, generation, pid, f"reset failed: {_failure(result)}")
-                continue
-        with production.locked(write=False) as pool:
+            source = template_name
+        with production.locked() as pool:
             _generation(pool, generation)
             current = pool.reviewers.get(name)
-            if current is None or not _owns(current, pid, reviewer.thread_id):
+            if current is None or not _owns(current, pid, ""):
                 raise PoolError(f"{name} allocation ownership changed")
-            if not isinstance(current.lease, PhaseLease):
-                raise PoolError(f"{name} allocation lost its lease")
-            allocation: AllocationJson = {
-                "reviewer": name, "thread_id": current.thread_id, "mesh_dir": str(production.mesh_dir(generation)),
-                "lease_ordinal": current.lease.ordinal, "prime_hash": current.prime_hash,
-            }
-        print(json.dumps(allocation))
-        return 0
+            fork_error = ""
+            try:
+                thread_id = _thread_id(result)
+            except PoolError as exc:
+                fork_error = str(exc)
+                del pool.reviewers[name]
+                production.collect_prompts(pool)
+                # Commit removal before reporting a failed fork.
+                thread_id = ""
+            if thread_id:
+                current.thread_id = thread_id
+                if source == template_name:
+                    # A template fork has none of the unit's context: its first turn carries the unit memory.
+                    current.lease = UnitLease(str(args.unit), 1)
+                    current.prime_hash = pool.templates[args.type].prime_hash
+                reviewer = current
+        if not thread_id:
+            raise PoolError(f"fork {name} failed: {fork_error}")
+    with production.locked(write=False) as pool:
+        _generation(pool, generation)
+        template = pool.templates.get(args.type)
+        current_hash = template.prime_hash if template is not None else reviewer.prime_hash
+    if current_hash != reviewer.prime_hash:
+        # Prime passed over this reviewer while it was busy, or forked it from one: this turn gets the new prompt.
+        _repoint(production, name, reviewer.thread_id, current_hash, generation, pid)
+    with production.locked(write=False) as pool:
+        _generation(pool, generation)
+        current = pool.reviewers.get(name)
+        if current is None or not _owns(current, pid, reviewer.thread_id):
+            raise PoolError(f"{name} allocation ownership changed")
+        if not isinstance(current.lease, UnitLease):
+            raise PoolError(f"{name} allocation lost its lease")
+        allocation: AllocationJson = {
+            "reviewer": name, "thread_id": current.thread_id, "mesh_dir": str(production.mesh_dir(generation)),
+            "lease_ordinal": current.lease.ordinal, "prime_hash": current.prime_hash,
+        }
+    print(json.dumps(allocation))
+    return 0
 
 
 def command_release(args: PoolArguments) -> int:
@@ -491,81 +549,124 @@ def command_release(args: PoolArguments) -> int:
         reviewer = pool.reviewers.get(str(args.reviewer))
         if reviewer is not None and isinstance(reviewer.ownership, ClaimedReviewer) and reviewer.ownership.pid == int(args.pid):
             if args.thread_id and args.thread_id != reviewer.thread_id:
+                # The mesh refused the resume and started a new thread: its next review carries the unit memory again.
                 reviewer.thread_id = args.thread_id
+                if isinstance(reviewer.lease, UnitLease):
+                    reviewer.lease = UnitLease(reviewer.lease.unit, 0)
             reviewer.ownership = IdleReviewer()
             reviewer.reviews += 1
     return 0
 
 
-def _end_reviewers(production: ProductionPool, leases: dict[str, PhaseLease]) -> list[str]:
-    ended: list[str] = []
-    pid = os.getpid()
-    for name, expected_lease in leases.items():
-        with production.locked() as pool:
-            _require_finished_stop(pool)
-            reviewer = pool.reviewers.get(name)
-            if reviewer is None or reviewer.lease != expected_lease:
-                continue
-            if not _idle(reviewer):
-                print(f"review_pool: {name} is busy; lease left intact", file=sys.stderr)
-                continue
-            if not reviewer.thread_id:
-                del pool.reviewers[name]
-                production.collect_prompts(pool)
-                print(f"review_pool: removed {name}: reservation owner is dead", file=sys.stderr)
-                ended.append(name)
-                continue
-            reviewer.ownership = ClaimedReviewer(pid)
-            generation = pool.generation
-            template = pool.templates.get(reviewer.type)
-            obsolete = template is None or template.prime_hash != reviewer.prime_hash
-        if obsolete:
-            _retire(production, name, reviewer, generation, pid, "old prime hash")
-        else:
-            result = production.mesh("reset", "--to", name, generation=generation, mesh_generation=generation)
-            with production.locked(write=False) as pool:
-                _generation(pool, generation)
-            if result.returncode:
-                _retire(production, name, reviewer, generation, pid, f"reset failed: {_failure(result)}")
-            else:
-                with production.locked() as pool:
-                    _generation(pool, generation)
-                    current = pool.reviewers.get(name)
-                    if current is None or not _owns(current, pid, reviewer.thread_id):
-                        raise PoolError(f"{name} lease-end ownership changed")
-                    template = pool.templates.get(current.type)
-                    obsolete = template is None or template.prime_hash != current.prime_hash
-                    if not obsolete:
-                        current.lease = Unleased()
-                        current.served.clear()
-                        current.ownership = IdleReviewer()
-                        production.collect_prompts(pool)
-                if obsolete:
-                    _retire(production, name, reviewer, generation, pid, "old prime hash")
-        ended.append(name)
-    return ended
+def _same_unit(lease: UnitLease, unit: str) -> bool:
+    # Lease names predate one spelling: some directors gave `trunk`, others `trunk-unit`.
+    return lease.unit.removesuffix("-unit") == unit.removesuffix("-unit")
 
 
-def command_end_lease(args: PoolArguments) -> int:
+def command_retire(args: PoolArguments) -> int:
+    """End the unit's reviewers; one still reviewing keeps its turn and is left in place."""
     production = _production(str(args.production))
+    unit = str(args.unit)
+    pid = os.getpid()
     with production.locked(write=False) as pool:
         _require_finished_stop(pool)
-        leases = {name: reviewer.lease for name, reviewer in pool.reviewers.items()
-                  if isinstance(reviewer.lease, PhaseLease) and reviewer.lease.unit == str(args.unit)
-                 and (not args.phase or reviewer.lease.phase == str(args.phase))}
-    _ = _end_reviewers(production, leases)
+        generation = pool.generation
+        names = [name for name, reviewer in pool.reviewers.items()
+                 if isinstance(reviewer.lease, UnitLease) and _same_unit(reviewer.lease, unit)]
+    for name in names:
+        with production.locked() as pool:
+            _generation(pool, generation)
+            reviewer = pool.reviewers.get(name)
+            if reviewer is None:
+                continue
+            if not _idle(reviewer):
+                print(f"review_pool: {name} is reviewing; left in place", file=sys.stderr)
+                continue
+            if not reviewer.thread_id:
+                # A fork whose allocating process died never got a thread.
+                del pool.reviewers[name]
+                production.collect_prompts(pool)
+                print(name)
+                continue
+            reviewer.ownership = ClaimedReviewer(pid)
+        _retire(production, name, reviewer, generation, pid, f"{unit} retired")
+        print(name)
     return 0
 
 
-def command_health(args: PoolArguments) -> int:
+def command_end_lease(_args: PoolArguments) -> int:
+    # A reviewer belongs to its unit for good; a director still running the old phase-end step ends nothing.
+    return 0
+
+
+def running_units(slug: str) -> set[str]:
+    """Units of the production whose unit director runs, plus those whose state is unknown."""
+    # unit_lookup imports its siblings by bare name, and it reads herdr, so only migrate loads it.
+    production_scripts = str(Path(__file__).resolve().parents[1] / "production")
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
+    import unit_lookup
+
+    return {unit for unit, marked in unit_lookup.marked_units(slug).items()
+            if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)}
+
+
+@dataclass(frozen=True)
+class MigrationStep:
+    name: str
+    thread_id: str
+    keep: bool
+    reason: str
+
+
+def migration_plan(pool: Pool, running: set[str]) -> list[MigrationStep]:
+    """Keep each running unit's newest reviewer per type; every other idle reviewer retires."""
+    steps: list[MigrationStep] = []
+    kept: set[tuple[str, ReviewerType]] = set()
+    ordered = sorted(pool.reviewers.items(), key=lambda entry: (entry[1].last_allocated, entry[0]), reverse=True)
+    for name, reviewer in ordered:
+        lease = reviewer.lease
+        if not _idle(reviewer):
+            steps.append(MigrationStep(name, reviewer.thread_id, True, "busy"))
+        elif not reviewer.thread_id:
+            steps.append(MigrationStep(name, "", True, "fork in flight"))
+        elif isinstance(lease, Unleased):
+            steps.append(MigrationStep(name, reviewer.thread_id, False, "no unit"))
+        # Lease names predate one spelling: some directors gave `trunk`, others `trunk-unit`.
+        elif lease.unit not in running and f"{lease.unit}-unit" not in running:
+            steps.append(MigrationStep(name, reviewer.thread_id, False, f"{lease.unit} is not running"))
+        elif (lease.unit, reviewer.type) in kept:
+            steps.append(MigrationStep(name, reviewer.thread_id, False, f"{lease.unit} keeps a newer {reviewer.type} reviewer"))
+        else:
+            kept.add((lease.unit, reviewer.type))
+            steps.append(MigrationStep(name, reviewer.thread_id, True, f"{lease.unit}'s {reviewer.type} reviewer"))
+    return steps
+
+
+def command_migrate(args: PoolArguments) -> int:
     production = _production(str(args.production))
-    cutoff = time.time() - float(args.stale_hours) * 3600
+    running = running_units(production.directory.name)
     with production.locked(write=False) as pool:
         _require_finished_stop(pool)
-        leases = {name: reviewer.lease for name, reviewer in pool.reviewers.items()
-                  if isinstance(reviewer.lease, PhaseLease) and reviewer.last_allocated < cutoff}
-    for name in _end_reviewers(production, leases):
-        print(name)
+        generation = pool.generation
+        steps = migration_plan(pool, running)
+    for step in steps:
+        print(f"{'keep' if step.keep else 'retire'}\t{step.name}\t{step.reason}")
+    if not args.apply:
+        return 0
+    pid = os.getpid()
+    for step in steps:
+        if step.keep:
+            continue
+        with production.locked() as pool:
+            _generation(pool, generation)
+            reviewer = pool.reviewers.get(step.name)
+            # Allocation may have taken it since the plan was printed.
+            if reviewer is None or reviewer.thread_id != step.thread_id or not _idle(reviewer):
+                print(f"review_pool: {step.name} changed since the plan; left in place", file=sys.stderr)
+                continue
+            reviewer.ownership = ClaimedReviewer(pid)
+        _retire(production, step.name, reviewer, generation, pid, step.reason)
     return 0
 
 
@@ -573,7 +674,7 @@ def command_status(args: PoolArguments) -> int:
     with _production(str(args.production)).locked(write=False) as pool:
         for name, reviewer in pool.reviewers.items():
             lease = reviewer.lease
-            description = "unleased" if isinstance(lease, Unleased) else f"{lease.unit}:{lease.phase}:{lease.ordinal}"
+            description = "unleased" if isinstance(lease, Unleased) else f"{lease.unit}:{lease.ordinal}"
             print(f"{name}\t{reviewer.type}\t{description}\t{'idle' if _idle(reviewer) else 'busy'}\t{reviewer.reviews}")
     return 0
 
@@ -608,37 +709,38 @@ def command_stop(args: PoolArguments) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="verb", required=True)
-    for verb in ("prime", "arm", "split", "allocate", "release", "end-lease", "status", "health", "stop", "unit-memory"):
+    for verb in ("prime", "allocate", "release", "retire", "end-lease", "status", "stop", "unit-memory",
+                 "migrate"):
         command = subparsers.add_parser(verb)
         _ = command.add_argument("--production", required=True)
         if verb in ("prime", "allocate"):
             _ = command.add_argument("--type", choices=("code", "ui"), required=True)
         if verb == "prime":
             _ = command.add_argument("--instructions-file", required=True)
-        if verb == "unit-memory":
+        if verb in ("unit-memory", "retire"):
             _ = command.add_argument("--unit", required=True)
-        if verb in ("arm", "allocate", "end-lease"):
-            _ = command.add_argument("--unit", required=True)
-            _ = command.add_argument("--phase", required=verb != "end-lease", default="")
+        if verb in ("allocate", "end-lease"):
+            _ = command.add_argument("--unit", required=verb == "allocate", default="")
+            _ = command.add_argument("--phase", required=verb == "allocate", default="")
         if verb == "allocate":
             _ = command.add_argument("--pass", dest="pass_number", required=True)
             _ = command.add_argument("--lens", default="")
+            # Accepted from a review started before reviewers stopped resetting; it changes nothing.
             _ = command.add_argument("--fresh", action="store_true")
         if verb in ("allocate", "release"):
             _ = command.add_argument("--pid", type=int, required=True)
         if verb == "release":
             _ = command.add_argument("--reviewer", required=True)
             _ = command.add_argument("--thread-id", default="")
-        if verb == "split":
-            _ = command.add_argument("--set", choices=("hash", "all", "off"), required=True)
-        if verb == "health":
-            _ = command.add_argument("--stale-hours", type=float, default=12.0)
+        if verb == "migrate":
+            _ = command.add_argument("--apply", action="store_true")
     args = parser.parse_args(namespace=PoolArguments())
     handlers = {
-        "prime": command_prime, "arm": command_arm, "split": command_split,
-        "allocate": command_allocate, "release": command_release, "end-lease": command_end_lease,
-        "status": command_status, "health": command_health, "stop": command_stop,
-        "unit-memory": command_unit_memory,
+        "prime": command_prime,
+        "allocate": command_allocate, "release": command_release, "retire": command_retire,
+        "end-lease": command_end_lease,
+        "status": command_status, "stop": command_stop,
+        "unit-memory": command_unit_memory, "migrate": command_migrate,
     }
     try:
         return handlers[str(args.verb)](args)

@@ -41,11 +41,11 @@ What it does:
      where the session resumes (`/showrunner:add_showrunner` names what
      counts as trusted).
 2. **Stops** the unit: it types `/exit` into the unit's pane and waits until its
-   Claude is gone, then ends its tmux session. Two processes on one session
+   Claude is gone, then ends its session on its host, herdr. Two processes on one session
    corrupt it, so nothing restarts while the old one runs.
 3. **Restarts** it with `/showrunner:add_showrunner`'s launcher, resuming the
-   same session in the unit's worktree: in tmux under the new production's
-   name, with no unit mark, on the showrunner account, attached to your production.
+   same session in the unit's worktree: in its own herdr session named for the
+   new production, with no unit mark, on the unit's own account, attached to your production.
 4. **Retires** the unit's Units row in your doc, `(retired <date>: promoted to
    showrunner of <slug>)`, and commits it in your checkout. Its branch stays as
    it is; the new production merges to the branch its own doc names.

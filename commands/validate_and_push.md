@@ -12,7 +12,7 @@ Validation requires a clean worktree. Before strict validation, the script autom
 
 If `cargo mend --fix` fails or rolls back because a fix does not compile, stop immediately and keep the tree for inspection. After automatic cargo-mend fixes and formatting, strict clippy, configured target checks, tests, and cargo-mend run normally, then the repo's `.claude/config/local_ci.sh` if one exists (hana's runs its CI-only checks). A fix command failure or any finding under strict validation aborts the workflow.
 
-`validate_ci.sh` ignores `config/lint.conf` for every step except its two cargo-mend steps, so a pre-push gate never silently no-ops. Turning `clippy` off quiets `/unit:direct` phases and the scheduled style-fix pass; it does not quiet this command. Turning `mend` off does quiet this command's mend steps, which print a loud `SKIPPED` line instead — mend rewrites source, so a mend release that emits a fix which does not compile would otherwise block every push from an affected repo with nothing that repo can do about it.
+`validate_ci.sh` ignores `config/lint.conf` for every step except its two cargo-mend steps, so a pre-push gate never silently no-ops. Turning `clippy` off quiets `/unit:direct` phases; it does not quiet this command. Turning `mend` off does quiet this command's mend steps, which print a loud `SKIPPED` line instead — mend rewrites source, so a mend release that emits a fix which does not compile would otherwise block every push from an affected repo with nothing that repo can do about it.
 
 If the script exits with code `2`, the current branch is the default branch and GitHub branch rules require a PR. The script prints JSON with:
 
@@ -146,7 +146,7 @@ For `cargo-liner`, `bevy_brp`, `obsidian_knife`, or `nateroids`, check `live`
 for affected entries, then run `add` or `supersede`, or record `none — <reason>`.
 The close-out is incomplete until the script succeeds or the reason is
 recorded. Run this after `push_pr_branch_and_merge.sh` too. Print nothing for
-`hana`, `natedev`, or `none`.
+`hana`, `natedev`, `claude`, or `none`.
 </FeatureLogCloseOut>
 
 On success, report a compact aligned summary in a fenced `text` block so columns survive rendering:
@@ -164,6 +164,6 @@ Feature log:      added <title> | superseded <old> → <title> | none — <reaso
 Final state:      <final branch state>
 ```
 
-Omit the `Feature log:` line for `hana`, `natedev`, or `none`.
+Omit the `Feature log:` line for `hana`, `natedev`, `claude`, or `none`.
 
 After the block, add one short sentence listing the validation steps that ran.

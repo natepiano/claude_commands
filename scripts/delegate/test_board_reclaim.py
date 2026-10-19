@@ -249,6 +249,27 @@ class BoardReclaimTests(unittest.TestCase):
         self.assertFalse(self.lock.exists())
         self.assert_guard_file()
 
+    def test_release_without_pid_keeps_a_live_holder_token(self) -> None:
+        holder = self.holder_process()
+        self.assert_acquired(self.board("acquire", "impl", "cargo", "--pid", str(holder.pid)),
+                             "acquired cargo")
+        release = self.board("release", "impl", "cargo")
+        self.assertEqual(release.returncode, 1, release.stdout + release.stderr)
+        self.assertIn(f"impl gave no pid and cargo is held by live pid {holder.pid}", release.stderr)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(holder.pid))
+        self.assertNotIn("token cargo released", (self.root / "board.log").read_text())
+
+    def test_release_without_pid_frees_a_gone_holder_token(self) -> None:
+        holder = self.holder_process()
+        self.assert_acquired(self.board("acquire", "impl", "cargo", "--pid", str(holder.pid)),
+                             "acquired cargo")
+        holder.kill()
+        _ = holder.wait(timeout=5)
+        release = self.board("release", "impl", "cargo")
+        self.assertEqual(release.returncode, 0, release.stderr)
+        self.assertEqual(release.stdout.strip(), "released cargo")
+        self.assertFalse(self.lock.exists())
+
     def test_reclaimed_same_slot_release_keeps_new_holder_lock(self) -> None:
         first = self.holder_process()
         second = self.holder_process()

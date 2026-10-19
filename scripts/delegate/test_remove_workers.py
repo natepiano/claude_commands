@@ -129,7 +129,7 @@ class RemoveWorkersTest(unittest.TestCase):
         )
 
     def run_remove_workers(
-        self, session_dir: Path | None = None, caller: str = ""
+        self, session_dir: Path | list[Path] | None = None, caller: str = ""
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         environment = os.environ.copy()
         environment.update(
@@ -141,8 +141,8 @@ class RemoveWorkersTest(unittest.TestCase):
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
         command = [sys.executable, str(SCRIPT), "--delegate-root", str(self.root)]
-        if session_dir is not None:
-            command += ["--session-dir", str(session_dir)]
+        for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
+            command += ["--session-dir", str(run)]
         result = subprocess.run(
             command, env=environment, capture_output=True, text=True, check=False
         )
@@ -153,7 +153,7 @@ class RemoveWorkersTest(unittest.TestCase):
         )
         return result, sorted(removed)
 
-    def remove_workers(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
+    def remove_workers(self, session_dir: Path | list[Path] | None = None, caller: str = "") -> tuple[int, list[str]]:
         result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
 
@@ -192,6 +192,16 @@ class RemoveWorkersTest(unittest.TestCase):
         self.list_rows([row("own1", "p-impl"), row("own2", "p-test")])
         self.assertEqual(self.remove_workers(own), (0, ["own1", "own2"]))
 
+    def test_every_given_run_goes_and_another_live_run_stays(self) -> None:
+        """Run end passes each run its director holds; another director's live run is kept."""
+        marked = self.run_dir("marked", ["mark1"], orchestrator=ORCHESTRATOR)
+        side = self.run_dir("side", ["side1"])
+        other = self.run_dir("other", ["other1"])
+        for run in (side, other):
+            _ = (run / "heartbeat.log").write_text("beat\n", encoding="utf-8")
+        self.list_rows([row("mark1", "a-impl"), row("side1", "b-impl"), row("other1", "c-impl")])
+        self.assertEqual(self.remove_workers([marked, side]), (0, ["mark1", "side1"]))
+
     def test_live_run_is_kept_and_dead_runs_are_swept(self) -> None:
         _ = self.run_dir("live", ["live1"], orchestrator=ORCHESTRATOR)
         _ = self.run_dir("orphaned", ["orph1"], orchestrator=GONE_ORCHESTRATOR)
@@ -208,6 +218,24 @@ class RemoveWorkersTest(unittest.TestCase):
         os.utime(stale / "heartbeat.log", (hour_ago, hour_ago))
         self.list_rows([row("fresh1", "a-impl"), row("stale1", "b-impl")])
         self.assertEqual(self.remove_workers(), (0, ["stale1"]))
+
+    def test_runs_under_either_folder_name_are_kept_live_or_swept(self) -> None:
+        former = self.root.parent / "former"
+        (former / "active").mkdir(parents=True)
+        new_live = self.run_dir("new-live", ["new1"], orchestrator=ORCHESTRATOR)
+        _ = self.run_dir("new-ended", ["new2"])
+        old_live = former / "old-live"
+        old_live.mkdir()
+        _ = (old_live / "workers").write_text("old1\tproject-old1\n", encoding="utf-8")
+        _ = (former / "active" / GONE_ORCHESTRATOR).write_text(f"{old_live}\n", encoding="utf-8")
+        (former / "old-ended").mkdir()
+        _ = (former / "old-ended" / "workers").write_text("old2\tproject-old2\n", encoding="utf-8")
+        roots = (self.root, former)
+        held: remove_workers.HeldSessions = {"kind": "held sessions", "session_ids": set()}
+        with patch.object(remove_workers, "shutdown_held_sessions", return_value=held):
+            live = remove_workers.live_runs(roots, {ORCHESTRATOR, GONE_ORCHESTRATOR})
+        self.assertEqual(live, {new_live.resolve(), old_live.resolve()})
+        self.assertEqual(set(remove_workers.removal_targets(roots, set(), [], live)), {"new2", "old2"})
 
     def test_legacy_names_follow_their_run(self) -> None:
         _ = self.run_dir(LEGACY_LIVE, [], orchestrator=ORCHESTRATOR)
@@ -242,7 +270,7 @@ class RemoveWorkersTest(unittest.TestCase):
             os.fspath(self.root),
         ]
         with patch.object(sys, "argv", arguments), \
-                patch.object(remove_workers, "DEFAULT_ROOT", self.root), \
+                patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)), \
                 patch.object(remove_workers, "claude_bin", return_value=os.fspath(self.claude)), \
                 patch.object(remove_workers, "list_sessions", return_value=None), \
                 patch.object(remove_workers, "sweep_app_servers") as sweep:

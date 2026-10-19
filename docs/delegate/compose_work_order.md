@@ -62,10 +62,12 @@ that builds the wrong thing.
    normalized stem is empty. The file need not exist.
 
 **Delegate-ready fast path:** do not research the codebase. Assemble
-`${SESSION_DIR}/implementation_prompt.md` under <WritePromptContract/>:
+`${PHASE_DIR}/implementation_prompt.md` under <WritePromptContract/>:
 
 - Project Context: Delegation Context except **Style**, plus Constraints from
-  prior phases.
+  prior phases. Its first line names the worktree and branch git reports at
+  dispatch (`git rev-parse --show-toplevel`, `git branch --show-current`), never
+  a path from the plan's text: a renamed unit's plan still names its old worktree.
 - Work Specification: Goal, Spec, Files, Workers verbatim, plus command-line
   amendments. Workers is what <LaunchImplementation/> partitions and opens from;
   when a plan predates the field, the launch step decides and says so.

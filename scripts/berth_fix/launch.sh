@@ -200,6 +200,9 @@ if found=$(live_fixer); then
     exit 0
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/../agents/claude_account.sh"
+claude_launch_environment || exit 1
+
 mkdir -p "$state/inbox"
 ensure_worktree || { printf 'worktree preparation failed\n' >&2; exit 1; }
 set_resume_flags "$mode" || exit 1
@@ -212,6 +215,12 @@ if [ "$mode" = here ]; then
         claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer"
 fi
 
-open_window claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer" \
+# An existing Ghostty process may have a different account environment.
+window_environment=(env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN)
+resolver_config_dir=${CLAUDE_CONFIG_DIR:-}
+if [[ -n "$resolver_config_dir" ]]; then
+    window_environment+=("CLAUDE_CONFIG_DIR=$resolver_config_dir" "CLAUDE_CODE_REMOTE_MEMORY_DIR=$HOME/.claude")
+fi
+open_window "${window_environment[@]}" claude -n "$session_name" "${resume_flags[@]}" --permission-mode auto "/berth_fix --fixer" \
     || { printf 'window launch failed\n' >&2; exit 1; }
 printf 'opened %s in a Ghostty window\n' "$session_name"

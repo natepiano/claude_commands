@@ -4,7 +4,7 @@
 Usage: dailies_render.py [<input.json>] [--chart default|ascii] [--state <state.json>] [--log <log.md>] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
        dailies_render.py --footer --zone <IANA zone> [--next-run <HH:MM[+N]>]
                          [--nothing-needed] [--at <YYYY-MM-DDTHH:MM[±HH:MM]>]
-                         [--below <outstanding.json>]... [--reports-to <root slug>]
+                         [--below <outstanding.json>]... [--reports-to <root slug>] [--doc <production doc>]
 Both forms take [--outstanding <outstanding.json>].
 
 The input gives each subject's fields; this script owns the layout, so no line
@@ -30,17 +30,16 @@ production's own plumbing words (PLUMBING).
          identifies an occurrence in a repeated hour.
 --chart  sets the chart mode in CHART_CONF, which every showrunner's dailies
          read; with no input file it only sets the mode.
---footer prints the separated bullet footer before every showrunner reply's
-         Waiting on block and at every report's end, at the current time in
-         --zone. Its Agents bullets
+--footer prints the separated bullet footer that ends every report, alone,
+         at the current time in --zone; the checks use it, and no reply
+         carries it (user, 2026-10-18). Its Agents bullets
          use the report's words. Hold lines come from BUILD_HOLD_DIR or
          ~/.local/state/build-hold and MAC_TEST_STATE_DIR or
          ~/.local/state/mac-test.
 --outstanding  JSON list of what waits on the user, `[{"since":
          "YYYY-MM-DDTHH:MM", "text": "..."}]`; outstanding items suppress
-         ` - nothing needed`; the showrunner's Waiting on block, which this
-         renderer does not print, shows only their count. A missing file is an
-         empty list.
+         ` - nothing needed`; the status line shows only their count. A
+         missing file is an empty list.
 --below  With --footer, once per production below a root showrunner: that
          production's list. Its due items count with --outstanding. A list
          that cannot be read adds the bullet `<slug>: needs-user list
@@ -48,9 +47,13 @@ production's own plumbing words (PLUMBING).
          footer.
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
          `reports to <root slug>`.
+--doc    With --footer, the production doc: the line after the header counts
+         its changes to review, proposals and projects (footer_counts.py). A
+         report reads the doc from its input's `doc`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -69,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
+import note_file
 from run_out import READINGS_LOG, Reading
 from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
@@ -123,7 +127,6 @@ DOT_RANGED = "●━"
 # The chart mode every showrunner's dailies use, kept in one file so no
 # session has to remember it (user, 2026-10-03). `--chart` sets it.
 CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
-AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
 # A unit under a /build:hold carries this marker on its timeline row; no
@@ -259,10 +262,53 @@ class Topic:
 
 
 @dataclass(frozen=True)
-class Outstanding:
+class DueNow:
+    pass
+
+
+@dataclass(frozen=True)
+class DeferredUntil:
+    at: datetime
+
+
+OutstandingTiming = DueNow | DeferredUntil
+
+
+@dataclass(frozen=True)
+class OutstandingReminder:
     since: datetime
     text: str
-    after: datetime | None = None
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class OutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewedOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reviewed: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewUnavailableOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reason: str
+    timing: OutstandingTiming = DueNow()
+
+
+Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
+               | ReviewUnavailableOutstandingQuestion)
 
 
 @dataclass(frozen=True)
@@ -346,6 +392,53 @@ class Row:
     plan: PlanProgress | None
     # Written last on the row: a lower production's counts and marks.
     note: str = ""
+    # Lines printed under the row, outside the chart's width fitting.
+    lines_below: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReportsEvery:
+    minutes: int
+
+
+@dataclass(frozen=True)
+class ReportsOnDemand:
+    pass
+
+
+@dataclass(frozen=True)
+class PendingHandoffs:
+    count: int
+    # An aware instant keeps the elapsed age exact across a daylight-saving change.
+    oldest_pending_since: datetime
+
+
+@dataclass(frozen=True)
+class NoPendingHandoffs:
+    pass
+
+
+@dataclass(frozen=True)
+class StyleSummary:
+    rules_done: int
+    rules_total: int
+    unclassified_rules: int
+    cells_current_pct: float
+    stale: int
+    proposals: int
+    waiting: PendingHandoffs | NoPendingHandoffs
+    synced_at: datetime
+    synced_tip: str
+
+
+@dataclass(frozen=True)
+class NoStyleSummary:
+    pass
+
+
+@dataclass(frozen=True)
+class StyleSummaryUnavailable:
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -353,11 +446,11 @@ class ChildReport:
     """A production below this one, as its own last report saved it. Times are in this report's zone."""
 
     written: datetime
-    # Its update interval in minutes; `None` when it reports only on demand.
-    interval: int | None
+    cadence: ReportsEvery | ReportsOnDemand
     units: int
     held: int
     rows: list[Row]
+    style: StyleSummary | NoStyleSummary | StyleSummaryUnavailable
 
 
 @dataclass(frozen=True)
@@ -391,6 +484,8 @@ class Report:
     children: list[Child]
     # The root this production's showrunner is under; empty for a root.
     reports_to: str
+    # The production doc the footer's counts line reads; None for an input that names none.
+    doc: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -479,7 +574,11 @@ def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
         later = draw_from(opening, now, rows, style)
         if chart_width(later) < chart_width(chart):
             chart = later
-    return chart
+    result = [chart[0]]
+    for line, row in zip(chart[1:], rows, strict=True):
+        result.append(line)
+        result.extend(row.lines_below)
+    return result
 
 
 def draw_from(start: datetime, now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
@@ -685,18 +784,60 @@ def parse_child_row(value: object, where: str, source: ZoneInfo, zone: ZoneInfo)
     return Row(name, Estimate(started, eta, earliest, latest), False, None)
 
 
+def style_moment(fields: JsonMap, key: str, where: str, zone: ZoneInfo) -> datetime:
+    value = text(fields, key, where)
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        raise InputError(f"{where}.{key}: expected an ISO timestamp with a UTC offset") from None
+    if moment.tzinfo is None:
+        raise InputError(f"{where}.{key}: expected an ISO timestamp with a UTC offset")
+    return moment.astimezone(zone)
+
+
+def parse_style_summary(value: object, where: str, zone: ZoneInfo) -> StyleSummary | StyleSummaryUnavailable:
+    fields = as_map(value, where)
+    if "unavailable" in fields:
+        check_keys(fields, {"unavailable"}, where)
+        return StyleSummaryUnavailable(text(fields, "unavailable", where))
+    check_keys(fields, {"rules_done", "rules_total", "unclassified_rules", "cells_current_pct", "stale",
+                        "proposals", "waiting_to_merge_back", "oldest_waiting", "synced_at", "synced_tip"}, where)
+    percent = fields.get("cells_current_pct")
+    if isinstance(percent, bool) or not isinstance(percent, (int, float)) or not 0 <= percent <= 100:
+        raise InputError(f"{where}.cells_current_pct: a number from 0 to 100")
+    count = whole(fields, "waiting_to_merge_back", where)
+    if "oldest_waiting" not in fields:
+        raise InputError(f"{where}.oldest_waiting: required")
+    waiting: PendingHandoffs | NoPendingHandoffs
+    if fields["oldest_waiting"] is None:
+        if count:
+            raise InputError(f"{where}.oldest_waiting: required when hand-offs are waiting")
+        waiting = NoPendingHandoffs()
+    else:
+        if not count:
+            raise InputError(f"{where}.waiting_to_merge_back: must be above 0 when oldest_waiting is given")
+        waiting = PendingHandoffs(count, style_moment(fields, "oldest_waiting", where, ZoneInfo("UTC")))
+    return StyleSummary(whole(fields, "rules_done", where), whole(fields, "rules_total", where),
+                        whole(fields, "unclassified_rules", where), float(percent), whole(fields, "stale", where),
+                        whole(fields, "proposals", where), waiting,
+                        style_moment(fields, "synced_at", where, zone).replace(tzinfo=None),
+                        text(fields, "synced_tip", where))
+
+
 def parse_child_report(value: object, where: str, zone: ZoneInfo) -> ChildReport:
     """A lower production's saved report, its times moved from its own zone into `zone`."""
     fields = as_map(value, where)
-    check_keys(fields, {"written", "zone", "interval", "units", "held", "rows"}, where)
+    check_keys(fields, {"written", "zone", "interval", "units", "held", "rows", "style"}, where)
     source = zone_named(text(fields, "zone", where), f"{where}.zone")
     interval = fields.get("interval")
     if interval is not None and (not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0):
         raise InputError(f"{where}.interval: minutes as a whole number above 0, or null when it reports on demand")
+    cadence = ReportsOnDemand() if interval is None else ReportsEvery(interval)
+    style = parse_style_summary(fields["style"], f"{where}.style", zone) if "style" in fields else NoStyleSummary()
     rows = [parse_child_row(item, f"{where}.rows[{index}]", source, zone)
             for index, item in enumerate(as_list(fields.get("rows"), f"{where}.rows"))]
-    return ChildReport(moment_in(fields, "written", where, source, zone), interval,
-                       whole(fields, "units", where), whole(fields, "held", where), rows)
+    return ChildReport(moment_in(fields, "written", where, source, zone), cadence,
+                       whole(fields, "units", where), whole(fields, "held", where), rows, style)
 
 
 def parse_child(value: object, where: str, zone: ZoneInfo) -> Child:
@@ -828,12 +969,18 @@ def check_words(line: str, key: str, where: str) -> None:
 
 
 def check_plumbing(line: str, name: str) -> None:
+    problem = plumbing(line)
+    if problem is not None:
+        raise InputError(f"{name}: {problem}")
+
+
+def plumbing(line: str) -> str | None:
+    """Why the line fails the plumbing check, or None when it passes."""
     found = PLUMBING.search(line)
-    if found is not None:
-        raise InputError(
-            f"{name}: {found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
-            + "say what changes in the app, or leave it out"
-        )
+    if found is None:
+        return None
+    return (f"{found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
+            + "say what changes in the app, or leave it out")
 
 
 def read_outstanding(path: Path | None) -> list[Outstanding]:
@@ -849,7 +996,7 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable"}, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
@@ -857,14 +1004,35 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
             raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
-        check_plumbing(text, f"{where}.text")
-        items.append(Outstanding(datetime.fromisoformat(since), text, datetime.fromisoformat(after) if after else None))
+        # The plumbing check runs when `update_registration.py questions` writes an item, not here:
+        # a stored item that fails it must not take the whole list down.
+        timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        since_at = datetime.fromisoformat(since)
+        question = fields.get("question")
+        reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
+        if "question" not in fields:
+            if "reviewed" in fields or "review_unavailable" in fields:
+                raise InputError(f"{where}: question required for a review result")
+            items.append(OutstandingReminder(since_at, text, timing))
+            continue
+        if not isinstance(question, str) or not question.strip():
+            raise InputError(f"{where}.question: expected non-empty full question")
+        if "reviewed" in fields:
+            if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
+                raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing))
+        elif "review_unavailable" in fields:
+            if not isinstance(unavailable, str):
+                raise InputError(f"{where}.review_unavailable: expected reason text")
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing))
+        else:
+            items.append(OutstandingQuestion(since_at, text, question, timing))
     return sorted(items, key=lambda item: item.since)
 
 
 def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
     """The items the user has not deferred past `now`, a local time in the report's zone."""
-    return [item for item in items if item.after is None or item.after <= now]
+    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
 
 
 def read_dailies_hold() -> HoldState:
@@ -1068,7 +1236,7 @@ def parse_report(value: object, chart: str) -> Report:
     fields = as_map(value, "input")
     if "build_hold" in fields:
         raise InputError("input.build_hold: remove this field; holds are read from the holder files")
-    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts", "children", "reports_to"}, "input")
+    check_keys(fields, {"length", "zone", "next_run", "units", "topics", "counts", "children", "reports_to", "doc"}, "input")
     length = text(fields, "length", "input")
     if length not in LENGTHS:
         raise InputError(f"input.length: must be one of {', '.join(LENGTHS)}")
@@ -1098,8 +1266,9 @@ def parse_report(value: object, chart: str) -> Report:
     for child in children:
         if child.name in labels:
             raise InputError(f"children: {child.name} is also a unit's label; give that unit another label")
+    doc = optional_text(fields, "doc", "input")
     return Report(length, chart, zone, next_run, hold, mac_block, units, topics, counts, children,
-                  optional_text(fields, "reports_to", "input") or "")
+                  optional_text(fields, "reports_to", "input") or "", Path(doc) if doc else None)
 
 
 def parse_count(value: object, where: str) -> ProductionCount:
@@ -1338,7 +1507,7 @@ def release_progress(cycle: HoldCycle, zone: ZoneInfo) -> str:
 
 
 def hold_line(holder: Holder, now: datetime, zone: ZoneInfo, cycle: HoldCycle | None = None) -> str:
-    """A holder's line, shared by reports and reply footers: who holds builds, why, since when and until when."""
+    """A holder's line, in a report's footer: who holds builds, why, since when and until when."""
     since = holder.since.astimezone(zone)
     head = f"{BUILD_HOLD_MARK}: {holder.name} holds builds since {since:%H:%M} {since:%Z} for {holder.purpose}"
     if cycle is not None and cycle["release_started_at"] and holder.key in cycle["holders"]:
@@ -1371,7 +1540,7 @@ def mac_block_line(
     block: PendingMacBlock | ActiveMacBlock | UnreadableMacBlock,
     zone: ZoneInfo,
 ) -> str:
-    """A Mac block line shared by reports and reply footers."""
+    """A Mac block line in a report's footer."""
     if isinstance(block, UnreadableMacBlock):
         return f"Mac block: its state file cannot be read ({block.path})"
     since = block.since.astimezone(zone)
@@ -1408,24 +1577,6 @@ def agent_number(value: str | None) -> float | None:
     except ValueError:
         return None
     return number if math.isfinite(number) else None
-
-
-def agent_fields(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return {}
-    if not lines or lines[0] != "---":
-        return {}
-    if "---" not in lines[1:]:
-        return {}
-    fields: dict[str, str] = {}
-    for line in lines[1:]:
-        if line == "---":
-            break
-        if (match := re.fullmatch(r"([A-Za-z_][\w-]*):\s*(.*?)\s*", line)) is not None:
-            fields[match.group(1)] = match.group(2).strip("\"'")
-    return fields
 
 
 def agent_refill(reset: datetime, now: datetime, zone: ZoneInfo) -> str:
@@ -1486,10 +1637,12 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
     if stamped is not None and stamped.tzinfo is None:
         stamped = stamped.replace(tzinfo=zone)
     minute_end = stamped.timestamp() + 60 if stamped is not None else None
-    for path in sorted(AGENTS_DIR.glob("*.md")):
-        fields = agent_fields(path)
-        if fields.get("state") == "active":
-            account_readings = readings.get(path.stem, [])
+    for note in note_file.read_notes():
+        fields = {key: value for key in ("limit_reset_count", "limit_reset", "resets",
+                                        "weekly_usage_checked_at", "weekly_remaining_usage")
+                  if (value := note.get(key)) is not None}
+        if note_file.in_use(note):
+            account_readings = readings.get(note.label, [])
             if minute_end is not None:
                 account_readings = [reading for reading in account_readings if reading.at.timestamp() < minute_end]
                 checked_at = agent_time(fields.get("weekly_usage_checked_at"))
@@ -1497,7 +1650,7 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
                     latest = account_readings[-1]
                     fields["weekly_usage_checked_at"] = latest.at.isoformat()
                     fields["weekly_remaining_usage"] = str(100 - latest.used_percent)
-            lines.append(agent_line(path.stem, fields, account_readings, now, zone))
+            lines.append(agent_line(note.label, fields, account_readings, now, zone))
     if len(lines) == 1:
         lines.append("- none active")
     lines.append("")
@@ -1507,12 +1660,14 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
 def footer(
     now: datetime, zone: ZoneInfo, zone_name: str, next_run: str | None,
     hold: HoldState, mac_block: MacBlockFooterState, outstanding: list[Outstanding], *,
-    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = ""
+    nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = "",
+    counts: str | None = None
 ) -> list[str]:
-    """The separated update footer shared by replies and dailies reports.
+    """The separated update footer that ends a dailies report.
 
     `outstanding` already holds the lower productions' items for a root. `unreadable` names each
     lower production whose list could not be read, and `root` the root a lower showrunner is under.
+    `counts` is the counts line that follows the header, when anything is counted.
     """
     items: list[str] = []
     if isinstance(hold, ActiveHolders):
@@ -1528,7 +1683,7 @@ def footer(
     if not isinstance(mac_block, NoMacBlock):
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
-    # By name, so a report and a reply name the same lists in the same order however each walked the tree.
+    # By name, so the lists keep one order however the tree was walked.
     items.extend(f"{slug}: {UNREADABLE_LIST}" for slug in sorted(unreadable))
     if root:
         items.append(f"reports to {root}")
@@ -1539,8 +1694,15 @@ def footer(
     # A list that cannot be read may hold an item, so the footer never calls that quiet.
     quiet = nothing_needed and not outstanding and not unreadable
     items.append(f"{schedule}{' - nothing needed' if quiet else ''}")
-    return ["", "---", f"{now:%H:%M} {zone_name} update:", "",
+    return ["", "---", f"{now:%H:%M} {zone_name} update:", *([counts] if counts else []), "",
             *(f"{item[:2]}* {item[2:]}" if item.startswith("  ") else f"* {item}" for item in items)]
+
+
+def doc_counts(doc: Path | None) -> str | None:
+    """The counts line for a production doc; the status line carries the question count."""
+    import footer_counts
+
+    return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))
 
 
 def eta_text(unit: Unit, previous: Previous, resolved: ResolvedEta,
@@ -1640,11 +1802,12 @@ def unit_rows(units: list[Unit], resolved: dict[str, ResolvedEta], now: datetime
     return rows
 
 
-def child_row(child: Child, now: datetime) -> Row:
+def child_row(child: Child, now: datetime, zone: ZoneInfo) -> Row:
     """A lower production as one row: a bar from its earliest start to its latest ETA, then its counts and marks."""
     saved = child.report
     estimate = None
     notes: list[str] = []
+    lines_below: tuple[str, ...] = ()
     if isinstance(saved, NoChildReport):
         notes.append(NO_REPORT)
     else:
@@ -1654,11 +1817,26 @@ def child_row(child: Child, now: datetime) -> Row:
             estimate = Estimate(min(each.started for each in estimates), last, last, last)
         notes.append(f"{saved.units} unit{'' if saved.units == 1 else 's'}, {saved.held} held")
         # Nothing refreshes a production that reports on demand, so its row always says when it is from.
-        if saved.interval is None or now - saved.written > timedelta(minutes=2 * saved.interval):
+        if isinstance(saved.cadence, ReportsOnDemand) or now - saved.written > timedelta(minutes=2 * saved.cadence.minutes):
             notes.append(f"as of {range_clock(saved.written, now)}")
+        style = saved.style
+        if isinstance(style, StyleSummaryUnavailable):
+            lines_below = (f"{child.name}  style summary unavailable: {style.reason}",)
+        elif isinstance(style, StyleSummary):
+            summary = (f"{child.name}  rules done {style.rules_done}/{style.rules_total}"
+                       f" · cells {math.floor(style.cells_current_pct)}% · stale {style.stale:,}"
+                       f" · proposals {style.proposals} · synced {range_clock(style.synced_at, now)}")
+            if style.unclassified_rules:
+                summary += f" · unclassified {style.unclassified_rules} — pull nate_style"
+            if isinstance(style.waiting, PendingHandoffs):
+                age = now.replace(tzinfo=zone) - style.waiting.oldest_pending_since
+                hours = age.total_seconds() / 3600
+                if hours > 4:
+                    summary += f" · hand-off waiting {int(hours)}h"
+            lines_below = (summary,)
     if child.open:
         notes.append(f"{child.open} open question{'' if child.open == 1 else 's'}")
-    return Row(child.name, estimate, False, None, ", ".join(notes))
+    return Row(child.name, estimate, False, None, ", ".join(notes), lines_below)
 
 
 def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[str, ResolvedEta],
@@ -1733,9 +1911,10 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
         for topic in other_topics:
             topic_section(topic)
 
+    zone = ZoneInfo(report.zone)
     rows = unit_rows(units, resolved, now)
     for child in report.children:
-        rows.append(child_row(child, now))
+        rows.append(child_row(child, now, zone))
         if child.expand and isinstance(child.report, ChildReport):
             rows.extend(Row(f"{child.name}/{row.name}", row.estimate, False, None) for row in child.report.rows)
     if report.counts:
@@ -1748,15 +1927,14 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
     # A due item in a lower production's list needs the user as much as one named here.
     needed = (any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
               or any(child.open for child in report.children))
-    zone = ZoneInfo(report.zone)
     lines.extend(footer(now, zone, zone_name, report.next_run, report.build_hold, report.mac_block, outstanding,
                         nothing_needed=not needed, agent_lines=agent_section(now, zone, at=at),
                         unreadable=[slug for child in report.children for slug in child.unreadable],
-                        root=report.reports_to))
+                        root=report.reports_to, counts=doc_counts(report.doc)))
     return lines
 
 
-def last_report(value: object, state_path: Path, at: str | None, interval: int | None) -> JsonMap:
+def last_report(value: object, state_path: Path, at: str | None, cadence: ReportsEvery | ReportsOnDemand) -> JsonMap:
     """What a production saves for the showrunner above it, from an input `check_render_state` passed.
 
     Its chart rows, the units first and then one row per production below it, and its counts with
@@ -1764,9 +1942,10 @@ def last_report(value: object, state_path: Path, at: str | None, interval: int |
     """
     report = parse_report(value, "default")
     now, _ = local_now(report.zone, "input.zone", at)
+    zone = ZoneInfo(report.zone)
     resolved = resolve_eta_moments(report, load_state(state_path), now)
     rows = [*unit_rows(ordered_units(report, resolved), resolved, now),
-            *(child_row(child, now) for child in report.children)]
+            *(child_row(child, now, zone) for child in report.children)]
     below = [child.report for child in report.children if isinstance(child.report, ChildReport)]
     saved_rows: list[JsonMap] = []
     for row in rows:
@@ -1776,6 +1955,7 @@ def last_report(value: object, state_path: Path, at: str | None, interval: int |
             fields.update(started=f"{estimate.started:{STAMP}}", eta=f"{estimate.eta:{STAMP}}",
                           earliest=f"{estimate.earliest:{STAMP}}", latest=f"{estimate.latest:{STAMP}}")
         saved_rows.append(fields)
+    interval = cadence.minutes if isinstance(cadence, ReportsEvery) else None
     return {"written": f"{now:{STAMP}}", "zone": report.zone, "interval": interval,
             "units": len(report.units) + sum(saved.units for saved in below),
             "held": sum(1 for unit in report.units if unit.held) + sum(saved.held for saved in below),
@@ -1802,7 +1982,7 @@ def local_now(zone: str, where: str, at: str | None) -> tuple[datetime, str]:
 
 
 def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_path: Path | None, *,
-                nothing_needed: bool, below: Sequence[Path] = (), root: str = "") -> int:
+                nothing_needed: bool, below: Sequence[Path] = (), root: str = "", doc: Path | None = None) -> int:
     unreadable: list[str] = []
     try:
         if next_run is not None and not TIME.match(next_run):
@@ -1822,7 +2002,7 @@ def footer_main(zone: str, next_run: str | None, at: str | None, outstanding_pat
             unreadable.append(path.stem)
     print("\n".join(footer(now, ZoneInfo(zone), abbreviation, next_run, hold, mac_block, outstanding,
                            nothing_needed=nothing_needed, agent_lines=agent_section(now, ZoneInfo(zone), at=at),
-                           unreadable=unreadable, root=root)))
+                           unreadable=unreadable, root=root, counts=doc_counts(doc))))
     return 0
 
 
@@ -1841,6 +2021,7 @@ def main(arguments: list[str]) -> int:
     _ = parser.add_argument("--below", type=Path, action="append", default=[],
                             help="with --footer, once per lower production: its list, counted with --outstanding; one that cannot be read is named")
     _ = parser.add_argument("--reports-to", default="", help="with --footer: the root production a lower showrunner is under")
+    _ = parser.add_argument("--doc", type=Path, help="with --footer: the production doc whose changes, proposals and projects are counted")
     options = parser.parse_args(arguments)
     input_path = cast(Path | None, options.input)
     chart = cast(str | None, options.chart)
@@ -1853,15 +2034,16 @@ def main(arguments: list[str]) -> int:
     outstanding_path = cast(Path | None, options.outstanding)
     below = cast(list[Path], options.below)
     reports_to = cast(str, options.reports_to)
+    doc = cast(Path | None, options.doc)
     if cast(bool, options.footer):
         if input_path is not None or chart is not None or state_path is not None or log_path is not None:
             parser.error("--footer takes no input file, --chart, --state or --log")
         if zone is None:
             parser.error("--footer needs --zone")
         return footer_main(zone, next_run, at, outstanding_path, nothing_needed=nothing_needed,
-                           below=below, root=reports_to)
-    if zone is not None or next_run is not None or nothing_needed or below or reports_to:
-        parser.error("--zone, --next-run, --nothing-needed, --below and --reports-to go with --footer; "
+                           below=below, root=reports_to, doc=doc)
+    if zone is not None or next_run is not None or nothing_needed or below or reports_to or doc is not None:
+        parser.error("--zone, --next-run, --nothing-needed, --below, --reports-to and --doc go with --footer; "
                      + "a report takes them from its input")
     if chart is not None:
         write_chart(CHART_CONF, chart)

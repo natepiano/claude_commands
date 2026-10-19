@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -11,9 +13,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
-import fake_tmux
-from fake_tmux import FakeSession
+import fake_unit_host
+import production_lifecycle
+import showrunners
+from add_unit import read_production
+from fake_unit_host import HostedUnit
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -28,15 +34,13 @@ name = Path(sys.argv[0]).name
 with (state / "calls").open("a") as output:
     output.write(name + " " + " ".join(sys.argv[1:])
                  + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
-if name == "tmux" and sys.argv[1:2] == ["has-session"]:
-    session = sys.argv[-1].removeprefix("=")
-    raise SystemExit(0 if (state / ("live-" + session)).exists() else 1)
 if name == "ssh":
     print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
     raise SystemExit(0)
 if name == "cargo-berth" and sys.argv[1:2] == ["board"]:
-    print((state / "reservations.json").read_text() if (state / "reservations.json").exists() else "")
-    raise SystemExit(0)
+    print((state / "reservations.json").read_text() if (state / "reservations.json").exists() else
+          '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}')
+    raise SystemExit(int((state / "board-exit").read_text()) if (state / "board-exit").exists() else 4)
 if name in ("notifier.sh", "showrunners.py", "cargo-berth", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
@@ -75,7 +79,7 @@ class LifecycleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.origin = self.root / "origin.git"
         self.checkout = self.root / "checkout"
         self.alpha = self.root / "alpha"
@@ -90,7 +94,7 @@ class LifecycleTests(unittest.TestCase):
         self.phase_table_vault.parent.mkdir()
         bin_path = self.root / "bin"
         bin_path.mkdir()
-        for name in ("tmux", "claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
+        for name in ("claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
             self.stub(bin_path / name)
         for relative in (".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py",
@@ -98,9 +102,6 @@ class LifecycleTests(unittest.TestCase):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
-                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
-                    "FAKE_TMUX_STATE": str(self.state / "tmux.json"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -109,6 +110,7 @@ class LifecycleTests(unittest.TestCase):
                     "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
+        self.env.update(fake_unit_host.environment(self.root))
         self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
@@ -302,6 +304,23 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("resumed state", resumed.stdout)
         self.assertIn("alpha-unit: no code checkpoint", resumed.stdout)
 
+    def test_load_copies_the_scratchpad_state_once_and_never_replaces_it(self) -> None:
+        scratch = self.root / "scratch"
+        self.write(scratch / "showrunner_state.json", '{"merges_held": ["old"]}\n')
+        self.write(scratch / "unit_status" / "decisions_seen", "alpha-unit|1\n")
+        target = self.state / "showrunner" / "example" / "session"
+
+        first = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
+        self.assert_step(first, "ok")
+        self.assertIn("copied unit_status, showrunner_state.json", first.stdout)
+        self.assertEqual((target / "unit_status" / "decisions_seen").read_text(), "alpha-unit|1\n")
+
+        self.write(target / "showrunner_state.json", '{"merges_held": ["new"]}\n')
+        again = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
+        self.assert_step(again, "ok")
+        self.assertNotIn("copied", again.stdout)
+        self.assertIn('"new"', (target / "showrunner_state.json").read_text())
+
     def test_load_reports_each_last_code_merge_even_after_shrink(self) -> None:
         self.running()
         _, alpha_merge = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "2")
@@ -320,12 +339,11 @@ class LifecycleTests(unittest.TestCase):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
-        fake_tmux.write(self.state / "tmux.json", {
-            # A session that only has the name the unit was launched under is not the unit.
-            "$1": FakeSession(label="alpha", panes=["%1"], env={}),
-            "$2": FakeSession(label="renamed-since-launch", panes=["%2"],
-                              env={"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
-        })
+        fake_unit_host.write(self.env, [
+            HostedUnit("alpha", "w1:p1", {}),
+            HostedUnit("renamed-since-launch", "w2:p1", {
+                "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "beta-unit"}),
+        ])
         result = self.run_lifecycle("load", "--no-ci", "--resume")
         self.assert_step(result, "ok")
         self.assertIn("alpha-unit: gone", result.stdout)
@@ -580,6 +598,35 @@ class LifecycleTests(unittest.TestCase):
         self.assert_step(result, "held")
         self.assertIn("wrap: held", result.stdout)
 
+    def test_wrap_held_at_close_out_keeps_its_style_child_attached_and_untold(self) -> None:
+        self.running()
+        self.production_doc("running", close_out="- Delete the cache")
+        self.showrunner("kid", live=True)
+        child_doc = self.root / "kid-production.md"
+        self.write(child_doc, "# Production — kid\n\n- **Kind:** style\n")
+        parent = self.reports_to("kid", "example")
+        child = showrunners.Showrunner(
+            slug="kid", session="kid-name", socket=str(self.root / "kid.sock"),
+            zone="America/New_York", doc=str(child_doc),
+        )
+        production = read_production(self.doc)
+        with (mock.patch.object(showrunners, "stored_children", return_value=("kid",)),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[child]),
+              mock.patch.object(showrunners, "detach") as detach,
+              mock.patch.object(showrunners, "tell_others", return_value=[]) as tell,
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
+                production_lifecycle.wrap(production, self.doc.read_text().splitlines(), True,
+                                          production_lifecycle.VerdictMissing(),
+                                          production_lifecycle.VerdictMissing(), ())
+            detach.assert_not_called()
+            tell.assert_not_called()
+        self.assertEqual(stopped.exception.step, "close-out")
+        self.assertEqual(stopped.exception.state, "held")
+        self.assertEqual(parent.read_text(), "example\n")
+        self.assertEqual(self.sent(), [])
+        self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
+
     def test_wrap_rejects_verdict_for_other_tip_before_retirement(self) -> None:
         self.running()
         other = self.git("rev-parse", "HEAD")
@@ -645,13 +692,65 @@ class LifecycleTests(unittest.TestCase):
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
         _ = self.git("push", "origin", "production")
-        reservations = '{"reservations": [{"worktree": "' + str(self.alpha) + '", "id": "alpha-reservation"}]}'
-        _ = (self.state / "reservations.json").write_text(reservations)
+        alpha = {"reservation_id": "alpha-reservation", "target": "refs/heads/production",
+                 "holder": {"worktree_root": str(self.alpha), "branch": "alpha-branch"},
+                 "scopes": ["file:alpha.txt"], "lifecycle": "active", "edit_blocking_status": "blocking"}
+        unrelated = {**alpha, "reservation_id": "other-reservation",
+                     "holder": {"worktree_root": str(self.root / "other"), "branch": "other"}}
+        empty: dict[str, object] = {"journal_position": {}, "entries": []}
+        board: dict[str, object] = {"output_contract_version": 1, "verb": "board", "status": "ok",
+                 "reservations": ["alpha-reservation", "other-reservation"],
+                 "payload": {"kind": "board", "data": {
+                     "targets": [{"reservations": [alpha, unrelated]}],
+                     "ready_now": {"journal_position": {}, "entries": [alpha]},
+                     "waiting": empty, "unresolved_overlaps": empty,
+                     "unconstrained_reservations": empty, "resolved": empty}}}
+        self.write(self.state / "reservations.json", json.dumps(board))
+        self.write(self.state / "board-exit", "0")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         self.assertIn(f"cargo-berth release alpha-reservation --json cwd={self.alpha}", self.calls())
+        self.assertEqual(self.calls().count("cargo-berth release alpha-reservation"), 1)
+        self.assertNotIn("cargo-berth release other-reservation", self.calls())
+        self.assertIn(f"cargo-berth board --json cwd={self.alpha}", self.calls())
+        self.assertNotIn("retire: skipped", result.stdout)
         # Removing the update timer is the whole of forgetting a showrunner: no registry is rewritten.
         self.assertNotIn("showrunners.py", self.calls())
+
+    def test_wrap_reports_an_unavailable_board_and_releases_nothing(self) -> None:
+        self.merged_units()
+        self.write(self.state / "reservations.json", json.dumps({
+            "output_contract_version": 1, "verb": "board", "status": "ledger_unreadable",
+            "message": "journal is unreadable", "payload": {"kind": "no_facts"}}))
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("retire: skipped — board unavailable (journal is unreadable)", result.stdout)
+        self.assertNotIn("cargo-berth release", self.calls())
+
+    def test_wrap_reports_an_empty_board_and_releases_nothing(self) -> None:
+        self.merged_units()
+        self.write(self.state / "reservations.json", "")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("retire: skipped — board unavailable (cargo-berth returned no board (exit 4))", result.stdout)
+        self.assertNotIn("cargo-berth release", self.calls())
+
+    def test_wrap_reports_a_malformed_board_and_releases_nothing(self) -> None:
+        self.merged_units()
+        self.write(self.state / "reservations.json", "{not-json")
+        self.write(self.state / "board-exit", "0")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("retire: skipped — board unavailable (", result.stdout)
+        self.assertNotIn("cargo-berth release", self.calls())
+
+    def test_wrap_an_unconfigured_repository_releases_nothing_without_a_skip(self) -> None:
+        self.merged_units()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("cargo-berth board --json", self.calls())
+        self.assertNotIn("cargo-berth release", self.calls())
+        self.assertNotIn("retire: skipped", result.stdout)
 
     def test_wrap_resumes_after_final_push_rejection_without_second_commit(self) -> None:
         self.running()
@@ -718,6 +817,36 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
         self.assertEqual(self.sent(), [])
 
+    def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        kept = self.checkout / "productions/example-production.md"
+        kept.parent.mkdir()
+        _ = self.git("mv", str(self.doc), str(kept))
+        _ = self.git("commit", "-m", "keep the doc in productions/")
+        _ = self.git("push", "origin", "production")
+        self.doc = kept
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        relative = "archive/checkout/example/example-production.md"
+        archived = self.checkout / relative
+        self.assertIn(f"wrap: ok — moved the doc out of productions/ to {relative}", result.stdout)
+        self.assertFalse(kept.exists())
+        self.assertIn("wrapped", archived.read_text())
+        self.assertEqual(self.git("status", "--short"), "")
+        moved = self.git("show", "--name-status", "--format=%s", "HEAD")
+        self.assertIn("production(example): wrapped", moved)
+        self.assertIn(relative, moved)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
+
+    def test_wrap_names_herdr_sessions_for_close_out(self) -> None:
+        self.merged_units()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("| Next | close herdr sessions |", result.stdout)
+
     def test_wrap_detaches_from_its_parent_and_leaves_each_child_a_root(self) -> None:
         self.merged_units()
         for slug in ("top", "kid", "other"):
@@ -768,6 +897,59 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(self.alpha.exists())
         self.assertNotIn("notifier.sh", self.calls())
         self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
+
+        self.write(self.root / "kid-production.md", "# Kid\n\n- **Kind:** product\n")
+        explicit_product = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(explicit_product, "held")
+        self.assertIn("children: held — kid still reports to example", explicit_product.stdout)
+        self.assertTrue(kid.exists())
+        self.assertEqual(self.sent(), [])
+
+    def test_wrap_detaches_and_tells_a_style_child_without_retiring_its_work(self) -> None:
+        self.merged_units()
+        style = self.root / "checkout-style"
+        unit = self.root / "checkout-style-names"
+        _ = self.git("worktree", "add", "-b", "style/main", str(style), "main")
+        _ = self.git("worktree", "add", "-b", "style-names", str(unit), "style/main")
+        style_doc = style / "docs/kid-production.md"
+        self.write(style_doc, "# Production — kid\n\n- **Kind:** style\n"
+                   + f"- **Showrunner checkout:** `{style}`\n\n## Units\n\n"
+                   + "| Unit | Plan | Worktree | Branch | Port | Owns |\n"
+                   + "| --- | --- | --- | --- | --- | --- |\n"
+                   + f"| names-unit | docs/style-production/names.md | {unit} | style-names | — | none |\n")
+        plan = unit / "docs/style-production/names.md"
+        pinned = unit / "docs/style-production/rules/names.md"
+        ledger = self.state / "style/ledger.sqlite3"
+        self.write(plan, "# Unit's own standing plan\n\n## Phases\n\n- active ticket\n")
+        self.write(pinned, "# Pinned rule\n")
+        self.write(ledger, "saved ledger and pending hand-offs\n")
+        self.showrunner("kid", live=True)
+        timer = self.state / "notifier/showrunner-kid/conf"
+        self.write(timer, f"TARGET=session:kid-session\nCHECK=zsh /x/production_check.sh {style_doc}\n")
+        parent = self.reports_to("kid", "example")
+        child_state = self.state / "showrunner/kid/prompt.txt"
+        self.write(child_state, "standing work remains\n")
+        preserved = {path: path.read_bytes() for path in (style_doc, plan, pinned, ledger, timer, child_state)}
+        style_tip = self.git("rev-parse", "HEAD", cwd=style)
+        unit_tip = self.git("rev-parse", "HEAD", cwd=unit)
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+
+        self.assert_step(result, "ok")
+        self.assertFalse(parent.exists())
+        self.assertIn("children: ok — detached kid; now root; told kid", result.stdout)
+        [sent] = self.sent()
+        self.assertEqual(sent[sent.index("--to") + 1], f"uds:{self.root / 'kid.sock'}")
+        self.assertEqual(sent[sent.index("--text") + 1],
+                         "example wrapped, so you are a root now: run style_sync.py resume and merge your own hand-offs "
+                         + "(docs/style_production.md, Merging back).")
+        for path, content in preserved.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=style), style_tip)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=unit), unit_tip)
+        self.assertEqual(self.git("branch", "--show-current", cwd=style), "style/main")
+        self.assertEqual(self.git("branch", "--show-current", cwd=unit), "style-names")
+        self.assertIn("**Status: PRODUCTION — wrapped.**", self.doc.read_text())
 
     def test_wrap_archives_owned_phase_note_and_keeps_other_files(self) -> None:
         self.running()

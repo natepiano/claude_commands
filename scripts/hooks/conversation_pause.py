@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import json
 import os
@@ -17,7 +16,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..lib import unit_runs
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import unit_runs
 
 
 QUIET_SECONDS = 900
@@ -26,7 +31,7 @@ UNANSWERED_SECONDS = 1800
 TOMBSTONE_SECONDS = 300
 SCHEDULED_PROMPT_RETENTION_SECONDS = 8 * 24 * 60 * 60
 WATCHER = "conversation-pause"
-JOB_SENDERS = frozenset({WATCHER, "stall-watch", "tmux-names", "quota_alert", "mac-test",
+JOB_SENDERS = frozenset({WATCHER, "stall-watch", "quota_alert", "mac-test",
                          "disk_floor", "shutdown"})
 QUESTION = (
     f"conversation-pause: the user has been quiet here for {QUIET_SECONDS // 60} minutes. "
@@ -111,7 +116,6 @@ PausePhase = Replying | Quiet | QuestionPending | Asked | KeptOff | Returned
 class PauseRecord:
     session_id: str
     instances: tuple[str, ...]
-    footers: tuple[str, ...]
     phase: PausePhase
 
 
@@ -502,8 +506,8 @@ def read_record(path: Path) -> PauseRecord:
     if not isinstance(session_id, str):
         raise ValueError(f"invalid conversation pause record: {path}")
     try:
+        # A record written while reply footers existed also has `footers`, which nothing reads now.
         return PauseRecord(session_id, _string_tuple(fields["instances"], "instances"),
-                           _string_tuple(fields["footers"], "footers"),
                            _phase_from_json(fields["phase"]))
     except (KeyError, ValueError) as error:
         raise ValueError(f"invalid conversation pause record: {path}") from error
@@ -516,7 +520,6 @@ def write_record(record: PauseRecord) -> None:
     payload: dict[str, object] = {
         "session_id": record.session_id,
         "instances": list(record.instances),
-        "footers": list(record.footers),
         "phase": _phase_json(record.phase),
     }
     temporary_path: Path | None = None
@@ -552,21 +555,15 @@ def _record(session_id: str) -> RecordLookup:
     return read_record(path) if path.exists() else NoPauseRecord.ABSENT
 
 
-def user_words(instances: tuple[str, ...] | list[str],
-               footers: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+def user_words(instances: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     instance_set = set(instances)
     words: list[str] = []
     if any(name.startswith("showrunner-") for name in instance_set):
         words.append("dailies")
-    if footers:
-        words.append("footer")
-    if any(name.startswith("delegate-") for name in instance_set):
+    if any(name.startswith(unit_runs.INSTANCE_PREFIXES) for name in instance_set):
         words.append("status reports")
-    if "report-builds" in instance_set:
-        words.append("build report")
     known = {name for name in instance_set
-             if name.startswith("showrunner-") or name.startswith("delegate-")
-             or name == "report-builds"}
+             if name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES))}
     words.extend(sorted(instance_set - known))
     return tuple(words)
 
@@ -595,28 +592,16 @@ def ensure_watcher() -> None:
 
 
 def _pause_locked(session_id: str, now: int) -> PauseResult:
-    import showrunner_footer
-
     current = _record(session_id)
     reports = session_reports(session_id)
-    footer_slugs = tuple(dict.fromkeys(
-        report.name.removeprefix("showrunner-")
-        for report in reports if report.name.startswith("showrunner-")
-    ))
-    footers_on = {
-        slug for slug in footer_slugs
-        if showrunner_footer.footer_state(slug) is showrunner_footer.FooterState.ON
-    }
-    if (isinstance(current, NoPauseRecord)
-            and not any(report.enabled for report in reports) and not footers_on):
+    if isinstance(current, NoPauseRecord) and not any(report.enabled for report in reports):
         return NothingToPause()
     ensure_watcher()
 
     record = (current if isinstance(current, PauseRecord)
-              else PauseRecord(session_id, (), (), Replying(now)))
+              else PauseRecord(session_id, (), Replying(now)))
     record = replace(record, phase=Replying(now))
     new_instances: list[str] = []
-    new_footers: list[str] = []
     failed: list[str] = []
     for report in reports:
         if not report.enabled:
@@ -637,30 +622,12 @@ def _pause_locked(session_id: str, now: int) -> PauseResult:
             continue
         if newly_recorded:
             new_instances.append(report.name)
-    for slug in footer_slugs:
-        if slug not in footers_on:
-            continue
-        newly_recorded = slug not in record.footers
-        if newly_recorded:
-            record = replace(record, footers=(*record.footers, slug))
-            write_record(record)
-        try:
-            showrunner_footer.pause_footer(slug)
-        except OSError:
-            record = replace(record, footers=tuple(
-                name for name in record.footers if name != slug
-            ))
-            write_record(record)
-            failed.append(f"footer {slug}")
-            continue
-        if newly_recorded:
-            new_footers.append(slug)
-    if not record.instances and not record.footers:
+    if not record.instances:
         record_path(session_id).unlink(missing_ok=True)
         result: PauseResult = NothingToPause()
     else:
         write_record(record)
-        result = Paused(user_words(new_instances, new_footers))
+        result = Paused(user_words(new_instances))
     if failed:
         raise RuntimeError(f"failed to pause: {', '.join(failed)}")
     return result
@@ -672,12 +639,8 @@ def pause(session_id: str, now: int) -> PauseResult:
 
 
 def _resume_items(record: PauseRecord) -> tuple[str, ...]:
-    import showrunner_footer
-
     resumed_instances: list[str] = []
     failed_instances: list[str] = []
-    resumed_footers: list[str] = []
-    failed_footers: list[str] = []
     for name in record.instances:
         if not (notifier_root() / name).is_dir():
             continue
@@ -689,24 +652,10 @@ def _resume_items(record: PauseRecord) -> tuple[str, ...]:
         else:
             if came_back:
                 resumed_instances.append(name)
-    for slug in record.footers:
-        try:
-            # Only a footer the pause turned off comes back; one switched off since stays off.
-            came_back = showrunner_footer.unpause_footer(slug)
-        except OSError:
-            failed_footers.append(slug)
-        else:
-            if came_back:
-                resumed_footers.append(slug)
-    if failed_instances or failed_footers:
-        write_record(replace(
-            record,
-            instances=tuple(failed_instances),
-            footers=tuple(failed_footers),
-        ))
-        failed = [*failed_instances, *(f"footer {slug}" for slug in failed_footers)]
-        raise RuntimeError(f"failed to resume: {', '.join(failed)}")
-    return user_words(resumed_instances, resumed_footers)
+    if failed_instances:
+        write_record(replace(record, instances=tuple(failed_instances)))
+        raise RuntimeError(f"failed to resume: {', '.join(failed_instances)}")
+    return user_words(resumed_instances)
 
 
 def _resume_locked(session_id: str) -> tuple[str, ...]:
@@ -726,11 +675,9 @@ def resume(session_id: str) -> tuple[str, ...]:
 def release(session_id: str) -> RecordLookup:
     """Remove and return a pause record without resuming what it paused.
 
-    The record returned names only what is still the pause's: a timer or footer stopped or started
-    by hand since the pause is left out, so whoever restores the rest leaves it as it was left.
+    The record returned names only what is still the pause's: a timer stopped or started by hand
+    since the pause is left out, so whoever restores the rest leaves it as it was left.
     """
-    import showrunner_footer
-
     with record_lock():
         current = _record(session_id)
         if not isinstance(current, PauseRecord):
@@ -740,7 +687,6 @@ def release(session_id: str) -> RecordLookup:
         return replace(
             current,
             instances=tuple(name for name in current.instances if _timer_paused(root / name)),
-            footers=tuple(slug for slug in current.footers if showrunner_footer.footer_paused(slug)),
         )
 
 
@@ -926,17 +872,13 @@ def _send_question(delivery: QuestionDelivery) -> bool:
 
 def _return_after_timeout(record: PauseRecord, now: int) -> tuple[str, ...]:
     words = _resume_items(record)
-    write_record(PauseRecord(record.session_id, (), (), Returned(now)))
+    write_record(PauseRecord(record.session_id, (), Returned(now)))
     return words
 
 
 def _review_slugs(record: PauseRecord) -> frozenset[str]:
-    slugs = set(record.footers)
-    slugs.update(
-        name.removeprefix("showrunner-")
-        for name in record.instances if name.startswith("showrunner-")
-    )
-    return frozenset(slugs)
+    return frozenset(name.removeprefix("showrunner-")
+                     for name in record.instances if name.startswith("showrunner-"))
 
 
 def _timer_paused(instance: Path) -> bool:
@@ -950,28 +892,16 @@ def _timer_paused(instance: Path) -> bool:
 def _prune_unscheduled(record: PauseRecord) -> PauseRecord | None:
     """Drop what no schedule runs any more; None when nothing paused is left to return.
 
-    A production switched to on demand loses its `showrunner-<slug>` instance while a pause
-    still names it, and its footer has no schedule to name. A timer or footer someone stopped,
-    started or switched by hand since the pause has lost the pause's mark and is no longer the
-    pause's to return. Asking to return such updates would ask about nothing.
+    A timer someone stopped or started by hand since the pause has lost the pause's mark and is no
+    longer the pause's to return. Asking to return such updates would ask about nothing.
     """
-    import showrunner_footer
-
     root = notifier_root()
     instances = tuple(name for name in record.instances if _timer_paused(root / name))
-    footers = tuple(
-        slug for slug in record.footers
-        if (root / f"showrunner-{slug}").is_dir() and showrunner_footer.footer_paused(slug)
-    )
-    for slug in record.footers:
-        if slug not in footers:
-            with contextlib.suppress(OSError):
-                _ = showrunner_footer.unpause_footer(slug)
-    if not instances and not footers:
+    if not instances:
         return None
-    if (instances, footers) == (record.instances, record.footers):
+    if instances == record.instances:
         return record
-    kept = replace(record, instances=instances, footers=footers)
+    kept = replace(record, instances=instances)
     write_record(kept)
     return kept
 
@@ -1086,7 +1016,7 @@ def _status(session_id: str) -> str:
         current = _record(session_id)
         if isinstance(current, NoPauseRecord):
             return "not paused"
-        names = ", ".join(user_words(current.instances, current.footers))
+        names = ", ".join(user_words(current.instances))
         kind = _phase_kind(current.phase)
         if (isinstance(current.phase, Asked)
                 and isinstance(current.phase.reading, QuestionRead)

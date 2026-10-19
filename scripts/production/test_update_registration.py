@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -10,11 +11,25 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 
+
+import update_registration as registration
+import showrunners
+import dailies_render
+from add_unit import read_production
+
+if TYPE_CHECKING:
+    from scripts.notify import review
+    from scripts.hooks.showrunner_footer import read_pending_reviewed, PendingReviewUnavailableQuestion
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    import review
+    from showrunner_footer import read_pending_reviewed, PendingReviewUnavailableQuestion
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 
@@ -94,14 +109,12 @@ class RegistrationTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
-                    # No test here may ask a real tmux which unit sessions exist.
-                    "UNIT_LOOKUP_TMUX": str(self.root / "no-tmux"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
         self.doc.parent.mkdir(parents=True)
-        # A linked worktree, where `.git` is a file: tmux is never asked whether its unit is gone.
+        # A linked worktree, where `.git` is a file: herdr is never asked whether its unit is gone.
         alpha = self.root / "alpha"
         alpha.mkdir()
         _ = (alpha / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
@@ -165,7 +178,7 @@ class RegistrationTests(unittest.TestCase):
         updates = next(call for call in initial_calls if call[:2] == ["new", "showrunner-example"])
         self.assertEqual(updates[updates.index("--to") + 1], "session:current-session-id")
         self.assertIn("next_due", first.stdout)
-        for instance in ("stall-watch", "tmux-names"):
+        for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
 
         new_env = {**self.env, "CLAUDE_CODE_SESSION_ID": "resume-session-id"}
@@ -182,7 +195,7 @@ class RegistrationTests(unittest.TestCase):
         updates = [call for call in calls if call[:2] == ["new", "showrunner-example"]]
         self.assertEqual([call[call.index("--to") + 1] for call in updates],
                          ["session:current-session-id", "session:resume-session-id", "session:resume-session-id"])
-        for instance in ("stall-watch", "tmux-names"):
+        for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
 
     def test_register_reports_unexpected_usage_write_failure_and_completes(self) -> None:
@@ -244,7 +257,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["status", "new", "stop", "status", "status"])
+                         ["new", "stop", "status"])
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
 
     def without_updates_line(self) -> None:
@@ -254,33 +267,13 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
 
     def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
         self.without_updates_line()
-        switch = self.state / "showrunner/footers-off/example"
-
         first = self.run_command("register")
 
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", first.stdout)
-        self.assertIn("footer: ok — off — new production; /showrunner:footer on turns it on", first.stdout)
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
-        # Off on purpose: an empty switch, which a conversation pause's resume leaves off.
-        self.assertEqual(switch.read_text(encoding="utf-8"), "")
+        self.assertNotIn("footer", first.stdout)
 
-    def test_a_restart_keeps_the_footer_it_has_on_or_off(self) -> None:
-        switch = self.state / "showrunner/footers-off/example"
-        first = self.run_command("register")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertTrue(switch.exists())
-        switch.unlink()
-
-        turned_on = self.run_command("register")
-
-        self.assertEqual(turned_on.returncode, 0, turned_on.stdout + turned_on.stderr)
-        self.assertNotIn("footer:", turned_on.stdout)
-        self.assertFalse(switch.exists())
-        _ = switch.write_text("", encoding="utf-8")
-        kept_off = self.run_command("register")
-        self.assertEqual(kept_off.returncode, 0, kept_off.stdout + kept_off.stderr)
-        self.assertEqual(switch.read_text(encoding="utf-8"), "")
 
     def test_a_line_asking_for_a_schedule_still_schedules(self) -> None:
         doc = self.doc.read_text(encoding="utf-8")
@@ -341,7 +334,10 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
         self.assertIn("/showrunner:dailies gantt", prompt)
-        self.assertEqual(prompt.count("Pass `--render-state <SCRATCH>/dailies_state.json` to the builder"), 1)
+        state_dir = self.state / "showrunner" / self.doc.name.removesuffix("-production.md") / "session"
+        self.assertEqual(prompt.count(f"Pass `--render-state {state_dir}/dailies_state.json` to the builder"), 1)
+        self.assertIn(f"unit_status.sh {state_dir}/unit_status ", prompt)
+        self.assertNotIn("<STATE_DIR>", prompt)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
         self.assertIn(f"--production {self.doc}", prompt)
@@ -383,7 +379,9 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
-                                           "open_for_user": ["stale state item"]}), encoding="utf-8")
+                                           "open_for_user": ["stale state item"],
+                                           "next": ["merge alpha phase 2 when its gate is green",
+                                                    "send the restarts plan at 03:30"]}), encoding="utf-8")
         before = self.run_command("log", "compacting", "--state", str(state), "--before-compaction")
         self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
         log = (self.checkout / "production.log").read_text(encoding="utf-8")
@@ -391,11 +389,39 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn("Merges accepted but held: alpha phase 2", log)
         self.assertIn("Open for the user: review colors", log)
         self.assertNotIn("stale state item", log)
+        self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
+
+    def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
+        slug = self.doc.name.removesuffix("-production.md")
+        timer = self.state / "notifier" / f"showrunner-{slug}"
+        timer.mkdir(parents=True)
+        _ = (timer / "conf").write_text("TARGET=session:old-showrunner\n", encoding="utf-8")
+        scratch = self.root / "tmp" / "claude-1000" / "-project" / "old-showrunner" / "scratchpad"
+        (scratch / "unit_status").mkdir(parents=True)
+        _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
+        _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")
+        target = self.state / "showrunner" / slug / "session"
+        target.mkdir(parents=True)
+        _ = (target / "showrunner_state.json").write_text('{"merges_held": ["kept"]}\n', encoding="utf-8")
+        prompt = self.state / "showrunner" / slug / "prompt.txt"
+        _ = prompt.write_text("an old prompt with <SCRATCH>/unit_status\n", encoding="utf-8")
+        env = {**self.env, "SHOWRUNNER_SCRATCH_ROOT": str(self.root / "tmp")}
+
+        result = self.run_command("log", "first event", env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"state-dir: ok — copied unit_status to {target}", result.stdout)
+        self.assertEqual((target / "unit_status" / "blocks_open").read_text(encoding="utf-8"), "alpha-unit\n")
+        self.assertIn("kept", (target / "showrunner_state.json").read_text(encoding="utf-8"))
+        self.assertIn(f"unit_status.sh {target}/unit_status ", prompt.read_text(encoding="utf-8"))
+
+        again = self.run_command("log", "second event", env=env)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertNotIn("state-dir", again.stdout)
 
     def test_invalid_state_fails_log_without_writing(self) -> None:
         log = self.checkout / "production.log"
         _ = log.write_text("existing line\n", encoding="utf-8")
-        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong")):
+        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong"), ("next", ["two\nlines"])):
             with self.subTest(key=key):
                 state = self.root / f"{key}.json"
                 _ = state.write_text(json.dumps({key: value}), encoding="utf-8")
@@ -405,27 +431,272 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
                 self.assertIn(f"log: failed — {state}: {key} must be", result.stdout)
                 self.assertEqual(log.read_bytes(), before)
 
-    def test_footer_state_updates_outstanding_only_when_open_items_are_present(self) -> None:
+    def question_state(self, items: list[dict[str, str] | str]) -> Path:
+        path = self.root / "questions.json"
+        _ = path.write_text(json.dumps({"open_for_user": items}))
+        return path
+
+    def run_questions(self, state: Path) -> str:
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
+              redirect_stdout(io.StringIO()) as output):
+            registration.questions(read_production(self.doc), state)
+        return output.getvalue()
+
+    def question_instance(self) -> Path:
+        instance = self.state / "notifier/showrunner-example"
+        instance.mkdir(parents=True, exist_ok=True)
+        _ = (instance / "conf").write_text("TARGET=session:current-session-id\n")
+        return instance
+
+    def test_new_object_question_requires_full_text_but_log_remains_a_parser(self) -> None:
+        state = self.question_state([{"text": "Choose layout"}])
+        parsed = registration.judgment_state(state, "log")
+        self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
+        with self.assertRaisesRegex(registration.RegistrationFailure, "a new question needs its full text"):
+            _ = self.run_questions(state)
+        self.assertFalse(self.outstanding().exists())
+        self.assertFalse((self.state / "notifier/showrunner-example/pending_reviewed.json").exists())
+
+    def test_held_question_batch_writes_no_records_and_rerun_accepts_reviewed_text(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"Existing reminder"}]')
+        history = outstanding.with_suffix(".history.jsonl")
+        _ = history.write_text(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "text": "Earlier"}) + "\n")
+        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
+        _ = self.question_instance()
+        _ = pending.write_text(json.dumps({"items": [{"kind": "reviewed", "text": "Earlier", "reviewed": "Earlier question?"}]}))
+        before = [path.read_bytes() for path in (outstanding, history, pending)]
+        full = "Build 42 failed.\nRetry (recommended) or stop?"
+        state = self.question_state([{"text": "Retry build", "question": full},
+                                     {"text": "Choose compiler", "question": "Use stable (recommended) or nightly?"}])
+        with mock.patch.object(review, "review_question", side_effect=[
+                review.QuestionAccepted(full),
+                review.QuestionAwaitingFacts("Use stable (recommended) or nightly?", ("Which target?",))]) as reviewer:
+            with self.assertRaisesRegex(registration.RegistrationFailure, "question held for review: Choose compiler: Which target"):
+                _ = self.run_questions(state)
+        self.assertEqual([path.read_bytes() for path in (outstanding, history, pending)], before)
+        self.assertEqual(reviewer.call_args_list[0].args, (review.QuestionKey("example", "Retry build"), full))
+        accepted = "Build 42 failed on natedev.\nRetry (recommended) or stop?"
+        with mock.patch.object(review, "review_question", side_effect=[
+                review.QuestionAccepted(accepted), review.QuestionAccepted("Use stable (recommended) or nightly?")]):
+            output = self.run_questions(state)
+        self.assertIn("reviewed question: " + accepted, output)
+        rows = cast(list[dict[str, str]], json.loads(outstanding.read_text()))
+        self.assertEqual(rows[0]["question"], full)
+        self.assertEqual(rows[0]["reviewed"], accepted)
+        saved = cast(dict[str, list[dict[str, str]]], json.loads(pending.read_text()))
+        self.assertEqual([item["text"] for item in saved["items"]], ["Retry build", "Choose compiler"])
+        lines = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual(lines[1]["reviewed"], accepted)
+
+    def test_question_rewrite_recheck_failure_keeps_registration_files_unchanged_and_revision(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text("[]")
+        history = outstanding.with_suffix(".history.jsonl")
+        _ = history.write_text("")
+        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
+        pending.parent.mkdir(parents=True)
+        _ = pending.write_text('{"items":[]}')
+        paths = (outstanding, history, pending)
+        before = [path.read_bytes() for path in paths]
+        original, rewritten = "Retry it?", "Retry build 42 (recommended) or stop?"
+        state = self.question_state([{"text": "Retry build", "question": original}])
+        responses = iter([
+            review.VerdictRecord(verdict="rewrite", title="", action=None, body=rewritten, questions=[],
+                failed_rules=[{"rule": "reader-starts-cold", "quote": original}]),
+            review.VerdictRecord(verdict="ask", title="", action=None, body=rewritten, questions=["Which machine?"],
+                failed_rules=[{"rule": "reader-starts-cold", "quote": "build 42"}]),
+            review.VerdictRecord(verdict="send", title="", action=None, body=original, questions=[], failed_rules=[])])
+        calls: list[tuple[list[str], float, dict[str, str]]] = []
+        def runner(argv: list[str], *, timeout: float,
+                   env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            calls.append((argv.copy(), timeout, env.copy()))
+            if argv[0] == "zsh":
+                return subprocess.CompletedProcess(argv, 0, "Question rules", "")
+            if argv[0] == "bash":
+                return subprocess.CompletedProcess(argv, 0, "agent=sonnet effort=high", "")
+            self.assertEqual(Path(argv[0]).name, "claude")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(next(responses)), "")
+        real_review = review.review_question
+        def question_review(key: review.QuestionKey, question: str) -> review.QuestionOutcome:
+            return real_review(key, question, runner=runner)
+        with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
+              mock.patch.object(review, "GUIDE", self.root),
+              mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
+              mock.patch.object(review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")),
+              mock.patch.object(review, "review_question", side_effect=question_review)):
+            with self.assertRaisesRegex(registration.RegistrationFailure, "Which machine"):
+                _ = self.run_questions(state)
+            self.assertEqual([path.read_bytes() for path in paths], before)
+            self.assertTrue((self.state / "notify/questions" / (review.QuestionKey("example", "Retry build").digest + ".json")).exists())
+            self.assertIn("reviewed question: " + original, self.run_questions(state))
+        prompts = [call[0][-1] for call in calls if Path(call[0][0]).name == "claude"]
+        self.assertIn("Revision: true", prompts[-1])
+        self.assertEqual(len(prompts), 3)
+        self.assertTrue(all(0 < call[1] <= review.review_timeout_seconds() for call in calls))
+
+    def test_later_registration_keeps_reviewed_and_unavailable_questions_and_recall_is_multiline(self) -> None:
+        _ = self.question_instance()
+        full = "Build 42 failed.\nRetry (recommended) or stop?"
+        unavailable = "Use stable (recommended) or nightly?"
+        state = self.question_state([{"text": "Retry build", "question": full}])
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(full)):
+            _ = self.run_questions(state)
+        state = self.question_state(["Retry build", {"text": "Choose compiler", "question": unavailable}])
+        with mock.patch.object(review, "review_question", return_value=review.QuestionReviewUnavailable(unavailable, "timeout")):
+            _ = self.run_questions(state)
+        state = self.question_state([{"text": "Retry build", "after": "2099-01-01T08:00"}, "Choose compiler", "Reminder"])
+        with mock.patch.object(review, "review_question", side_effect=AssertionError("reminder reviewed")):
+            _ = self.run_questions(state)
+        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
+        self.assertEqual(rows[0]["reviewed"], full)
+        self.assertEqual(rows[0]["question"], full)
+        self.assertEqual(rows[1]["question"], unavailable)
+        self.assertEqual(rows[1]["review_unavailable"], "timeout")
+        self.assertNotIn("reviewed", rows[1])
+        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
+        saved = cast(dict[str, list[dict[str, str]]], json.loads(pending.read_text()))
+        self.assertEqual([item["kind"] for item in saved["items"]], ["reviewed", "review unavailable"])
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(showrunners, "user_facing", return_value=["example"]),
+              redirect_stdout(io.StringIO()) as output):
+            registration.open_items(read_production(self.doc))
+        self.assertIn(full, output.getvalue())
+        self.assertIn(unavailable, output.getvalue())
+        self.assertIn("Reminder", output.getvalue())
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
+        with mock.patch.dict(os.environ, self.env):
+            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+            _ = self.run_questions(self.question_state([]))
+            self.assertIn(" ".join(full.split()), review.registered_questions(cutoff))
+
+    def test_blank_reviewer_rewrite_stores_original_as_review_unavailable(self) -> None:
+        question = "Retry build 42?"
+        state = self.question_state([{"text": "Retry build", "question": question}])
+        real_review = review.review_question
+        for body in ("", " \n\t"):
+            with self.subTest(body=body):
+                self.outstanding().unlink(missing_ok=True)
+                decisions: list[review.VerdictRecord] = [
+                    review.VerdictRecord(verdict="rewrite", title="", action=None, body=body, questions=[],
+                        failed_rules=[{"rule": "reader-starts-cold", "quote": question}]),
+                    review.VerdictRecord(verdict="send", title="", action=None, body=body,
+                        questions=[], failed_rules=[])]
+                calls: list[tuple[list[str], float, dict[str, str]]] = []
+                def runner(argv: list[str], *, timeout: float,
+                           env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    calls.append((argv.copy(), timeout, env.copy()))
+                    if argv[0] == "zsh":
+                        return subprocess.CompletedProcess(argv, 0, "Question rules", "")
+                    if argv[0] == "bash":
+                        return subprocess.CompletedProcess(argv, 0, "agent=sonnet effort=high", "")
+                    self.assertEqual(Path(argv[0]).name, "claude")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(decisions.pop(0)), "")
+                def question_review(key: review.QuestionKey, text: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner)
+                with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
+                      mock.patch.object(review, "GUIDE", self.root),
+                      mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
+                      mock.patch.object(review, "reviewer_binary", return_value=review.ResolvedReviewerBinary(self.root / "claude")),
+                      mock.patch.object(review, "review_question", side_effect=question_review)):
+                    output = self.run_questions(state)
+                self.assertEqual(len([call for call in calls if Path(call[0][0]).name == "claude"]), 1)
+                rows = dailies_render.read_outstanding(self.outstanding())
+                self.assertEqual(len(rows), 1)
+                self.assertIsInstance(rows[0], dailies_render.ReviewUnavailableOutstandingQuestion)
+                row = rows[0]
+                assert isinstance(row, dailies_render.ReviewUnavailableOutstandingQuestion)
+                self.assertEqual(row.question, question)
+                self.assertIn("rewrite needs nonempty text", row.reason)
+                self.assertIn("reviewed question: " + question, output)
+
+    def test_reviewed_question_without_instance_does_not_create_a_timer_directory(self) -> None:
+        question = "Retry build 42?"
+        state = self.question_state([{"text": "Retry build", "question": question}])
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
+            output = self.run_questions(state)
+        self.assertIn("reviewed question: " + question, output)
+        rows = dailies_render.read_outstanding(self.outstanding())
+        self.assertIsInstance(rows[0], dailies_render.ReviewedOutstandingQuestion)
+        self.assertFalse((self.state / "notifier/showrunner-example").exists())
+        self.assertEqual(showrunners.registered_showrunners(self.state / "notifier"), [])
+
+    def test_duplicate_question_text_is_reviewed_and_recorded_once_using_first_occurrence(self) -> None:
+        _ = self.question_instance()
+        first = "Retry build 42?"
+        state = self.question_state([
+            {"text": "Retry build", "question": first},
+            {"text": "Retry build", "question": "Use build 43?", "after": "2099-01-01T08:00"},
+            "Reminder", "Reminder"])
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(first)) as reviewer:
+            _ = self.run_questions(state)
+        reviewer.assert_called_once_with(review.QuestionKey("example", "Retry build"), first)
+        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
+        self.assertEqual([row["text"] for row in rows], ["Retry build", "Reminder"])
+        self.assertEqual(rows[0]["question"], first)
+        self.assertNotIn("after", rows[0])
+        history = [cast(dict[str, str], json.loads(line))
+                   for line in self.outstanding().with_suffix(".history.jsonl").read_text().splitlines()]
+        self.assertEqual([row["text"] for row in history], ["Retry build", "Reminder"])
+
+    def test_replacing_outstanding_removes_closed_pending_questions_and_keeps_open_ones(self) -> None:
+        instance = self.question_instance()
+        question = "Retry build 42?"
+        other = "Use stable?"
+        state = self.question_state([{"text": "Retry build", "question": question},
+                                     {"text": "Compiler", "question": other}])
+        with mock.patch.object(review, "review_question", side_effect=[
+                review.QuestionAccepted(question), review.QuestionReviewUnavailable(other, "timeout")]):
+            _ = self.run_questions(state)
+        _ = self.run_questions(self.question_state(["Compiler"]))
+        self.assertEqual(read_pending_reviewed(instance), [
+            PendingReviewUnavailableQuestion("Compiler", other, "timeout")])
+        _ = self.run_questions(self.question_state([]))
+        self.assertFalse((instance / "pending_reviewed.json").exists())
+
+    def test_questions_state_updates_outstanding_only_when_open_items_are_present(self) -> None:
         outstanding = self.outstanding()
         saved = [{"since": "2026-10-01T08:00", "text": "review colors"}]
         _ = outstanding.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
         before = outstanding.read_bytes()
         state = self.root / "judgment.json"
         _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
-        absent = self.run_command("footer", "--state", str(state))
+        absent = self.run_command("questions", "--state", str(state))
         self.assertEqual(absent.returncode, 0, absent.stdout + absent.stderr)
         self.assertEqual(outstanding.read_bytes(), before)
         _ = state.write_text(json.dumps({"open_for_user": ["review colors"]}), encoding="utf-8")
-        retained = self.run_command("footer", "--state", str(state))
+        retained = self.run_command("questions", "--state", str(state))
         self.assertEqual(retained.returncode, 0, retained.stdout + retained.stderr)
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual(entries[0]["since"], "2026-10-01T08:00")
         _ = state.write_text(json.dumps({"open_for_user": []}), encoding="utf-8")
-        cleared = self.run_command("footer", "--state", str(state))
+        cleared = self.run_command("questions", "--state", str(state))
         self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
 
-    def test_footer_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
+    def test_questions_state_replaces_reports_only_when_report_to_user_is_present(self) -> None:
+        written = self.outstanding().parent.parent / "reports/example.json"
+        state = self.root / "judgment.json"
+        report = {"text": "hanadocs is back", "until": "2026-10-17T09:00"}
+        _ = state.write_text(json.dumps({"report_to_user": [report]}), encoding="utf-8")
+        saved = self.run_command("questions", "--state", str(state))
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
+        kept = self.run_command("questions", "--state", str(state))
+        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+        for bad in ([{"text": "x", "until": "tomorrow"}], [{"text": "", "until": "2026-10-17T09:00"}],
+                    [{"text": "x", "until": "2026-10-17T09:00", "question": "?"}], "x"):
+            with self.subTest(bad=bad):
+                _ = state.write_text(json.dumps({"report_to_user": bad}), encoding="utf-8")
+                refused = self.run_command("questions", "--state", str(state))
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertIn("report_to_user", refused.stdout)
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8")), [report])
+
+    def test_questions_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text(json.dumps([{"since": "2026-10-01T08:00", "text": "Choose a compiler."}]))
         now = datetime.now(timezone.utc)
@@ -436,7 +707,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         state = self.root / "judgment.json"
         _ = state.write_text(json.dumps({"open_for_user": ["Choose a compiler.", "Approve the release."]}))
         for _ in range(2):
-            result = self.run_command("footer", "--state", str(state))
+            result = self.run_command("questions", "--state", str(state))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         saved = [cast(QuestionRegistration, json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([item["text"] for item in saved], ["Recent question?", "Approve the release."])
@@ -445,16 +716,16 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIsNotNone(stamp.tzinfo)
         self.assertGreaterEqual(stamp, now)
 
-    def test_footer_keeps_registration_history_when_the_question_closes(self) -> None:
+    def test_questions_keeps_registration_history_when_the_question_closes(self) -> None:
         outstanding = self.outstanding()
         state = self.root / "judgment.json"
         _ = state.write_text(json.dumps({"open_for_user": ["Would you retry the build?"]}))
-        opened = self.run_command("footer", "--state", str(state))
+        opened = self.run_command("questions", "--state", str(state))
         self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
         history = outstanding.with_suffix(".history.jsonl")
         before = history.read_bytes()
         _ = state.write_text(json.dumps({"open_for_user": []}))
-        closed = self.run_command("footer", "--state", str(state))
+        closed = self.run_command("questions", "--state", str(state))
         self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
         self.assertEqual(json.loads(outstanding.read_text()), [])
         self.assertEqual(history.read_bytes(), before)
@@ -462,76 +733,64 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(saved["text"], "Would you retry the build?")
         self.assertIsNotNone(datetime.fromisoformat(saved["time"]).tzinfo)
 
-    def test_footer_rejects_bad_deferred_item_before_writing_outstanding(self) -> None:
+    def test_questions_rejects_bad_deferred_item_before_writing_outstanding(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"review colors"}]\n', encoding="utf-8")
         before = outstanding.read_bytes()
         state = self.root / "judgment.json"
         _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}), encoding="utf-8")
-        result = self.run_command("footer", "--state", str(state))
+        result = self.run_command("questions", "--state", str(state))
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("footer: failed", result.stdout)
+        self.assertIn("questions: failed", result.stdout)
         self.assertEqual(outstanding.read_bytes(), before)
 
-    def test_footer_nothing_needed_is_explicit(self) -> None:
-        ordinary = self.run_command("footer")
-        self.assertEqual(ordinary.returncode, 0, ordinary.stdout + ordinary.stderr)
-        self.assertNotIn(" - nothing needed", ordinary.stdout)
-        quiet = self.run_command("footer", "--nothing-needed")
-        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
-        self.assertIn("* no dailies scheduled - nothing needed", quiet.stdout)
 
-    def test_footer_stopped_schedule_has_no_next_run(self) -> None:
-        instance = self.state / "instance-showrunner-example"
-        _ = instance.write_text("stopped", encoding="utf-8")
-        stopped = self.run_command("footer")
-        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
-        self.assertIn("no dailies scheduled", stopped.stdout)
-        self.assertNotIn("next dailies:", stopped.stdout)
-        _ = instance.write_text("enabled", encoding="utf-8")
-        enabled = self.run_command("footer")
-        self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
-        self.assertIn("next dailies:", enabled.stdout)
-
-    def test_footer_switch_off_still_stores_what_waits_on_the_user(self) -> None:
-        switch = self.state / "showrunner/footers-off/example"
-        switch.parent.mkdir(parents=True)
-        switch.touch()
+    def test_a_stored_item_with_plumbing_is_named_and_a_new_one_is_refused(self) -> None:
         outstanding = self.outstanding()
+        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"free the cargo-berth on the Mac"}]\n',
+                                   encoding="utf-8")
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": ["free the cargo-berth on the Mac", "review colors"]}),
+                             encoding="utf-8")
+        kept = self.run_command("questions", "--state", str(state))
+        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
+        self.assertIn("questions: reword — free the cargo-berth on the Mac: 'berth' is the production's own plumbing",
+                      kept.stdout)
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual([entry["text"] for entry in entries], ["free the cargo-berth on the Mac", "review colors"])
+        before = outstanding.read_bytes()
+        _ = state.write_text(json.dumps({"open_for_user": ["review colors", "release the writers"]}), encoding="utf-8")
+        refused = self.run_command("questions", "--state", str(state))
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("questions: failed — release the writers: 'writers' is the production's own plumbing",
+                      refused.stdout)
+        self.assertEqual(outstanding.read_bytes(), before)
+
+    def test_questions_store_what_waits_on_the_user_and_print_one_line(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"choose layout"}]')
         state = self.root / "judgment.json"
         _ = state.write_text(json.dumps({"open_for_user": [
             "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
-        stored = self.run_command("footer", "--state", str(state))
+        stored = self.run_command("questions", "--state", str(state))
         self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
-        self.assertEqual(stored.stdout.strip(), "footer: ok — footers off")
+        # The reply carries no footer: the user reads the counts in the status line.
+        self.assertEqual(stored.stdout.strip(), "questions: ok — recorded")
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
         self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
         before = outstanding.read_bytes()
         _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
-        kept = self.run_command("footer", "--state", str(state))
-        self.assertEqual(kept.stdout.strip(), "footer: ok — footers off")
+        kept = self.run_command("questions", "--state", str(state))
+        self.assertEqual(kept.stdout.strip(), "questions: ok — recorded")
         self.assertEqual(outstanding.read_bytes(), before)
         _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
                              encoding="utf-8")
-        bad = self.run_command("footer", "--state", str(state))
+        bad = self.run_command("questions", "--state", str(state))
         self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
-        self.assertIn("footer: failed", bad.stdout)
+        self.assertIn("questions: failed", bad.stdout)
         self.assertEqual(outstanding.read_bytes(), before)
 
-    def test_footer_switch_off_drops_all_output_and_on_renders_footer(self) -> None:
-        switch = self.state / "showrunner/footers-off/example"
-        switch.parent.mkdir(parents=True)
-        switch.touch()
-        off = self.run_command("footer")
-        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
-        self.assertEqual(off.stdout.strip(), "footer: ok — footers off")
-        switch.unlink()
-        on = self.run_command("footer")
-        self.assertEqual(on.returncode, 0, on.stdout + on.stderr)
-        self.assertIn("footer: ok", on.stdout)
-        self.assertIn("update:", on.stdout)
-        self.assertIn("no dailies scheduled", on.stdout)
 
     def timer(self, slug: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
@@ -553,26 +812,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
         return listed.stdout.splitlines()
 
-    def test_footer_of_a_root_covers_lower_lists_and_a_lower_one_names_its_root(self) -> None:
-        for slug in ("example", "kid"):
-            self.timer(slug)
-        self.attach("kid", "example")
-        quiet = self.run_command("footer", "--nothing-needed")
-        self.assertIn(" - nothing needed", quiet.stdout)
-        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?"})
-        counted = self.run_command("footer", "--nothing-needed")
-        self.assertEqual(counted.returncode, 0, counted.stdout + counted.stderr)
-        self.assertNotIn("nothing needed", counted.stdout)
-        self.assertNotIn("merge today?", counted.stdout)
-        _ = self.outstanding().with_name("kid.json").write_text("{bad", encoding="utf-8")
-        unread = self.run_command("footer", "--nothing-needed")
-        self.assertEqual(unread.returncode, 0, unread.stdout + unread.stderr)
-        self.assertIn("* kid: needs-user list unreadable", unread.stdout.splitlines())
-        self.timer("top")
-        self.attach("example", "top")
-        lower = self.run_command("footer")
-        self.assertIn("* reports to top", lower.stdout.splitlines())
-        self.assertNotIn("* kid: needs-user list unreadable", lower.stdout.splitlines())
 
     def test_open_lists_every_item_below_a_root_in_full_oldest_first(self) -> None:
         for slug in ("example", "kid", "grandkid", "stranger"):

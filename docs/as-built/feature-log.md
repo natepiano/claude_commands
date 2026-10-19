@@ -2,7 +2,7 @@
 
 ## What it is
 
-The feature log is the current account of what six projects do: hana, natedev, cargo-liner, bevy_brp, obsidian_knife and nateroids. It keeps one Markdown note per user-visible result in the hanadocs vault. Git already records the order of the work; the log records what exists now, so a reader or an agent learns a project's behavior without reconstructing it from commits. A note is `live` while its statement is true and `superseded` once a later result replaces it; superseded notes stay as evidence and as release history. One script, `scripts/feature_log/feature_log.py`, writes every note, validates every field and refuses a bad call. Three close-out steps call it once a result is accepted, and a digest lists new entries on request. For a published crate the log renders a Keep a Changelog section, compares it with the hand-written one, and stamps the released version onto the entries that shipped.
+The feature log is the current account of what seven projects do: hana, natedev, cargo-liner, bevy_brp, obsidian_knife, nateroids and claude (this repository, `~/.claude`). It keeps one Markdown note per user-visible result in the hanadocs vault. Git already records the order of the work; the log records what exists now, so a reader or an agent learns a project's behavior without reconstructing it from commits. A note is `live` while its statement is true and `superseded` once a later result replaces it; superseded notes stay as evidence and as release history. One script, `scripts/feature_log/feature_log.py`, writes every note, validates every field and refuses a bad call. Three close-out steps call it once a result is accepted, and a digest lists new entries on request. For a published crate the log renders a Keep a Changelog section, compares it with the hand-written one, and stamps the released version onto the entries that shipped.
 
 ## How it works
 
@@ -12,18 +12,18 @@ The feature log is the current account of what six projects do: hana, natedev, c
 | --- | --- |
 | `scripts/feature_log/feature_log.py` | The only writer of feature notes. The CLI, plus the importable `PROJECTS`, `vault_dir`, `state_dir` and `locked`. |
 | `scripts/feature_log/inventory.py` | Read-only inventory of backfill evidence. Owns the frozen ledgers. |
-| `scripts/feature_log/test_feature_log.py` | 116 `unittest` cases on a temp vault and temp state. |
-| `scripts/feature_log/test_inventory.py` | 31 cases on temp git repositories. |
+| `scripts/feature_log/test_feature_log.py` | 117 `unittest` cases on a temp vault and temp state. |
+| `scripts/feature_log/test_inventory.py` | 32 cases on temp git repositories. |
 | `commands/feature_log.md` | `/feature_log digest [--since]` and `/feature_log live <project> [filters]`. Reads only. |
-| `commands/showrunner/produce.md` | `<ChangeReviewFeatureLog/>` inside `<MergeCheckpoint/>`, and `<CloseChangeReview/>`: the Hana close-out. |
+| `commands/showrunner/produce.md` | `<ChangeReviewFeatureLog/>` inside `<MergeCheckpoint/>`, and `<CloseChangeReview/>`: the hana and claude close-out. |
 | `commands/validate_and_push.md` | `<FeatureLogCloseOut/>` and the `Feature log:` summary line. |
 | `commands/release.md` | The compare step in `<FinalizeOnBase/>` and `<FinalizeOnHotfixBranch/>`; the stamp step in `<PublishPhases/>`. |
 | `/etc/nixos/README.md` | Per-change loop step 6: the natedev close-out. Outside this repository. |
 | `pyrightconfig.json` | An `executionEnvironments` entry for `scripts/feature_log`. |
 | `/home/natepiano/rust/hanadocs/feature-log/<project>/` | The notes. |
-| `/home/natepiano/rust/hanadocs/home-base/feature-log.base`, `feature-log - <project>.base` | The seven Bases. |
+| `/home/natepiano/rust/hanadocs/home-base/feature-log.base`, `feature-log - <project>.base` | The Bases: the global one and one per project. |
 | `~/.local/state/claude/feature-log/` | State: lock, events, proposals, digest cursor, ledgers, saved release contents. |
-| `/home/natepiano/rust/hanadocs/proposals/feature-log.md` | The design this implements. Read-only for agents. |
+| `~/rust/hanadocs/issues/feature log.md` | The design this implements. Read-only for agents. |
 
 Every call is `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py <verb> …`. Both scripts use the Python standard library only.
 
@@ -39,17 +39,18 @@ Every call is `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_lo
 | `bevy_brp` | `natepiano/bevy_brp` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`, `bevy_brp_test_apps`, `test-app-a`, `test-app-b` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros` |
 | `obsidian_knife` | `natepiano/obsidian_knife` | `obsidian_knife` | none |
 | `nateroids` | `natepiano/nateroids` | `nateroids` | none |
+| `claude` | `natepiano/claude_commands` | none | none |
 
-The folder is the repository boundary; `crate` narrows ownership. `published` holds crates confirmed on crates.io on 2026-10-10. A crate that may publish but has not (`cargo-berth`, `cargo-handler`, `obsidian_knife`, `nateroids`) is not in it. A first publication or a new workspace member is an edit to `PROJECTS`.
+The folder is the repository boundary; `crate` narrows ownership. A project with no crates (natedev, claude) takes none. `published` holds crates confirmed on crates.io on 2026-10-10. A crate that may publish but has not (`cargo-berth`, `cargo-handler`, `obsidian_knife`, `nateroids`) is not in it. A first publication or a new workspace member is an edit to `PROJECTS`.
 
 ### Vault layout
 
-The vault of record is natedev's `/home/natepiano/rust/hanadocs`. It holds six folders, `feature-log/{hana,natedev,cargo-liner,bevy_brp,obsidian_knife,nateroids}/`, named exactly as the project keys, and seven Bases at the vault root. A note's path is `feature-log/<project>/<title>.md`. The vault is a git repository that agents never commit.
+The vault of record is natedev's `/home/natepiano/rust/hanadocs`. It holds one folder per project, `feature-log/{hana,natedev,cargo-liner,bevy_brp,obsidian_knife,nateroids,claude}/`, named exactly as the project keys, and the Bases at the vault root. A write creates a missing folder; `check` and `live` treat one as empty. The vault owner adds a new project's Base, `feature-log - claude.base` included. A note's path is `feature-log/<project>/<title>.md`. The vault is a git repository. Agents never commit their hand edits in it; a script commits the files it writes, and only those (the `hanadocs-commit.py` jobs in `/etc/nixos/modules/linux/`, and `change_review.py` for a change-review list).
 
 | Base | Views |
 | --- | --- |
 | `feature-log.base` | **Latest**, **By project**, **By crate**, **By kind** (live notes; the three "By" views use `groupBy: {property: note.<prop>, direction: ASC}`), **Superseded** |
-| `feature-log - <project>.base` (six) | **Current** and **Superseded**, each with `project.contains(link("<project>"))` |
+| `feature-log - <project>.base` (one per project) | **Current** and **Superseded**, each with `project.contains(link("<project>"))` |
 
 Every view is a table sorted by `completed_date` descending. Every filter starts with `file.hasTag("feature-log")`, then `state == "live"` or `state == "superseded"`. Live views show `file.name`, `summary`, `kind`, `crate`, `completed_date`, `project`, `area`, `link`, `production`, `unit`. Superseded views end with `replaced_by` and `release` in place of the last two.
 
@@ -95,11 +96,11 @@ unit:
 | --- | --- | --- |
 | `area` | `"[[topic]]"`; optional | `--area` |
 | `completed_date` | `"[[YYYY-MM-DD]]"` | `--completed`, default `today()` |
-| `crate` | sorted package names; `[]` only for natedev, at least one elsewhere | `--crate` |
+| `crate` | sorted package names; `[]` only for natedev and claude, at least one elsewhere | `--crate` |
 | `date_created`, `date_modified` | date links | `today()`; `date_modified` moves on every rewrite |
 | `kind` | `feature`, `fix`, `change`, `perf`, `deprecation`, `removal`, `security` | `--kind` |
 | `link` | `https://github.com/<repo>/commit/<40-hex, lowercase>` | `--link`, a 40-hex sha or that URL |
-| `production` | string; Hana only; optional | `--production` |
+| `production` | string; optional; the production whose change review accepted the note | `--production` |
 | `project` | `"[[<project>]]"` | `--project` |
 | `release` | sorted `crate@Unreleased` or `crate@version`; the crate is in `crate` and published; no crate has both `@Unreleased` and a version | default, or `--release` |
 | `replaced_by` | `[]` while live; links to replacements when superseded | `supersede` |
@@ -107,7 +108,7 @@ unit:
 | `state` | `live` or `superseded` | derived |
 | `summary` | one line, no leading `- `; for a published crate it reads unchanged as a changelog bullet | `--summary` |
 | `tags` | `[feature-log]` | derived |
-| `unit` | sorted unit slugs; Hana only; key absent when empty | `--unit` |
+| `unit` | sorted unit slugs; key absent when empty | `--unit` |
 
 - The file name is the title; no `title` key exists. `normalize_title` lowercases, turns `-` into a space, drops every character outside `[a-z0-9 _]`, collapses spaces, and refuses an empty title or one over 50 characters.
 - `render_note` writes keys in ascending order, `[]` for an empty list, sorted block items otherwise, and links and dates as `"[[x]]"`. A string is bare only when YAML reads it back unchanged (`SAFE_SCALAR_RE`), else `json.dumps`.
@@ -125,7 +126,7 @@ unit:
 | `lock` | `fcntl.flock` target | `locked()` |
 | `events.jsonl` | one `FeatureLogEvent` per line, append-only | every writing verb |
 | `digest.json` | `DigestCursor {"line": int, "at": str}` | `digest` without `--since` |
-| `proposals/<ROW>.json` | one `FeatureLogProposal` | `propose`, `add`/`supersede --review`, `drop` |
+| `proposals/<ROW>.json`, `proposals/<list>/<ROW>.json` | one `FeatureLogProposal` | `propose`, `add`/`supersede --review`, `drop` |
 | `backfill/<project>.jsonl` | the frozen ledger | `inventory.py` |
 | `release/<crate>.json` | `ReviewedReleaseContents {"crate": str, "titles": list[str]}`, on the host that ran the comparison | `changelog --compare --save`; the path comes from `commands/release.md` |
 
@@ -156,7 +157,7 @@ Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A no
 | `changelog` | `--crate --version`, optional `--compare PATH`, optional `--save FILE` | a section rendered or compared | the section, `match`, or the differences; a comparison can end with a `not compared:` line |
 | `release` | `--crate --version --contents FILE` | `X@Unreleased` becomes `X@V` | `released X@V (<n> notes)` or `unchanged` |
 | `project-of` | optional `PATH`, default `.` | maps `origin` to a project; exit 0 always | the project key or `none` |
-| `check` | none | every note in the six folders parsed and validated; every `replaced_by` target exists | `ok: <n> notes`, or one `<path>: <reason>` per error |
+| `check` | none | every note in every project folder parsed and validated; every `replaced_by` target exists | `ok: <n> notes`, or one `<path>: <reason>` per error |
 
 New-note flags: `--project --title --kind --summary --behavior --see --link --evidence` are required; `--crate --area --completed --production --unit --release --backfill --separate-result` are optional. `--crate`, `--evidence`, `--unit` and `--release` repeat and take one or more values.
 
@@ -164,7 +165,7 @@ New-note rules:
 
 - Without `--backfill`, each published crate in `--crate` adds `crate@Unreleased`, so the new entry is pending for that crate and an exact `--release` version of it in the same call is refused: `feature_log: release cannot hold both X@Unreleased and X@<version>`, where `X@Unreleased` is the default. With `--backfill`, `release` holds only the `--release` values given; a released version on a new entry takes `--backfill`.
 - `VERSION_RE` accepts `Unreleased` or `N.N.N` with optional prerelease identifiers; an empty identifier (`1.2.3-..`) is refused by every writer.
-- `--production` and `--unit` are refused outside hana. `--crate` is refused for natedev.
+- `--crate` is refused for natedev and claude: `feature_log: <project> does not accept crates`.
 - `live --grep` matches title, summary and behavior, case-insensitive. The ` (<area>)` part is absent when the note has no area.
 - `project-of` reads `git -C PATH remote get-url origin` and accepts `git@github.com:<slug>` and `https://github.com/<slug>`, with or without `.git`.
 
@@ -209,13 +210,15 @@ Release refusals, each checked before any write:
 
 ### Review rows
 
-`FeatureLogProposal = OpenProposal | LandedProposal | DroppedProposal`, discriminated by `status`. Each holds `row` (`^[AC]\d+$`), `verb` (`supersede` when `--old` is given, else `add`), `args: ProposalArgs` (all 17 new-note arguments, `completed` saved resolved) and `at`. `LandedProposal` adds `note`; `DroppedProposal` adds `verdict`.
+`FeatureLogProposal = OpenProposal | LandedProposal | DroppedProposal`, discriminated by `status`. Each holds `row`, `verb` (`supersede` when `--old` is given, else `add`), `args: ProposalArgs` (all 17 new-note arguments, `completed` saved resolved) and `at`. `LandedProposal` adds `note`; `DroppedProposal` adds `verdict`.
 
 | Call | Open proposal | Landed | Dropped | None |
 | --- | --- | --- | --- | --- |
 | `propose --review ROW …` | replaced; `completed` is kept unless `--completed` is passed | refused | refused | saved |
 | `add`/`supersede --review ROW` | lands with the saved arguments; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
 | `drop --review ROW --verdict TEXT` | becomes dropped | refused | `unchanged: <ROW>` | refused |
+
+A row is `A<n>` or `C<n>`, bare for a row of hana's list `~/rust/hanadocs/change-review/change-review - hana.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the showrunner `~/rust/hanadocs/change-review/change-review - <list>.md` is named for (`natedev/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
 
 A verb that differs from the proposal's fails and names the right verb. `propose` also requires every `--old` note to exist and be live.
 
@@ -276,13 +279,15 @@ A call is off host when the verb is not `project-of`, the short host name is not
 | Project | Step | Runs when | Outcome |
 | --- | --- | --- | --- |
 | hana | `<ChangeReviewFeatureLog/>`, then `<CloseChangeReview/>` | `merge_checkpoint.py` accepts a merge in `~/rust/hana` or `~/rust/hana_catalyst`; later, the user's change-review verdict | `propose` at merge; `add`/`supersede --review` on `works` or `fine`; `drop` on any other verdict |
+| claude | the same two steps | `merge_checkpoint.py` accepts a merge in a `~/.claude` worktree (build-followups); later, the user's change-review verdict | the same, with rows qualified by the production's list: `propose --review build-followups/C<n> --project claude`, then `add --review build-followups/C<n>` or `drop --review build-followups/C<n> --verdict …` |
 | cargo-liner, bevy_brp, obsidian_knife, nateroids | `<FeatureLogCloseOut/>` in `/validate_and_push` | the commit is on the default branch and all watched CI is green; also after `push_pr_branch_and_merge.sh` | `add`, `supersede`, or `none — <reason>` in the summary's `Feature log:` line |
 | natedev | `/etc/nixos/README.md` step 6 | `rebuild` succeeded and the activated revision (last line of `~/.local/state/rebuild/generations.log`, without `-dirty`) is on `origin/main` | `add --project natedev`, `supersede`, or `feature log: none — <reason>` |
 
 - An entry exists for a result when a user or operator can state what is now possible, now works, changed, went away or became noticeably faster. Refactor, test, build, CI and docs-only work gets none; it may be evidence for an entry.
 - Before writing, the agent reads `live` for affected entries. Still true: leave it. Stale wording or scope: `amend`. Replaced: `supersede --old`.
-- Hana: each distinct result gets one `A<n>` or `C<n>` row under `## To review` in `~/rust/hanadocs/change-review.md` and one `propose --review <row>` with `--project hana`, every owning crate, the merge sha as `--link`, `--evidence "Showrunner merge <merge-sha>, from checkpoint <checkpoint-sha>."`, `--production`, every `--unit`, and one `--old` per replaced entry. Internal-only work logs `feature log: none — <reason>` in the production log. The showrunner keeps `change-review.md` by hand; no script edits it. A script failure leaves the row open.
-- `<FeatureLogCloseOut/>` starts with `project-of .` and prints nothing for `hana`, `natedev` or `none`.
+- Hana: each distinct result gets one `A<n>` or `C<n>` row under `## To review` in `~/rust/hanadocs/change-review/change-review - hana.md` and one `propose --review <row>` with `--project hana`, every owning crate, the merge sha as `--link`, `--evidence "Showrunner merge <merge-sha>, from checkpoint <checkpoint-sha>."`, `--production`, every `--unit`, and one `--old` per replaced entry. Internal-only work logs `feature log: none — <reason>` in the production log. A script failure leaves the row open.
+- claude: the same, with no `--crate`, the merge sha as `--link` (a `natepiano/claude_commands` commit), and each row qualified by its list, `<list>/C<n>`.
+- `<FeatureLogCloseOut/>` starts with `project-of .` and prints nothing for `hana`, `natedev`, `claude` or `none`.
 
 ### `inventory.py` and the frozen ledgers
 
@@ -344,7 +349,7 @@ Rules the backfill followed, which bind any correction:
 
 ### Tests
 
-`python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'`. `test_feature_log.py` pins the two example notes byte for byte, every refusal leaving vault and events unchanged with no temp file, repeats, an interrupted supersede, splits, amend corrections and retries, the pending mark and its refusals, the pending-or-released rule in `add`, `supersede`, `amend` and `check`, exact event keys, proposals, the digest cursor and lock, every changelog kind, the headings a comparison covers, release stamping, and forwarding through injected callables. `test_inventory.py` pins each record kind, an excluded range, non-ASCII paths, a repeat `collect` leaving the ledger byte-identical, claims, path prefixes, `mark` refusals, `status` exits, and that no command changes a repository.
+`python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'`. `test_feature_log.py` pins the two example notes byte for byte, every refusal leaving vault and events unchanged with no temp file, repeats, an interrupted supersede, splits, amend corrections and retries, the pending mark and its refusals, the pending-or-released rule in `add`, `supersede`, `amend` and `check`, exact event keys, proposals, list-qualified review rows for claude beside a bare hana row of the same number, the digest cursor and lock, every changelog kind, the headings a comparison covers, release stamping, and forwarding through injected callables. `test_inventory.py` pins each record kind, an excluded range, non-ASCII paths, a repeat `collect` leaving the ledger byte-identical, claims, path prefixes, `mark` refusals, `status` exits, and that no command changes a repository.
 
 ## Invariants
 
@@ -422,7 +427,8 @@ Ledgers and evidence:
 - **One note per result, not per commit.** The log is an as-built; a second commit log in the vault would be a weaker copy of git.
 - **Script-only writing.** One schema, one validator and one file-name rule make `check`, the Bases and the changelog mechanical. The agent closest to the work decides meaning; the script owns every mechanical choice.
 - **Close-out steps, no hooks.** A hook cannot tell whether a result matters, and some run before CI settles. A rebuild must stay short and must not depend on the vault.
-- **Log at acceptance, not at release.** Hana's acceptance is the user's change-review verdict, so `propose` holds the entry until the row closes.
+- **Log at acceptance, not at release.** For hana and claude acceptance is the user's change-review verdict, so `propose` holds the entry until the row closes. A push to `~/.claude`'s default branch is not acceptance, so `<FeatureLogCloseOut/>` skips claude.
+- **A row names its list.** Each production's list numbers from 1, and proposals live in one state directory, so a bare `C17` from a second list would overwrite or be refused by Hana's `C17`. Hana's rows stay bare because its proposals were written that way.
 - **Silent writes, digest on request.** A message per entry is noise.
 - **One vault with forwarding.** Obsidian has natedev's vault open; the Mac clone syncs only through git and lacks `change-review.md`.
 - **Own frontmatter parser and writer.** No YAML library is installed under `scripts/lib/py`. The output follows Obsidian Linter's form (sorted keys and arrays, compact lists, date links), so a save in the editor leaves a note valid.
@@ -466,6 +472,7 @@ Measured on natedev. `feature_log.py check` prints `ok: 928 notes`: the 717 the 
 | nateroids | 41 | 41 | 557 (2 structured, 555 commits) | 39 | 154 | 354 | 10 | `c7d6a51` | not recorded |
 
 - Every ledger is fully disposed: `inventory.py status --project <p>` exits 0 for all six, with 0 `unresolved`.
+- claude joined on 2026-10-15 with no notes, no backfill and no ledger; `inventory.py collect --project claude` refuses with `no source configuration for claude`.
 - The backfill is complete for all six projects: each was audited against its current surface.
 - Every backfilled hana note links a commit on `git rev-list --first-parent bcd669367`. 48 cargo-mend notes link cargo-mend's graft commit, and its 2026-08-30 work carries 2026-09-03. bevy_brp's pre-workspace history is accepted by its subtree imports `c0839f61` (`extras/`) and `344e15aa` (`mcp/`), both 2025-06-27.
 - Historical release values are exact versions only: cargo-liner 91 values on 90 notes, bevy_brp 66 values on 51 notes. natedev, obsidian_knife and nateroids carry none.
@@ -492,4 +499,4 @@ Changelog comparison for the 13 published crates:
 
 The 217 entries stay pending until each crate's release stamps them.
 
-Old claim records convert `seat` to `worker` once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.
+Old claim records convert old worker field names once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.

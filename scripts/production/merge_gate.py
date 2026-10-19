@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
-The default sampled RSS cap is 4096 MiB. A 163-module run with an empty timing
+The default sampled memory cap is 4096 MiB. A 163-module run with an empty timing
 cache took 102.80 s, peaked at 2.027 GiB, and had a largest module peak of
-0.494 GiB (one-minute load 7.79-16.32). Each running job keeps a reservation:
-admission counts max(job RSS, largest job peak seen so far, initially 96 MiB)
-plus the runner itself. Startup RSS samples never discard reservations.
+0.494 GiB (one-minute load 7.79-16.32). A sample is resident plus swapped memory.
+Each running job keeps a reservation: admission counts max(job memory, largest job peak seen so far, initially 96 MiB)
+plus the runner itself. Startup samples never discard reservations.
 Samples are at least 0.25 seconds apart. One job is always allowed to progress;
 an observed overshoot makes the run red. This is admission on samples, not an
-OS allocation limit; unexpected job growth can still exceed the cap.
+OS allocation limit; growth between samples can still exceed the cap. A job whose
+own sampled memory goes over the cap is killed at that sample and fails the run, and so is
+a job still running at the module time limit (default 1800 s).
 --tests-only runs the same suite runner without performing any git operations.
+A unit checkpoint commit without its Change-Review line is refused before the merge. After the
+push, each visible change becomes a row in the change-review list that --change-review names, or
+the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
+its frontmatter; the first row creates a missing list, and the list commits itself in its vault.
+The production is --production, else the calling showrunner's (its update timer); a gate that
+finds neither is refused before the merge, so no merge lands without its rows.
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,16 +39,23 @@ import tempfile
 import time
 from typing import TextIO, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import change_review  # noqa: E402
+
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
     "mac_test", "usage", "bevy_upgrade", "production", "delegate", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline",
+    "model_study", "herdr", "notify", "statusline", "astra", "style",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
 MODULE_MEMORY_MIB = 48
+# A module still running this long is killed and the run is red: a hung module holds every gate
+# behind it. The slowest measured module took 387 s at load 152 (delegate/test_verify_mac_offload.py,
+# 2026-10-18); the limit is about 4.6 times that.
+DEFAULT_MODULE_TIME_LIMIT_S = 1800
 MEMORY_SAMPLE_SECONDS = 0.25
-SETTINGS_BLOB = "f430ede1"
+SETTINGS_BLOB = "b3466859"
 # Python restores these dispositions before exec, including an inherited SIG_IGN.
 # No preexec_fn is needed, and the suite receives signals as a normal foreground job.
 SUITE_BOOTSTRAP = """import os, signal, sys
@@ -58,6 +74,8 @@ class GateArguments(argparse.Namespace):
     unit_branch: str = ""
     checkpoint: str = ""
     previous_checkpoint: str = ""
+    change_review: str = ""
+    production: str = ""
     unit: str = ""
     phase: str = ""
     body: str = ""
@@ -69,6 +87,7 @@ class GateArguments(argparse.Namespace):
     mac_repo: str = ""
     settings_blob: str = ""
     memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB
+    module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
 
 
@@ -101,6 +120,8 @@ class RunningGateJob:
     started: float
     output: TextIO
     log: Path
+    # Set when the runner kills the job for its sampled memory; the job's result names it.
+    killed_for: str = ""
 
 
 @dataclass
@@ -201,8 +222,22 @@ def release_running() -> bool:
     return False
 
 
+def swapped_kib(pid: int) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmSwap:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def process_memory_mib(roots: set[int]) -> dict[int, float]:
-    """Sum resident memory of our child roots and descendants, never other jobs."""
+    """Sum resident and swapped memory of our child roots and descendants, never other jobs.
+
+    Swap counts: a job that leaks under memory pressure keeps its old pages swapped out, so its
+    RSS alone stays low while it grows (2026-10-18: 10 GiB resident of 28 GiB held).
+    """
     parents: dict[int, int] = {}
     resident: dict[int, int] = {}
     for entry in Path("/proc").iterdir():
@@ -222,7 +257,8 @@ def process_memory_mib(roots: set[int]) -> dict[int, float]:
         while frontier:
             frontier = {pid for pid, parent in parents.items() if parent in frontier and pid not in owned}
             owned.update(frontier)
-        totals[root] = sum(resident.get(pid, 0) for pid in owned) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        pages = sum(resident.get(pid, 0) for pid in owned)
+        totals[root] = (pages * os.sysconf("SC_PAGE_SIZE") / 1024 + sum(swapped_kib(pid) for pid in owned)) / 1024
     return totals
 
 
@@ -267,9 +303,12 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
-def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = ()) -> GateRun:
+def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
+               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
+    if module_time_limit_s <= 0:
+        raise GateRefused("module time limit must be positive")
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
@@ -283,7 +322,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     tmpfs = Path("/dev/shm")
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
-    print(f"Runner: {len(modules)} modules, sampled RSS cap {memory_cap_mib} MiB", flush=True)
+    print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
     timings_path = module_timings_path()
     timings = previous_module_seconds(timings_path)
     modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
@@ -317,6 +356,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         if job.suite != "types" and measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.path.name}"
+                        if measured > memory_cap_mib and not job.killed_for:
+                            # Admission cannot stop a job that grows after it starts; on 2026-10-18 one
+                            # module grew to 28 GiB in 56 minutes and filled natedev's swap.
+                            job.killed_for = (f"killed: sampled memory {measured / 1024:.3f} GiB is over the "
+                                              + f"{memory_cap_mib / 1024:.3f} GiB cap")
+                            print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                            kill_job_group(job)
                 while pending and admission.admits(bool(running)):
                     suite, path = pending.popleft()
                     log = Path(temporary) / f"{suite}-{path.stem}.log"
@@ -340,6 +386,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     admission.reserve(process.pid)
                 for job in running[:]:
                     status = job.process.poll()
+                    if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
+                        job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
+                        print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                        kill_job_group(job)
+                        status = job.process.poll()
                     if status is None:
                         continue
                     finished = time.monotonic()
@@ -347,6 +398,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     job.output.close()
                     captured = job.log.read_text(errors="replace")
                     job.log.unlink()
+                    if job.killed_for:
+                        captured = f"{job.killed_for}\n{captured}"
                     # Python 3.13's unittest CLI exits 5 for an empty module. Helper
                     # modules were also empty within whole-suite discovery; no tests
                     # are discarded, and import errors still return 1.
@@ -379,11 +432,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     for result in results:
         if result.suite == "types":
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
-    print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled RSS); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
-    print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled RSS); module: {largest_module or '(not sampled)'}", flush=True)
+    print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+    print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
-        print("RED: sampled RSS exceeded the cap", flush=True)
+        print("RED: sampled memory exceeded the cap", flush=True)
     return GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib)
 
 
@@ -447,6 +500,40 @@ def rollback_merge(repo: Path, baseline: str) -> None:
         raise GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or result.stderr.strip()}; {result.stderr.strip()}")
 
 
+def notify_style(repo: Path, branch: str, tip: str) -> None:
+    try:
+        script = (os.environ.get("MERGE_GATE_STYLE_SYNC") or shutil.which("style_sync.py")
+                  or str(Path(__file__).resolve().parents[1] / "style/style_sync.py"))
+        python = shutil.which("python3") or sys.executable
+        _ = sys.stdout.flush()
+        result = subprocess.run(
+            [python, script, "notify", "--repo-dir", str(repo), "--branch", branch, "--tip", tip],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode or result.stdout.strip() or result.stderr.strip():
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            print("style sync: " + detail.replace("\n", "; "), flush=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print("style sync: " + str(error).replace("\n", "; "), flush=True)
+
+
+# add_unit.commit_paths commits a production doc change on the merge branch and leaves its push to
+# this gate (user, 2026-10-08: a push of its own starts CI). Its subjects start with this.
+DOC_COMMIT_HEAD = "production("
+
+
+def check_local_doc_commits(repo: Path, origin: str) -> None:
+    """The merge HEAD is origin's merge branch plus only production doc commits, which go out with the merge."""
+    if git(repo, "merge-base", "--is-ancestor", origin, "HEAD").returncode:
+        raise GateRefused("merge HEAD differs from origin merge branch")
+    ahead = checked_git(repo, "log", "--format=%H %P%x09%s", f"{origin}..HEAD")
+    for line in ahead.splitlines():
+        hashes, _, subject = line.partition("\t")
+        if len(hashes.split()) != 2 or not subject.startswith(DOC_COMMIT_HEAD):
+            raise GateRefused(f"merge HEAD differs from origin merge branch: {hashes.split()[0][:12]} {subject}")
+        print(f"Local doc commit goes out with this merge: {hashes.split()[0][:12]} {subject}", flush=True)
+
+
 def merge_checkpoint(args: GateArguments) -> int:
     repo = Path(str(args.repo)).resolve()
     # Untracked files (each showrunner's LOG) never block; a merge that would
@@ -456,15 +543,21 @@ def merge_checkpoint(args: GateArguments) -> int:
     if checked_git(repo, "branch", "--show-current") != args.merge_branch:
         raise GateRefused("checkout is not on the merge branch")
     fetch_branches(repo, args.merge_branch, args.unit_branch)
-    baseline = checked_git(repo, "rev-parse", f"origin/{args.merge_branch}")
-    if checked_git(repo, "rev-parse", "HEAD") != baseline:
-        raise GateRefused("merge HEAD differs from origin merge branch")
+    baseline = checked_git(repo, "rev-parse", "HEAD")
+    check_local_doc_commits(repo, f"origin/{args.merge_branch}")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
     if git(repo, "merge-base", "--is-ancestor", previous, checkpoint).returncode:
         raise GateRefused("previous checkpoint is not an ancestor of checkpoint")
+    production, review_list = change_review_list(args)
+    try:
+        commits = change_review.unit_commits(repo, checkpoint, previous, str(args.merge_branch))
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(str(error)) from error
+    if refused := change_review.missing(commits):
+        raise GateRefused("checkpoint commits without a Change-Review line: " + "; ".join(refused))
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     try:
         result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
@@ -473,7 +566,7 @@ def merge_checkpoint(args: GateArguments) -> int:
             abort = git(repo, "merge", "--abort")
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs)
+        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s))
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         check_settings(repo, "HEAD", str(args.settings_blob))
@@ -484,10 +577,56 @@ def merge_checkpoint(args: GateArguments) -> int:
         rollback_merge(repo, baseline)
         raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
+    notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
+    if review_list is not None:
+        record_changes(repo, review_list, production, commits, str(args.merge_branch))
     if args.promote:
         promote(args)
     return 0
+
+
+def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
+    """The production whose merge this is, and the list its rows go to: --change-review, else its own.
+
+    The production is --production, else the calling showrunner's. Rows always name their
+    production, so --change-review needs --production too.
+    """
+    if args.change_review and not args.production:
+        raise GateRefused("--change-review needs --production: every row's list names its production")
+    try:
+        production = change_review.production_doc(str(args.production))
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
+    if args.change_review:
+        return production, Path(str(args.change_review)).expanduser()
+    try:
+        found = change_review.list_path(production)
+    except OSError as error:
+        raise GateRefused(f"production doc unreadable: {error}") from error
+    if found is None:
+        print("Change review: the production doc has no Change review line; no rows written", flush=True)
+    return production, found
+
+
+def record_changes(repo: Path, review_list: Path, production: Path, commits: list[change_review.Commit],
+                   merge_branch: str) -> None:
+    """Add a row per visible change to the list, then name any landed merge still missing its rows."""
+    merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
+    try:
+        rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged,
+                                         production)
+        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED)
+    except (change_review.ChangeReviewError, OSError) as error:
+        raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
+    if rows:
+        ids = [change_review.row_id(row) for row in rows]
+        print(f"Change review: {len(rows)} row(s) added to {review_list}: "
+              + (ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"), flush=True)
+    for row in rows:
+        print(f"Change review: {row}", flush=True)
+    for line in drifted:
+        print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -496,6 +635,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
+    _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
+    _ = parser.add_argument("--production", default="",
+                            help="the production doc whose header names the list (default: the calling showrunner's)")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
@@ -504,7 +646,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--mac-repo", default="~/.claude")
     _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled RSS admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+                            help="sampled memory admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+    _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
+                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
     args = cast(GateArguments, parser.parse_args(argv))
     if not args.tests_only:
@@ -515,7 +659,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with rollback_signals():
             if args.tests_only:
-                return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib)).passed else 1
+                return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
+                                       module_time_limit_s=float(args.module_time_limit_s)).passed else 1
             return merge_checkpoint(args)
     except (GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

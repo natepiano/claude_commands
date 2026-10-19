@@ -17,7 +17,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from scripts.production import merge_gate
+from scripts.production import change_review, merge_gate
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -26,8 +26,10 @@ EXPECTED_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
     "mac_test", "usage", "bevy_upgrade", "production", "delegate", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline",
+    "model_study", "herdr", "notify", "statusline", "astra", "style",
 )
+# Each suite's fixture holds test_first.py, and lib also test_second.py.
+MODULES = len(EXPECTED_SUITES) + 1
 
 TOOL_STUB = '''#!/usr/bin/env python3
 import json
@@ -64,6 +66,15 @@ if name == "ps":
     raise SystemExit(0)
 if name == "suite-python":
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+if name == "style_sync.py":
+    import subprocess
+    args = sys.argv[1:]
+    repo = args[args.index("--repo-dir") + 1]
+    branch = args[args.index("--branch") + 1]
+    observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
+                              capture_output=True, text=True, check=True).stdout.split()[0]
+    (state / "notified-tip").write_text(observed)
+    raise SystemExit(1 if (state / "notify-fails").exists() else 0)
 raise SystemExit("unexpected tool: " + name)
 '''
 
@@ -104,14 +115,25 @@ class FixtureTest(unittest.TestCase):
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            (state / "child-pid").write_text(str(child.pid))
+            (state / "child-pid.tmp").write_text(str(child.pid))
+            # Publish by rename: a reader must never see the file empty.
+            os.replace(state / "child-pid.tmp", state / "child-pid")
         if (state / "modify-tracked").exists() and suite == "hooks":
             Path("unit.txt").write_text("gate debris\\n")
             self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
-            (state / "module-held").write_text(str(os.getpid()))
+            (state / "module-held.tmp").write_text(str(os.getpid()))
+            # Publish by rename: a reader must never see the file empty.
+            os.replace(state / "module-held.tmp", state / "module-held")
             while True:
                 time.sleep(0.01)
+        if (state / "grow-memory").exists() and suite == "hooks":
+            # Grows until the runner kills it; past 2 GiB the cap failed to stop it.
+            blocks = []
+            while len(blocks) < 256:
+                blocks.append(b"x" * (8 << 20))
+                time.sleep(0.02)
+            self.fail("fixture grew to 2 GiB and was never killed")
         if (state / "barrier").exists() and suite == "lib":
             deadline = time.monotonic() + 300
             while True:
@@ -154,6 +176,7 @@ class MergeGateTests(unittest.TestCase):
         self.main = Path()
         self.bin = Path()
         self.state = Path()
+        self.quiet_production = Path()
         self.environment: dict[str, str] = {}
         self.base = ""
         self.checkpoint = ""
@@ -181,7 +204,13 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
+            "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
+            # The calling showrunner is found from these update timers, never the live ones.
+            "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
         }
+        # A production with no Change review line: a gate always names one, and these write no rows.
+        self.quiet_production = self.root / "quiet-production.md"
+        self.write(self.quiet_production, "# quiet\n")
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         self.environment["PYTHONPATH"] = self.environment["MERGE_GATE_TEST_PYTHONPATH"]
         _ = self.git(self.root, "init", "--bare", str(self.origin))
@@ -205,7 +234,7 @@ class MergeGateTests(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "ssh", "ps", "suite-python"):
+        for name in ("basedpyright", "ssh", "ps", "suite-python", "style_sync.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -241,7 +270,7 @@ class MergeGateTests(unittest.TestCase):
         return self.git(checkout, "rev-parse", "HEAD")
 
     def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False) -> subprocess.CompletedProcess[str]:
+                 ignored_signals: bool = False, callers_production: bool = False) -> subprocess.CompletedProcess[str]:
         prefix = [sys.executable, str(SCRIPT)]
         if ignored_signals:
             prefix = [sys.executable, "-c",
@@ -258,6 +287,7 @@ class MergeGateTests(unittest.TestCase):
              "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
              "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
+             *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
              *extra], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=300,
         )
@@ -306,6 +336,27 @@ class MergeGateTests(unittest.TestCase):
         self.assert_refused_before_gate(self.run_gate())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
 
+    def test_a_local_production_doc_commit_goes_out_with_the_merge(self) -> None:
+        # retire_unit, add_unit and promote_showrunner leave their doc commit to the next merge push.
+        self.write(self.checkout / "local.txt", "retired\n")
+        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Local doc commit goes out with this merge: {local[:12]}", result.stdout)
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [head, local, self.checkpoint])
+
+    def test_a_red_gate_keeps_the_local_production_doc_commit(self) -> None:
+        self.write(self.checkout / "local.txt", "retired\n")
+        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        self.write(self.state / "modify-tracked", "modify")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
+        self.assert_not_pushed()
+
     def test_merge_checkout_behind_origin_is_refused(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         result = self.run_gate()
@@ -348,12 +399,92 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
         self.assertFalse((self.checkout / ".git" / "MERGE_HEAD").exists())
 
+    def checkpoint_commit(self, message: str) -> str:
+        """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        self.write(self.unit / "visible.txt", message)
+        _ = self.git(self.unit, "add", ".")
+        self.environment["GIT_COMMITTER_DATE"] = "2026-10-15T12:00:00-04:00"
+        try:
+            _ = self.git(self.unit, "commit", "-m", message)
+        finally:
+            del self.environment["GIT_COMMITTER_DATE"]
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
+        return self.git(self.unit, "rev-parse", "HEAD")
+
+    def test_a_checkpoint_without_a_change_review_line_is_refused_before_the_merge(self) -> None:
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades")
+        result = self.run_gate(checkpoint=checkpoint)
+        self.assert_refused_before_gate(result)
+        self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
+
+    def review_list(self) -> tuple[Path, Path]:
+        """A change-review list holding C7, and the production doc that names it."""
+        review = self.root / "change-review.md"
+        self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
+                   + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
+        doc = self.root / "production.md"
+        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        return review, doc
+
+    def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
+        review, doc = self.review_list()
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor\n"
+                                            + "Change-Review: none — the gate script")
+        # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
+        before = change_review.today()
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        days = {before.isoformat(), change_review.today().isoformat()}
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
+        written = review.read_text(encoding="utf-8").splitlines()[-1]
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Look across the floor |" for day in days}
+        self.assertIn(written, rows)
+        self.assertIn(f"Change review: {written}", result.stdout)
+        self.assertNotIn("drift", result.stderr)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+    def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
+        review, doc = self.review_list()
+        timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / "showrunner-fixture"
+        timer.mkdir(parents=True)
+        self.write(timer / "conf", "TARGET=session:fixture-showrunner\n"
+                   + f"CHECK=bash /scripts/production/production_check.sh {doc}\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor\n"
+                                            + "Change-Review: The sky dims | Look up")
+        result = self.run_gate(checkpoint=checkpoint, callers_production=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Change review: 2 row(s) added to {review}: C8–C9", result.stdout)
+        self.assertEqual([line.split(" | ")[1] for line in review.read_text(encoding="utf-8").splitlines()[-2:]],
+                         ["The grid fades gently", "The sky dims"])
+
+    def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor")
+        result = self.run_gate(checkpoint=checkpoint, callers_production=True)
+        self.assert_refused_before_gate(result)
+        self.assertIn("pass --production <doc>: the gate adds this merge's change-review rows to its list",
+                      result.stderr)
+
+    def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
+        doc = self.root / "production.md"
+        self.write(doc, "# p\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Change review: the production doc has no Change review line; no rows written",
+                      result.stdout)
+
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
+        notifications = [call["args"] for call in self.calls() if call["tool"] == "style_sync.py"]
+        self.assertEqual(notifications, [["notify", "--repo-dir", str(self.checkout), "--branch", "integration", "--tip", head]])
+        self.assertEqual((self.state / "notified-tip").read_text(), head)
         self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                          [head, self.base, self.checkpoint])
         message = self.git(self.checkout, "log", "-1", "--format=%B")
@@ -362,7 +493,7 @@ class MergeGateTests(unittest.TestCase):
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertCountEqual([(row["suite"], row["module"]) for row in starts],
                               [(suite, "test_first.py") for suite in EXPECTED_SUITES] + [("lib", "test_second.py")])
-        self.assertEqual(len({row["pid"] for row in starts}), 23)
+        self.assertEqual(len({row["pid"] for row in starts}), MODULES)
         self.assertEqual(len({row["tmpdir"] for row in starts}), 1)
         self.assertFalse(Path(starts[0]["tmpdir"]).exists())
         type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
@@ -375,14 +506,52 @@ class MergeGateTests(unittest.TestCase):
         self.assertIsNotNone(peak, result.stdout)
         assert peak is not None
         self.assertGreater(float(peak.group(1)), 0)
-        self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled RSS\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
+        self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled memory\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
-        self.assertEqual(len(launches), 23)
+        self.assertEqual(len(launches), MODULES)
         for call in launches:
             self.assertIn("discover", call["args"])
             self.assertEqual(call["cwd"], str(self.checkout))
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_rejected_push_never_notifies_style(self) -> None:
+        self.write(self.origin / "hooks/pre-receive", "#!/bin/sh\nexit 1\n")
+        (self.origin / "hooks/pre-receive").chmod(0o755)
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_not_pushed()
+        self.assertFalse(any(call["tool"] == "style_sync.py" for call in self.calls()))
+
+    def test_style_notification_failure_keeps_the_green_merge_successful(self) -> None:
+        self.write(self.state / "notify-fails", "fail")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("style sync: exit 1", result.stdout)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
+
+    def test_notification_value_error_keeps_the_completed_merge_successful(self) -> None:
+        original_notify = merge_gate.notify_style
+
+        def malformed_notification(repo: Path, branch: str, tip: str) -> None:
+            with mock.patch("scripts.production.merge_gate.subprocess.run",
+                            side_effect=ValueError("invalid production")):
+                original_notify(repo, branch, tip)
+
+        arguments = ["--repo", str(self.checkout), "--merge-branch", "integration",
+                     "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
+                     "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
+                     "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
+                     "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
+                     "--ssh", str(self.bin / "ssh"), "--production", str(self.quiet_production)]
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+            merge_gate, "notify_style", side_effect=malformed_notification,
+        ), redirect_stdout(output):
+            code = merge_gate.main(arguments)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("style sync: invalid production", output.getvalue())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "integration"))
 
     def test_memory_cap_admits_two_overlapping_module_processes(self) -> None:
         self.write(self.state / "barrier", "two")
@@ -399,8 +568,8 @@ class MergeGateTests(unittest.TestCase):
             peak = max(peak, len(active))
         self.assertGreaterEqual(peak, 2)
         self.assertEqual(active, set())
-        self.assertEqual(len(events), 46)
-        self.assertIn("sampled RSS cap 268 MiB", result.stdout)
+        self.assertEqual(len(events), 2 * MODULES)
+        self.assertIn("sampled memory cap 268 MiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
         self.assertFalse(any(call["tool"] in ("basedpyright", "ssh") for call in self.calls()))
@@ -409,11 +578,11 @@ class MergeGateTests(unittest.TestCase):
         result = self.run_gate("--tests-only", "--memory-cap-mib", "48")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.module_events()
-        self.assertEqual(len(events), 46)
+        self.assertEqual(len(events), 2 * MODULES)
         for start, finish in zip(events[::2], events[1::2], strict=True):
             self.assertEqual((start["event"], finish["event"]), ("start", "finish"))
             self.assertEqual(start["pid"], finish["pid"])
-        self.assertIn("sampled RSS cap 48 MiB", result.stdout)
+        self.assertIn("sampled memory cap 48 MiB", result.stdout)
 
     def test_nonpositive_memory_cap_refuses_without_running_modules(self) -> None:
         result = self.run_gate("--tests-only", "--memory-cap-mib", "0")
@@ -446,7 +615,40 @@ class MergeGateTests(unittest.TestCase):
         for suite, module in (("lib", "test_first.py"), ("lib", "test_second.py"), ("hooks", "test_first.py")):
             self.assertIn(f"fixture failure in {suite}/{module}", result.stdout + result.stderr)
         starts = [row for row in self.module_events() if row["event"] == "start"]
-        self.assertEqual(len(starts), 23)
+        self.assertEqual(len(starts), MODULES)
+
+    def test_a_module_that_grows_past_the_cap_is_killed_and_the_gate_is_red(self) -> None:
+        self.write(self.state / "grow-memory", "grow")
+        result = self.run_gate("--tests-only", "--memory-cap-mib", "256")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^hooks/test_first\.py killed: sampled memory [\d.]+ GiB is over the 0\.250 GiB cap$")
+        self.assertRegex(result.stdout, r"(?m)^hooks: RED ")
+        self.assertNotIn("never killed", result.stdout)
+        starts = [row for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(len(starts), MODULES)
+
+    def test_a_module_still_running_at_the_time_limit_is_killed_and_the_gate_is_red(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        result = self.run_gate("--tests-only", "--module-time-limit-s", "2")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^hooks/test_first\.py killed: still running after 2 s, the module time limit$")
+        self.assertRegex(result.stdout, r"(?m)^hooks: RED ")
+        held = int((self.state / "module-held").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(held, 0)
+        starts = [row for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(len(starts), MODULES)
+
+    def test_nonpositive_module_time_limit_refuses_without_running_modules(self) -> None:
+        result = self.run_gate("--tests-only", "--module-time-limit-s", "0")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("module time limit must be positive", result.stdout + result.stderr)
+        self.assertEqual(self.module_events(), [])
+
+    def test_a_sample_counts_swapped_memory(self) -> None:
+        with mock.patch.object(merge_gate, "swapped_kib", return_value=1024 * 1024):
+            sample = merge_gate.process_memory_mib({os.getpid()})
+        self.assertGreater(sample[os.getpid()], 1024.0)
 
     def test_type_failure_resets_merge_and_does_not_push(self) -> None:
         self.write(self.state / "types-red", "red")
@@ -504,7 +706,7 @@ class MergeGateTests(unittest.TestCase):
         updated = cast(object, json.loads((self.state / "runner" / "module_seconds.json").read_text()))
         self.assertIsInstance(updated, dict)
         assert isinstance(updated, dict)
-        self.assertEqual(len(cast(dict[str, object], updated)), 23)
+        self.assertEqual(len(cast(dict[str, object], updated)), MODULES)
 
     def test_termination_signals_roll_back_and_clean_module_groups(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -516,7 +718,7 @@ class MergeGateTests(unittest.TestCase):
                     [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
                      "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
-                     "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
+                     "--production", str(self.quiet_production), "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     deadline = time.monotonic() + 300
@@ -546,13 +748,17 @@ class MergeGateTests(unittest.TestCase):
     def test_signal_during_merge_aborts_pending_merge_and_its_hook(self) -> None:
         ready = self.state / "merge-hook-ready"
         hook = self.checkout / ".git" / "hooks" / "prepare-commit-msg"
+        # The pid is published by rename, so the test never reads a created but
+        # still empty file.
         self.write(hook, f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\n"
-                   + f"Path({str(ready)!r}).write_text(str(os.getpid()))\nwhile True: time.sleep(0.01)\n")
+                   + f"Path({str(ready) + '.tmp'!r}).write_text(str(os.getpid()))\n"
+                   + f"os.replace({str(ready) + '.tmp'!r}, {str(ready)!r})\nwhile True: time.sleep(0.01)\n")
         hook.chmod(0o755)
         process = subprocess.Popen(
             [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
-             "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob],
+             "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
+             "--production", str(self.quiet_production)],
             env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         hook_pid = 0
         try:
@@ -640,8 +846,8 @@ class MergeGateTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 100.0}), redirect_stdout(output):
             result = merge_gate.run_suites(self.checkout, 48)
         self.assertFalse(result.passed)
-        self.assertEqual(len(result.jobs), 23)
-        self.assertIn("sampled RSS exceeded the cap", output.getvalue())
+        self.assertEqual(len(result.jobs), MODULES)
+        self.assertIn("sampled memory exceeded the cap", output.getvalue())
 
     def test_runner_reports_load_at_its_own_start_and_end(self) -> None:
         output = io.StringIO()
@@ -653,7 +859,7 @@ class MergeGateTests(unittest.TestCase):
             if calls == 1:
                 return 10.0
             events = self.state / "modules.jsonl"
-            return 20.0 if events.exists() and len(events.read_text().splitlines()) == 46 else 60.0
+            return 20.0 if events.exists() and len(events.read_text().splitlines()) == 2 * MODULES else 60.0
 
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "one_minute_load", side_effect=measured_load), redirect_stdout(output):
             result = merge_gate.run_suites(self.checkout)

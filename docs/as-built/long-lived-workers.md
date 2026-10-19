@@ -2,13 +2,19 @@
 
 ## What it is
 
-A `/unit:direct` run opens its Codex workers once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a worker that is already open, with `--to <full-worker-name>`. The exception is a phase on the pool arm of a production with a review pool: its code reviews go to the production's pooled reviewers, which are not workers of the run (`docs/as-built/review-pool.md`). A worker can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open worker gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up "Continue where you stopped." When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/seat_usage.py` checks whether this saves Codex usage. It reads the usage store (`docs/as-built/usage-ledger.md`), compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside.
+A `/unit:direct` run opens its Codex workers once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a worker that is already open, with `--to <full-worker-name>`. The exception is a phase on the pool arm of a production with a review pool: its code reviews go to the production's pooled reviewers, which are not workers of the run (`docs/as-built/review-pool.md`). A worker can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open worker gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up "Continue where you stopped." When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/worker_usage.py` checks whether this saves Codex usage. It reads the usage store (`docs/as-built/usage-ledger.md`), compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside.
 
 ## How it works
 
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`
 
-Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it. The verbs:
+Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
+
+**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `PLAN_DELEGATE_BOARD_DIR` to that folder, replacing any value the caller carries. Seat processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A review pool's mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing. A server already running keeps its environment until it is next started.
+
+The berth hook takes the session directory from `PLAN_DELEGATE_BOARD_DIR` when it names a folder that exists. When the variable is unset or its folder is gone, it reads the director's run marker (`unit_runs.marker`), so a stale variable never lets an edit through unchecked. The marker names one run, so a seat in a director's side run would otherwise check the main run's reservations.
+
+The verbs:
 
 | Verb | Signature | Behavior |
 | --- | --- | --- |
@@ -19,7 +25,8 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the worker held before), and appends the role and lens to the role log `agents.jsonl` (`docs/as-built/usage-ledger.md`). |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores `previous_role`, or removes `role` if the worker had none, returns the worker to its previous status, and appends the restored role to `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
 | `end` | `--session-dir --to` | Clears the worker's pending queue, writes its end marker and sets the worker's roster `status` to `"ended"`. |
-| `stop` | `--session-dir` | Sets every roster worker to `"ended"` and stops the current server and every retired one. |
+| `stop` | `--session-dir [--pause]` | Sets every roster worker to `"ended"` and stops the current server and every retired one. With `--pause` (a shutdown stop, `docs/as-built/shutdown-and-restart.md`) it instead sets every non-ended worker to the followable `"paused"`, with `paused_from` and `paused_turn`, after dropping its queued messages and interrupting a live turn. |
+| `reopen` | `--session-dir --to` | Returns an `ended` worker, or a `running`/`starting` one whose launcher is dead and whose server is gone, to `"paused"` on its recorded thread. Exits 2 with one stderr line when the thread id is missing or a launcher or server is alive. |
 | `sweep` | `[--root] [--stop]` | Gives a verdict on every app-server listening on `ws://` (see Cleanup). |
 | `idle-stop` | `--session-dir --pid --port` | The server's own watcher calls this. It stops the server, or touches its record if something still uses it. |
 | `list` | `--session-dir` | Prints the roster. |
@@ -29,7 +36,7 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 **Roster fields (`mesh_roster.json`).** Each entry has:
 
 - `thread_id`.
-- `status`: `starting`, `running`, `done`, `failed`, `waiting_capacity`, `capacity_exhausted`, or the terminal `ended`.
+- `status`: `starting`, `running`, `done`, `failed`, `paused`, `waiting_capacity`, `capacity_exhausted`, or the terminal `ended`. `done`, `failed` and `paused` are followable (`FOLLOWABLE_STATES`); a follow clears `paused_from` and `paused_turn`.
 - `role`: `impl`, `test`, `fix` or `review`, or absent for a roleless thread.
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`, or `"not_measured_since_compaction"` after a compaction turn that reported 0, until the worker's next turn reports a size.
 - `revision`: raised by one on every write inside the roster lock; an entry without one reads as 0. `_update_roster_if_expected` writes only when the entry still matches what the writer expects (still on its thread, absent, ended on its thread, or at an unchanged revision), so a command still at work for an earlier thread, or a compaction that ends late, cannot replace a newer record (`docs/as-built/usage-ledger.md`, Worker roster guards).
@@ -52,21 +59,22 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`.
-  2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`) or whose status is `implementing`.
+  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`.
+  2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On any other failure it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
 - On exit, it releases the claim.
+- After launch it waits for the worker's record (with `--to` on Codex, the turn record) for up to `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` (30) checks `PLAN_DELEGATE_WORKER_POLL_SECS` (1 s) apart, stopping early when the launcher exits. Tests shorten the interval and raise the count.
 - It reads the threshold from `config/delegate.conf` (`PLAN_DELEGATE_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
 - A worker assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
 
 **`scripts/delegate/review.sh [--to <worker> | --slot <new-slot> | --pool code|ui --lease <slug>/<unit>/<phase>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
 
-`lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Artifacts are keyed by pass and lens, never by worker: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`, `review_agent_<N>[_<lens>].log`.
+`lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Findings and status are keyed by pass and lens, never by worker: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`. The agent log adds the seat, `review_agent_<N>[_<lens>]-<slot>.log` for a worker and `-pool` for a pool reviewer, so a second seat on the same pass cannot truncate the first one's log.
 
 - **`--pool code|ui --lease …`**: reviews on a pooled reviewer of the production, on a read-only turn. `docs/as-built/review-pool.md` describes this path.
 - **`--to <worker>`**: reviews on an open worker.
-  - It writes one turn record per attempt and marks it `canceled` on TERM, INT or HUP, exiting 143, 130 or 129 (`docs/as-built/review-pool.md`, Turn record). `REVIEW_LEASE=<slug>/<unit>/<phase>` in the environment names the unit and phase in that record.
+  - It writes one turn record per attempt and marks it `canceled` on TERM, INT or HUP, exiting 143, 130 or 129 (`docs/as-built/review-pool.md`, Turn record). Only a pool review's `--lease` names the unit and phase in that record.
   - The recorder slot is the worker name's last hyphen segment. It must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`.
   - The family must be Codex with the mesh on.
   - Under `impl_worker_claim.lock`, it compacts when the recorded size is an integer above the threshold (best-effort, one board line), then claims with `can-follow --role review`.
@@ -79,21 +87,15 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
   - The worker stays open until `end_session.sh`.
 - **Neither flag**: runs the fresh blind reviewer through `agent_exec.sh … readonly`, with no address (`mesh=none`). The skills use this form only for a review outside a run.
 
-**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` records five things:
+**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
 
-- `git rev-parse HEAD`
-- `git status --porcelain`
-- a SHA-256 of `git diff HEAD`
-- a SHA-256 over every untracked, non-ignored file's name and content (a symlink's target, for symlinks)
-- the changed paths
-
-After the turn it compares the first four. Any difference makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
+After the turn `review_tree.py changes` checks every path that was dirty before or after, or that HEAD moved under, and lists each one whose entries differ. When two or more phases are open in the session and the review names its phase with `--phase`, a changed path that another open phase's `phases/<phase>/files` list holds is that phase's writer at work: the launcher log notes it and the check leaves it out. A path the reviewed phase holds, or no phase holds, stays the review's. Any path left makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
 
 ### Choosing a worker for a review
 
 The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegate/dual_review.md` (`<TeamReview/>` and `<ReviewPromptContract/>`), `docs/delegate/run_phase_review.md`, `docs/delegate/write_prompt_contract.md` (`<RoleReassignment/>`) and `commands/plan/phase_review.md`:
 
-- Each lens gets a different open worker, preferring one that did not write the files under review. If the other workers are busy, the writer may take the `adversary` lens on its own work.
+- Each lens gets a different open worker, and an idle open worker, a writer included, takes a lens before a new worker opens. Idle workers that did not write the files under review go first; then a writer takes one, arguing against its own choices on the `adversary` lens.
 - Roles move between workers; slots do not. Any open worker may take any role, including in the middle of a phase. Before dispatching, post a board `handoff` that names the slot, the role it leaves and the role it takes. The new prompt has the worker run `board.sh role` before its first tool call.
 - If every open worker is busy, open an extra worker named for its role with `--slot` (`review`, then `review2`; `fix2` for repair) and keep it until `end_session.sh`. Never name an extra worker with a bare number.
 - Only the adversary lens starts early, and the director records its worker in `EARLY_REVIEW_SLOT`. The closure review and the phase-review architect go to an open worker with `--to`.
@@ -101,20 +103,20 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 - Every prompt carries the Three Gods sentence written out in full: opening, later-phase, repair, review and follow-up prompts alike. It also carries the Type Design Contract, verbatim for a new worker or as the allowed pointer for a follow-up. Compaction can erase earlier prompt text, which is why each prompt repeats them.
 - A new worker opens only when no open worker can take the work: the assignment needs more workers, every open worker is busy, or a reusable thread is gone. A replacement under the same name starts fresh and gets an opening prompt.
 
-`scripts/delegate/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` column after `impl` and `test`, in the order workers first appear. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
+`scripts/delegate/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` number after `impl` and `test`, in the order workers first appear: a `- **Agent N**` line in every report, and a round-table column under `progress --tables`. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
 
 ### Cleanup
 
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. That removes Claude workers only and leaves Codex threads open. After a successful Claude session listing, and only under the real delegate root, it runs `codex_mesh.py sweep --stop` (best-effort). A sweep failure prints one line and worker cleanup continues.
-- **Run end.** `scripts/delegate/end_session.sh` takes these steps in order:
-  1. `remove_workers.py`
-  2. `codex_mesh.py stop`, whenever `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json` exists
-  3. `sweep --root <delegate root> --stop`
-  4. removal of `verify_cache/`
-  5. removal of the run's notifier
+- **Run end.** `scripts/delegate/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
+  1. one `remove_workers.py` call with a `--session-dir` per held run
+  2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
+  3. one `sweep --root <root of the first held run> --stop`
+  4. removal of each held run's `verify_cache/`
+  5. removal of the marker run's notifier
   6. removal of the run-active marker
 
-  Each step continues after a failure.
+  Steps 1 to 4 run even with no marker, for runs the session still holds. Each step continues after a failure. Tests point the scan at a temp folder with `PLAN_DELEGATE_RUN_ROOT` and the marker with `PLAN_DELEGATE_ACTIVE_DIR`.
 - **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. It then judges whether anything still needs the server:
   - Any connected client means in use.
   - For a current server, a run-active marker or a running worker means in use.
@@ -124,11 +126,11 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 
   It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the run folder's server lock before stopping a server. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
 
-### Measurement: `scripts/whoami/seat_usage.py`
+### Measurement: `scripts/whoami/worker_usage.py`
 
-`seat_usage.py` is a view over the usage store (`docs/as-built/usage-ledger.md`, Worker readout). It reads no rollout, ssh, git or readings file; the hourly collector stores Codex requests from both machines, compactions, edits, checkpoints, account readings and account role changes, and the readout opens the store read-only through `usage_report.open_read_store`.
+`worker_usage.py` is a view over the usage store (`docs/as-built/usage-ledger.md`, Worker readout). It reads no rollout, ssh, git or readings file; the hourly collector stores Codex requests from both machines, compactions, edits, checkpoints, account readings and account role changes, and the readout opens the store read-only through `usage_report.open_read_store`.
 
-- **Modes.** `[--db PATH]` with `--before <start> <end> --after <start> <end>`, or `--daily [--t-live <time>]`. In `--daily` mode, the before window is the 7 days before T_live and the after window runs from T_live to now. T_live defaults to `2026-10-10T18:17:00Z` (`DEFAULT_T_LIVE`). `--t-live` is accepted only with `--daily`. A bad window exits 2; a store it cannot open or query exits 1 with one `seat_usage.py:` line.
+- **Modes.** `[--db PATH]` with `--before <start> <end> --after <start> <end>`, or `--daily [--t-live <time>]`. In `--daily` mode, the before window is the 7 days before T_live and the after window runs from T_live to now. T_live defaults to `2026-10-10T18:17:00Z` (`DEFAULT_T_LIVE`). `--t-live` is accepted only with `--daily`. A bad window exits 2; a store it cannot open or query exits 1 with one `worker_usage.py:` line.
 - **Weights.** Dated per-model weights from `scripts/usage/weights.py`, applied as grouped SQL through `weights.sql_weights`. A window is cut into pieces at each dated weight entry that starts inside it for a model with Codex turns there (`After, from 2026-10-10 21:35Z` for `gpt-6.1-sol`). `Weighting:` heads the report with each weight version used (`<model>[@<start>]: 1 / <cached> / <output>`); `Unweighted:` names each model with no entry and its turn count.
 - **Table, per window piece.**
   - threads opened
@@ -144,7 +146,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
   - Credits show `no credit history` or `insufficient credit history`.
   - A window with no checkpoints shows `unavailable`.
   - A zero before-value gives `change unavailable`.
-- **Switch counting.** A switch is a change of the account holding the `seats` role (`accounts.CODEX_ROLE`) in the store's `account_role_changes` (`store_switch_history`). Before the stored role history begins, a change of `codex …` account between consecutive readings still counts. The total is scaled to per week over the time the readings cover.
+- **Switch counting.** A switch is a change of the account holding the `workers` role (`accounts.CODEX_ROLE`) in the store's `account_role_changes` (`store_switch_history`). Before the stored role history begins, a change of `codex …` account between consecutive readings still counts. The total is scaled to per week over the time the readings cover.
 - **Credit counting.** Credits used is the sum, per account, of balance decreases between consecutive `account_readings` rows.
 - **Credit readings.** `scripts/whoami/agent_notes.py` stores `credits` with each Codex reading, and the collector copies the readings into `account_readings`. The value is the note's `credit_balance` if it is a finite, non-negative number.
 - **Edit detection (`scripts/usage/rollouts.py` `is_edit`).** The collector stores an `edits` row for each record that counts as an edit:
@@ -160,10 +162,11 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/delegate/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/delegate/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
-| `scripts/delegate/end_session.sh` | Ends the run's workers (`stop`) and sweeps |
-| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end; sweeps after a successful listing |
+| `scripts/delegate/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
+| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
+| `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
 | `scripts/delegate/progress_history.py` | Agent columns for extra workers |
-| `scripts/whoami/seat_usage.py` | Before/after usage report over the usage store |
+| `scripts/whoami/worker_usage.py` | Before/after usage report over the usage store |
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |
 | `scripts/usage/rollouts.py` | `is_edit`, used by the collector |
 | `scripts/whoami/agent_notes.py` | `credits` on Codex readings |
@@ -185,7 +188,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 - Every prompt to a worker, follow-ups included, repeats the Three Gods sentence and the Type Design Contract, verbatim or by pointer.
 - Only the worker's own work items clear the overflow guard; `userMessage` and `contextCompaction` items never do.
 - `sweep` treats every doubt as in use, judges a second time under the owner's lock before stopping, and never touches the `unix://` daemon. A sweep failure never stops worker cleanup.
-- `seat_usage.py` reads only the usage store and writes nothing. It prints an explicit unavailable state where a value has no data, and its verdict names unweighted turns left out and the Mac's freshness when the Mac was not read in full.
+- `worker_usage.py` reads only the usage store and writes nothing. It prints an explicit unavailable state where a value has no data, and its verdict names unweighted turns left out and the Mac's freshness when the Mac was not read in full.
 - A roster writer that changes an entry in place advances `revision`; `compact` writes its size only when the revision it read is unchanged.
 
 ## Calibration / gotchas

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Bump idle unit directors and tell their running showrunners once per stretch."""
+"""Bump idle unit directors and tell their running showrunners once per stretch.
+
+A unit that herdr reports `blocked` waits at a permission, trust or question prompt: no bump can
+move it, so after PROMPT_ALERT_SECONDS the user gets one phone alert per prompt instead.
+"""
 
 from __future__ import annotations
 
@@ -11,15 +15,26 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from datetime import time as clock
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from socket import gethostname
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import add_unit
+import production_units
 import showrunners
 import unit_lookup
-from session_pane import HerdrFailure, read_place
+from session_pane import HerdrFailure, agent_status, read_place
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+import push_texts  # noqa: E402
+
+import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -30,7 +45,21 @@ PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
 TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*$", re.MULTILINE)
+# A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
+# not in the production's zone.
+HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
+                       + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
+BLOCKED = "blocked"
+PROMPT_ALERT_SECONDS = 60
+PROMPT_TEXT_ID = "stall_watch.permission_prompt"
+# The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
+PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
+# "make this edit to panes.py" reads as "edit panes.py".
+EDIT_ASK = re.compile(r"make (?:this|these) edits? to (?P<file>.+)")
+BASH_PROMPT_TITLE = "Bash command"
+UNKNOWN_REQUEST = "go on with its work"
+FRAME = " \t│┃|╭╮╰╯─"
 
 
 class Process(NamedTuple):
@@ -47,13 +76,29 @@ class Stretch(TypedDict):
     reported_status: str
 
 
+class PromptWait(TypedDict):
+    since: float
+    alerted: bool
+
+
 class Delivery(NamedTuple):
     state_path: Path
     kind: str
     command: list[str]
 
 
+class ContentBlock(TypedDict, total=False):
+    type: str
+    text: str
 
+
+class TranscriptMessage(TypedDict, total=False):
+    content: list[ContentBlock] | str
+
+
+class TranscriptEntry(TypedDict, total=False):
+    type: str
+    message: TranscriptMessage
 
 
 def command_output(command: list[str]) -> str:
@@ -87,11 +132,18 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
 
 def unit_marks(pid: int) -> tuple[str, str] | None:
     """The production and unit a process's environment marks it with, inherited from its unit's session."""
-    try:
-        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return None
-    values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+    if sys.platform == "darwin":
+        # The Mac has no /proc; herdr reads the environment from ps.
+        try:
+            values = herdr.darwin_process_environment(pid)
+        except (HerdrFailure, subprocess.SubprocessError, OSError):
+            return None
+    else:
+        try:
+            environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            return None
+        values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
     slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
     return (slug, unit) if slug and unit else None
 
@@ -118,8 +170,19 @@ def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = 
         current = parents[current]
     helpers = {row.pid for row in rows if row.parent == pid}
     helpers.update(child.pid for helper in tuple(helpers) for child in descendants(helper, rows))
-    return any(row.pid not in ancestors and row.pid not in helpers and not row.command.endswith(" <defunct>")
-               and unit_marks(row.pid) == marks for row in rows)
+    current_slugs: dict[str, str] = {}
+    for row in rows:
+        if row.pid in ancestors or row.pid in helpers or row.command.endswith(" <defunct>"):
+            continue
+        inherited = unit_marks(row.pid)
+        if inherited is None or inherited[1] != marks[1]:
+            continue
+        slug = inherited[0]
+        if slug not in current_slugs:
+            current_slugs[slug] = showrunners.canonical_slug(slug)
+        if (current_slugs[slug], inherited[1]) == marks:
+            return True
+    return False
 
 
 def latest_transcript_activity(session_id: str) -> float:
@@ -133,9 +196,149 @@ def latest_transcript_activity(session_id: str) -> float:
     return latest
 
 
+def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
+    """The file's lines, last first, read a block at a time from its end."""
+    with path.open("rb") as file:
+        end = file.seek(0, os.SEEK_END)
+        rest = b""
+        while end > 0:
+            start = max(0, end - block)
+            _ = file.seek(start)
+            lines = (file.read(end - start) + rest).split(b"\n")
+            rest = lines.pop(0) if start > 0 else b""
+            yield from reversed(lines)
+            end = start
+
+
+def transcript_turn_end(session_id: str) -> re.Match[str] | None:
+    """The turn-end line closing the session's last assistant text, read from its transcript.
+
+    Compaction clears the pane, so a unit that ended its turn and then compacted while idle shows no
+    turn-end line on screen; its transcript still ends with that text. A tool call after the text
+    means the turn went on, so there is no turn-end line.
+    """
+    try:
+        transcripts = sorted(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
+        if not transcripts:
+            return None
+        for line in lines_from_end(transcripts[-1]):
+            if b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            content = entry.get("message", {}).get("content") if entry.get("type") == "assistant" else None
+            blocks = content if isinstance(content, list) else []
+            if any(block.get("type") == "tool_use" for block in blocks):
+                return None
+            text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            if text:
+                turns = list(TURN_END.finditer(text))
+                return turns[-1] if turns else None
+    except OSError:
+        return None
+    return None
+
+
+def hold_days(match: re.Match[str], today: date) -> list[date]:
+    """The days a hold's time can fall on: the one it names, or each near today when it names no year or no date."""
+    if not match["day"]:
+        return [today + timedelta(days=offset) for offset in (-1, 0, 1)]
+    years = [int(match["year"])] if match["year"] else [today.year + offset for offset in (-1, 0, 1)]
+    days: list[date] = []
+    for year in years:
+        try:
+            days.append(date(year, int(match["month"]), int(match["day"])))
+        except ValueError:
+            continue
+    return days
+
+
+def stated_hold_end(line: str, now: float, zone: ZoneInfo) -> float | None:
+    """The latest time a holding line names, so a hold that states when it ends is not bumped before then.
+
+    A time without a date, or a date without a year, is the occurrence nearest now: "until 01:00" read at
+    23:00 is tomorrow, "since 23:50" read at 00:10 is yesterday, and "10-22 11:47" is the nearest 22 October.
+    """
+    instants: list[float] = []
+    for match in HOLD_TIME.finditer(line):
+        hour, minute = int(match["hour"]), int(match["minute"])
+        if hour > 23 or minute > 59:
+            continue
+        place = ZoneInfo("UTC") if match["utc"] else zone
+        candidates = [datetime.combine(day, clock(hour, minute), place).timestamp()
+                      for day in hold_days(match, datetime.fromtimestamp(now, place).date())]
+        if candidates:
+            instants.append(min(candidates, key=lambda instant: abs(instant - now)))
+    return max(instants, default=None)
+
+
 def stretch_path(slug: str, unit: str) -> Path:
     name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
     return STATE_DIR / f"{name}.json"
+
+
+def prompt_path(slug: str, unit: str) -> Path:
+    return stretch_path(slug, unit).with_suffix(".prompt.json")
+
+
+def forget(slug: str, unit: str) -> None:
+    stretch_path(slug, unit).unlink(missing_ok=True)
+    prompt_path(slug, unit).unlink(missing_ok=True)
+
+
+def read_prompt(path: Path, now: float) -> PromptWait:
+    """The wait at the prompt on screen now: the saved one while the unit stays blocked, else a new one."""
+    try:
+        old = cast(PromptWait, json.loads(path.read_text(encoding="utf-8")))
+        return PromptWait(since=float(old["since"]), alerted=old["alerted"] is True)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return PromptWait(since=now, alerted=False)
+
+
+def save_prompt(path: Path, prompt: PromptWait) -> None:
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    _ = temporary.write_text(json.dumps(prompt) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def prompt_request(pane: str) -> str:
+    """What the permission prompt at the pane's bottom asks to do, worded to follow "asks permission to"."""
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-40:]]
+    asked = [(index, found) for index, line in enumerate(lines) if (found := PROMPT_QUESTION.search(line))]
+    if not asked:
+        return UNKNOWN_REQUEST
+    index, question = asked[-1]
+    ask = question["ask"].strip()
+    edit = EDIT_ASK.fullmatch(ask)
+    if edit is not None:
+        return f"edit {edit['file']}"
+    if ask != "proceed":
+        return ask
+    above = [line for line in lines[:index] if line]
+    if BASH_PROMPT_TITLE not in above:
+        return UNKNOWN_REQUEST
+    # Claude Code shows the command below the title, then its description, if it has one.
+    shown = above[len(above) - above[::-1].index(BASH_PROMPT_TITLE):]
+    if len(shown) < 2:
+        return "run a shell command"
+    description = shown[-1]
+    return f"run a shell command to {description[:1].lower()}{description[1:]}"[:200]
+
+
+def machine_name() -> str:
+    return gethostname().split(".", 1)[0]
+
+
+def prompt_alert(path: Path, unit: str, pane: str, since: float, zone: ZoneInfo) -> Delivery:
+    rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
+                                 since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
+                                 request=prompt_request(pane))
+    command = push_texts.user_send_argv(rendered, sender="stall-watch")
+    # The send script is the one this watcher is set to use, so a test's stands in for it.
+    return Delivery(path, "alert", [sys.executable, str(SEND), *command[2:]])
 
 
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
@@ -183,6 +386,11 @@ def send_all(pending: list[Delivery]) -> None:
         if process.returncode != 0:
             print(f"stall-watch: {item.kind}: {err.strip() or out.strip() or process.returncode}", file=sys.stderr)
             continue
+        if item.kind == "alert":
+            prompt = read_prompt(item.state_path, 0)
+            prompt["alerted"] = True
+            save_prompt(item.state_path, prompt)
+            continue
         stretch = cast(Stretch, json.loads(item.state_path.read_text(encoding="utf-8")))
         if item.kind == "bump":
             stretch["bump_sent"] = True
@@ -205,20 +413,20 @@ def tick(now: float) -> None:
         except (KeyError, ValueError):
             print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
-        # The units are the doc's live rows; each is found by the mark on its tmux session.
+        # The units are the doc's live rows; each is found by the mark on its herdr pane.
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
-            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
-                    for cells in add_unit.live_unit_table(lines, slug)}
+            live = {production_units.cell_value(cells.get("Unit", "")): production_units.cell_value(cells.get("Worktree", ""))
+                    for cells in production_units.live_unit_table(lines, slug)}
             marked = unit_lookup.marked_units(slug)
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
             # The review unit waits for a review merge by design, so idle is its normal state.
             if add_unit.is_review_unit(name, lines):
-                stretch_path(slug, name).unlink(missing_ok=True)
+                forget(slug, name)
                 continue
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
             try:
@@ -227,7 +435,7 @@ def tick(now: float) -> None:
                 print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
                 continue
             if not running:
-                stretch_path(slug, name).unlink(missing_ok=True)
+                forget(slug, name)
                 continue
             claude = unit.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
@@ -241,10 +449,30 @@ def tick(now: float) -> None:
                 continue
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket
             path = stretch_path(slug, name)
+            waiting = prompt_path(slug, name)
+            try:
+                blocked = agent_status(unit.place) == BLOCKED
+            except (OSError, HerdrFailure) as error:
+                print(f"stall-watch: {name}: its herdr state is unknown: {error}", file=sys.stderr)
+                blocked = False
+            if blocked:
+                # It waits on the user, not on itself: the idle clock starts again after the prompt.
+                prompt = read_prompt(waiting, now)
+                save_prompt(waiting, prompt)
+                save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
+                                           bump_sent=False, tell_sent=False, reported_status=""))
+                if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
+                    pending.append(prompt_alert(waiting, name, pane, prompt["since"], zone))
+                continue
+            waiting.unlink(missing_ok=True)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
-            last = turns[-1].group(0).strip() if turns else "none on screen"
-            if turns and turns[-1].group("kind") in WAITING_KINDS:
+            turn = turns[-1] if turns else transcript_turn_end(session_id)
+            last = turn.group(0).strip() if turn else "none on screen"
+            # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
+            held_until = (stated_hold_end(turn.group(0), now, zone)
+                          if turn and turn.group("kind") == HOLDING_KIND else None)
+            if turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now)):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

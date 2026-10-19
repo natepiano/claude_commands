@@ -12,7 +12,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 import usage_store
-from agent_accounts import Quota, Report
+from agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip
 
 READ = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 RESETS = datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc)
@@ -47,11 +47,11 @@ class UsageStoreTests(unittest.TestCase):
         usage_store.save([Report(
             "Claude", email="Main@Example.invalid", quotas=[Quota("Weekly", 98.0, RESETS)],
             five_hour=Quota("5-hour", 36.0, READ + timedelta(hours=2)),
-        )], READ, {"claude 2": "main@example.invalid", "claude 3": "spare@example.invalid",
+        )], READ, {"claude 2": "main@example.invalid", "claude3": "spare@example.invalid",
                    "main@example.invalid": "main@example.invalid"})
 
         text = usage_store.label_file().read_text(encoding="utf-8")
-        self.assertEqual(json.loads(text), {"claude 2": {
+        self.assertEqual(json.loads(text), {"claude2": {
             "five_hour": {"left": 64.0, "resets_at": int((READ + timedelta(hours=2)).timestamp()),
                           "at": int(READ.timestamp())},
             "weekly": {"left": 2.0, "resets_at": int(RESETS.timestamp()), "at": int(READ.timestamp())},
@@ -60,21 +60,21 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(usage_store.label_file(), self.home / ".local/state/agent-notes/by-label.json")
 
     def test_a_refused_read_keeps_the_label_s_last_reading(self) -> None:
-        logins = {"claude 2": "main@example.invalid"}
+        logins = {"claude2": "main@example.invalid"}
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])],
                          READ, logins)
         usage_store.save([Report("Claude", email="main@example.invalid", problem="HTTP 429")],
                          READ + timedelta(minutes=2), logins)
 
         held = cast(dict[str, dict[str, dict[str, float]]], json.loads(usage_store.label_file().read_text(encoding="utf-8")))
-        self.assertEqual(held["claude 2"]["weekly"]["at"], int(READ.timestamp()))
+        self.assertEqual(held["claude2"]["weekly"]["at"], int(READ.timestamp()))
 
     def test_a_none_open_five_hour_window_has_no_reset(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])],
-                         READ, {"claude 2": "main@example.invalid"})
+                         READ, {"claude2": "main@example.invalid"})
 
         held = cast(dict[str, dict[str, dict[str, object]]], json.loads(usage_store.label_file().read_text(encoding="utf-8")))
-        self.assertEqual(held["claude 2"]["five_hour"], {"left": 100.0, "resets_at": None, "at": int(READ.timestamp())})
+        self.assertEqual(held["claude2"]["five_hour"], {"left": 100.0, "resets_at": None, "at": int(READ.timestamp())})
 
     def test_a_read_with_no_five_hour_window_stores_all_of_it_left(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])], READ)
@@ -128,6 +128,43 @@ class UsageStoreTests(unittest.TestCase):
         ], READ + timedelta(minutes=2))
 
         self.assertEqual(usage_store.store_file().read_text(encoding="utf-8"), before)
+
+    def test_stale_token_skip_round_trips_without_changing_last_good_readings(self) -> None:
+        usage_store.save([Report("Claude", email="Main@Example.invalid",
+            quotas=[Quota("Weekly", 90, RESETS)])], READ, {"claude2": "main@example.invalid"})
+        before = usage_store.load()["main@example.invalid"].copy()
+        labels = cast(object, json.loads(usage_store.label_file().read_text()))
+        usage_store.save([Report("Claude", email="Main@Example.invalid",
+            quota_problem="display wording can change", weekly_read_skip=StaleTokenSkip())],
+            RESETS + timedelta(minutes=2), {"claude2": "main@example.invalid"})
+        held = usage_store.load()["main@example.invalid"]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), StaleTokenSkip)
+        self.assertEqual({key: value for key, value in held.items() if key != "weekly_read_skip"}, before)
+        self.assertEqual(json.loads(usage_store.label_file().read_text()), labels)
+        self.assertFalse(usage_store.merge(usage_store.load(), [Report("Claude", email="main@example.invalid",
+            weekly_read_skip=StaleTokenSkip())], RESETS + timedelta(minutes=4)))
+
+    def test_another_read_failure_clears_the_stale_token_reason_without_refreshing_usage(self) -> None:
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quotas=[Quota("Weekly", 90, RESETS)])], READ)
+        before = usage_store.load()["main@example.invalid"].copy()
+        usage_store.save([Report("Claude", email="main@example.invalid", weekly_read_skip=StaleTokenSkip())], RESETS)
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quota_problem="Weekly quota: not read (stale token; a Claude session on this account refreshes it)")],
+            RESETS + timedelta(minutes=2))
+        held = usage_store.load()["main@example.invalid"]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), NoWeeklyReadSkip)
+        self.assertEqual(held, before)
+
+    def test_a_successful_read_clears_the_stale_token_skip_and_saves_new_usage(self) -> None:
+        usage_store.save([Report("Claude", email="main@example.invalid", weekly_read_skip=StaleTokenSkip())], READ)
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quotas=[Quota("Weekly", 37, RESETS)])], READ + timedelta(minutes=2))
+        held = usage_store.load()["main@example.invalid"]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), NoWeeklyReadSkip)
+        assert "weekly" in held
+        self.assertEqual(held["weekly"]["left"], 63)
+        self.assertEqual(held["weekly"]["at"], (READ + timedelta(minutes=2)).isoformat())
 
     def test_load_drops_what_it_cannot_read(self) -> None:
         self.assertEqual(usage_store.load(), {})

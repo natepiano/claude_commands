@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -18,7 +19,8 @@ from typing import TypedDict, cast, override
 
 from scripts.delegate import wait_for_test_state
 from scripts.delegate.local_release_wait import IntervalReleasePolling
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_until
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -85,7 +87,7 @@ elif verb == 'compact':
     else:
         print(f'compacted {name}: {before} -> 12000 tokens')
 elif verb == 'can-follow':
-    if entry.get('status') not in ('done', 'failed'):
+    if entry.get('status') not in ('done', 'failed', 'paused'):
         print(f'codex_mesh: {name}: worker is busy or not followable; follow refused',
               file=sys.stderr)
         sys.exit(2)
@@ -365,9 +367,10 @@ class ReviewLauncherPassTests(unittest.TestCase):
         # directory.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
-            "review.sh", "implement.sh", "progress_history.py", "findings.py",
-            "board.sh", "worker_name.sh", "worker_state.py",
+            "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py",
+            "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh"):
@@ -479,22 +482,94 @@ else:
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         environment["REVIEW_POOL_STATE"] = str(self.root / "pool-state")
-        _ = environment.pop("REVIEW_LEASE", None)
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
+        mesh_runs = self.root / "mesh_runs_stub.py"
+        if not mesh_runs.exists():
+            _ = mesh_runs.write_text(
+                "import json, os, sys\n"
+                + "with open(os.environ['MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                + "    _ = calls.write(json.dumps(sys.argv[1:]) + '\\n')\n", encoding="utf-8")
+        environment["MESH_RUNS_SCRIPT"] = str(mesh_runs)
+        environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
         return environment
 
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
-        result = subprocess.run(
-            ["python3", str(DELEGATE_DIR / "progress_history.py"), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_early_delivery_probes_default_to_five_seconds_without_test_overrides(self) -> None:
+        session = self.start_implementation("default-early-poll")
+        worker = self.open_worker(session)
+        self.finish_implementation(session)
+        ready, finish = session / "ready", session / "finish"
+        binaries = session / "bin"
+        binaries.mkdir()
+        sleep = binaries / "sleep"
+        _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_POLL_ARGUMENTS"\n'
+                             + ': > "$TEST_POLL_ENTERED"\n'
+                             + ': > "$TEST_EARLY_READY"\n')
+        sleep.chmod(0o755)
+        entered = session / "poll-entered"
+        arguments = session / "poll-arguments"
+        environment = self.environment()
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+            _ = environment.pop(key, None)
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "TEST_POLL_ARGUMENTS": str(arguments), "TEST_POLL_ENTERED": str(entered),
+                            "TEST_EARLY_READY": str(ready), "STUB_REVIEW_FINISH_FILE": str(finish)})
+        process = subprocess.Popen(self.review_command(session, "adversary", str(ready), worker),
+                                   env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            wait_until(entered.exists, session, processes=(process,))
+            self.assertEqual(arguments.read_text().splitlines(), ["5"])
+            self.assertIsNone(process.poll())
+            wait_until(lambda: any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)),
+                       self.history_dir / "runs", processes=(process,))
+        finally:
+            output, errors = self.finish_early_launcher(process, ready, finish)
+        self.assertEqual(process.returncode, 0, output + errors)
+
+    def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
+                              finish: Path, timeout: float = 300) -> tuple[str, str]:
+        ready.touch()
+        finish.touch()
+        return communicate_launcher(process, timeout)
+
+    def test_early_launcher_timeout_reaps_its_group_before_fixture_cleanup(self) -> None:
+        child_ready = self.root / "blocked-review-child"
+        child_code = ("import os, signal, sys; from pathlib import Path; "
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                      "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
+                      "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
+        program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(child_ready)!r}]); child.wait()"
+        process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        ready, finish = self.root / "early-ready", self.root / "early-finish"
+        try:
+            descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _ = self.finish_early_launcher(process, ready, finish, timeout=0)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(select.select([descriptor], [], [], 300)[0], [descriptor])
+                self.assertTrue(ready.exists())
+                self.assertTrue(finish.exists())
+                self.assertTrue(process.stdout is not None and process.stdout.closed)
+                self.assertTrue(process.stderr is not None and process.stderr.closed)
+            finally:
+                os.close(descriptor)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
 
     def start_implementation(self, name: str) -> Path:
         session_dir = self.root / name
@@ -646,7 +721,7 @@ import sys
 
 if sys.argv[1] in ("start-pass", "finish-pass"):
     with Path(os.environ["STUB_PASS_CALLS"]).open("a") as calls:
-        calls.write(json.dumps({"verb": sys.argv[1]}) + "\\n")
+        calls.write(json.dumps({"verb": sys.argv[1], "argv": sys.argv[2:]}) + "\\n")
 os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress_history_real.py")), *sys.argv[1:]])
 ''', encoding="utf-8")
         calls = self.root / "pass-calls.jsonl"
@@ -678,7 +753,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertIn("[pool_code1] register:", board)
         self.assertIn("compacted code1", board)
         self.assertFalse((Path(environment["STUB_POOL_MESH_DIR"]) / "board.log").exists())
-        self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract.log").read_text())
+        self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract-pool.log").read_text())
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
         self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
         events = [event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]
@@ -755,7 +830,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
-        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract.log").read_text())
+        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract-pool.log").read_text())
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
         self.assertEqual(list(session.glob("review_message_*")), [])
 
@@ -772,7 +847,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
-    def test_failed_pool_attempt_and_own_retry_leave_one_record_of_each_arm(self) -> None:
+    def test_failed_pool_attempt_and_own_retry_leave_one_record_each_and_ignore_review_lease(self) -> None:
         session = self.start_implementation("pool-retry")
         self.finish_implementation(session)
         environment = self.pool_fixture()
@@ -783,7 +858,6 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
         worker = self.open_worker(session)
-        environment["REVIEW_LEASE"] = "production/unit/3"
         retry = subprocess.run(self.review_command(session, "contract", "", worker), env=environment,
                                capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(retry.returncode, 0, retry.stderr)
@@ -792,7 +866,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(records["pool"]["status"], "error")
         self.assertEqual(records["own"]["status"], "reviewed")
         self.assertEqual(records["own"]["thread_id"], "thread-fixture")
-        self.assertEqual(records["own"]["unit"], "unit")
+        self.assertEqual((records["own"]["unit"], records["own"]["phase"]), ("", ""))
 
     def test_own_turn_records_survive_two_phases_in_the_same_session(self) -> None:
         session = self.start_implementation("two-phases")
@@ -833,6 +907,53 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call["verb"] for call in self.call_records("pass-calls.jsonl")],
                          ["start-pass", "finish-pass"])
+
+    def test_a_review_naming_an_older_open_phase_starts_its_pass_in_that_phase(self) -> None:
+        session = self.start_implementation("named-phase-pass")
+        self.finish_implementation(session)
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+        environment = self.pool_fixture()
+        self.trace_pass_recorder(environment)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
+        self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
+
+    def test_a_review_naming_its_phase_writes_its_files_in_that_phase_directory(self) -> None:
+        # Two phases reviewing at once each pass their own id, so neither reads the other's findings.
+        session = self.start_implementation("phase-directory-files")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        phase_dir = session / "phases" / "3"
+        self.assertTrue(list(phase_dir.glob("review_findings_*.txt")))
+        self.assertTrue(list(phase_dir.glob("review_status*")))
+        self.assertEqual(sorted(path.name for path in session.glob("review_*")), [])
+
+    def test_a_pool_review_names_the_director_in_the_unit_run_folder(self) -> None:
+        session = self.start_implementation("director")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
+        result = subprocess.run(self.pool_command(session), env=environment, capture_output=True, text=True,
+                                check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "director").read_text(encoding="utf-8"), "sid-director\n")
+
+    def test_a_phase_id_with_a_space_names_a_directory_without_it(self) -> None:
+        session = self.start_implementation("phase-directory-name")
+        self.finish_implementation(session)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "ad hoc"]
+        result = subprocess.run(command, env=self.pool_fixture(), capture_output=True, text=True,
+                                check=False, timeout=300)
+        self.assertNotEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(list((session / "phases" / "adhoc").glob("review_status*")))
 
     def test_ui_pool_reviewed_turn_records_ux_kind_without_pass_calls_at_either_start_site(self) -> None:
         session = self.start_implementation("ui-no-pass")
@@ -891,7 +1012,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertFalse((self.root / "pool-calls.jsonl").exists())
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
 
-    def test_ui_pool_allocates_fresh_and_sends_each_shot_on_the_requested_check(self) -> None:
+    def test_ui_pool_allocates_without_a_reset_and_sends_each_shot_on_the_requested_check(self) -> None:
         session = self.start_implementation("ui-shots")
         self.finish_implementation(session)
         shots = [str(self.root / "shot one.png"), str(self.root / "café.png")]
@@ -902,7 +1023,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                                 env=environment, capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
         allocation = self.call_records("pool-calls.jsonl")[0]
-        self.assertTrue(allocation["fresh"])
+        self.assertFalse(allocation["fresh"])
         self.assertEqual(allocation["type"], "ui")
         self.assertEqual(allocation["lens"], "ux")
         self.assertEqual(allocation["pass"], "2")
@@ -924,12 +1045,12 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                                 env=environment, capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
-        self.assertTrue(self.call_records("pool-calls.jsonl")[0]["fresh"])
+        self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
         self.assertFalse((self.root / "mesh-calls.jsonl").exists())
         self.assertEqual((session / "review_status_ux").read_text().strip(), "error")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
-    def test_ui_pool_second_lease_turn_prepends_unit_memory_before_the_prompt(self) -> None:
+    def test_ui_pool_later_turn_sends_the_prompt_without_unit_memory(self) -> None:
         session = self.start_implementation("ui-memory")
         self.finish_implementation(session)
         _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
@@ -942,11 +1063,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         result = subprocess.run(command, env=environment, capture_output=True,
                                 text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(),
-                         memory + "\n\n" + original)
-        self.assertEqual(Path(command[8]).read_text(), original)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
-                         ["allocate", "unit-memory", "release"])
+                         ["allocate", "release"])
         self.assertEqual(list(session.glob("review_message_*")), [])
 
     def test_ui_pool_missing_shots_file_records_error_without_allocation(self) -> None:
@@ -1032,6 +1151,59 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertIn("changed the working tree", result.stderr)
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
         self.assertEqual(self.call_records("pool-calls.jsonl")[-1]["verb"], "release")
+
+    def side_by_side_review(self, name: str, edited: str, *, commit_change: bool = False) -> tuple[
+            subprocess.CompletedProcess[str], Path]:
+        """Review phase 3 while phase 4, open beside it, holds `other.txt` and its writer edits `edited`."""
+        session = self.start_implementation(name)
+        self.finish_implementation(session)
+        # The stub's commit adds every file, so the plan start_implementation writes is committed first.
+        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True)
+        _ = subprocess.run(
+            ["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.com",
+             "commit", "-q", "-m", "plan"],
+            cwd=self.working_dir, check=True, capture_output=True, text=True,
+        )
+        for phase, files in (("3", "reviewed.txt\n"), ("4", "other.txt\n")):
+            directory = session / "phases" / phase
+            directory.mkdir(parents=True, exist_ok=True)
+            _ = (directory / "delegated_phase_reservation_state.json").write_text(
+                json.dumps({"state": "active", "phase": phase}), encoding="utf-8")
+            _ = (directory / "files").write_text(files, encoding="utf-8")
+        environment = self.pool_fixture()
+        environment["STUB_REVIEW_EDIT"] = str(self.working_dir / edited)
+        environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)
+        if commit_change:
+            environment["STUB_REVIEW_COMMIT"] = "1"
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        return result, session / "phases" / "3"
+
+    def test_a_parallel_phase_writing_its_own_files_during_a_review_leaves_the_review_passed(self) -> None:
+        result, phase_dir = self.side_by_side_review("parallel-writer", "other.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("changed the working tree", result.stderr)
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
+        log = "".join(path.read_text(encoding="utf-8") for path in phase_dir.glob("review_agent_1*.log"))
+        self.assertIn("open phase 4's files changed during the review: other.txt", log)
+        self.assertEqual(list(phase_dir.glob("review_tree_*")), [])
+
+    def test_a_parallel_phase_commit_during_a_review_leaves_the_review_passed(self) -> None:
+        result, phase_dir = self.side_by_side_review("parallel-commit", "other.txt", commit_change=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "reviewed\n")
+
+    def test_beside_a_parallel_phase_an_edit_to_the_reviewed_phases_file_still_fails(self) -> None:
+        result, phase_dir = self.side_by_side_review("parallel-own-edit", "reviewed.txt")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changed the working tree: reviewed.txt", result.stderr)
+        self.assertEqual((phase_dir / "review_status_contract").read_text(encoding="utf-8"), "error\n")
+
+    def test_beside_a_parallel_phase_an_edit_no_phase_holds_still_fails(self) -> None:
+        result, _ = self.side_by_side_review("parallel-unheld-edit", "loose.txt")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changed the working tree: loose.txt", result.stderr)
 
     def test_pool_excludes_to_and_slot_before_any_allocation(self) -> None:
         session = self.start_implementation("pool-exclusive")
@@ -1239,12 +1411,11 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("adversary, contract, craft, ux", result.stderr)
 
-    def test_own_failed_closure_turn_records_lease_and_findings_count(self) -> None:
+    def test_own_failed_closure_turn_records_its_findings_count(self) -> None:
         session = self.start_implementation("own-failed")
         self.finish_implementation(session)
         worker = self.open_worker(session)
         environment = self.environment()
-        environment["REVIEW_LEASE"] = "production/unit/3"
         environment["STUB_TURN_FAILURE"] = "1"
         environment["STUB_FINDINGS"] = "1. Partial finding\n"
         command = self.review_command(session, "", "", worker)
@@ -1257,7 +1428,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(record["pass"], 2)
         self.assertEqual(record["raised"], 1)
         self.assertEqual(record["status"], "error")
-        self.assertEqual(record["phase"], "3")
+        self.assertEqual(record["phase"], "")
 
     def test_a_reviewer_that_finishes_before_delivery_records_no_pass(self) -> None:
         session_dir = self.start_implementation("early")
@@ -1307,6 +1478,18 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                 ("pass_finished", "review"),
             ],
         )
+
+    def test_paused_reviewer_receives_followup_on_its_recorded_thread(self) -> None:
+        session_dir = self.start_implementation("paused-review")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir, status="paused")
+        result = self.run_assigned_review(session_dir, worker)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["can-follow", "follow"])
+        roster = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
+        self.assertEqual(roster[worker]["thread_id"], "thread-fixture")
+        self.assertEqual((session_dir / "follow_message.txt").read_text(), "Review the diff.\n")
+        self.assertEqual((session_dir / "review_status").read_text(), "reviewed\n")
 
     def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
         session_dir = self.start_implementation("assigned")
@@ -1371,6 +1554,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
         )
+        # The seat's log is its own, so a second seat on pass 1 cannot truncate it.
+        self.assertTrue((session_dir / "review_agent_1-review2.log").is_file())
+        self.assertEqual(os.readlink(session_dir / "review_agent.log"), "review_agent_1-review2.log")
         reviews = [
             event for event in self.pass_events("new-worker")
             if event.get("pass_kind") == "review"
@@ -1464,6 +1650,15 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
+        calls = [cast(list[str], json.loads(line)) for line in
+                 (self.root / "mesh_runs_calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call[:5], ["start", "--session-dir", str(session_dir), "--to", worker])
+        self.assertEqual(call[call.index("--label") + 1], "final diff ready")
+        stage_two = Path(call[call.index("--done-message-file") + 1]).read_text(encoding="utf-8")
+        self.assertIn(f"Stage 2: the final diff is at {session_dir / 'final_diff_1.diff'}", stage_two)
+        self.assertIn(str(ready), call)
 
     def test_a_assigned_early_review_before_delivery_records_no_pass(self) -> None:
         session_dir = self.start_implementation("assigned-early")

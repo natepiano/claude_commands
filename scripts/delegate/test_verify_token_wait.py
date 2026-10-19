@@ -102,7 +102,7 @@ exit 97
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
-    *"status --porcelain"*) : ;;
+    *"status --porcelain"*|*" ls-tree "*) : ;;
     *) exit 1 ;;
 esac
 ''')
@@ -122,7 +122,8 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.environment = {
             **{name: value for name, value in os.environ.items()
-               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}},
+               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
+                               "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(home),
             "RUSTUP_HOME": str(Path.home() / ".rustup"),
@@ -238,12 +239,48 @@ esac
             _ = child.wait(timeout=300)
 
     def test_no_token_records_zero(self) -> None:
-        result = self.verify(self.environment)
+        # A session dir alone makes this a director's run, which takes the token.
+        environment = {name: value for name, value in self.environment.items()
+                       if name != "PLAN_DELEGATE_SESSION_DIR"}
+        result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
         self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+
+    def test_director_run_takes_the_token_as_slot_director(self) -> None:
+        clock = self.root / "director-clock"
+        _ = clock.write_text("100\n")
+        session = Path(self.environment["PLAN_DELEGATE_SESSION_DIR"])
+        result = self.verify({**self.environment, "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records()[0]["token_wait_s"], 0)
+        self.assertIn("[director] claim: token cargo acquired", (session / "board.log").read_text())
+        self.assertFalse((session / "locks" / "cargo.d").exists(), "the director's token was not released")
+
+    def test_token_wait_uses_elapsed_seconds_when_no_clock_override_is_present(self) -> None:
+        # Copy the board boundary into a disposable HOME; acquire deliberately
+        # crosses a whole second, so scheduling can only increase the wait.
+        home = self.root / "clock-home"
+        delegate = home / ".claude/scripts/delegate"
+        delegate.mkdir(parents=True)
+        for source in VERIFY.parent.parent.iterdir():
+            if source.name != "delegate":
+                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        board = delegate / "board.sh"
+        _ = board.write_text('#!/bin/bash\nif [[ "$1" == acquire ]]; then sleep 1.1; fi\n'
+                             + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
+        environment = {**self.environment, "HOME": str(home),
+                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "clock-board"),
+                       "PLAN_DELEGATE_TEAM_ROLE": "clock", "TEST_REAL_BOARD": str(BOARD)}
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+            _ = environment.pop(key, None)
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertGreaterEqual(cast(int, self.records()[0]["token_wait_s"]), 1)
 
     def test_step_group_is_recorded_before_cargo_starts(self) -> None:
         board = self.root / "board"
@@ -558,6 +595,91 @@ exec "$TEST_REAL_SLEEP" "$@"
                 if second.stderr is not None:
                     second.stderr.close()
 
+    def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
+        """Start a verify that takes the token and then waits on the held meminfo.
+
+        verify.sh tees its step output to stdout, so both streams go to `errors`.
+        """
+        with errors.open("wb") as stream:
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                       cwd=self.root, env=environment, stdout=stream,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(process.pid)
+        # The directory watch sees new files, not writes to this one, so poll it.
+        deadline = time.monotonic() + 300
+        while ("waiting for memory" not in errors.read_text(errors="replace")
+               and process.poll() is None and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertIn("waiting for memory", errors.read_text(errors="replace"))
+        self.assertIsNone(process.poll(), errors.read_text(errors="replace"))
+        return process
+
+    def test_two_phases_sharing_a_role_name_each_keep_the_token_through_a_memory_wait(self) -> None:
+        # Phases 15 and 16 of one unit share the session's board and its role
+        # names. Phase 15's launcher ending must not free phase 16's token.
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        phase_16_errors = self.root / "phase-16.err"
+        phase_15_errors = self.root / "phase-15.err"
+        phase_16 = self.start_memory_waiter(environment, phase_16_errors)
+        phase_15: subprocess.Popen[bytes] | None = None
+        try:
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+            launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
+                                               "cargo"], capture_output=True, text=True,
+                                              check=False, timeout=300)
+            self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
+            self.assertIn(f"held by live pid {phase_16.pid}", launcher_release.stderr)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+
+            with phase_15_errors.open("wb") as stream:
+                phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                            cwd=self.root, env=environment,
+                                            stdout=stream, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+            self.started_groups.add(phase_15.pid)
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.assertEqual(phase_16.wait(timeout=300), 0, phase_16_errors.read_text())
+            self.assertEqual(phase_15.wait(timeout=300), 0, phase_15_errors.read_text())
+            self.assertNotIn("Traceback", phase_16_errors.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertFalse(lock.exists())
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            for process in (phase_16, phase_15):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
+
+    def test_a_token_lost_during_the_memory_wait_stops_the_step_with_a_reason(self) -> None:
+        board = self.root / "board"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        errors = self.root / "lost.err"
+        process = self.start_memory_waiter(environment, errors)
+        try:
+            # A peer's acquire made the directory and has not written its pid yet.
+            shutil.rmtree(board / "locks" / "cargo.d")
+            (board / "locks" / "cargo.d").mkdir()
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.assertNotEqual(process.wait(timeout=300), 0)
+            text = errors.read_text()
+            self.assertIn("lost the cargo token before its step started", text)
+            self.assertNotIn("Traceback", text)
+            self.assertFalse((self.root / "cargo-calls").exists())
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            if process.poll() is None:
+                self.end_group(process.pid)
+            _ = process.wait(timeout=300)
+
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"
         first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
@@ -595,6 +717,50 @@ exec "$TEST_REAL_SLEEP" "$@"
 
     def test_sigint_stops_step_before_token_release(self) -> None:
         self.assert_interrupted_holder_stops_step_before_release(signal.SIGINT)
+
+    def detach_environment(self, status: int) -> dict[str, str]:
+        """A Codex worker's environment whose mesh_runs.py stub records its argv and exits `status`."""
+        stub = self.root / "mesh_runs_stub.py"
+        _ = stub.write_text("import json, os, sys\n"
+                            + "with open(os.environ['TEST_MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                            + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                            + "raise SystemExit(int(os.environ['TEST_MESH_RUNS_STATUS']))\n")
+        return {**self.environment, "CODEX_THREAD_ID": "thread-worker", "VERIFY_MESH_RUNS_SCRIPT": str(stub),
+                "TEST_MESH_RUNS_CALLS": str(self.root / "mesh-runs-calls"), "TEST_MESH_RUNS_STATUS": str(status)}
+
+    def mesh_runs_calls(self) -> list[list[str]]:
+        path = self.root / "mesh-runs-calls"
+        if not path.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_a_codex_worker_call_detaches_and_returns_without_building(self) -> None:
+        result = self.verify(self.detach_environment(0))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.mesh_runs_calls(), [[
+            "start", "--label", "verify.sh check sample", "--",
+            "bash", str(VERIFY.resolve()), "check", "sample",
+        ]])
+        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertEqual(self.records(), [])
+
+    def test_a_caller_mesh_runs_cannot_detach_runs_attached(self) -> None:
+        for status, note in ((3, False), (1, True)):
+            with self.subTest(status=status):
+                for path in (self.root / "mesh-runs-calls", self.root / "cargo-calls"):
+                    path.unlink(missing_ok=True)
+                result = self.verify(self.detach_environment(status))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(self.mesh_runs_calls()), 1)
+                self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+                self.assertEqual("could not detach" in result.stderr, note, result.stderr)
+
+    def test_the_detached_run_itself_does_not_detach_again(self) -> None:
+        environment = {**self.detach_environment(0), "PLAN_DELEGATE_DETACHED_RUN": "1"}
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.mesh_runs_calls(), [])
+        self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
 
 if __name__ == "__main__":

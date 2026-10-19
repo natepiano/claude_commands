@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # implement.sh — Invoke the configured delegate agent to implement code changes.
 #
-# Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task]
+# Usage: implement.sh [--to <worker>] [--phase <id>] <session_dir> [working_dir] [prompt_file] [task]
 #                     [role_description] [pass_kind] [pass_activity] [fix_pass]
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
@@ -47,23 +47,39 @@
 #                                     this session: a role header block at start,
 #                                     [wrapper] beats every 60s while the agent
 #                                     pid is alive (each carrying an activity
-#                                     digest from the agent log), and [agent]
-#                                     narration lines (prompt-instructed)
-#   <session_dir>/impl_awake_<role>   — seconds the beat loop has counted for
-#                                     this dispatch, which excludes time the
-#                                     machine was suspended; stamped on the pass
+#                                     digest from the agent log)
 
 set -euo pipefail
 
 FOLLOW_TO=""
-if [[ "${1:-}" == "--to" ]]; then
-  FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}"
+# A phase running beside another names itself: start-pass stamps its pass with it, and its
+# per-role files go to <session_dir>/phases/<id>/.
+PHASE_ID=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --to) FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}" ;;
+    --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
+    *) echo "ERROR: unknown implement option '$1'." >&2; exit 2 ;;
+  esac
   shift 2
-fi
+done
 
 SESSION_DIR="${1:?Usage: implement.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
+# Two phases running the same role would otherwise write one status, summary and log.
+# Run-wide files -- the board, heartbeat, recorder and ledger state, worker identities -- stay
+# in the session.
+ARTIFACT_DIR="${SESSION_DIR}"
+if [[ -n "${PHASE_ID}" ]]; then
+  # The directory keeps only the id's letters, digits, `.`, `_` and `-`: `ad hoc` is `adhoc`.
+  PHASE_DIR_NAME="${PHASE_ID//[^[:alnum:]._-]/}"
+  if [[ -z "${PHASE_DIR_NAME}" || "${PHASE_DIR_NAME}" == . || "${PHASE_DIR_NAME}" == .. ]]; then
+    echo "ERROR: phase id names no directory: ${PHASE_ID}" >&2
+    exit 2
+  fi
+  ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
 WORKING_DIR="${2:-$(pwd)}"
-PROMPT_FILE="${3:-${SESSION_DIR}/implementation_prompt.md}"
+PROMPT_FILE="${3:-${ARTIFACT_DIR}/implementation_prompt.md}"
 SUBTASK="${4:-impl}"
 ROLE_DESC="${5:-work order at ${PROMPT_FILE}}"
 PASS_KIND="${6:-}"
@@ -149,19 +165,22 @@ fi
 # repo needs >= 3.10.
 PY="${SCRIPT_DIR}/../lib/py"
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
-SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
+mkdir -p "${ARTIFACT_DIR}"
+# Every dispatch names the run's director in the run folder (unit_runs.py), which the
+# production tree reads: a marker names one run per director, and a director runs phases side by side.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
+SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
 # the previous round's file sitting at exactly the path the board line points to.
-REPLY_FILE="${SESSION_DIR}/impl_reply${SLOT}.txt"
-STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
-LOG_FILE="${SESSION_DIR}/impl_agent${SLOT}.log"
-AGENT_FILE="${SESSION_DIR}/impl_agent${SLOT}"
-BG_ID_FILE="${SESSION_DIR}/impl_bg_id${SLOT}"
+REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
+STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
+LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
+AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
+BG_ID_FILE="${ARTIFACT_DIR}/impl_bg_id${SLOT}"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
-AWAKE_FILE="${SESSION_DIR}/impl_awake${SLOT}"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
@@ -178,18 +197,6 @@ if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0
   echo "ERROR: PLAN_DELEGATE_COMPACT_ABOVE_TOKENS in ${DELEGATE_CONFIG} must be a positive integer." >&2
   exit 2
 fi
-
-# -1 says the beat loop counted nothing, which a dispatch shorter than one
-# interval always does. The previous dispatch's file is removed before this one
-# launches, so a leftover total can never be read as this pass's.
-awake_seconds() {
-  local counted
-  counted="$(cat "${AWAKE_FILE}" 2>/dev/null || true)"
-  case "${counted}" in
-    ''|*[!0-9]*) echo "-1" ;;
-    *) echo "${counted}" ;;
-  esac
-}
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
@@ -223,10 +230,11 @@ from pathlib import Path
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
-identity_file = root / f"impl_worker_{slot}.json"
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
-from worker_state import worker_claim_lock, worker_ledger
+from worker_state import worker_claim_lock, worker_ledger, worker_record_path
+
+identity_file = worker_record_path(root, name, slot)
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -277,16 +285,25 @@ with worker_claim_lock(root):
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
+        stale_claim = False
         if isinstance(pid, int) and pid > 0:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                status_path.write_text("error\n")
+                stale_claim = True
                 claim_file.unlink(missing_ok=True)
             else:
                 fail(f"{name} is claimed by launcher {pid}")
-        if status_path.exists() and status_path.read_text().strip() == "implementing":
-            fail(f"{name} is already implementing")
+        if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
+            launcher = entry.get("launcher_pid", 0) if isinstance(entry, dict) else 0
+            if isinstance(launcher, int) and launcher > 0:
+                try:
+                    os.kill(launcher, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    fail(f"{name} is already implementing")
+            status_path.write_text("error\n")
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
@@ -362,8 +379,19 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   trap 'worker_record release' EXIT
 fi
 
+# A phase claims its files before any seat edits them, wherever the seat runs
+# (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
+if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
+  --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "error" > "${STATUS_FILE}"
+  bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+  exit 1
+fi
+
 : > "${SUMMARY_FILE}"
-rm -f "${REPLY_FILE}" "${AWAKE_FILE}"
+rm -f "${REPLY_FILE}"
 echo "implementing" > "${STATUS_FILE}"
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
@@ -378,7 +406,8 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     --called-task "${TASK}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
-    --called-effort "${AGENT_EFFORT:-unset}"; then
+    --called-effort "${AGENT_EFFORT:-unset}" \
+    ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     echo "ERROR: unable to record the ${PASS_KIND} pass start." >&2
     echo "error" > "${STATUS_FILE}"
     bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
@@ -451,7 +480,7 @@ export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
 # codex_mesh.py launches it there instead. With codex_mesh=0 it falls back to
 # the plain launcher and coordinates through the board alone.
 if [[ -n "${FOLLOW_TO}" ]]; then
-  FOLLOW_MESSAGE="${SESSION_DIR}/impl_follow_message${SLOT}.$$.txt"
+  FOLLOW_MESSAGE="${ARTIFACT_DIR}/impl_follow_message${SLOT}.$$.txt"
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
   if [[ "${AGENT_FAMILY}" == "claude" ]]; then
@@ -461,7 +490,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
       --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
-      --role "${PASS_KIND}" \
+      --role "${PASS_KIND}" --cwd "${WORKING_DIR}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
       --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
@@ -526,10 +555,8 @@ fi
 
 # Wrapper beats with an activity digest from the agent log: proves the process
 # is alive and names what it is doing even while blocked in a long tool call.
-# [agent] lines still come from the delegate itself, per its prompt.
 bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
-  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
-  "${AWAKE_FILE}" &
+  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
 HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0
@@ -559,8 +586,7 @@ fi
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   if [[ -f "${PROGRESS_STATE}" ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
-      --session-dir "${SESSION_DIR}" --status completed \
-      --agent-awake-seconds "$(awake_seconds)"; then
+      --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the ${PASS_KIND} pass completion." >&2
       echo "error" > "${STATUS_FILE}"
       bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
@@ -573,7 +599,10 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # be killed or compacted inside, and that gap used to resolve as "fixed" --
   # handing the next review a defect pre-labelled as repaired.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
-    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}"; then
+    # The phase is named so a repair in an older open phase lands on its own
+    # ledger, not on the newest phase's.
+    if ! "$PY" "${FINDINGS_HELPER}" landed --session-dir "${SESSION_DIR}" \
+        ${PHASE_ID:+--phase "${PHASE_ID}"}; then
       echo "ERROR: unable to record the repair round as landed." >&2
       echo "error" > "${STATUS_FILE}"
       bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
@@ -596,14 +625,13 @@ else
   if [[ -f "${PROGRESS_STATE}" ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
-      --agent-awake-seconds "$(awake_seconds)" \
       || { echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2; LEDGER_CODE=1; }
   fi
   # The attempt stands rather than being refunded: a worker that ran and then
   # failed may have left partial edits behind, and the launcher cannot tell.
   if [[ "${RESOLVES_ROUND}" == "1" && -f "${FINDINGS_STATE}" ]]; then
     "$PY" "${FINDINGS_HELPER}" abandon --session-dir "${SESSION_DIR}" --edits-landed \
-      --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
+      ${PHASE_ID:+--phase "${PHASE_ID}"} --reason "the ${SUBTASK} worker exited with code ${AGENT_CODE}" \
       || { echo "ERROR: unable to record the repair round as abandoned." >&2; LEDGER_CODE=1; }
   fi
   echo "error" > "${STATUS_FILE}"

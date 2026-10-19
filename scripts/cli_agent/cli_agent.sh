@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Resolves which agent (codex|claude) the ~/.zshrc CLI aliases — review,
-# commit_no, commit_yes, merge, code — should run, then runs it.
+# Resolves which agent (codex|claude) the ~/.zshrc CLI aliases — commit_no,
+# commit_yes, merge, code — should run, then runs it.
 #
 # Family, model, and effort assignments live in the global registry,
 # ~/.claude/config/agents.conf, via scripts/agents/agents_config.sh.
@@ -17,7 +17,6 @@ CLI_AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$CLI_AGENT_DIR/../agents/agents_config.sh"
 
 cli_agent_print_status() {
-    agents_resolve_print cli.style_fix_review
     agents_resolve_print cli.commit_prep
     agents_resolve_print cli.merge_branch
     agents_resolve_print cli.interactive
@@ -35,11 +34,11 @@ cli_agent_run() {
     else
         skill="$1"
         case "$skill" in
-            style_fix_review|commit_prep|merge_branch)
+            commit_prep|merge_branch)
                 task="cli.$skill"
                 ;;
             *)
-                echo "ERROR: unknown skill '$skill'. Known skills: style_fix_review, commit_prep, merge_branch." >&2
+                echo "ERROR: unknown skill '$skill'. Known skills: commit_prep, merge_branch." >&2
                 return 1
                 ;;
         esac
@@ -57,6 +56,8 @@ cli_agent_run() {
             exec codex "${agent_args[@]}" "$invocation"
             ;;
         claude)
+            source "$CLI_AGENT_DIR/../agents/claude_account.sh"
+            claude_launch_environment || return 1
             read -r -a agent_args <<< "$(agents_claude_args)"
             if [[ -z "$invocation" ]]; then
                 exec claude "${agent_args[@]}"
