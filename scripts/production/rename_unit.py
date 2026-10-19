@@ -65,7 +65,7 @@ else:
 RESERVED = frozenset({"review-unit", add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.
 EDITED_COLUMNS = {"## Hub files": ("Owner unit", "Other units that touch it"), "## Gates": ("Waiting", "Waits on")}
-PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept")
+PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept", "old_session")
 SHUTDOWN = Path(os.environ.get("RENAME_UNIT_SHUTDOWN") or Path(__file__).resolve().parent.parent / "shutdown/shutdown.py")
 STOPPED = frozenset({"stopped", "already gone", "process identity lost"})
 STOPPING = frozenset({"waiting", "reaping", "ready", "stopping", "held by usage limit", "passive worker ready"})
@@ -106,6 +106,10 @@ class UnitRename:
     session_id: str = ""
     # Why the unit branch took no merge: its work was in progress (an open phase or uncommitted work).
     kept: str = ""
+    # The Claude session's name before the rename, which verify finds nowhere live afterwards.
+    old_session: str = ""
+    # The id already is the new one, so only the session takes the new name: stop, record, relaunch, verify.
+    id_matches: bool = False
 
     @property
     def message(self) -> str:
@@ -116,7 +120,7 @@ class UnitRename:
         return Path(self.new_worktree if self.step >= step_number(_move_git) else self.old_worktree)
 
 
-REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", *PROGRESS))
+REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", "id_matches", *PROGRESS))
 
 
 def _swap(value: str, old_stem: str, new_stem: str, what: str) -> str:
@@ -150,12 +154,18 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     production = _production(slug)
     rows = _rows(production.doc)
     units = [production_units.cell_value(row.get("Unit", "")) for row in rows]
+    given = old
     old, new = _ids(old, new, units)
+    if old not in units:
+        # The user names a unit by what they see: its Claude session name (user, 2026-10-19).
+        old = _unit_of_session(slug, given, units) or old
     if RESERVED & {old, new}:
         raise RenameRefused(f"{' and '.join(sorted(RESERVED & {old, new}))} is known to code and keeps its name")
-    if old == new:
+    id_matches = old == new
+    old_session = _session_name(slug, old)
+    if id_matches and old_session in ("", unit_names.stem(new)):
         raise RenameRefused(f"{old} already has that name")
-    if new in units:
+    if new in units and not id_matches:
         raise RenameRefused(f"{new} is already in the Units table")
     matching = [row for row, unit in zip(rows, units, strict=True) if unit == old]
     if len(matching) != 1:
@@ -174,7 +184,37 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
         raise RenameRefused(f"{worktree} is not on {old_branch}")
     return UnitRename(slug, old, new, str(production.doc), str(production.checkout), production.merge_branch,
                       old_branch, new_branch, str(worktree), str(new_worktree),
-                      git(worktree, "rev-parse", "HEAD"), str(scratch))
+                      git(worktree, "rev-parse", "HEAD"), str(scratch), old_session=old_session,
+                      id_matches=id_matches)
+
+
+def _unit_of_session(slug: str, name: str, units: list[str]) -> str:
+    """The one unit whose live or recorded Claude session is called `name`; empty when none is."""
+    try:
+        marked = unit_lookup.marked_units(slug)
+    except OSError as error:
+        raise RenameRefused(f"{name}: cannot tell which unit's session it names: {error}") from error
+    found = {unit for unit, place in marked.items()
+             if isinstance(place.claude, unit_lookup.LiveClaude) and place.claude.name == name}
+    for item in _records(slug, tuple(units)):
+        host = item["session"]["host"]
+        if host["kind"] == "unit" and item["session"]["name"] == name:
+            found.add(host["unit"])
+    if len(found) > 1:
+        raise RenameRefused(f"{name} names the sessions of {' and '.join(sorted(found))}; give the unit id")
+    return next(iter(found), "")
+
+
+def _session_name(slug: str, unit: str) -> str:
+    """The unit's Claude session name: the live one, else its stopped record's; empty when neither."""
+    try:
+        found = unit_lookup.marked_unit(slug, unit)
+    except OSError as error:
+        raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {error}") from error
+    if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+        return found.claude.name
+    names = [item["session"]["name"] for item in _records(slug, (unit,))]
+    return names[0] if names else ""
 
 
 def _check_stopped(rename: UnitRename) -> None:
@@ -202,7 +242,7 @@ def _check_stoppable(rename: UnitRename) -> None:
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     old, new = marked.get(rename.old), marked.get(rename.new)
-    if new and not isinstance(new.claude, unit_lookup.ClaudeNotRunning):
+    if new and not rename.id_matches and not isinstance(new.claude, unit_lookup.ClaudeNotRunning):
         raise RenameRefused(f"{rename.new} already runs in session {new.place.session}")
     if old and isinstance(old.claude, unit_lookup.ClaudeUnknown):
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
@@ -226,6 +266,9 @@ def _preflight(rename: UnitRename) -> None:
     """The read-only refusals of a fresh rename; a resumed one accepts what its own steps made."""
     checkout = Path(rename.checkout)
     _check_checkout(rename)
+    if rename.id_matches:
+        _check_stoppable(rename)
+        return
     if unit_move.branch_tip(checkout, rename.new_branch) or unit_move.remote_tip(checkout, rename.new_branch):
         raise RenameRefused(f"branch {rename.new_branch} already exists")
     if unit_move.exists(Path(rename.new_worktree)):
@@ -410,6 +453,10 @@ def _shutdown(*arguments: str) -> None:
 
 def _unit_records(rename: UnitRename) -> list[SessionShutdown]:
     """This production's shutdown records of the unit, under either id."""
+    return _records(rename.slug, (rename.old, rename.new))
+
+
+def _records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
     try:
         saved = shutdown_record.all_session_records()
     except (shutdown_record.InvalidRecord, OSError) as error:
@@ -417,7 +464,7 @@ def _unit_records(rename: UnitRename) -> list[SessionShutdown]:
     found: list[SessionShutdown] = []
     for item in saved:
         host = item["session"]["host"]
-        if host["kind"] == "unit" and host["production"] == rename.slug and host["unit"] in (rename.old, rename.new):
+        if host["kind"] == "unit" and host["production"] == slug and host["unit"] in units:
             found.append(item)
     return found
 
@@ -488,24 +535,34 @@ def renamed_note(rename: UnitRename) -> str:
                + f"now work in {rename.new_worktree}; say so in your next message to each." if rename.kept else ""))
 
 
-def _restart_record(rename: UnitRename, _save: Callable[[], None]) -> None:
+def _host_names(rename: UnitRename) -> dict[str, str]:
+    """Each herdr session name made from the old stem or the old session name, to its new form."""
+    import herdr
+
+    new_stem = unit_names.stem(rename.new)
+    olds = [unit_names.stem(rename.old), *([rename.old_session] if rename.old_session else [])]
+    return {herdr.generated_session_name(form.format(slug=rename.slug, stem=old)):
+            herdr.generated_session_name(form.format(slug=rename.slug, stem=new_stem))
+            for old in olds for form in ("{stem}", "{slug}-{stem}")}
+
+
+def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
     """Point the stopped unit's shutdown record at its new names; restart reads the plan from the Units row.
 
-    The Claude session and herdr names follow the unit only while they are the names add_unit gave
-    it: a name the user chose stays.
+    The Claude session takes the new stem whatever it was called before, and a herdr session name
+    made from the old stem or the old session name takes the same form of the new stem (user,
+    2026-10-19: builder-report kept its name when build-report-unit became builds-unit).
     """
     if not rename.session_id:
         return
-    old_stem, new_stem = unit_names.stem(rename.old), unit_names.stem(rename.new)
-    import herdr
-
-    host_names = {herdr.generated_session_name(form.format(slug=rename.slug, stem=old_stem)):
-                  herdr.generated_session_name(form.format(slug=rename.slug, stem=new_stem))
-                  for form in ("{stem}", "{slug}-{stem}")}
+    new_stem = unit_names.stem(rename.new)
 
     def change(saved: SessionShutdown) -> None:
         session = saved["session"]
         host = session["host"]
+        if not rename.old_session:
+            rename.old_session = session["name"]
+        host_names = _host_names(rename)
         if host["kind"] != "unit" or host["unit"] not in (rename.old, rename.new):
             raise RenameRefused(f"shutdown record {rename.session_id} is not {rename.old}'s")
         if saved["progress"]["kind"] not in STOPPED:
@@ -514,8 +571,7 @@ def _restart_record(rename: UnitRename, _save: Callable[[], None]) -> None:
         host["session_name"] = host_names.get(host["session_name"], host["session_name"])
         if host["plan"]["kind"] == "plan":
             host["plan"]["path"] = _moved(host["plan"]["path"], rename.old_worktree, rename.new_worktree)
-        if session["name"] == old_stem:
-            session["name"] = new_stem
+        session["name"] = new_stem
         session["cwd"] = _moved(session["cwd"], rename.old_worktree, rename.new_worktree)
         for worker in saved["workers"]:
             worker["cwd"] = _moved(worker["cwd"], rename.old_worktree, rename.new_worktree)
@@ -525,6 +581,7 @@ def _restart_record(rename: UnitRename, _save: Callable[[], None]) -> None:
         _ = shutdown_record.update_session(rename.account, rename.session_id, change)
     except (shutdown_record.NoLiveRecord, shutdown_record.InvalidRecord, OSError) as error:
         raise RenameRefused(f"{rename.old}'s shutdown record: {error}") from error
+    save()
 
 
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -617,7 +674,26 @@ def _session_failures(rename: UnitRename) -> list[str]:
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     if rename.old in marked:
         failures.append(f"a session still carries the mark {rename.old}")
+    new_stem = unit_names.stem(rename.new)
+    if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+        if found.claude.name != new_stem:
+            failures.append(f"{rename.new}'s session is named {found.claude.name}, not {new_stem}")
+        failures.extend(_label_failures(rename, found.place.session))
     return failures
+
+
+def _label_failures(rename: UnitRename, session: str) -> list[str]:
+    """A herdr pane in the unit's herdr session still labelled with the old session name."""
+    if not rename.old_session or rename.old_session == unit_names.stem(rename.new):
+        return []
+    import herdr
+
+    try:
+        panes = herdr.Herdr(session).panes()
+    except (herdr.HerdrFailure, OSError) as error:
+        return [f"herdr {session}: pane labels could not be read: {error}"]
+    return [f"herdr {session}:{pane['pane_id']} is still labelled {rename.old_session}"
+            for pane in panes if pane.get("label") == rename.old_session]
 
 
 def _control_failures(rename: UnitRename) -> list[str]:
@@ -641,6 +717,8 @@ def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
 
 def verify_failures(rename: UnitRename) -> list[str]:
     """Every live place holds the new names, and no unclassified file holds an old one."""
+    if rename.id_matches:
+        return _session_failures(rename)
     try:
         return [*_doc_failures(rename), *_git_failures(rename), *_state_failures(rename),
                 *_session_failures(rename), *_control_failures(rename),
@@ -701,7 +779,11 @@ def _describe_retire(r: UnitRename) -> str:
 
 
 def _describe_record(r: UnitRename) -> str:
-    return f"shutdown record: unit {r.old} -> {r.new}, and the paths under its worktree"
+    session = (f"Claude session {r.old_session} -> {unit_names.stem(r.new)}" if r.old_session
+               else "no Claude session to name")
+    if r.id_matches:
+        return f"shutdown record: {session}"
+    return f"shutdown record: unit {r.old} -> {r.new}, {session}, and the paths under its worktree"
 
 
 def _describe_relaunch(r: UnitRename) -> str:
@@ -727,6 +809,10 @@ STEPS = (
 )
 
 
+# The steps a name-only rename runs; the rest name the id, which already is the new one.
+NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (_stop, _restart_record, _relaunch, _verify)
+
+
 def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:
     return next(number for number, step in enumerate(STEPS, 1) if step.run is run)
 
@@ -734,12 +820,17 @@ def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:
 def _load(path: Path) -> UnitRename:
     fields = unit_move.json_object(read_json(path))
     step = fields.get("step")
+    id_matches = fields.get("id_matches", False)
+    if type(id_matches) is not bool:
+        raise RenameRefused(f"{path}: invalid unit rename journal")
     if (not all(isinstance(fields.get(name), str) and fields.get(name) for name in REQUIRED)
             or type(step) is not int or not all(isinstance(fields.get(name, ""), str) for name in PROGRESS)):
         raise RenameRefused(f"{path}: invalid unit rename journal")
-    merged, doc_commit, unit_tip, account, session_id, kept = (cast(str, fields.get(name, "")) for name in PROGRESS)
+    merged, doc_commit, unit_tip, account, session_id, kept, old_session = (cast(str, fields.get(name, ""))
+                                                                            for name in PROGRESS)
     return UnitRename(*(cast(str, fields[name]) for name in REQUIRED), step=step, merged=merged,
-                      doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id, kept=kept)
+                      doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id, kept=kept,
+                      old_session=old_session, id_matches=id_matches)
 
 
 def _save(path: Path, rename: UnitRename) -> None:
@@ -755,7 +846,7 @@ def _resumed(path: Path, old: str, new: str) -> UnitRename | None:
         return None
     recorded = _load(path)
     try:
-        same = recorded.old in (old, unit_names.unit_id(old)) and unit_names.unit_id(new) == recorded.new
+        same = (recorded.old in (old, unit_names.unit_id(old)) or (old and old == recorded.old_session)) and unit_names.unit_id(new) == recorded.new
     except unit_names.BadName:
         same = False
     if not same:
@@ -765,8 +856,14 @@ def _resumed(path: Path, old: str, new: str) -> UnitRename | None:
 
 
 def describe(rename: UnitRename) -> list[str]:
-    return [f"{number}. {step.describe(rename)}{'  (done)' if number <= rename.step else ''}"
-            for number, step in enumerate(STEPS, 1)]
+    """Every step, and which part of the request each changes or already matches."""
+    lines: list[str] = []
+    for number, step in enumerate(STEPS, 1):
+        if rename.id_matches and step.run not in NAME_STEPS:
+            lines.append(f"{number}. already matches: the id is {rename.new}, so nothing here changes")
+            continue
+        lines.append(f"{number}. {step.describe(rename)}{'  (done)' if number <= rename.step else ''}")
+    return lines
 
 
 def plan(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
@@ -795,6 +892,10 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             _save(path, rename)
         for number in range(rename.step + 1, len(STEPS) + 1):
             step = STEPS[number - 1]
+            if rename.id_matches and step.run not in NAME_STEPS:
+                rename.step = number
+                _save(path, rename)
+                continue
             # Revalidated before every step: a resumed run may come back to a changed machine. A merge
             # gate leaves the checkout mid-merge while it runs, so the check waits for it too.
             with _merge_lock(rename):
