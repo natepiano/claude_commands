@@ -13,6 +13,9 @@ from typing import override
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+# A hang limit, not a speed check: a verify.sh call starts many processes, and at load 150 one took
+# over 30 s (a merge gate went red at 30 s, 2026-10-18). A real hang still fails, after this many seconds.
+HANG_SECONDS = 300
 REAL_CARGO = shutil.which("cargo")
 
 
@@ -144,7 +147,7 @@ esac
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=HANG_SECONDS,
         )
 
     def calls_made(self) -> list[str]:

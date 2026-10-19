@@ -8,19 +8,24 @@
 # one process.
 #
 # Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
-#                --arg showrunner "<session JSON>" --arg counts "<id> <row> lines"
+#                --arg showrunner "<session JSON>" --arg own "<session JSON>" --arg counts "<id> <row> lines"
 #                --slurpfile labels <by-label.json> --rawfile colors <statusline.conf> -f statusline.jq
-# Input:      the status line JSON on stdin; labels, showrunner, showrunners, counts and
+# Input:      the status line JSON on stdin; labels, showrunner, own, showrunners, counts and
 #             colors are optional; /dev/null stands in for missing input files.
 #             Empty or damaged showrunner text leaves the unit director unnamed.
-# Output:     Line 1: "<role> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
+#             $own is this session's record; its name is used only when its sessionId
+#             is this session's.
+# Output:     Line 1: "<role> | <dirname> | <tokens with thousands separators> | <model [effort]>"
 #             A unit director's role reads "unit director for <showrunner name>"
-#             when the live showrunner record has a name.
-#             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
+#             when the live showrunner record has a name. A named session puts its name
+#             first: "<session> - unit director …" for a unit director, "<session> showrunner"
+#             for a showrunner.
+#             Line 2: "<account> | 5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
+#             each piece only when present, the 5-hour piece only when under 10% is left,
 #             each " until ..." only when its window carries a reset time.
 #             Line 3, when present: this session's "For you: …" counts row, from
 #             the "<session id> <row>" lines in $counts that statusline.sh reads
-#             from each showrunner's counts cache.
+#             from each showrunner's counts cache, with each count in bold.
 #             ANSI colors wrap the role, account, tokens and percentages only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
@@ -138,6 +143,10 @@ def usage($config; $label; $window; $fmt):
 | ($ARGS.named.showrunner // "" | try fromjson catch null
    | if type == "object" then .name else null end
    | if type == "string" and . != "" then . else null end) as $showrunner_name
+| (.session_id // "") as $session_id
+| ($ARGS.named.own // "" | try fromjson catch null
+   | if type == "object" and $session_id != "" and .sessionId == $session_id then .name else null end
+   | if type == "string" and . != "" then . else null end) as $session_name
 | ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
 # Trailing slashes stripped first, so "/etc/nixos/" gives "nixos" and not "".
 # "/" survives that to become "", and falls back to the path itself.
@@ -150,11 +159,11 @@ def usage($config; $label; $window; $fmt):
       | (if $role == "unit director" and ($showrunner_name | type) == "string"
             and $showrunner_name != ""
          then $role + " for " + $showrunner_name else $role end)
-      | color($colors; "role." + ($role | gsub(" "; "-")))),
-     # A label is a note name; an address never reaches the line.
-     (if $account == "" or ($account | contains("@")) then empty
-      elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
-      else $account end | . as $label | color($colors; "account." + $label)),
+      | color($colors; "role." + ($role | gsub(" "; "-")))
+      | if $session_name == null then .
+        elif $role == "showrunner" then $session_name + " " + .
+        elif $role == "unit director" then $session_name + " - " + .
+        else . end),
      $base,
      (.context_window as $context
       | (($context.total_input_tokens // 0) | commas)
@@ -165,11 +174,19 @@ def usage($config; $label; $window; $fmt):
      $m
    ] | join(" | ")) as $first_line
 | ([
-     usage($colors; "5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
+     # A label is a note name; an address never reaches the line.
+     (if $account == "" or ($account | contains("@")) then empty
+      elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
+      else $account end | . as $label | color($colors; "account." + $label)),
+     # The 5-hour window shows only when under 10% of it is left (user, 2026-10-18).
+     (window("five_hour"; .rate_limits.five_hour?) as $five_hour
+      | select((remaining($five_hour) // 100) < 10)
+      | usage($colors; "5-hour"; $five_hour; "%H:%M")),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
 | ((.session_id // "") as $id
    | [$ARGS.named.counts // "" | split("\n")[]
-      | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]]
+      | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
+      | gsub("(?<count>[0-9]+)"; "\u001b[1m\(.count)\u001b[22m")]
    | join("\n")) as $counts_row
 | [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")

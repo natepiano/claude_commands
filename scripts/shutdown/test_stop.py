@@ -335,6 +335,26 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(finished["progress"], {"kind": "stopped", "at": NOW})
         self.assertEqual(finished["where"], saved["where"])
 
+    def test_move_stops_an_owner_with_unpushed_commits_and_a_full_shutdown_waits(self) -> None:
+        for moving in (True, False):
+            with self.subTest(moving=moving):
+                owner = top_level(f"unpushed-{moving}", 101)
+                owner["checkout"] = checkout()
+                owner["checkout"]["upstream"] = inventory.Tracking(kind="tracking", ahead=2)
+                saved = entry(owner)
+                saved["progress"] = {"kind": "ready", "at": NOW}
+                if moving:
+                    saved["target"] = "claude3"
+                self.create([saved])
+                signals: list[int] = []
+                finished = stop.stop_session(saved, kill=lambda _pid, sent: signals.append(sent),
+                    is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                    fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                    clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+                    sleep=lambda _seconds: None)
+                self.assertEqual(signals, [signal.SIGTERM] if moving else [])
+                self.assertEqual(finished["progress"]["kind"], "stopped" if moving else "ready")
+
     def test_idle_decision_preserves_ready_checkpoint_arriving_before_stop_claim(self) -> None:
         owner = top_level("became-ready", 101, status="shell")
         saved = entry(owner, progress="waiting")
@@ -634,7 +654,7 @@ class StopTests(ShutdownTestCase):
 
     def test_cancel_during_a_stop_claim_keeps_its_record_and_timers(self) -> None:
         saved = entry(top_level('owner', 101))
-        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True, footer=record.NoFooter(kind='no footer'))]
+        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True)]
         self.create([saved])
         entered = threading.Event()
         release = threading.Event()
@@ -1480,7 +1500,8 @@ class StopTests(ShutdownTestCase):
         self.create([saved])
         replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
 
-        def blocker(_session: inventory.Session) -> record.ReadinessCheck:
+        def blocker(_session: inventory.Session, *, moving: bool = False) -> record.ReadinessCheck:
+            _ = moving
             def replace(current: record.SessionShutdown) -> None:
                 current["progress"] = replacement
             _ = record.update_session(LOGIN, "owner", replace)

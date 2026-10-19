@@ -11,9 +11,8 @@ set -euo pipefail
 #
 # Unlike the settings.json filter, this cannot simply delete the volatile rows.
 # agents_config.sh validates every agent and effort and hard-errors on an empty
-# one, so a stripped file would fail on a fresh clone and take delegate,
-# the fix pipeline, and the CLI aliases down with it. Pinning keeps the committed copy
-# complete and valid.
+# one. A stripped file would fail on a fresh clone and stop delegate and the CLI
+# aliases. Pinning keeps the committed copy complete and valid.
 #
 # To commit a real structural change (a new function, subtask, or section):
 #

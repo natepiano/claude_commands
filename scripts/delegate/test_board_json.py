@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -13,12 +14,13 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import cast, override
 from unittest.mock import patch
 
 from scripts.delegate import board_json
 from scripts.lib import unit_runs
-from scripts.production import fake_showrunner
+from scripts.production import fake_showrunner, showrunners
 from scripts.production.cli_fixture import invoke_cli
 
 
@@ -53,6 +55,7 @@ class BoardJsonTests(unittest.TestCase):
     run_root: Path = Path()
     former_root: Path = Path()
     notifier: Path = Path()
+    showrunner_state: Path = Path()
     sessions: Path = Path()
     session_script: Path = Path()
     output: Path = Path()
@@ -69,6 +72,7 @@ class BoardJsonTests(unittest.TestCase):
         self.run_root.mkdir()
         self.former_root.mkdir()
         self.notifier = self.root / "notifier"
+        self.showrunner_state = self.root / "showrunners"
         self.sessions = self.root / "sessions"
         self.notifier.mkdir()
         self.sessions.mkdir()
@@ -98,11 +102,14 @@ class BoardJsonTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "SHOWRUNNERS_SESSIONS": str(self.session_script),
+            "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
             "UNIT_BOARD_DIR": str(self.output),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "STYLE_LEDGER_STATE_DIR": str(self.root / "style-ledgers"),
         }
 
-    def production(self, slug: str = "show", *, running: bool = True) -> ProductionFixture:
+    def production(self, slug: str = "show", *, running: bool = True,
+                   unit_name: str = "alpha-unit") -> ProductionFixture:
         checkout = self.root / f"{slug}-checkout"
         worktree = self.root / f"{slug}-unit"
         checkout.mkdir()
@@ -118,7 +125,7 @@ class BoardJsonTests(unittest.TestCase):
             "- **Log:** show.log", "- **User zone:** UTC", "", "## Units", "",
             "| Unit | Plan | Worktree | Branch | Owns |",
             "| --- | --- | --- | --- | --- |",
-            f"| alpha-unit | {plan} | {worktree} | branch | fixture.py |", "",
+            f"| {unit_name} | {plan} | {worktree} | branch | fixture.py |", "",
         )), encoding="utf-8")
         fixture = ProductionFixture(slug, checkout, worktree, plan, document)
         self.plan(fixture)
@@ -149,6 +156,63 @@ class BoardJsonTests(unittest.TestCase):
             "| --- | --- | --- | --- |",
             f"| G2 | alpha phase 3 | renderer phase 9 | {gate} |", "",
         )), encoding="utf-8")
+
+    def attach(self, child: str, parent: str) -> None:
+        directory = self.showrunner_state / child
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
+
+    def standing_plan(self, fixture: ProductionFixture, *, phase_id: str = "alpha-unit-63",
+                      title: str = "Fix names") -> None:
+        # A real linked worktree pins the ledger's main-repository namespace,
+        # which differs from both the Unit cell and the worktree basename.
+        for arguments in (
+            ["git", "init", "--quiet", str(fixture.checkout)],
+            ["git", "-C", str(fixture.checkout), "-c", "user.name=Fixture",
+             "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+             "commit", "--quiet", "--allow-empty", "-m", "Fixture"],
+        ):
+            result = subprocess.run(arguments, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        fixture.plan.unlink()
+        (fixture.worktree / ".git").unlink()
+        result = subprocess.run(
+            ["git", "-C", str(fixture.checkout), "worktree", "add", "--quiet", "--detach",
+             str(fixture.worktree), "HEAD"], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _ = fixture.plan.write_text(
+            "> **Standing:** style_plan.py\n\n"
+            + f"### Phase {phase_id} — {title} · status: todo\n", encoding="utf-8",
+        )
+        _ = self.write_run(fixture, [self.event(
+            "phase_started", NOW - 120, phase=phase_id, instance="ticket-63",
+            phase_title=title,
+        )])
+
+    def ledger(self, fixture: ProductionFixture, *, default_path: bool = False,
+               tickets: tuple[tuple[str, str, str, int], ...] = ()) -> Path:
+        root = self.root / ".local/state/style" if default_path else self.root / "style-ledgers"
+        database = root / fixture.checkout.name / "ledger.sqlite"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database)
+        try:
+            _ = connection.execute(
+                "CREATE TABLE tickets (id TEXT, unit TEXT, state TEXT, created_at INTEGER)",
+            )
+            _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
+                ("alpha-unit-1", "alpha-unit", "merged", 1),
+                ("alpha-unit-2", "alpha-unit", "merged", 2),
+                ("alpha-unit-3", "alpha-unit", "open", 3),
+                ("alpha-unit-4", "alpha-unit", "rejected", 4),
+                ("other-unit-1", "other-unit", "merged", 5),
+                ("alpha-1", "alpha", "merged", 6),
+                *tickets,
+            ])
+            connection.commit()
+        finally:
+            connection.close()
+        return database
 
     @staticmethod
     def event(kind: str, at: int, *, phase: str = "2", instance: str = "two",
@@ -224,7 +288,7 @@ class BoardJsonTests(unittest.TestCase):
                 if module is not None:
                     for field, value in (
                         ("NOTIFIER_STATE_DIR", self.notifier), ("SESSIONS_DIR", self.sessions),
-                        ("SESSIONS", self.session_script),
+                        ("SESSIONS", self.session_script), ("SHOWRUNNER_STATE_DIR", self.showrunner_state),
                     ):
                         _ = scope.enter_context(patch.object(module, field, value))
             return invoke_cli(
@@ -251,7 +315,7 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(len(units), 1)
         return documents[0], object_fields(units[0])
 
-    def test_cwd_inside_unit_focuses_that_unit_and_only_its_production(self) -> None:
+    def test_unit_worktree_does_not_select_a_production_or_unit(self) -> None:
         fixture = self.production()
         other = self.production("other")
         nested = fixture.worktree / "nested"
@@ -259,23 +323,185 @@ class BoardJsonTests(unittest.TestCase):
 
         response, documents = self.generate("--cwd", str(nested))
 
-        self.assertEqual(response["files"], [str(self.output / "show.json")])
-        self.assertEqual(response["focus"], "alpha")
+        self.assertEqual(response["files"], [])
+        self.assertNotIn("focus", response)
         self.assertEqual(response["watch"], [str(self.notifier.resolve())])
-        self.assertEqual(documents[0]["production"], fixture.slug)
-        unit = object_fields(array_items(documents[0]["units"])[0])
-        self.assertEqual(unit["key"], "alpha")
-        self.assertEqual(unit["plan"], str(fixture.plan))
+        self.assertEqual(documents, [])
+        self.assertFalse((self.output / f"{fixture.slug}.json").exists())
         self.assertFalse((self.output / f"{other.slug}.json").exists())
 
-    def test_showrunner_checkout_selects_its_production_without_a_unit_focus(self) -> None:
-        fixture = self.production()
-        _ = self.production("other")
+    def test_showrunner_cwd_and_production_select_the_same_three_level_subtree(self) -> None:
+        root = self.production("z-root")
+        child = self.production("m-child")
+        grandchild = self.production("a-grandchild")
+        other = self.production("other", running=False)
+        self.attach(child.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+        nested = root.checkout / "nested"
+        nested.mkdir()
 
-        response, documents = self.generate("--cwd", str(fixture.checkout))
+        for arguments in (("--cwd", str(nested)), ("--production", root.slug)):
+            with self.subTest(arguments=arguments):
+                response, documents = self.generate(*arguments)
 
-        self.assertIsNone(response["focus"])
-        self.assertEqual([doc["production"] for doc in documents], [fixture.slug])
+                self.assertEqual(response["files"], [str(self.output / f"{slug}.json")
+                                                     for slug in (root.slug, child.slug, grandchild.slug)])
+                self.assertEqual([doc["production"] for doc in documents],
+                                 [root.slug, child.slug, grandchild.slug])
+                self.assertNotIn("focus", response)
+                self.assertEqual(response["watch"], sorted(str(path.resolve()) for path in (
+                    self.notifier, self.showrunner_state,
+                    self.showrunner_state / child.slug, self.showrunner_state / grandchild.slug,
+                )))
+                for fixture, document in zip((root, child, grandchild), documents, strict=True):
+                    unit = object_fields(array_items(document["units"])[0])
+                    self.assertEqual(unit["key"], "alpha")
+                    self.assertEqual(unit["plan"], str(fixture.plan))
+                self.assertFalse((self.output / f"{other.slug}.json").exists())
+
+        # A nested showrunner sees its own subtree, without its parent or siblings.
+        response, documents = self.generate("--cwd", str(child.checkout))
+        self.assertEqual([doc["production"] for doc in documents], [child.slug, grandchild.slug])
+        self.assertNotIn("focus", response)
+
+    def test_showrunner_session_timer_selects_its_production_from_an_unrelated_cwd(self) -> None:
+        fixture = self.production(running=False)
+        unrelated = self.root / "etc/nixos"
+        unrelated.mkdir(parents=True)
+
+        response, documents = self.generate("--cwd", str(unrelated), "--session", "show-id")
+
+        self.assertEqual(response["files"], [str(self.output / "show.json")])
+        self.assertEqual([document["production"] for document in documents], [fixture.slug])
+        unit = object_fields(array_items(documents[0]["units"])[0])
+        self.assertEqual(unit["plan"], str(fixture.plan))
+
+    def test_showrunner_session_takes_precedence_over_another_productions_cwd(self) -> None:
+        fixture = self.production("session-production", running=False)
+        other = self.production("cwd-production", running=False)
+
+        _, documents = self.generate("--cwd", str(other.checkout),
+                                     "--session", "session-production-id")
+
+        self.assertEqual([document["production"] for document in documents], [fixture.slug])
+        self.assertFalse((self.output / f"{other.slug}.json").exists())
+
+    def test_showrunner_session_selects_its_subtree_without_parents_or_siblings(self) -> None:
+        parent = self.production("parent", running=False)
+        root = self.production("z-root", running=False)
+        child = self.production("m-child", running=False)
+        grandchild = self.production("a-grandchild", running=False)
+        sibling = self.production("sibling", running=False)
+        self.attach(root.slug, parent.slug)
+        self.attach(sibling.slug, parent.slug)
+        self.attach(child.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+
+        response, documents = self.generate("--cwd", str(self.root), "--session", "z-root-id")
+
+        self.assertEqual([document["production"] for document in documents],
+                         [root.slug, child.slug, grandchild.slug])
+        self.assertEqual(response["files"], [str(self.output / f"{slug}.json")
+                                             for slug in (root.slug, child.slug, grandchild.slug)])
+        self.assertFalse((self.output / f"{parent.slug}.json").exists())
+        self.assertFalse((self.output / f"{sibling.slug}.json").exists())
+
+    def test_unknown_session_falls_back_to_cwd_and_leaves_an_unrelated_cwd_empty(self) -> None:
+        fixture = self.production(running=False)
+        nested = fixture.checkout / "nested"
+        nested.mkdir()
+        for cwd, expected in ((nested, [fixture.slug]), (self.root, [])):
+            with self.subTest(cwd=cwd):
+                _, documents = self.generate("--cwd", str(cwd), "--session", "unknown-session")
+
+                self.assertEqual([document["production"] for document in documents], expected)
+
+    def test_explicit_production_wins_over_session(self) -> None:
+        fixture = self.production("explicit", running=False)
+        other = self.production("session-production", running=False)
+        for production, expected in ((fixture.slug, [fixture.slug]), ("unknown-production", [])):
+            with self.subTest(production=production):
+                _, documents = self.generate("--production", production,
+                                             "--session", "session-production-id")
+
+                self.assertEqual([document["production"] for document in documents], expected)
+                self.assertFalse((self.output / f"{other.slug}.json").exists())
+
+    def test_attach_and_detach_change_a_watched_directory_and_refresh_the_subtree(self) -> None:
+        root = self.production("root")
+        child = self.production("child")
+        child_state = self.showrunner_state / child.slug
+        child_state.mkdir(parents=True)
+        # An unrelated directory must not become a discovery source.
+        (self.showrunner_state / "unregistered").mkdir()
+        expected_watch = sorted(str(path.resolve()) for path in (
+            self.notifier, self.showrunner_state, child_state,
+        ))
+        runners = showrunners
+        with patch.object(runners, "NOTIFIER_STATE_DIR", self.notifier), \
+                patch.object(runners, "SHOWRUNNER_STATE_DIR", self.showrunner_state):
+            for operation in ("attach", "detach"):
+                with self.subTest(operation=operation):
+                    # Give each actual filesystem operation room to advance mtime,
+                    # without sleeping or relying on filesystem clock resolution.
+                    os.utime(child_state, (NOW, NOW))
+                    response, documents = self.generate("--cwd", str(root.checkout))
+                    self.assertEqual(response["watch"], expected_watch)
+                    watched_mtime = child_state.stat().st_mtime_ns
+                    self.assertEqual([doc["production"] for doc in documents],
+                                     [root.slug] if operation == "attach" else [root.slug, child.slug])
+
+                    if operation == "attach":
+                        self.assertFalse((child_state / "parent").exists())
+                        runners.attach(child.slug, root.slug)
+                    else:
+                        self.assertEqual(runners.detach(child.slug), root.slug)
+                    self.assertGreater(child_state.stat().st_mtime_ns, watched_mtime)
+
+                    response, documents = self.generate("--cwd", str(root.checkout))
+                    self.assertEqual(response["watch"], expected_watch)
+                    self.assertEqual([doc["production"] for doc in documents],
+                                     [root.slug, child.slug] if operation == "attach" else [root.slug])
+
+    def test_subtree_keeps_nearest_levels_before_grandchildren_and_includes_stopped_showrunners(self) -> None:
+        root = self.production("root")
+        child = self.production("b-child", running=False)
+        sibling = self.production("z-sibling", running=False)
+        grandchild = self.production("a-grandchild", running=False)
+        self.attach(child.slug, root.slug)
+        self.attach(sibling.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+
+        _, documents = self.generate("--production", root.slug)
+
+        self.assertEqual([doc["production"] for doc in documents],
+                         [root.slug, child.slug, sibling.slug, grandchild.slug])
+
+    def test_descendant_not_in_the_registered_showrunners_is_left_out(self) -> None:
+        root = self.production("root")
+        child = self.production("child")
+        grandchild = self.production("grandchild")
+        self.attach(child.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+        # The tree lookup can outlive a registry entry while its timer is removed.
+        # Keep real board generation and registry reads; vary only that boundary.
+        with patch.object(showrunners, "descendants_of",
+                          return_value=[child.slug, "unregistered", grandchild.slug]):
+            response, documents = self.generate("--production", root.slug)
+
+        self.assertEqual([doc["production"] for doc in documents],
+                         [root.slug, child.slug, grandchild.slug])
+        self.assertNotIn("focus", response)
+        self.assertFalse((self.output / "unregistered.json").exists())
+
+    def test_unknown_explicit_production_does_not_fall_back_to_registered_productions(self) -> None:
+        _ = self.production()
+
+        response, documents = self.generate("--production", "unregistered")
+
+        self.assertEqual(response["files"], [])
+        self.assertEqual(documents, [])
+        self.assertNotIn("focus", response)
 
     def test_deleted_plan_is_omitted_from_the_unit_path(self) -> None:
         fixture = self.production()
@@ -302,21 +528,24 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(unit["plan"], str(as_built))
         self.assertNotEqual(unit["plan"], str(fixture.plan))
 
-    def test_unrelated_cwd_lists_every_running_production(self) -> None:
+    def test_unrelated_cwd_does_not_fall_back_to_running_productions(self) -> None:
         _ = self.production()
         _ = self.production("other")
         _ = self.production("stopped", running=False)
 
         response, documents = self.generate("--cwd", "/")
 
-        self.assertIsNone(response["focus"])
-        self.assertEqual({doc["production"] for doc in documents}, {"show", "other"})
+        self.assertNotIn("focus", response)
+        self.assertEqual(response["files"], [])
+        self.assertEqual(documents, [])
+        self.assertFalse((self.output / "show.json").exists())
+        self.assertFalse((self.output / "other.json").exists())
         self.assertFalse((self.output / "stopped.json").exists())
 
     def test_no_registered_production_resolves_without_output_files(self) -> None:
         response, documents = self.generate("--cwd", "/")
         self.assertEqual(response, {
-            "files": [], "focus": None, "watch": [str(self.notifier.resolve())],
+            "files": [], "watch": [str(self.notifier.resolve())],
         })
         self.assertEqual(documents, [])
 
@@ -325,7 +554,7 @@ class BoardJsonTests(unittest.TestCase):
 
         response, documents = self.generate("--cwd", "/")
 
-        self.assertEqual(response, {"files": [], "focus": None, "watch": []})
+        self.assertEqual(response, {"files": [], "watch": []})
         self.assertEqual(documents, [])
 
     def test_output_directory_uses_xdg_then_home_when_no_override_is_set(self) -> None:
@@ -349,7 +578,328 @@ class BoardJsonTests(unittest.TestCase):
                 _, unit = self.unit(fixture)
                 self.assertEqual(unit["stage"], label)
                 self.assertEqual(unit["state"], "running")
-                self.assertEqual(unit["phase"], {"id": "2", "of": 4, "title": "Current delivery"})
+                self.assertEqual(unit["phase"], {
+                    "kind": "plan", "id": "2", "of": 4, "title": "Current delivery",
+                })
+
+    def test_numeric_phase_names_the_assigned_ledger_ticket_with_one_read_only_connection(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        database = self.ledger(fixture, tickets=(
+            ("names-unit-1", "names-unit", "merged", 1),
+            ("names-unit-2", "names-unit", "merged", 2),
+            ("names-unit-63", "names-unit", "assigned", 63),
+        ))
+        before = database.read_bytes()
+
+        with patch("sqlite3.connect", wraps=sqlite3.connect) as connect:
+            document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 2,
+        })
+        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertIn(str(database), array_items(document["sources"]))
+        self.assertEqual(database.read_bytes(), before)
+        self.assertEqual(connect.call_count, 1)
+        self.assertEqual(connect.call_args.args, (f"file:{database}?mode=ro",))
+        self.assertEqual(connect.call_args.kwargs, {"uri": True, "timeout": 0})
+
+    def test_ledger_ahead_of_the_run_uses_the_newest_assigned_or_checkpointed_ticket(self) -> None:
+        fixture = self.production(unit_name="types-unit")
+        self.standing_plan(fixture, phase_id="124", title="types-unit-124")
+        database = self.ledger(fixture)
+        for state in ("assigned", "checkpointed"):
+            with self.subTest(state=state):
+                connection = sqlite3.connect(database)
+                try:
+                    _ = connection.execute("DELETE FROM tickets")
+                    _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?)", [
+                        ("types-unit-125", "types-unit", state, 500),
+                        ("types-unit-126", "types-unit", "assigned", 300),
+                        ("types-unit-124", "types-unit", "checkpointed", 400),
+                        ("types-unit-127", "types-unit", "merged", 600),
+                        ("types-unit-128", "types-unit", "rejected", 700),
+                        ("types-unit-129", "types-unit", "open", 800),
+                        ("types-unit-extra-999", "types-unit-extra", "assigned", 900),
+                    ])
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                _, unit = self.unit(fixture)
+
+                self.assertEqual(unit["phase"], {
+                    "kind": "ticket", "id": "types-unit-125", "title": "types-unit-124", "merged": 1,
+                })
+                self.assertEqual(unit["stage"], "Ticket types-unit-125 running")
+
+    def test_no_open_ledger_row_falls_back_to_the_ticket_word_in_the_phase_title(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        _ = self.ledger(fixture, tickets=(
+            ("names-unit-62", "names-unit", "merged", 62),
+            ("names-unit-99", "names-unit", "rejected", 99),
+        ))
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 1,
+        })
+        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+
+    def test_missing_ledger_falls_back_to_the_title_ticket_and_zero_merged(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 0,
+        })
+        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertFalse((self.root / "style-ledgers").exists())
+
+    def test_ticket_title_removes_only_its_leading_id_and_separator(self) -> None:
+        fixture = self.production(unit_name="values-unit")
+        self.standing_plan(fixture, phase_id="8", title="values-unit-8")
+        for title, remaining in (
+            ("values-unit-8", ""),
+            ("values-unit-8 — read time", "read time"),
+            ("values-unit-8   read time", "read time"),
+            ("values-unit-8 — read values-unit-8 time", "read values-unit-8 time"),
+        ):
+            with self.subTest(title=title):
+                _ = fixture.plan.write_text(
+                    "> **Standing:** style_plan.py\n\n"
+                    + f"### Phase 8 — {title} · status: todo\n", encoding="utf-8",
+                )
+                _ = self.write_run(fixture, [self.event(
+                    "phase_started", NOW - 120, phase="8", instance="ticket-8", phase_title=title,
+                )])
+
+                _, unit = self.unit(fixture)
+
+                self.assertEqual(unit["phase"], {
+                    "kind": "ticket", "id": "values-unit-8", "title": remaining, "merged": 0,
+                })
+                self.assertEqual(unit["stage"], "Ticket values-unit-8 running")
+
+    def test_non_ticket_title_word_keeps_the_phase_id_and_uses_the_ticket_stage(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="63", title="Fix names")
+        for title in ("Fix names", "other-unit-63 — read time", "names-unit-63suffix",
+                      "names-unit-nope", "Read names-unit-63"):
+            with self.subTest(title=title):
+                _ = fixture.plan.write_text(
+                    "> **Standing:** style_plan.py\n\n"
+                    + f"### Phase 63 — {title} · status: todo\n", encoding="utf-8",
+                )
+                _ = self.write_run(fixture, [self.event(
+                    "phase_started", NOW - 120, phase="63", instance="ticket-63", phase_title=title,
+                )])
+
+                _, unit = self.unit(fixture)
+
+                self.assertEqual(unit["phase"], {
+                    "kind": "ticket", "id": "63", "title": title, "merged": 0,
+                })
+                self.assertEqual(unit["stage"], "Ticket 63 running")
+
+    def test_locked_ledger_discards_open_ticket_and_count_then_uses_title_fallback(self) -> None:
+        fixture = self.production(unit_name="types-unit")
+        self.standing_plan(fixture, phase_id="124", title="types-unit-124")
+        database = self.ledger(fixture, tickets=(
+            ("types-unit-123", "types-unit", "merged", 123),
+            ("types-unit-125", "types-unit", "assigned", 125),
+        ))
+        writer = sqlite3.connect(database)
+        self.addCleanup(writer.close)
+        _ = writer.execute("BEGIN EXCLUSIVE")
+
+        started = monotonic()
+        document, unit = self.unit(fixture)
+        elapsed = monotonic() - started
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "types-unit-124", "title": "", "merged": 0,
+        })
+        self.assertEqual(unit["stage"], "Ticket types-unit-124 running")
+        self.assertIn(str(database), array_items(document["sources"]))
+        self.assertLess(elapsed, 1.0)
+
+    def test_ticket_keeps_build_test_review_and_repair_stages(self) -> None:
+        fixture = self.production(unit_name="names-unit")
+        self.standing_plan(fixture, phase_id="63", title="names-unit-63")
+        for kind, label in (("impl", "Build"), ("test", "Tests"), ("review", "Review"),
+                            ("fix", "Repair round 3")):
+            with self.subTest(kind=kind):
+                _ = self.write_run(fixture, [
+                    self.event("phase_started", NOW - 120, phase="63", instance="ticket-63",
+                               phase_title="names-unit-63"),
+                    self.event("pass_started", NOW - 60, phase="63", instance="ticket-63",
+                               pass_instance_id="pass", pass_kind=kind, fix_pass=3),
+                ])
+
+                _, unit = self.unit(fixture)
+
+                self.assertEqual(unit["phase"], {
+                    "kind": "ticket", "id": "names-unit-63", "title": "", "merged": 0,
+                })
+                self.assertEqual(unit["stage"], label)
+
+    def test_standing_plan_counts_only_its_units_merged_tickets_with_a_read_only_connection(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        before = database.read_bytes()
+        # A recorder may hold a write reservation while the pane refreshes.
+        # Read-only readers must still succeed and never construct Ledger.
+        writer = sqlite3.connect(database)
+        self.addCleanup(writer.close)
+        _ = writer.execute("BEGIN IMMEDIATE")
+        database.chmod(0o444)
+        self.addCleanup(database.chmod, 0o644)
+        with patch("sqlite3.connect", wraps=sqlite3.connect) as connect:
+            document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 2,
+        })
+        self.assertIn(str(database), array_items(document["sources"]))
+        self.assertEqual(database.read_bytes(), before)
+        self.assertTrue(any(
+            call.args and call.args[0] == f"file:{database}?mode=ro"
+            and call.kwargs.get("uri") is True for call in connect.call_args_list
+        ), connect.call_args_list)
+
+    def test_exclusively_locked_ledger_gives_zero_in_under_one_second(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        writer = sqlite3.connect(database)
+        self.addCleanup(writer.close)
+        _ = writer.execute("BEGIN EXCLUSIVE")
+
+        started = monotonic()
+        document, unit = self.unit(fixture)
+        elapsed = monotonic() - started
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+        })
+        self.assertIn(str(database), array_items(document["sources"]))
+        self.assertLess(elapsed, 1.0, "a locked ledger must not delay the board refresh")
+
+    def test_standing_plan_without_a_ledger_gives_zero_and_does_not_create_one(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        ledger_root = self.root / "style-ledgers"
+
+        document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+        })
+        self.assertFalse(ledger_root.exists())
+        self.assertFalse(any(str(path).endswith("ledger.sqlite")
+                             for path in array_items(document["sources"])))
+
+    def test_standing_plan_with_an_unreadable_ledger_keeps_zero_and_watches_the_file(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        for contents in (b"not a sqlite database", b""):
+            with self.subTest(contents=contents):
+                _ = database.write_bytes(contents)
+
+                document, unit = self.unit(fixture)
+
+                self.assertEqual(unit["phase"], {
+                    "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+                })
+                self.assertIn(str(database), array_items(document["sources"]))
+                self.assertEqual(database.read_bytes(), contents)
+
+    def test_standing_plan_uses_the_home_style_ledger_when_no_override_is_set(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        _ = self.environment.pop("STYLE_LEDGER_STATE_DIR")
+        database = self.ledger(fixture, default_path=True)
+
+        document, unit = self.unit(fixture)
+
+        self.assertEqual(object_fields(unit["phase"])["merged"], 2)
+        self.assertIn(str(database), array_items(document["sources"]))
+
+    def test_standing_plan_reads_a_later_merge_without_changing_the_ticket(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        _, before = self.unit(fixture)
+        connection = sqlite3.connect(database)
+        try:
+            _ = connection.execute("UPDATE tickets SET state = 'merged' WHERE id = 'alpha-unit-3'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        _, after = self.unit(fixture)
+
+        self.assertEqual(object_fields(before["phase"])["merged"], 2)
+        self.assertEqual(after["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 3,
+        })
+
+    def test_standing_marker_is_read_from_the_runs_plan_rather_than_the_display_plan(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        active_plan = fixture.worktree / "ticket-plan.md"
+        _ = fixture.plan.rename(active_plan)
+        self.plan(fixture, all_done=True)
+        _ = self.ledger(fixture)
+        run = self.history / "runs/current.jsonl"
+        events = [object_fields(cast(object, json.loads(line)))
+                  for line in run.read_text(encoding="utf-8").splitlines()]
+        events[0]["plan_doc"] = str(active_plan)
+        events[0]["project_plan_doc"] = str(active_plan)
+        _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+        document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["plan"], str(fixture.plan))
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 2,
+        })
+        self.assertIn(str(active_plan), array_items(document["sources"]))
+
+    def test_standing_plan_with_no_open_ticket_keeps_a_null_phase(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        _ = self.ledger(fixture)
+        _ = self.write_run(fixture, [
+            self.event("phase_started", NOW - 120, phase="alpha-unit-63", instance="ticket-63",
+                       phase_title="Fix names"),
+            self.event("phase_finished", NOW - 60, phase="alpha-unit-63", instance="ticket-63",
+                       status="completed", phase_elapsed_seconds=60),
+        ])
+
+        _, unit = self.unit(fixture)
+
+        self.assertIsNone(unit["phase"])
+
+    def test_standing_marker_in_prose_does_not_tag_an_ordinary_plan_as_a_ticket(self) -> None:
+        fixture = self.production()
+        with fixture.plan.open("a", encoding="utf-8") as stream:
+            _ = stream.write("\nA standing plan uses > **Standing:** style_plan.py.\n")
+        _ = self.write_run(fixture, self.delivery_events())
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "plan", "id": "2", "of": 4, "title": "Current delivery",
+        })
 
     def test_dispatched_batches_name_the_repair_until_landed_in_the_current_instance(self) -> None:
         fixture = self.production()
@@ -953,7 +1503,7 @@ class BoardJsonTests(unittest.TestCase):
                           ("8", "Follow-up delivery", "open")])
         self.assertEqual([row["took"] for row in rows[:2]], [1_200, 1_000])
         self.assertEqual(object_fields(unit["phase"]),
-                         {"id": "8", "of": 3, "title": "Follow-up delivery"})
+                         {"kind": "plan", "id": "8", "of": 3, "title": "Follow-up delivery"})
         self.assertEqual([(row["fix_done"], row["fix_running"], row["findings"]) for row in rows], [
             (1, 0, {"blocker": 1, "minor": 0, "nit": 0}),
             (0, 0, {"blocker": 0, "minor": 1, "nit": 1}),
@@ -1100,6 +1650,10 @@ class BoardJsonTests(unittest.TestCase):
             )])
             document, _ = self.unit(fixture)
             samples.append(document)
+        self.standing_plan(fixture)
+        _ = self.ledger(fixture)
+        document, _ = self.unit(fixture)
+        samples.append(document)
         declared = set(re.findall(r"\b([A-Za-z_]\w*)\??\s*:", CONTRACT.read_text(encoding="utf-8")))
 
         def check_fields(value: object, location: str) -> None:

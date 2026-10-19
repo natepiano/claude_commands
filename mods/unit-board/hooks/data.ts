@@ -53,7 +53,7 @@ export function snapshotPaths(snapshot: BoardSnapshot<BoardData>): RefreshPaths[
 }
 
 export async function loadBoard(
-  calls: BoardLoader, cwd: string, isOpen: () => boolean,
+  calls: BoardLoader, cwd: string, session: string, isOpen: () => boolean,
   watch: (paths: RefreshPaths) => void,
 ): Promise<BoardSnapshot<BoardData>> {
   const ensureOpen = () => { if (!isOpen()) throw new Error('Pane closed.'); };
@@ -65,7 +65,7 @@ export async function loadBoard(
   ensureOpen();
   watch({ kind: 'discovery', sources: [registry || `${home}/.local/state/notifier`], loadedAt });
   const result = await calls.run([
-    `${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/delegate/board_json.py`, '--cwd', cwd,
+    `${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/delegate/board_json.py`, '--cwd', cwd, '--session', session,
   ]);
   ensureOpen();
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'The board could not be refreshed.');
@@ -82,7 +82,7 @@ export async function loadBoard(
     boards.push(JSON.parse(await calls.read(path)) as BoardData);
   }
   ensureOpen();
-  return { files: response.files, boards, focus: response.focus, watch: response.watch, loadedAt };
+  return { files: response.files, boards, watch: response.watch, loadedAt };
 }
 
 export interface AccountsLoader {

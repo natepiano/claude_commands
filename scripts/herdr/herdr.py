@@ -35,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
+# herdr refuses a longer `agent start --timeout`.
+_AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
 _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
@@ -222,6 +224,8 @@ class PromptSubmitted:
 class PromptNotSubmitted:
     reason: str
     screen: str | PromptScreenNotRead = PromptScreenNotRead()
+    # True only when the launcher never typed the prompt: the session then holds no work of it.
+    never_typed: bool = False
 
 
 @dataclass(frozen=True)
@@ -962,8 +966,10 @@ class Herdr:
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
         launched_at = datetime.now(timezone.utc)
-        deadline = time.monotonic() + timeout_ms / 1000
-        attempt_timeout_ms = timeout_ms
+        # A loaded machine starts Claude slowly: the start and the opening prompt wait longer.
+        budget_ms = int(timeout_ms * load_factor())
+        deadline = time.monotonic() + budget_ms / 1000
+        attempt_timeout_ms = min(budget_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
         try:
             while True:
                 result = self.start_command(
@@ -982,7 +988,7 @@ class Herdr:
                     if remaining_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
                         raise
                     time.sleep(0.1)
-                    attempt_timeout_ms = int((deadline - time.monotonic()) * 1000)
+                    attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000), _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     if attempt_timeout_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
                         raise
                     continue
@@ -1181,7 +1187,7 @@ class Herdr:
                         return PromptSubmitted(proof.at, recipient)
             detail = f"{reason}; prompt typed {typings} times" if typings else reason
             visible = "\n".join(screen.splitlines()[-40:]) if isinstance(screen, str) else screen
-            return PromptNotSubmitted(detail, visible)
+            return PromptNotSubmitted(detail, visible, never_typed=typings == 0)
 
         def deadline_failure() -> PromptSubmitOutcome:
             reason = "opening prompt deadline elapsed"
@@ -1453,6 +1459,15 @@ def generated_session_name(text: str, suffix: str = "") -> str:
     if base in (".", ".."):
         base = "-"
     return base + tail
+
+
+def load_factor() -> float:
+    """How many times its limit a launch may wait: the one-minute load per CPU, from 1 to 6."""
+    try:
+        per_cpu = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except OSError:
+        return 1.0
+    return min(6.0, max(1.0, per_cpu))
 
 
 def _timeout(timeout_ms: object) -> None:

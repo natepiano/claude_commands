@@ -21,7 +21,8 @@ from scripts.whoami import account, agent_accounts
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
 EXAMPLE_FIRST_LINE = "unassigned | claude_commands | 182,340 | Opus 5.5 high"
-ACCOUNT_FIRST_LINE = "unassigned | claude2 | claude_commands | 182,340 | Opus 5.5 high"
+# The account leads the second line, before the quota windows.
+ACCOUNT_FIRST_LINE = "unassigned | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):
@@ -587,7 +588,7 @@ class AccountTests(unittest.TestCase):
     def test_status_line_prints_account_first_and_both_remaining_windows_second(self) -> None:
         document = self.status_line_input() | {
             "rate_limits": {
-                "five_hour": {"used_percentage": 26.4, "resets_at": 1_800_000_000},
+                "five_hour": {"used_percentage": 96.4, "resets_at": 1_800_000_000},
                 "seven_day": {"used_percentage": 58.2, "resets_at": 1_800_000_000},
             }
         }
@@ -595,20 +596,20 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(
             self.render_status_line(document, "claude2"),
             ACCOUNT_FIRST_LINE
-            + "\n5-hour 73% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
+            + "\nclaude2 | 5-hour 3% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
         )
 
     def test_status_line_without_reset_times_names_no_reset(self) -> None:
         document = self.status_line_input() | {
             "rate_limits": {
-                "five_hour": {"used_percentage": 26.4},
+                "five_hour": {"used_percentage": 96.4},
                 "seven_day": {"used_percentage": 58.2},
             }
         }
 
         self.assertEqual(
             self.render_status_line(document, "claude2"),
-            ACCOUNT_FIRST_LINE + "\n5-hour 73% left | weekly 41% left\n",
+            ACCOUNT_FIRST_LINE + "\nclaude2 | 5-hour 3% left | weekly 41% left\n",
         )
 
     def test_status_line_floors_and_clamps_remaining_percentage(self) -> None:
@@ -621,32 +622,32 @@ class AccountTests(unittest.TestCase):
             with self.subTest(used_percentage=used_percentage):
                 document = self.status_line_input() | {
                     "rate_limits": {
-                        "five_hour": {"used_percentage": used_percentage}
+                        "seven_day": {"used_percentage": used_percentage}
                     }
                 }
                 self.assertEqual(
                     self.render_status_line(document),
                     EXAMPLE_FIRST_LINE
-                    + f"\n5-hour {remaining_percentage}% left\n",
+                    + f"\nweekly {remaining_percentage}% left\n",
                 )
 
-    def test_status_line_is_one_line_with_the_account_when_limits_are_absent(self) -> None:
+    def test_status_line_puts_the_account_alone_on_line_two_when_limits_are_absent(self) -> None:
         self.assertEqual(
             self.render_status_line(self.status_line_input(), "claude2"),
-            ACCOUNT_FIRST_LINE + "\n",
+            ACCOUNT_FIRST_LINE + "\nclaude2\n",
         )
 
     def test_status_line_prints_windows_without_an_account_argument(self) -> None:
         document = self.status_line_input() | {
             "rate_limits": {
-                "five_hour": {"used_percentage": 25},
+                "five_hour": {"used_percentage": 95},
                 "seven_day": {"used_percentage": 60},
             }
         }
 
         self.assertEqual(
             self.render_status_line(document),
-            EXAMPLE_FIRST_LINE + "\n5-hour 75% left | weekly 40% left\n",
+            EXAMPLE_FIRST_LINE + "\n5-hour 5% left | weekly 40% left\n",
         )
 
     def test_status_line_omits_a_null_or_missing_window(self) -> None:
@@ -660,13 +661,13 @@ class AccountTests(unittest.TestCase):
             ),
             (
                 {
-                    "five_hour": {"used_percentage": 25},
+                    "five_hour": {"used_percentage": 95},
                     "seven_day": None,
                 },
-                "5-hour 75% left",
+                "5-hour 5% left",
             ),
             ({"seven_day": {"used_percentage": 60}}, "weekly 40% left"),
-            ({"five_hour": {"used_percentage": 25}}, "5-hour 75% left"),
+            ({"five_hour": {"used_percentage": 95}}, "5-hour 5% left"),
         )
         for rate_limits, expected_second_line in cases:
             with self.subTest(rate_limits=rate_limits):
@@ -687,10 +688,10 @@ class AccountTests(unittest.TestCase):
             ),
             (
                 {
-                    "five_hour": {"used_percentage": 25},
+                    "five_hour": {"used_percentage": 95},
                     "seven_day": {"resets_at": 1_800_000_000},
                 },
-                "5-hour 75% left",
+                "5-hour 5% left",
             ),
         )
         for rate_limits, expected_second_line in cases:

@@ -91,8 +91,6 @@ from session_types import (
     WorkerSession as WorkerSession,
     TopLevelSession as TopLevelSession,
     Session as Session,
-    ShowrunnerFooter as ShowrunnerFooter,
-    NoFooter as NoFooter,
     TimerRestore as TimerRestore,
     CodexSessionId as CodexSessionId,
     CodexResumePicker as CodexResumePicker,
@@ -1085,7 +1083,6 @@ def _snapshot_timers() -> _SnapshotTimers:
 
 
 def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[TimerRestore]:
-    import showrunner_footer
     try:
         pause = conversation_pause.read_record(conversation_pause.record_path(owner["session_id"]))
     except FileNotFoundError:
@@ -1094,23 +1091,10 @@ def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[Ti
     if isinstance(pause, conversation_pause.PauseRecord):
         restore = not isinstance(pause.phase, conversation_pause.KeptOff)
         for instance in pause.instances:
-            restores[instance] = TimerRestore(instance=instance, was_enabled=restore,
-                footer=NoFooter(kind="no footer"))
-        for slug in pause.footers:
-            instance = f"showrunner-{slug}"
-            timer = restores.setdefault(instance, TimerRestore(instance=instance,
-                was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
-            if restore:
-                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+            restores[instance] = TimerRestore(instance=instance, was_enabled=restore)
     for instance in owner["timers"]:
-        timer = restores.setdefault(instance, TimerRestore(instance=instance,
-            was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
-        if instance.startswith("showrunner-") and isinstance(pause, conversation_pause.NoPauseRecord):
-            slug = instance.removeprefix("showrunner-")
-            try:
-                _ = showrunner_footer.switch_path(slug).stat()
-            except FileNotFoundError:
-                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+        _ = restores.setdefault(instance, TimerRestore(instance=instance,
+            was_enabled=timers.enabled.get(instance, False)))
     return list(restores.values())
 
 

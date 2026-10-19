@@ -150,42 +150,7 @@ else:
 PY
   fi
 
-  # Enroll in the fix flow (config lives outside the workspace).
-  CONF="$HOME/.claude/scripts/fix/fix.conf"
   ROOTDIR=$(basename "$ROOT")
-  if [[ -f "$CONF" ]]; then
-    echo "=== Enrolling in fix pipeline ==="
-    "$PY" - "$CONF" "$ROOTDIR" "$NAME" <<'PY'
-import sys
-conf, rootdir, name = sys.argv[1], sys.argv[2], sys.argv[3]
-lines = open(conf).read().splitlines()
-
-def section_range(sec):
-    start = next((i for i, l in enumerate(lines) if l.strip() == f'[{sec}]'), None)
-    if start is None:
-        return None
-    end = next((j for j in range(start + 1, len(lines)) if lines[j].startswith('[')), len(lines))
-    return start, end
-
-def ensure(sec, entry):
-    rng = section_range(sec)
-    if rng is None:
-        print(f"  [{sec}] section not found — skipping {entry}", file=sys.stderr)
-        return
-    s, e = rng
-    if entry in (lines[k].strip() for k in range(s + 1, e)):
-        print(f"  {entry} already in [{sec}]")
-        return
-    ins = e
-    while ins - 1 > s and lines[ins - 1].strip() == '':
-        ins -= 1
-    lines.insert(ins, entry)
-    print(f"  added {entry} to [{sec}]")
-
-ensure('projects', f'{rootdir}/crates/{name}')
-open(conf, 'w').write('\n'.join(lines) + '\n')
-PY
-  fi
 
   # clippy, not build: the workspace denies pedantic/cargo lint groups that a
   # plain `cargo build` never runs (e.g. cargo_common_metadata, doc_markdown).
@@ -205,7 +170,7 @@ PY
 
   echo "=== Done! ==="
   echo "Member: $DEST"
-  echo "Built, formatted, fix pipeline enrolled, and committed to $ROOTDIR. Push when ready."
+  echo "Built, formatted, and committed to $ROOTDIR. Push when ready."
   exit 0
 fi
 

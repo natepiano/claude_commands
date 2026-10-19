@@ -33,9 +33,8 @@ import note_file
 from inventory import Inventory, Session, inventory
 from launch_permission import shutdown_state_root
 import record as store
-from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
+from record import SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
-import showrunner_footer
 import showrunners
 import sessions
 import stop as stop_work
@@ -380,45 +379,12 @@ def _notifier_enabled(instance: str) -> bool:
     except (OSError, UnicodeError):
         return False
 
-def _restore_footer(slug: str) -> None:
-    showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
-
 def _pause_timers(session_id: str) -> list[TimerRestore]:
     released = conversation_pause.release(session_id)
     if isinstance(released, conversation_pause.NoPauseRecord):
         return []
-    footers = set(released.footers)
     restore = not isinstance(released.phase, conversation_pause.KeptOff)
-    timers: list[TimerRestore] = []
-    for instance in released.instances:
-        slug = instance.removeprefix("showrunner-")
-        footer: ShowrunnerFooter | NoFooter
-        if restore and instance.startswith("showrunner-") and slug in footers:
-            footer = {"kind": "footer", "slug": slug}
-            footers.remove(slug)
-        else:
-            footer = {"kind": "no footer"}
-        timers.append(
-            {
-                "instance": instance,
-                "was_enabled": restore,
-                "footer": footer,
-            }
-        )
-    for slug in sorted(footers):
-        instance = f"showrunner-{slug}"
-        timers.append(
-            {
-                "instance": instance,
-                "was_enabled": _notifier_enabled(instance),
-                "footer": (
-                    {"kind": "footer", "slug": slug}
-                    if restore
-                    else {"kind": "no footer"}
-                ),
-            }
-        )
-    return timers
+    return [{"instance": instance, "was_enabled": restore} for instance in released.instances]
 
 def _session_timer_snapshot(session: Session) -> list[TimerRestore]:
     timers = _pause_timers(session["session_id"])
@@ -431,7 +397,6 @@ def _session_timer_snapshot(session: Session) -> list[TimerRestore]:
             {
                 "instance": instance,
                 "was_enabled": enabled,
-                "footer": {"kind": "no footer"},
             }
         )
     return timers
@@ -464,11 +429,15 @@ def merge_in_progress(session: Session) -> bool:
         return False
     return result.returncode == 0
 
-def blocker(session: Session) -> ReadinessCheck:
-    """Check whether outstanding work prevents this session from stopping."""
+def blocker(session: Session, *, moving: bool = False) -> ReadinessCheck:
+    """Check whether outstanding work prevents this session from stopping.
+
+    A move keeps the checkout on this machine, so commits not yet pushed never hold it.
+    """
     checkout = session["checkout"]
     if (
-        checkout["kind"] == "git"
+        not moving
+        and checkout["kind"] == "git"
         and checkout["upstream"]["kind"] == "tracking"
         and checkout["upstream"]["ahead"] > 0
     ):
@@ -737,7 +706,8 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
         progress += f" · to {target}: {record.get('why', '')}"
     if record["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} and not isinstance(owner, _StatusUnobserved) and owner["kind"] == "matching session":
         try:
-            detail = ", ".join(_hold_details(owner, record["progress"]["kind"], local_observation=local_observation))
+            detail = ", ".join(_hold_details(owner, record["progress"]["kind"], local_observation=local_observation,
+                                             moving=bool(target)))
         except Exception:
             detail = record["progress"]["kind"]
         if detail and detail != record["progress"]["kind"]:
@@ -857,7 +827,8 @@ def stoppable_status(status: str) -> bool:
     return status in _STOPPABLE_STATUSES
 
 
-def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True) -> list[str]:
+def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True,
+                  moving: bool = False) -> list[str]:
     """Return observed hold conditions without delivery state."""
     if owner["kind"] == "session account unreadable":
         return ["account unreadable"]
@@ -872,7 +843,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     if local_observation and progress != "held by usage limit" and _showing_form(session):
         details.append(SHOWING_FORM)
     checkout = session["checkout"]
-    if checkout["kind"] == "git" and checkout["upstream"]["kind"] == "tracking":
+    if not moving and checkout["kind"] == "git" and checkout["upstream"]["kind"] == "tracking":
         ahead = checkout["upstream"]["ahead"]
         if ahead:
             head = checkout["head"]
@@ -889,7 +860,8 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
 
 def hold_reason(saved: SessionShutdown, owner: stop_work.FreshSession, *, local_observation: bool = True) -> str:
     """Describe the condition preventing this owner from advancing."""
-    details = _hold_details(owner, saved["progress"]["kind"], local_observation=local_observation)
+    details = _hold_details(owner, saved["progress"]["kind"], local_observation=local_observation,
+                            moving=bool(saved.get("target")))
     message = saved["settle_message"]
     if owner["kind"] == "matching session" and message["kind"] == "queued":
         details.append(f"message queued: {message['reason']}")
@@ -925,7 +897,7 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
                 return StopSession()
             if owner["session"]["status"] in _STOPPABLE_STATUSES and all(
                 worker["status"] == "idle" for worker in owner["workers"]
-            ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
+            ) and blocker(owner["session"], moving=bool(saved.get("target")))["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 if progress in {"ready", "held by usage limit"}:
                     return StopSession()
                 message = saved["settle_message"]
@@ -990,7 +962,7 @@ def ready(where: str) -> int:
         if owner["kind"] != "matching session":
             print(f"this session is not in a fresh inventory of {saved['label']}: {owner['kind']}", file=sys.stderr)
             return 2
-        check = blocker(owner["session"])
+        check = blocker(owner["session"], moving=bool(saved.get("target")))
         if check["kind"] == "blocked":
             print(check["reason"], file=sys.stderr)
             return 2
@@ -1037,9 +1009,6 @@ def _restore_record(saved: SessionShutdown) -> None:
     for timer in saved["timers"]:
         if timer["was_enabled"]:
             run_notifier("start", timer["instance"])
-        footer = timer["footer"]
-        if footer["kind"] == "footer":
-            _restore_footer(footer["slug"])
     _retire_shutdown_messages(saved["login"], saved["session"]["session_id"])
     if saved["settle_message"]["kind"] in {"sent", "queued"}:
         _ = send_message(f"session:{saved['session']['session_id']}",
@@ -1241,18 +1210,17 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     from scripts.accounts import accounts
     origin_arguments = accounts.move_origin_arguments(origin)
     ids = tuple(only)
-    if not _warm():
+    # A move never waits on cold keys: the session keeps its commits on the same machine.
+    if not target and not _warm():
         retry = ["down", account.login]
         if here:
             retry.append("--here")
+        elif not ids:
+            retry.extend(("--also", other_machine()))
         if ids:
             retry.extend(("--only", ",".join(ids)))
         if then == "restart":
             retry.append("--restart")
-        if target:
-            retry.extend(("--to", target, "--why", why, *origin_arguments))
-            if move_id:
-                retry.extend(("--move-id", move_id))
         if alerts == "none":
             retry.append("--no-alert")
         print(f"GitHub keys are cold; in a terminal on {_machine()}: github-warm-status; github-warmup. Then in a terminal on {_machine()}: {shutdown_command(*retry)}", file=sys.stderr)

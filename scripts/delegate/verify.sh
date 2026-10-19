@@ -33,8 +33,8 @@
 # the whole workspace.
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
-# it with /lint_config), so one switch silences a check across the fix pipeline
-# and every delegate phase. `lint` also always runs taplo fmt --check at the
+# it with /lint_config). One switch controls a check in the lint CLI and every
+# delegate phase. `lint` also always runs taplo fmt --check at the
 # workspace root, using its taplo.toml. A phase runs all five; its unit director
 # runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
@@ -136,8 +136,8 @@
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
 # single bottom layer, sourced below. This file adds only delegate scope rules
-# on top. Workspace-scope entry points (aliases, validate_ci, the fix pipeline,
-# release checks) use the lint CLI in that directory instead of this script.
+# on top. Shell aliases, validate_ci and release checks use the lint CLI in that
+# directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
 # the same command unsandboxed; anything else is the underlying tool status.
@@ -736,6 +736,13 @@ while [[ $# -gt 0 ]]; do
         --local)
             if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
                 echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
+                exit 2
+            fi
+            # A reservation passed as a --local reason is recorded nowhere and
+            # never ends; the Mac hold is the one way to keep tests off the Mac
+            # (user, 2026-10-18).
+            if [[ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" =~ (^|[^[:alpha:]])(reserve|reserved|reservation|hold|holds|held|blocked|claim|claims|busy|showrunner|ruling)([^[:alpha:]]|$) ]]; then
+                printf 'verify.sh: --local is only for a test that cannot pass on macOS, not to keep tests off the Mac ("%s"). To reserve the Mac, its holder runs /build:hold hold <why> target mac: tests then skip the Mac by themselves, /build:targets shows the hold, and it ends at its expiry. Leave --local off.\n' "$2" >&2
                 exit 2
             fi
             LOCAL_ONLY=1

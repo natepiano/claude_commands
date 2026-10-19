@@ -42,7 +42,7 @@ from record import (
 class ShutdownReadiness(Protocol):
     def stoppable_status(self, status: str) -> bool: ...
 
-    def blocker(self, session: Session) -> ReadinessCheck: ...
+    def blocker(self, session: Session, *, moving: bool = False) -> ReadinessCheck: ...
 
 
 settle = cast(ShutdownReadiness, cast(object, import_module("settle")))
@@ -605,7 +605,7 @@ def _stop_owner(
          and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
         or not settle.stoppable_status(current["status"])
         or any(worker["status"] != "idle" for worker in match["workers"])
-        or settle.blocker(current)["kind"] != "clear"
+        or settle.blocker(current, moving=bool(entry.get("target")))["kind"] != "clear"
     ):
         issue = NotReadyToStop(
             kind="not ready to stop", at=_timestamp(clock),
