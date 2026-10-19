@@ -341,6 +341,10 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual((session["name"], cast(dict[str, object], session["host"])["session_name"]),
                          ("alpha", "demo-alpha"))
         self.assertEqual((self.git("branch", "--list"), self.doc.read_text()), (branches, doc))
+        # The relaunched unit keeps its mark alpha-unit, now under the new session name.
+        _ = self.mark_live("alpha-unit", "sid-alpha")
+        self.assert_ok(self.rename("apply", "builder-report", "alpha"))
+        self.assertEqual(self.journal()["done"], True)
 
     def test_verify_fails_while_the_old_session_name_is_live(self) -> None:
         _ = self.seed_record(name="builder-report")
