@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Bump idle unit directors and tell their running showrunners once per stretch."""
+"""Bump idle unit directors and tell their running showrunners once per stretch.
+
+A unit that herdr reports `blocked` waits at a permission, trust or question prompt: no bump can
+move it, so after PROMPT_ALERT_SECONDS the user gets one phone alert per prompt instead.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ import time
 from datetime import date, datetime, timedelta
 from datetime import time as clock
 from pathlib import Path
+from socket import gethostname
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
@@ -21,7 +26,10 @@ import add_unit
 import production_units
 import showrunners
 import unit_lookup
-from session_pane import HerdrFailure, read_place
+from session_pane import HerdrFailure, agent_status, read_place
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+import push_texts  # noqa: E402
 
 import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
 
@@ -42,6 +50,16 @@ TURN_END = re.compile(rf"^\s*(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDIN
 HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
                        + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
+BLOCKED = "blocked"
+PROMPT_ALERT_SECONDS = 60
+PROMPT_TEXT_ID = "stall_watch.permission_prompt"
+# The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
+PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
+# "make this edit to panes.py" reads as "edit panes.py".
+EDIT_ASK = re.compile(r"make (?:this|these) edits? to (?P<file>.+)")
+BASH_PROMPT_TITLE = "Bash command"
+UNKNOWN_REQUEST = "go on with its work"
+FRAME = " \t│┃|╭╮╰╯─"
 
 
 class Process(NamedTuple):
@@ -56,6 +74,11 @@ class Stretch(TypedDict):
     bump_sent: bool
     tell_sent: bool
     reported_status: str
+
+
+class PromptWait(TypedDict):
+    since: float
+    alerted: bool
 
 
 class Delivery(NamedTuple):
@@ -256,6 +279,68 @@ def stretch_path(slug: str, unit: str) -> Path:
     return STATE_DIR / f"{name}.json"
 
 
+def prompt_path(slug: str, unit: str) -> Path:
+    return stretch_path(slug, unit).with_suffix(".prompt.json")
+
+
+def forget(slug: str, unit: str) -> None:
+    stretch_path(slug, unit).unlink(missing_ok=True)
+    prompt_path(slug, unit).unlink(missing_ok=True)
+
+
+def read_prompt(path: Path, now: float) -> PromptWait:
+    """The wait at the prompt on screen now: the saved one while the unit stays blocked, else a new one."""
+    try:
+        old = cast(PromptWait, json.loads(path.read_text(encoding="utf-8")))
+        return PromptWait(since=float(old["since"]), alerted=old["alerted"] is True)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return PromptWait(since=now, alerted=False)
+
+
+def save_prompt(path: Path, prompt: PromptWait) -> None:
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    _ = temporary.write_text(json.dumps(prompt) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def prompt_request(pane: str) -> str:
+    """What the permission prompt at the pane's bottom asks to do, worded to follow "asks permission to"."""
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-40:]]
+    asked = [(index, found) for index, line in enumerate(lines) if (found := PROMPT_QUESTION.search(line))]
+    if not asked:
+        return UNKNOWN_REQUEST
+    index, question = asked[-1]
+    ask = question["ask"].strip()
+    edit = EDIT_ASK.fullmatch(ask)
+    if edit is not None:
+        return f"edit {edit['file']}"
+    if ask != "proceed":
+        return ask
+    above = [line for line in lines[:index] if line]
+    if BASH_PROMPT_TITLE not in above:
+        return UNKNOWN_REQUEST
+    # Claude Code shows the command below the title, then its description, if it has one.
+    shown = above[len(above) - above[::-1].index(BASH_PROMPT_TITLE):]
+    if len(shown) < 2:
+        return "run a shell command"
+    description = shown[-1]
+    return f"run a shell command to {description[:1].lower()}{description[1:]}"[:200]
+
+
+def machine_name() -> str:
+    return gethostname().split(".", 1)[0]
+
+
+def prompt_alert(path: Path, unit: str, pane: str, since: float, zone: ZoneInfo) -> Delivery:
+    rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
+                                 since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
+                                 request=prompt_request(pane))
+    command = push_texts.user_send_argv(rendered, sender="stall-watch")
+    # The send script is the one this watcher is set to use, so a test's stands in for it.
+    return Delivery(path, "alert", [sys.executable, str(SEND), *command[2:]])
+
+
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
     try:
         old = cast(Stretch, json.loads(path.read_text(encoding="utf-8")))
@@ -301,6 +386,11 @@ def send_all(pending: list[Delivery]) -> None:
         if process.returncode != 0:
             print(f"stall-watch: {item.kind}: {err.strip() or out.strip() or process.returncode}", file=sys.stderr)
             continue
+        if item.kind == "alert":
+            prompt = read_prompt(item.state_path, 0)
+            prompt["alerted"] = True
+            save_prompt(item.state_path, prompt)
+            continue
         stretch = cast(Stretch, json.loads(item.state_path.read_text(encoding="utf-8")))
         if item.kind == "bump":
             stretch["bump_sent"] = True
@@ -336,7 +426,7 @@ def tick(now: float) -> None:
         for name, unit in marked.items():
             # The review unit waits for a review merge by design, so idle is its normal state.
             if add_unit.is_review_unit(name, lines):
-                stretch_path(slug, name).unlink(missing_ok=True)
+                forget(slug, name)
                 continue
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
             try:
@@ -345,7 +435,7 @@ def tick(now: float) -> None:
                 print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
                 continue
             if not running:
-                stretch_path(slug, name).unlink(missing_ok=True)
+                forget(slug, name)
                 continue
             claude = unit.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
@@ -359,6 +449,22 @@ def tick(now: float) -> None:
                 continue
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket
             path = stretch_path(slug, name)
+            waiting = prompt_path(slug, name)
+            try:
+                blocked = agent_status(unit.place) == BLOCKED
+            except (OSError, HerdrFailure) as error:
+                print(f"stall-watch: {name}: its herdr state is unknown: {error}", file=sys.stderr)
+                blocked = False
+            if blocked:
+                # It waits on the user, not on itself: the idle clock starts again after the prompt.
+                prompt = read_prompt(waiting, now)
+                save_prompt(waiting, prompt)
+                save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
+                                           bump_sent=False, tell_sent=False, reported_status=""))
+                if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
+                    pending.append(prompt_alert(waiting, name, pane, prompt["since"], zone))
+                continue
+            waiting.unlink(missing_ok=True)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
             turn = turns[-1] if turns else transcript_turn_end(session_id)
