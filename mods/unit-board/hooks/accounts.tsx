@@ -6,7 +6,6 @@ export type AccountReading<Value> = { kind: 'available'; value: Value } | { kind
 export type CreditBalance = { kind: 'finite'; amount: number } | { kind: 'unlimited' } | { kind: 'unavailable' };
 export interface AccountDisplay {
   label: string;
-  login: AccountReading<string>;
   roles: string[];
   weekly: AccountReading<number>;
   resets: AccountReading<string>;
@@ -35,7 +34,7 @@ function reading<Value>(value: Value | null | undefined): AccountReading<Value> 
 
 export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
-    label: account.label, login: reading(account.login), roles: account.roles,
+    label: account.label, roles: account.roles,
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
@@ -54,9 +53,8 @@ function dateText(value: AccountReading<string>, zone: string): string {
 }
 
 export function accountsTable(rows: AccountDisplay[], zone: string): AccountsTable {
-  const headings = ['Label', 'Login', 'Roles', 'Left', 'Resets', 'Credits', 'Read'];
-  const cells = rows.map(row => [row.label,
-    row.login.kind === 'available' ? row.login.value : '—', row.roles.join(', '),
+  const headings = ['Label', 'Roles', 'Left', 'Resets', 'Credits', 'Read'];
+  const cells = rows.map(row => [row.label, row.roles.join(', '),
     row.weekly.kind === 'available' ? `${Math.round(row.weekly.value)}%` : '—',
     dateText(row.resets, zone),
     row.credits.kind === 'unavailable' ? '—'
@@ -70,22 +68,19 @@ export function accountsTable(rows: AccountDisplay[], zone: string): AccountsTab
 export function AccountsView(elements: PaneElements, status: StoredAccountsStatus, zone: string) {
   const { Box, Text } = elements;
   const rows = status.accounts.map(accountDisplay);
-  const assignments = (...roles: string[]) => rows.filter(row => roles.some(role => row.roles.includes(role))).map(row => row.label).join(', ') || 'unassigned';
   const table = accountsTable(rows, zone);
   const line = (cells: string[]) => cells.map((cell, index) => index < cells.length - 1
     ? cell + ' '.repeat(table.widths[index]! - cellWidth(cell)) : cell).join('  ');
+  const left = table.headings.indexOf('Left');
   return <Box flexDirection="column">
-    <Text bold>units: {assignments('units', 'unit directors')}, showrunners: {assignments('showrunners')}</Text>
-    <Box flexDirection="column" marginTop={1}>
-      <Text bold>{line(table.headings)}</Text>
-      {table.rows.map((cells, index) => {
-        const tone = leftTone(rows[index]!.weekly);
-        return <Text wrap="wrap">{cells.map((cell, column) => [
-          column === 3 && tone !== 'normal' ? <Text color={tone}>{cell}</Text> : <Text>{cell}</Text>,
-          column < cells.length - 1 ? <Text>{' '.repeat(table.widths[column]! - cellWidth(cell))}{'  '}</Text> : null,
-        ])}</Text>;
-      })}
-    </Box>
+    <Text bold>{line(table.headings)}</Text>
+    {table.rows.map((cells, index) => {
+      const tone = leftTone(rows[index]!.weekly);
+      return <Text wrap="wrap">{cells.map((cell, column) => [
+        column === left && tone !== 'normal' ? <Text color={tone}>{cell}</Text> : <Text>{cell}</Text>,
+        column < cells.length - 1 ? <Text>{' '.repeat(table.widths[column]! - cellWidth(cell))}{'  '}</Text> : null,
+      ])}</Text>;
+    })}
     {status.problems.length > 0 && <Box flexDirection="column" marginTop={1}>
       <Text bold>Problems</Text>
       {status.problems.map(problem => <Text color="warning" wrap="wrap">{problem}</Text>)}
