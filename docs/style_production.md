@@ -25,7 +25,7 @@ it joins; a tier A or E rule, local or global, has no family.
 | --- | --- | --- | --- |
 | `names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
 | `values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | Uncovered components of its partial B rules | — |
+| `types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
 | `modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
 Every partial B rule also has a C read in its own family.
@@ -359,6 +359,15 @@ Each finding must preserve behavior using only its own edits; another finding's
 call-site changes cannot complete its rename. Changed documented usage, including
 block documentation, requires review. Glob imports prevent proving a rename's
 identity, and public glob re-exports prevent establishing module privacy.
+The gate shortens constant paths only when the added import and each site share one module scope and both paths match.
+A glob is allowed in a module, but not in a block around a changed site.
+An added import may carry one `#[cfg]` if each site's item carries the same condition.
+An external crate name counts as a root only when the file uses it only as a path root.
+It proves `Mode::Old` and `Self::Old` variant renames only when no other item has the enum's name.
+Attributes or unsupported derives that observe variant names prevent proof.
+It proves a local `let` rename only when its name is used after the statement, in its own block.
+It clears a changed condition line only when its tokens match after proven rewrites.
+It permits lint names to be removed from `allow` and `expect` attributes, including whole attributes.
 Generic signature brackets and attributes on unrelated items alone do not
 require review. Derive changes count as trait implementation changes.
 Changes inside macro invocations require review even when only spacing changes;

@@ -639,6 +639,10 @@ def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
         if where["kind"] == "said":
             punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
             note += f" Before it you wrote: {where['text']}{punctuation}"
+        if "cut_off" in record:
+            step = f"; your last step was {record['cut_off']}" if record["cut_off"] else ""
+            note += (f" The move stopped you in the middle of a turn{step}. "
+                     "Check whether that step finished, and do it again if it did not.")
         return note
     origin = record["requested_by"]
     if origin["kind"] == "snapshot":
@@ -746,14 +750,6 @@ def herdr_space(session: Session) -> str:
         from showrunners import herdr_space as production_space, production_slug
         return production_space(production_slug(session["doc"]), session["doc"])
     return "ad-hoc"
-
-
-def herdr_tab_title(session: Session) -> str:
-    """The session's tab title in that workspace: a showrunner's name loses its production prefix."""
-    if session["kind"] == "showrunner":
-        from showrunners import production_slug, tab_title
-        return tab_title(production_slug(session["doc"]), session["name"])
-    return session["name"]
 
 
 class HerdrDestinationTaken(OSError):
@@ -1162,8 +1158,7 @@ def _herdr_launch(
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
         if name == herdr.shared_session():
-            pane = herdr.open_tab(name, herdr_space(session), herdr_tab_title(session), session["name"], parts.cwd,
-                                  environment)
+            pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
         else:
             pane = herdr.open_pane(name, name, parts.cwd, environment)
         try:
@@ -2332,7 +2327,7 @@ def _launch_codex_snapshot(
                                   exclusive=True)
     try:
         pane = herdr.open_pane(name, name, owner["cwd"], {"CODEX_HOME": launch["home"]})
-        _ = herdr.start_agent(name, pane, kind="codex", agent_arguments=arguments,
+        _ = herdr.start_agent(name, pane, kind="codex", agent=name, agent_arguments=arguments,
                           opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
         herdr.stop_created_server(name, server)

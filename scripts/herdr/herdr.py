@@ -35,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
+# herdr refuses a longer `agent start --timeout`.
+_AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
 _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
@@ -222,6 +224,8 @@ class PromptSubmitted:
 class PromptNotSubmitted:
     reason: str
     screen: str | PromptScreenNotRead = PromptScreenNotRead()
+    # True only when the launcher never typed the prompt: the session then holds no work of it.
+    never_typed: bool = False
 
 
 @dataclass(frozen=True)
@@ -840,11 +844,8 @@ class Herdr:
         _ = self.run("pane", "rename", pane, label)
         return pane
 
-    def open_tab(self, space: str, title: str, label: str, cwd: str, environment: dict[str, str]) -> str:
-        """Open a tab titled `title` in the workspace named `space`, creating the workspace first.
-
-        The tab's pane is named `label`, the full session name that lookups use.
-        """
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first."""
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
@@ -861,8 +862,32 @@ class Herdr:
             _ = self.run("tab", "rename", tab, title)
         root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
         pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
-        _ = self.run("pane", "rename", pane, label)
+        _ = self.run("pane", "rename", pane, title)
         return pane if workspace is None else self.order_tabs(workspace).get(pane, pane)
+
+    def retitle(self, pane: str, title: str) -> bool:
+        """Give the pane and its tab the name `title`, then order the workspace's tabs again.
+
+        False when both already carry it, after two reads and no change.
+        """
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        row = next((row for row in rows if row.get("pane_id") == pane), None)
+        if row is None:
+            raise HerdrFailure(f"no pane {pane!r}")
+        tab = json_text(row.get("tab_id"), "herdr pane tab id")
+        workspace = json_text(row.get("workspace_id"), "herdr pane workspace id")
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+        shown = next((item.get("label") for item in tabs if item.get("tab_id") == tab), None)
+        if shown == title and row.get("label") == title:
+            return False
+        if row.get("label") != title:
+            _ = self.run("pane", "rename", pane, title)
+        if shown != title:
+            _ = self.run("tab", "rename", tab, title)
+            _ = self.order_tabs(workspace)
+        return True
 
     def order_tabs(self, workspace: str) -> dict[str, str]:
         """Put the workspace's showrunner tab first and its other tabs in alphabetical order.
@@ -941,8 +966,10 @@ class Herdr:
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
         launched_at = datetime.now(timezone.utc)
-        deadline = time.monotonic() + timeout_ms / 1000
-        attempt_timeout_ms = timeout_ms
+        # A loaded machine starts Claude slowly: the start and the opening prompt wait longer.
+        budget_ms = int(timeout_ms * load_factor())
+        deadline = time.monotonic() + budget_ms / 1000
+        attempt_timeout_ms = min(budget_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
         try:
             while True:
                 result = self.start_command(
@@ -961,7 +988,7 @@ class Herdr:
                     if remaining_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
                         raise
                     time.sleep(0.1)
-                    attempt_timeout_ms = int((deadline - time.monotonic()) * 1000)
+                    attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000), _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     if attempt_timeout_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
                         raise
                     continue
@@ -1160,7 +1187,7 @@ class Herdr:
                         return PromptSubmitted(proof.at, recipient)
             detail = f"{reason}; prompt typed {typings} times" if typings else reason
             visible = "\n".join(screen.splitlines()[-40:]) if isinstance(screen, str) else screen
-            return PromptNotSubmitted(detail, visible)
+            return PromptNotSubmitted(detail, visible, never_typed=typings == 0)
 
         def deadline_failure() -> PromptSubmitOutcome:
             reason = "opening prompt deadline elapsed"
@@ -1368,6 +1395,40 @@ def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | Unrea
     return Untrusted(folder, claude_json, keys)
 
 
+def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Untrusted | UnreadableTrustFile:
+    """Give the target account file the source account's trust for this folder, and nothing more.
+
+    The target gains only the one key the source already trusts. The file is replaced in one step,
+    so Claude never reads half of it; every other value in it stays as it was.
+    """
+    present = claude_trust(folder, target)
+    if not isinstance(present, Untrusted):
+        return present
+    granted = claude_trust(folder, source)
+    if not isinstance(granted, Trusted):
+        return granted
+    try:
+        raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+        if not isinstance(raw, dict):
+            raise ValueError()
+        settings = cast(dict[str, object], raw)
+        projects = settings.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError()
+        entry = cast(dict[str, object], projects).setdefault(str(granted.project_key), {})
+        if not isinstance(entry, dict):
+            raise ValueError()
+        cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
+        staged = target.with_name(f".{target.name}.trust-{os.getpid()}")
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(settings, output, indent=2)
+        os.replace(staged, target)
+    except (OSError, UnicodeError, ValueError) as error:
+        return UnreadableTrustFile(folder, target, type(error).__name__)
+    return Trusted(folder, target, granted.project_key)
+
+
 def repository_root(directory: Path) -> Path:
     return _repository_key(directory, "--show-toplevel")
 
@@ -1432,6 +1493,15 @@ def generated_session_name(text: str, suffix: str = "") -> str:
     if base in (".", ".."):
         base = "-"
     return base + tail
+
+
+def load_factor() -> float:
+    """How many times its limit a launch may wait: the one-minute load per CPU, from 1 to 6."""
+    try:
+        per_cpu = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except OSError:
+        return 1.0
+    return min(6.0, max(1.0, per_cpu))
 
 
 def _timeout(timeout_ms: object) -> None:
@@ -1708,8 +1778,8 @@ def shared_session() -> str:
     return name
 
 
-def open_tab(name: str, space: str, title: str, label: str, cwd: str, environment: dict[str, str]) -> str:
-    return Herdr(name).open_tab(space, title, label, cwd, environment)
+def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+    return Herdr(name).open_tab(space, title, cwd, environment)
 
 
 def close_agent(session: str, pane: str) -> None:
@@ -2391,10 +2461,10 @@ def _agent_name(name: str) -> str:
 
 
 def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
-                opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
-    """Start in the named session, using the pane's label as the agent label."""
+                opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, *, agent: str) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
+    """Start the agent named `agent` in the named session.
+
+    `agent` is the full session name: a pane carries only the short tab title.
+    """
     _check_agent_arguments(kind, agent_arguments)
-    herdr = Herdr(name)
-    labels = [row.get("label") for row in herdr.panes() if row["pane_id"] == pane]
-    label = labels[0] if labels else pane
-    return herdr.start_agent(label or pane, pane, kind, agent_arguments, opening, timeout_ms)
+    return Herdr(name).start_agent(agent, pane, kind, agent_arguments, opening, timeout_ms)

@@ -761,19 +761,39 @@ def launch_session(
         _ = herdr.start_server(host, timeout_ms)
         production = request.production
         pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
-                              showrunners.tab_title(production.slug, name), name, str(request.session_cwd), environment)
+                              session_name, str(request.session_cwd), environment)
     else:
         host = name
         herdr.start_new_server(host, timeout_ms)
         pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
     try:
-        outcome = herdr.start_agent(host, pane, kind="claude", agent_arguments=arguments,
+        outcome = herdr.start_agent(host, pane, kind="claude", agent=name, agent_arguments=arguments,
             opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
             timeout_ms=timeout_ms)
         return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
     except herdr.AgentExited:
         herdr.close_agent(host, pane)
         raise
+
+
+def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
+    """Close a new session that never got its prompt, so no half-started unit stays behind.
+
+    The Units row, commit and worktree stay: the same command finds them and starts the session
+    again. A prompt typed even once may have started work, so that session stays open.
+    """
+    import herdr
+
+    if not outcome.never_typed:
+        return ""
+    found = launched_unit(request)
+    if isinstance(found, NoMarkedUnit):
+        return "; run the same command again"
+    try:
+        herdr.close_agent(found.unit.place.session, found.unit.place.pane)
+    except herdr.HerdrFailure as error:
+        return f"; its session {found.unit.place.session} could not be closed: {error}"
+    return "; its session is closed: run the same command again"
 
 
 def launch_environment() -> dict[str, str]:
@@ -1093,7 +1113,8 @@ def main(argv: list[str]) -> int:
             print(f"{request.identity.unit} restore launched: {attach}")
             return 0
         if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(marked_unit, NoMarkedUnit):
-            raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}")
+            raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}"
+                               + close_untyped_session(request, outcome))
         launched = wait_for_remote_control(request)
         record(request)
         attach = f"herdr session attach {launched.place.session}"

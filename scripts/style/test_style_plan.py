@@ -355,40 +355,6 @@ class StylePlanTests(unittest.TestCase):
             "A defect several rules name is held once, under the rule it breaks most directly, "
             + "naming the others in its text.", text)
 
-    def test_every_ticket_kind_preserves_comment_reasons_only_when_the_rule_is_pinned(self) -> None:
-        comments = self.rule("comments-name-code-constructs")
-        other = self.rule("other-names")
-        self.sync()
-        ledger = self.ledger()
-        issue = self.root / "approved.md"
-        for rule in (comments, other):
-            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-            finding = ledger.hold(rule, self.sources[0], 1, "comment reason", "rename",
-                                  "// reason", "// reason naming constructs", blob, "outside")
-            ledger.file_held(finding.finding_id, issue)
-        guidance = "Keep every reason a comment states; name the constructs in addition to it, never in its place."
-        context = style_plan.delegation_context(self.plan.read_text())
-        kinds: tuple[style_ledger.TicketKind, ...] = ("read", "listed", "structure", "proposal")
-        for number, kind in enumerate(kinds, 1):
-            ticket_id = f"names-unit-{number}"
-            ledger.ticket_add(ticket_id, "names-unit", kind, "names", "crates/alpha", [self.sources[0]],
-                              [comments, other], rule=comments if kind == "listed" else "",
-                              proposal=str(issue) if kind == "proposal" else "")
-            ticket = ledger.queued_tickets("names-unit")[-1]
-            texts = ledger.pinned_rule_texts(ticket_id)
-            windows = {self.sources[0]: (style_plan.ReadWindow(1, 1),)}
-            baseline = style_plan.phase_text(ticket, tuple(pin for pin in texts if pin.rule_id != comments),
-                                             self.plan, context, file_windows=windows)
-            self.assertNotIn(guidance, baseline)
-            for suffix in ("", "#uncovered"):
-                with self.subTest(kind=kind, surface=suffix):
-                    pins = tuple(style_ledger.PinnedRuleText(pin.rule_id + suffix, pin.blob, pin.text)
-                                 if pin.rule_id == comments else pin for pin in texts)
-                    text = style_plan.phase_text(ticket, pins, self.plan, context, file_windows=windows)
-                    self.assertEqual(text.count(guidance), 1)
-                    rule_line = next(line for line in text.splitlines() if line.startswith(f"- `{comments + suffix}`:"))
-                    self.assertEqual(text.replace(rule_line + "\n", "").replace(guidance + "\n", ""), baseline)
-
     def test_structure_phase_asks_when_to_split_each_file_only_when_the_rule_is_pinned(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
         split = self.rule("when-to-split-a-module", "tier: D\nfamily: modules\n")
@@ -2014,6 +1980,364 @@ class StylePlanTests(unittest.TestCase):
             self.assertIn("resume names-unit-1", result[1])
             self.assertEqual(self.plan.read_text(), first)
         self.assertIn("stage: active", issue.read_text())
+
+    def approved_reference_ticket(
+        self, pairs: tuple[tuple[str, str], ...] = (("Outcome::OldName", "Outcome::NewName"),),
+        kinds: tuple[style_ledger.FindingKind, ...] = ("rename",),
+    ) -> str:
+        rule = self.rule("approved-reference")
+        issue = self.root / "reference-approval.md"
+        with style_ledger.open_ledger(self.repo) as ledger:
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            ids: list[str] = []
+            for index, (before, after) in enumerate(pairs):
+                finding = ledger.hold(rule, self.sources[0], index + 1, "rename", kinds[index % len(kinds)],
+                                      before, after, blob, "outside")
+                ledger.file_held(finding.finding_id, issue)
+                ids.append(finding.finding_id)
+            _ = issue.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n"
+                                 + f"style_findings: [{', '.join(ids)}]\n---\n")
+            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha",
+                              [self.sources[0]], [rule], proposal=str(issue))
+        return "names-unit-1"
+
+    def reference_gate(self, ticket: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = style_plan.gate(self.repo, ticket)
+        return result, output.getvalue()
+
+    def test_approved_rename_allows_only_reference_edits_in_an_outside_file(self) -> None:
+        before = ('// Outcome::OldName stays in this comment.\r\n'
+                  + 'fn read() { /* nested /* note */ comment */ Outcome :: OldName; '
+                  + 'let text = r#"Outcome::OldName é"#; }\r\n')
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[0], "// The finding file keeps unrestricted approval.\n")
+        self.write(self.sources[1], before.replace("Outcome :: OldName", "Outcome :: NewName"))
+        _ = self.git("add", self.sources[1])
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_allows_two_pairs_and_qualified_use_leaves(self) -> None:
+        before = ("use crate::m::Outcome::{OldName, Other};\n"
+                  + "use crate::m::Outcome::SignalFailed;\n"
+                  + "fn read() { Outcome::OldName; Outcome::SignalFailed; }\n")
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"),
+                                                 ("Outcome::SignalFailed", "Outcome::Failed")))
+        self.write(self.sources[1], before.replace("OldName", "NewName").replace("SignalFailed", "Failed"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_updates_comments_without_code_changes(self) -> None:
+        before = ("// OldName and Outcome::OldName\r\n"
+                  + "/// See OldName and Outcome::OldName.\r\n"
+                  + "//! OldName remains; Outcome::OldName changes.\r\n"
+                  + "/* OldName /* Outcome::OldName */ OldName */\r\n"
+                  + "/** OldName */\r\n")
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        after = before.replace("OldName", "NewName").replace("//! NewName", "//! OldName")
+        self.write(self.sources[1], after)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_updates_code_and_comments_together(self) -> None:
+        before = "// OldName and Outcome::OldName\nfn read() { Outcome::OldName; }\n"
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[1], before.replace("OldName", "NewName"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_refuses_other_comment_changes_and_partial_words(self) -> None:
+        before = "// OldName OldNameX XOldName _OldName OldName_ 1OldName OldName1\n"
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        for after in (before.replace("OldName ", "NewName ", 1) + "// extra\n",
+                      before.replace("OldNameX", "NewNameX"),
+                      before.replace("XOldName", "XNewName"),
+                      before.replace("_OldName", "_NewName"),
+                      before.replace("OldName_", "NewName_"),
+                      before.replace("1OldName", "1NewName"),
+                      before.replace("OldName1", "NewName1")):
+            with self.subTest(after=after):
+                self.write(self.sources[1], after)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+
+    def test_approved_rename_keeps_string_and_char_literals_unchanged(self) -> None:
+        before = 'fn read() { let text = "OldName"; let raw = r#"Outcome::OldName"#; let c = \'A\'; }\n'
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        for after in (before.replace('"OldName"', '"NewName"'),
+                      before.replace("Outcome::OldName", "Outcome::NewName"),
+                      before.replace("'A'", "'B'")):
+            with self.subTest(after=after):
+                self.write(self.sources[1], after)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+
+    def test_approved_rename_updates_only_whole_names_in_markdown(self) -> None:
+        path = "docs/renames.md"
+        before = "# Outcome::OldName\r\nUse OldName; OldName may stay. OldNameX is unrelated. é\r\n"
+        self.write(path, before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        after = before.replace("Outcome::OldName", "Outcome::NewName").replace("Use OldName", "Use NewName")
+        self.write(path, after)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for refused in (after.replace("may stay", "can stay"),
+                        after.replace("OldNameX", "NewNameX"), after.replace("\r\n", "\n")):
+            with self.subTest(after=refused):
+                self.write(path, refused)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(path, output)
+
+    def test_approved_rename_refuses_reference_edits_in_other_file_types(self) -> None:
+        paths = ("notes.txt", "settings.toml")
+        for path in paths:
+            self.write(path, "Outcome::OldName\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        for path in paths:
+            with self.subTest(path=path):
+                self.write(path, "Outcome::NewName\n")
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(path, output)
+                self.write(path, "Outcome::OldName\n")
+
+    def test_approved_rename_ticket_requires_comment_and_markdown_updates(self) -> None:
+        _ = self.approved_reference_ticket()
+        ledger = self.ledger()
+        ticket = ledger.queued_tickets("names-unit")[0]
+        ledger.ticket_assign(ticket["id"], "demo-style-names")
+        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
+        sentence = ("For a rename, find every use through the compiler, not a text search, and update each one "
+                    + "in other files. Also update every comment and Markdown doc in the repo that means the "
+                    + "renamed item, and leave mentions of other items with the same name. "
+                    + "Change nothing else in those files.")
+        self.assertIn("Apply the approved findings. " + sentence, self.plan.read_text())
+
+    def test_nonrename_approval_ticket_omits_comment_and_markdown_instruction(self) -> None:
+        _ = self.approved_reference_ticket(kinds=("type",))
+        ledger = self.ledger()
+        ticket = ledger.queued_tickets("names-unit")[0]
+        ledger.ticket_assign(ticket["id"], "demo-style-names")
+        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
+        self.assertNotIn("For a rename, find every use", self.plan.read_text())
+
+    def test_prose_rename_approval_ticket_omits_reference_update_instruction(self) -> None:
+        _ = self.approved_reference_ticket((("The file contains MutationLock.",
+                                             "Rename ledger/lock.rs to ledger/mutation_lock.rs."),))
+        ledger = self.ledger()
+        ticket = ledger.queued_tickets("names-unit")[0]
+        ledger.ticket_assign(ticket["id"], "demo-style-names")
+        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
+        self.assertIn("Apply the approved findings.", self.plan.read_text())
+        self.assertNotIn("For a rename, find every use", self.plan.read_text())
+
+    def test_bare_rename_mention_ignores_unknown_tokens_without_the_old_name(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName, Other }\n")
+        self.write(self.sources[2], "fn unrelated() { § }\n")
+        self.write("docs/renames.md", "Use OldName.\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write("docs/renames.md", "Use NewName.\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_bare_rename_mention_allows_no_matching_rust_files(self) -> None:
+        self.write(self.sources[2], "fn unrelated() { § }\n")
+        self.write("docs/renames.md", "Use OldName.\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write("docs/renames.md", "Use NewName.\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_bare_rename_mention_refuses_unknown_tokens_in_a_matching_file(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName, Other }\n")
+        self.write(self.sources[2], "fn read() { Outcome::OldName; § }\n")
+        self.write("docs/renames.md", "Use OldName.\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write("docs/renames.md", "Use NewName.\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn("docs/renames.md", output)
+
+    def test_read_ticket_omits_comment_and_markdown_instruction(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        self.assertEqual(self.run_next()[0], 0)
+        self.assertNotIn("For a rename, find every use", self.plan.read_text())
+
+    def test_approved_rename_allows_bare_comment_mentions_of_a_unique_item(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName, Other }\nimpl Outcome { fn read() { Self::OldName; } }\n")
+        self.write(self.sources[1], "use crate::Outcome::{OldName};\n// OldName and Outcome::OldName\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[1], "use crate::Outcome::{OldName};\n// NewName and Outcome::OldName\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_refuses_ambiguous_bare_comments_but_allows_qualified_mentions(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName, Other }\n")
+        self.write(self.sources[2], "enum Different { OldName, Other }\n")
+        self.write(self.sources[1], "// OldName and Outcome::OldName\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[1], "// NewName and Outcome::OldName\n")
+        self.assertEqual(self.reference_gate(ticket)[0], 1)
+        self.write(self.sources[1], "// OldName and Outcome::NewName\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_allows_bare_markdown_mentions_of_a_unique_item(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName, Other }\n")
+        self.write("docs/renames.md", "Use OldName and Outcome::OldName.\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write("docs/renames.md", "Use NewName and Outcome::OldName.\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_refuses_ambiguous_bare_markdown_but_allows_qualified_mentions(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName, Other }\n")
+        self.write(self.sources[2], "enum Different { OldName, Other }\n")
+        self.write("docs/renames.md", "Use OldName and Outcome::OldName.\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write("docs/renames.md", "Use NewName and Outcome::OldName.\n")
+        self.assertEqual(self.reference_gate(ticket)[0], 1)
+        self.write("docs/renames.md", "Use OldName and Outcome::NewName.\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_checks_ambiguity_at_head_even_in_the_finding_file(self) -> None:
+        self.write(self.sources[0], "enum Outcome { OldName }\nenum Different { OldName }\n")
+        self.write("docs/renames.md", "Use OldName.\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[0], "enum Outcome { NewName }\n")
+        self.write("docs/renames.md", "Use NewName.\n")
+        self.assertEqual(self.reference_gate(ticket)[0], 1)
+
+    def test_approved_rename_uses_the_parent_of_an_absolute_approved_path(self) -> None:
+        self.write(self.sources[1], "fn read() { library::Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket((("::library::Outcome::OldName", "::library::Outcome::NewName"),))
+        self.write(self.sources[1], "fn read() { library::Outcome::NewName; }\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_rename_refuses_other_text_changes_in_reference_files(self) -> None:
+        before = ('// Outcome::OldName\nfn read() { Outcome::OldName; let n = 1; '
+                  + 'let text = "Outcome::OldName"; }\n')
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        reference = before.replace("{ Outcome::OldName", "{ Outcome::NewName")
+        for after in (reference.replace("n = 1", "n = 2"),
+                      reference.replace("// Outcome::OldName", "// Outcome::NewName extra"),
+                      reference.replace('"Outcome::OldName"', '"Outcome::NewName"'),
+                      reference.replace("let n", "let  n"),
+                      before.replace("\n", "\r\n")):
+            with self.subTest(after=after):
+                self.write(self.sources[1], after)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("files outside approved findings:", output)
+                self.assertIn(self.sources[1] + " (change is not an approved rename reference)", output)
+
+    def test_approved_rename_refuses_unqualified_or_unapproved_names(self) -> None:
+        ticket = self.approved_reference_ticket()
+        for before, after in (("Self::OldName", "Self::NewName"), ("OldName", "NewName"),
+                              ("Other::OldName", "Other::NewName"),
+                              ("Outcome::OldName", "Outcome::NotApproved"),
+                              ("use crate::m::Other::{OldName};", "use crate::m::Other::{NewName};")):
+            with self.subTest(before=before):
+                self.write(self.sources[1], before + "\n")
+                _ = self.commit()
+                self.write(self.sources[1], after + "\n")
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(self.sources[1], output)
+
+    def test_approved_rename_refuses_untracked_added_deleted_or_renamed_reference_files(self) -> None:
+        self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket()
+        new_path = "crates/alpha/src/new.rs"
+        self.write(new_path, "fn read() { Outcome::NewName; }\n")
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                if staged:
+                    _ = self.git("add", new_path)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(new_path, output)
+        _ = self.git("reset", "--hard", "HEAD")
+        _ = self.git("mv", self.sources[1], new_path)
+        self.write(new_path, "fn read() { Outcome::NewName; }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(new_path, output)
+        _ = self.git("reset", "--hard", "HEAD")
+        (self.repo / self.sources[1]).unlink()
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.sources[1], output)
+
+    def test_approved_rename_refuses_nonrename_or_invalid_approval_pairs(self) -> None:
+        self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"),
+                                                 ("Other::Before", "Other::After")), ("rename", "type"))
+        self.write(self.sources[1], "fn read() { Outcome::NewName; }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.sources[1], output)
+
+    def test_approved_rename_refuses_an_approval_without_a_parent(self) -> None:
+        self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket((("OldName", "NewName"),))
+        self.write(self.sources[1], "fn read() { Outcome::NewName; }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.sources[1], output)
+
+    def test_approved_rename_refuses_a_pair_that_changes_the_parent_path(self) -> None:
+        self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket((("a::Outcome::OldName", "b::Outcome::NewName"),))
+        self.write(self.sources[1], "fn read() { Outcome::NewName; }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.sources[1], output)
+
+    def test_type_approval_still_allows_any_change_in_the_finding_file(self) -> None:
+        ticket = self.approved_reference_ticket(kinds=("type",))
+        self.write(self.sources[0], "// Approved type work may change more than a name.\nfn changed() {}\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_type_approval_keeps_reference_files_outside_its_scope(self) -> None:
+        self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket(kinds=("type",))
+        self.write(self.sources[1], "fn read() { Outcome::NewName; }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.sources[1], output)
+
+    def test_restructure_approval_keeps_reference_files_outside_its_scope(self) -> None:
+        self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")
+        _ = self.commit()
+        ticket = self.approved_reference_ticket(kinds=("restructure",))
+        self.write(self.sources[1], "fn read() { Outcome::NewName; }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.sources[1], output)
 
     def test_footprint_gate_uses_the_declared_arguments_and_preserves_the_ticket_start(self) -> None:
         _ = self.rule("read")

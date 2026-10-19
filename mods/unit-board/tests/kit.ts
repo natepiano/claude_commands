@@ -10,6 +10,7 @@ export const RUN = "/history/runs/current.jsonl";
 export const DISCOVERY = "/history/runs";
 export const REGISTRY = "/test-home/.local/state/notifier";
 export const CWD = "/test-worktree";
+export const SESSION = "showrunner-session-id";
 export const time = (minutes: number, text: string): BoardTime => ({ at: NOW / 1000 + minutes * 60, text });
 
 export function phase(id: string, status: BoardPhase["status"]): BoardPhase {
@@ -29,7 +30,7 @@ export function fixture(): BoardData {
   open.start = time(-60, "17:00");
   return { production: "show", as_of: time(0, "18:00"), zone: "America/New_York",
     utc_offset_minutes: -240, sources: [RUN, DISCOVERY], units: [{
-      key: "alpha", plan: "plan.md", state: "running", phase: { id: "2", of: 3, title: "Delivery 2" },
+      key: "alpha", plan: "plan.md", state: "running", phase: { kind: "plan", id: "2", of: 3, title: "Delivery 2" },
       phases: [done, open, phase("3", "todo")], finish: { kind: "predicted", at: time(42, "18:42") },
       stage: "Repair round 2", summary: "Finishing the retry path",
       eta: { at: time(30, "18:30"), first: time(-45, "17:15"),
@@ -43,11 +44,12 @@ export function fixture(): BoardData {
     }] };
 }
 
-export function hostEngine(on: On) {
+export function hostEngine(on: On, sessionId = () => SESSION) {
   const panes = new Map<string, UiPane>();
   const opened: string[] = [];
   const closed: string[] = [];
   const forbidden: string[] = [];
+  on("session.id", () => ({ value: sessionId() }));
   on("session.start", (_$, event) => ({ cwd: event.cwd }));
   on("turn.complete", (_$, event) => ({ text: event.answer }));
   on("command.register", (_$, event) => ({ value: { command: event.name } }));
@@ -68,8 +70,9 @@ export function hostEngine(on: On) {
   return { opened, closed, forbidden };
 }
 
-export function engineFiles(on: On, focus: string | null = null) {
-  const host = hostEngine(on);
+export function engineFiles(on: On) {
+  let sessionId = SESSION;
+  const host = hostEngine(on, () => sessionId);
   const clock = mock.clock(on, { now: NOW });
   mock.env(on, { HOME: "/test-home", XDG_STATE_HOME: "/test-state" });
   let boards = [fixture()];
@@ -96,7 +99,7 @@ export function engineFiles(on: On, focus: string | null = null) {
       mtimes.set(path, clock.now());
       return path;
     });
-    return { value: { exitCode: 0, stdout: JSON.stringify({ files: paths, focus, watch: [REGISTRY] }), stderr: "",
+    return { value: { exitCode: 0, stdout: JSON.stringify({ files: paths, watch: [REGISTRY] }), stderr: "",
       isStdoutTruncated: false, isStderrTruncated: false } };
   });
   on("fs.read", (_$, e) => {
@@ -115,6 +118,7 @@ export function engineFiles(on: On, focus: string | null = null) {
     replace: (value: BoardData) => { boards = [value]; },
     replaceBoards: (values: BoardData[]) => { boards = values; },
     failNext: (reason: string) => { failure = reason; },
+    setSession: (value: string) => { sessionId = value; },
     clear: () => { reads.length = 0; stats.length = 0; processes.length = 0; },
   };
 }
@@ -158,7 +162,7 @@ export function lifecycleHarness() {
       set: async (_key: unknown, value: Record<string, PaneState<BoardData>>) => { calls.push("state"); panes = value; },
     },
     ui: { open: async () => ({ isPlaced: true }) },
-    session: { cwd: async () => CWD },
+    session: { cwd: async () => CWD, id: async () => SESSION },
     env: { get: async (name: string) => name === "HOME" ? "/test-home" : undefined },
     clock: {
       now: async () => NOW,
@@ -176,7 +180,7 @@ export function lifecycleHarness() {
       calls.push("process");
       signal();
       await pending;
-      return { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], focus: null, watch: [REGISTRY] }), stderr: "" };
+      return { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }), stderr: "" };
     } },
   };
   // The registered hooks use only these services. Keep the partial host at this

@@ -18,7 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
@@ -917,6 +917,22 @@ class AddUnitTests(ShutdownTestCase):
         stopped.assert_called_once_with("build-followups-alpha")
         self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-build-followups-alpha.service"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
+
+    def test_a_prompt_never_typed_closes_the_new_session_so_a_rerun_starts_it(self) -> None:
+        for unit, typed, ending in (("alpha", False, "its session is closed: run the same command again"),
+                                    ("beta", True, "prompt typed 1 times")):
+            with self.subTest(typed=typed):
+                place = herdr.HerdrPlace(f"build-followups-{unit}", "w1:p1")
+                found = add_unit.MarkedUnitFound(unit_lookup.MarkedUnit(f"{unit}-unit", unit_lookup.ClaudeNotRunning(), place))
+                outcome = herdr.PromptNotSubmitted("destination never became ready for input"
+                                                   + ("; prompt typed 1 times" if typed else ""), never_typed=not typed)
+                with (patch.object(herdr, "start_agent", return_value=outcome),
+                      patch.object(add_unit, "launched_unit", side_effect=[add_unit.NoMarkedUnit(), found]),
+                      patch.object(herdr, "close_agent") as closed):
+                    result = self.cli(unit, "--plan", "docs/plans/given.md")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue(result.stderr.rstrip().endswith(ending), result.stderr)
+                self.assertEqual(closed.call_args_list, [] if typed else [call(f"build-followups-{unit}", "w1:p1")])
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
         with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:

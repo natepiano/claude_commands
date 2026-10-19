@@ -1866,7 +1866,7 @@ class RestartTests(ShutdownTestCase):
                 restart.SharedHerdrTab("agents"), owner, dry_run=False)
         self.assertEqual(result.prompt_outcome, failed)
         opened.assert_called_once()
-        self.assertEqual(opened.call_args.args[1:4], ("ad-hoc", "kept name", "kept name"))
+        self.assertEqual(opened.call_args.args[1:3], ("ad-hoc", "kept name"))
         pane.assert_not_called()
         self.assertEqual(start.call_args.args[1], "destination:p1")
         opening = cast(herdr.OpeningPrompt, start.call_args.kwargs["opening"])
@@ -3163,6 +3163,18 @@ class RestartTests(ShutdownTestCase):
                     self.assertTrue(arguments[-1].startswith(f"/showrunner:produce {owner['doc']} resume "))
                 if owner["kind"] == "unit":
                     self.assertIn("/unit:direct", note)
+
+    def test_a_move_note_names_the_step_a_mid_turn_stop_cut_off(self) -> None:
+        for cut_off, step in (("Bash: Run the tests", "; your last step was Bash: Run the tests."), ("", ".")):
+            with self.subTest(cut_off=cut_off):
+                saved = entry(top_level("cut-off"), where=record.WhereNotSaid(kind="not said"))
+                saved["target"], saved["source_label"], saved["why"] = "claude2", "claude3", "weekly limit reached"
+                saved["cut_off"] = cut_off
+                note = restart.restart_note(saved, RESTARTED)
+                self.assertIn(f"The move stopped you in the middle of a turn{step} Check whether that step finished", note)
+        unbroken = entry(top_level("between-turns"), where=record.WhereNotSaid(kind="not said"))
+        unbroken["target"] = "claude2"
+        self.assertNotIn("middle of a turn", restart.restart_note(unbroken, RESTARTED))
 
     def test_notes_use_the_stop_dates_zone_and_explain_a_missing_where(self) -> None:
         october = entry(top_level('october'), where=record.WhereSaid(kind='said', text="quoted 'work' and $()", at=STOPPED))

@@ -16,7 +16,7 @@ async function render($: Engine, on: On, surface: RenderSurface, data: BoardData
     return detail
       ? UnitView(elements, columns, bodyRows, data, data.units[0]!, NOW / 1000, () => {})
       : BoardView(elements, columns, bodyRows, { files: [], watch: [], loadedAt: NOW / 1000,
-        boards: [data], focus: null }, NOW / 1000, () => {});
+        boards: [data] }, NOW / 1000, () => {});
   });
   return $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "phase8-layout", surface,
     props: { ...props, bodyColumns: columns, scroll: { offset: 0, bodyRows } } });
@@ -50,6 +50,9 @@ function emptyBoxes(value: unknown): number {
   return (node(value).type === "Box" && lines(value).every(line => !line.trim()) ? 1 : 0)
     + children(value).reduce<number>((count, child) => count + emptyBoxes(child), 0);
 }
+function textSpans(value: unknown): string[] {
+  return node(value).type === "Text" ? lines(value) : children(value).flatMap(textSpans);
+}
 function unit(key: string, state: BoardUnit["state"]): BoardUnit {
   return { ...fixture().units[0]!, key, state };
 }
@@ -81,7 +84,7 @@ function trunk(): BoardData {
   const data = fixture();
   const running = Array.from({ length: 4 }, (_, index) => {
     const result = unit(`run-${index + 1}`, "running");
-    result.phase = { id: "2", of: 3, title: `Active delivery ${index + 1}` };
+    result.phase = { kind: "plan", id: "2", of: 3, title: `Active delivery ${index + 1}` };
     result.stage = ["Build", "Tests", "Review", "Repair round 2"][index]!;
     result.workers = [{ slot: `worker-${index + 1}`, role: "", state: "running", model: "", doing: "" }];
     return result;
@@ -102,7 +105,7 @@ function trunk(): BoardData {
 function longUnit(): BoardData {
   const data = fixture();
   const active = data.units[0]!;
-  active.phase = { id: "10", of: 17, title: "Current delivery" };
+  active.phase = { kind: "plan", id: "10", of: 17, title: "Current delivery" };
   active.phases = Array.from({ length: 17 }, (_, index) => {
     const id = index + 1;
     const row = phase(String(id), id < 10 ? "done" : id === 10 ? "open" : "todo");
@@ -123,6 +126,70 @@ function longUnit(): BoardData {
 // Run the same layout assertions against both engine element surfaces.
 describe("board layout", () => {
   for (const surface of ["terminal", "desktop"] as const) {
+    test(`${surface}: board empty ticket title leaves no title gap at 76 columns`, async ($, on) => {
+      const data = fixture();
+      const active = data.units[0]!;
+      active.phase = { kind: "ticket", id: "names-unit-63", title: "", merged: 62 };
+      active.phases = [];
+      active.stage = "Build";
+      const ui = await render($, on, surface, data, false, 76);
+      const tree = await ui.drawn();
+      const ticketSpans = textSpans(tree).filter(span => span.includes("Ticket names-unit-63"));
+
+      expect(ticketSpans).toHaveLength(1);
+      // The open button may reserve two cells; an absent title adds none.
+      expect(ticketSpans[0]).toMatch(/Ticket names-unit-63 · 62 merged {0,2}$/);
+      expect(ticketSpans[0]!.match(/names-unit-63/g)).toHaveLength(1);
+      expect(cellWidth(lines(tree).find(row => row.includes("Ticket names-unit-63"))!))
+        .toBeLessThanOrEqual(76);
+    });
+
+    for (const detail of [false, true]) {
+      for (const merged of [0, 62]) {
+        test(`${surface}: ${detail ? "unit" : "board"} ticket heading shows ${merged} merged at 76 columns`, async ($, on) => {
+          const data = fixture();
+          const active = data.units[0]!;
+          active.phase = { kind: "ticket", id: "alpha-unit-63", title: "Fix names", merged };
+          active.phases = [phase("alpha-unit-63", "open")];
+          active.stage = "Build";
+          const ui = await render($, on, surface, data, detail, 76);
+          const rows = lines(await ui.drawn());
+          const heading = rows.find(row => row.includes("alpha"))!;
+
+          expect(heading).toContain(detail
+            ? `Ticket alpha-unit-63 · ${merged} merged · Build`
+            : `  Ticket alpha-unit-63 · ${merged} merged  Fix names`);
+          expect(heading).not.toContain("Phase ");
+          expect(heading).not.toContain("/1");
+          expect(cellWidth(heading)).toBeLessThanOrEqual(76);
+        });
+      }
+
+      test(`${surface}: ${detail ? "unit" : "board"} plan heading keeps its phase total at 76 columns`, async ($, on) => {
+        const data = fixture();
+        data.units[0]!.stage = "Build";
+        const ui = await render($, on, surface, data, detail, 76);
+        const heading = lines(await ui.drawn()).find(row => row.includes("alpha"))!;
+
+        expect(heading).toContain(detail ? "Phase 2 of 3 · Build" : "  Phase 2/3  Delivery 2");
+        expect(heading).not.toContain("Ticket ");
+        expect(heading).not.toContain("merged");
+        expect(cellWidth(heading)).toBeLessThanOrEqual(76);
+      });
+    }
+
+    test(`${surface}: an empty board gives only the showrunner command instruction`, async ($, on) => {
+      on("ui.render", { component: "Pane", requestId: "empty-board" }, ($, event) =>
+        BoardView($.ui.resolve(event), 170, 50,
+          { files: [], watch: [], loadedAt: NOW / 1000, boards: [] }, NOW / 1000, () => {}));
+      const ui = await $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "empty-board",
+        surface, props });
+
+      expect(lines(await ui.drawn()).filter(line => line.trim()))
+        .toEqual(["Run /showrunner:unit_board in a showrunner session."]);
+      expect(await ui.findAll({ type: "Button" })).toEqual([]);
+    });
+
     for (const bodyRows of [4, 50]) {
       for (const hasStrip of [false, true]) {
       test(`${surface}: a 76-column no-phase unit shows its stage once with ${hasStrip ? "a strip" : "no strip"} in ${bodyRows} rows`, async ($, on) => {

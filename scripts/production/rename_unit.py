@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "make_a_worktree"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
 import add_unit  # noqa: E402
@@ -45,7 +44,6 @@ import production_units  # noqa: E402
 import proposal_issue  # noqa: E402
 import proposals_folder  # noqa: E402
 import rename_state  # noqa: E402
-import retarget_fix  # noqa: E402
 import review_pool  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
@@ -418,18 +416,6 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
     _ = git(worktree, "push", "origin", f"{rename.new_branch}:refs/heads/{rename.new_branch}")
 
 
-def _move_fix_redirects(rename: UnitRename) -> None:
-    old, new = Path(rename.old_worktree), Path(rename.new_worktree)
-    conf = retarget_fix.DEFAULT_CONF
-    # fix.conf names checkouts relative to ~/rust; a worktree elsewhere has no redirect.
-    if old.parent != Path.home() / "rust" or not conf.exists():
-        return
-    lines, moved = retarget_fix.move(retarget_fix.read_conf(conf), old.name, new.name)
-    if moved:
-        write_text(conf, "\n".join(lines) + "\n")
-        _ = retarget_fix.commit_conf(conf, f"fix.conf: {rename.old} renamed to {rename.new}")
-
-
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch))
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
@@ -446,7 +432,6 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     for issue in _unit_proposals(rename, rename.old):
         _ = proposal_issue.edit(issue.path, {"unit": rename.new}, today)
     _ = phase_table.rename_unit(rename.slug, rename.old, rename.new)
-    _move_fix_redirects(rename)
 
 
 def _retire(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -673,10 +658,6 @@ def _state_failures(rename: UnitRename) -> list[str]:
     failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(rename.slug, rename.old))
-    conf = retarget_fix.DEFAULT_CONF
-    if old.parent == Path.home() / "rust" and conf.exists() and retarget_fix.move(
-            retarget_fix.read_conf(conf), old.name, new.name)[1]:
-        failures.append(f"{conf}: a redirect still names {old.name}")
     return failures
 
 
@@ -791,7 +772,7 @@ def _describe_merge_rename(r: UnitRename) -> str:
 
 def _describe_state(r: UnitRename) -> str:
     return ("state: report scratch, stall-watch stretch, reviewer leases and memory, run record, open proposals, "
-            + f"phase notes, fix.conf redirects: {r.old} -> {r.new}")
+            + f"phase notes: {r.old} -> {r.new}")
 
 
 def _describe_retire(r: UnitRename) -> str:

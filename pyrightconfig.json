@@ -65,14 +65,6 @@
       ]
     },
     {
-      "root": "scripts/fix",
-      "extraPaths": [
-        "scripts/fix",
-        "scripts/style",
-        "scripts/lib"
-      ]
-    },
-    {
       "root": "scripts/style",
       "extraPaths": [
         ".",
@@ -180,8 +172,7 @@
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/lib",
-        "scripts/herdr",
-        "scripts/make_a_worktree"
+        "scripts/herdr"
       ]
     },
     {
