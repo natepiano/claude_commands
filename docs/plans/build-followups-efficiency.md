@@ -51,36 +51,20 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 ### Phase 1 — "N efficiency proposals" in the For you row  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a production doc with `- **Efficiency ledger:** <path>` shows `N efficiency proposals` in its `For you:` line (status line row and dailies footer), N = ledger lines whose status is `proposed` or `deferred`.
-
-**Spec:**
-- `footer_counts.py`:
-  - `EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"`.
-  - `EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d .*? — (?P<status>.*)$")` — non-greedy, so the status is the text after the **first** ` — `.
-  - `open_efficiency(line: str) -> bool`: the line matches and its stripped status starts with `proposed` or `deferred`.
-  - `efficiency_ledger(doc) -> Path | None`, as `ledger(doc)` but for the new field (`Refusal` → None). Share one private helper `_field_path(doc, field)` between the two.
-  - `efficiency(doc) -> int`: open lines in that ledger; no field, or a file that cannot be read, counts 0.
-  - `FooterCounts` gains `efficiency: int = 0` as its **last** field (positional constructions stay valid). `read_counts` fills it; its `OSError` fallback stays `FooterCounts(questions=questions)`.
-  - `sources(doc)` adds the efficiency ledger beside the improvement queue, so the status line cache refreshes when a line changes.
-  - `counts_line` renders it after the proposals count: `plural(counts.efficiency, "efficiency proposal")` → `For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question`. Update the docstrings that list the counts (module, `counts_line`).
-- `docs/production_format.md`: add the `Efficiency ledger` field next to `Improvement queue`: optional; names a nightly-review style ledger; its proposed and deferred lines show as `N efficiency proposals`.
-- Not in this phase: the line `- **Efficiency ledger:** ~/.local/state/nightly-review/ledger.md` in `docs/plans/build-followups-production.md`. The showrunner owns that doc; the unit director asks the showrunner to add it at merge.
+- `FooterCounts` ends with `efficiency: int = 0`. `read_counts(doc, *, questions)` fills it from the doc's `- **Efficiency ledger:** <path>` line; `sources(doc)` lists that path even before the file exists, so the status line cache refreshes when the ledger appears or changes.
+- `efficiency(doc)` counts dated ledger lines (`- YYYY-MM-DD … — <status>`) whose status, the text after the first ` — `, starts with `proposed` or `deferred`. An absent field, a missing file, or a file that cannot be read or decoded counts 0 and leaves the other counts in place.
+- `counts_line` renders `plural(counts.efficiency, "efficiency proposal")` right after the proposals count: `For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question`.
+- `docs/production_format.md` documents the `Improvement queue` and `Efficiency ledger` fields.
 
 **Files:**
-- `scripts/production/footer_counts.py` — the field, parser, count, source and render.
-- `scripts/production/test_footer_counts.py` — tests below.
-- `scripts/statusline/test_statusline.py` — one end-to-end row with the new field.
-- `docs/production_format.md` — the field.
+- `scripts/production/footer_counts.py` — the For you counts, their sources, and the line
+- `scripts/production/test_footer_counts.py` — parser, missing and undecodable ledger, render order
+- `scripts/statusline/test_statusline.py` — end-to-end efficiency count in the status line
+- `docs/production_format.md` — the two ledger fields
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/production/footer_counts.py`, `docs/production_format.md`.
-- `test` — `scripts/production/test_footer_counts.py`, `scripts/statusline/test_statusline.py`, from this Spec: a ledger with `proposed`, `deferred`, `accepted, applied`, `declined`, `no proposal`, a line `… — accepted, applied; from Also found: X — proposed` (counts 0: first status wins), a non-dated line (ignored) → count 2; field absent → 0; unreadable path → 0; `sources` includes the ledger; `counts_line(FooterCounts(1, 2, 3, 1, 130))` renders the order above; singular `1 efficiency proposal`; `total` sums the new column; the status line row shows the count for a doc with the field.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** merge_gate `--tests-only` green; basedpyright `0 errors, 0 warnings` on `scripts/production scripts/statusline`; `python3 -c` over the live ledger with the new `efficiency()` prints 130 (or the live count, matched by hand with `grep`).
+**Binds later work:** each `proposed` line Ranked proposals appends to the efficiency ledger raises the For you count by one.
 
 ### Phase 2 — Where the tokens go  · status: todo
 **Depends on:** none
