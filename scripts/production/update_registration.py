@@ -24,7 +24,7 @@ else:
     from showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
         read_pending_reviewed, ReportItem, reports_path)
 import showrunners
-from dailies_render import (UNREADABLE_LIST, InputError, read_outstanding,
+from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
     ReviewUnavailableOutstandingQuestion)
 
@@ -502,6 +502,16 @@ def questions(production: Production, path: Path | None) -> None:
         for item in items_by_text.values():
             if item.text not in previous and isinstance(item, OpenQuestionWithoutText):
                 raise RegistrationFailure("questions", f"{item.text}: a new question needs its full text in `question`")
+        # A new or changed item must pass the plumbing check; a stored one that fails is only named.
+        refused: list[str] = []
+        for text in items_by_text:
+            problem = plumbing(text)
+            if problem is not None and text in previous:
+                report("questions", "reword", f"{text}: {problem}")
+            elif problem is not None:
+                refused.append(f"{text}: {problem}")
+        if refused:
+            raise RegistrationFailure("questions", "; ".join(refused))
         for item in items_by_text.values():
             entry = OutstandingItem(since=previous[item.text].since.strftime("%Y-%m-%dT%H:%M")
                                     if item.text in previous else since, text=item.text)

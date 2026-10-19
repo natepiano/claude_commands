@@ -712,6 +712,27 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(outstanding.read_bytes(), before)
 
 
+    def test_a_stored_item_with_plumbing_is_named_and_a_new_one_is_refused(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"free the cargo-berth on the Mac"}]\n',
+                                   encoding="utf-8")
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": ["free the cargo-berth on the Mac", "review colors"]}),
+                             encoding="utf-8")
+        kept = self.run_command("questions", "--state", str(state))
+        self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
+        self.assertIn("questions: reword — free the cargo-berth on the Mac: 'berth' is the production's own plumbing",
+                      kept.stdout)
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual([entry["text"] for entry in entries], ["free the cargo-berth on the Mac", "review colors"])
+        before = outstanding.read_bytes()
+        _ = state.write_text(json.dumps({"open_for_user": ["review colors", "release the writers"]}), encoding="utf-8")
+        refused = self.run_command("questions", "--state", str(state))
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("questions: failed — release the writers: 'writers' is the production's own plumbing",
+                      refused.stdout)
+        self.assertEqual(outstanding.read_bytes(), before)
+
     def test_questions_store_what_waits_on_the_user_and_print_one_line(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"choose layout"}]')
