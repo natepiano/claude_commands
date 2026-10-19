@@ -82,30 +82,23 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Gotchas:** the usage store holds only `.claude` checkpoints, so checkpoints come from each production repository's git history. Codex logs record no cache writes: Claude cache write and Codex uncached input are the same kind of cost.
 
-### Phase 3 — The fixed cost of every request  · status: todo
+### Phase 3 — The fixed cost of every request  · status: done
 **Depends on:** Phase 2
 
-#### Work Order
+#### As-built
 
-**Goal:** for each role, the tokens every request carries before any work (system prompt, tool schemas, deferred-tool and skill listings, MCP instructions, CLAUDE.md, memory index, session-start hook output), each part sized and multiplied by its weekly request count.
-
-**Spec:**
-- Claude: the first request of fresh sessions per role gives the start size (cache write). Size each part from its source text (CLAUDE.md files, `MEMORY.md` per project, `skillOverrides`, the skill listing, MCP server instructions, deferred tool list, SessionStart hook output) and check the parts against the start size; the gap is the system prompt and tool schemas. Reuse the methods of the 10-12 Artifact-tool and 10-15/10-19 CLAUDE.md findings.
-- Per-request repeats: system reminders injected each turn (hooks, cross-session messages, task notifications, context-usage lines), counted from transcripts by kind, with tokens per week.
-- Codex: the worker start prompt (`AGENTS.md`, the Work Order, Delegation Context, review prompts by lens) and its size per thread start.
-- Re-measure the open ledger findings that fall here (Artifact tool, CLAUDE.md twice and its repeats, memory index lines, context-usage hook repeats, handoff instruction) on this window; mark each as confirmed, changed or gone.
-- Output: a table part → tokens per request → requests per week → weighted tokens per week → share; `token-study/3-fixed/report.md`.
+- `~/.local/state/nightly-review/token-study/3-fixed/report.md` (outside git) prices what every request carries before any work, per role, for both families, against Phase 2's 7,240,515,495 weighted tokens a week.
+- Largest Claude parts: other tool schemas 264,186,777 (3.65%), the Artifact tool schema 253,051,412 (3.49%; 5 calls in the week), memory index 71,478,825 (0.99%), global CLAUDE.md 40,270,186 (0.56%). All named Claude parts: 824,343,825 (11.39%). Claude reminders carried per turn: 56,277,164 (0.78%).
+- Codex retained original-start blocks: 250,573,210 (3.46%), led by base instructions 103,038,176 (1.42%) and the skill catalog 43,883,789 (0.61%). This is a partial figure: Codex rollouts show no tool schemas.
+- Ledger findings: none gone. The Artifact finding changed (still carried, now called); the CLAUDE.md, memory-index, context-hook and handoff findings are confirmed.
+- Scripts and data: `3-fixed/claude/work/` and `3-fixed/codex/work/`.
 
 **Files:**
-- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/3-fixed/` (outside git).
+- `docs/plans/build-followups-efficiency.md` — this record; the study lives outside git
 
-**Workers:** 2 writers (no test lane).
-- `impl` — Claude fixed parts and per-turn reminders.
-- `test` opens as `impl` — Codex start prompts and review prompts.
+**Binds later work:** no role's parts match its start size within 5%; the named residual is 15–30% of Claude start input and 21–28% of Codex start input. These figures are carried cost (estimated sizes at average input price), not savings.
 
-**Constraints from prior phases:** the role and production totals and token-class split from "Where the tokens go" are the denominators.
-
-**Acceptance gate:** the parts of each role's start size add up to the measured start size within 5%, or the report names the unexplained part; the shares use Phase 2's totals; Invariants checks as Phase 2.
+**Gotchas:** a Codex thread resumed in a new rollout file must keep the retention its compactions decided (`3-fixed/codex/work/scan_rollouts.py`, checked by `check_parser.py`); restoring all start parts on resume overstated cost by 1,272,628 weighted tokens a week.
 
 ### Phase 4 — What the turns do  · status: todo
 **Depends on:** Phase 2, Phase 3
@@ -115,7 +108,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 **Goal:** the work patterns that spend tokens without moving work forward, across all four productions, each with tokens per week and the sessions that show it.
 
 **Spec:**
-- Sample per production: the showrunner session and the two most expensive unit directors and two Codex workers of the window (Phase 2's sinks), read from transcripts and rollouts.
+- Sample per production: the showrunner session and the two most expensive unit directors and two Codex workers of the window (Phase 2's sinks), read from transcripts and rollouts. Write a sampling manifest (session ids, why chosen); add targeted sessions for roles or patterns the sample misses (reviewers, repair loops that did not converge). Scale each pattern to the week from a population count or an explicit scaling denominator with its uncertainty; keep Phase 2's Mac-coverage caveat.
 - Measure, each as weighted tokens per week and share:
   - turns with no new work: waits, status checks, polls, update ticks, idle re-wakes (`activity` dimension plus transcript reading);
   - context growth: requests per session before compaction, context size at each request, compaction re-reads (re-measure the 10-13 and 10-16 `/unit:direct` and `/showrunner:produce` findings);
@@ -123,8 +116,9 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
   - messaging between sessions: showrunner ↔ unit relays, broadcasts (re-measure `/build_hold` 24.2M), reviewer round trips;
   - review and repair loops: rounds per finding, rounds that did not converge;
   - model and effort per role against the work it did (an Opus turn that only relays).
-- Compare productions on `weighted_per_checkpoint`; explain the spread.
-- Output: one row per pattern with evidence (session ids, turn counts), `token-study/4-turns/report.md`.
+- Follow up Phase 3's leads, reusing its measurements rather than counting again: tokenize one real start per family to explain the start residual (Claude 15–30%, Codex 21–28%); how long showrunner cross-session messages stay in context (5,780 tokens per carrying request); the large Codex review starts (47,083 tokens, 15,818-token Work Orders); the director skill listing (4,620 tokens at start, 500 carried) after compaction. Name what stays unexplained where no tokenizer or runtime material is available; keep in-window starts apart from the older director cohort.
+- Compare productions on `weighted_per_checkpoint`; explain the spread, keeping observed differences apart from demonstrated causes.
+- Output: one row per pattern with evidence (session ids, turn counts). Each family writes its own folder, `token-study/4-turns/claude/` and `token-study/4-turns/codex/`; the unit director merges them into `token-study/4-turns/report.md`.
 
 **Files:**
 - `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/4-turns/` (outside git).
@@ -133,7 +127,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 - `impl` — Claude sessions (showrunners, directors, subagents).
 - `test` opens as `impl` — Codex workers and reviewers.
 
-**Constraints from prior phases:** Phase 2's sinks pick the sample; Phase 3's fixed cost per request prices each avoided request.
+**Constraints from prior phases:** Phase 2's sinks pick the sample. Phase 3's fixed costs are carried-cost estimates (estimated sizes, average input price), not savings: price an avoided turn from that request's billed tokens in the ledger, and keep component-removal estimates apart. Any Codex rollout scan reuses `token-study/3-fixed/codex/work/scan_rollouts.py` retention: a compaction after a file's last selected request still applies to the resumed file, and replayed messages decide which original blocks survive; a new scanner carries the equivalent resume/compaction checks of `3-fixed/codex/work/check_parser.py` (the old reset overstated cost by 1,272,627.79 weighted tokens/week).
 
 **Acceptance gate:** each pattern names at least two sessions as evidence and its weekly tokens; the patterns do not count one token twice with Phase 3 (the report says how overlap was removed); Invariants checks as Phase 2.
 
@@ -153,11 +147,11 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 **Files:**
 - `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/5-experiments/` and `token-study/experiments/` (outside git).
 
-**Workers:** 2 writers (no test lane), one experiment set each; the unit director assigns experiments by family.
+**Workers:** 2 writers (no test lane), one experiment set each; the unit director assigns experiments by family, gives each experiment its own folder `token-study/experiments/<name>/` with its verification files, splits the 3M budget between the writers before launch, and owns the merged `5-experiments/report.md`.
 
 **Constraints from prior phases:** the candidates and their estimated gains come from "The fixed cost of every request" and "What the turns do".
 
-**Acceptance gate:** each experiment reports before/after numbers, its cost and a pass/fail against its estimate; total cost under budget; Invariants checks as Phase 2.
+**Acceptance gate:** each experiment reports before/after numbers, its cost and a pass/fail against its estimate, plus a check that the work still comes out the same (the removed instructions, tool access or task result are still available where the work needs them: Artifact was called 5 times in Phase 3's week); observed savings are kept apart from replay projections (`compaction_replay` models cost, not equal work); total cost under budget; Invariants checks as Phase 2.
 
 ### Phase 6 — Ranked proposals  · status: todo
 **Depends on:** Phase 5
@@ -169,7 +163,8 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 **Spec:**
 - One proposal per change: what changes, where (file or setting, owner unit when one owns it), weekly gain as share and weighted tokens with range, evidence (phase report and query), risk to the work (what could get worse), and how to re-measure after adoption.
 - Rank by gain; break ties by Simple, then Fast, then Beautiful (decision criteria).
-- Fold in the open ledger token findings: each is re-measured, merged into a new proposal, or marked gone. A merged or gone line gets its status text updated (`superseded by <date> <title>` or `gone on re-measure <date>`); no line is deleted.
+- Each proposal's gain says which kind it is: measured saving (Phase 5), modeled estimate, or not measurable (with the reason); missing evidence is never zero.
+- Fold in the open ledger token findings: each is re-measured, merged into a new proposal, marked gone, or marked inconclusive or untested with the reason (for example no Codex tool-schema evidence, a zero-match scan, a judgment not re-checked); inconclusive and untested lines stay open. A merged or gone line gets its status text updated (`superseded by <date> <title>` or `gone on re-measure <date>`); no line is deleted.
 - Append each new proposal to `~/.local/state/nightly-review/ledger.md` as `- 2026-10-<dd> <scope>: <title> [gain/week: <x>% of tokens] — proposed`.
 - Write `token-study/report.md`: the token map summary, the ranked table, the experiment results, and what the study did not cover.
 - Send the showrunner the ranked table (top 10) and the report path.
@@ -179,6 +174,6 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Workers:** nothing splits: the unit director writes the ranking and the ledger lines from the phase reports; no worker opens.
 
-**Constraints from prior phases:** all phase reports; the "same work" yardstick is Phase 2's weighted per checkpoint.
+**Constraints from prior phases:** all phase reports. Phase 2's weighted per checkpoint is a descriptive comparison only; a claim that a change does the same work needs matched tasks or unchanged acceptance outcomes.
 
-**Acceptance gate:** every proposal has a gain with range and evidence; the open token findings listed in Key files each have a disposition; the For you row's efficiency count changes by the new lines; the showrunner has the table.
+**Acceptance gate:** every proposal has a gain with range and evidence; the open token findings listed in Key files each have a disposition; the For you row's efficiency count equals the net count after every ledger change (new lines up, superseded or gone lines down), checked against the rendered row; the showrunner has the table.

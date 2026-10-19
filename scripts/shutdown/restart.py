@@ -162,6 +162,10 @@ class NoUnitPlan(Exception):
     """Neither the unit's Units row nor a run record says what it resumes with."""
 
 
+class UnitRetired(Exception):
+    """The unit's Units row says it is retired, so nothing brings it back."""
+
+
 @dataclass(frozen=True)
 class AccountNamed:
     """An account name was given at the command line."""
@@ -981,6 +985,8 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
     recorded_plan = host["plan"]
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
     row_plan = _units_row_plan(host["doc"], host["unit"])
+    if row_plan is not None and production_units.plan_cell_is_retired(row_plan):
+        raise UnitRetired(f"{host['unit']} is retired in the Units table of {host['doc']}")
     plan_arguments: list[str]
     if row_plan in ("standby", "permanent"):
         plan_arguments = ["--" + row_plan]
@@ -1881,7 +1887,7 @@ def launch_entry(
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
         return EntrySettled()
-    except NoUnitPlan as error:
+    except (NoUnitPlan, UnitRetired) as error:
         if dry_run:
             print(f"cannot restart {session['name']}: {error}")
         else:
