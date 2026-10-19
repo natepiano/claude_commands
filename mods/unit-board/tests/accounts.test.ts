@@ -109,7 +109,7 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
         isStdoutTruncated: false, isStderrTruncated: false } };
     }
     mtimes.set(BOARD, clock.now());
-    return { value: { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], focus: null, watch: [REGISTRY] }),
+    return { value: { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }),
       stderr: '', isStdoutTruncated: false, isStderrTruncated: false } };
   });
   on('session.send', (_$, e) => { escaped.push(e.text); throw new Error('Unexpected message from accounts pane'); });
@@ -242,7 +242,7 @@ describe('accounts pane', () => {
   test('closing during startup zone lookup cannot restart accounts while the board keeps refreshing', async ($, on) => {
     const fake = accountsHost(on, [], {});
     await $.session.start(start);
-    await $.command.run(command('unit-board'));
+    await $.command.run(command('showrunner:unit_board'));
     await $.command.run(command());
     const pending = fake.pauseZone();
     const restarting = $.session.start(start);
@@ -410,11 +410,11 @@ describe('accounts pane', () => {
     expect(fake.processes).toEqual([]);
   });
 
-  for (const close of ['accounts-board', 'unit-board']) {
+  for (const close of ['accounts-board', 'showrunner:unit_board']) {
     test(`closing ${close} preserves the other pane refresh loop`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
-      await $.command.run(command('unit-board'));
+      await $.command.run(command('showrunner:unit_board'));
       await $.command.run(command());
       await $.command.run(command(close, 'close'));
       fake.clear();
@@ -422,10 +422,10 @@ describe('accounts pane', () => {
       fake.change(RUN);
       await fake.clock.advance(10_000);
       expect(fake.accountRuns().length).toBe(close === 'accounts-board' ? 0 : 1);
-      expect(fake.boardRuns().length).toBe(close === 'unit-board' ? 0 : 1);
+      expect(fake.boardRuns().length).toBe(close === 'showrunner:unit_board' ? 0 : 1);
       expect(fake.fs.includes(USAGE)).toBe(close !== 'accounts-board');
-      expect(fake.fs.includes(RUN)).toBe(close !== 'unit-board');
-      await $.command.run(command(close === 'accounts-board' ? 'unit-board' : 'accounts-board', 'close'));
+      expect(fake.fs.includes(RUN)).toBe(close !== 'showrunner:unit_board');
+      await $.command.run(command(close === 'accounts-board' ? 'showrunner:unit_board' : 'accounts-board', 'close'));
       fake.clear();
       await fake.clock.advance(60_000);
       expect(fake.fs).toEqual([]);
@@ -471,7 +471,7 @@ describe('accounts pane', () => {
     test(`closing during pending ${refresh ? 'refresh' : 'open'} leaves no state and keeps the board live`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
-      await $.command.run(command('unit-board'));
+      await $.command.run(command('showrunner:unit_board'));
       if (refresh) await $.command.run(command());
       const pending = fake.pause();
       let opening: Promise<unknown> = Promise.resolve();

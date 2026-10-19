@@ -1010,7 +1010,7 @@ signal.pause()
                 self.assertEqual(self.routing_record()["target"], "natedev")
 
     def test_declined_mac_attempt_announces_only_local_execution(self) -> None:
-        for reason in ("busy", "blocked", "battery"):
+        for reason in ("busy", "blocked", "disk"):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 result = self.verify("test", "sample", "--no-cache", extra={
@@ -1724,6 +1724,42 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
                 self.assertEqual(self.cargo_events(), [])
                 self.assertEqual(self.runner_events(), [])
                 self.assertEqual(len(self.call_records()), call_count)
+
+    def test_local_flag_refuses_a_mac_reservation_before_any_work(self) -> None:
+        reasons = (
+            "Mac reserved for demo",
+            "RESERVATION: demo has the Mac",
+            "showrunner ruling: no Mac claim",
+            "Mac held by demo",
+            "the Mac is blocked",
+            "Mac busy, hold off",
+        )
+
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.clear_observations()
+                call_count = len(self.call_records())
+                result = self.verify("test", "sample", "--local", reason)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(
+                    result.stderr,
+                    "verify.sh: --local is only for a test that cannot pass on macOS, not to keep "
+                    + f'tests off the Mac ("{reason}"). To reserve the Mac, its holder runs '
+                    + "/build:hold hold <why> target mac: tests then skip the Mac by themselves, "
+                    + "/build:targets shows the hold, and it ends at its expiry. Leave --local off.\n",
+                )
+                self.assertEqual(self.cargo_events(), [])
+                self.assertEqual(self.runner_events(), [])
+                self.assertEqual(len(self.call_records()), call_count)
+
+    def test_local_flag_accepts_linux_reasons_that_contain_reservation_letters(self) -> None:
+        for reason in ("uses a threshold only Linux reports", "needs Wayland; the household fixture is Linux only"):
+            with self.subTest(reason=reason):
+                result = self.verify("test", "sample", "--local", reason, "--no-cache")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(self.local_runs()), 1)
+                self.clear_observations()
 
     def test_local_flag_skips_runner_records_reason_and_shares_pass_key(self) -> None:
         first_reason = 'needs Linux path handling with a "quoted" mount'

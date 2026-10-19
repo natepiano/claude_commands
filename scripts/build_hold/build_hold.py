@@ -41,6 +41,9 @@ SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # a memory wait ends as unanswered only this long after that limit.
 MEMORY_GATE_GRACE_S = 60
 NO_ADMISSION_ACK_S = 900
+# A release ends this long after it starts. Each session still unanswered then counts as released
+# and is named in the result: one silent session never holds every other build past it.
+RELEASE_LIMIT_S = NO_ADMISSION_ACK_S
 NO_REGISTRATION_S = 60
 RELEASE_POLL_S = 15
 # A lookup that cannot read the session records is tried again before the release gives up on the
@@ -1171,7 +1174,8 @@ def remove_call(key: str, call_id: str, *, cycle_id: str = "") -> None:
             save_cycle(cycle)
 
 
-def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0) -> str:
+def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0,
+              launch: bool = False) -> str:
     if not session_id:
         return "NoSessionId"
     if not has_holder_file(holder_directory()):
@@ -1195,6 +1199,12 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
                  or state == "MemoryGateReturned" and outcome in {"Granted", "TimedOut", "MeminfoUnavailable"})
                 and confirm_delivery(entry, cycle.get("holder_generation", 1))):
                 save_cycle(cycle)
+            if (not call_id and not launch and entry["active_call_id"]
+                    and isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued))):
+                # The session builds on its own while a queued call has not reached its memory
+                # gate: the build takes the session's turn, and the queued calls wait only on their gates.
+                # An app launch is no build and leaves the call's turn as it is.
+                end_session_turn(entry, cycle.get("holder_generation", 1))
             if entry["active_call_id"] != call_id:
                 continue
             previous = read_release_state(entry)
@@ -1225,30 +1235,56 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
         return "mark ignored"
 
 
-def answer_nothing_to_build(session_id: str) -> str:
-    """A released session's answer when it has no build or BRP launch to start, so the release stops waiting for it."""
+@dataclass(frozen=True)
+class AnswerTaken:
+    """After the answer, the release does not wait for this session."""
+    text: str
+
+
+@dataclass(frozen=True)
+class AnswerRefused:
+    """The release still waits for this session; the text says on what."""
+    text: str
+
+
+def answer_nothing_to_build(session_id: str) -> AnswerTaken | AnswerRefused:
+    """A session's answer when it has no build or BRP launch to start, so the release stops waiting for it.
+
+    The answer covers the session's whole release, not one turn: a turn opened later for a run the
+    session queued sends no new notice, so an answer given after an earlier turn ends it too.
+    """
     if not session_id:
-        return "NoSessionId"
+        return AnswerRefused("nothing-to-build failed: CLAUDE_CODE_SESSION_ID is not set, so the session is unknown")
     if not has_holder_file(holder_directory()):
-        return "no build hold"
+        return AnswerTaken("no build hold")
     with release_lock():
         if isinstance(read_holders(holder_directory()), NoHolders):
-            return "no build hold"
+            return AnswerTaken("no build hold")
         cycle = read_cycle_for_change()
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
-            return "no hold cycle"
+            return AnswerTaken("no hold cycle")
         entry = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
         if entry is None:
-            return "nothing-to-build ignored: this session is not registered"
+            return AnswerTaken("the release does not wait for this session: it is not registered")
+        generation = cycle.get("holder_generation", 1)
         if ((not cycle.get("holder_signature", "") or cycle.get("holder_signature", "") == holders_signature())
-            and confirm_delivery(entry, cycle.get("holder_generation", 1))):
+            and confirm_delivery(entry, generation)):
             save_cycle(cycle)
-        if entry["active_call_id"] or not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
-            return f"nothing-to-build ignored: {entry_text(entry)}"
-        entry["session_pending"] = False
+        state = read_release_state(entry)
+        if isinstance(state, WaitingForMemory):
+            return AnswerRefused("nothing-to-build refused: a build of this session is in its memory gate, "
+                                 + f"and the release waits on that gate: {entry_text(entry)}")
+        if isinstance(state, AwaitingRelease) and entry["delivery"]["generation"] != generation:
+            return AnswerRefused("nothing-to-build refused: the release notice has not reached this session yet; "
+                                 + f"answer it when it comes: {entry_text(entry)}")
+        if not (in_progress(entry) or has_pending_call(entry, generation) or entry["session_pending"]):
+            return AnswerTaken(f"the release does not wait for this session: {entry_text(entry)}")
+        # An active call that has not reached its memory gate does not hold the answer back:
+        # the session's turn ends, and its queued calls each wait only on their own memory gate.
+        end_session_turn(entry, generation)
         store_release_state(entry, NothingToBuild(datetime.now(timezone.utc)))
         save_cycle(cycle)
-        return f"{entry_text(entry)}; the release stops waiting for this session"
+        return AnswerTaken(f"{entry_text(entry)}; the release stops waiting for this session")
 
 
 def confirm_delivery(entry: ReleaseEntry, generation: int) -> bool:
@@ -1345,8 +1381,21 @@ def not_reached_detail(cycle: HoldCycle) -> str:
     return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
 
 
-def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime) -> None:
-    """A released turn that outlives its limit, or whose session left, ends; it never holds another session."""
+def end_session_turn(entry: ReleaseEntry, generation: int) -> None:
+    """The session's turn ends: each call it queued is admitted now and waits only on its own memory gate."""
+    for call in entry["calls"]:
+        call["admitted_generation"] = generation
+    entry["active_call_id"] = ""
+    entry["session_pending"] = False
+    entry["session_admitted_generation"] = generation
+
+
+def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime, generation: int) -> None:
+    """A released turn that outlives its limit, or whose session left, ends; it never holds another session.
+
+    A lapse ends the session's whole turn, not just the active call, so a session with queued
+    calls that never start holds the release one limit, not one limit per call.
+    """
     state = read_release_state(entry)
     match state:
         case RecipientGone() | DeliveryFailed() if entry["active_call_id"]:
@@ -1361,8 +1410,7 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime)
         case _:
             return
     if now >= deadline:
-        entry["active_call_id"] = ""
-        entry["session_pending"] = False
+        end_session_turn(entry, generation)
         store_release_state(entry, NoAdmissionAck(released_at))
     elif (not entry["active_call_id"] and not isinstance(state, (RecipientGone, DeliveryFailed))
           and isinstance(socket_for(entry["session_id"]), RecipientGone)):
@@ -1414,8 +1462,33 @@ def release_entry(cycle: HoldCycle, entry: ReleaseEntry, clock: Callable[[], dat
         entry["session_pending"] = False
 
 
+def end_release_at_limit(entries: list[ReleaseEntry], now: datetime, release_start: datetime, generation: int) -> None:
+    """At the release limit, each session the release still waits for counts as released.
+
+    Each turn has its own limit, but a session gets a new turn for each run it queued, so only a
+    limit on the whole release bounds how long one silent session holds every other build. A build
+    already in its memory gate keeps its own limit: that is admitted work, not silence.
+    """
+    if now < release_start + timedelta(seconds=RELEASE_LIMIT_S):
+        return
+    for entry in entries:
+        if (isinstance(read_release_state(entry), WaitingForMemory)
+                or not (in_progress(entry) or has_pending_call(entry, generation) or entry["session_pending"])):
+            continue
+        released_at = aware_instant(entry["active_released_at"]) if entry["active_released_at"] else release_start
+        end_session_turn(entry, generation)
+        store_release_state(entry, NoAdmissionAck(released_at))
+
+
+def unanswered_detail(entries: Sequence[ReleaseEntry]) -> str:
+    names = [entry["name"] if entry["name"] == entry["session_id"] else f"{entry['name']} [{entry['session_id']}]"
+             for entry in entries if isinstance(read_release_state(entry), NoAdmissionAck)]
+    return ". No answer, counted as released: " + ", ".join(names) if names else ""
+
+
 def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], datetime] = release_clock) -> tuple[bool, str]:
-    """One pass: every waiting session is released at once, and each turn ends on its own clock.
+    """One pass: every waiting session is released at once, each turn ends on its own clock, and
+    the whole release ends at RELEASE_LIMIT_S.
 
     No stagger between notices: every released build passes memory_gate.sh, whose check and
     reservation run under one flock (memory_admit.check), so two builds starting together
@@ -1425,9 +1498,10 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
     generation = cycle.get("holder_generation", 1)
     release_start = aware_instant(cycle["release_started_at"])
     queue_told_sessions(cycle)
+    end_release_at_limit(entries, now, release_start, generation)
     for entry in entries:
         prune_calls(entry)
-        end_lapsed_turn(entry, now, release_start)
+        end_lapsed_turn(entry, now, release_start, generation)
         if not in_progress(entry) and (has_pending_call(entry, generation) or entry["session_pending"]):
             store_release_state(entry, AwaitingRelease())
         if isinstance(read_release_state(entry), AwaitingRelease):
@@ -1441,7 +1515,9 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
         return False, "; ".join(waiting)
     if not cycle["recipients"] and (now - release_start).total_seconds() < NO_REGISTRATION_S:
         return False, "waiting for registrations"
-    return True, "; ".join(entry_text(entry) for entry in entries) or "NoRegistration timeout; no recipients registered"
+    if not entries:
+        return True, "NoRegistration timeout; no recipients registered"
+    return True, "; ".join(entry_text(entry) for entry in entries) + unanswered_detail(entries)
 
 
 @dataclass(frozen=True)
@@ -1605,6 +1681,7 @@ def main(arguments: list[str]) -> int:
     _ = mark.add_argument("--call-id", default="")
     _ = mark.add_argument("--cycle-id", default="")
     _ = mark.add_argument("--generation", type=int, default=0)
+    _ = mark.add_argument("--launch", action="store_true")
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
     _ = recipient.add_argument("--name", required=True)
@@ -1674,13 +1751,18 @@ def main(arguments: list[str]) -> int:
         elif action == "wait":
             print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "nothing-to-build":
-            print(answer_nothing_to_build(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
+            answer = answer_nothing_to_build(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+            if isinstance(answer, AnswerRefused):
+                print(answer.text, file=sys.stderr)
+                return 1
+            print(answer.text)
         elif action == "mark":
             call_id = cast(str, options.call_id)
             owner = OwningSession(cast(str, options.session_id)) if hasattr(options, "session_id") else owning_session()
             session_id = waiter_key(call_id) if call_id and not hasattr(options, "session_id") else owner.session_id if isinstance(owner, OwningSession) else ""
             print(mark_gate(session_id, cast(str, options.state), cast(str, options.outcome),
-                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation)))
+                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation),
+                            launch=cast(bool, options.launch)))
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         else:

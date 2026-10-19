@@ -944,7 +944,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
     def test_showrunner_says_an_unmeasured_eta_request_cannot_repeat(self) -> None:
         produce = (SCRIPT.parents[2] / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **Waiting on block.**", 1)[0]
+        unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **No footer.**", 1)[0]
         self.assertNotIn("Ask again only if", unmeasured)
         self.assertIn("the command will not repeat the request", unmeasured)
 

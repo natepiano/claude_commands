@@ -17,18 +17,14 @@ from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
-    from ..hooks.showrunner_footer import (FooterState, footer_state, set_footer_state,
-        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
-        read_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
-        NoDailiesSchedule, Production as FooterProduction)
+    from ..hooks.showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
+        read_pending_reviewed, ReportItem, reports_path)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from showrunner_footer import (FooterState, footer_state, set_footer_state,
-        PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
-        read_pending_reviewed, ReportItem, reports_path, counts_line, open_questions,
-        NoDailiesSchedule, Production as FooterProduction)
+    from showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
+        read_pending_reviewed, ReportItem, reports_path)
 import showrunners
-from dailies_render import (UNREADABLE_LIST, InputError, footer_main, read_outstanding,
+from dailies_render import (UNREADABLE_LIST, InputError, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
     ReviewUnavailableOutstandingQuestion)
 
@@ -204,17 +200,11 @@ def register(production: Production) -> None:
     if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
         _ = prompt_file.write_text(prompt, encoding="utf-8")
     check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
-    # No instance yet means a new production, which starts with its footer off (user, 2026-10-13). A
-    # restart finds its instance, so an existing production keeps the footer it has.
-    new_production = isinstance(instance(updates), InstanceAbsent)
     _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
               "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
               "--check", check, *(["--aligned"] if aligned else [])])
     if isinstance(schedule, UpdatesOnDemand):
         _ = notifier(["stop", updates])
-    if new_production:
-        set_footer_state(production.slug, FooterState.OFF)
-        report("footer", "ok", "off — new production; /showrunner:footer on turns it on")
     if isinstance(instance("stall-watch"), InstanceAbsent):
         run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/stall_watch.py"
         _ = notifier(["new", "stall-watch", "--every", "1", "--run", run])
@@ -493,8 +483,9 @@ def review_open_question(slug: str, item: QuestionForReview) -> PendingQuestion 
     return HeldRegistrationQuestion("; ".join(details + tuple(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
 
 
-def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
-    state = judgment_state(path, "footer")
+def questions(production: Production, path: Path | None) -> None:
+    """Record what waits on the user and review each new question before the reply asks it."""
+    state = judgment_state(path, "questions")
     outstanding = outstanding_path(production)
     if isinstance(state.outstanding, ReplaceOutstanding):
         previous = {item.text: item for item in read_outstanding(outstanding)} if outstanding.exists() else {}
@@ -510,7 +501,7 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
         # Validate all new object questions before starting any review.
         for item in items_by_text.values():
             if item.text not in previous and isinstance(item, OpenQuestionWithoutText):
-                raise RegistrationFailure("footer", f"{item.text}: a new question needs its full text in `question`")
+                raise RegistrationFailure("questions", f"{item.text}: a new question needs its full text in `question`")
         for item in items_by_text.values():
             entry = OutstandingItem(since=previous[item.text].since.strftime("%Y-%m-%dT%H:%M")
                                     if item.text in previous else since, text=item.text)
@@ -530,7 +521,7 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
                     held.append(f"{item.text}: {accepted.details}")
             entries.append(entry)
         if held:
-            raise RegistrationFailure("footer", "question held for review: " + "; ".join(held))
+            raise RegistrationFailure("questions", "question held for review: " + "; ".join(held))
         outstanding.parent.mkdir(parents=True, exist_ok=True)
         instance_dir = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{production.slug}"
         if (instance_dir / "conf").exists():
@@ -547,37 +538,13 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
         reports = reports_path(production.slug)
         reports.parent.mkdir(parents=True, exist_ok=True)
         _ = reports.write_text(json.dumps(list(state.reports.items)) + "\n", encoding="utf-8")
-    # The switch hides the printed footer only. What waits on the user is stored above either way,
-    # so the dailies and the open-questions count still see it.
-    place = showrunners.place_of(production.slug)
-    if footer_state(production.slug) is FooterState.OFF:
-        # The reply ends with the counts line instead, the open questions counted in it.
-        counted = FooterProduction(production.slug, production.doc, str(production.zone),
-                                   NoDailiesSchedule.PAUSED_OR_UNSCHEDULED)
-        questions = open_questions([counted], {production.slug: place.below})
-        line = counts_line([counted], questions or 0)
-        if line is not None:
-            print(line)
-        report("footer", "ok", "footers off")
-        return
-    schedule = instance(f"showrunner-{production.slug}")
-    next_run: str | None = None
-    if isinstance(schedule, InstancePresent) and not schedule.output.splitlines()[0].endswith(", stopped"):
-        match = re.search(r"(?m)^next_due=(\d+)", schedule.output)
-        if match is not None:
-            due = datetime.fromtimestamp(int(match.group(1)), production.zone)
-            days = (due.date() - datetime.now(production.zone).date()).days
-            next_run = due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
-    if footer_main(str(production.zone), next_run, None, outstanding, nothing_needed=nothing_needed,
-                   below=[outstanding_file(slug) for slug in place.below], root=place.root, doc=production.doc):
-        raise RegistrationFailure("footer", "renderer refused the footer")
-    report("footer", "ok", "rendered")
+    report("questions", "ok", "recorded")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("register", "time", "log", "footer", "open"):
+    for action in ("register", "time", "log", "questions", "open"):
         subcommand = commands.add_parser(action)
         _ = subcommand.add_argument("--production", type=Path, required=True)
         if action == "register":
@@ -589,9 +556,8 @@ def main() -> int:
             _ = subcommand.add_argument("event")
             _ = subcommand.add_argument("--state", type=Path)
             _ = subcommand.add_argument("--before-compaction", action="store_true")
-        elif action == "footer":
+        elif action == "questions":
             _ = subcommand.add_argument("--state", type=Path)
-            _ = subcommand.add_argument("--nothing-needed", action="store_true")
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
@@ -605,7 +571,7 @@ def main() -> int:
         elif action == "open":
             open_items(production)
         else:
-            footer(production, cast(Path | None, args.state), cast(bool, args.nothing_needed))
+            questions(production, cast(Path | None, args.state))
         return 0
     except (RegistrationFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         step = error.step if isinstance(error, RegistrationFailure) else action

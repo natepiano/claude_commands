@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rules
+import coverage_report
 import style_ledger
 import style_proposals
 import add_style
@@ -306,11 +307,49 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(fields["backlog_goal"], [])
             self.assertTrue(all(len(path.name) <= 50 for path in paths))
             self.assertEqual(len(open_issues(self.proposals, "proposal")), ledger.summary().proposals)
-            self.assertEqual(len(proposals_table.issue_rows(self.proposals)), ledger.summary().proposals)
+            self.assertEqual(len(proposals_table.issue_rows(open_issues(self.proposals, "proposal"))), ledger.summary().proposals)
             before = {path: path.read_bytes() for path in paths}
             self.assertEqual(self.file(ledger), ())
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
             self.assertEqual(len(self.calls), 4)
+
+    def test_file_reads_workspace_once_for_many_findings_in_multiple_crates(self) -> None:
+        with self.ledger() as ledger:
+            findings = tuple(self.hold(ledger, crate=crate, line=line)
+                             for crate in ("alpha", "beta") for line in range(1, 5))
+            with mock.patch.object(coverage_report, "workspace", wraps=coverage_report.workspace) as workspace:
+                paths = self.file(ledger)
+                workspace.assert_called_once_with(ledger, self.tip)
+            self.assertEqual(len(paths), 2)
+            for path in paths:
+                fields = frontmatter(path)
+                crate = next(finding.path.split("/")[0] for finding in findings
+                             if finding.finding_id == fields["style_findings"][0])
+                self.assertEqual(set(fields["style_findings"]),
+                                 {finding.finding_id for finding in findings if finding.path.startswith(crate + "/")})
+                self.assertIn("# Style rename: names\n", path.read_text())
+                self.assertIn("Proposed ranking: goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐ · urgency ⭐ · effort ⭐⭐\n",
+                              path.read_text())
+
+    def test_rank_reads_workspace_and_held_findings_once_for_multiple_issues_and_crates(self) -> None:
+        with self.ledger() as ledger:
+            for crate in ("alpha", "beta"):
+                for line in range(1, 5):
+                    _ = self.hold(ledger, crate=crate, line=line)
+            paths = self.file(ledger)
+            self.assertEqual(len(paths), 2)
+            expected = {path: path.read_bytes() for path in paths}
+            for path in paths:
+                _ = path.write_bytes(re.sub(rb"Proposed ranking: [^\n]*", b"Proposed ranking: ", expected[path]))
+            output = io.StringIO()
+            with (mock.patch.object(coverage_report, "workspace", wraps=coverage_report.workspace) as workspace,
+                  mock.patch.object(ledger, "held_findings", wraps=ledger.held_findings) as held_findings,
+                  redirect_stdout(output)):
+                style_proposals.rank_proposals(ledger, self.proposals)
+                workspace.assert_called_once_with(ledger, self.tip)
+                held_findings.assert_called_once_with(style_ledger.AllHeldFindings())
+            self.assertEqual({path: path.read_bytes() for path in paths}, expected)
+            self.assertTrue(output.getvalue().endswith("ranked 2 issues\n"))
 
     def test_package_project_uses_its_base_shorthand_and_return_link(self) -> None:
         self.write("alpha/Cargo.toml", '[package]\nname = "hana_diegetic"\nversion = "0.1.0"\n')
@@ -501,7 +540,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(frontmatter(issue)["reason"], ["declined: Keep the API"])
             self.assertEqual(ledger.summary().proposals, 0)
             self.assertEqual(open_issues(self.proposals, "proposal"), [])
-            self.assertEqual(proposals_table.issue_rows(self.proposals), [])
+            self.assertEqual(proposals_table.issue_rows(open_issues(self.proposals, "proposal")), [])
             calls = len(self.calls)
             style_proposals.decline(ledger, issue, "Keep the API")
             self.assertEqual(len(self.calls), calls)

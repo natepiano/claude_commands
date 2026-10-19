@@ -67,6 +67,9 @@ export function UnitView(elements: PaneElements, columns: number, bodyRows: numb
   const eta = etaText(unit, now);
   const gate = gateText(unit);
   const finish = finishText(unit, now);
+  const heading = !unit.phase ? unit.stage : unit.phase.kind === 'ticket'
+    ? `Ticket ${unit.phase.id} · ${unit.phase.merged} merged · ${unit.stage}`
+    : `Phase ${unit.phase.id} of ${unit.phase.of} · ${unit.stage}`;
   const trail = unit.eta?.trail.map(([eta, stated]) => `${eta.text} said ${stated.text}`).join(' → ') ?? '';
   const strip = stripCells(unit.phases);
   const slotWidth = Math.max(0, ...unit.workers.map(worker => cellWidth(worker.slot))) + 1;
@@ -89,11 +92,13 @@ export function UnitView(elements: PaneElements, columns: number, bodyRows: numb
 
   function sections(): UnitSection[] {
     const overview = [row(<Box justifyContent="space-between">
-      <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {unit.phase ? `Phase ${unit.phase.id} of ${unit.phase.of} · ` : ''}{unit.stage}</Text>
+      <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {heading}</Text>
       <Button key="back" label="board" plain onPress={back} />
     </Box>, 'navigation')];
-    if (unit.phase?.title || unit.plan) overview.push(row(<Text bold wrap="truncate-end">{unit.phase?.title || unit.plan}</Text>));
-    if (unit.phase && unit.plan) overview.push(row(<Text color="subtle" wrap="truncate-end">{unit.plan}</Text>));
+    if (unit.phase?.title) overview.push(row(<Text bold wrap="truncate-end">{unit.phase.title}</Text>));
+    if (unit.plan) overview.push(row(unit.phase
+      ? <Text color="subtle" wrap="truncate-end">{unit.plan}</Text>
+      : <Text bold wrap="truncate-end">{unit.plan}</Text>));
     overview.push(...wrappedLines(unit.summary, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
     overview.push(row(<Text color="subtle" wrap="truncate-end">as of {data.as_of.text}</Text>));
     const timing: UnitRow[] = [];

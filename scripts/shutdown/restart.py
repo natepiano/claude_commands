@@ -92,7 +92,6 @@ import launch_permission as restore_permission  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import remote_control  # noqa: E402
-import showrunner_footer  # noqa: E402
 import stop as stop_work  # noqa: E402
 from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -749,14 +748,6 @@ def herdr_space(session: Session) -> str:
     return "ad-hoc"
 
 
-def herdr_tab_title(session: Session) -> str:
-    """The session's tab title in that workspace: a showrunner's name loses its production prefix."""
-    if session["kind"] == "showrunner":
-        from showrunners import production_slug, tab_title
-        return tab_title(production_slug(session["doc"]), session["name"])
-    return session["name"]
-
-
 class HerdrDestinationTaken(OSError):
     """An exclusive launch found an occupied destination, before opening a pane."""
 
@@ -1163,8 +1154,7 @@ def _herdr_launch(
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
         if name == herdr.shared_session():
-            pane = herdr.open_tab(name, herdr_space(session), herdr_tab_title(session), session["name"], parts.cwd,
-                                  environment)
+            pane = herdr.open_tab(name, herdr_space(session), session["name"], parts.cwd, environment)
         else:
             pane = herdr.open_pane(name, name, parts.cwd, environment)
         try:
@@ -1437,11 +1427,6 @@ def _restore_timers(
                             reason=_error_reason(error),
                         )
                     )
-        footer = timer["footer"]
-        if footer["kind"] == "footer" and not dry_run:
-            showrunner_footer.set_footer_state(
-                footer["slug"], showrunner_footer.FooterState.ON
-            )
     return tuple(failures)
 
 
@@ -2338,7 +2323,7 @@ def _launch_codex_snapshot(
                                   exclusive=True)
     try:
         pane = herdr.open_pane(name, name, owner["cwd"], {"CODEX_HOME": launch["home"]})
-        _ = herdr.start_agent(name, pane, kind="codex", agent_arguments=arguments,
+        _ = herdr.start_agent(name, pane, kind="codex", agent=name, agent_arguments=arguments,
                           opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
         herdr.stop_created_server(name, server)

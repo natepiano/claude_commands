@@ -150,14 +150,16 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
     }
   }
   return <Box flexDirection="column">
-    {boards.length === 0 && bodyRows > 0 && <Text color="inactive">No running productions.</Text>}
+    {boards.length === 0 && bodyRows > 0 && <Text color="inactive">Run /showrunner:unit_board in a showrunner session.</Text>}
     {boards.map(({ data, folds, blocks, hidden, showHeader, showOverflow }) => <Box flexDirection="column" flexShrink={0}>
       {showHeader && <Box justifyContent="space-between">
         <Text bold wrap="truncate-end">{data.production}</Text>
         <Text color="subtle" wrap="truncate-end">{data.units.length} units · as of {data.as_of.text}</Text>
       </Box>}
       {blocks.map(({ unit, strip, eta, gate, finish, workers, detailRows, compact }) => {
-        const heading = unit.phase ? `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}` : `  ${unit.stage}`;
+        const heading = !unit.phase ? `  ${unit.stage}` : unit.phase.kind === 'ticket'
+          ? `  Ticket ${unit.phase.id} · ${unit.phase.merged} merged${unit.phase.title ? `  ${unit.phase.title}` : ''}`
+          : `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}`;
         return <Box flexDirection="column" flexShrink={0} marginTop={gap}>
           <Box justifyContent="space-between">
             <Text wrap="truncate-end"><Text color={unit.state === 'running' ? 'suggestion' : 'inactive'}>● </Text>

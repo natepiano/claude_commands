@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Block a showrunner reply whose final lines are not its current footer, or that answers a turn
-the user did not start with anything but "-" when nothing needs the user."""
+"""Block a showrunner reply that asks the user a question not recorded and reviewed first.
+
+The file keeps its name because settings.json names it; the reply footer it once checked is gone.
+"""
 
 from __future__ import annotations
 
@@ -12,9 +14,7 @@ from typing import TypedDict, cast
 
 class StopPayload(TypedDict, total=False):
     session_id: str
-    transcript_path: str
     last_assistant_message: str
-    stop_hook_active: bool
     agent_id: str
 
 
@@ -53,20 +53,9 @@ def main() -> None:
     instances = showrunner_instances(session_id)
     if not instances:
         return
-    from pathlib import Path
-
     import showrunner_footer
-    import turn_input
 
-    transcript = payload.get("transcript_path", "")
-    turn = turn_input.read_turn(Path(transcript)) if transcript else None
-
-    states: dict[str, showrunner_footer.FooterState] = {}
-    for instance in instances:
-        slug = os.path.basename(instance).removeprefix("showrunner-")
-        states[slug] = showrunner_footer.footer_state(slug)
-    reason = showrunner_footer.block_reason(instances, reply, states,
-                                            skip_footer=payload.get("stop_hook_active", False), turn=turn)
+    reason = showrunner_footer.block_reason(instances, reply)
     if reason is not None:
         print(json.dumps({"decision": "block", "reason": reason}))
 

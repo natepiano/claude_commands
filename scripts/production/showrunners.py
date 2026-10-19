@@ -272,11 +272,6 @@ def herdr_space(slug: str, doc: str) -> str:
     return line[1] if line else slug
 
 
-def tab_title(slug: str, session: str) -> str:
-    """A session's tab title in its production's workspace: its name without the production prefix."""
-    return session.removeprefix(f"{slug}-")
-
-
 def current_address(slug: str) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""
@@ -297,15 +292,21 @@ def named(showrunner: str) -> Showrunner:
     raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
 
 
-def timer_slugs(state_dir: Path | None = None) -> set[str]:
-    """Every production with a complete update timer, whether or not its showrunner runs."""
-    found: set[str] = set()
+def timer_docs(state_dir: Path | None = None) -> dict[str, Path]:
+    """Each production with a complete update timer, by slug, with its doc, whether or not its showrunner runs."""
+    found: dict[str, Path] = {}
     for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
         try:
-            found.add(_timer(instance).slug)
+            timer = _timer(instance)
         except (OSError, KeyError, ValueError, UnicodeError):
             continue
+        found[timer.slug] = timer.doc
     return found
+
+
+def timer_slugs(state_dir: Path | None = None) -> set[str]:
+    """Every production with a complete update timer, whether or not its showrunner runs."""
+    return set(timer_docs(state_dir))
 
 
 def _stored_parent(child: str) -> str:

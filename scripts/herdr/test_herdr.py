@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -86,6 +86,10 @@ class WaitingAgentCLI:
         self.returncode = -9
 
 
+REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
+REAL_LOAD_FACTOR = herdr.load_factor
+
+
 @final
 class PromptSubmissionTests(unittest.TestCase):
     """Real scratch transcripts, with every pane command and elapsed second faked."""
@@ -116,6 +120,8 @@ class PromptSubmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"}, clear=True)))
+        # Test limits stay as written on a loaded machine.
+        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         self.transcript = herdr.SessionTranscript(self.root / ".claude3", "moved-session")
         self.path = self.transcript.config_dir / "projects/project/moved-session.jsonl"
         self.path.parent.mkdir(parents=True)
@@ -901,6 +907,8 @@ class HerdrTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
+        # Test limits stay as written on a loaded machine.
+        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         # These fixtures specify process startup and argv; PromptSubmissionTests
         # exercises the real transcript/readiness path without this substitute.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -1879,7 +1887,7 @@ class HerdrTests(unittest.TestCase):
         options = ["--label", "boss", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
             "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
-        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
+        self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
         self.assertEqual(self.commands()[1:], [["--session", "fixture", "workspace", "create", *options],
                                                ["--session", "fixture", "tab", "rename", "w1:t1", "boss"],
                                                ["--session", "fixture", "pane", "rename", "w1:p1", "boss"]])
@@ -1889,9 +1897,9 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(tab, json.dumps({"result": {"root_pane": {"pane_id": "w1:p2"}}}))
         self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
             {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]}}))
-        self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "prod-alpha", "/wt", {}), "w1:p2")
+        self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
         self.assertEqual(self.commands()[-4:], [["--session", "fixture", *tab],
-                                                ["--session", "fixture", "pane", "rename", "w1:p2", "prod-alpha"],
+                                                ["--session", "fixture", "pane", "rename", "w1:p2", "alpha"],
                                                 ["--session", "fixture", "workspace", "list"],
                                                 ["--session", "fixture", "tab", "list", "--workspace", "w1"]])
 
@@ -1914,6 +1922,26 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
                                  ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "delta"],
                                  ["tab", "focus", "w1:t5"], ["workspace", "focus", "w2"]])
+
+    def test_retitle_names_the_pane_and_tab_then_orders_only_on_a_change(self) -> None:
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t1", "label": "boss"}, {"tab_id": "w1:t2", "label": "old-name"}]}}))
+        for label, changed in (("old-name", True), ("new-name", False)):
+            with self.subTest(label=label):
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+                    {"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1", "label": label}]}}))
+                if not changed:
+                    self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+                        {"tab_id": "w1:t2", "label": "new-name"}]}}))
+                self.log.unlink(missing_ok=True)
+                with patch.object(herdr.Herdr, "order_tabs", return_value={}) as ordered:
+                    self.assertEqual(herdr.Herdr("fixture").retitle("w1:p2", "new-name"), changed)
+                acted = [command[2:] for command in self.commands() if command[3:4] == ["rename"]]
+                self.assertEqual(acted, [["pane", "rename", "w1:p2", "new-name"], ["tab", "rename", "w1:t2", "new-name"]]
+                                 if changed else [])
+                self.assertEqual(ordered.call_args_list, [call("w1")] if changed else [])
+        with self.assertRaisesRegex(herdr.HerdrFailure, "no pane"):
+            _ = herdr.Herdr("fixture").retitle("w9:p9", "new-name")
 
     def test_order_tabs_leaves_a_tab_with_several_panes_and_an_ordered_space_alone(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
@@ -2237,6 +2265,54 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
                                      {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "w1:p1"))
+
+    def test_a_slow_start_on_a_loaded_machine_still_gets_its_opening_prompt(self) -> None:
+        # Claude is ready for input 200 s after the start: past the 90 s limit, inside it scaled by load.
+        for factor, typed_at, limit in ((4.0, 200.0, "300000"), (1.0, None, "90000")):
+            with self.subTest(factor=factor):
+                clock: list[float] = [0.0]
+                started: list[list[str]] = []
+                typed: list[float] = []
+
+                def sleep(seconds: float) -> None:
+                    clock[0] += seconds
+
+                def start(_client: herdr.Herdr, argv: list[str], _kind: str, _pane: str,
+                          _timeout: float) -> subprocess.CompletedProcess[str]:
+                    started.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                def state(_client: herdr.Herdr, _pane: str, _transcript: object, _launched_at: datetime, *,
+                          cursor: object = None) -> herdr.PromptInputReady | herdr.PromptInputNotReady:
+                    del cursor
+                    return (herdr.PromptInputReady("composer", True) if clock[0] >= 200
+                            else herdr.PromptInputNotReady("destination session is still loading"))
+
+                def prompt(_client: herdr.Herdr, _pane: str, _text: str) -> None:
+                    typed.append(clock[0])
+
+                with (patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)),
+                      patch.object(herdr, "load_factor", return_value=factor),
+                      patch.object(herdr.Herdr, "submit_opening_prompt", REAL_SUBMIT_OPENING_PROMPT),
+                      patch.object(herdr.Herdr, "start_command", autospec=True, side_effect=start),
+                      patch.object(herdr.Herdr, "prompt_input_state", autospec=True, side_effect=state),
+                      patch.object(herdr.Herdr, "prompt", autospec=True, side_effect=prompt)):
+                    outcome = self.herdr.start_agent("worker", "pane-1", "claude", [], herdr.OpeningPrompt("go"), 90_000)
+                self.assertEqual(started[0][started[0].index("--timeout") + 1], limit)
+                assert isinstance(outcome, herdr.PromptNotSubmitted)
+                if typed_at is None:
+                    self.assertEqual((outcome.reason, outcome.never_typed, typed),
+                                     ("destination never became ready for input", True, []))
+                else:
+                    self.assertEqual(len(typed), 1)
+                    self.assertGreaterEqual(typed[0], typed_at)
+                    self.assertFalse(outcome.never_typed)
+
+    def test_load_factor_is_the_load_per_cpu_from_one_to_six(self) -> None:
+        for load, factor in ((4.0, 1.0), (64.0, 2.0), (400.0, 6.0)):
+            with (self.subTest(load=load), patch.object(os, "getloadavg", return_value=(load, 0.0, 0.0)),
+                  patch.object(os, "cpu_count", return_value=32)):
+                self.assertEqual(REAL_LOAD_FACTOR(), factor)
 
     def test_agent_not_ready_reads_screen_without_input(self) -> None:
         arguments = ["agent", "start", "worker", "--kind", "claude", "--pane", "pane-1", "--timeout", "100", "--", "--model", "fixture-model"]
@@ -2565,18 +2641,16 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "agent_arguments must omit"):
             _ = herdr.start_agent(
                 "fixture", "pane-1", kind="claude", agent_arguments=["claude", "--resume", "conversation"],
-                opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
+                opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000, agent="worker",
             )
         self.assertEqual(self.commands(), [])
 
-    def test_module_start_passes_extra_arguments_and_uses_pane_label(self) -> None:
-        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{"pane_id": "pane-1", "label": "worker"}]}}))
+    def test_module_start_passes_extra_arguments_and_names_the_agent(self) -> None:
         _ = herdr.start_agent(
             "fixture", "pane-1", kind="claude", agent_arguments=["--resume", "conversation"],
-            opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000,
+            opening=herdr.OpeningPrompt("continue"), timeout_ms=10_000, agent="worker",
         )
         self.assertEqual(self.start_commands(), [
-            ["--session", "fixture", "pane", "list"],
             ["--session", "fixture", "agent", "start", "worker", "--kind", "claude", "--pane", "pane-1",
              "--timeout", "10000", "--", "--resume", "conversation"],
             ["--session", "fixture", "agent", "prompt", "pane-1", "continue"],
@@ -2589,10 +2663,8 @@ class HerdrTests(unittest.TestCase):
                 with self.subTest(label=label, module_launch=module_launch):
                     self.log.unlink(missing_ok=True)
                     if module_launch:
-                        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-                            {"pane_id": "7pane-1", "label": label},
-                        ]}}))
-                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
+                        _ = herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200,
+                                              agent=label or "7pane-1")
                     else:
                         _ = self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], herdr.OpeningPrompt("continue"), 200)
                     start, prompt = self.start_commands()[-2:]

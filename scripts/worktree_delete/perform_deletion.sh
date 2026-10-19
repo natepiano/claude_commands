@@ -19,10 +19,6 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# python3 goes through the repo shim, which picks an interpreter by VERSION
-# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.10.
-PY="$SCRIPT_DIR/../lib/py"
 # shellcheck source=confirm_gate.sh
 source "$SCRIPT_DIR/confirm_gate.sh"
 
@@ -45,21 +41,6 @@ cleanup_residual_directory() {
         rm -rf "$project_dir"
     fi
 }
-
-# Capture the fix pipeline identity BEFORE removing the worktree. A *_style_fix
-# worktree's dir name may encode its source checkout (e.g.
-# bevy_lagrange_flycam_style_fix), so the history key comes from the
-# .fix-project marker, not the basename — and the marker is gone once the
-# worktree is removed below. Fall back to the basename strip for legacy
-# worktrees created before the marker existed.
-WORKTREE_NAME="$(basename "$WORKTREE_PATH")"
-STYLE_FIX_PROJECT=""
-if [[ "$WORKTREE_NAME" == *_style_fix ]]; then
-    if [[ -f "$WORKTREE_PATH/.fix-project" ]]; then
-        STYLE_FIX_PROJECT="$(tr -d '[:space:]' < "$WORKTREE_PATH/.fix-project")"
-    fi
-    [[ -z "$STYLE_FIX_PROJECT" ]] && STYLE_FIX_PROJECT="${WORKTREE_NAME%_style_fix}"
-fi
 
 # Every git call below runs against the ambient cwd. When the caller's cwd is
 # inside the worktree being removed, that directory stops existing partway
@@ -97,8 +78,7 @@ if ! git branch -D "$BRANCH_NAME"; then
 fi
 echo "Branch deleted."
 
-# A failed remote deletion is reported after the style-fix cleanup below and
-# becomes the exit status.
+# A failed remote deletion becomes the exit status.
 REMOTE_STATUS=0
 if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
     echo ""
@@ -107,25 +87,6 @@ if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
         echo "Remote branch deleted."
     else
         REMOTE_STATUS=1
-    fi
-fi
-
-# A <project>_style_fix worktree carries a fix pipeline pending JSON in
-# fixed_findings state. The history row is already recorded by finalize-fix;
-# the pending file is the only leftover, and while it exists every fix run
-# run skips the project. Remove it here so the cycle can restart.
-# PROJECT (identity/history key) was read from the marker before removal above.
-if [[ -n "$STYLE_FIX_PROJECT" ]]; then
-    PROJECT="$STYLE_FIX_PROJECT"
-    HISTORY_HELPER="$HOME/.claude/scripts/fix/style_history.py"
-    if [[ -f "$HISTORY_HELPER" ]]; then
-        echo ""
-        echo "Style-fix worktree deleted — discarding fix pipeline pending state for: $PROJECT"
-        if "$PY" "$HISTORY_HELPER" discard-pending --project "$PROJECT"; then
-            echo "Pending state discarded."
-        else
-            echo "Warning: discard-pending failed for $PROJECT — the fix pipeline will keep skipping it until ~/rust/nate_style/.history/.pending/$PROJECT.json is removed."
-        fi
     fi
 fi
 

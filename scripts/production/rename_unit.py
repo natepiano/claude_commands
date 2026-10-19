@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "make_a_worktree"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
 import add_unit  # noqa: E402
@@ -40,7 +39,6 @@ import production_units  # noqa: E402
 import proposal_issue  # noqa: E402
 import proposals_folder  # noqa: E402
 import rename_state  # noqa: E402
-import retarget_fix  # noqa: E402
 import review_pool  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
@@ -62,7 +60,7 @@ else:
 RESERVED = frozenset({"review-unit", add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.
 EDITED_COLUMNS = {"## Hub files": ("Owner unit", "Other units that touch it"), "## Gates": ("Waiting", "Waits on")}
-PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id")
+PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept")
 SHUTDOWN = Path(os.environ.get("RENAME_UNIT_SHUTDOWN") or Path(__file__).resolve().parent.parent / "shutdown/shutdown.py")
 STOPPED = frozenset({"stopped", "already gone", "process identity lost"})
 STOPPING = frozenset({"waiting", "reaping", "ready", "stopping", "held by usage limit", "passive worker ready"})
@@ -95,6 +93,8 @@ class UnitRename:
     unit_tip: str = ""
     account: str = ""
     session_id: str = ""
+    # Why the unit branch took no merge: its work was in progress (an open phase or uncommitted work).
+    kept: str = ""
 
     @property
     def message(self) -> str:
@@ -221,14 +221,8 @@ def _preflight(rename: UnitRename) -> None:
         raise RenameRefused(f"destination already exists: {rename.new_worktree}")
     if rename_state.unfinished(rename_state.production_journal(rename.slug)):
         raise RenameRefused(f"{rename.slug}: finish the production rename first")
-    pending = [subject for subject in git(checkout, "log", "--format=%s", f"{rename.merge_branch}..{rename.tip}")
-               .splitlines() if subject.startswith("checkpoint(")]
-    if pending:
-        raise RenameRefused(f"{rename.old} has a checkpoint not merged yet: {pending[0]}")
-    run = unit_move.open_run(Path(rename.old_worktree))
-    phase = unit_move.open_phase(run) if run else ""
-    if phase:
-        raise RenameRefused(f"{rename.old} is in phase {phase}; rename between phases")
+    # A unit mid-phase is renamed too: its commits move with the branch, and _merge leaves work in
+    # progress alone (user, 2026-10-18).
     _check_stoppable(rename)
 
 
@@ -288,8 +282,25 @@ def _subject(directory: Path, ref: str) -> str:
     return git(directory, "show", "-s", "--format=%s", ref)
 
 
+def _in_progress(worktree: Path) -> str:
+    """Why the unit's work is in progress, or empty: a merge into it could lose uncommitted work."""
+    run = unit_move.open_run(worktree)
+    phase = unit_move.open_phase(run) if run else ""
+    if phase:
+        return f"phase {phase} is open"
+    return "the worktree has uncommitted work" if git(worktree, "status", "--porcelain") else ""
+
+
 def _merge(rename: UnitRename, _save: Callable[[], None]) -> None:
     worktree, checkout = Path(rename.old_worktree), Path(rename.checkout)
+    if not rename.merged:
+        rename.kept = _in_progress(worktree)
+    if rename.kept:
+        # Work in progress keeps its tip: the unit takes the merge branch and the rename commit
+        # at its own next merge.
+        unit_move.check_tip(checkout, rename.old_branch, rename.tip)
+        rename.merged = rename.tip
+        return
     _ = git(checkout, "fetch", "origin", rename.merge_branch)
     message = f"merge({rename.old_branch}): origin/{rename.merge_branch} before renaming {rename.old} to {rename.new}"
     head = git(worktree, "rev-parse", "HEAD")
@@ -340,24 +351,15 @@ def _commit_doc(rename: UnitRename, save: Callable[[], None]) -> None:
 def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
     """The unit branch takes the rename commit, so the unit's next checkpoint carries the new names."""
     worktree = Path(rename.new_worktree)
+    if not rename.unit_tip and rename.kept:
+        rename.unit_tip = rename.merged
+        save()
     if not rename.unit_tip:
         message = f"merge({rename.new_branch}): {rename.merge_branch} at {rename.doc_commit[:8]} — {rename.message}"
         rename.unit_tip = unit_move.merge_into(worktree, rename.doc_commit, message)
         save()
     unit_move.check_tip(Path(rename.checkout), rename.new_branch, rename.unit_tip)
     _ = git(worktree, "push", "origin", f"{rename.new_branch}:refs/heads/{rename.new_branch}")
-
-
-def _move_fix_redirects(rename: UnitRename) -> None:
-    old, new = Path(rename.old_worktree), Path(rename.new_worktree)
-    conf = retarget_fix.DEFAULT_CONF
-    # fix.conf names checkouts relative to ~/rust; a worktree elsewhere has no redirect.
-    if old.parent != Path.home() / "rust" or not conf.exists():
-        return
-    lines, moved = retarget_fix.move(retarget_fix.read_conf(conf), old.name, new.name)
-    if moved:
-        write_text(conf, "\n".join(lines) + "\n")
-        _ = retarget_fix.commit_conf(conf, f"fix.conf: {rename.old} renamed to {rename.new}")
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -376,7 +378,6 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     for issue in _unit_proposals(rename, rename.old):
         _ = proposal_issue.edit(issue.path, {"unit": rename.new}, today)
     _ = phase_table.rename_unit(rename.slug, rename.old, rename.new)
-    _move_fix_redirects(rename)
 
 
 def _retire(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -450,7 +451,10 @@ def renamed_note(rename: UnitRename) -> str:
     plans = ", ".join(str(path).replace(rename.checkout, rename.new_worktree, 1) for path in _plans(rename))
     return (f"While you were stopped the showrunner renamed you: you are now {rename.new}, in worktree "
             + f"{rename.new_worktree} on branch {rename.new_branch}"
-            + (f", and your plan is at {plans}" if plans else "") + ". Use these names from now on.")
+            + (f", and your plan is at {plans}" if plans else "") + ". Use these names from now on."
+            + (f" Your work was in progress ({rename.kept}), so your branch kept its commits and took no merge: "
+               + f"the rename commit comes with your next merge of {rename.merge_branch}. Your paused Codex seats "
+               + f"now work in {rename.new_worktree}; say so in your next message to each." if rename.kept else ""))
 
 
 def _restart_record(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -554,10 +558,6 @@ def _state_failures(rename: UnitRename) -> list[str]:
     failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(rename.slug, rename.old))
-    conf = retarget_fix.DEFAULT_CONF
-    if old.parent == Path.home() / "rust" and conf.exists() and retarget_fix.move(
-            retarget_fix.read_conf(conf), old.name, new.name)[1]:
-        failures.append(f"{conf}: a redirect still names {old.name}")
     return failures
 
 
@@ -625,7 +625,8 @@ def _describe_stop(r: UnitRename) -> str:
 
 
 def _describe_merge(r: UnitRename) -> str:
-    return f"merge origin/{r.merge_branch} into {r.old_branch} in {r.old_worktree}"
+    return (f"merge origin/{r.merge_branch} into {r.old_branch} in {r.old_worktree}, unless its work is in "
+            + "progress (an open phase or uncommitted work): then the branch keeps its tip")
 
 
 def _describe_git(r: UnitRename) -> str:
@@ -641,12 +642,12 @@ def _describe_doc(r: UnitRename) -> str:
 
 
 def _describe_merge_rename(r: UnitRename) -> str:
-    return f"{r.new_branch}: merge the rename commit and push it"
+    return f"{r.new_branch}: merge the rename commit and push it, unless the merge step kept the tip"
 
 
 def _describe_state(r: UnitRename) -> str:
     return ("state: report scratch, stall-watch stretch, reviewer leases and memory, run record, open proposals, "
-            + f"phase notes, fix.conf redirects: {r.old} -> {r.new}")
+            + f"phase notes: {r.old} -> {r.new}")
 
 
 def _describe_retire(r: UnitRename) -> str:
@@ -690,9 +691,9 @@ def _load(path: Path) -> UnitRename:
     if (not all(isinstance(fields.get(name), str) and fields.get(name) for name in REQUIRED)
             or type(step) is not int or not all(isinstance(fields.get(name, ""), str) for name in PROGRESS)):
         raise RenameRefused(f"{path}: invalid unit rename journal")
-    merged, doc_commit, unit_tip, account, session_id = (cast(str, fields.get(name, "")) for name in PROGRESS)
+    merged, doc_commit, unit_tip, account, session_id, kept = (cast(str, fields.get(name, "")) for name in PROGRESS)
     return UnitRename(*(cast(str, fields[name]) for name in REQUIRED), step=step, merged=merged,
-                      doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id)
+                      doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id, kept=kept)
 
 
 def _save(path: Path, rename: UnitRename) -> None:

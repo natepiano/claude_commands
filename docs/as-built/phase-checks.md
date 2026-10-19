@@ -1,6 +1,6 @@
 # Phase checks
 
-**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of six checks: cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each runs once per phase, and the phase's workers fix what they find. Nothing at the end of the run repeats them, and there is no separate `/clippy` skill: lint and style each have one place in each phase.
+**What it is.** Every `/unit:direct` phase runs one named step, `<PhaseChecks/>`, made of six checks: cargo mend `--fix`, fmt, taplo, clippy, rustdoc and the style review. Each check has one place in the phase. Lint can repeat clippy and fmt to apply multiply-add repairs. The phase's workers fix the remaining failures. Nothing at the end of the run repeats the checks. There is no separate `/clippy` skill.
 
 ## How it works
 
@@ -15,7 +15,7 @@
 | rustdoc `-D warnings` | the same `lint` | the members that differ from HEAD |
 | style review | the unit director's main review in `<DualReview/>`, pass 1 only | the phase's diff from `${PHASE_DIR}/phase_baseline`, untracked files included |
 
-`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy, doc. Mend rewrites the code first, fmt formats what mend wrote, and clippy and rustdoc read the settled tree.
+`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy, doc. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Rustdoc runs after clippy passes. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 
 **Files and their roles**
 
@@ -66,7 +66,7 @@
 
 ## Invariants
 
-- Each of the six checks runs once per phase, at the place `<PhaseChecks/>` names.
+- Each of the six checks runs at the place `<PhaseChecks/>` names. The lint check owns its multiply-add repair rounds and the format and judgment that follow them.
 - Nothing after the last phase repeats them: `verify.sh final` stays check plus tests, `verify.sh` has no `fmt` arm, and `<FinalGate/>`, `<FinalGateCommit/>` and `/unit:checkpoint` do not lint, reformat or style-review.
 - `commands/unit/style_review.md` is the one source of the style review. The phase review reads it at the point of use and never restates it.
 - Workers never load the style guide. The unit director's main review is the only place style is audited in a phase.

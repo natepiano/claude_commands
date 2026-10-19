@@ -27,8 +27,8 @@ from typing import NamedTuple, cast
 
 import showrunners
 from production_units import Refusal
-from issues import Issue, open_issues
-from proposals_folder import PROPOSAL_TAG, issues_folder
+from issues import Issue
+from proposals_folder import open_proposals
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import phase_table
@@ -117,10 +117,10 @@ def issue_state(issue: Issue) -> str:
     return f"approved, not started: {plan}" if plan else REVIEW_STATE
 
 
-def issue_rows(folder: Path) -> list[Row]:
-    """One row per open proposal issue in the folder, oldest first; its title is the file's name."""
+def issue_rows(found: list[Issue]) -> list[Row]:
+    """One row per open proposal issue, oldest first; its title is the file's name."""
     rows = [Row(issue.value("proposed_by") or NONE, issue.path.stem, issue.value("date_created") or NONE,
-                issue_state(issue)) for issue in open_issues(folder, PROPOSAL_TAG)]
+                issue_state(issue)) for issue in found]
     return sorted(rows, key=lambda row: (row.date, row.proposal))
 
 
@@ -209,8 +209,7 @@ def table(rows: list[Row]) -> str:
 
 def open_rows(doc: Path, records: dict[str, object]) -> list[Row]:
     plans = unit_plan_paths(records)
-    folder = issues_folder(doc)
-    rows = issue_rows(folder) if folder is not None else []
+    rows = issue_rows(open_proposals(doc))
     rows += backlog_rows(BACKLOG_DIR)
     for unit, plan in plans.items():
         rows.extend(unit_add_on_rows(unit, plan))

@@ -59,15 +59,8 @@
         "scripts/message",
         "scripts/notify",
         "scripts/production",
-        "scripts/lib"
-      ]
-    },
-    {
-      "root": "scripts/fix",
-      "extraPaths": [
-        "scripts/fix",
-        "scripts/style",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
@@ -178,8 +171,7 @@
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/lib",
-        "scripts/herdr",
-        "scripts/make_a_worktree"
+        "scripts/herdr"
       ]
     },
     {
