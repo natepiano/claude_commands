@@ -120,7 +120,7 @@ Steps on natedev, in order, after promotion:
 
 - The Mac has no `/proc`. There `pane_record` reads a parent with `ps -o ppid= -p <pid>`, and the
   arguments and environment from the kernel's KERN_PROCARGS2 record (`account.kern_procargs2`,
-  parsed by `pane_record.procargs`). On both machines an environment keeps only
+  split by `account.procargs2_parts`). On both machines an environment keeps only
   `CLAUDE_CONFIG_DIR` and the names the entry keeps; every other value, a token included, is
   dropped as it is read. The Mac hides the environment of a system binary such as `/bin/zsh`,
   never of Claude.

@@ -93,23 +93,13 @@ MAC_RECORD = (
     (5).to_bytes(4, sys.byteorder) + b"/opt/claude/bin/claude\0\0\0\0"
     + b"claude\0--name\0alpha-unit\0--model\0opus\0"
     + b"CLAUDE_CONFIG_DIR=/Users/n/.claude3\0CLAUDE_CODE_OAUTH_TOKEN=" + TOKEN.encode()
-    + b"\0SHOWRUNNER_UNIT_ID=alpha-unit\0ENABLE_TOOL_SEARCH=true\0HOME=/Users/n\0"
+    + b"\0SHOWRUNNER_UNIT_ID=alpha-unit\0ENABLE_TOOL_SEARCH=true\0HOME=/Users/n\0\0"
     + b"executable_path=/opt/claude/bin/claude\0\0\0"
 )
 
 
 @final
 class MacRecordTests(unittest.TestCase):
-    def test_a_mac_record_keeps_the_arguments_and_only_the_needed_environment(self) -> None:
-        arguments, environment = pane_record.procargs(MAC_RECORD)
-        self.assertEqual(arguments, ["claude", "--name", "alpha-unit", "--model", "opus"])
-        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/Users/n/.claude3",
-                                       "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true"})
-
-    def test_a_short_mac_record_is_refused(self) -> None:
-        with self.assertRaises(ValueError):
-            _ = pane_record.procargs((9).to_bytes(4, sys.byteorder) + b"/bin/claude\0claude\0")
-
     def test_on_the_mac_a_launch_reads_its_flags_and_never_keeps_the_token(self) -> None:
         parents = {"200": "100\n", "100": "1\n"}
 
