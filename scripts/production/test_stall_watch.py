@@ -27,6 +27,10 @@ from fake_unit_host import HostedUnit
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
 PANE = "— holding: waiting on a decision\n"
+EDIT_PROMPT = ("— holding: waiting on the seats\n\n Edit file\n scripts/herdr/panes.py\n"
+               + " Do you want to make this edit to panes.py?\n ❯ 1. Yes\n   2. No\n")
+BASH_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n\n"
+               + " Do you want to proceed?\n ❯ 1. Yes\n   3. No, and tell Claude what to do differently (esc)\n")
 
 
 def executable(path: Path, source: str) -> None:
@@ -112,7 +116,10 @@ raise SystemExit(1)
         executable(self.bin / "send.py", """#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
-record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text')}
+record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
+          if '--' + name in args}
+if '--value' in args:
+    record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
 line = (json.dumps(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
@@ -239,7 +246,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         units = [
             HostedUnit(str(data["label"]), f"w{data['id']}:p1",
-                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]))
+                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]),
+                       str(data.get("agent_status", "idle")))
             for name, data in self.panes.items()]
         fake_unit_host.write(self.environment, units)
         for unit, data in zip(units, self.panes.values()):
@@ -340,6 +348,47 @@ raise SystemExit(1 if record['to'] in fail else 0)
         second = self.sent()[2:]
         self.assertEqual(len(second), 2)
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
+
+    def test_a_unit_at_a_permission_prompt_alerts_the_user_once_and_is_not_bumped(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        # A failed alert is sent again on the next tick.
+        _ = self.fail_file.write_text('["user"]')
+        failed = self.tick(START + 60)
+        self.assertIn("alert", failed.stderr)
+        _ = self.fail_file.write_text("[]")
+        self.assertEqual(self.tick(START + 120).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        alerts = self.sent()
+        self.assertEqual(len(alerts), 2, alerts)
+        self.assertEqual(alerts[-1]["to"], "user")
+        self.assertEqual(alerts[-1]["text-id"], "stall_watch.permission_prompt")
+        self.assertEqual(alerts[-1]["need"], "blocked")
+        values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
+        self.assertEqual((values["unit"], values["request"], values["since"]), ("unit-one", "edit panes.py", "12:00 PDT"))
+        # No bump and no tell while it waits on the user.
+        self.assertNotIn("uds:", " ".join(item["to"] for item in alerts))
+        # The prompt is answered: the idle clock starts again, and a new prompt alerts again.
+        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"]["pane"] = "— holding: ready for next step\n"
+        self.assertEqual(self.tick(START + 960).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.assertEqual(self.tick(START + 1000).returncode, 0)
+        self.assertEqual(self.tick(START + 1060).returncode, 0)
+        self.assertEqual([item["to"] for item in self.sent()[2:]], ["user"])
+
+    def test_the_request_is_read_from_the_prompt_at_the_bottom_of_the_pane(self) -> None:
+        import stall_watch
+        self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT), "edit panes.py")
+        self.assertEqual(stall_watch.prompt_request(BASH_PROMPT),
+                         "run a shell command to read lines 5 to the end of a saved output")
+        self.assertEqual(stall_watch.prompt_request(" Do you want to create notes.md?\n ❯ 1. Yes\n"), "create notes.md")
+        self.assertEqual(stall_watch.prompt_request("Bash command\n\n   ls\n\n Do you want to proceed?\n"),
+                         "run a shell command")
+        self.assertEqual(stall_watch.prompt_request("— holding: waiting\n"), "go on with its work")
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)

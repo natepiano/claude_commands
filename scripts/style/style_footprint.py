@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
+from functools import lru_cache
 import difflib
 import json
 import os
@@ -142,9 +144,26 @@ def folded_base(repo: Path, base: str, head: str) -> str:
     return current
 
 
-def tokens(text: str) -> tuple[Token, ...]:
+@dataclass(frozen=True)
+class TokenizedText:
+    tokens: tuple[Token, ...]
+    lines: tuple[int, ...]
+
+
+@lru_cache(maxsize=128)
+def tokenized_text(text: str) -> TokenizedText:
     """Keep literals opaque; comments cannot turn their contents into Rust code."""
     result: list[Token] = []
+    lines: list[int] = []
+    previous, line = 0, 1
+
+    def append(token: Token) -> None:
+        nonlocal previous, line
+        line += text.count("\n", previous, cursor)
+        previous = cursor
+        result.append(token)
+        lines.append(line)
+
     cursor = 0
     while cursor < len(text):
         if text[cursor].isspace():
@@ -167,40 +186,44 @@ def tokens(text: str) -> tuple[Token, ...]:
                 else:
                     cursor += 1
             if depth:
-                result.append(Token("unterminated comment", "unknown"))
+                append(Token("unterminated comment", "unknown"))
             continue
         raw = RAW_STRING.match(text, cursor)
         if raw:
             terminator = '"' + raw.group(1)
             end = text.find(terminator, raw.end())
             finish = len(text) if end < 0 else end + len(terminator)
-            result.append(Token(text[cursor:finish], "literal" if end >= 0 else "unknown"))
+            append(Token(text[cursor:finish], "literal" if end >= 0 else "unknown"))
             cursor = finish
             continue
         quoted = QUOTED_LITERAL.match(text, cursor)
         if quoted:
-            result.append(Token(quoted.group(), "literal"))
+            append(Token(quoted.group(), "literal"))
             cursor = quoted.end()
             continue
         number = NUMBER.match(text, cursor)
         if number:
-            result.append(Token(number.group(), "literal"))
+            append(Token(number.group(), "literal"))
             cursor = number.end()
             continue
         identifier = IDENTIFIER.match(text, cursor)
         if identifier:
             word = identifier.group()
-            result.append(Token(word, "literal" if word in {"true", "false"} else "identifier"))
+            append(Token(word, "literal" if word in {"true", "false"} else "identifier"))
             cursor = identifier.end()
             continue
         punctuation = PUNCTUATION.match(text, cursor)
         if punctuation:
-            result.append(Token(punctuation.group(), "punctuation"))
+            append(Token(punctuation.group(), "punctuation"))
             cursor = punctuation.end()
             continue
-        result.append(Token(text[cursor], "unknown"))
+        append(Token(text[cursor], "unknown"))
         cursor += 1
-    return tuple(result)
+    return TokenizedText(tuple(result), tuple(lines))
+
+
+def tokens(text: str) -> tuple[Token, ...]:
+    return tokenized_text(text).tokens
 
 
 def parse_hunks(patch: str) -> tuple[Hunk, ...]:
@@ -369,8 +392,16 @@ class RevisionTree:
 
 
 def public_glob(source: str) -> bool:
-    words = " ".join(token.value for token in tokens(source))
-    return re.search(r"\bpub use\b[^;]*\*", words) is not None
+    words = tuple(token.value for token in tokens(source))
+    public_use = False
+    for index, word in enumerate(words):
+        if word == "use":
+            public_use = index > 0 and words[index - 1] == "pub"
+        elif word == ";":
+            public_use = False
+        elif word == "*" and public_use:
+            return True
+    return False
 
 
 def documented_text(source: str) -> tuple[str, ...]:
@@ -437,10 +468,11 @@ def attribute_spans(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
 def attribute_owners(words: tuple[str, ...]) -> dict[int, int]:
     owners: dict[int, int] = {}
     spans = attribute_spans(words)
+    following_attributes = dict(spans)
     for start, end in spans:
         cursor = end
         while cursor < len(words):
-            following = next((finish for begin, finish in spans if begin == cursor), cursor)
+            following = following_attributes.get(cursor, cursor)
             if following != cursor:
                 cursor = following
                 continue
@@ -788,6 +820,8 @@ def lint_attributes(source: tuple[Token, ...]) -> tuple[LintAttribute, ...]:
 def prove_lint_removals(change: FileChange) -> LintAttributeProof:
     old, new = tokens(change.before), tokens(change.after)
     old_attributes, new_attributes = lint_attributes(old), lint_attributes(new)
+    if not old_attributes:
+        return LintAttributeProof()
 
     def units(source: tuple[Token, ...], attributes: tuple[LintAttribute, ...]) -> tuple[tuple[int, int], ...]:
         spans = {item.start: item.end for item in attributes}
@@ -802,11 +836,36 @@ def prove_lint_removals(change: FileChange) -> LintAttributeProof:
     old_units, new_units = units(old, old_attributes), units(new, new_attributes)
     old_by_start = {item.start: item for item in old_attributes}
     new_by_start = {item.start: item for item in new_attributes}
-    matcher = difflib.SequenceMatcher(None, tuple(old[start:end] for start, end in old_units),
-                                     tuple(new[start:end] for start, end in new_units), autojunk=False)
+    old_starts = tuple(start for start, _ in old_units)
+    new_starts = tuple(start for start, _ in new_units)
+    old_ends = tuple(end for _, end in old_units)
+    new_ends = tuple(end for _, end in new_units)
+    operations: list[tuple[str, int, int, int, int]] = []
+    offset = 0
+    for hunk in change.hunks:
+        new_line = hunk.old_start + (not hunk.old_count) + offset
+        ranges: list[tuple[int, int]] = []
+        for text, line, count, starts, ends in (
+            (change.before, hunk.old_start, len(hunk.removed), old_starts, old_ends),
+            (change.after, new_line, len(hunk.added), new_starts, new_ends),
+        ):
+            parsed = tokenized_text(text)
+            start = bisect_left(parsed.lines, line)
+            end = bisect_left(parsed.lines, line + count)
+            # A changed line inside a multiline attribute owns the whole unit.
+            begin = bisect_left(ends, start + 1)
+            ranges.append((begin, bisect_left(starts, end)))
+        (old_begin, old_finish), (new_begin, new_finish) = ranges
+        matcher = difflib.SequenceMatcher(
+            None, tuple(old[start:end] for start, end in old_units[old_begin:old_finish]),
+            tuple(new[start:end] for start, end in new_units[new_begin:new_finish]), autojunk=False,
+        )
+        operations.extend((operation, a + old_begin, b + old_begin, c + new_begin, d + new_begin)
+                          for operation, a, b, c, d in matcher.get_opcodes())
+        offset += len(hunk.added) - hunk.old_count
     before: list[TokenRewrite] = []
     after: list[TokenRewrite] = []
-    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+    for operation, old_start, old_end, new_start, new_end in operations:
         if operation == "equal":
             continue
         removed = old_units[old_start:old_end]
@@ -828,7 +887,7 @@ def prove_lint_removals(change: FileChange) -> LintAttributeProof:
         if cursor == len(added):
             before.extend(TokenRewrite(start, end, ()) for start, end in removed)
             after.extend(pending)
-    return LintAttributeProof(tuple(before), tuple(after))
+    return LintAttributeProof(tuple(dict.fromkeys(before)), tuple(dict.fromkeys(after)))
 
 
 def original_rewrites(source: tuple[Token, ...], omitted: tuple[TokenRewrite, ...],
@@ -875,20 +934,28 @@ def use_paths(words: tuple[str, ...], prefix: tuple[str, ...] = ()) -> tuple[tup
 
 def use_items(words: tuple[str, ...]) -> tuple[UseItem, ...]:
     result: list[UseItem] = []
-    spans = attribute_spans(words)
+    attributes_by_end = {end: start for start, end in attribute_spans(words)}
+    opening = {end: start for start, end in delimiter_ends(words).items()}
+    semicolons = [len(words)] * len(words)
+    following = len(words)
+    for index in range(len(words) - 1, -1, -1):
+        semicolons[index] = following
+        if words[index] == ";":
+            following = index
     for index, word in enumerate(words):
         if word != "use":
             continue
-        end = next((i for i in range(index + 1, len(words)) if words[i] == ";"), len(words))
+        end = semicolons[index]
         start = index
         if index and words[index - 1] == "pub":
             start = index - 1
         elif index and words[index - 1] == ")":
-            start = next((i for i in range(index - 1, -1, -1)
-                          if words[i:i + 2] == ("pub", "(") and closing(words, i + 1) == index - 1), index)
-        attributed = any(finish == start for _, finish in spans)
-        while any(finish == start for _, finish in spans):
-            start = next(begin for begin, finish in spans if finish == start)
+            begin = opening.get(index - 1, 0)
+            if begin and words[begin - 1] == "pub":
+                start = begin - 1
+        attributed = start in attributes_by_end
+        while start in attributes_by_end:
+            start = attributes_by_end[start]
         result.append(UseItem(start, min(end + 1, len(words)), use_paths(words[index + 1:end]), attributed))
     return tuple(result)
 
@@ -897,15 +964,151 @@ def plain_use(words: tuple[str, ...], item: UseItem) -> bool:
     return bool(item.paths) and not item.attributed and words[item.start] == "use"
 
 
-def qualified_import_sites(source: tuple[Token, ...], uses: tuple[UseItem, ...],
-                           added: set[tuple[str, ...]]) -> tuple[TokenRewrite, ...]:
+@dataclass(frozen=True)
+class ImportScope:
+    module: tuple[str, ...]
+    block: int
+
+
+@dataclass(frozen=True)
+class ImportContext:
+    scopes: tuple[ImportScope, ...]
+    module_blocks: frozenset[int]
+    block_ends: dict[int, int]
+    configurations: tuple[frozenset[tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True)
+class AddedImport:
+    path: tuple[str, ...]
+    module: tuple[str, ...]
+    configuration: tuple[str, ...]
+
+
+def delimiter_ends(words: tuple[str, ...]) -> dict[int, int]:
+    stack: list[int] = []
+    ends: dict[int, int] = {}
+    pairs = {"}": "{", ")": "(", "]": "["}
+    for index, word in enumerate(words):
+        if word in {"{", "(", "["}:
+            stack.append(index)
+        elif word in pairs and stack and words[stack[-1]] == pairs[word]:
+            ends[stack.pop()] = index
+    return ends
+
+
+def cfg_attribute(words: tuple[str, ...]) -> bool:
+    return (words[:4] == ("#", "[", "cfg", "(") and words[-2:] == (")", "]")
+            and closing(words, 1) == len(words) - 1 and closing(words, 3) == len(words) - 2)
+
+
+def import_context(words: tuple[str, ...]) -> ImportContext:
+    ends = delimiter_ends(words)
+    modules = {index + 2: words[index + 1] for index, word in enumerate(words[:-2])
+               if word == "mod" and words[index + 2] == "{"}
+    scopes: list[ImportScope] = []
+    blocks: list[int] = []
+    module_names: list[str] = []
+    module_counts: dict[tuple[tuple[str, ...], str], int] = {}
+    for index, word in enumerate(words):
+        scopes.append(ImportScope(tuple(module_names), blocks[-1] if blocks else -1))
+        if word == "{":
+            blocks.append(index)
+            if index in modules:
+                key = (tuple(module_names), modules[index])
+                module_counts[key] = module_counts.get(key, 0) + 1
+                module_names.append(f"{modules[index]}@{module_counts[key]}")
+        elif word == "}" and blocks:
+            begin = blocks.pop()
+            if begin in modules:
+                _ = module_names.pop()
+    # Sweep cfg-bearing item extents once instead of searching all items per site.
+    starts: dict[int, list[tuple[str, ...]]] = {}
+    finishes: dict[int, list[tuple[str, ...]]] = {}
+    owners = attribute_owners(words)
+    for begin, end in attribute_spans(words):
+        attribute = words[begin:end]
+        owner = owners.get(begin)
+        if not cfg_attribute(attribute) or owner is None or words[owner] not in {
+            "fn", "impl", "mod", "struct", "enum", "const", "static",
+        }:
+            continue
+        cursor = owner + 1
+        while cursor < len(words) and words[cursor] not in {"{", ";"}:
+            if words[cursor] in {"(", "["}:
+                cursor = ends.get(cursor, cursor)
+            cursor += 1
+        finish = ends.get(cursor, cursor) + 1
+        starts.setdefault(owner, []).append(attribute)
+        finishes.setdefault(finish, []).append(attribute)
+    active: dict[tuple[str, ...], int] = {}
+    configurations: list[frozenset[tuple[str, ...]]] = []
+    for index in range(len(words)):
+        for attribute in finishes.get(index, ()):
+            active[attribute] -= 1
+            if not active[attribute]:
+                del active[attribute]
+        for attribute in starts.get(index, ()):
+            active[attribute] = active.get(attribute, 0) + 1
+        configurations.append(frozenset(active))
+    return ImportContext(tuple(scopes), frozenset(modules), ends, tuple(configurations))
+
+
+def added_use_configuration(words: tuple[str, ...], item: UseItem) -> tuple[tuple[str, ...], ...]:
+    # Zero entries means refused; one empty entry means unconditional.
+    if plain_use(words, item):
+        return ((),)
+    if not item.paths or words[item.start] != "#":
+        return ()
+    end = closing(words, item.start + 1) + 1 if words[item.start + 1] == "[" else item.start
+    attribute = words[item.start:end]
+    return (attribute,) if cfg_attribute(attribute) and end < item.end and words[end] == "use" else ()
+
+
+def path_only_roots(before: tuple[str, ...], after: tuple[str, ...]) -> frozenset[str]:
+    candidates = {word for index, word in enumerate(before[:-1]) if before[index + 1] == "::"}
+    invalid: set[str] = set()
+    for words in (before, after):
+        for index, word in enumerate(words):
+            if word in candidates and (index + 1 == len(words) or words[index + 1] != "::"
+                                      or (index and words[index - 1] == "::")):
+                invalid.add(word)
+    return frozenset(candidates - invalid)
+
+
+def scoped_import_sites(source: tuple[Token, ...], uses: tuple[UseItem, ...],
+                        context: ImportContext, added: tuple[AddedImport, ...],
+                        roots: frozenset[str]) -> tuple[TokenRewrite, ...]:
     words = tuple(token.value for token in source)
     use_indices = {i for item in uses for i in range(item.start, item.end)}
-    aliases: dict[str, set[tuple[str, ...]]] = {}
+    aliases: dict[tuple[tuple[str, ...], str], set[tuple[str, ...]]] = {}
+    blocked_qualifiers: set[tuple[tuple[str, ...], str]] = set()
+    block_globs: list[tuple[int, int]] = []
     for item in uses:
-        if plain_use(words, item):
+        scope = context.scopes[item.start]
+        module_use = scope.block == -1 or scope.block in context.module_blocks
+        if module_use and plain_use(words, item):
             for path in item.paths:
-                aliases.setdefault(path[-1], set()).add(path)
+                aliases.setdefault((scope.module, path[-1]), set()).add(path)
+        elif not plain_use(words, item) and "*" not in words[item.start:item.end] and not any(
+            candidate.module == scope.module and candidate.path in item.paths and candidate.configuration
+            and words[item.start:item.start + len(candidate.configuration)] == candidate.configuration
+            for candidate in added
+        ):
+            blocked_qualifiers.update((scope.module, word) for word in words[item.start:item.end])
+        if not module_use:
+            if "*" in words[item.start:item.end]:
+                block_globs.append((scope.block, context.block_ends.get(scope.block, len(words))))
+            # A block-level use can shadow a module qualifier.
+            blocked_qualifiers.update((scope.module, path[-1]) for path in item.paths)
+    blocked_sites: set[int] = set()
+    previous_end = 0
+    for begin, end in sorted(block_globs):
+        blocked_sites.update(range(max(begin, previous_end), end))
+        previous_end = max(previous_end, end)
+    by_name: dict[str, list[AddedImport]] = {}
+    for item in added:
+        by_name.setdefault(item.path[-1], []).append(item)
     replacements: list[TokenRewrite] = []
     cursor = 0
     while cursor < len(words):
@@ -916,14 +1119,19 @@ def qualified_import_sites(source: tuple[Token, ...], uses: tuple[UseItem, ...],
         while end + 1 < len(words) and words[end] == "::" and IDENTIFIER.fullmatch(words[end + 1]):
             end += 2
         segments = words[cursor:end:2]
-        if len(segments) > 1:
+        scope = context.scopes[cursor].module
+        if len(segments) > 1 and segments[-1] in by_name:
             resolved = segments
+            key = (scope, segments[0])
+            options = aliases.get(key, set())
             if segments[0] not in {"crate", "self", "super", "std", "core", "alloc"}:
-                options = aliases.get(segments[0], set())
-                resolved = next(iter(options)) + segments[1:] if len(options) == 1 else ()
-            if resolved in added and not any(
-                not plain_use(words, item) and segments[0] in words[item.start:item.end] for item in uses
-            ):
+                resolved = next(iter(options)) + segments[1:] if len(options) == 1 else (
+                    segments if segments[0] in roots and not options else ()
+                )
+            candidates = [item for item in by_name[segments[-1]] if item.path == resolved
+                          and item.module == scope and (not item.configuration or
+                              item.configuration in context.configurations[cursor])]
+            if candidates and key not in blocked_qualifiers and cursor not in blocked_sites:
                 replacements.append(TokenRewrite(cursor, end, (source[end - 1],)))
         cursor = end
     return tuple(replacements)
@@ -933,11 +1141,13 @@ def prove_imports(change: FileChange) -> ImportProof:
     old, new = tokens(change.before), tokens(change.after)
     before, after = tuple(t.value for t in old), tuple(t.value for t in new)
     old_uses, new_uses = use_items(before), use_items(after)
+    old_context, new_context = import_context(before), import_context(after)
     remaining = list(new_uses)
     removed_items: list[UseItem] = []
     unchanged_items: list[UseItem] = []
     for item in old_uses:
-        match = next((other for other in remaining if before[item.start:item.end] == after[other.start:other.end]), None)
+        match = next((other for other in remaining if before[item.start:item.end] == after[other.start:other.end]
+                      and old_context.scopes[item.start].module == new_context.scopes[other.start].module), None)
         if match is None:
             removed_items.append(item)
         else:
@@ -946,19 +1156,26 @@ def prove_imports(change: FileChange) -> ImportProof:
     added_items = tuple(remaining)
     if not removed_items and not added_items:
         return ImportProof()
-    if any("*" in words[item.start:item.end] for words, items in ((before, old_uses), (after, new_uses))
-           for item in items):
+    if any(not plain_use(before, item) for item in removed_items):
         return ImportProof()
-    if any(not plain_use(before, item) for item in removed_items) or any(
-        not plain_use(after, item) for item in added_items
-    ):
-        return ImportProof()
+    candidates: list[AddedImport] = []
+    for item in added_items:
+        scope = new_context.scopes[item.start]
+        configurations = added_use_configuration(after, item)
+        if not configurations or (scope.block != -1 and scope.block not in new_context.module_blocks):
+            return ImportProof()
+        candidates.extend(AddedImport(path, scope.module, configurations[0]) for path in item.paths)
     if any(path[-1] in before[unchanged.start:unchanged.end] for item in added_items for path in item.paths
            for unchanged in unchanged_items):
         return ImportProof()
     old_paths = {path for item in old_uses for path in item.paths}
     new_paths = {path for item in new_uses for path in item.paths}
     added, removed = new_paths - old_paths, old_paths - new_paths
+    candidates = [item for item in candidates if item.path in added]
+    replaced_paths = {path for item in removed_items for path in item.paths}
+    if any(not re.fullmatch(r"[A-Z][A-Z0-9_]*", path[-1]) for item in added_items for path in item.paths
+           if path not in replaced_paths):
+        return ImportProof()
     if len({path[-1] for path in added}) != len(added):
         return ImportProof()
     old_use_indices = {i for item in old_uses for i in range(item.start, item.end)}
@@ -976,8 +1193,19 @@ def prove_imports(change: FileChange) -> ImportProof:
                (i == 0 or before[i - 1] != "::") and
                (i + 1 == len(before) or before[i + 1] != "::") for i, word in enumerate(before)):
             return ImportProof()
-    old_sites = qualified_import_sites(old, old_uses, added)
-    new_sites = qualified_import_sites(new, new_uses, added)
+    roots = path_only_roots(before, after)
+    old_sites = scoped_import_sites(old, old_uses, old_context, tuple(candidates), roots)
+    new_sites = scoped_import_sites(new, new_uses, new_context, tuple(candidates), roots)
+    added_names = {path[-1] for path in added}
+    for index, word in enumerate(after):
+        if word not in added_names or index in new_use_indices:
+            continue
+        if (index and after[index - 1] == "::") or (index + 1 < len(after) and after[index + 1] == "::"):
+            continue
+        if not any(item.path[-1] == word and item.module == new_context.scopes[index].module
+                   and (not item.configuration or item.configuration in new_context.configurations[index])
+                   for item in candidates):
+            return ImportProof()
     used = {tuple(before[site.start:site.end:2])[-1] for site in old_sites}
     if used != {path[-1] for path in added}:
         return ImportProof()
@@ -1320,16 +1548,47 @@ def normalized_source(change: FileChange, proof: FileNormalization) -> tuple[Tok
     return rewrite_tokens(rewrite_tokens(tokens(change.before), proof.rewrites.before), proof.renames)
 
 
+@lru_cache(maxsize=32)
+def rewritten_lines(source: str, rewrites: tuple[TokenRewrite, ...]) -> tuple[tuple[Token, ...], ...]:
+    parsed = tokenized_text(source)
+    lines: list[list[Token]] = [[] for _ in range(source.count("\n") + 2)]
+    replacements = {item.start: item for item in rewrites}
+    cursor = 0
+    while cursor < len(parsed.tokens):
+        rewrite = replacements.get(cursor)
+        if rewrite is None:
+            lines[parsed.lines[cursor]].append(parsed.tokens[cursor])
+            cursor += 1
+        else:
+            lines[parsed.lines[cursor]].extend(rewrite.replacement)
+            cursor = rewrite.end
+    return tuple(tuple(line) for line in lines)
+
+
 def line_tokens(source: str, line: int, rewrites: tuple[TokenRewrite, ...]) -> tuple[Token, ...]:
-    lines = source.splitlines(keepends=True)
-    start = len(tokens("".join(lines[:line - 1])))
-    end = len(tokens("".join(lines[:line])))
-    # Full-file token indices keep local renames inside their function.
-    return tuple(
-        token for index, original in enumerate(tokens(source)) if start <= index < end
-        for token in next((rewrite.replacement if index == rewrite.start else ()
-                           for rewrite in rewrites if rewrite.start <= index < rewrite.end), (original,))
-    )
+    lines = rewritten_lines(source, rewrites)
+    return lines[line] if 0 <= line < len(lines) else ()
+
+
+def line_flag_omissions(change: FileChange, proof: FileNormalization) -> FileTokenRewrites:
+    before = tuple(item for item in proof.rewrites.before if not item.replacement)
+    after = tuple(item for item in proof.rewrites.after if not item.replacement)
+    after_indices = {index for item in after for index in range(item.start, item.end)}
+    words = tuple(token.value for token in tokens(change.after))
+    configurations = {words[start:end] for start, end in attribute_spans(words)
+                      if start in after_indices and cfg_attribute(words[start:end])}
+    if not configurations:
+        return FileTokenRewrites(before, after)
+    # Git can align an item's unchanged cfg with the new import's identical cfg.
+    # Keep that line alignment from flagging a retained condition as a literal edit.
+    results: list[tuple[TokenRewrite, ...]] = []
+    for text, omissions in ((change.before, before), (change.after, after)):
+        words = tuple(token.value for token in tokens(text))
+        omitted = {index for item in omissions for index in range(item.start, item.end)}
+        results.append(omissions + tuple(TokenRewrite(start, end, ())
+                                        for start, end in attribute_spans(words)
+                                        if start not in omitted and words[start:end] in configurations))
+    return FileTokenRewrites(results[0], results[1])
 
 
 def flagged_hunks(change: FileChange, proof: FileNormalization) -> bool:
@@ -1340,15 +1599,17 @@ def flagged_hunks(change: FileChange, proof: FileNormalization) -> bool:
         origins[rewrite.start:rewrite.end] = [rewrite.end - 1] * len(rewrite.replacement)
     renames = tuple(TokenRewrite(origins[item.start], origins[item.start] + 1, item.replacement) for item in proof.renames)
     before_rewrites = proof.rewrites.before + renames
+    omissions = line_flag_omissions(change, proof)
+    before_omissions, after_omissions = omissions.before, omissions.after
     offset = 0
     for hunk in change.hunks:
         new_start = hunk.old_start + (not hunk.old_count) + offset
         removed_lines = tuple(" ".join(token.value for token in line_tokens(
-            change.before, hunk.old_start + index, proof.lint_attributes.before,
-        )) for index in range(len(hunk.removed))) if proof.lint_attributes.before else hunk.removed
+            change.before, hunk.old_start + index, before_omissions,
+        )) for index in range(len(hunk.removed))) if before_omissions else hunk.removed
         added_lines = tuple(" ".join(token.value for token in line_tokens(
-            change.after, new_start + index, proof.lint_attributes.after,
-        )) for index in range(len(hunk.added))) if proof.lint_attributes.after else hunk.added
+            change.after, new_start + index, after_omissions,
+        )) for index in range(len(hunk.added))) if after_omissions else hunk.added
         if len(hunk.removed) == len(hunk.added):
             for index, (removed, added) in enumerate(zip(removed_lines, added_lines)):
                 if line_tokens(change.before, hunk.old_start + index, before_rewrites) != line_tokens(
