@@ -134,7 +134,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Ruled out:** dropping the director's `direct.md` re-Read after compaction (the copy in context holds only 260/707 and 236/710 of the required lines); raising Codex review compaction limits on cost-model evidence alone.
 
-### Phase 6 — Ranked proposals  · status: todo
+### Phase 6 — Ranked proposals  · status: done
 **Depends on:** Phase 5
 
 #### Work Order
