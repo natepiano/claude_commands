@@ -304,7 +304,8 @@ review records its pass under the slot `pool_<reviewer>`
 `progress` writes the event and prints a short report under a line naming the
 worktree, and the branch when it differs: the phase heading, one ETA line, the
 verification block's gate notes when there is one, one `- **Agent N**` line per
-worker, the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
+worker, less a worker whose stretch is `done` with its window and board line both
+over 10 minutes old (`FINISHED_WORKER_SECONDS`), the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
 In the dual layout the clocks table prints above the phase heading in every
 report. `--tables` adds the round table with its `Earlier:` line under the ETA
 line. The legacy layout prints the clocks table only under `--tables`.
@@ -313,6 +314,11 @@ not. The
 worktree line carries no position: how far through the plan the run is belongs
 to the clocks table's Phases column, and a plan with deferred earlier phases or
 retired ids puts the active phase at an ordinal that matches neither number.
+The Phases count adds the run's active phase when the run's own plan has no
+heading for it, so "Phase 32" never sits beside "of 31". `start-phase` refuses
+such a phase: an id other than `ad hoc` that the run's plan does not list exits
+and names the heading to add. hana cables, 2026-10-19: Phase 32's heading was
+only in a scratch clone, and the report read "19 of 31 done" beside "Phase 32".
 
 The ETA line comes from `_phase_eta_line(session_dir, phase_number)`, which
 reads only the reported phase's own row and gate from

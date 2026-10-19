@@ -3173,6 +3173,34 @@ print('two homes isolated; recorder lock retained; caller restored')
             header,
         )
 
+    def test_a_worker_finished_over_ten_minutes_ago_drops_out_of_the_report(self) -> None:
+        """Only the report's worker lines drop it; a worker still at work stays."""
+        started_at = 65_000
+        session_dir = self.start_run("finished", started_at)
+        self.start_phase(session_dir, started_at)
+        for slot in ("impl", "test"):
+            self.run_board(session_dir, "post", slot, "register", "role=fix; up", at=started_at + 1)
+            self.start_slot_pass(session_dir, slot, "fix", started_at + 10, fix_pass=1)
+        for slot in ("impl", "test"):
+            self.finish_slot_pass(session_dir, slot, "completed", started_at + 310)
+        # A second round opens for test alone, so impl's round is over.
+        self.start_slot_pass(session_dir, "test", "fix", started_at + 320, fix_pass=2)
+        self.team_slot = ""
+
+        def report(at: int) -> str:
+            return self.run_command(
+                "progress", "--session-dir", str(session_dir),
+                "--project-raw-percent", "40", "--project-percent", "40",
+                "--phase-raw-percent", "30", "--phase-percent", "30",
+                "--cap-stage", "implementation", "--activity", "implementing", at=at,
+            )
+
+        recent = report(started_at + 400)
+        self.assertIn("- **Agent 1** (impl) fix 5m done", recent)
+        later = report(started_at + 310 + 601)
+        self.assertNotIn("**Agent 1**", later)
+        self.assertIn("- **Agent 2** (test) fix", later)
+
     def broad_review(self, session_dir: Path, lenses: tuple[str, ...], started_at: int) -> None:
         """Both workers write, then the broad review workers one pass per lens.
 
@@ -4432,6 +4460,43 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("| Project |  38 | ", header)
         self.assertIn("| 1 of 4 done |", header)
         self.assertIn("| Phase 3 |", header)
+
+    def test_the_phases_count_adds_a_run_phase_the_plan_has_no_heading_for(self) -> None:
+        """Phase 3 opened before its plan listed phases, and the plan lists 1 and 2.
+
+        The count takes Phase 3 in, so the report never puts "Phase 3" beside
+        "of 2" (hana cables, 2026-10-19: "19 of 31 done" beside "Phase 32").
+        """
+        session_dir = self.start_run("unlisted", 0)
+        self.start_phase_and_pass(session_dir, 70_000)
+        plan_path = self.working_dir / "docs" / "unlisted.md"
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8")
+            + "### Phase 1 — Done work  · status: done\n\n"
+            + "### Phase 2 — Waiting  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        header = self.run_progress(session_dir, 80_000)
+        self.assertIn("| 1 of 3 done |", header)
+        self.assertIn("| Phase 3 |", header)
+
+    def test_start_phase_refuses_a_phase_the_plan_has_no_heading_for(self) -> None:
+        session_dir = self.start_run("refused", 0)
+        plan_path = self.working_dir / "docs" / "refused.md"
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8") + "### Phase 1 — Only phase  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        result = self.run_failing_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "3",
+            "--phase-title", "Retry handling", at=70_000,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Phase 3 has no heading in", result.stderr)
+        state = cast(dict[str, object], json.loads(
+            (session_dir / "progress_history_state.json").read_text(encoding="utf-8")
+        ))
+        self.assertIsNone(state["phase"])
 
     def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,
