@@ -50,7 +50,7 @@
 | style-unit | docs/plans/build-followups-style.md | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
 | hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
-| review-unit | docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
+| review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 
 ## Hub files
 
