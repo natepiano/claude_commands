@@ -50,6 +50,7 @@ class PilotCrates:
 
 PilotScope = AllCrates | PilotCrates
 _ALL_CRATES = AllCrates()
+_NO_FIRST_FILES: frozenset[str] = frozenset()
 _ALL_FAMILY_SCOPES: Mapping[rules.Family, PilotScope] = MappingProxyType(
     {family: _ALL_CRATES for family in FAMILIES})
 
@@ -76,20 +77,67 @@ def parse_pilot_scope(text: str, repo: Path) -> PilotScope:
     return PilotCrates(frozenset(members[name] for name in names))
 
 
-def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
-    """Read each style unit's scope from its own standing plan copy."""
-    scopes: dict[rules.Family, PilotScope] = {}
+def parse_first_files(text: str) -> frozenset[str]:
+    """Read the optional file priority line in the plan's Delegation Context."""
+    lines = [match.group(1) for match in re.finditer(
+        r"(?m)^\s*(?:- )?\*\*First files:\*\*[^\S\n]*(.*)$", delegation_context(text))]
+    if not lines:
+        return frozenset()
+    if len(lines) > 1:
+        raise style_ledger.LedgerError("first files has more than one line")
+    paths: set[str] = set()
+    for entry in lines[0].split(","):
+        path = entry.strip()
+        if not path:
+            raise style_ledger.LedgerError("first files has empty entry")
+        if PurePosixPath(path).is_absolute():
+            raise style_ledger.LedgerError(f"first files has absolute path {path}")
+        if path in paths:
+            raise style_ledger.LedgerError(f"first files has duplicate path {path}")
+        paths.add(path)
+    return frozenset(paths)
+
+
+@dataclass(frozen=True)
+class UnitPlanSettings:
+    pilot_scope: PilotScope
+    first_files: frozenset[str]
+
+
+def unit_plan_settings(text: str, repo: Path) -> UnitPlanSettings:
+    return UnitPlanSettings(parse_pilot_scope(text, repo), parse_first_files(text))
+
+
+@dataclass(frozen=True)
+class MissingUnitPlan:
+    pass
+
+
+def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
+    """Read each style unit's own standing plan copy."""
+    texts: dict[rules.Family, str | MissingUnitPlan] = {}
     for row in unit_worktrees(doc):
         for family in FAMILIES:
             if row.unit == family + "-unit":
                 plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
                 try:
-                    text = plan.read_text()
+                    texts[family] = plan.read_text()
                 except FileNotFoundError:
-                    scopes[family] = AllCrates()
-                else:
-                    scopes[family] = parse_pilot_scope(text, repo)
-    return scopes
+                    texts[family] = MissingUnitPlan()
+    return texts
+
+
+def family_plan_settings(doc: Path, repo: Path, *, unit: str = "") -> Mapping[rules.Family, UnitPlanSettings]:
+    """Parse selection settings only for the units whose queue is requested."""
+    return {family: unit_plan_settings(text, repo) if isinstance(text, str)
+            else UnitPlanSettings(AllCrates(), frozenset())
+            for family, text in family_plan_texts(doc).items()
+            if not unit or unit == family + "-unit"}
+
+
+def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
+    return {family: parse_pilot_scope(text, repo) if isinstance(text, str) else AllCrates()
+            for family, text in family_plan_texts(doc).items()}
 
 
 @dataclass(frozen=True)
@@ -540,7 +588,8 @@ def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
-                      family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
+                      family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES,
+                      *, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
@@ -616,9 +665,13 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                 if group:
                     by_rules[group].append(path)
         for rule_ids, paths in sorted(by_rules.items()):
-            for files in read_slices(repo, tip, tuple(paths)):
-                result.append(TicketSelection("read", family, crate, files, rule_ids))
-    return tuple(result)
+            priority = tuple(path for path in paths if path in first_files)
+            remaining = tuple(path for path in paths if path not in first_files)
+            for group in (priority, remaining):
+                if group:
+                    for files in read_slices(repo, tip, group):
+                        result.append(TicketSelection("read", family, crate, files, rule_ids))
+    return tuple(sorted(result, key=lambda ticket: not first_files.intersection(ticket.files)))
 
 
 def delegation_context(text: str) -> str:
@@ -920,7 +973,7 @@ class NoAvailableWork:
 
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
-    doc: Path, text: str, scope: PilotScope, busy: BusyFiles,
+    doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
 ) -> PhaseWritten | NoAvailableWork | WaitingForStructure:
     queued = ledger.queued_tickets(unit)
     for index, ticket in enumerate(queued):
@@ -966,7 +1019,8 @@ def _select_phase(
             style_proposals.proposal_command("start", str(issue.path))
             write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
             return PhaseWritten(ticket_id)
-    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
+    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo),
+                                   first_files=first_files)
     if not candidates:
         if family != "modules":
             pending = tuple(cell for cell in _refill_cells(ledger)
@@ -999,7 +1053,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
-    scope = parse_pilot_scope(original, repo)
+    settings = unit_plan_settings(original, repo)
+    scope = settings.pilot_scope
     if any("repair" in line.lower() and re.search(r"status:\s*todo", line) for line in original.splitlines() if line.startswith("### Phase ")):
         return RepairFirst()
     with style_ledger.open_ledger(repo) as ledger:
@@ -1038,7 +1093,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         if isinstance(board, berth_board.BoardUnavailable):
             return board
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files)
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
@@ -1047,7 +1102,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         if isinstance(board, berth_board.BoardUnavailable):
             return board
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files)
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
@@ -1081,13 +1136,15 @@ def main(argv: list[str]) -> int:
             with style_ledger.open_ledger(args.repo) as ledger:
                 doc = style_document(args.repo)
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
+                settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
                 for family in FAMILIES:
                     unit = family + "-unit"
                     if args.unit and args.unit != unit:
                         continue
+                    first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
                     for ticket in candidate_tickets(args.repo, ledger, busy, family,
-                                                    scopes.get(family, _ALL_CRATES), scopes):
+                                                    scopes.get(family, _ALL_CRATES), scopes, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
