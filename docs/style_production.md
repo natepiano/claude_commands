@@ -137,6 +137,15 @@ After launch, only the unit's own copy counts:
 proposals. An out-of-scope approved proposal stays approved and unassigned;
 coverage selection proceeds.
 
+## First files
+
+Add `- **First files:** crates/cargo-port/src/one.rs, crates/cargo-port/src/two.rs`
+to the Delegation Context in the unit's own plan copy, beside `**Pilot scope:**`.
+Use repo-relative paths, separated by commas. These files get separate read
+tickets before the other files in their group. Tickets that include these files
+rank first. This line filters nothing. It has no effect once those files are
+judged. Both `queue` and `next-phase` read the unit's own copy.
+
 ## Ledger
 
 One style production and one synced branch point per repository. The ledger is
