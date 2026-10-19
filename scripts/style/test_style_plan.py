@@ -18,6 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import approved_renames
 import style_plan
 import style_proposals
 import proposal_issue
@@ -2140,7 +2141,18 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed_without_this_ticket() {}\n")
         self.assertEqual(self.reference_gate(ticket)[0], 1)
         self.write(self.sources[1], "pub fn value() {}\n")
-        self.write(self.sources[0], "pub fn approved_change() {}\n")
+        self.write(self.sources[0], "pub fn approved_change() {}\nenum Outcome { NewName }\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_decision_gate_refuses_until_each_approved_rename_is_applied(self) -> None:
+        ticket = self.approved_reference_ticket()
+        origin = self.ledger().ticket_origin(ticket)
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        finding_id, = origin.finding_ids
+        self.write(self.sources[0], "enum Outcome { OldName }\n")
+        self.assertEqual(self.reference_gate(ticket), (1, f"review: {finding_id}: Outcome::OldName -> Outcome::NewName "
+                                                          + f"not applied in {self.sources[0]}\n"))
+        self.write(self.sources[0], "enum Outcome { NewName }\n")
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
 
     def test_decision_refill_slices_forty_restructure_files_and_releases_dropped_slice(self) -> None:
@@ -2185,7 +2197,11 @@ class StylePlanTests(unittest.TestCase):
                 self.assertFalse(built & set(ticket["files"]))
                 built.update(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)
-                ledger.ticket_merge(ticket["id"])
+                not_built = ledger.ticket_merge(ticket["id"])
+                self.assertEqual(not_built, tuple(style_ledger.FindingNotBuilt(identity, approved_renames.NoAppliedCheck("restructure"))
+                                                  for identity in sorted(ticket["finding_ids"])))
+                for identity in ticket["finding_ids"]:
+                    ledger.mark_built(identity)
                 if len(built) == 40:
                     break
         self.assertEqual(built, set(files))
@@ -2198,7 +2214,7 @@ class StylePlanTests(unittest.TestCase):
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
             for path in files:
-                finding = ledger.hold(rule, path, 1, "change", kind, "before", "after", blob, "outside")
+                finding = ledger.hold(rule, path, 1, "change", kind, "Outcome::Old", "Outcome::New", blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
@@ -2230,7 +2246,9 @@ class StylePlanTests(unittest.TestCase):
                 self.assertEqual(ticket["kind"], "proposal")
                 tickets.append(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)
-                ledger.ticket_merge(ticket["id"])
+                _ = ledger.ticket_merge(ticket["id"])
+                for identity in ticket["finding_ids"]:
+                    ledger.mark_built(identity)
             self.assertEqual(self.run_next()[0], 0)
         self.assertEqual(sorted(tuple(files) for files in tickets), sorted(expected))
         self.assertEqual(len(ledger.proposal_tickets()), 2)
@@ -2255,6 +2273,7 @@ class StylePlanTests(unittest.TestCase):
         issue = self.approved_decision(rule, self.sources[:2], "rename")
         gone = next(finding for finding in self.ledger().proposal_findings(issue) if finding.path == self.sources[1])
         _ = self.git("rm", "-q", self.sources[1])
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
         self.commit_to_every_checkout()
         with mock.patch.object(style_proposals, "proposal_command"):
             code, output, errors = self.run_next()
@@ -2266,11 +2285,58 @@ class StylePlanTests(unittest.TestCase):
         ticket = ledger.ticket_open("names-unit")[0]
         self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
         ledger.ticket_checkpoint(ticket["id"], self.tip)
-        ledger.ticket_merge(ticket["id"])
+        _ = ledger.ticket_merge(ticket["id"])
         with (mock.patch.object(style_proposals, "proposal_command") as command,
               mock.patch.object(style_proposals, "renumber")):
             style_proposals.complete(ledger)
         command.assert_called_once_with("close", str(issue), "--reason", f"built in {ticket['id']}")
+
+    def test_decision_refill_after_a_merge_builds_only_the_unbuilt_findings(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:2], "rename")
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
+        self.write(self.sources[1], "pub enum Outcome { Old }\n")
+        self.commit_to_every_checkout()
+        ledger = self.ledger()
+        applied, unapplied = (next(finding for finding in ledger.proposal_findings(issue) if finding.path == path)
+                              for path in self.sources[:2])
+        with mock.patch.object(style_proposals, "proposal_command"):
+            self.assertEqual(self.run_next()[0], 0)
+            first = ledger.ticket_open("names-unit")[0]
+            self.assertEqual(sorted(first["finding_ids"]), sorted((applied.finding_id, unapplied.finding_id)))
+            ledger.ticket_checkpoint(first["id"], self.tip)
+            _ = ledger.ticket_merge(first["id"])
+            code, _, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        second = ledger.ticket_open("names-unit")[0]
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual((second["kind"], second["files"], second["finding_ids"]),
+                         ("proposal", [unapplied.path], [unapplied.finding_id]))
+
+    def test_decision_refill_skips_a_merged_type_finding_until_a_person_marks_it_built(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, (self.sources[0],), "type")
+        ledger = self.ledger()
+        finding, = ledger.proposal_findings(issue)
+        with mock.patch.object(style_proposals, "proposal_command"):
+            self.assertEqual(self.run_next()[0], 0)
+        ticket = ledger.ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
+        ledger.ticket_checkpoint(ticket["id"], self.tip)
+        self.assertEqual(ledger.ticket_merge(ticket["id"]),
+                         (style_ledger.FindingNotBuilt(finding.finding_id, approved_renames.NoAppliedCheck("type")),))
+        held, = ledger.proposal_findings(issue)
+        self.assertEqual((held.state, held.build_ticket), (style_ledger.Filed(issue), style_ledger.BuildTicket(ticket["id"])))
+        code, _, errors, _ = self.refill_closing()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual([item["id"] for item in ledger.proposal_tickets()], [ticket["id"]])
+        self.assertEqual(frontmatter(issue)["status"], ["open"])
+        ledger.mark_built(finding.finding_id)
+        with mock.patch.object(style_proposals, "renumber"), redirect_stdout(io.StringIO()):
+            style_proposals.complete(ledger)
+        self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [f"built in {ticket['id']}"]))
 
     def refill_closing(self) -> tuple[int, str, str, int]:
         """Run refill with only the real close command, so a decision it closes is closed on disk.
@@ -2308,11 +2374,13 @@ class StylePlanTests(unittest.TestCase):
         ledger = self.ledger()
         built, gone = (next(finding for finding in ledger.proposal_findings(issue) if finding.path == path)
                        for path in self.sources[:2])
+        self.write(built.path, "pub enum Outcome { New }\n")
+        self.commit_to_every_checkout()
         ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [built.path], [rule],
                           proposal=str(issue), finding_ids=(built.finding_id,))
         ledger.ticket_assign("names-unit-1", "main")
         ledger.ticket_checkpoint("names-unit-1", self.tip)
-        ledger.ticket_merge("names-unit-1")
+        _ = ledger.ticket_merge("names-unit-1")
         _ = self.git("rm", "-q", gone.path)
         self.commit_to_every_checkout()
         code, output, errors, renumbers = self.refill_closing()
@@ -2421,6 +2489,15 @@ class StylePlanTests(unittest.TestCase):
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
             ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha",
                               [self.sources[0]], [rule], proposal=str(issue), finding_ids=tuple(ids))
+        # The gate passes only when the finding file declares each checkable rename's new name.
+        declared: dict[str, list[str]] = {}
+        for index, (before, after) in enumerate(pairs):
+            rename = approved_renames.approved_rename(kinds[index % len(kinds)], before, after)
+            if isinstance(rename, approved_renames.ApprovedRename):
+                declared.setdefault(rename.parent, []).append(rename.new)
+        if declared:
+            self.write(self.sources[0], "".join(f"enum {parent} {{ {', '.join(names)} }}\n"
+                                                for parent, names in declared.items()))
         return "names-unit-1"
 
     def reference_gate(self, ticket: str) -> tuple[int, str]:
@@ -2436,7 +2513,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], before)
         _ = self.commit()
         ticket = self.approved_reference_ticket()
-        self.write(self.sources[0], "// The finding file keeps unrestricted approval.\n")
+        self.write(self.sources[0], "// The finding file keeps unrestricted approval.\nenum Outcome { NewName }\n")
         self.write(self.sources[1], before.replace("Outcome :: OldName", "Outcome :: NewName"))
         _ = self.git("add", self.sources[1])
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
@@ -3028,7 +3105,7 @@ class StylePlanTests(unittest.TestCase):
         with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
             self.assertEqual(self.run_next(), (5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
-        ledger.ticket_merge(ticket["id"])
+        _ = ledger.ticket_merge(ticket["id"])
         code, output, errors = self.run_next()
         self.assertEqual((code, errors), (0, ""))
         self.assertIn("discarded names-unit-1: merged", output)

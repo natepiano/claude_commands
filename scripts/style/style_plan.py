@@ -26,6 +26,8 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
+from approved_renames import (AppliedCheck, ApprovedRename, Declarations, NoQualifiedRename, RenameNotApplied, UncertainScan,
+                              applied_check, approved_rename, declaration_sites)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
@@ -218,23 +220,13 @@ def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, bo
     return BusyFiles(board, busy)
 
 
-@dataclass(frozen=True)
-class ApprovedRename:
-    parent: str
-    old: str
-    new: str
-
-
 def approved_rename_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[ApprovedRename, ...]:
     pairs: list[ApprovedRename] = []
     for finding in findings:
-        before, after = finding.before.split("::"), finding.after.split("::")
-        if (finding.kind != "rename" or len(before) < 2 or len(before) != len(after)
-                or before[:-1] != after[:-1] or before[-1] == after[-1]
-                or not style_footprint.IDENTIFIER.fullmatch(before[-1])
-                or not style_footprint.IDENTIFIER.fullmatch(after[-1])):
+        pair = approved_rename(finding.kind, finding.before, finding.after)
+        if isinstance(pair, NoQualifiedRename):
             return ()
-        pairs.append(ApprovedRename(before[-2], before[-1], after[-1]))
+        pairs.append(pair)
     return tuple(pairs)
 
 
@@ -293,27 +285,6 @@ def approved_reference_qualifier(
     return parent != "Self" and parent == pair.parent
 
 
-def approved_declaration_sites(words: tuple[str, ...], pair: ApprovedRename) -> frozenset[int]:
-    sites = {index for body in style_footprint.enum_bodies(words) if body.name == pair.parent
-             for index in body.variants if words[index] == pair.old}
-    bodies = list(style_footprint.impl_bodies(words, pair.parent))
-    for index, word in enumerate(words[:-2]):
-        if word in {"mod", "trait"} and words[index + 1] == pair.parent:
-            start = next((i for i in range(index + 2, len(words)) if words[i] in {"{", ";"}), len(words))
-            if start < len(words) and words[start] == "{":
-                bodies.append((start, style_footprint.closing(words, start)))
-    for start, end in bodies:
-        cursor = start + 1
-        while cursor < end:
-            if words[cursor] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
-                if cursor + 1 < end and words[cursor + 1] == pair.old:
-                    sites.add(cursor + 1)
-            if words[cursor] in {"{", "(", "["}:
-                cursor = style_footprint.closing(words, cursor)
-            cursor += 1
-    return frozenset(sites)
-
-
 def unique_rename_mentions(
     repo: Path, pairs: tuple[ApprovedRename, ...], finding_files: set[str],
 ) -> frozenset[ApprovedRename]:
@@ -338,7 +309,8 @@ def unique_rename_mentions(
         words = tuple(token.value for token in source)
         use_parents = use_reference_parents(words)
         for pair in tuple(unique):
-            declarations = approved_declaration_sites(words, pair) if path in finding_files else frozenset[int]()
+            found = declaration_sites(words, path, pair, pair.old) if path in finding_files else UncertainScan()
+            declarations = found.sites if isinstance(found, Declarations) else frozenset[int]()
             for index, token in enumerate(source):
                 if token.kind != "identifier" or token.value != pair.old:
                     continue
@@ -416,6 +388,13 @@ def approved_reference_file(
     return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
 
 
+def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedCheck:
+    """Whether the finding's change is in its file in the worktree."""
+    target = repo / finding.path
+    source = target.read_bytes() if target.is_file() else b""
+    return applied_check(finding.kind, finding.before, finding.after, finding.path, source)
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
@@ -456,6 +435,11 @@ def gate(repo: Path, ticket_id: str) -> int:
                 if refused:
                     raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
                         f"{path} (change is not an approved rename reference)" for path in refused))
+            unapplied = tuple(finding for finding in findings if isinstance(worktree_check(repo, finding), RenameNotApplied))
+            if unapplied:
+                for finding in unapplied:
+                    print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
+                return 1
             print("approved proposal")
             return 0
     except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
