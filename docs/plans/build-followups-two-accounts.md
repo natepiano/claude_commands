@@ -2189,38 +2189,23 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 81 — Account moves: the new name, and workers to any account  · status: done
 
-**Depends on:** Phase 80
+#### As-built
 
-#### Work Order
-
-**Goal:** The user (via the showrunner, 2026-10-19 16:3x EDT): rename `/next_moves` to `/account_moves`. A queued workers move may name any numbered account: Codex workers can go to a Claude account (`accounts.py next add workers 1 claude4`; today it refuses "workers target must be a numbered Codex account"). Only the automatic fallback, with no queued entry, keeps moving workers to a Codex account with room. After this is live, the user wants workers at 1% → claude4.
-
-**Constraints from prior phases:**
-- Slash name references: `commands/next_moves.md` (line 5 names `accounts.py next`), `commands/showrunner/accounts.md:17`, `docs/accounts.md:316` (319–330, 345), `docs/quota_alerts.md:7`, `scripts/notify/push_catalog.py:74,79` and the reviewed quote `scripts/notify/push_texts_reviewed.json:176`; tests `scripts/whoami/test_quota_alert.py:353,636`, `scripts/whoami/test_codex_alert_accounts.py:134,159`. No hook or settings file names it.
-- The CLI subcommand `accounts.py next` stays: the Mac sends `next …` to natedev over ssh (`next_moves.py:301,368,386,408,494,520`), so renaming it needs both machines at once. The module `scripts/accounts/next_moves.py` and the state file `next_moves.json` keep their names. User-facing "next move(s)" text says "account move(s)": `accounts.py:4236,4258`, log prefixes `moves.py:257,274,367`, `role_map.py:531,540,551`, `quota_alert.py:1011,1238`.
-- The refusal is `CodexWorkersTarget.__post_init__` (`next_moves.py:199-205`); `decode_next_moves` (~283) maps `"claude"` to `DelegateToClaude()` (no fields, 208–210) and everything else to `CodexWorkersTarget`. `validate_next_move_target` (`accounts.py:4218-4223`) checks only Codex homes.
-- `quota_alert._workers_next_move_pass` (1114–1239) runs a `DelegateToClaude` head through `switch_to_claude` (755–799), which sets every assignment's agent family to claude and stores `AccountCodexQuotaFallback` / journals `RoutedToClaude`. No Claude account is chosen there: Claude-family work starts via `agent_exec.sh:128-130` → `claude_account.sh:3-23` → `accounts.account_for_unscoped_launch` (1370–1384: the caller's `CLAUDE_CONFIG_DIR` account, else the showrunners group account).
-- Agent-tool subagents inside a Claude session always use the session's account; a target cannot move them.
-
-**Spec:**
-1. **Rename.** `commands/next_moves.md` becomes `commands/account_moves.md` (`/account_moves`). Every reference above names `/account_moves`. User-facing text says "account moves". The push texts change only the command name; record the changed quotes in the reviewed file in the same form as its other entries.
-2. **Any account.** A workers entry target is `claude` (today's meaning), `claudeN` or `codexN`. `DelegateToClaude` carries the target account (`claudeN`, or none for bare `claude`). `validate_next_move_target` checks a `claudeN` folder with `claude_account_dir`, as it checks a Codex home. `list` prints the target as given.
-3. **Claude target honoured.** When a `claudeN` head runs, `switch_to_claude` records that account on `AccountCodexQuotaFallback` and `RoutedToClaude`. While that fallback is open, Claude-family work started for the workers (`agent_exec.sh` → `claude_account.sh` → the unscoped launch resolver) runs on that account, not on the caller's or showrunners account. Bare `claude` keeps today's account choice. A target account that is missing or signed out refuses with its setup or login step, as other launches do.
-4. **Fallback unchanged.** With no queued entry, the refusal and low-quota fallbacks still move workers to a Codex account with room, and to Claude only when none has room.
+- `/next_moves` is `/account_moves` (`commands/account_moves.md`); the docs, the showrunner accounts skill, the push texts and the log lines (`account moves: …`) use the new name. The CLI subcommand stays `accounts.py next`, because the Mac sends it to natedev over ssh. The state file stays `next_moves.json` and the module `next_moves.py`.
+- A workers entry takes a numbered Claude account, a numbered Codex account, or bare `claude` (user, 2026-10-19). `DelegateToClaude.account` is `ClaudeWorkersTarget(label)` or `DefaultClaudeAccount()`. A named account is checked for setup and login when it is added (`claude_workers_account`) and again when the entry runs; a failed check blocks the head entry with its reason.
+- When a named entry runs, `switch_to_claude` writes the route to the role map before the registry edit: `workers_claude: {"label": "claude4", "until": "<source weekly reset>"}`. Quota state (`AccountCodexQuotaFallback.claude_account`) and the routing journal (`RoutedToClaude.claude_account`) keep it as history. The route is rolled back only when a successful read-back shows nothing moved; a rollback error is added to the switch failure. `switch_back` clears it early; otherwise it ends at `until`.
+- Worker launches read the route from the role map on both machines (`account_for_unscoped_launch(..., workers=True)`): `agent_exec.sh`, `cli_agent.sh`, and `agent_bg.sh` with `AGENT_BG_WORKERS=1`, which only `delegate/implement.sh`'s Claude worker launch sets; agent_bg removes the flag from the child. Friend sessions and the berth fixer keep the caller or showrunners account. An unreadable map with no cache refuses the launch. A route with no `until`, or past it, is the default.
+- Bare `claude` and the automatic fallback with no entry keep their old choice: a Codex account with room first, then Claude on the caller or showrunners account.
 
 **Files:**
-- `commands/next_moves.md`, `commands/account_moves.md` — the rename, `commands/showrunner/accounts.md`, `docs/accounts.md`, `docs/quota_alerts.md`
-- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`
-- `scripts/accounts/next_moves.py`, `scripts/accounts/accounts.py`, `scripts/accounts/moves.py`, `scripts/accounts/role_map.py`
-- `scripts/whoami/quota_alert.py`, `scripts/agents/claude_account.sh`, `scripts/agents/agent_exec.sh`
-- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/agents/test_agent_exec.sh`
+- `scripts/accounts/next_moves.py`, `scripts/accounts/accounts.py`, `scripts/accounts/role_map.py`, `scripts/accounts/moves.py` — targets, checks, the shared route, the launch resolver.
+- `scripts/whoami/quota_alert.py` — the named switch, rollback and history.
+- `scripts/agents/claude_account.sh`, `scripts/agents/agent_exec.sh`, `scripts/agents/agent_bg.sh`, `scripts/cli_agent/cli_agent.sh`, `scripts/delegate/implement.sh` — worker launches.
+- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/agents/test_agent_exec.sh` — tests.
+- `commands/account_moves.md`, `commands/showrunner/accounts.md`, `docs/accounts.md`, `docs/quota_alerts.md`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — text.
 
-**Workers:** 1 writer. impl owns all files.
-
-**Verification:** `scripts.accounts.test_next_moves scripts.accounts.test_accounts scripts.accounts.test_refusal_watch scripts.whoami.test_quota_alert scripts.whoami.test_codex_alert_accounts scripts.notify.test_push_catalog` (the ones that exist) and `bash scripts/agents/test_agent_exec.sh`, with a scratch HOME; basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **Rename:** `git grep -n next_moves -- commands docs/accounts.md docs/quota_alerts.md scripts/notify` finds only the module or state file names.
-- **Any account:** `next add workers 1 claude4` is accepted with a `claude4` folder and refused with its setup step without one; the low-quota pass with that head routes the workers to Claude, and a workers Claude launch then resolves `claude4`.
-- **Fallback:** with no entry, a refusal still moves workers to a Codex account with room.
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- A Mac on older code ignores `workers_claude` (the decoder skips unknown keys), so it keeps the caller account until it updates.
+- Subagents inside a Claude session always use that session's account; a route cannot move them.
+- One pool review and two closure reviews found 8 issues (delegate launches ignored the route, the Mac could not see it, friends took it, a failed read-back undid it, lost state kept it, a rollback error escaped, a doc example used a wrong CLI name). Each fix has a test.
+- `test_codex_mesh` `test_follow_cli_accepts_each_new_flag_independently` failed once under gate load and passed 3 of 3 alone.
