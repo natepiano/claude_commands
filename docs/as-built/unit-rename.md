@@ -8,7 +8,7 @@ with three actions: `plan`, `apply` and `verify`.
 
 - The unit id (`<stem>-unit`) is the key. The branch `<slug>-<stem>` and the worktree are built from
   the stem.
-- A session name is a label: the rename changes it only while it is still add_unit's default.
+- The Claude session always takes the new stem, and verify fails while the live session or a herdr pane label still has the old session name (user, 2026-10-19). `<old>` may be the session name; when the id already matches, only stop, record, relaunch and verify run.
 - Rule: store only what cannot be looked up, and never rewrite history.
   - Merge subjects, logs, transcripts and plan prose keep the old id.
   - `merge_checkpoint.merge_branch_history` follows the commit `chore(<slug>): rename unit <old> to
@@ -58,7 +58,7 @@ steps:
    The journal records the commit's hash, so a retry only pushes it.
 6. **Merge rename.** The unit branch takes the rename commit.
 7. **State.** These move to the new id:
-   - the six showrunner scratch files (`rename_state.SCRATCH_FILES`);
+   - the six showrunner state files (`rename_state.SCRATCH_FILES`) in `showrunners.session_state_dir(<slug>)`, or in the `--scratch` directory when one is given;
    - the stall-watch stretch;
    - the reviewer leases and memory;
    - the newest run record and the recorder state;
@@ -98,7 +98,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the state root;
   - every `~/.claude*` config dir;
   - the showrunner checkout and the new worktree, as git sees them;
-  - the six scratch files.
+  - the six showrunner state files.
 
   A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.

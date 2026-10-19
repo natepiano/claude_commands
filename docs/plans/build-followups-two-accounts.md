@@ -2069,3 +2069,101 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `test_launch_accounts.py`'s shell-launch guard still rejects `accounts.py pick` in a launcher script. It guards against the verb coming back, so it stays.
 - The refusal now runs the ranking. A defect in a candidate home that makes `pick()` raise changes the refusal into that error. The move is still refused.
 - C4 (0% means no room in pick) stays closed under the room-until-refusal rule. This phase did not change it.
+
+### Phase 75 — A failed read shows a star and a footnote  · status: done
+
+#### As-built
+
+- The Read cell of the accounts status table shows the last good read. When the latest attempt failed, it adds `*`. An old read also shows its month and day (`10-17 20:15 EDT*`). An account with no good read shows `—*`. There is no new column. The user asked for this through the showrunner (2026-10-19): claude4 showed a 10-17 time because its login token expired.
+- Under the table there is one footnote per failed account: `* <label>: login token expired; start a session on it to refresh`, `usage read refused (401); start a session on it to check its login`, `usage read refused (rate limit); the next read is in 2 minutes`, `usage read failed; the next read is in 2 minutes`. The same lines go to the JSON problems list. A good read clears the star and the footnote.
+- `agent_accounts.UsageReadOutcome` is a closed enum: ok, stale_token, refused_401, rate_limited_429, error. The live Claude read classifies the HTTP status where it catches the error. `usage_store` saves `read_outcome` for each login and keeps the last good numbers and times on a failure.
+- `usage_store.UsageReadings` links each tool directory to its login (`directory_logins`, saved as `_directory_logins` in `usage.json`). A failed read that returns no login uses that link, then the caller's `KnownUsageLogin` (status passes the identities it read; the timer passes its named Claude selection and the default identity). With neither, it records nothing. It never takes a login from error text or credentials.
+
+**Files:**
+- `scripts/whoami/agent_accounts.py` — the outcome enum, the HTTP status classification, `KnownUsageLogin`/`UnknownUsageLogin`.
+- `scripts/whoami/usage_store.py` — the saved outcome, the directory links, old-store decoding.
+- `scripts/accounts/accounts.py` — the Read cell and the footnotes.
+- `scripts/whoami/test_usage_store.py`, `scripts/accounts/test_accounts.py` — each cause's star and footnote, the date form, clearing on a good read, the old-store and shared-login cases.
+- `docs/accounts.md` — the star and the footnote.
+
+**Gotchas:**
+- Only `usage_store` reads `usage.json`. Code from before this phase would load `_directory_logins` as an empty login entry. Both machines promote together, so this lasts only until the promotion.
+- `load()` seeds the links from the old `read_source_directory` and `weekly_read_skip_directory` fields. It writes only the directory map.
+- A failed identity read stays unmarked when its directory has no link and the caller knows no login, for example a first failed Codex identity read on an old store. The next good read makes the link.
+- The one pool review found a blocker: a failed read with no login was dropped on a store written before this phase, and also when two directories shared a login. The directory links fixed it.
+
+### Phase 76 — A held quota continuation recovers when its account has room  · status: done
+
+#### As-built
+
+- `codex_mesh._quota_continuation_ready`: a known serving account with no refusal on record is ready when `refusals.stored_reading` is a `FreshReading` and every window it holds has `left > 0`. A recorded refusal still needs `refusals.resolved()`.
+- `codex_mesh._move_idle_worker`: an owed continuation that is not ready on a known account with no refusal returns `WorkerWaitingOnLiveTurn("no fresh reading shows room on the account")`. The roster keeps `continuation_owed`, and the next attempt checks again. An `UnknownCodexAccount` still returns `WorkerThreadStateUnknown`.
+- The showrunner reported the defect (2026-10-19): berth-parallel's Mac seat was held for good after its refusal write failed on an ImportError during the Phase 75 promotion. After this phase is live, the seat recovers at its director's next `implement.sh --to` dispatch.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the ready rule and the wait branch.
+- `scripts/agents/test_codex_mesh.py` — recovery with and without a five-hour window; missing, stale and zero-room readings wait and recover later; an unknown account sends nothing; the cleanup test pins `ensure_server` to its stub port.
+
+**Gotchas:**
+- With no refusal on record, a fresh reading with room is enough, also when it was taken before the failure. A recorded refusal still blocks such a reading.
+- The unreadable-thread cleanup test started a real app-server from its scratch HOME after a long suite run (its fake epoch made the process look older than the synthetic sign-in). Its `ensure_server` is now pinned to the stub port.
+- `scripts.agents.test_codex_mesh` ran about 20 minutes, and this phase's merge gate took 1258 s, where the Phase 75 gates took about 300 s. Reported to the showrunner; not diagnosed.
+
+### Phase 77 — A follow with no stored refusal returns at once  · status: done
+
+#### As-built
+
+- `codex_mesh.WorkerWaitingForRoom(reason, client, port, thread_id)` is a `WorkerMoveResult` that is not a live turn. `_move_idle_worker` returns it for a known account with no stored refusal and no fresh reading with room. The refused-account wait and the unknown-account hold do not change.
+- `_wait_for_room` adopts the carried client, port and thread, then logs `<seat> waits for room on <account>: <reason>; the continuation stays owed` once. A follow or one-turn launch keeps `continuation_owed` and the held messages for the next dispatch and finishes at once. A resident stays.
+- `_start_workers_turn`, `_resume_account_move`, the capacity retry, the context-overflow continuation and the account-move resume all hand the wait to `_wait_for_room`. A capacity retry that meets the wait clears `resume_owed`, so the quota continuation is the one continuation.
+- The showrunner reported it (2026-10-19), and test-threads found the cause: Phase 76 returned `WorkerWaitingOnLiveTurn` there, and the follow loops polled until `CALL_TIMEOUT_SECS` (300 s).
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the new result and its handling.
+- `scripts/agents/test_codex_mesh.py` — the four refusal tests store their refusal; tests for the follow, launch, resident, moved connection and single continuation.
+
+**Gotchas:**
+- The Phase 76 regression made four tests wait 300 s each and the merge gate take about 1260 s. After this phase the gate took 121 s.
+- The one pool review found two blockers: the wait dropped the connection and thread a refused move had already adopted, and a capacity retry left `resume_owed` set. Both are fixed with regression tests.
+
+### Phase 78 — A launcher sees a refused thread as ended  · status: done
+
+#### As-built
+
+- `codex_mesh._thread_has_no_active_turn(status)` names the app-server thread states with no active turn: `idle`, `notLoaded` and `systemError`. `_ended_unseen`, `_read_live_turn` and reset use it.
+- A refused thread (status `systemError`) with an account-move marker resumes the move on the next quiet poll. A result held after a detached run ends goes through `_finish_if_ended_unseen`: the worker moves, waits for room or finishes. Reset accepts a refused or unloaded thread.
+- `_move_idle_worker` returns `WorkerWaitingForRoom("the refused account has not recovered", ...)` for an owed continuation on an unchanged account with a stored refusal. `WorkerWaitingOnLiveTurn` now means only a live turn. A follow or one-turn launch logs the wait once, keeps the continuation and the held messages, and finishes. A later account move resumes the continuation through its detached resume.
+- The showrunner reported it (2026-10-19): style's seat `claude-build-followups-style-impl2` stayed attached about 3 hours after codex1 reached zero.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the predicate, its three callers and the stored-refusal room wait.
+- `scripts/agents/test_codex_mesh.py` — regressions for the marked move, the held result (follow and one-turn launch, with and without a stored refusal) and reset; six refusal tests now expect the room wait, not the timeout handoff.
+
+**Gotchas:**
+- After a refused turn the app-server reports the thread as `systemError`, not `idle`. A status check that accepts only `idle` waits on a refused thread without limit.
+- The one pool review found one blocker (the stored-refusal path still returned `WorkerWaitingOnLiveTurn`). It is fixed with regression tests. The first new tests fail on the old code.
+
+### Phase 79 — One usage read at a time, in clear words  · status: done
+
+#### As-built
+
+- `agent_accounts.claude_live` claims each read with `usage_store.claim_read` under an `fcntl.flock` on `~/.local/state/agent-notes/usage.lock`. A login attempted less than 90 s ago, or less than 10 minutes after a 429, is not read: the report has outcome `HELD`, no quotas and no `quota_problem`. `merge`, `agent_notes.apply` and the accounts table change nothing for it. The lock is never held during the HTTP call.
+- `usage_store.finish_read` keeps the attempt outcome (`attempted_at`, `attempt_outcome`) and the reading for every claimed read, also for callers that do not save (whoami). A claimed report carries its `UsageReadClaim`; a claim older than the stored `attempted_at` changes nothing in `merge`.
+- `save`, `claim_read`, `finish_read` and `quota_alert._save_codex_readings` do their load, merge and write under the lock. `write` is a plain replace and takes no lock.
+- A store error in the claim reads without a hold; one in the finish keeps the live report. Each prints one stderr line.
+- `accounts._read_failure_note` says "the usage service is busy, so this shows the reading from HH:MM; next try after HH:MM" (429 attempt time plus 10 minutes), "the usage read failed, so this shows the reading from HH:MM; next try in 2 min", and "the usage service did not accept this login; start a session on it to check it". With no stored reading the first two say "... and no reading is stored yet". The JSON problems list carries the same lines.
+- Cause (2026-10-19 08:11 EDT): during the units move, about 28 `shutdown.py status` and `ready --where` runs each started the full snapshot, which read every Claude login. Six overlapping passes made 18 reads in 24 s, and every login got 429.
+
+**Files:**
+- `scripts/whoami/agent_accounts.py` — `HELD`, the claim types and the claim and finish around the HTTP call.
+- `scripts/whoami/usage_store.py` — the lock, the attempt fields, `claim_read`, `finish_read`, `merge` for held and stale claims, `save` under the lock.
+- `scripts/whoami/quota_alert.py` — the Codex save under the lock.
+- `scripts/whoami/agent_notes.py` — a held report writes nothing.
+- `scripts/accounts/accounts.py` — the footnote words and the attempt time on each row.
+- Tests: `scripts/whoami/test_agent_accounts.py`, `test_usage_store.py`, `test_quota_alert.py`, `test_agent_notes.py`, `scripts/accounts/test_accounts.py`.
+
+**Gotchas:**
+- The 90 s hold must stay shorter than the 2-minute agent-sessions timer, or the timer holds its own reads.
+- `write` needs the caller to hold `read_lock`. A second flock on the lock file in one thread blocks, so never take the lock inside a path that already holds it.
+- The extra passes still run the snapshot's notes refresh (in `/etc/nixos/modules/linux/agent-sessions-snapshot.py`, outside this repo); they now read nothing. The showrunner routes the change that skips it.
+- The one pool review found one blocker (a late save of an older good read cleared a newer 429) and one minor (a store error cost the read). Both are fixed with tests.

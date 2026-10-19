@@ -2,7 +2,7 @@
 
 ## What it is
 
-A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, and `/accounts-board` shows the accounts table that `accounts.py` reports, logins included, without the addresses ever passing through a model reply. `/unit:report` prints a short report (phase, stage, one ETA line, workers, summary), and adds the recorder's tables only when asked with `tables`.
+A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, and `/accounts-board` shows the accounts table that `accounts.py` reports from stored readings, with no login addresses. `/unit:report` prints a short report (phase, stage, one ETA line, the summary table, workers, summary sentences), and adds the recorder's round table only when asked with `tables`.
 
 ## How it works
 
@@ -17,7 +17,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
             (short report / --tables)              writes <slug>.json, prints {files, watch}
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
-                                       mod: /accounts-board ── runs accounts.py status --json --stored --with-login
+                                       mod: /accounts-board ── runs accounts.py status --json --stored
 ```
 
 ### Recording ETAs
@@ -93,7 +93,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `overdueText` gives ` · overdue Nm|Nh Mm|Nd Mh`. |
 | `hooks/board.tsx` | `BoardView`, `RulerView` and the shared text helpers `etaText`, `gateText`, `finishText`, `workersText`. |
 | `hooks/unit.tsx` | `UnitView`: one unit's detail. |
-| `hooks/accounts.tsx` | `AccountsView`, `accountDisplay` and the display types. |
+| `hooks/accounts.tsx` | `AccountsView`, `accountsTable`, `accountDisplay` and the display types. |
 | `types/board.d.ts`, `types/accounts.d.ts` | Wire contracts of the generator and of `accounts.py`. |
 | `types/index.d.ts` | `BoardSnapshot`, `PaneState`, `AccountsPaneState`, the `PluginState` keys. |
 | `tests/` | `kit.ts` fixtures; `geometry`, `register` and `accounts` tests. |
@@ -102,7 +102,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 - `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd> --session <$.session.id()>` (the open pane keeps both, so every refresh passes them), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `Run /showrunner:unit_board in a showrunner session.`; it replies `Unit board opened.` `open` buttons on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
 - A mod command name allows only letters, digits, `_` and `-`, so [`commands/showrunner/unit_board.md`](../../commands/showrunner/unit_board.md) gives the name. The mod answers it with a `command.run` hook on `{ command: 'showrunner:unit_board' }` that returns `{ text }` and never calls `next`, so no model turn starts. In a session without the mod, the file's body makes the model reply one line naming `unit-board@nate-local`.
-- `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored", "--with-login"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
+- `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
 - `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh.
 
 **State.** Plugin state `unit-board` holds two keys, each a record keyed by pane id; a missing entry is a closed pane.
@@ -158,26 +158,26 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
   - Older done rows fold into `+N earlier: <ids>`, and todo rows past the next three into `+N later`.
   - Older steps fold into `+N earlier steps`.
   - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
-- Accounts: `units: <labels>, showrunners: <labels>` from `roles` (units match `units` and `unit directors`; none reads `unassigned`), then Label, Login, Roles, Weekly left, Weekly resets, On credits, Credits left, Read, then Problems. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`), so a null reading shows `unavailable`, never 0. Dates format with `Intl.DateTimeFormat` in the resolved zone.
+- Accounts: the table Label, Roles, Left, Resets, Credits, Read is the first line of the pane, then Problems. There is no Login column and no `units: …, showrunners: …` line: the user found the table already shows the roles, and the space is better spent on the table. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`). `accountsTable(rows, zone): AccountsTable` makes the cell strings: Left is the rounded percent; Resets and Read are `Oct 18 14:00` (`Intl.DateTimeFormat` in the resolved zone, no weekday, comma removed); Credits is the balance (`42`, `unlimited`) with ` in use` when the account uses credits; a missing reading or invalid date is `—`, never 0. Its `width` is the column widths in terminal columns (`cellWidth`) plus two spaces between columns, and the last column has no padding: a pane at least `width` columns wide draws each account on one line, and only a narrower pane wraps. Row text is the default colour.
 - `resolveUserZone(calls, isActive): Promise<ZoneLookup>` follows [`scripts/lib/user_zone.py`](../../scripts/lib/user_zone.py): `USER_ZONE`, then the `zone=` line of `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`, validated through `Intl.DateTimeFormat`; it returns `{kind: 'cancelled'}` once the lifecycle moves on.
 
 ### The short report
 
-`progress_history.py progress` (and `_print_last_recorded` between windows) prints by default the phase heading, one ETA line from `_phase_eta_line(session_dir, phase_number)`, the stage line and one `- **Agent N**` line per worker. `--tables` adds the clocks table (`_summary_table`) and the round table with its `Earlier:` line; verification gate lines print in both forms.
+`progress_history.py progress` (and `_print_last_recorded` between windows) prints by default the clocks table (`_summary_table`), the phase heading, one ETA line from `_phase_eta_line(session_dir, phase_number)`, the stage line and one `- **Agent N**` line per worker. `--tables` adds the round table with its `Earlier:` line; verification gate lines print in both forms.
 
 - ETA line forms: `ETA HH:MM (first HH:MM, +H:MM, moved N×, …)`, `ETA HH:MM (on its first ETA, …)`, a leading `passed` when an open phase is overdue, fix rounds as `N fix rounds`, `+ 1 running` or `1 fix round running`, `gated until Wed 22 Oct 11:47`, `gated by <gate>: <Waits on>`, and `ETA unavailable` when no plan, state, row or promise exists. A promise on another local day shows weekday and date. The line reads only the reported phase's own row and gate.
 - Worker lines come from `_current_worker_windows` / `_current_worker_cells`: per slot, the live window, else the most recent finished one, independent of the director's own activity.
 - In the clocks table Project ETA is the chain's finish (`_project_chain_eta`), low/high shifted by the open phase's band; under an untimed gate it reads `after G<k>` with `—` for low/high.
-- The legacy (non-dual) layout keeps its old form plus one ETA line after the phase line. The vault phase note keeps the full phase list.
-- [`commands/unit/report.md`](../../commands/unit/report.md): `/unit:report [tables|on|off]` presents phase and stage, ETA line, worker table, summary sentences, then `See /showrunner:unit_board for the board.`; `tables` passes `--tables` and adds both tables after the ETA line. `<DelegationResultFormat>` in [`commands/unit/direct.md`](../../commands/unit/direct.md) closes every delegation result and launch with this short report.
+- The legacy (non-dual) layout keeps its old form plus one ETA line after the phase line, and prints the clocks table only under `--tables`. The vault phase note keeps the full phase list.
+- [`commands/unit/report.md`](../../commands/unit/report.md): `/unit:report [tables|on|off]` presents phase and stage, ETA line, the summary table copied byte for byte, worker table, summary sentences, then `See /showrunner:unit_board for the board.`; `tables` passes `--tables` and adds the round table after the summary table, with `Earlier:` and the verification gate lines. `<DelegationResultFormat>` in [`commands/unit/direct.md`](../../commands/unit/direct.md) closes every delegation result and launch with this short report.
 
 ## Invariants
 
 - **Nothing shows by itself.** A pane opens only from its slash command or a press inside an open pane, and closes from its command, Escape or its close mark. No pane at `session.start`, no `AbovePrompt` band, no status line, no toast.
 - **A closed pane does no work.** With a pane closed there is no timer, no `$.fs` call and no `$.process.run` for it; with no board pane open, `turn.complete` passes straight to `next`, and it never refreshes accounts. While open, refresh is `$.fs.stat` of existing files, and a process starts only on open or when a stat shows a change.
 - **No new long-running process.** No daemon, service or timer job exists outside the mod; the generator and `accounts.py` are one-shot runs.
-- **The mod never opens a credential file.** It never reads `.claude.json`, `auth.json` or any `id_token`; logins arrive only in the `login` field of `accounts.py --stored --with-login`.
-- **Login addresses are only drawn.** They never appear in a command reply, log, toast or message; a failed accounts run shows a fixed reason, never process output.
+- **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and runs `accounts.py` without `--with-login`, so no login address reaches the mod.
+- **A failed accounts run shows a fixed reason**, never process output, in the pane, a command reply, a log, a toast or a message.
 - **User-facing times use the user zone.** Python writes them with `astimezone(user_zone())`; the mod resolves the zone in `scripts/lib/user_zone.py`'s order; board times use the production's registered zone. `scripts/lib/test_user_zone` scans every script.
 - **The ETA is the latest stated promise**, never the schedule end an overdue phase is advanced to. `eta.at`, `first` and `trail` hold promises only; `schedule_end` is never a trail entry; the ruler's ETA mark is `eta.at`.
 - **Readers place an ETA by `eta_phase_id`**, never `phase_id`, which names the phase active when it was recorded.
@@ -194,7 +194,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Ruler horizon: 10 % beyond the later of the promise and now; board ruler width is `bodyColumns - 4`, unit `bodyColumns - 2`, minimum 8.
 - `doing` is cut to 80 characters, after the `launcher: ` prefix and the summary or findings path are removed.
 - `local_run` stops at the `run_started` line: parsing every line of every run file once per unit took 35 s for three productions, past the mod's 30 s process limit. Reading to that line brings it to about 4.5 s.
-- Weekly left under 10 % is `error`, under 25 % `warning`.
+- Left under 10 % is `error`, under 25 % `warning`, else the default colour (`leftTone`); no account row is `subtle`, which made the table hard to read.
 - `HH:MM` for `--time`, `--earliest`, `--latest` means today only; a later-day ETA needs the full date.
 - A phase record's `first_eta` comes from `_instance_eta_events`, so a checkpoint-notice ETA recorded before the phase starts counts as its first.
 - `build_plan` can select an older resumed phase as open, so the newest `phase_started` is the wrong instance for `steps` and `stage`; both follow `OpenPhase.instance_id`.
@@ -219,9 +219,9 @@ The mod draws and Python computes. The chain, gates and history live in `phase_t
 
 The panes open only on demand because the user asked for it, and a closed pane costs nothing for the same reason a background watcher was ruled out: no session should pay for a view nobody is looking at. While open, stat-based refresh is cheap: the sources are files the run already writes, so an unchanged tick is a handful of stats and a redraw, and the generator runs only after something changed. The `discovery` paths exist so a production or input that appears later still triggers a refresh without a scan.
 
-The accounts view draws `accounts.py`'s stored status straight to the screen so login addresses reach the user without passing through a model reply, a log or a message. It reads stored values (`--stored`) rather than probing accounts, and reruns only when one of its four input files changes, so an open pane spends no quota and no network.
+The accounts view draws `accounts.py`'s stored status straight to the screen. It first showed login addresses; the user removed the Login column (2026-10-19) to give the table room, so the mod no longer asks for logins at all. It reads stored values (`--stored`) rather than probing accounts, and reruns only when one of its four input files changes, so an open pane spends no quota and no network.
 
-The terminal report got shorter because the tables answered questions most ticks do not ask; the board carries the visual view, and `tables` keeps the full recorder output one word away.
+The terminal report leaves out the round table because it answers questions most ticks do not ask; the board carries the visual view, and `tables` keeps the full recorder output one word away.
 
 A standing plan shows its ticket and a merged count, not `Phase N/total`, because it holds one ticket phase at a time and refill discards each merged one: `Phase 63/1` read as phase 63 of 1 when it was the 63rd ticket. The merged count, not a total, is the progress a ticket queue has.
 

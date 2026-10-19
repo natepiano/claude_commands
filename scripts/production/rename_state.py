@@ -184,7 +184,7 @@ def _rename_blocks_open(path: Path, old: str, new: str) -> bool:
     return True
 
 
-# The showrunner scratch files _rename_scratch rewrites; verify reads them for a stale unit id.
+# The showrunner state files (showrunners.session_state_dir) _rename_scratch rewrites; verify reads them for a stale unit id.
 SCRATCH_FILES = ("dailies_input_state/eta_seen.json", "unit_status/decisions_seen", "unit_status/blocks_open",
                  "showrunner_state.json", "dailies_judgment.json", "dailies_state.json")
 

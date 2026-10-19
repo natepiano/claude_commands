@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import refusals
 from scripts.accounts.role_map import role_map_command
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report,
+from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report, UsageReadOutcome,
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
@@ -261,6 +261,8 @@ def apply(
     *, multiple_codex_homes: bool = False,
 ) -> QuotaUpdates:
     """Compute quota updates without writing any note."""
+    if account.usage_read_outcome == UsageReadOutcome.HELD:
+        return QuotaUpdates({}, (), ())
     messages: list[str] = []
     by_label: dict[str, dict[str, str]] = {}
     reset = account.weekly_reset

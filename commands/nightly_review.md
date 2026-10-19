@@ -41,7 +41,7 @@ For each mode, pick the single change with the largest measurable gain for its c
 **Also found:** <up to three one-line runners-up, each `- **<title>.** <one line> [gain/week: 12 min red CI]` or `[gain/week: 0.4% of tokens]`; leave the tag off an unmeasured one>
 ```
 
-LEDGER gets one line for the proposal and one for each Also found item, with these gains, and `/nightly_next` and `/showrunner:nightly` rank by them. Write each gain as a week's worth in the form shown, so a script can read it. Anything that is no candidate (what was denied tonight, a note on the target choice) goes below the items under a plain line of its own, which closes the list.
+LEDGER gets one line for the proposal and one for each Also found item, with these gains, and `/efficiency_next` and `/showrunner:nightly` rank by them. Write each gain as a week's worth in the form shown, so a script can read it. Anything that is no candidate (what was denied tonight, a note on the target choice) goes below the items under a plain line of its own, which closes the list.
 
-Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/nightly_next` reads every night's reports. After the last mode, stay open: the user may run `herdr session attach nightly-review` to ask about it.
+Then `SendMessage` to the address `python3 ~/.claude/scripts/message/sessions.py address natedev` prints, which is natedev's session on this machine: first line `Nightly proposal ready: DIR/<mode>.md`, second line the title. If it prints nothing, natedev is not running: skip the message; `/efficiency_next` reads every night's reports. After the last mode, stay open: the user may run `herdr session attach nightly-review` to ask about it.
 </Proposal>

@@ -17,12 +17,10 @@ from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
-    from ..hooks.showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
-        read_pending_reviewed, ReportItem, reports_path)
+    from ..hooks.showrunner_footer import ReportItem, reports_path
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
-        read_pending_reviewed, ReportItem, reports_path)
+    from showrunner_footer import ReportItem, reports_path
 import showrunners
 from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
@@ -105,6 +103,8 @@ class ShowrunnerState(NamedTuple):
     merges_held: tuple[str, ...]
     outstanding: KeepOutstanding | ReplaceOutstanding
     reports: KeepReports | ReplaceReports = KeepReports()
+    # What the showrunner owes and what sets each off; a resume acts on it first.
+    owed: tuple[str, ...] = ()
 
 
 class RegistrationFailure(Exception):
@@ -159,7 +159,7 @@ def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     return ScheduledUpdates(minutes, "on the hour" in line)
 
 
-def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
+def scheduled_prompt(minutes: int, zone: str, doc: Path, slug: str) -> str:
     source = Path(__file__).resolve().parents[2] / "commands/showrunner/produce.md"
     document = source.read_text(encoding="utf-8")
     if "The prompt:\n" not in document:
@@ -170,7 +170,33 @@ def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
     template = tail.split("\n**A tick**", 1)[0]
     prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
     prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", zone).replace("<production doc>", str(doc))
+    prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(slug)))
     return prompt
+
+
+def adopt_moved_state(production: Production) -> list[str]:
+    """Copy the scratchpad state the state directory lacks and rewrite a tick prompt that differs.
+
+    Every registration and dailies call runs this first, so a showrunner started before the state
+    moved out of its scratchpad needs no step (showrunner, 2026-10-19). A failure only skips it.
+    """
+    done: list[str] = []
+    try:
+        copied = showrunners.adopt_session_state(production.slug)
+        if copied:
+            done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(production.slug)}")
+        prompt_file = showrunners.SHOWRUNNER_STATE_DIR / production.slug / "prompt.txt"
+        if not prompt_file.exists():
+            return done
+        schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
+        minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
+        prompt = scheduled_prompt(minutes, str(production.zone), production.doc, production.slug)
+        if prompt_file.read_text(encoding="utf-8") != prompt:
+            _ = prompt_file.write_text(prompt, encoding="utf-8")
+            done.append(f"rewrote {prompt_file} from produce.md")
+    except (OSError, UnicodeError, RegistrationFailure) as error:
+        done.append(f"state move skipped: {error}")
+    return done
 
 
 def register(production: Production) -> None:
@@ -187,7 +213,7 @@ def register(production: Production) -> None:
     # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
     minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
                         else (DEFAULT_MINUTES, False))
-    prompt = scheduled_prompt(minutes, str(production.zone), production.doc)
+    prompt = scheduled_prompt(minutes, str(production.zone), production.doc, production.slug)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
@@ -244,7 +270,7 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
         raise state_error(step, path, "root", "an object")
     fields = cast(dict[str, object], value)
     for key in fields:
-        if key not in {"units", "merges_held", "open_for_user", "report_to_user"}:
+        if key not in {"units", "merges_held", "open_for_user", "report_to_user", "next"}:
             raise state_error(step, path, key, "a known key")
     raw_units = fields.get("units", [])
     if not isinstance(raw_units, list):
@@ -267,6 +293,10 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
     raw_held = fields.get("merges_held", [])
     if not isinstance(raw_held, list) or not all(isinstance(item, str) for item in cast(list[object], raw_held)):
         raise state_error(step, path, "merges_held", "a list of text")
+    raw_next = fields.get("next", [])
+    if not isinstance(raw_next, list) or not all(isinstance(item, str) and item.strip() and "\n" not in item
+                                                 for item in cast(list[object], raw_next)):
+        raise state_error(step, path, "next", "a list of one-line text")
     outstanding: KeepOutstanding | ReplaceOutstanding = KeepOutstanding()
     if "open_for_user" in fields:
         raw_open = fields["open_for_user"]
@@ -305,7 +335,7 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
                 items.append(OpenQuestionWithoutText(cast(str, item["text"]), after))
         outstanding = ReplaceOutstanding(tuple(items))
     return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding,
-                           report_items(fields, path, step))
+                           report_items(fields, path, step), tuple(cast(list[str], raw_next)))
 
 
 def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReports | ReplaceReports:
@@ -397,7 +427,7 @@ def state_block(production: Production, state: ShowrunnerState, timestamp: str) 
     held_lines = ", ".join(state.merges_held)
     open_lines = ", ".join(item.text for item in read_outstanding(outstanding_path(production)))
     return "\n".join([f"### STATE {timestamp}", *unit_lines, f"Merges accepted but held: {held_lines or 'none'}",
-                      f"Open for the user: {open_lines or 'none'}", ""])
+                      f"Open for the user: {open_lines or 'none'}", f"Next: {'; '.join(state.owed) or 'none'}", ""])
 
 
 def append_log(production: Production, event: str, path: Path | None, before_compaction: bool) -> None:
@@ -467,7 +497,21 @@ class HeldRegistrationQuestion(NamedTuple):
     details: str
 
 
-def review_open_question(slug: str, item: QuestionForReview) -> PendingQuestion | HeldRegistrationQuestion:
+class ReviewedQuestion(NamedTuple):
+    text: str
+    reviewed: str
+
+
+class ReviewUnavailableQuestion(NamedTuple):
+    text: str
+    question: str
+    reason: str
+
+
+AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
+
+
+def review_open_question(slug: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Copied registration trees can run reminder-only commands without notify installed.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
     if TYPE_CHECKING:
@@ -476,9 +520,9 @@ def review_open_question(slug: str, item: QuestionForReview) -> PendingQuestion 
         import review
     outcome = review.review_question(review.QuestionKey(slug, item.text), item.question)
     if isinstance(outcome, review.QuestionAccepted):
-        return PendingReviewedQuestion(item.text, outcome.question)
+        return ReviewedQuestion(item.text, outcome.question)
     if isinstance(outcome, review.QuestionReviewUnavailable):
-        return PendingReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
+        return ReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
     details = outcome.questions if isinstance(outcome, review.QuestionAwaitingFacts) else outcome.details
     return HeldRegistrationQuestion("; ".join(details + tuple(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
 
@@ -492,7 +536,7 @@ def questions(production: Production, path: Path | None) -> None:
         now = datetime.now(production.zone)
         since = now.strftime("%Y-%m-%dT%H:%M")
         entries: list[OutstandingItem] = []
-        pending: list[PendingQuestion] = []
+        pending: list[AcceptedQuestion] = []
         held: list[str] = []
         items_by_text: dict[str, OpenForUserItem] = {}
         for item in state.outstanding.items:
@@ -521,10 +565,10 @@ def questions(production: Production, path: Path | None) -> None:
                 keep_question_fields(entry, previous[item.text])
             elif isinstance(item, QuestionForReview):
                 accepted = review_open_question(production.slug, item)
-                if isinstance(accepted, PendingReviewedQuestion):
+                if isinstance(accepted, ReviewedQuestion):
                     entry["question"], entry["reviewed"] = item.question, accepted.reviewed
                     pending.append(accepted)
-                elif isinstance(accepted, PendingReviewUnavailableQuestion):
+                elif isinstance(accepted, ReviewUnavailableQuestion):
                     entry["question"], entry["review_unavailable"] = item.question, accepted.reason
                     pending.append(accepted)
                 else:
@@ -533,16 +577,10 @@ def questions(production: Production, path: Path | None) -> None:
         if held:
             raise RegistrationFailure("questions", "question held for review: " + "; ".join(held))
         outstanding.parent.mkdir(parents=True, exist_ok=True)
-        instance_dir = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{production.slug}"
-        if (instance_dir / "conf").exists():
-            existing_pending = read_pending_reviewed(instance_dir)
-            retained_pending = [item for item in existing_pending if item.text in items_by_text]
-            if retained_pending != existing_pending or pending:
-                write_pending_reviewed(instance_dir, retained_pending + pending)
         record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
         for item in pending:
-            accepted_text = item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
+            accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
             print("reviewed question: " + accepted_text)
     if isinstance(state.reports, ReplaceReports):
         reports = reports_path(production.slug)
@@ -572,6 +610,8 @@ def main() -> int:
     action = cast(str, args.action)
     try:
         production = read_production(cast(Path, args.production))
+        for line in adopt_moved_state(production):
+            report("state-dir", "ok", line)
         if action == "register":
             register(production)
         elif action == "time":

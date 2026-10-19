@@ -1502,6 +1502,36 @@ def archive_session(login: str, session_id: str) -> None:
         os.replace(path, target)
 
 
+def taken_over(saved: SessionShutdown) -> bool:
+    """Whether a later request on any account holds this session, live or archived (a stop, a forget, a new move)."""
+    root = _state_root()
+    if not _record_directory(root):
+        return False
+    since = datetime.fromisoformat(saved["requested_at"])
+    session_id = saved["session"]["session_id"]
+    name = _session_filename(session_id)
+
+    def later(requested_at: str) -> bool:
+        try:
+            return datetime.fromisoformat(requested_at) > since
+        except ValueError:
+            return False
+
+    if any(item["session"]["session_id"] == session_id and later(item["requested_at"]) for item in all_session_records()):
+        return True
+    for directory in root.iterdir():
+        history = directory / "history"
+        try:
+            if _is_root_metadata(directory.name) or not _record_directory(directory) or not _record_directory(history):
+                continue
+            names = [path.name for path in history.iterdir()]
+        except (OSError, ValueError):
+            continue
+        if any(entry.endswith("-" + name) and later(entry[:-len(name) - 1]) for entry in names):
+            return True
+    return False
+
+
 def restarted_history() -> list[SessionShutdown]:
     """Read completed per-session history once, ignoring each unreadable entry.
 

@@ -607,19 +607,22 @@ def _forget(text: str, account: str = "") -> int:
             add(saved["login"], saved["label"], saved["session"])
     exact = [item for item in candidates.values() if item.session_id == text]
     matches = exact or [item for item in candidates.values() if text in item.names]
-    if len(matches) != 1:
+    # After a move one session can have a record on each account; forgetting it forgets every copy.
+    if len({item.session_id for item in matches}) != 1:
         print(f"forget: {text} matches {'no local session' if not matches else 'more than one local session'}", file=sys.stderr)
         for item in matches:
             print(f"  {item.label}: {item.name} ({item.session_id})", file=sys.stderr)
         return 2
-    item = matches[0]
-    outcome = recovery_store.forget_session(item.login, item.session_id, machine)
-    if isinstance(outcome, recovery_store.SessionRetained):
-        print(f"forget: {item.name}: cannot forget shutdown in progress ({outcome.record['progress']['kind']})", file=sys.stderr)
-        return 1
-    _ = recovery_store.acknowledge_snapshot(item.login, item.session_id)
-    print(f"{item.name}: forgotten")
-    return 0
+    code = 0
+    for item in matches:
+        outcome = recovery_store.forget_session(item.login, item.session_id, machine)
+        if isinstance(outcome, recovery_store.SessionRetained):
+            print(f"forget: {item.name}: cannot forget shutdown in progress ({outcome.record['progress']['kind']})", file=sys.stderr)
+            code = 1
+            continue
+        _ = recovery_store.acknowledge_snapshot(item.login, item.session_id)
+        print(f"{item.name}: forgotten" + (f" on {item.label}" if len(matches) > 1 else ""))
+    return code
 
 
 def _unresolved_snapshot_lines(login: str, only: tuple[str, ...] = ()) -> list[str]:

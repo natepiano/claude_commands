@@ -226,6 +226,46 @@ def tokens(text: str) -> tuple[Token, ...]:
     return tokenized_text(text).tokens
 
 
+@dataclass(frozen=True)
+class TokenSpan:
+    token: Token
+    start: int
+    end: int
+
+
+def token_spans(text: str) -> tuple[TokenSpan, ...]:
+    """Locate code tokens without treating comments as replacement sites."""
+    result: list[TokenSpan] = []
+    cursor = 0
+    for token in tokens(text):
+        while cursor < len(text):
+            if text[cursor].isspace():
+                cursor += 1
+            elif text.startswith("//", cursor):
+                end = text.find("\n", cursor)
+                cursor = len(text) if end < 0 else end
+            elif text.startswith("/*", cursor):
+                depth = 1
+                cursor += 2
+                while cursor < len(text) and depth:
+                    if text.startswith("/*", cursor):
+                        depth += 1
+                        cursor += 2
+                    elif text.startswith("*/", cursor):
+                        depth -= 1
+                        cursor += 2
+                    else:
+                        cursor += 1
+            else:
+                break
+        if token.kind == "unknown" or not text.startswith(token.value, cursor):
+            return ()
+        end = cursor + len(token.value)
+        result.append(TokenSpan(token, cursor, end))
+        cursor = end
+    return tuple(result)
+
+
 def parse_hunks(patch: str) -> tuple[Hunk, ...]:
     hunks: list[Hunk] = []
     old_start = old_count = new_start = 0

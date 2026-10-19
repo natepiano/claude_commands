@@ -2,6 +2,8 @@ import { describe, expect, mock, test } from 'claude-code/testing';
 import type { Engine } from 'claude-code/testing';
 import type { CommandRunInput, EngineInterface, On, TurnCompleteInput } from 'claude-code';
 import { register } from '../hooks/register';
+import { accountDisplay, accountsTable } from '../hooks/accounts';
+import { cellWidth } from '../hooks/geometry';
 import type { StoredAccountsStatus } from '../types/accounts';
 import { BOARD, CWD, DISCOVERY, drawnText, fixture, hostEngine, NOW, REGISTRY, RUN } from './kit';
 
@@ -12,7 +14,7 @@ const CACHE = `${HOME}/.local/state/accounts/role_map_cache.json`;
 const CONFIG = `${HOME}/.claude/config/accounts.json`;
 const INPUTS = [USAGE, GROUPS, CACHE, CONFIG];
 const ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/accounts/accounts.py`,
-  'status', '--json', '--stored', '--with-login'];
+  'status', '--json', '--stored'];
 const command = (name = 'accounts-board', args = ''): CommandRunInput => ({ command: name, args,
   origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
@@ -23,14 +25,64 @@ const props = { title: 'Accounts', isFocused: true, bodyColumns: 170,
 const address = (label: string) => `${label}@example.invalid`;
 function statusFixture(): StoredAccountsStatus {
   return { accounts: [
-    { label: 'Low', tool: 'claude', login: address('low'), roles: ['unit directors', 'showrunners'],
+    { label: 'Low', tool: 'claude', roles: ['unit directors', 'showrunners'],
       weekly_left_percent: 9, resets_at: '2026-10-18T18:00:00+00:00', credits: 42,
       use_credits: true, read_at: '2026-10-16T17:59:00+00:00' },
-    { label: 'Watch', tool: 'codex', login: address('watch'), roles: ['workers'],
+    { label: 'Watch', tool: 'codex', roles: ['workers'],
       weekly_left_percent: 24, resets_at: null, credits: 'unlimited', use_credits: false, read_at: null },
-    { label: 'Unknown', tool: 'claude', login: null, roles: [], weekly_left_percent: null,
+    { label: 'Unknown', tool: 'claude', roles: [], weekly_left_percent: null,
       resets_at: null, credits: null, use_credits: false, read_at: null },
   ], problems: ['Stored reading unavailable for one account.'] };
+}
+const HEADINGS = ['Label', 'Roles', 'Left', 'Resets', 'Credits', 'Read'];
+const OLD_HEADINGS = ['Login', 'Weekly left', 'Weekly resets', 'On credits', 'Credits left'];
+function compactFixture(): StoredAccountsStatus {
+  const data = statusFixture();
+  data.accounts[0] = { ...data.accounts[0]!,
+    weekly_left_percent: 9.4, resets_at: '2026-10-18T14:00:00Z', read_at: '2026-10-18T14:00:00Z' };
+  data.accounts[1] = { ...data.accounts[1]!, weekly_left_percent: 25.6 };
+  return data;
+}
+
+/** Extra fields can still arrive from an older status producer. */
+function legacyLoginFixture() {
+  const data = statusFixture();
+  return { ...data, accounts: data.accounts.map(account => ({ ...account, login: address(account.label) })) };
+}
+
+function element(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+function children(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  const found = element(value).children;
+  return Array.isArray(found) ? found : found === undefined ? [] : [found];
+}
+/** Preserve cell padding and adjacent spans so width checks measure drawn rows. */
+function rowLines(value: unknown): string[] {
+  if (typeof value === 'string' || typeof value === 'number') return [String(value)];
+  const node = element(value);
+  const parts = children(value).flatMap(rowLines);
+  if (node.type === 'Text') return [parts.join('')];
+  if (node.type !== 'Box') return parts;
+  const props = element(node.props);
+  const top = Number(props.marginTop ?? props.marginY ?? props.margin ?? 0)
+    + Number(props.paddingTop ?? props.paddingY ?? props.padding ?? 0);
+  const lines = props.flexDirection === 'column' ? parts
+    : parts.length ? [parts.join(' '.repeat(Number(props.columnGap ?? props.gap ?? 0)))] : [];
+  return [...Array.from({ length: top }, () => ''), ...lines];
+}
+function textNodes(value: unknown): Record<string, unknown>[] {
+  const node = element(value);
+  return [...(node.type === 'Text' ? [node] : []), ...children(value).flatMap(textNodes)];
+}
+function accountRow(tree: unknown, label: string): unknown {
+  if (children(tree).some(child => drawnText(child).trim() === label)) return tree;
+  for (const child of children(tree)) {
+    const found = accountRow(child, label);
+    if (found) return found;
+  }
+  return undefined;
 }
 function accountsHost(on: On, missing: readonly string[] = [], environment: Record<string, string> = { USER_ZONE: 'UTC' }) {
   const host = hostEngine(on);
@@ -152,7 +204,146 @@ function accountRowText(tree: unknown, label: string): string {
   return accountRowText(children, label);
 }
 
+describe('compact accounts table', () => {
+  test('a CJK label reserves terminal columns and drawn rows fit the stated width', async ($, on) => {
+    const fake = accountsHost(on);
+    const account = { ...compactFixture().accounts[0]!, label: '用户名用户名用户',
+      roles: ['unit directors', 'showrunners'],
+      credits: 'unlimited' as const, use_credits: true };
+    fake.replace({ accounts: [account], problems: [] });
+    const table = accountsTable([accountDisplay(account)], 'UTC');
+    const widths = table.headings.map((heading, index) => Math.max(cellWidth(heading),
+      ...table.rows.map(row => cellWidth(row[index]!))));
+    expect(table.width).toBe(widths.reduce((sum, width) => sum + width, 0) + 10);
+    await $.session.start(start);
+    await $.command.run(command());
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+        props: { ...props, bodyColumns: table.width } });
+      const rows = rowLines(await ui.drawn()).filter(line => line.startsWith(account.label));
+      expect(rows.length).toBe(1);
+      const expected = table.rows[0]!.map((cell, index) => index === 5 ? cell
+        : cell + ' '.repeat(widths[index]! - cellWidth(cell))).join('  ');
+      for (const row of rows) {
+        expect(row).toBe(expected);
+        expect(cellWidth(row)).toBeLessThanOrEqual(table.width);
+      }
+    }
+  });
+
+  test('six short headings and compact cells preserve the stored readings', () => {
+    const data = compactFixture();
+    const before = JSON.stringify(data);
+    const table = accountsTable(data.accounts.map(accountDisplay), 'UTC');
+    expect(table.headings).toEqual(HEADINGS);
+    expect(table.rows[0]).toEqual(['Low', 'unit directors, showrunners',
+      '9%', 'Oct 18 14:00', '42 in use', 'Oct 18 14:00']);
+    expect(table.rows[1]?.[2]).toBe('26%');
+    expect(table.rows[1]?.[4]).toBe('unlimited');
+    expect(JSON.stringify(data)).toBe(before);
+    for (const heading of OLD_HEADINGS) expect(table.headings.includes(heading)).toBe(false);
+  });
+
+  test('the display projection drops a legacy login address', () => {
+    const account = legacyLoginFixture().accounts[0]!;
+    const display = accountDisplay(account);
+    expect('login' in display).toBe(false);
+    expect(JSON.stringify(display).includes(account.login)).toBe(false);
+  });
+
+  test('each missing reading and invalid date uses an em dash while real zero stays zero', () => {
+    const data = compactFixture();
+    const missing = data.accounts[2]!;
+    const invalid = { ...missing, label: 'Invalid', resets_at: 'not-a-date', read_at: 'not-a-date',
+      use_credits: true };
+    const zero = { ...data.accounts[0]!, label: 'Zero', weekly_left_percent: 0, credits: 0,
+      use_credits: false };
+    const table = accountsTable([missing, invalid, zero].map(accountDisplay), 'UTC');
+    for (const row of table.rows.slice(0, 2)) {
+      expect([row[2], row[3], row[4], row[5]]).toEqual(['—', '—', '—', '—']);
+      expect(row.join(' ').includes('unavailable')).toBe(false);
+      expect(row.join(' ').includes('0%')).toBe(false);
+    }
+    expect(table.rows[2]?.[2]).toBe('0%');
+    expect(table.rows[2]?.[4]).toBe('0');
+  });
+
+  test('short dates honor the resolved zone and unlimited credits show when they are in use', () => {
+    const account = { ...compactFixture().accounts[0]!, credits: 'unlimited' as const, use_credits: true };
+    const table = accountsTable([accountDisplay(account)], 'America/New_York');
+    expect(table.rows[0]?.[3]).toBe('Oct 18 10:00');
+    expect(table.rows[0]?.[5]).toBe('Oct 18 10:00');
+    expect(table.rows[0]?.[4]).toBe('unlimited in use');
+  });
+
+  test('width reserves six columns and exactly five two-space gaps within 90 columns', () => {
+    const data = compactFixture();
+    data.accounts[1]!.use_credits = true;
+    const table = accountsTable(data.accounts.map(accountDisplay), 'UTC');
+    const widths = table.headings.map((heading, index) => Math.max(cellWidth(heading),
+      ...table.rows.map(row => cellWidth(row[index]!))));
+    expect(table.width).toBe(widths.reduce((sum, width) => sum + width, 0) + 10);
+    expect(table.width).toBeLessThanOrEqual(90);
+    for (const row of [table.headings, ...table.rows]) {
+      expect(row.length).toBe(6);
+      for (const cell of row) expect(cell).toBe(cell.trim());
+    }
+  });
+});
+
 describe('accounts pane', () => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`${surface}: the stated table width draws whole unpadded rows with normal text colors`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = compactFixture();
+      data.accounts[1]!.use_credits = true;
+      fake.replace(data);
+      const table = accountsTable(data.accounts.map(accountDisplay), 'UTC');
+      await $.session.start(start);
+      await $.command.run(command());
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+        props: { ...props, bodyColumns: table.width } });
+      const tree = await ui.drawn();
+      const lines = rowLines(tree);
+      const header = lines.find(line => line.trimStart().startsWith('Label'));
+      expect(lines[0]).toBe(header);
+      expect(lines.some(line => /^\s*units:/i.test(line))).toBe(false);
+      expect(header?.trim().split(/\s{2,}/)).toEqual(HEADINGS);
+      expect(header!.length).toBeLessThanOrEqual(table.width);
+      expect(header!.endsWith(' ')).toBe(false);
+      const widths = table.headings.map((heading, index) => Math.max(heading.length,
+        ...table.rows.map(row => row[index]!.length)));
+      for (const [index, account] of data.accounts.entries()) {
+        const line = lines.find(line => line.trimStart().startsWith(account.label));
+        expect(typeof line).toBe('string');
+        expect(line!.length).toBeLessThanOrEqual(table.width);
+        expect(line!.endsWith(' ')).toBe(false);
+        expect(line).toBe(table.rows[index]!.map((cell, column) => column === 5
+          ? cell : cell.padEnd(widths[column]!)).join('  '));
+        const row = accountRow(tree, account.label);
+        expect(row !== undefined).toBe(true);
+        const cells = textNodes(row);
+        expect(cells.length).toBeGreaterThan(0);
+        for (const cell of cells) {
+          const text = rowLines(cell).join('');
+          const color = element(cell.props).color;
+          expect(color === 'subtle').toBe(false);
+          expect(color ?? 'default').toBe(text.trim() === '9%' ? 'error' : 'default');
+        }
+        // The final Read cell must be on this same line, including for missing dates.
+        expect(line!.trimEnd().endsWith(account.read_at ? 'Oct 18 14:00' : '—')).toBe(true);
+      }
+      const bold = textNodes(tree).filter(cell => /^Label\b/.test(rowLines(cell).join('').trimStart()));
+      expect(bold.length).toBeGreaterThan(0);
+      for (const cell of bold) expect(element(cell.props).bold).toBe(true);
+      const problems = await ui.findAll({ type: 'Text', text: 'Stored reading unavailable for one account.' });
+      expect(problems.length).toBeGreaterThan(0);
+      expect(problems.every(cell => cell.props.color === 'warning')).toBe(true);
+      expect(lines.indexOf('Stored reading unavailable for one account.')).toBeGreaterThan(
+        lines.findIndex(line => line.startsWith('Unknown')));
+    });
+  }
+
   for (const surface of ['terminal', 'desktop'] as const) {
     test(`${surface}: stored status opens a private table with roles and problems`, async ($, on) => {
       const fake = accountsHost(on);
@@ -164,16 +355,43 @@ describe('accounts pane', () => {
       expect(fake.opened).toEqual(['accounts-board']);
       const ui = await mount($, surface);
       const text = drawnText(await ui.drawn());
-      for (const word of ['Label', 'Login', 'Roles', 'Weekly left', 'Weekly resets', 'On credits',
-        'Credits left', 'Read', 'Low', 'Watch', 'Unknown', 'units', 'showrunners', 'workers',
+      for (const word of [...HEADINGS, 'Low', 'Watch', 'Unknown', 'showrunners', 'workers',
         'Stored reading unavailable for one account.', 'unlimited', '42']) {
         expect(text.toLowerCase().includes(word.toLowerCase())).toBe(true);
       }
-      expect(text.includes(address('low')) && text.includes(address('watch'))).toBe(true);
+      for (const heading of OLD_HEADINGS) expect(text.includes(heading)).toBe(false);
+      expect(text.includes('@')).toBe(false);
       expect(text.includes('unit directors, showrunners')).toBe(true);
       expect(hasSensitivePath(fake.fs)).toBe(false);
       expect(fake.escaped.length).toBe(0);
       expect(fake.forbidden).toEqual([]);
+    });
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`${surface}: a legacy login field draws no address on open or refresh`, async ($, on) => {
+      const fake = accountsHost(on);
+      fake.replace(legacyLoginFixture());
+      await $.session.start(start);
+      await $.command.run(command());
+      expect(fake.accountRuns()).toEqual([ARGV]);
+      const ui = await mount($, surface);
+      let text = drawnText(await ui.drawn());
+      expect(text.includes('Low')).toBe(true);
+      expect(text.includes('@')).toBe(false);
+      expect(text.includes('Login')).toBe(false);
+      const changed = legacyLoginFixture();
+      changed.accounts[0]!.label = 'Refreshed';
+      changed.accounts[0]!.login = address('changed');
+      fake.replace(changed);
+      fake.change(USAGE);
+      await fake.clock.advance(10_000);
+      expect(fake.accountRuns()).toEqual([ARGV, ARGV]);
+      text = drawnText(await ui.drawn());
+      expect(text.includes('Refreshed')).toBe(true);
+      expect(text.includes('@')).toBe(false);
+      expect(text.includes('Login')).toBe(false);
+      expect(fake.escaped).toEqual([]);
     });
   }
 
@@ -215,7 +433,7 @@ describe('accounts pane', () => {
   });
 
   for (const role of ['units', 'unit directors']) {
-    test(`${role} assignments populate the units summary from stored roles`, async ($, on) => {
+    test(`${role} assignments stay in the table with its headings first`, async ($, on) => {
       const fake = accountsHost(on);
       const data = statusFixture();
       data.accounts[0]!.roles = [role];
@@ -224,8 +442,12 @@ describe('accounts pane', () => {
       await $.session.start(start);
       await $.command.run(command());
       const ui = await mount($);
-      const text = drawnText(await ui.drawn());
-      expect(/units:\s+Low\s*,\s+showrunners:\s+Watch/.test(text)).toBe(true);
+      const tree = await ui.drawn();
+      const lines = rowLines(tree);
+      expect(lines[0]?.trim().split(/\s{2,}/)).toEqual(HEADINGS);
+      expect(lines.some(line => /^\s*units:/i.test(line))).toBe(false);
+      expect(accountRowText(tree, 'Low').includes(role)).toBe(true);
+      expect(accountRowText(tree, 'Watch').includes('showrunners')).toBe(true);
     });
   }
 
@@ -313,14 +535,15 @@ describe('accounts pane', () => {
     expect(fake.fs.includes(`${HOME}/.local/state/accounts`)).toBe(false);
   });
 
-  test('nullable readings and login stay unavailable instead of becoming zero', async ($, on) => {
+  test('nullable readings draw four em dashes instead of unavailable or zero', async ($, on) => {
     const fake = accountsHost(on);
     await $.session.start(start);
     await $.command.run(command());
     const ui = await mount($);
     const row = accountRowText(await ui.drawn(), 'Unknown');
     expect(row.includes('Unknown')).toBe(true);
-    expect(/(?:—|unavailable|unknown)/i.test(row.replace('Unknown', ''))).toBe(true);
+    expect(row.match(/—/g)?.length).toBe(4);
+    expect(row.includes('unavailable')).toBe(false);
     expect(row.includes('0%')).toBe(false);
     expect(row.includes('null') || row.includes('undefined')).toBe(false);
     expect(fake.accountRuns()).toEqual([ARGV]);
@@ -450,7 +673,8 @@ describe('accounts pane', () => {
       await fake.clock.advance(10_000);
       const text = drawnText(await ui.drawn());
       expect(fake.accountStateKind()).toBe('accounts');
-      expect(text.includes('Weekly left')).toBe(true);
+      expect(text.includes('Left')).toBe(true);
+      for (const heading of OLD_HEADINGS) expect(text.includes(heading)).toBe(false);
       expect(fake.accountRuns().every(argv => JSON.stringify(argv) === JSON.stringify(ARGV))).toBe(true);
     });
   }

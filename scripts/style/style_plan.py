@@ -31,8 +31,9 @@ import rules
 import style_ledger
 import style_footprint
 import style_proposals
-from issues import frontmatter
+from issues import Issue, frontmatter
 from production_units import Refusal, production_field
+from proposal_issue import ApprovedDecision, decision_answer
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 
 FAMILIES: tuple[rules.Family, ...] = ("modules", "names", "values", "types")
@@ -50,6 +51,7 @@ class PilotCrates:
 
 PilotScope = AllCrates | PilotCrates
 _ALL_CRATES = AllCrates()
+_NO_FIRST_FILES: frozenset[str] = frozenset()
 _ALL_FAMILY_SCOPES: Mapping[rules.Family, PilotScope] = MappingProxyType(
     {family: _ALL_CRATES for family in FAMILIES})
 
@@ -76,20 +78,67 @@ def parse_pilot_scope(text: str, repo: Path) -> PilotScope:
     return PilotCrates(frozenset(members[name] for name in names))
 
 
-def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
-    """Read each style unit's scope from its own standing plan copy."""
-    scopes: dict[rules.Family, PilotScope] = {}
+def parse_first_files(text: str) -> frozenset[str]:
+    """Read the optional file priority line in the plan's Delegation Context."""
+    lines = [match.group(1) for match in re.finditer(
+        r"(?m)^\s*(?:- )?\*\*First files:\*\*[^\S\n]*(.*)$", delegation_context(text))]
+    if not lines:
+        return frozenset()
+    if len(lines) > 1:
+        raise style_ledger.LedgerError("first files has more than one line")
+    paths: set[str] = set()
+    for entry in lines[0].split(","):
+        path = entry.strip()
+        if not path:
+            raise style_ledger.LedgerError("first files has empty entry")
+        if PurePosixPath(path).is_absolute():
+            raise style_ledger.LedgerError(f"first files has absolute path {path}")
+        if path in paths:
+            raise style_ledger.LedgerError(f"first files has duplicate path {path}")
+        paths.add(path)
+    return frozenset(paths)
+
+
+@dataclass(frozen=True)
+class UnitPlanSettings:
+    pilot_scope: PilotScope
+    first_files: frozenset[str]
+
+
+def unit_plan_settings(text: str, repo: Path) -> UnitPlanSettings:
+    return UnitPlanSettings(parse_pilot_scope(text, repo), parse_first_files(text))
+
+
+@dataclass(frozen=True)
+class MissingUnitPlan:
+    pass
+
+
+def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
+    """Read each style unit's own standing plan copy."""
+    texts: dict[rules.Family, str | MissingUnitPlan] = {}
     for row in unit_worktrees(doc):
         for family in FAMILIES:
             if row.unit == family + "-unit":
                 plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
                 try:
-                    text = plan.read_text()
+                    texts[family] = plan.read_text()
                 except FileNotFoundError:
-                    scopes[family] = AllCrates()
-                else:
-                    scopes[family] = parse_pilot_scope(text, repo)
-    return scopes
+                    texts[family] = MissingUnitPlan()
+    return texts
+
+
+def family_plan_settings(doc: Path, repo: Path, *, unit: str = "") -> Mapping[rules.Family, UnitPlanSettings]:
+    """Parse selection settings only for the units whose queue is requested."""
+    return {family: unit_plan_settings(text, repo) if isinstance(text, str)
+            else UnitPlanSettings(AllCrates(), frozenset())
+            for family, text in family_plan_texts(doc).items()
+            if not unit or unit == family + "-unit"}
+
+
+def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
+    return {family: parse_pilot_scope(text, repo) if isinstance(text, str) else AllCrates()
+            for family, text in family_plan_texts(doc).items()}
 
 
 @dataclass(frozen=True)
@@ -169,6 +218,204 @@ def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, bo
     return BusyFiles(board, busy)
 
 
+@dataclass(frozen=True)
+class ApprovedRename:
+    parent: str
+    old: str
+    new: str
+
+
+def approved_rename_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[ApprovedRename, ...]:
+    pairs: list[ApprovedRename] = []
+    for finding in findings:
+        before, after = finding.before.split("::"), finding.after.split("::")
+        if (finding.kind != "rename" or len(before) < 2 or len(before) != len(after)
+                or before[:-1] != after[:-1] or before[-1] == after[-1]
+                or not style_footprint.IDENTIFIER.fullmatch(before[-1])
+                or not style_footprint.IDENTIFIER.fullmatch(after[-1])):
+            return ()
+        pairs.append(ApprovedRename(before[-2], before[-1], after[-1]))
+    return tuple(pairs)
+
+
+def modified_reference_files(repo: Path) -> frozenset[str]:
+    """Accept only in-place edits in both the index and the worktree."""
+    entries = iter(git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all").split("\0"))
+    modified: set[str] = set()
+    rejected: set[str] = set()
+    for entry in entries:
+        if not entry:
+            continue
+        status, path = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            rejected.update((path, next(entries)))
+        elif status in {" M", "M ", "MM"}:
+            modified.add(path)
+        else:
+            rejected.add(path)
+    return frozenset(modified - rejected)
+
+
+def use_reference_parents(words: tuple[str, ...]) -> dict[int, str]:
+    """Associate a use leaf with the path that owns its brace group."""
+    parents: dict[int, str] = {}
+    cursor = 0
+    while cursor < len(words):
+        if words[cursor] != "use":
+            cursor += 1
+            continue
+        cursor += 1
+        groups: list[str] = []
+        while cursor < len(words) and words[cursor] != ";":
+            word = words[cursor]
+            if word == "{":
+                parent = words[cursor - 2] if cursor >= 2 and words[cursor - 1] == "::" else ""
+                groups.append(parent)
+            elif word == "}":
+                if groups:
+                    _ = groups.pop()
+            elif style_footprint.IDENTIFIER.fullmatch(word):
+                previous = words[cursor - 1] if cursor else ""
+                following = words[cursor + 1] if cursor + 1 < len(words) else ""
+                if previous != "as" and following != "::":
+                    if previous == "::" and cursor >= 2:
+                        parents[cursor] = words[cursor - 2]
+                    elif groups and previous in {"{", ","}:
+                        parents[cursor] = groups[-1]
+            cursor += 1
+    return parents
+
+
+def approved_reference_qualifier(
+    words: tuple[str, ...], index: int, use_parents: Mapping[int, str], pair: ApprovedRename,
+) -> bool:
+    parent = words[index - 2] if index >= 2 and words[index - 1] == "::" else use_parents.get(index, "")
+    return parent != "Self" and parent == pair.parent
+
+
+def approved_declaration_sites(words: tuple[str, ...], pair: ApprovedRename) -> frozenset[int]:
+    sites = {index for body in style_footprint.enum_bodies(words) if body.name == pair.parent
+             for index in body.variants if words[index] == pair.old}
+    bodies = list(style_footprint.impl_bodies(words, pair.parent))
+    for index, word in enumerate(words[:-2]):
+        if word in {"mod", "trait"} and words[index + 1] == pair.parent:
+            start = next((i for i in range(index + 2, len(words)) if words[i] in {"{", ";"}), len(words))
+            if start < len(words) and words[start] == "{":
+                bodies.append((start, style_footprint.closing(words, start)))
+    for start, end in bodies:
+        cursor = start + 1
+        while cursor < end:
+            if words[cursor] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
+                if cursor + 1 < end and words[cursor + 1] == pair.old:
+                    sites.add(cursor + 1)
+            if words[cursor] in {"{", "(", "["}:
+                cursor = style_footprint.closing(words, cursor)
+            cursor += 1
+    return frozenset(sites)
+
+
+def unique_rename_mentions(
+    repo: Path, pairs: tuple[ApprovedRename, ...], finding_files: set[str],
+) -> frozenset[ApprovedRename]:
+    """Prove which bare names refer only to the approved item at HEAD."""
+    unique = set(pairs)
+    matching = subprocess.run(
+        ["git", "-C", str(repo), "grep", "-l", "-z", "-w",
+         *(argument for pair in pairs for argument in ("-e", pair.old)), "HEAD", "--", "*.rs"],
+        capture_output=True, text=True, check=False,
+    )
+    if matching.returncode == 1:
+        return frozenset(unique)
+    if matching.returncode:
+        return frozenset()
+    for entry in matching.stdout.split("\0"):
+        if not entry:
+            continue
+        path = entry.removeprefix("HEAD:")
+        source = style_footprint.tokens(git(repo, "show", f"HEAD:{path}"))
+        if any(token.kind == "unknown" for token in source):
+            return frozenset()
+        words = tuple(token.value for token in source)
+        use_parents = use_reference_parents(words)
+        for pair in tuple(unique):
+            declarations = approved_declaration_sites(words, pair) if path in finding_files else frozenset[int]()
+            for index, token in enumerate(source):
+                if token.kind != "identifier" or token.value != pair.old:
+                    continue
+                if approved_reference_qualifier(words, index, use_parents, pair):
+                    continue
+                if path in finding_files:
+                    if index >= 2 and words[index - 2:index] == ("Self", "::"):
+                        continue
+                    if index in declarations:
+                        continue
+                unique.discard(pair)
+                break
+    return frozenset(unique)
+
+
+def approved_word_swaps(
+    before: str, after: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
+) -> bool:
+    """Keep each text part exact except for approved whole identifier words."""
+    parts = r"[A-Za-z0-9_]+|[^A-Za-z0-9_]+"
+    old, new = tuple(re.finditer(parts, before)), tuple(re.finditer(parts, after))
+    if len(old) != len(new):
+        return False
+    for left, right in zip(old, new, strict=True):
+        if left[0] == right[0]:
+            continue
+        qualifier = re.search(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*::\s*$", before[:left.start()])
+        if not any(left[0] == pair.old and right[0] == pair.new
+                   and (qualifier[1] == pair.parent if qualifier else pair in unique) for pair in pairs):
+            return False
+    return True
+
+
+def approved_reference_tokens(
+    before: str, after: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
+) -> bool:
+    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    if (before == after or len(old) != len(new)
+            or len(old) != len(style_footprint.tokens(before))
+            or len(new) != len(style_footprint.tokens(after))):
+        return False
+    words = tuple(span.token.value for span in old)
+    use_parents = use_reference_parents(words)
+    old_cursor = new_cursor = 0
+    for index, (span, target) in enumerate(zip(old, new, strict=True)):
+        # Gaps contain only comments and whitespace; literals stay code tokens.
+        if not approved_word_swaps(before[old_cursor:span.start], after[new_cursor:target.start], pairs, unique):
+            return False
+        old_cursor, new_cursor = span.end, target.end
+        if span.token == target.token:
+            continue
+        if span.token.kind != "identifier" or target.token.kind != "identifier":
+            return False
+        if not any(pair.old == span.token.value and pair.new == target.token.value
+                   and approved_reference_qualifier(words, index, use_parents, pair) for pair in pairs):
+            return False
+    return approved_word_swaps(before[old_cursor:], after[new_cursor:], pairs, unique)
+
+
+def approved_reference_file(
+    repo: Path, path: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
+) -> bool:
+    target = repo / path
+    if not pairs or target.is_symlink() or not target.is_file():
+        return False
+    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
+    if result.returncode:
+        return False
+    try:
+        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return False
+    if target.suffix == ".md":
+        return before != after and approved_word_swaps(before, after, pairs, unique)
+    return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     try:
         with style_ledger.open_ledger(repo) as ledger:
@@ -184,16 +431,30 @@ def gate(repo: Path, ticket_id: str) -> int:
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
                 return 0 if result.returncode == 0 else 1
             fields = frontmatter(origin.issue)
-            findings = style_proposals.issue_findings(ledger, origin.issue)
-            if (fields.get("status") != ["open"] or fields.get("unit") != [origin.unit] or not fields.get("plan")
-                    or set(fields.get("style_findings", [])) != set(origin.finding_ids)
+            decision = Issue(origin.issue, fields)
+            answer = decision_answer(decision)
+            if not origin.finding_ids:
+                raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
+            by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
+            if any(identity not in by_id for identity in origin.finding_ids):
+                raise style_ledger.LedgerError("proposal ticket findings changed")
+            findings = tuple(by_id[identity] for identity in origin.finding_ids)
+            if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
+                    or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
                     or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
-                           for finding in findings)):
+                           or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
                 raise style_ledger.LedgerError("proposal approval or filed findings changed")
             allowed = {finding.path for finding in findings}
             outside = changed_files(repo) - allowed
             if outside:
-                raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(sorted(outside)))
+                pairs = approved_rename_pairs(findings)
+                unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
+                modified = modified_reference_files(repo)
+                refused = [path for path in sorted(outside)
+                           if path not in modified or not approved_reference_file(repo, path, pairs, unique)]
+                if refused:
+                    raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
+                        f"{path} (change is not an approved rename reference)" for path in refused))
             print("approved proposal")
             return 0
     except (OSError, ValueError, sqlite3.Error) as error:
@@ -335,7 +596,8 @@ def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
-                      family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES) -> tuple[TicketSelection, ...]:
+                      family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES,
+                      *, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
@@ -411,9 +673,13 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                 if group:
                     by_rules[group].append(path)
         for rule_ids, paths in sorted(by_rules.items()):
-            for files in read_slices(repo, tip, tuple(paths)):
-                result.append(TicketSelection("read", family, crate, files, rule_ids))
-    return tuple(result)
+            priority = tuple(path for path in paths if path in first_files)
+            remaining = tuple(path for path in paths if path not in first_files)
+            for group in (priority, remaining):
+                if group:
+                    for files in read_slices(repo, tip, group):
+                        result.append(TicketSelection("read", family, crate, files, rule_ids))
+    return tuple(sorted(result, key=lambda ticket: not first_files.intersection(ticket.files)))
 
 
 def delegation_context(text: str) -> str:
@@ -616,10 +882,21 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             ]),
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
-        ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
+        (("Apply the approved findings. "
+          + ("For a rename, find every use through the compiler, not a text search, and update each one "
+             + "in other files. Also update every comment and Markdown doc in the repo that means the "
+             + "renamed item, and leave mentions of other items with the same name. "
+             + "Change nothing else in those files. "
+             if approved_rename_pairs(held_findings) else "")
+          + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
+        "Hold a finding only when the cited rule's text requires the change.",
+        f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
         f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
+        "Add `--input-scope file` only to a crate or module cell of a Rust source file.",
+        "Use it only for a `clean` or `exception` verdict based on that file alone.",
+        "Without this flag, changes to any file in the crate or module scope can make the verdict stale.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
@@ -665,6 +942,10 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                   if finding.path in ticket["files"] and finding.rule in ticket["rules"]
                   and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
             if ticket["kind"] == "structure" and ticket["cells"] else ())
+    if ticket["kind"] == "proposal":
+        identities = set(ticket["finding_ids"])
+        held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
+                     if finding.finding_id in identities)
     phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
@@ -705,11 +986,22 @@ class NoAvailableWork:
     pass
 
 
+def made_before_decisions(ticket_id: str) -> str:
+    """Why a proposal ticket with no finding ids cannot build, and what to do."""
+    return f"{ticket_id}: made before decisions; drop it with style_ledger.py ticket drop, then run migrate"
+
+
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
-    doc: Path, text: str, scope: PilotScope, busy: BusyFiles,
+    doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
+    definitions: Mapping[str, rules.Rule],
 ) -> PhaseWritten | NoAvailableWork | WaitingForStructure:
-    queued = ledger.queued_tickets(unit)
+    queued: list[style_ledger.TicketRecord] = []
+    for ticket in ledger.queued_tickets(unit):
+        if ticket["kind"] == "proposal" and not ticket["finding_ids"]:
+            print("waiting " + made_before_decisions(ticket["id"]))
+        else:
+            queued.append(ticket)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
         if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
@@ -731,29 +1023,71 @@ def _select_phase(
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
     except Refusal:
-        issue = style_proposals.NoApprovedProposal()
+        decisions: tuple[Issue, ...] = ()
     else:
         if not folder.is_absolute():
             folder = doc.parent.parent / folder
-        issue = style_proposals.approved_issue(folder, unit, ledger)
-    if not isinstance(issue, style_proposals.NoApprovedProposal):
-        findings = style_proposals.issue_findings(ledger, issue.path)
-        if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != issue.path for finding in findings):
-            raise style_ledger.LedgerError(f"{issue.path}: every approved finding must be filed")
-        if any(not crate_in_scope(scope, style_proposals.crate_for(ledger, finding.path)) for finding in findings):
+        decisions = style_proposals.approved_decisions(folder, unit)
+    directories = style_proposals.workspace_directories(ledger) if decisions else ()
+    tip = synced_tip(ledger)
+    decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
+    closed = False
+    for issue in decisions:
+        rule = issue.value("style_rule")
+        definition = definitions.get(rule)
+        if definition is None:
+            print(f"waiting {issue.path}: rule {rule} not in the catalog")
+            continue
+        findings = tuple(finding for finding in ledger.proposal_findings(issue.path)
+                         if isinstance(finding.state, style_ledger.Filed)
+                         and isinstance(finding.build_ticket, style_ledger.NoBuildTicket))
+        if not findings:
+            continue
+        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
+        by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
+        gone: dict[str, list[str]] = defaultdict(list)
+        for finding in findings:
+            if finding.path in present:
+                by_file[finding.path].append(finding)
+            else:
+                gone[finding.path].append(finding.finding_id)
+        # A finding in a removed file can never build, so it is waived and the decision can close.
+        for path, finding_ids in sorted(gone.items()):
+            words = f"{path} is not in synced commit {tip}"
+            _ = ledger.decline_findings(finding_ids, words)
+            print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
+        if gone and style_proposals.close_finished_decision(ledger, issue.path):
+            closed = True
+            continue
+        outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}
+        if outside:
             print(f"waiting {issue.path}: outside pilot scope")
-        elif any(busy.contains(finding.path) for finding in findings):
+        held = {path for path in by_file if path not in outside and busy.contains(path)}
+        if held:
             print(f"waiting {issue.path}: files busy")
-        else:
-            ticket_id = ledger.next_ticket_id(unit)
-            ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(ledger, findings[0].path),
-                              sorted({finding.path for finding in findings}), sorted({finding.rule for finding in findings}),
-                              proposal=str(issue.path))
-            ledger.ticket_assign(ticket_id, branch)
-            style_proposals.proposal_command("start", str(issue.path))
-            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-            return PhaseWritten(ticket_id)
-    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo))
+        available = tuple(sorted(set(by_file) - outside - held))
+        if not available:
+            continue
+        limits = (_STRUCTURE_LIMITS if any(style_proposals.proposal_kind(finding, definition) == "restructure"
+                                           for finding in findings) else _READ_LIMITS)
+        files = read_slices(repo, tip, available, limits)[0]
+        selected_findings = tuple(finding for path in files for finding in by_file[path])
+        ticket_id = ledger.next_ticket_id(unit)
+        ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(directories, files[0]),
+                          list(files), sorted({finding.rule for finding in selected_findings}),
+                          proposal=str(issue.path), finding_ids=tuple(finding.finding_id for finding in selected_findings))
+        ledger.ticket_assign(ticket_id, branch)
+        style_proposals.proposal_command("start", str(issue.path))
+        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        decision_phase = PhaseWritten(ticket_id)
+        break
+    # As complete does, one renumber follows every decision this refill closed.
+    if closed:
+        style_proposals.renumber()
+    if isinstance(decision_phase, PhaseWritten):
+        return decision_phase
+    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo),
+                                   first_files=first_files)
     if not candidates:
         if family != "modules":
             pending = tuple(cell for cell in _refill_cells(ledger)
@@ -786,7 +1120,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
-    scope = parse_pilot_scope(original, repo)
+    settings = unit_plan_settings(original, repo)
+    scope = settings.pilot_scope
     if any("repair" in line.lower() and re.search(r"status:\s*todo", line) for line in original.splitlines() if line.startswith("### Phase ")):
         return RepairFirst()
     with style_ledger.open_ledger(repo) as ledger:
@@ -824,8 +1159,11 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
             return board
+        # One catalog read serves both refill passes.
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                 definitions)
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
@@ -834,7 +1172,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         if isinstance(board, berth_board.BoardUnavailable):
             return board
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                 definitions)
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
@@ -868,13 +1207,15 @@ def main(argv: list[str]) -> int:
             with style_ledger.open_ledger(args.repo) as ledger:
                 doc = style_document(args.repo)
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
+                settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
                 for family in FAMILIES:
                     unit = family + "-unit"
                     if args.unit and args.unit != unit:
                         continue
+                    first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
                     for ticket in candidate_tickets(args.repo, ledger, busy, family,
-                                                    scopes.get(family, _ALL_CRATES), scopes):
+                                                    scopes.get(family, _ALL_CRATES), scopes, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)

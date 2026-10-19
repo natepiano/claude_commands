@@ -25,7 +25,7 @@ it joins; a tier A or E rule, local or global, has no family.
 | --- | --- | --- | --- |
 | `names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
 | `values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | Uncovered components of its partial B rules | — |
+| `types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
 | `modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
 Every partial B rule also has a C read in its own family.
@@ -137,6 +137,15 @@ After launch, only the unit's own copy counts:
 proposals. An out-of-scope approved proposal stays approved and unassigned;
 coverage selection proceeds.
 
+## First files
+
+Add `- **First files:** crates/cargo-port/src/one.rs, crates/cargo-port/src/two.rs`
+to the Delegation Context in the unit's own plan copy, beside `**Pilot scope:**`.
+Use repo-relative paths, separated by commas. These files get separate read
+tickets before the other files in their group. Tickets that include these files
+rank first. This line filters nothing. It has no effect once those files are
+judged. Both `queue` and `next-phase` read the unit's own copy.
+
 ## Ledger
 
 One style production and one synced branch point per repository. The ledger is
@@ -174,7 +183,9 @@ Bootstrap and sync store the style branch with
 without one, unmerged judgments read `stale`.
 
 Fingerprints use committed Git objects at the rule's `file`, `crate` or
-`manifest` scope. The manifest scope covers the workspace root and member
+`manifest` scope. A `clean` or `exception` verdict with `--input-scope file` uses
+the file's own fingerprint. It stays current when other files in its crate or
+module change. The manifest scope covers the workspace root and member
 manifests; crate `.` covers only its own files. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
@@ -373,36 +384,59 @@ require review. Derive changes count as trait implementation changes.
 Changes inside macro invocations require review even when only spacing changes;
 type-shape checks include unions and their derives.
 
-File held changes as issues tagged `proposal` and `style` under the production's
-required `**Proposals:**` folder: one issue per rule and crate for renames or
-type changes, one per crate for restructuring. Include sites, before and after,
-live units holding those files, and a recommended answer. Show the count in
-reports; present proposals only when asked through `/showrunner:proposals` or
-`/adhoc_review`. Run `style_proposals.py file --repo <style checkout> --proposals <folder> --parent <slug>`
-after every ticket checkpoint with held cells and every no-change ticket notice
-with a positive held count. Read the folder from the current production doc's
-`**Proposals:**` line and the parent from `showrunners.py parent <style slug>`
-each time. Filing recovers issues created before a crash and skips findings
-judged against an older rule blob. Findings held by assigned or checkpointed
-tickets stay unfiled until those tickets close; filing reports their counts per
-open ticket.
+File held changes with `style_proposals.py file --repo <style checkout>
+--proposals <folder> --parent <slug>`. Read the folder from the production's
+`**Proposals:**` line and the parent from `showrunners.py parent <style slug>`.
+Run filing after each checkpoint with held cells and each no-change notice
+with held findings. Findings held by assigned or checkpointed tickets wait.
+Findings judged under an older rule text stay unfiled.
+A `skipped <issue>: <reason>` line means that filing cannot write that
+decision. When filing new findings, those findings stay unfiled. When
+refreshing an open decision, its findings stay filed and the file stays as it
+was. The other decisions still file. When it skips one or more decisions,
+`file` exits 1. Fix the named decision file as the reason tells, then run
+`file` again. A `skipped <finding>: rule changed since judged` line names one
+finding, not a decision, and does not change the exit status.
 
-Record approval with `proposal_issue.py approve <issue> --showrunner <parent>
---unit <unit> --plan <plan phase>`. Refill selects the oldest approved style issue
-for that unit before coverage work and marks it active. Its Work Order overrides
-the copied mechanical-only invariant for exactly the approved findings;
-`style_plan.py gate --repo . --ticket <id>` permits only their files at refill
-and checkpoint. Other findings remain held; package verification still runs.
-When approved changes touch a live unit's files, the parent schedules them
-through `produce.md`'s `<CrossUnitChange>`.
+One style decision covers one rule and crate under one rule blob. An answer
+also covers later findings under that rule text. A new rule blob needs a new
+answer. Each decision shows counts and up to three examples from different
+files. The ledger holds its full site list. Show decisions only when the user
+asks through `/showrunner:proposals` or `/adhoc_review`.
 
-After each `ticket merge` and at startup run `style_proposals.py complete --repo
-<style checkout>`: merged proposal findings become built, their issues close,
-and the backlog is renumbered. Decline with `style_proposals.py decline --repo
-<style checkout> --issue <issue> --words '<the user’s words>'`. It waives each
-finding and only waives the still-current held cell after all of its findings
-are waived; changed inputs stay stale. The issue closes with the user's words.
+Approve with `proposal_issue.py approve <issue> --showrunner <parent>
+--unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
+Refill builds approved findings in small tickets before coverage work.
+Each ticket permits its own approved findings and proven rename references.
+Other findings stay held. Package checks still run. The parent schedules
+changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
+Refill waives a finding whose file is not in the synced commit, and prints the
+file and the commit. When no finding of the decision is left to build, refill
+closes it. Refill does not assign a queued proposal ticket that was
+made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
+then run migrate.
+
+After each merge and at startup, run `style_proposals.py complete --repo
+<style checkout>`. It closes only approved decisions, and only when all their
+findings are built or waived. It also closes an approved decision with no merged
+ticket when no finding is left to build. Decline only with `style_proposals.py decline --repo <style checkout>
+--issue <issue> --words '<the user's words>'`. It stores the answer and waives
+the findings still filed to the decision. Built findings stay built. Later
+findings are waived with the same words. Changed inputs stay stale.
 A general reason becomes a repo-local rule through `/local_style`.
+
+Record off-rule ideas as candidates, never held proposals. The showrunner
+reads `style_proposals.py candidates --repo <style checkout>` and makes a rule
+through `/new_style`, or drops the idea with `style_proposals.py drop-candidate
+--repo <style checkout> --idea "<text>"`. Use `style_proposals.py sites --repo
+<style checkout> --issue <issue>` for a decision's full findings. Review
+`style_proposals.py migrate --repo <style checkout> --proposals <folder>
+--parent <slug> --dry-run` before migrating old style issues. Migration moves
+only the findings filed to each old issue. A moved finding takes the answer of
+its decision: a declined decision waives it with the stored words, and a
+decision closed as built opens again with its approval. A decision closed with
+nothing left to build also opens again with its approval for a later finding. Migration leaves an
+issue with an unfinished build ticket unchanged, and it can resume after a crash.
 
 ## Lifetime
 

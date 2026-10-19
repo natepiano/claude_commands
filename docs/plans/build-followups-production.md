@@ -19,6 +19,7 @@
 - **Capacity:** five units; `report.py` is shared, and whoever lands second resolves conflicts; its seats share natedev's build slots (steve)
 - **Review pool:** code (the user, 2026-10-16: "cargo-liner and natedev should have reviewers turned on also")
 - **Improvement queue:** ~/.local/state/plan-backlog/ledger.md
+- **Efficiency ledger:** ~/.local/state/nightly-review/ledger.md
 
 ## Units
 
@@ -42,15 +43,16 @@
 | accounts-unit | docs/plans/build-followups-two-accounts.md | /home/natepiano/worktrees/claude-build-followups-accounts | build-followups-accounts | — | docs/plans/build-followups-two-accounts.md |
 | review-pool-unit | (retired 2026-10-13: promoted to showrunner of nested-g2) `docs/as-built/review-pool.md` (runs done) | /home/natepiano/worktrees/claude-build-followups-review-pool | build-followups-review-pool | — | scripts/delegate/review_pool.py, commands/review/ |
 | bevy-upgrade-unit | docs/as-built/bevy-upgrade.md | /home/natepiano/worktrees/claude-build-followups-bevy-upgrade | build-followups-bevy-upgrade | — | scripts/bevy_upgrade/, commands/showrunner/bevy_upgrade.md |
-| message-clarity-unit | `docs/as-built/message-clarity.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-message-clarity | build-followups-message-clarity | — | scripts/notify/ |
+| messaging-unit | `docs/as-built/message-clarity.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-messaging | build-followups-messaging | — | scripts/notify/ |
 | herdr-trial-unit | (retired 2026-10-18, worktree removed) done, as-built `docs/as-built/herdr-adoption.md` (trial: `docs/as-built/herdr-trial.md`) | /home/natepiano/worktrees/claude-build-followups-herdr-trial | build-followups-herdr-trial | — | scripts/herdr/; docs/plans/build-followups-herdr-*.md; docs/as-built/herdr-*.md |
 | herdr-trust-unit | (retired 2026-10-18, worktree removed) `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
 | herdr-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
-| nightly-review-unit | permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
+| nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
 | style-unit | docs/plans/build-followups-style.md | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
 | hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
+| efficiency-unit | docs/plans/build-followups-efficiency.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 
 ## Hub files
 

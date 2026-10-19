@@ -21,15 +21,19 @@ import unit_move
 from add_unit import Production, read_production
 
 if TYPE_CHECKING:
+    from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
     from scripts.shutdown import record as shutdown_record
     from scripts.shutdown.record import SessionShutdown
 else:
     # retire_unit puts the message and shutdown folders on the path.
     import record as shutdown_record
+    import sessions
     from sessions import SessionRecord
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
+# The fixture replaces the lookup; a test of the lookup itself puts it back.
+CLAUDE_SESSIONS = retire_unit.claude_sessions
 SEAT = "22222222-2222-2222-2222-222222222222"
 
 
@@ -108,7 +112,7 @@ class RetireUnitTests(unittest.TestCase):
         def production_of(_slug: str) -> Production:
             return production
 
-        def claude_sessions(_worktree: Path) -> tuple[SessionRecord, ...]:
+        def claude_sessions(_worktree: Path, _ids: frozenset[str]) -> tuple[SessionRecord, ...]:
             return tuple(self.claude)
 
         def nothing_inside(_worktree: Path) -> list[int]:
@@ -204,6 +208,16 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(self.stops(), [])
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(self.doc.read_text(encoding="utf-8"), before)
+
+    def test_a_run_director_working_outside_the_worktree_is_still_stopped(self) -> None:
+        director = session(DIRECTOR, "alpha", 4101)
+        elsewhere = session("33333333-3333-3333-3333-333333333333", "elsewhere", 4103)
+        with (mock.patch.object(retire_unit, "claude_sessions", CLAUDE_SESSIONS),
+              mock.patch.object(sessions, "live_sessions", return_value=[director, elsewhere])):
+            code, output = self.retire("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would stop: Claude session alpha ({DIRECTOR}, pid 4101), through shutdown down", output.splitlines())
+        self.assertNotIn("elsewhere", output)
 
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
         code, output = self.retire()

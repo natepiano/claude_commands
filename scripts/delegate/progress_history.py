@@ -4225,10 +4225,10 @@ def _print_last_recorded(
     Between windows -- the reviews closed, the repair writers not launched yet
     -- there is nothing live to measure. The same is true of an activity opened
     after its phase closed: it belongs in the round table, but does not revise
-    the closed phase's assessment. Optional tables keep the last recorded clocks
-    and the phase's current windows. It writes nothing -- no
-    event, no window, no state -- so pass counts, convergence and calibration
-    never see it.
+    the closed phase's assessment. The summary table keeps the last recorded
+    clocks. With --tables, the round table shows the phase's current windows.
+    It writes no event, window or state, so pass counts, convergence and
+    calibration never see it.
     """
     events = _run_events(state)
     plan_phase_counts = _state_plan_phase_counts(state)
@@ -4248,7 +4248,7 @@ def _print_last_recorded(
         f"*Percentages and clocks as of {_moment_stamp(recorded['at'], now)}, "
         + f"{recorded['source']}.*",
         "",
-        *(_summary_table(
+        *_summary_table(
             _string(phase.get("id"), "ad hoc"),
             recorded["project"],
             recorded["phase"],
@@ -4257,7 +4257,7 @@ def _print_last_recorded(
             recorded["at"],
             now,
             state,
-        ) if tables else []),
+        ),
         *section,
         window_line,
         _clock_line(now, _next_report_at(session_dir, now, notifier_due)),
@@ -4479,7 +4479,7 @@ def _report_progress(args: argparse.Namespace) -> None:
         now,
         now,
         state,
-    ) if tables else []
+    ) if uses_dual_layout or tables else []
     if uses_dual_layout:
         lines = [
             _scope_line(state),
@@ -4889,7 +4889,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     progress = subparsers.add_parser("progress")
     _ = progress.add_argument("--session-dir", required=True)
-    _ = progress.add_argument("--tables", action="store_true", help="include the clocks and round tables")
+    _ = progress.add_argument("--tables", action="store_true", help="include the round table")
     _ = progress.add_argument("--raw-percent", type=int, default=-1)
     _ = progress.add_argument("--percent", type=int, default=-1)
     _ = progress.add_argument("--project-raw-percent", type=int, default=-1)

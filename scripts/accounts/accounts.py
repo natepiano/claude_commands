@@ -18,7 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -3639,21 +3639,29 @@ def _stored_usage(
                    if status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now)]
     if stale or stale_codex:
         with ThreadPoolExecutor() as pool:
-            reads = [pool.submit(agent_accounts.claude_live, config_dir) for config_dir in stale]
-            reads.extend(pool.submit(_codex_live, home) for home in stale_codex)
-            reports = [read.result() for read in reads]
+            reads: list[tuple[Future[agent_accounts.Report],
+                              agent_accounts.ClaudeDirectorySource | agent_accounts.CodexHomeSource, str]] = [
+                     (pool.submit(agent_accounts.claude_live, status.config_dir),
+                      agent_accounts.ClaudeDirectorySource(status.config_dir), status.login)
+                     for status in statuses if status.config_dir in stale]
+            reads.extend((pool.submit(_codex_live, status.home),
+                          agent_accounts.CodexHomeSource(status.home), status.login)
+                         for status in codex if status.home in stale_codex)
+            reports = [replace(read.result(), source=directory,
+                               last_known_login=agent_accounts.KnownUsageLogin(login))
+                       for read, directory, login in reads]
         for report in reports:
             startup = report.codex_startup
             if isinstance(startup, agent_accounts.CodexStartupFailure):
                 for index, status in enumerate(codex):
                     if status.home == startup.home:
                         codex[index] = replace(status, startup=startup, problems=(*status.problems, startup.problem))
-        if usage_store.merge(stored, reports, now):
-            try:
-                usage_store.write(stored)
-            except OSError:
-                # The table still shows what was read; only the next run reads it again.
-                pass
+        try:
+            usage_store.save(reports, now)
+            stored = usage_store.load()
+        except OSError:
+            # Keep this reading visible even if the store cannot be written.
+            _ = usage_store.merge(stored, reports, now)
     return stored
 
 
@@ -3694,6 +3702,8 @@ class StatusRow:
     on_credits: str
     use_credits: bool
     read_at: datetime | StatusUnavailable
+    read_outcome: agent_accounts.UsageReadOutcome
+    attempted_at: datetime | StatusUnavailable
 
 
 @dataclass(frozen=True)
@@ -3703,6 +3713,7 @@ class StatusReading:
     group_line: str
     detail_lines: tuple[str, ...]
     zone: tzinfo
+    checked_at: datetime
 
 
 class StatusAccountDocument(TypedDict):
@@ -3757,6 +3768,7 @@ def _status_row(
     on_credits = NO_VALUE
     login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
     if login:
+        read_at = _read_at(usage) or StatusUnavailable()
         if isinstance(status, CodexStatus) and isinstance(status.startup, agent_accounts.CodexStartupFailure):
             weekly = StatusUnavailable(status.startup.setup_command)
         else:
@@ -3768,7 +3780,6 @@ def _status_row(
             else:
                 weekly = StatusUnavailable("unavailable")
                 resets = StatusUnavailable("unavailable")
-            read_at = _read_at(usage) or StatusUnavailable()
             if (window is not None and isinstance(read_at, datetime)
                     and (reset := _stored_time(window["resets"])) is not None and reset <= now):
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
@@ -3777,10 +3788,12 @@ def _status_row(
     return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
         weekly, resets, credits, on_credits,
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
-        read_at)
+        read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
+        else agent_accounts.UsageReadOutcome.OK,
+        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable())
 
 
-def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
+def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tuple[str, ...]:
     weekly = row.weekly_left_percent
     reset = row.resets_at
     credits = row.credits
@@ -3792,12 +3805,21 @@ def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
             weekly_cell += ": no session to refresh its login"
     else:
         weekly_cell = weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%"
+    failed = row.read_outcome != agent_accounts.UsageReadOutcome.OK
+    if isinstance(read, StatusUnavailable):
+        read_cell = read.cell
+    else:
+        local = read.astimezone(zone)
+        date_format = "%m-%d %H:%M %Z" if failed and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
+        read_cell = local.strftime(date_format)
+    if failed:
+        read_cell += "*"
     return (row.folder, row.label, row.login_cell, role_cell,
         weekly_cell,
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
-        read.cell if isinstance(read, StatusUnavailable) else read.astimezone(zone).strftime("%H:%M %Z"))
+        read_cell)
 
 
 def render_status_json(reading: StatusReading, *, with_login: bool = False) -> str:
@@ -3815,9 +3837,28 @@ def render_status_json(reading: StatusReading, *, with_login: bool = False) -> s
     return json.dumps(StatusDocument(accounts=accounts, problems=list(reading.notes)))
 
 
+def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
+    previous = (f", so this shows the reading from {row.read_at.astimezone(zone):%H:%M}"
+                if isinstance(row.read_at, datetime) else " and no reading is stored yet")
+    match row.read_outcome:
+        case agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            reason = "login token expired; start a session on it to refresh"
+        case agent_accounts.UsageReadOutcome.REFUSED_401:
+            reason = "the usage service did not accept this login; start a session on it to check it"
+        case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
+            retry = (f"after {(row.attempted_at + timedelta(minutes=10)).astimezone(zone):%H:%M}"
+                     if isinstance(row.attempted_at, datetime) else "in 2 min")
+            reason = f"the usage service is busy{previous}; next try {retry}"
+        case agent_accounts.UsageReadOutcome.ERROR:
+            reason = f"the usage read failed{previous}; next try in 2 min"
+        case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
+            return ""
+    return f"* {row.label}: {reason}"
+
+
 def render_status_table(reading: StatusReading) -> str:
     return "\n".join([reading.group_line,
-        _render_table([_status_row_cells(row, reading.zone) for row in reading.rows]), "",
+        _render_table([_status_row_cells(row, reading.zone, reading.checked_at) for row in reading.rows]), "",
         *reading.notes, *reading.detail_lines])
 
 
@@ -3895,6 +3936,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     )
     home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
     notes = [
+        *(note for row in rows if (note := _read_failure_note(row, zone))),
         *role_problems,
         *([f"~/.claude holds a login; {home_step}"]
           if account.claude_account(main_config_dir()) is not None else []),
@@ -3912,7 +3954,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*live_lines,
             *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), group_status_line(groups), detail_lines, zone)
+    return StatusReading(rows, tuple(notes), group_status_line(groups), detail_lines, zone, now)
 
 
 @role_map.role_map_command

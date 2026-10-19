@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import io
 import os
 from pathlib import Path
@@ -50,12 +51,25 @@ if name == "basedpyright":
             if time.monotonic() >= deadline:
                 raise SystemExit("type job never overlapped a module")
             time.sleep(0.01)
+    if (state / "types-hold").exists():
+        # Outlive several 0.25 s memory samples so the runner records this job's peak.
+        import time
+        time.sleep(1.5)
     if (state / "types-red").exists():
         print("fixture type error")
         print("1 error, 0 warnings, 0 notes")
         raise SystemExit(1)
     print("0 errors, 0 warnings, 0 notes")
     raise SystemExit(3)
+if name == "uv":
+    if (state / "uv-fails").exists():
+        print("fixture: no network", file=sys.stderr)
+        raise SystemExit(2)
+    if sys.argv[1] == "venv":
+        python = Path(sys.argv[-1]) / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_text("")
+    raise SystemExit(0)
 if name == "ssh":
     answer = (state / "mac-answer").read_text() if (state / "mac-answer").exists() else "ff_rc=0\\nfixture-head\\n"
     print(answer, end="")
@@ -203,6 +217,7 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_TEST_STATE": str(self.state),
             "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
+            "MERGE_GATE_UV": str(self.bin / "uv"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             # The calling showrunner is found from these update timers, never the live ones.
@@ -234,7 +249,7 @@ class MergeGateTests(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "ssh", "ps", "suite-python", "style_sync.py"):
+        for name in ("basedpyright", "uv", "ssh", "ps", "suite-python", "style_sync.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -478,6 +493,7 @@ class MergeGateTests(unittest.TestCase):
 
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
+        self.write(self.state / "types-hold", "hold")
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
@@ -498,7 +514,10 @@ class MergeGateTests(unittest.TestCase):
         self.assertFalse(Path(starts[0]["tmpdir"]).exists())
         type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
         self.assertEqual(len(type_calls), 1)
-        self.assertEqual(type_calls[0]["args"], ["scripts/production"])
+        venv = self.state / "runner" / "typecheck-venv"
+        self.assertEqual(type_calls[0]["args"], ["--pythonpath", str(venv / "bin" / "python"), "scripts/production"])
+        peaks = cast(dict[str, float], json.loads((self.state / "runner" / "types_peak_mib.json").read_text()))
+        self.assertEqual(list(peaks), ["scripts/production"])
         self.assertEqual(type_calls[0]["cwd"], str(self.checkout))
         for suite in EXPECTED_SUITES:
             self.assertRegex(result.stdout, rf"(?m)^{suite}: OK \d+\.\d+s$")
@@ -649,6 +668,26 @@ class MergeGateTests(unittest.TestCase):
         with mock.patch.object(merge_gate, "swapped_kib", return_value=1024 * 1024):
             sample = merge_gate.process_memory_mib({os.getpid()})
         self.assertGreater(sample[os.getpid()], 1024.0)
+
+    def test_the_type_check_venv_is_built_once_with_the_pinned_stubs(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            first, second = merge_gate.typecheck_python(), merge_gate.typecheck_python()
+        venv = self.state / "runner" / "typecheck-venv"
+        self.assertEqual((first, second), (venv / "bin" / "python", venv / "bin" / "python"))
+        self.assertEqual([call["args"] for call in self.calls() if call["tool"] == "uv"],
+                         [["venv", "--clear", str(venv)],
+                          ["pip", "install", "--python", str(venv / "bin" / "python"),
+                           *merge_gate.TYPECHECK_REQUIREMENTS]])
+
+    def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
+        self.write(self.state / "uv-fails", "fail")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("basedpyright: RED\ntype-check venv missing: fixture: no network; build it with: ", result.stdout)
+        self.assertIn(" pip install --python ", result.stdout)
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
+        self.assertRegex(result.stdout, r"(?m)^lib: OK \d+\.\d+s$")
+        self.assert_not_pushed()
 
     def test_type_failure_resets_merge_and_does_not_push(self) -> None:
         self.write(self.state / "types-red", "red")
@@ -832,6 +871,43 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(admission.headroom_mib, 240.0)
         self.assertEqual(admission.reserved_mib, 224.0)
         self.assertFalse(admission.admits(True))
+
+    def test_a_job_reserved_at_a_known_size_holds_it_and_leaves_module_headroom_alone(self) -> None:
+        admission = merge_gate.SampledRSSAdmission(4096)
+        admission.observe(100.0, 0.0, {})
+        admission.reserve(1, 3072.0)
+        self.assertEqual(admission.reserved_mib, 3072.0)
+        self.assertTrue(admission.admits(True))
+        admission.observe(100.25, 2700.0, {1: 2700.0})
+        self.assertEqual(admission.headroom_mib, 96.0)
+        self.assertEqual(admission.reserved_mib, 372.0)
+        self.assertTrue(admission.admits(True))
+        admission.release(1)
+        self.assertEqual(admission.fixed_mib, {})
+
+    def test_a_module_three_times_slower_than_its_record_and_a_minute_over_is_slow(self) -> None:
+        self.assertTrue(merge_gate.slower_than_recorded(1264.0, 49.0))
+        self.assertTrue(merge_gate.slower_than_recorded(90.0, 30.0))
+        self.assertFalse(merge_gate.slower_than_recorded(89.0, 30.0))
+        self.assertFalse(merge_gate.slower_than_recorded(12.0, 1.0))
+
+    def test_the_report_names_a_module_slower_than_its_record(self) -> None:
+        runner = self.state / "runner"
+        runner.mkdir()
+        self.write(runner / "module_history.json", json.dumps({
+            "lib/test_second.py": [0.0, 0.0, 1000.0], "hooks/test_first.py": [1000.0] * 5}))
+        with mock.patch.object(merge_gate, "SLOW_MODULE_FLOOR_S", 0.0), \
+                mock.patch.dict(os.environ, self.environment), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            run = merge_gate.run_suites(self.checkout)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertRegex(output.getvalue(), r"(?m)^Slow module: lib/test_second\.py \d+ s, median of the last 3 runs 0 s \(3x or more\)$")
+        history = cast(dict[str, list[float]], json.loads((runner / "module_history.json").read_text()))
+        self.assertEqual(history["lib/test_second.py"][:3], [0.0, 0.0, 1000.0])
+        self.assertEqual(len(history["lib/test_second.py"]), 4)
+        self.assertEqual(history["hooks/test_first.py"][:4], [1000.0] * 4)
+        self.assertEqual(len(history["hooks/test_first.py"]), 5)
+        self.assertNotIn("Slow module: hooks/", output.getvalue())
 
     def test_memory_scan_schedule_uses_controlled_quarter_second_clock(self) -> None:
         admission = merge_gate.SampledRSSAdmission(3072)

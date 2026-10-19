@@ -259,7 +259,7 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("unit: alpha-unit", (self.root / "vault/showrunners/other-sr/alpha-unit.md").read_text())
         self.assertIs(self.journal()["done"], True)
 
-    def seed_record(self, progress: str = "stopped", name: str = "alpha") -> Path:
+    def seed_record(self, progress: str = "stopped", name: str = "alpha", host_session: str = "demo-alpha") -> Path:
         """A stopped unit's shutdown record, as `shutdown.py down` leaves it."""
         old = self.rust / "claude-demo-alpha"
         session: dict[str, object] = {
@@ -270,7 +270,7 @@ class UnitRenameTests(unittest.TestCase):
                          "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
             "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
             "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit", "doc": str(self.doc),
-                     "session_name": "demo-alpha", "session_host": "herdr",
+                     "session_name": host_session, "session_host": "herdr",
                      "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha.md"}}}
         saved: dict[str, object] = {
             "login": "owner@example.com", "label": "claude2", "machine": "natedev",
@@ -315,10 +315,50 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn(f"you are now gamma-unit, in worktree {new} on branch demo-gamma, and your plan is at "
                       + f"{new}/docs/plans/alpha.md", cast(str, saved["renamed"]))
 
-    def test_a_chosen_session_name_stays(self) -> None:
-        _ = self.seed_record(name="showrunner-fixer")
+    def test_a_session_with_its_own_name_takes_the_new_name(self) -> None:
+        _ = self.seed_record(name="builder-report")
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        self.assertEqual(cast(dict[str, object], self.record()["session"])["name"], "showrunner-fixer")
+        self.assertEqual(cast(dict[str, object], self.record()["session"])["name"], "gamma")
+        self.assertEqual(self.journal()["old_session"], "builder-report")
+
+    def test_the_session_name_finds_the_unit_and_only_what_differs_changes(self) -> None:
+        # The user names the unit by its session (builder-report); its id already is the new one.
+        _ = self.seed_record(name="builder-report", host_session="demo-builder-report")
+        planned = self.rename("plan", "builder-report", "alpha")
+        self.assert_ok(planned)
+        self.assertIn("Claude session builder-report -> alpha", planned.stdout)
+        self.assertIn("already matches: the id is alpha-unit", planned.stdout)
+        branches = self.git("branch", "--list")
+        doc = self.doc.read_text()
+        self.assert_refused(self.rename("apply", "builder-report", "alpha"), "alpha-unit is not running")
+        session = cast(dict[str, object], self.record()["session"])
+        self.assertEqual((session["name"], cast(dict[str, object], session["host"])["session_name"]),
+                         ("alpha", "demo-alpha"))
+        self.assertEqual((self.git("branch", "--list"), self.doc.read_text()), (branches, doc))
+        # The relaunched unit keeps its mark alpha-unit, now under the new session name.
+        _ = self.mark_live("alpha-unit", "sid-alpha")
+        self.assert_ok(self.rename("apply", "builder-report", "alpha"))
+        self.assertEqual(self.journal()["done"], True)
+
+    def test_verify_fails_while_the_old_session_name_is_live(self) -> None:
+        _ = self.seed_record(name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        _ = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        result = self.rename("apply")
+        self.assert_refused(result, "gamma-unit's session is named builder-report, not gamma")
+        self.assertIn("is still labelled builder-report", result.stderr)
+
+    def test_a_verify_that_passes_closes_the_journal(self) -> None:
+        _ = self.seed_record(name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        end = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit's session is named builder-report, not gamma")
+        self.assertEqual(self.journal()["done"], False)
+        end()
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        self.assert_ok(self.rename("verify"))
+        self.assertEqual(self.journal()["done"], True)
+        self.assert_ok(self.rename("plan", "gamma", "delta"))
 
     def test_apply_waits_while_the_unit_is_stopping(self) -> None:
         _ = self.seed_record(progress="waiting")
@@ -380,12 +420,16 @@ class UnitRenameTests(unittest.TestCase):
                 self.assert_refused(self.rename("apply", old, new), text)
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
 
-    def mark_live(self, unit: str, session_id: str) -> Callable[[], None]:
-        """A live Claude in a herdr session marked as `unit` of this production; the result ends it."""
-        held = fake_showrunner.write_session(self.root / "state/sessions", unit.removesuffix("-unit"), session_id)
+    def mark_live(self, unit: str, session_id: str, name: str = "") -> Callable[[], None]:
+        """A live Claude in a herdr session marked as `unit` of this production; the result ends it.
+
+        The session and its pane label are called `name`, the unit's stem when it is empty.
+        """
+        name = name or unit.removesuffix("-unit")
+        held = fake_showrunner.write_session(self.root / "state/sessions", name, session_id)
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
-            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit})])
+            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}, label=name)])
         fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
 
         def end() -> None:

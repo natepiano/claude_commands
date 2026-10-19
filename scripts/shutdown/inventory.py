@@ -609,6 +609,11 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
+# The updater's main() also refreshes the vault's agent notes, which reads every Claude login.
+# Shutdown needs only the desktops; an updater from before the flag ignores it and stays correct.
+SKIP_AGENT_NOTES = "AGENT_SESSIONS_SKIP_AGENT_NOTES"
+
+
 def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
     if sys.platform == "darwin":
         return {}
@@ -622,6 +627,7 @@ def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
                 text=True,
                 timeout=60,
                 check=False,
+                env={**os.environ, SKIP_AGENT_NOTES: "1"},
             )
         except (OSError, subprocess.TimeoutExpired):
             pass

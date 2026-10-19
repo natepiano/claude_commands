@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Batch held style findings into issues and finish approved or declined proposals."""
+"""File style decisions and track their answers and builds."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import subprocess
 import sys
 import tempfile
 import tomllib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
+from urllib.parse import quote
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
@@ -22,10 +25,13 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 import coverage_report
 import rules
 import style_ledger
+import style_rules
 from add_style import StandingStyleProduction, standing_style_production
-from issues import Issue, frontmatter, open_issues
-from proposal_issue import STAR
-from unit_files import unit_file_holders
+from issues import Issue, frontmatter, open_issues, plain
+from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
+                            decision_answer, fill_ranking, refresh_decision, require_generated_body)
+from unit_files import git, unit_file_holders
+from user_zone import user_zone
 
 
 def proposal_command(*arguments: str) -> None:
@@ -44,29 +50,20 @@ def renumber() -> None:
         raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip())
 
 
-@dataclass(frozen=True)
-class NoApprovedProposal:
-    """There is no approved open style issue for this unit."""
+def is_decision(issue: Issue) -> bool:
+    return (all(issue.value(key) for key in ("style_rule", "style_crate", "style_rule_blob"))
+            and {"proposal", "style"} <= set(issue.fields.get("tags", [])))
 
 
-def approved_issue(folder: Path, unit: str, ledger: style_ledger.Ledger) -> Issue | NoApprovedProposal:
-    used = {ticket["proposal"] for ticket in ledger.proposal_tickets() if ticket["state"] != "dropped"}
-    candidates = (issue for issue in open_issues(folder, "style")
-                  if issue.value("unit") == unit and issue.value("plan") and str(issue.path) not in used)
-    ordered = sorted(candidates, key=lambda issue: (issue.value("date_created"), issue.path.name))
-    return ordered[0] if ordered else NoApprovedProposal()
+def approved_decisions(folder: Path, unit: str) -> tuple[Issue, ...]:
+    return tuple(sorted((issue for issue in open_issues(folder, "style")
+                         if is_decision(issue) and isinstance(decision_answer(issue), ApprovedDecision)
+                         and issue.value("unit") == unit),
+                        key=lambda issue: (issue.value("date_created"), issue.path.name)))
 
 
 def issue_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
-    by_id = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
-    return _issue_findings(by_id, issue)
-
-
-def _issue_findings(by_id: Mapping[str, style_ledger.HeldFinding], issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
-    ids = frontmatter(issue).get("style_findings", [])
-    if not ids or any(finding_id not in by_id for finding_id in ids):
-        raise style_ledger.LedgerError(f"{issue}: unknown or absent style_findings")
-    return tuple(by_id[finding_id] for finding_id in ids)
+    return ledger.proposal_findings(issue)
 
 
 def repository_name(repo: Path) -> str:
@@ -81,15 +78,11 @@ def style_slug(repo: Path) -> str:
     return repository_name(repo) + "-style"
 
 
-def crate_for(ledger: style_ledger.Ledger, path: str) -> str:
-    return _crate_for(_workspace_directories(ledger), path)
+def workspace_directories(ledger: style_ledger.Ledger) -> tuple[str, ...]:
+    return tuple(member.directory for member in coverage_report.workspace(ledger, ledger.synced_commit()))
 
 
-def _workspace_directories(ledger: style_ledger.Ledger) -> tuple[str, ...]:
-    return tuple(member.directory for member in coverage_report.workspace(ledger, ledger.summary().synced_tip))
-
-
-def _crate_for(directories: tuple[str, ...], path: str) -> str:
+def crate_for(directories: tuple[str, ...], path: str) -> str:
     # A finding names a site even when its coverage cell is the enclosing crate.
     return next((directory for directory in sorted(directories, key=len, reverse=True)
                  if path == directory or path.startswith(directory + "/")), ".")
@@ -121,16 +114,57 @@ def issue_project(repo: Path, crate: str, vault: Path) -> IssueProject:
     return IssueProject(name, name)
 
 
-def batch_name(label: str, findings: tuple[style_ledger.HeldFinding, ...]) -> str:
-    digest = hashlib.sha256("\n".join(sorted(finding.finding_id for finding in findings)).encode()).hexdigest()[:8]
-    label = re.sub(r"[^\w .-]", "-", label).strip(" .-") or "crate"
-    return f"style {label[:32]} {digest}.md"
+@dataclass(frozen=True, order=True)
+class DecisionKey:
+    rule: str
+    crate: str
+    blob: str
 
 
-def proposed_ranking(kind: style_ledger.FindingKind, finding_count: int) -> str:
+def decision_key(finding: style_ledger.HeldFinding, directories: tuple[str, ...]) -> DecisionKey:
+    return DecisionKey(finding.rule.removesuffix("#uncovered"), crate_for(directories, finding.path), finding.rule_blob)
+
+
+UNSAFE_NAME = re.compile(r"[^\w .-]")
+UNSAFE_CRATE_LABEL = re.compile(r"[^\w.+-]")
+PLAIN_CRATE = re.compile(r"[A-Za-z0-9_./-]+")
+
+
+def batch_name(key: DecisionKey) -> str:
+    label = UNSAFE_NAME.sub("-", PurePosixPath(key.rule).stem).strip(" .-") or "rule"
+    # The root crate has no crate part, so no crate path can give its name.
+    if key.crate != ".":
+        # A plain crate path shows each "/" as "+". A plain path holds no "+", so two plain paths give two labels.
+        shown = key.crate.replace("/", "+")
+        crate = UNSAFE_CRATE_LABEL.sub("-", shown).strip(".-")
+        # Any other path can give the label of a plain path, so it adds a hash of the path.
+        # A plain label cannot hold the parentheses, so no plain path gives a hashed name.
+        plain_path = PLAIN_CRATE.fullmatch(key.crate) is not None and crate == shown
+        label += f" {crate}" if plain_path else f" {crate} ({hashlib.sha256(key.crate.encode()).hexdigest()[:8]})"
+    return f"style {label} {key.blob[:8]}.md"
+
+
+DEFAULT_GOAL = "1 - Ship Hana"
+
+
+def project_goal(proposals: Path, project: str) -> str:
+    counts: Counter[str] = Counter()
+    for path in sorted(proposals.glob("*.md")):
+        issue = Issue(path, frontmatter(path))
+        goal = plain(issue.value("backlog_goal"))
+        if (issue.value("status") == "open" and "style" not in issue.fields.get("tags", [])
+                and plain(issue.value("project")) == plain(project) and GOAL.fullmatch(goal)):
+            counts[goal] += 1
+    if counts:
+        return min(counts, key=lambda goal: (-counts[goal], int(goal.split(" - ", 1)[0]), goal))
+    print(f"goal: no ranked {project} issue; default {DEFAULT_GOAL}")
+    return DEFAULT_GOAL
+
+
+def proposed_ranking(kind: style_ledger.FindingKind, finding_count: int, goal: str) -> str:
     effort = 1 if finding_count <= 3 else 2 if finding_count <= 15 else 3
     impact = 1 if kind == "rename" else 2
-    return (f"goal 1 - Ship Hana · alignment {STAR * 2} · impact {STAR * impact} "
+    return (f"goal {goal} · alignment {STAR * 2} · impact {STAR * impact} "
             + f"· urgency {STAR} · effort {STAR * effort}")
 
 
@@ -138,134 +172,487 @@ def proposal_kind(finding: style_ledger.HeldFinding, definition: rules.Rule) -> 
     return "restructure" if definition.tier == "D" or definition.mode_propose else finding.kind
 
 
-def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> tuple[Path, ...]:
-    definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
-    directories = _workspace_directories(ledger)
+@dataclass(frozen=True)
+class GitHubRuleRoot:
+    repository: str
+    branch: str
+
+    def url(self, path: str) -> str:
+        return f"https://github.com/{self.repository}/blob/{quote(self.branch, safe='')}/{quote(path, safe='/')}"
+
+
+def github_rule_root(root: Path) -> GitHubRuleRoot:
+    remote = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"],
+                            capture_output=True, text=True, check=False)
+    if remote.returncode:
+        raise style_ledger.LedgerError(f"{root}: cannot read origin: {remote.stderr.strip()}")
+    origin = remote.stdout.strip()
+    match = re.fullmatch(r"(?:git@github\.com:|https://github\.com/)([^/\s]+/[^/\s]+)", origin)
+    if match is None:
+        raise style_ledger.LedgerError(f"{root}: non-GitHub origin {origin}")
+    branch = subprocess.run(["git", "-C", str(root), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                            capture_output=True, text=True, check=False)
+    name = branch.stdout.strip().removeprefix("origin/")
+    if branch.returncode or not name:
+        name = "main"
+        print(f"rules: {root}: no origin/HEAD; default main")
+    return GitHubRuleRoot(match[1].removesuffix(".git"), name)
+
+
+@dataclass
+class RuleLinker:
+    repo: Path
+    roots: dict[Path, GitHubRuleRoot] = field(default_factory=dict)
+
+    def rule_url(self, rule: str) -> str:
+        origin, separator, path = rule.removesuffix("#uncovered").partition(":")
+        if not separator or origin not in {"global", "local"} or not path:
+            raise style_ledger.LedgerError(f"invalid rule {rule}")
+        if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
+            raise style_ledger.LedgerError(f"invalid rule path {rule}")
+        root = (style_rules.NATE_STYLE_DIR if origin == "global" else self.repo).resolve()
+        if root not in self.roots:
+            self.roots[root] = github_rule_root(root)
+        return self.roots[root].url(path)
+
+    def urls(self, findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[str, ...]:
+        return tuple(sorted({self.rule_url(finding.rule) for finding in findings}))
+
+
+def link_rules(ledger: style_ledger.Ledger, proposals: Path) -> None:
+    linker = RuleLinker(ledger.repo)
+    linked = already = skipped = 0
+    for path in sorted(proposals.glob("*.md")):
+        issue = Issue(path, frontmatter(path))
+        if not is_decision(issue):
+            continue
+        if "style_rules" in issue.fields:
+            already += 1
+            continue
+        findings = issue_findings(ledger, path)
+        if not findings:
+            skipped += 1
+            print(f"skipped {path}: no decision findings")
+            continue
+        proposal_command("rules", str(path), "--rules", ",".join(linker.urls(findings)))
+        linked += 1
+    print(f"linked {linked}, already linked {already}, skipped {skipped}")
+
+
+def decision_kind(findings: tuple[style_ledger.HeldFinding, ...],
+                  definitions: Mapping[str, rules.Rule]) -> style_ledger.FindingKind:
+    kinds = {proposal_kind(item, definitions[item.rule.removesuffix("#uncovered")])
+             if item.rule.removesuffix("#uncovered") in definitions else item.kind for item in findings}
+    return "restructure" if "restructure" in kinds else "type" if "type" in kinds else "rename"
+
+
+@dataclass
+class DecisionWriter:
+    """What one command run loads once and shares for every decision it writes."""
+    ledger: style_ledger.Ledger
+    proposals: Path
+    parent: str
+    definitions: Mapping[str, rules.Rule]
+    holders: Mapping[str, frozenset[str]]
+    linker: RuleLinker
+    repository: str
+    goals: dict[str, str] = field(default_factory=dict)
+
+    def goal(self, project: str) -> str:
+        if project not in self.goals:
+            self.goals[project] = project_goal(self.proposals, project)
+        return self.goals[project]
+
+    def text(self, key: DecisionKey, findings: tuple[style_ledger.HeldFinding, ...]) -> str:
+        crate = key.crate if key.crate != "." else self.repository
+        stem = PurePosixPath(key.rule).stem
+        body = [f"# Style decision: {stem} in {crate}", "", f"Parent: {self.parent}", "",
+                f"Kind: {decision_kind(findings, self.definitions)}", f"Rule: {key.rule}",
+                f"Rule link: {self.linker.rule_url(key.rule)}",
+                f"Findings: {len(findings)}; files: {len({finding.path for finding in findings})}", ""]
+        seen: set[str] = set()
+        for finding in sorted(findings, key=lambda item: (len(item.before) + len(item.after), item.path, item.line, item.finding_id)):
+            if finding.path in seen:
+                continue
+            seen.add(finding.path)
+            live = ", ".join(sorted(unit for unit, paths in self.holders.items() if finding.path in paths)) or "none"
+            body.extend([f"## Example {len(seen)}", f"Site: {finding.path}:{finding.line}",
+                         f"Live units holding file: {live}", "Before:", "```", finding.before, "```",
+                         "After:", "```", finding.after, "```", ""])
+            if len(seen) == 3:
+                break
+        body.append("Recommended answer: approve the described changes under this rule text.")
+        return "\n".join(body) + "\n"
+
+    def create(self, key: DecisionKey, findings: tuple[style_ledger.HeldFinding, ...],
+               inherited: Mapping[str, str]) -> Path:
+        issue = self.proposals / batch_name(key)
+        project = issue_project(self.ledger.repo, key.crate, self.proposals.parent)
+        ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
+        with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
+            body = Path(scratch) / "body.md"
+            _ = body.write_text(self.text(key, findings))
+            proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
+                             "--proposed-by", style_slug(self.ledger.repo), "--extra-tags", "style",
+                             "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
+                             "--count", str(len(findings)), "--body-file", str(body),
+                             "--proposed-ranking", ranking, "--initial-fields", json.dumps(dict(inherited)),
+                             "--rules", ",".join(self.linker.urls(findings)))
+        return issue
+
+    def refresh(self, decision: Issue) -> None:
+        """Write the decision's count, examples and open ranking only when its bytes change."""
+        key = DecisionKey(decision.value("style_rule"), decision.value("style_crate"), decision.value("style_rule_blob"))
+        findings = self.ledger.proposal_findings(decision.path)
+        ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings),
+                                   self.goal(plain(decision.value("project"))))
+        _ = refresh_decision(decision.path, len(findings), self.text(key, findings), ranking,
+                             datetime.now(user_zone()).date())
+
+
+def decision_writer(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> DecisionWriter:
+    standing = standing_style_production(ledger.repo)
+    holders = unit_file_holders(ledger.repo, standing.doc, ledger) if isinstance(standing, StandingStyleProduction) else {}
+    return DecisionWriter(ledger, proposals, parent, {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)},
+                          holders, RuleLinker(ledger.repo), repository_name(ledger.repo))
+
+
+def find_decision(proposals: Path, key: DecisionKey) -> Path:
+    issue = proposals / batch_name(key)
+    if issue.exists():
+        fields = frontmatter(issue)
+        if any(fields.get(name) != [value] for name, value in (
+            ("style_rule", key.rule), ("style_crate", key.crate), ("style_rule_blob", key.blob),
+        )):
+            raise style_ledger.LedgerError(f"{issue}: different decision key")
+    return issue
+
+
+# The close reasons of a decision with no finding left to build.
+BUILT_REASON = "built in "
+NOTHING_LEFT_REASON = "nothing left to build: "
+FINISHED_REASONS = (BUILT_REASON, NOTHING_LEFT_REASON)
+
+
+@dataclass(frozen=True)
+class FilingResult:
+    filed: tuple[Path, ...]
+    skipped: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class WaiveWithAnswer:
+    """The user declined the decision. Its words waive each finding that joins it."""
+    words: str
+
+
+@dataclass(frozen=True)
+class ReopenBuiltDecision:
+    """The decision is closed as finished. A finding that joins it reopens it with its approval."""
+
+
+@dataclass(frozen=True)
+class JoinOpenDecision:
+    """The decision is open. A finding joins it with no change to its answer."""
+
+
+JoinAction = WaiveWithAnswer | ReopenBuiltDecision | JoinOpenDecision
+
+
+def join_action(issue: Path) -> JoinAction:
+    """What the decision's answer does to findings that join it. Refuse a decision they cannot join."""
+    fields = frontmatter(issue)
+    answer = decision_answer(Issue(issue, fields))
+    if isinstance(answer, DeclinedDecision):
+        return WaiveWithAnswer(answer.words)
+    closed = fields.get("status") == ["closed"]
+    if closed and not fields.get("reason", [""])[0].startswith(FINISHED_REASONS) and not fields.get("as_built"):
+        raise style_ledger.LedgerError("closed decision is not built")
+    require_generated_body(issue)
+    return ReopenBuiltDecision() if closed else JoinOpenDecision()
+
+
+def apply_answer(ledger: style_ledger.Ledger, issue: Path, action: JoinAction, finding_ids: tuple[str, ...]) -> None:
+    """Waive the joining findings of a declined decision, or reopen a built one.
+
+    The answer acts only on pending findings, so with none it does nothing.
+    """
+    if not finding_ids:
+        return
+    if isinstance(action, WaiveWithAnswer):
+        _ = ledger.decline_findings(finding_ids, action.words)
+    elif isinstance(action, ReopenBuiltDecision):
+        proposal_command("reopen", str(issue))
+
+
+def file_decision(writer: DecisionWriter, key: DecisionKey, items: tuple[style_ledger.HeldFinding, ...]) -> bool:
+    """File the findings to their decision. True when they are filed, False when the answer waived them."""
+    issue = find_decision(writer.proposals, key)
+    if not issue.exists():
+        issue = writer.create(key, items, {})
+    action = join_action(issue)
+    apply_answer(writer.ledger, issue, action, tuple(finding.finding_id for finding in items))
+    if isinstance(action, WaiveWithAnswer):
+        return False
+    for finding in items:
+        writer.ledger.file_held(finding.finding_id, issue)
+    return True
+
+
+def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> FilingResult:
+    writer = decision_writer(ledger, proposals, parent)
+    directories = workspace_directories(ledger)
     waiting = ledger.held_findings(style_ledger.UnfiledFindingsFromOpenTickets())
-    open_ticket_counts: dict[str, int] = defaultdict(int)
-    for finding in waiting:
-        open_ticket_counts[finding.ticket] += 1
-    for ticket, count in sorted(open_ticket_counts.items()):
+    for ticket, count in sorted(Counter(finding.ticket for finding in waiting).items()):
         print(f"held for open ticket {ticket}: {count} findings")
     waiting_ids = {finding.finding_id for finding in waiting}
-    valid: list[style_ledger.HeldFinding] = []
+    batches: dict[DecisionKey, list[style_ledger.HeldFinding]] = defaultdict(list)
     for finding in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")):
         if finding.finding_id in waiting_ids:
             continue
-        definition = definitions.get(finding.rule.removesuffix("#uncovered"))
+        definition = writer.definitions.get(finding.rule.removesuffix("#uncovered"))
         if definition is None or definition.blob != finding.rule_blob:
             print(f"skipped {finding.finding_id}: rule changed since judged")
         else:
-            valid.append(finding)
-    # Recover a create that reached disk before file_held, including partially marked batches.
-    for issue_path in sorted(proposals.glob("*.md")):
-        fields = frontmatter(issue_path)
-        if "style" not in fields.get("tags", []):
-            continue
-        identities = set(fields.get("style_findings", []))
-        recovered = [finding for finding in valid if finding.finding_id in identities]
-        for finding in recovered:
-            ledger.file_held(finding.finding_id, issue_path)
-        valid = [finding for finding in valid if finding.finding_id not in identities]
-    batches: dict[tuple[style_ledger.FindingKind, str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
-    for finding in valid:
-        definition = definitions[finding.rule.removesuffix("#uncovered")]
-        kind = proposal_kind(finding, definition)
-        crate = _crate_for(directories, finding.path)
-        batches[(kind, "" if kind == "restructure" else finding.rule, crate)].append(finding)
-    if not batches:
-        return ()
-    standing = standing_style_production(ledger.repo)
-    holders: dict[str, frozenset[str]] = (
-        unit_file_holders(ledger.repo, standing.doc, ledger) if isinstance(standing, StandingStyleProduction) else {}
-    )
+            batches[decision_key(finding, directories)].append(finding)
     written: list[Path] = []
-    for (kind, rule, crate), items in sorted(batches.items()):
-        findings = tuple(items)
-        label = (PurePosixPath(rule.removesuffix("#uncovered")).stem if rule else
-                 repository_name(ledger.repo) if crate == "." else PurePosixPath(crate).name)
-        issue = proposals / batch_name(label, findings)
-        body = [f"# Style {kind}: {label}", "", f"Parent: {parent}", "", "Recommended answer: approve the described change; schedule it with any live units holding these files.", ""]
-        for finding in findings:
-            live = ", ".join(sorted(unit for unit, paths in holders.items() if finding.path in paths)) or "none"
-            body.extend([f"## {finding.finding_id}", f"Rule: {finding.rule}",
-                         f"Site: {finding.path}:{finding.line} — {finding.text}", f"Live units holding file: {live}",
-                         "", "Before:", "```", finding.before, "```", "After:", "```", finding.after, "```", ""])
-        with tempfile.TemporaryDirectory(prefix="style-proposal-") as scratch:
-            body_file = Path(scratch) / "body.md"
-            _ = body_file.write_text("\n".join(body))
-            project = issue_project(ledger.repo, crate, proposals.parent)
-            proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
-                             "--proposed-by", style_slug(ledger.repo),
-                             "--proposed-ranking", proposed_ranking(kind, len(findings)),
-                             "--extra-tags", "style", "--findings", ",".join(finding.finding_id for finding in findings),
-                             "--body-file", str(body_file))
-        for finding in findings:
-            ledger.file_held(finding.finding_id, issue)
-        written.append(issue)
-        print(f"filed {issue}")
-    return tuple(written)
+    skipped: list[Path] = []
+    for key, items in sorted(batches.items()):
+        issue = proposals / batch_name(key)
+        try:
+            if file_decision(writer, key, tuple(items)):
+                written.append(issue)
+                print(f"filed {issue}")
+        except (style_ledger.LedgerError, Refusal) as error:
+            skipped.append(issue)
+            print(skip_line(issue, error))
+    # Also finish a refresh interrupted after all ledger moves reached disk.
+    # Only an open decision can get new findings, so a closed one needs no repair.
+    for decision in open_issues(proposals, "style"):
+        if decision.path not in skipped and is_decision(decision) and ledger.proposal_findings(decision.path):
+            try:
+                writer.refresh(decision)
+            except (style_ledger.LedgerError, Refusal) as error:
+                skipped.append(decision.path)
+                print(skip_line(decision.path, error))
+    return FilingResult(tuple(written), tuple(skipped))
+
+
+def skip_line(issue: Path, error: ValueError) -> str:
+    return f"skipped {issue}: {str(error).removeprefix(f'{issue}: ')}"
 
 
 def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
     definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
-    directories = _workspace_directories(ledger)
-    by_id = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+    directories = workspace_directories(ledger)
+    goals: dict[str, str] = {}
     ranked = 0
     for issue in open_issues(proposals, "style"):
+        if not is_decision(issue):
+            continue
         try:
-            findings = _issue_findings(by_id, issue.path)
-            kinds: set[style_ledger.FindingKind] = set()
-            crates: set[str] = set()
-            for finding in findings:
-                rule = finding.rule.removesuffix("#uncovered")
-                if rule not in definitions:
-                    raise style_ledger.LedgerError(f"unknown rule {rule}")
-                kinds.add(proposal_kind(finding, definitions[rule]))
-                crates.add(_crate_for(directories, finding.path))
-            if len(kinds) != 1 or len(crates) != 1:
+            findings = issue_findings(ledger, issue.path)
+            if not findings:
+                raise style_ledger.LedgerError("no decision findings")
+            unknown = sorted({finding.rule.removesuffix("#uncovered") for finding in findings} - set(definitions))
+            if unknown:
+                raise style_ledger.LedgerError(f"unknown rule {unknown[0]}")
+            if len({crate_for(directories, finding.path) for finding in findings}) != 1:
                 raise style_ledger.LedgerError("findings do not form one proposal batch")
-            kind: style_ledger.FindingKind = next(iter(kinds))
-            text = issue.path.read_bytes().decode("utf-8")
-            updated = re.sub(r"^Proposed ranking:[ \t]*(?=\r?$)",
-                             lambda match: match[0].rstrip(" \t") + " " + proposed_ranking(kind, len(findings)),
-                             text, count=1, flags=re.MULTILINE)
-            if kind == "restructure" and crates == {"."}:
-                updated = re.sub(r"^# Style restructure: (?=\r?$)",
-                                 lambda match: match[0] + repository_name(ledger.repo),
-                                 updated, count=1, flags=re.MULTILINE)
-            if updated != text:
-                _ = issue.path.write_bytes(updated.encode("utf-8"))
+            project = plain(issue.value("project"))
+            if project not in goals:
+                goals[project] = project_goal(proposals, project)
+            ranking = proposed_ranking(decision_kind(findings, definitions), len(findings), goals[project])
+            if fill_ranking(issue.path, ranking):
                 ranked += 1
                 print(f"ranked {issue.path}")
-        except (style_ledger.LedgerError, OSError, UnicodeError) as error:
+        except (style_ledger.LedgerError, Refusal, OSError, UnicodeError) as error:
             print(f"skipped {issue.path}: {error}")
     print(f"ranked {ranked} issues")
 
 
+def files_at(repo: Path, tip: str, paths: tuple[str, ...]) -> frozenset[str]:
+    """The paths that are files at the tip."""
+    if not paths:
+        return frozenset()
+    return frozenset(path for path in git(repo, "ls-tree", "-r", "-z", "--name-only", tip, "--", *paths).split("\0") if path)
+
+
+def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
+    """Close an open, approved decision when every one of its findings is built or waived. True when it closes.
+
+    A legacy proposal issue is not a decision, so it stays open for migrate.
+    """
+    if not issue.is_file():
+        return False
+    decision = Issue(issue, frontmatter(issue))
+    if (not is_decision(decision) or decision.value("status") != "open"
+            or not isinstance(decision_answer(decision), ApprovedDecision)):
+        return False
+    findings = issue_findings(ledger, issue)
+    if not findings or not all(isinstance(item.state, (style_ledger.Built, style_ledger.Waived)) for item in findings):
+        return False
+    tickets = sorted(ticket["id"] for ticket in ledger.proposal_tickets()
+                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == issue)
+    if tickets:
+        reason = BUILT_REASON + ", ".join(tickets)
+    else:
+        # Refill waives a finding whose file is gone, so nothing was built.
+        commit = ledger.synced_commit()
+        paths = tuple(sorted({item.path for item in findings}))
+        removed = sorted(set(paths) - files_at(ledger.repo, commit, paths))
+        reason = NOTHING_LEFT_REASON + (f"{', '.join(removed)} not in synced commit {commit}" if removed
+                                        else "every finding is waived")
+    proposal_command("close", str(issue), "--reason", reason)
+    print(f"closed {issue}: {reason}")
+    return True
+
+
 def complete(ledger: style_ledger.Ledger) -> None:
-    merged = False
-    for ticket in ledger.proposal_tickets():
-        if ticket["state"] != "merged":
-            continue
-        merged = True
-        issue = Path(ticket["proposal"])
-        if frontmatter(issue).get("status") == ["open"]:
-            proposal_command("close", str(issue), "--reason", f"built in {ticket['id']}")
-    if merged:
+    closed = [issue for issue in ledger.proposal_paths() if close_finished_decision(ledger, issue)]
+    # Complete and refill both close decisions. A close whose renumber failed is not seen again,
+    # so any merged build renumbers once more.
+    if closed or any(ticket["state"] == "merged" for ticket in ledger.proposal_tickets()):
         renumber()
 
 
 def decline(ledger: style_ledger.Ledger, issue: Path, words: str) -> None:
-    if frontmatter(issue).get("status") == ["closed"]:
-        renumber()
-        return
-    for finding in issue_findings(ledger, issue):
-        result = ledger.decline_held(finding.finding_id, words)
-        if isinstance(result, style_ledger.InputChangedSinceJudged):
-            print(f"not re-recorded {finding.finding_id}: input changed since judged")
-    proposal_command("close", str(issue), "--reason", f"declined: {words}")
+    # The answer goes first, so a stop after it never leaves an approved decision with its findings waived.
+    if decision_answer(Issue(issue, frontmatter(issue))) != DeclinedDecision(words):
+        proposal_command("decline-answer", str(issue), "--words", words)
+    filed = tuple(finding.finding_id for finding in issue_findings(ledger, issue)
+                  if isinstance(finding.state, style_ledger.Filed))
+    for finding_id, outcome in ledger.decline_findings(filed, words).items():
+        if isinstance(outcome, style_ledger.InputChangedSinceJudged):
+            print(f"not re-recorded {finding_id}: input changed since judged")
+    if frontmatter(issue).get("status") != ["closed"]:
+        proposal_command("close", str(issue), "--reason", f"declined: {words}")
     renumber()
+
+
+def state_name(finding: style_ledger.HeldFinding) -> str:
+    return ("filed" if isinstance(finding.state, style_ledger.Filed) else
+            "built" if isinstance(finding.state, style_ledger.Built) else
+            "waived" if isinstance(finding.state, style_ledger.Waived) else "unfiled")
+
+
+def sites(ledger: style_ledger.Ledger, issue: Path) -> None:
+    for finding in issue_findings(ledger, issue):
+        print(f"{finding.finding_id} {state_name(finding)} {finding.path}:{finding.line}\nBefore: {finding.before}\nAfter: {finding.after}")
+
+
+def candidates(ledger: style_ledger.Ledger) -> None:
+    groups: dict[str, list[style_ledger.RuleCandidate]] = defaultdict(list)
+    for candidate in ledger.rule_candidates():
+        groups[candidate.idea].append(candidate)
+    for idea, items in sorted(groups.items()):
+        print(idea)
+        for item in items:
+            print(f"  {item.path}:{item.line} — {item.ticket} ({item.unit})")
+
+
+def drop_candidate(ledger: style_ledger.Ledger, idea: str) -> None:
+    print(f"dropped {ledger.drop_candidates(idea)} candidates")
+
+
+@dataclass(frozen=True)
+class LegacyIssue:
+    issue: Issue
+    # Only the findings that this migration takes from the issue.
+    owned: tuple[style_ledger.HeldFinding, ...]
+
+
+def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_run: bool = False) -> None:
+    all_findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+    open_tickets = tuple(ticket for ticket in ledger.proposal_tickets()
+                         if ticket["state"] not in style_ledger.FINAL_TICKET_STATES)
+    holding = {Path(ticket["proposal"]): ticket for ticket in open_tickets}
+    open_ids = {ticket["id"] for ticket in open_tickets}
+    directories = workspace_directories(ledger)
+    sources: list[LegacyIssue] = []
+    keys: dict[str, DecisionKey] = {}
+    origin: dict[str, Issue] = {}
+    moved_before: set[str] = set()
+    for issue in open_issues(proposals, "style"):
+        identities = tuple(dict.fromkeys(issue.fields.get("style_findings", [])))
+        if not identities:
+            continue
+        if issue.path in holding:
+            ticket = holding[issue.path]
+            print(f"refused {issue.path}: live build ticket {ticket['id']} ({ticket['state']})")
+            continue
+        if any(identity not in all_findings for identity in identities):
+            print(f"refused {issue.path}: unknown findings")
+            continue
+        listed = tuple(all_findings[identity] for identity in identities)
+        if any(isinstance(item.build_ticket, style_ledger.BuildTicket) and
+               item.build_ticket.ticket in open_ids for item in listed):
+            print(f"refused {issue.path}: live build ticket")
+            continue
+        # An earlier run that stopped moved these findings from this issue.
+        moved = ledger.moved_findings(issue.path)
+        owned: list[style_ledger.HeldFinding] = []
+        for finding in listed:
+            if finding.finding_id in moved or (isinstance(finding.state, style_ledger.Filed)
+                                               and finding.state.proposal == issue.path):
+                owned.append(finding)
+                keys[finding.finding_id] = decision_key(finding, directories)
+                origin[finding.finding_id] = issue
+            else:
+                print(f"kept {finding.finding_id}: {state_name(finding)}, not filed to {issue.path}")
+        moved_before.update(moved)
+        sources.append(LegacyIssue(issue, tuple(owned)))
+    groups: dict[DecisionKey, list[style_ledger.HeldFinding]] = defaultdict(list)
+    for source in sources:
+        for finding in source.owned:
+            groups[keys[finding.finding_id]].append(finding)
+    writer = decision_writer(ledger, proposals, parent)
+    decisions: dict[DecisionKey, Path] = {}
+    actions: dict[DecisionKey, JoinAction] = {}
+    pending: dict[DecisionKey, tuple[str, ...]] = {}
+    created = moved_count = closed = 0
+    for key, findings in sorted(groups.items()):
+        issue = find_decision(proposals, key)
+        action: JoinAction = JoinOpenDecision()
+        if not issue.exists():
+            created += 1
+            print(f"create {issue}")
+            if not dry_run:
+                origins = sorted({origin[finding.finding_id].path: origin[finding.finding_id] for finding in findings}.values(),
+                                 key=lambda item: item.path)
+                inherited = {name: origins[0].value(name) for name in sorted(INHERITED_FIELDS)
+                             if origins[0].value(name) and all(item.value(name) == origins[0].value(name) for item in origins)}
+                _ = writer.create(key, tuple(findings), inherited)
+        else:
+            action = join_action(issue)
+        count = sum(finding.finding_id not in moved_before for finding in findings)
+        moved_count += count
+        print(f"move {count} findings to {issue}")
+        # A finding still filed has not yet taken the decision's answer.
+        pending[key] = tuple(finding.finding_id for finding in findings if isinstance(finding.state, style_ledger.Filed))
+        if isinstance(action, WaiveWithAnswer):
+            print(f"waive {len(pending[key])} findings in {issue}: declined: {action.words}")
+        elif isinstance(action, ReopenBuiltDecision) and pending[key]:
+            print(f"reopen {issue}")
+        decisions[key] = issue
+        actions[key] = action
+    if not dry_run:
+        for source in sources:
+            if source.owned:
+                ledger.move_issue_findings(source.issue.path, {
+                    finding.finding_id: decisions[keys[finding.finding_id]] for finding in source.owned})
+        for key, issue in sorted(decisions.items()):
+            apply_answer(ledger, issue, actions[key], pending[key])
+        for issue in sorted(set(decisions.values())):
+            writer.refresh(Issue(issue, frontmatter(issue)))
+    for source in sources:
+        names = sorted({decisions[keys[finding.finding_id]].name for finding in source.owned})
+        reason = "merged into " + ", ".join(names) if names else "no filed findings"
+        print(f"close {source.issue.path}: {reason}")
+        closed += 1
+        if not dry_run:
+            proposal_command("close", str(source.issue.path), "--reason", reason)
+    print(f"totals: create {created}, move {moved_count}, close {closed}")
 
 
 def main(argv: list[str]) -> int:
@@ -276,7 +663,18 @@ def main(argv: list[str]) -> int:
     _ = filing.add_argument("--parent", required=True)
     ranking = sub.add_parser("rank")
     _ = ranking.add_argument("--proposals", type=Path, required=True)
+    linking = sub.add_parser("link-rules")
+    _ = linking.add_argument("--proposals", type=Path, required=True)
     _ = sub.add_parser("complete")
+    _ = sub.add_parser("candidates")
+    showing = sub.add_parser("sites")
+    _ = showing.add_argument("--issue", type=Path, required=True)
+    migration = sub.add_parser("migrate")
+    _ = migration.add_argument("--proposals", type=Path, required=True)
+    _ = migration.add_argument("--parent", required=True)
+    _ = migration.add_argument("--dry-run", action="store_true")
+    dropping = sub.add_parser("drop-candidate")
+    _ = dropping.add_argument("--idea", required=True)
     declining = sub.add_parser("decline")
     _ = declining.add_argument("--issue", type=Path, required=True)
     _ = declining.add_argument("--words", required=True)
@@ -284,13 +682,28 @@ def main(argv: list[str]) -> int:
         _ = command.add_argument("--repo", type=Path, default=Path.cwd())
     args = cast(ProposalArguments, parser.parse_args(argv))
     try:
-        with style_ledger.open_ledger(args.repo) as ledger:
+        source = (style_ledger.preview_ledger(args.repo) if args.command == "migrate" and args.dry_run
+                  else style_ledger.open_ledger(args.repo))
+        with source as ledger:
             if args.command == "file":
-                _ = file_proposals(ledger, args.proposals.expanduser().resolve(), args.parent)
+                result = file_proposals(ledger, args.proposals.expanduser().resolve(), args.parent)
+                if result.skipped:
+                    print(f"style_proposals: skipped {len(result.skipped)} decisions", file=sys.stderr)
+                    return 1
             elif args.command == "rank":
                 rank_proposals(ledger, args.proposals.expanduser().resolve())
+            elif args.command == "link-rules":
+                link_rules(ledger, args.proposals.expanduser().resolve())
             elif args.command == "decline":
                 decline(ledger, args.issue.expanduser().resolve(), args.words)
+            elif args.command == "sites":
+                sites(ledger, args.issue.expanduser().resolve())
+            elif args.command == "candidates":
+                candidates(ledger)
+            elif args.command == "drop-candidate":
+                drop_candidate(ledger, args.idea)
+            elif args.command == "migrate":
+                migrate(ledger, args.proposals.expanduser().resolve(), args.parent, dry_run=args.dry_run)
             else:
                 complete(ledger)
         return 0
@@ -309,6 +722,8 @@ class ProposalArguments(argparse.Namespace):
     parent: str = ""
     issue: Path = Path()
     words: str = ""
+    idea: str = ""
+    dry_run: bool = False
 
 
 if __name__ == "__main__":

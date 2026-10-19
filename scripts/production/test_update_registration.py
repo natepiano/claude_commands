@@ -25,11 +25,9 @@ from add_unit import read_production
 
 if TYPE_CHECKING:
     from scripts.notify import review
-    from scripts.hooks.showrunner_footer import read_pending_reviewed, PendingReviewUnavailableQuestion
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     import review
-    from showrunner_footer import read_pending_reviewed, PendingReviewUnavailableQuestion
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 
@@ -334,7 +332,10 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
         self.assertIn("/showrunner:dailies gantt", prompt)
-        self.assertEqual(prompt.count("Pass `--render-state <SCRATCH>/dailies_state.json` to the builder"), 1)
+        state_dir = self.state / "showrunner" / self.doc.name.removesuffix("-production.md") / "session"
+        self.assertEqual(prompt.count(f"Pass `--render-state {state_dir}/dailies_state.json` to the builder"), 1)
+        self.assertIn(f"unit_status.sh {state_dir}/unit_status ", prompt)
+        self.assertNotIn("<STATE_DIR>", prompt)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
         self.assertIn(f"--production {self.doc}", prompt)
@@ -376,7 +377,9 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
-                                           "open_for_user": ["stale state item"]}), encoding="utf-8")
+                                           "open_for_user": ["stale state item"],
+                                           "next": ["merge alpha phase 2 when its gate is green",
+                                                    "send the restarts plan at 03:30"]}), encoding="utf-8")
         before = self.run_command("log", "compacting", "--state", str(state), "--before-compaction")
         self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
         log = (self.checkout / "production.log").read_text(encoding="utf-8")
@@ -384,11 +387,39 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn("Merges accepted but held: alpha phase 2", log)
         self.assertIn("Open for the user: review colors", log)
         self.assertNotIn("stale state item", log)
+        self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
+
+    def test_the_first_call_moves_the_scratchpad_state_and_rewrites_the_tick_prompt(self) -> None:
+        slug = self.doc.name.removesuffix("-production.md")
+        timer = self.state / "notifier" / f"showrunner-{slug}"
+        timer.mkdir(parents=True)
+        _ = (timer / "conf").write_text("TARGET=session:old-showrunner\n", encoding="utf-8")
+        scratch = self.root / "tmp" / "claude-1000" / "-project" / "old-showrunner" / "scratchpad"
+        (scratch / "unit_status").mkdir(parents=True)
+        _ = (scratch / "unit_status" / "blocks_open").write_text("alpha-unit\n", encoding="utf-8")
+        _ = (scratch / "showrunner_state.json").write_text('{"merges_held": ["from scratch"]}\n', encoding="utf-8")
+        target = self.state / "showrunner" / slug / "session"
+        target.mkdir(parents=True)
+        _ = (target / "showrunner_state.json").write_text('{"merges_held": ["kept"]}\n', encoding="utf-8")
+        prompt = self.state / "showrunner" / slug / "prompt.txt"
+        _ = prompt.write_text("an old prompt with <SCRATCH>/unit_status\n", encoding="utf-8")
+        env = {**self.env, "SHOWRUNNER_SCRATCH_ROOT": str(self.root / "tmp")}
+
+        result = self.run_command("log", "first event", env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"state-dir: ok — copied unit_status to {target}", result.stdout)
+        self.assertEqual((target / "unit_status" / "blocks_open").read_text(encoding="utf-8"), "alpha-unit\n")
+        self.assertIn("kept", (target / "showrunner_state.json").read_text(encoding="utf-8"))
+        self.assertIn(f"unit_status.sh {target}/unit_status ", prompt.read_text(encoding="utf-8"))
+
+        again = self.run_command("log", "second event", env=env)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertNotIn("state-dir", again.stdout)
 
     def test_invalid_state_fails_log_without_writing(self) -> None:
         log = self.checkout / "production.log"
         _ = log.write_text("existing line\n", encoding="utf-8")
-        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong")):
+        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong"), ("next", ["two\nlines"])):
             with self.subTest(key=key):
                 state = self.root / f"{key}.json"
                 _ = state.write_text(json.dumps({key: value}), encoding="utf-8")
@@ -452,8 +483,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         rows = cast(list[dict[str, str]], json.loads(outstanding.read_text()))
         self.assertEqual(rows[0]["question"], full)
         self.assertEqual(rows[0]["reviewed"], accepted)
-        saved = cast(dict[str, list[dict[str, str]]], json.loads(pending.read_text()))
-        self.assertEqual([item["text"] for item in saved["items"]], ["Retry build", "Choose compiler"])
         lines = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual(lines[1]["reviewed"], accepted)
 
@@ -522,9 +551,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(rows[1]["question"], unavailable)
         self.assertEqual(rows[1]["review_unavailable"], "timeout")
         self.assertNotIn("reviewed", rows[1])
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        saved = cast(dict[str, list[dict[str, str]]], json.loads(pending.read_text()))
-        self.assertEqual([item["kind"] for item in saved["items"]], ["reviewed", "review unavailable"])
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(showrunners, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
@@ -606,21 +632,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         history = [cast(dict[str, str], json.loads(line))
                    for line in self.outstanding().with_suffix(".history.jsonl").read_text().splitlines()]
         self.assertEqual([row["text"] for row in history], ["Retry build", "Reminder"])
-
-    def test_replacing_outstanding_removes_closed_pending_questions_and_keeps_open_ones(self) -> None:
-        instance = self.question_instance()
-        question = "Retry build 42?"
-        other = "Use stable?"
-        state = self.question_state([{"text": "Retry build", "question": question},
-                                     {"text": "Compiler", "question": other}])
-        with mock.patch.object(review, "review_question", side_effect=[
-                review.QuestionAccepted(question), review.QuestionReviewUnavailable(other, "timeout")]):
-            _ = self.run_questions(state)
-        _ = self.run_questions(self.question_state(["Compiler"]))
-        self.assertEqual(read_pending_reviewed(instance), [
-            PendingReviewUnavailableQuestion("Compiler", other, "timeout")])
-        _ = self.run_questions(self.question_state([]))
-        self.assertFalse((instance / "pending_reviewed.json").exists())
 
     def test_questions_state_updates_outstanding_only_when_open_items_are_present(self) -> None:
         outstanding = self.outstanding()

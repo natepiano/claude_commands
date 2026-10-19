@@ -390,6 +390,8 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
     # A restore creates no worktree or branch, so the naming pattern behind `request.worktree` and
     # `request.branch` neither reserves them against other rows nor has to match the unit's own row.
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
+    # A resumed session also runs in its row's worktree, whatever the naming rule now gives.
+    row_names_place = restoring or isinstance(request.session, ResumedSession)
     matching: list[ExistingUnitRow] = []
     for cells in unit_table(lines):
         fields = {heading: cell_value(cell) for heading, cell in cells.items()}
@@ -407,7 +409,7 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
     if not matching:
         return NoUnitRow()
     existing = matching[0]
-    pattern_cells = () if restoring else (("Worktree", existing.worktree, str(request.worktree)),
+    pattern_cells = () if row_names_place else (("Worktree", existing.worktree, str(request.worktree)),
                                           ("Branch", existing.branch, request.branch))
     for cell, actual, expected in (("Plan", existing.plan, request.plan_cell), *pattern_cells):
         if actual != expected:
@@ -509,6 +511,10 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         if isinstance(existing, NoUnitRow):
             raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
         # Its row, not the naming pattern, names a restored unit's worktree and branch.
+        request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
+    elif isinstance(request.session, ResumedSession) and isinstance(existing, ExistingUnitRow):
+        if request.session.cwd != Path(existing.worktree).expanduser().resolve():
+            raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
         production=request.production,
