@@ -66,7 +66,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Binds later work:** each `proposed` line Ranked proposals appends to the efficiency ledger raises the For you count by one.
 
-### Phase 2 — Where the tokens go  · status: todo
+### Phase 2 — Where the tokens go  · status: done
 **Depends on:** none
 
 #### Work Order
