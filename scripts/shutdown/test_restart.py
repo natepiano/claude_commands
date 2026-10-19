@@ -21,7 +21,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1446,6 +1446,19 @@ class RestartTests(ShutdownTestCase):
                 self.assertTrue(any(row[2:4] == ["agent", "start"] for row in calls))
                 self.assertFalse(any(row[2:4] in (["workspace", "list"], ["workspace", "close"])
                                      for row in calls))
+
+    def test_a_started_shared_server_that_keeps_its_layout_restores_its_other_panes_once(self) -> None:
+        import pane_restore
+
+        owner, _, _ = self.herdr_restart_fixture()
+        for server, kept, restored in ((herdr.ServerCreated(), True, [call("writing", dry_run=False)]),
+                                       (herdr.ServerCreated(), False, []), (herdr.ServerAdopted(), True, [])):
+            with (self.subTest(server=server, kept=kept), patch.object(herdr, "restore_server", return_value=server),
+                  patch.object(herdr, "keeps_restored_layout", return_value=kept),
+                  patch.object(pane_restore, "restore", return_value=0) as restore):
+                result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                self.assertEqual(restore.call_args_list, restored)
 
     def test_ssh_mac_refusal_keeps_claude_records_restartable_and_reaches_peer_json(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()

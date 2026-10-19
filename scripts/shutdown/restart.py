@@ -1139,6 +1139,11 @@ def _herdr_launch(
                     f"herdr server {name} carries {variable} from where it started; "
                     + f"stop it with herdr --session {name} server stop and restart again"
                 )
+        if isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)) and herdr.keeps_restored_layout(name):
+            # The restored panes no shutdown record owns come back on their own accounts.
+            import pane_restore
+
+            _ = pane_restore.restore(name, dry_run=False)
         client = herdr.Herdr(name)
         agents = client.agents()
         if any((isinstance(destination, NewHerdrSession)
