@@ -2198,6 +2198,26 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     return HerdrPlace(session, pane) if session else NotInHerdr()
 
 
+def herdr_places() -> dict[int, HerdrPlace]:
+    """Every herdr process's place from one scan, by pid: herdr_place_of for many pids at once."""
+    if _platform() == "darwin":
+        return {process.pid: process.place for process in herdr_processes()}
+    try:
+        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+    except OSError:
+        return {}
+    places: dict[int, HerdrPlace] = {}
+    for pid, session in _process_sessions(candidates, _live_server_processes(candidates)).items():
+        try:
+            environment = _process_environment(_proc_root() / str(pid))
+        except OSError:
+            continue
+        pane = environment.get("HERDR_PANE_ID", "")
+        if pane and not environment.get("TMUX_PANE"):
+            places[pid] = HerdrPlace(session, pane)
+    return places
+
+
 def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
     """Identify servers by listening socket ownership, independent of argv."""
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr"
