@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import cast, override
 from unittest.mock import patch
 
@@ -103,6 +105,7 @@ class BoardJsonTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
             "UNIT_BOARD_DIR": str(self.output),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "STYLE_LEDGER_STATE_DIR": str(self.root / "style-ledgers"),
         }
 
     def production(self, slug: str = "show", *, running: bool = True) -> ProductionFixture:
@@ -157,6 +160,53 @@ class BoardJsonTests(unittest.TestCase):
         directory = self.showrunner_state / child
         directory.mkdir(parents=True, exist_ok=True)
         _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
+
+    def standing_plan(self, fixture: ProductionFixture) -> None:
+        # A real linked worktree pins the ledger's main-repository namespace,
+        # which differs from both the Unit cell and the worktree basename.
+        for arguments in (
+            ["git", "init", "--quiet", str(fixture.checkout)],
+            ["git", "-C", str(fixture.checkout), "-c", "user.name=Fixture",
+             "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+             "commit", "--quiet", "--allow-empty", "-m", "Fixture"],
+        ):
+            result = subprocess.run(arguments, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        fixture.plan.unlink()
+        (fixture.worktree / ".git").unlink()
+        result = subprocess.run(
+            ["git", "-C", str(fixture.checkout), "worktree", "add", "--quiet", "--detach",
+             str(fixture.worktree), "HEAD"], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _ = fixture.plan.write_text(
+            "> **Standing:** style_plan.py\n\n"
+            + "### Phase alpha-unit-63 — Fix names · status: todo\n", encoding="utf-8",
+        )
+        _ = self.write_run(fixture, [self.event(
+            "phase_started", NOW - 120, phase="alpha-unit-63", instance="ticket-63",
+            phase_title="Fix names",
+        )])
+
+    def ledger(self, fixture: ProductionFixture, *, default_path: bool = False) -> Path:
+        root = self.root / ".local/state/style" if default_path else self.root / "style-ledgers"
+        database = root / fixture.checkout.name / "ledger.sqlite"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database)
+        try:
+            _ = connection.execute("CREATE TABLE tickets (id TEXT, unit TEXT, state TEXT)")
+            _ = connection.executemany("INSERT INTO tickets VALUES (?, ?, ?)", [
+                ("alpha-unit-1", "alpha-unit", "merged"),
+                ("alpha-unit-2", "alpha-unit", "merged"),
+                ("alpha-unit-3", "alpha-unit", "open"),
+                ("alpha-unit-4", "alpha-unit", "rejected"),
+                ("other-unit-1", "other-unit", "merged"),
+                ("alpha-1", "alpha", "merged"),
+            ])
+            connection.commit()
+        finally:
+            connection.close()
+        return database
 
     @staticmethod
     def event(kind: str, at: int, *, phase: str = "2", instance: str = "two",
@@ -459,7 +509,161 @@ class BoardJsonTests(unittest.TestCase):
                 _, unit = self.unit(fixture)
                 self.assertEqual(unit["stage"], label)
                 self.assertEqual(unit["state"], "running")
-                self.assertEqual(unit["phase"], {"id": "2", "of": 4, "title": "Current delivery"})
+                self.assertEqual(unit["phase"], {
+                    "kind": "plan", "id": "2", "of": 4, "title": "Current delivery",
+                })
+
+    def test_standing_plan_counts_only_its_units_merged_tickets_with_a_read_only_connection(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        before = database.read_bytes()
+        # A recorder may hold a write reservation while the pane refreshes.
+        # Read-only readers must still succeed and never construct Ledger.
+        writer = sqlite3.connect(database)
+        self.addCleanup(writer.close)
+        _ = writer.execute("BEGIN IMMEDIATE")
+        database.chmod(0o444)
+        self.addCleanup(database.chmod, 0o644)
+        with patch("sqlite3.connect", wraps=sqlite3.connect) as connect:
+            document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 2,
+        })
+        self.assertIn(str(database), array_items(document["sources"]))
+        self.assertEqual(database.read_bytes(), before)
+        self.assertTrue(any(
+            call.args and call.args[0] == f"file:{database}?mode=ro"
+            and call.kwargs.get("uri") is True for call in connect.call_args_list
+        ), connect.call_args_list)
+
+    def test_exclusively_locked_ledger_gives_zero_in_under_one_second(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        writer = sqlite3.connect(database)
+        self.addCleanup(writer.close)
+        _ = writer.execute("BEGIN EXCLUSIVE")
+
+        started = monotonic()
+        document, unit = self.unit(fixture)
+        elapsed = monotonic() - started
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+        })
+        self.assertIn(str(database), array_items(document["sources"]))
+        self.assertLess(elapsed, 1.0, "a locked ledger must not delay the board refresh")
+
+    def test_standing_plan_without_a_ledger_gives_zero_and_does_not_create_one(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        ledger_root = self.root / "style-ledgers"
+
+        document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+        })
+        self.assertFalse(ledger_root.exists())
+        self.assertFalse(any(str(path).endswith("ledger.sqlite")
+                             for path in array_items(document["sources"])))
+
+    def test_standing_plan_with_an_unreadable_ledger_keeps_zero_and_watches_the_file(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        for contents in (b"not a sqlite database", b""):
+            with self.subTest(contents=contents):
+                _ = database.write_bytes(contents)
+
+                document, unit = self.unit(fixture)
+
+                self.assertEqual(unit["phase"], {
+                    "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 0,
+                })
+                self.assertIn(str(database), array_items(document["sources"]))
+                self.assertEqual(database.read_bytes(), contents)
+
+    def test_standing_plan_uses_the_home_style_ledger_when_no_override_is_set(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        _ = self.environment.pop("STYLE_LEDGER_STATE_DIR")
+        database = self.ledger(fixture, default_path=True)
+
+        document, unit = self.unit(fixture)
+
+        self.assertEqual(object_fields(unit["phase"])["merged"], 2)
+        self.assertIn(str(database), array_items(document["sources"]))
+
+    def test_standing_plan_reads_a_later_merge_without_changing_the_ticket(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        database = self.ledger(fixture)
+        _, before = self.unit(fixture)
+        connection = sqlite3.connect(database)
+        try:
+            _ = connection.execute("UPDATE tickets SET state = 'merged' WHERE id = 'alpha-unit-3'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        _, after = self.unit(fixture)
+
+        self.assertEqual(object_fields(before["phase"])["merged"], 2)
+        self.assertEqual(after["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 3,
+        })
+
+    def test_standing_marker_is_read_from_the_runs_plan_rather_than_the_display_plan(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        active_plan = fixture.worktree / "ticket-plan.md"
+        _ = fixture.plan.rename(active_plan)
+        self.plan(fixture, all_done=True)
+        _ = self.ledger(fixture)
+        run = self.history / "runs/current.jsonl"
+        events = [object_fields(cast(object, json.loads(line)))
+                  for line in run.read_text(encoding="utf-8").splitlines()]
+        events[0]["plan_doc"] = str(active_plan)
+        events[0]["project_plan_doc"] = str(active_plan)
+        _ = run.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+        document, unit = self.unit(fixture)
+
+        self.assertEqual(unit["plan"], str(fixture.plan))
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "alpha-unit-63", "title": "Fix names", "merged": 2,
+        })
+        self.assertIn(str(active_plan), array_items(document["sources"]))
+
+    def test_standing_plan_with_no_open_ticket_keeps_a_null_phase(self) -> None:
+        fixture = self.production()
+        self.standing_plan(fixture)
+        _ = self.ledger(fixture)
+        _ = self.write_run(fixture, [
+            self.event("phase_started", NOW - 120, phase="alpha-unit-63", instance="ticket-63",
+                       phase_title="Fix names"),
+            self.event("phase_finished", NOW - 60, phase="alpha-unit-63", instance="ticket-63",
+                       status="completed", phase_elapsed_seconds=60),
+        ])
+
+        _, unit = self.unit(fixture)
+
+        self.assertIsNone(unit["phase"])
+
+    def test_standing_marker_in_prose_does_not_tag_an_ordinary_plan_as_a_ticket(self) -> None:
+        fixture = self.production()
+        with fixture.plan.open("a", encoding="utf-8") as stream:
+            _ = stream.write("\nA standing plan uses > **Standing:** style_plan.py.\n")
+        _ = self.write_run(fixture, self.delivery_events())
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "plan", "id": "2", "of": 4, "title": "Current delivery",
+        })
 
     def test_dispatched_batches_name_the_repair_until_landed_in_the_current_instance(self) -> None:
         fixture = self.production()
@@ -1063,7 +1267,7 @@ class BoardJsonTests(unittest.TestCase):
                           ("8", "Follow-up delivery", "open")])
         self.assertEqual([row["took"] for row in rows[:2]], [1_200, 1_000])
         self.assertEqual(object_fields(unit["phase"]),
-                         {"id": "8", "of": 3, "title": "Follow-up delivery"})
+                         {"kind": "plan", "id": "8", "of": 3, "title": "Follow-up delivery"})
         self.assertEqual([(row["fix_done"], row["fix_running"], row["findings"]) for row in rows], [
             (1, 0, {"blocker": 1, "minor": 0, "nit": 0}),
             (0, 0, {"blocker": 0, "minor": 1, "nit": 1}),
@@ -1210,6 +1414,10 @@ class BoardJsonTests(unittest.TestCase):
             )])
             document, _ = self.unit(fixture)
             samples.append(document)
+        self.standing_plan(fixture)
+        _ = self.ledger(fixture)
+        document, _ = self.unit(fixture)
+        samples.append(document)
         declared = set(re.findall(r"\b([A-Za-z_]\w*)\??\s*:", CONTRACT.read_text(encoding="utf-8")))
 
         def check_fields(value: object, location: str) -> None:

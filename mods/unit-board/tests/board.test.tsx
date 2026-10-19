@@ -81,7 +81,7 @@ function trunk(): BoardData {
   const data = fixture();
   const running = Array.from({ length: 4 }, (_, index) => {
     const result = unit(`run-${index + 1}`, "running");
-    result.phase = { id: "2", of: 3, title: `Active delivery ${index + 1}` };
+    result.phase = { kind: "plan", id: "2", of: 3, title: `Active delivery ${index + 1}` };
     result.stage = ["Build", "Tests", "Review", "Repair round 2"][index]!;
     result.workers = [{ slot: `worker-${index + 1}`, role: "", state: "running", model: "", doing: "" }];
     return result;
@@ -102,7 +102,7 @@ function trunk(): BoardData {
 function longUnit(): BoardData {
   const data = fixture();
   const active = data.units[0]!;
-  active.phase = { id: "10", of: 17, title: "Current delivery" };
+  active.phase = { kind: "plan", id: "10", of: 17, title: "Current delivery" };
   active.phases = Array.from({ length: 17 }, (_, index) => {
     const id = index + 1;
     const row = phase(String(id), id < 10 ? "done" : id === 10 ? "open" : "todo");
@@ -123,6 +123,40 @@ function longUnit(): BoardData {
 // Run the same layout assertions against both engine element surfaces.
 describe("board layout", () => {
   for (const surface of ["terminal", "desktop"] as const) {
+    for (const detail of [false, true]) {
+      for (const merged of [0, 62]) {
+        test(`${surface}: ${detail ? "unit" : "board"} ticket heading shows ${merged} merged at 76 columns`, async ($, on) => {
+          const data = fixture();
+          const active = data.units[0]!;
+          active.phase = { kind: "ticket", id: "alpha-unit-63", title: "Fix names", merged };
+          active.phases = [phase("alpha-unit-63", "open")];
+          active.stage = "Build";
+          const ui = await render($, on, surface, data, detail, 76);
+          const rows = lines(await ui.drawn());
+          const heading = rows.find(row => row.includes("alpha"))!;
+
+          expect(heading).toContain(detail
+            ? `Ticket alpha-unit-63 · ${merged} merged · Build`
+            : `  Ticket alpha-unit-63 · ${merged} merged  Fix names`);
+          expect(heading).not.toContain("Phase ");
+          expect(heading).not.toContain("/1");
+          expect(cellWidth(heading)).toBeLessThanOrEqual(76);
+        });
+      }
+
+      test(`${surface}: ${detail ? "unit" : "board"} plan heading keeps its phase total at 76 columns`, async ($, on) => {
+        const data = fixture();
+        data.units[0]!.stage = "Build";
+        const ui = await render($, on, surface, data, detail, 76);
+        const heading = lines(await ui.drawn()).find(row => row.includes("alpha"))!;
+
+        expect(heading).toContain(detail ? "Phase 2 of 3 · Build" : "  Phase 2/3  Delivery 2");
+        expect(heading).not.toContain("Ticket ");
+        expect(heading).not.toContain("merged");
+        expect(cellWidth(heading)).toBeLessThanOrEqual(76);
+      });
+    }
+
     test(`${surface}: an empty board gives only the showrunner command instruction`, async ($, on) => {
       on("ui.render", { component: "Pane", requestId: "empty-board" }, ($, event) =>
         BoardView($.ui.resolve(event), 170, 50,
