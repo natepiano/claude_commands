@@ -2010,6 +2010,14 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         self.assertTrue(self.advance()[0])
         self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
 
+    def test_an_app_launch_leaves_the_turn_a_queued_run_holds(self) -> None:
+        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
+        _ = self.advance()
+        before = self.record_bytes()
+        self.assertEqual(build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", launch=True), "mark ignored")
+        self.assertEqual(self.record_bytes(), before)
+        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AwaitingTurn)
+
     def test_session_wait_after_the_release_began_adds_no_entry(self) -> None:
         self.begin("owner")
         before = self.record_bytes()

@@ -38,6 +38,8 @@ build_hold_mark() {
     [[ -f "$holder" ]] || return 0
     local arguments=(mark --state "$1") cycle_id="" generation=""
     if [[ -n "${2:-}" ]]; then arguments+=(--outcome "$2"); fi
+    # An app launch is no build: it never ends a turn a queued run holds.
+    if [[ "${3:-}" == launch ]]; then arguments+=(--launch); fi
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
         arguments+=(--call-id "$BUILDLOG_CALL_ID")
         if [[ -n "${BUILDLOG_HOLD_ADMISSION_FILE:-}" && -r "$BUILDLOG_HOLD_ADMISSION_FILE" ]]; then

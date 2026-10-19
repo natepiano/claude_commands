@@ -1171,7 +1171,8 @@ def remove_call(key: str, call_id: str, *, cycle_id: str = "") -> None:
             save_cycle(cycle)
 
 
-def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0) -> str:
+def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0,
+              launch: bool = False) -> str:
     if not session_id:
         return "NoSessionId"
     if not has_holder_file(holder_directory()):
@@ -1195,10 +1196,11 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
                  or state == "MemoryGateReturned" and outcome in {"Granted", "TimedOut", "MeminfoUnavailable"})
                 and confirm_delivery(entry, cycle.get("holder_generation", 1))):
                 save_cycle(cycle)
-            if (not call_id and entry["active_call_id"]
+            if (not call_id and not launch and entry["active_call_id"]
                     and isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued))):
                 # The session builds on its own while a queued call has not reached its memory
                 # gate: the build takes the session's turn, and the queued calls wait only on their gates.
+                # An app launch is no build and leaves the call's turn as it is.
                 end_session_turn(entry, cycle.get("holder_generation", 1))
             if entry["active_call_id"] != call_id:
                 continue
@@ -1624,6 +1626,7 @@ def main(arguments: list[str]) -> int:
     _ = mark.add_argument("--call-id", default="")
     _ = mark.add_argument("--cycle-id", default="")
     _ = mark.add_argument("--generation", type=int, default=0)
+    _ = mark.add_argument("--launch", action="store_true")
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
     _ = recipient.add_argument("--name", required=True)
@@ -1699,7 +1702,8 @@ def main(arguments: list[str]) -> int:
             owner = OwningSession(cast(str, options.session_id)) if hasattr(options, "session_id") else owning_session()
             session_id = waiter_key(call_id) if call_id and not hasattr(options, "session_id") else owner.session_id if isinstance(owner, OwningSession) else ""
             print(mark_gate(session_id, cast(str, options.state), cast(str, options.outcome),
-                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation)))
+                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation),
+                            launch=cast(bool, options.launch)))
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         else:
