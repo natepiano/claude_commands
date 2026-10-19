@@ -8,6 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
+
+import pane_record  # first: it puts the whoami scripts on the path
+import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
 BASH = shutil.which("bash") or "/bin/sh"
@@ -80,6 +84,50 @@ class PaneRecordTests(unittest.TestCase):
         self.env["HERDR_ENV"] = ""
         self.assertEqual(self.start("w1:p2", "sid-alpha").returncode, 0)
         self.assertFalse(self.records.exists())
+
+
+TOKEN = "sk-ant-oat01-do-not-keep"
+# A Mac KERN_PROCARGS2 record: argc, the executable path, NUL padding, the arguments, the
+# environment, then the kernel's own `key=value` strings.
+MAC_RECORD = (
+    (5).to_bytes(4, sys.byteorder) + b"/opt/claude/bin/claude\0\0\0\0"
+    + b"claude\0--name\0alpha-unit\0--model\0opus\0"
+    + b"CLAUDE_CONFIG_DIR=/Users/n/.claude3\0CLAUDE_CODE_OAUTH_TOKEN=" + TOKEN.encode()
+    + b"\0SHOWRUNNER_UNIT_ID=alpha-unit\0ENABLE_TOOL_SEARCH=true\0HOME=/Users/n\0"
+    + b"executable_path=/opt/claude/bin/claude\0\0\0"
+)
+
+
+@final
+class MacRecordTests(unittest.TestCase):
+    def test_a_mac_record_keeps_the_arguments_and_only_the_needed_environment(self) -> None:
+        arguments, environment = pane_record.procargs(MAC_RECORD)
+        self.assertEqual(arguments, ["claude", "--name", "alpha-unit", "--model", "opus"])
+        self.assertEqual(environment, {"CLAUDE_CONFIG_DIR": "/Users/n/.claude3",
+                                       "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true"})
+
+    def test_a_short_mac_record_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            _ = pane_record.procargs((9).to_bytes(4, sys.byteorder) + b"/bin/claude\0claude\0")
+
+    def test_on_the_mac_a_launch_reads_its_flags_and_never_keeps_the_token(self) -> None:
+        parents = {"200": "100\n", "100": "1\n"}
+
+        def ps(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, parents[command[-1]], "")
+
+        def kernel(pid: int) -> bytes:
+            return MAC_RECORD if pid == 100 else (1).to_bytes(4, sys.byteorder) + b"/bin/zsh\0zsh\0\0"
+
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(subprocess, "run", side_effect=ps),
+              mock.patch.object(account, "kern_procargs2", side_effect=kernel)):
+            arguments = pane_record.claude_arguments(200)
+            environment = pane_record._process_environment(100)  # pyright: ignore[reportPrivateUsage]
+        entry = pane_record.launch("w1:p1", "sid-alpha", "/work/alpha", environment, arguments)
+        self.assertEqual((entry["name"], entry["model"], entry["flags_read"]), ("alpha-unit", "opus", True))
+        self.assertEqual(entry["config_dir"], "/Users/n/.claude3")
+        self.assertNotIn(TOKEN, json.dumps(environment) + json.dumps(entry))
 
 
 if __name__ == "__main__":

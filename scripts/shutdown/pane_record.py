@@ -14,6 +14,10 @@ other than by a signal (`/exit`, logout) marks its entry ended (`session-end-pan
 restore leaves a Claude closed by hand closed.
 
 `seed` writes the entries for the Claudes already running, read from herdr's process info.
+
+Linux reads a process from /proc. The Mac has no /proc: it reads the parent with `ps` and the
+arguments and environment from the kernel's KERN_PROCARGS2 record. Of an environment, only the
+names below are kept; every other value is dropped as it is read and never written or printed.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import argparse
 import fcntl
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Generator, Mapping, Sequence
@@ -33,6 +38,7 @@ from typing import TypedDict, cast
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
+sys.path.insert(0, str(SCRIPTS / "whoami"))
 import herdr  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
@@ -56,7 +62,7 @@ class PaneLaunch(TypedDict):
     model: str
     remote_control: bool
     environment: dict[str, str]
-    # False when the launch flags could not be read (the Mac has no /proc): a restore refuses it.
+    # False when the launch flags could not be read: a restore refuses it.
     flags_read: bool
     ended: bool
     written_at: str
@@ -124,12 +130,51 @@ def forget_unit(unit_id: str) -> list[str]:
     return dropped
 
 
+def _needed(name: str) -> bool:
+    """An environment name a record reads; the value of any other name is dropped as it is read."""
+    return name == "CLAUDE_CONFIG_DIR" or name in KEPT_NAMES or name.startswith(KEPT_PREFIXES)
+
+
+def _environment(parts: Sequence[bytes]) -> dict[str, str]:
+    pairs = (os.fsdecode(part).partition("=") for part in parts if b"=" in part)
+    return {key: value for key, _, value in pairs if _needed(key)}
+
+
+def procargs(raw: bytes) -> tuple[list[str], dict[str, str]]:
+    """The arguments and the needed environment in a KERN_PROCARGS2 record.
+
+    The record is argc, the executable path, NUL padding, argc arguments, then the environment,
+    each string NUL-terminated.
+    """
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    parts = raw[4:].split(b"\0")[1:]
+    start = next((index for index, part in enumerate(parts) if part), len(parts))
+    arguments = parts[start:start + argc]
+    if len(arguments) < argc:
+        raise ValueError("short KERN_PROCARGS2 record")
+    rest = parts[start + argc:]
+    end = next((index for index, part in enumerate(rest) if not part), len(rest))
+    return [os.fsdecode(part) for part in arguments], _environment(rest[:end])
+
+
+def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
+    # Imported here: the Linux hook never needs the account module.
+    from account import kern_procargs2
+
+    return procargs(kern_procargs2(pid))
+
+
 def _parent(pid: int) -> int:
+    if sys.platform == "darwin":
+        result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False)
+        return int(result.stdout)
     stat = (PROC / str(pid) / "stat").read_text()
     return int(stat.rsplit(")", 1)[1].split()[1])
 
 
 def _arguments(pid: int) -> list[str]:
+    if sys.platform == "darwin":
+        return _mac_record(pid)[0]
     raw = (PROC / str(pid) / "cmdline").read_bytes()
     return [os.fsdecode(part) for part in raw.split(b"\0") if part]
 
@@ -178,9 +223,10 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
 
 
 def _process_environment(pid: int) -> dict[str, str]:
-    raw = (PROC / str(pid) / "environ").read_bytes()
-    pairs = (os.fsdecode(part).partition("=") for part in raw.split(b"\0") if b"=" in part)
-    return {key: value for key, _, value in pairs}
+    """The needed part of `pid`'s environment."""
+    if sys.platform == "darwin":
+        return _mac_record(pid)[1]
+    return _environment((PROC / str(pid) / "environ").read_bytes().split(b"\0"))
 
 
 def _conversation_of(config_dir: str, pid: int) -> str:
@@ -213,7 +259,7 @@ def seed(session: str) -> int:
         arguments = [str(part) for part in cast(list[object], found[0].get("argv"))]
         try:
             environment = _process_environment(pid)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             print(f"{pane_id}: cannot read the environment of {pid}: {error}")
             continue
         config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
@@ -232,7 +278,4 @@ if __name__ == "__main__":
     _ = parser.add_argument("command", choices=["seed"])
     _ = parser.add_argument("--session", default="")
     options = parser.parse_args()
-    if sys.platform == "darwin":
-        print("pane_record seed reads /proc; the Mac comes in a later checkpoint", file=sys.stderr)
-        sys.exit(2)
     sys.exit(seed(cast(str, options.session) or herdr.shared_session() or "default"))

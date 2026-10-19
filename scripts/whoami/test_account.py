@@ -207,7 +207,7 @@ class AccountTests(unittest.TestCase):
                            + os.fsencode(arguments[0]) + b"\0\0\0"
                            + b"\0".join(os.fsencode(word) for word in arguments) + b"\0" + environment)
                 with (patch.object(sys, "platform", "darwin"),
-                      patch.object(account, "_kern_procargs2", return_value=payload),
+                      patch.object(account, "kern_procargs2", return_value=payload),
                       patch.object(subprocess, "run", side_effect=AssertionError("ps text cannot identify environment"))):
                     record = account.mac_process_record(321)
                     selected = account.process_codex_home(321)
@@ -222,7 +222,7 @@ class AccountTests(unittest.TestCase):
                    + b"/opt/codex\0\0codex\0exec\0CODEX_HOME=/scratch/prompt\0"
                    + b"CODEX_HOME=/scratch/selected home\0FIXTURE_VALUE=private-marker\0")
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(account, "_kern_procargs2", return_value=payload)):
+              patch.object(account, "kern_procargs2", return_value=payload)):
             record = account.mac_process_record(321)
             selected = account.process_codex_home(321)
         self.assertIsInstance(record, account.MacProcessRecord)
@@ -236,7 +236,7 @@ class AccountTests(unittest.TestCase):
         executable = "/Applications/ChatGPT.app/Contents/MacOS/codex"
         payload = (int(3).to_bytes(4, sys.byteorder, signed=True)
                    + os.fsencode(executable) + b"\0\0codex\0app-server\0daemon\0HOME=/scratch\0")
-        with patch.object(account, "_kern_procargs2", return_value=payload):
+        with patch.object(account, "kern_procargs2", return_value=payload):
             record = account.mac_process_record(321)
         self.assertIsInstance(record, account.MacProcessRecord)
         assert isinstance(record, account.MacProcessRecord)
@@ -255,14 +255,14 @@ class AccountTests(unittest.TestCase):
         )
         with patch.object(sys, "platform", "darwin"):
             for index, payload in enumerate(malformed):
-                with self.subTest(case=index), patch.object(account, "_kern_procargs2", return_value=payload):
+                with self.subTest(case=index), patch.object(account, "kern_procargs2", return_value=payload):
                     record = account.mac_process_record(321)
                     selected = account.process_codex_home(321)
                 self.assertIsInstance(record, account.ProcessEnvironmentUnread)
                 self.assertIsInstance(selected, account.ProcessEnvironmentUnread)
                 assert isinstance(selected, account.ProcessEnvironmentUnread)
                 self.assertTrue(selected.reason)
-            with patch.object(account, "_kern_procargs2", side_effect=PermissionError("denied")):
+            with patch.object(account, "kern_procargs2", side_effect=PermissionError("denied")):
                 self.assertIsInstance(account.mac_process_record(321), account.ProcessEnvironmentUnread)
                 self.assertIsInstance(account.process_codex_home(321), account.ProcessEnvironmentUnread)
 
