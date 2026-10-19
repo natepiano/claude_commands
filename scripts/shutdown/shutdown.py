@@ -79,6 +79,7 @@ class CommandLine(argparse.Namespace):
     account: str | None = None
     as_json: bool = False
     here: bool = False
+    also: str = ""
     only: str | None = None
     request_id: str = ""
     requested_by: str | None = None
@@ -896,6 +897,8 @@ def main(arguments: list[str] | None = None) -> int:
         usage="in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> [arguments]",
         epilog="Run in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [--only ID[,ID...]].\nFollow in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow <account> --request <request-id>.\nInternal fixer in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py remote-control <session-id> --pid <pid> --proc-start <start> --who <name> --session <session-name>.",
     )
+    # Commands without these flags still read them.
+    parser.set_defaults(also="", target="")
     commands = parser.add_subparsers(
         dest="command",
         required=True,
@@ -908,6 +911,8 @@ def main(arguments: list[str] | None = None) -> int:
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
     _ = down.add_argument("--here", action="store_true")
+    _ = down.add_argument("--also", metavar="MACHINE", default="",
+                          help="also stop the account on the other machine; a stop covers only this machine by default")
     _ = down.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = down.add_argument("--restart", action="store_true")
     from typing import override
@@ -980,6 +985,8 @@ def main(arguments: list[str] | None = None) -> int:
     now = commands.add_parser("now", help="stop without waiting for idle sessions")
     _ = now.add_argument("account", nargs="?")
     _ = now.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
+    _ = now.add_argument("--also", metavar="MACHINE", default="",
+                         help="also stop the account on the other machine; a stop covers only this machine by default")
     _ = now.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     restart = commands.add_parser(
         "restart", help="bring back every session stopped for one account"
@@ -1155,6 +1162,15 @@ def _all_accounts(options: CommandLine) -> int:
     return status
 
 
+def _stop_here(options: CommandLine, ids: tuple[str, ...]) -> bool:
+    """Whether a stop stays on this machine.
+
+    Stopping a whole account covers only this machine unless --also names the other one.
+    Named sessions are stopped where they run, and a move keeps both machines in scope.
+    """
+    return options.here or not (options.also or ids or options.target)
+
+
 def _dispatch(options: CommandLine) -> int:
     if options.command in {"snapshot", "forget"}:
         try:
@@ -1279,6 +1295,9 @@ def _dispatch(options: CommandLine) -> int:
             return 2
         if options.command == "follow":
             return follow(selected.login, options.request_id)
+        if options.also and (options.also != other_machine() or options.here):
+            print(f"shutdown: --also names the other machine ({other_machine()}) and cannot join --here", file=sys.stderr)
+            return 2
         ids: tuple[str, ...] = ()
         down_report: Inventory | settle.InventoryNeeded = settle.InventoryNeeded()
         if options.command in {"down", "now", "cancel"} and options.only is not None:
@@ -1303,7 +1322,7 @@ def _dispatch(options: CommandLine) -> int:
                 move_origin = accounts.RefusalOrigin(cast(Literal["weekly", "five_hour", "unknown"], options.refused),
                     KnownReset(options.reset) if options.reset is not None else NoResetKnown())
             return settle.down(
-                selected, options.here, ids,
+                selected, _stop_here(options, ids), ids,
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
@@ -1311,7 +1330,7 @@ def _dispatch(options: CommandLine) -> int:
                 origin=move_origin, move_id=options.move_id,
             )
         if options.command == "now":
-            return settle.now(selected, options.here, ids)
+            return settle.now(selected, _stop_here(options, ids), ids)
         if options.command == "cancel":
             return settle.cancel(selected, options.here, ids)
         status_ids = resolve_sessions(selected.login, _only_ids(options.only), here=options.here).session_ids if options.only is not None else ()

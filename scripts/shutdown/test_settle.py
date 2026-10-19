@@ -415,8 +415,8 @@ class SettleTests(ShutdownTestCase):
 
     def test_cold_key_retry_round_trips_original_scope_move_and_alert_policy(self) -> None:
         cases: list[tuple[bool, Literal["user", "none"], tuple[str, ...], record.ShutdownContinuation, str, str, list[str]]] = [
-            (False, "user", (), "stop", "", "", ["down", LOGIN]),
-            (False, "none", (), "stop", "", "", ["down", LOGIN, "--no-alert"]),
+            (False, "user", (), "stop", "", "", ["down", LOGIN, "--also", "mac"]),
+            (False, "none", (), "stop", "", "", ["down", LOGIN, "--also", "mac", "--no-alert"]),
             (False, "none", ("peer-owner",), "restart", "", "",
                 ["down", LOGIN, "--only", "peer-owner", "--restart", "--no-alert"]),
             (True, "user", ("local-one", "local-two"), "restart", "", "",
