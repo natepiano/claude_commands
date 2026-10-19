@@ -260,37 +260,8 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ### Phase 12 — Standing plans show their ticket  · status: done
 
-#### Work Order
+#### As-built
+`board_json.unit` tags the phase: `{kind: "plan", id, of, title}` for an ordinary plan, `{kind: "ticket", id, title, merged}` when the plan holds a `> **Standing:**` line. `merged` counts the unit's `merged` tickets in the style ledger (`<state>/<main repo name>/ledger.sqlite`), opened `mode=ro` with `timeout=0`; a missing, failed or locked ledger gives 0, and the ledger file is a watched source. The board heading reads `Ticket <id> · <n> merged  <title>`, the unit view `Ticket <id> · <n> merged · <stage>`.
 
-**Goal:** A unit on a standing plan shows its current ticket id and its count of merged tickets, never `Phase N/total`.
-
-**Spec:**
-
-Source: the showrunner, 2026-10-18, from the cargo-liner-style showrunner. A style unit's plan carries `> **Standing:** style_plan.py` (`docs/style_production.md` line 57). It holds one ticket phase at a time, and refill discards each merged one. So the board's `Phase 63/1` is the 63rd ticket, not phase 63 of 1.
-
-1. **The phase record is tagged.** In `board_json.unit`, `phase` becomes one of:
-   - `{"kind": "plan", "id", "of", "title"}` for an ordinary plan (today's fields);
-   - `{"kind": "ticket", "id", "title", "merged"}` when the record's plan file holds a line starting `> **Standing:**`. `id` is the open phase id (the ticket id, such as `names-unit-63`). `merged` is the unit's count of merged tickets;
-   - null when no phase is open (as today).
-2. **The merged count.** Read the style ledger read-only. Never construct `style_ledger.Ledger`: it opens the database with `BEGIN IMMEDIATE` and loads the rule catalog.
-   - The database is `${STYLE_LEDGER_STATE_DIR:-~/.local/state/style}/<main repo dir name>/ledger.sqlite`. The main repo is the parent of `git -C <worktree> rev-parse --path-format=absolute --git-common-dir` (as `style_ledger.open_ledger` does).
-   - Open it with `sqlite3.connect(f"file:{db}?mode=ro", uri=True)` and count `SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'`, where `unit` is the Unit cell (such as `names-unit`).
-   - A missing database or a failed read gives `merged` 0. Add the database file to `sources` when it exists, so a merge refreshes an open pane.
-3. **The board heading.** `board.tsx`: a ticket phase reads `  Ticket <id> · <merged> merged  <title>`; a plan phase keeps `  Phase <id>/<of>  <title>`.
-4. **The unit view header.** `unit.tsx`: a ticket phase reads `Ticket <id> · <merged> merged · <stage>`; a plan phase keeps `Phase <id> of <of> · <stage>`.
-5. **The contract.** `types/board.d.ts`: `BoardUnit.phase` is `PlanPhase | TicketPhase | null`, tagged by `kind`. `test_board_json.py` keeps checking every output key against it.
-
-**Files:**
-- `scripts/delegate/board_json.py` — the tagged phase and the read-only ledger count.
-- `mods/unit-board/types/board.d.ts` — the tagged phase type.
-- `mods/unit-board/hooks/board.tsx` — the ticket heading.
-- `mods/unit-board/hooks/unit.tsx` — the ticket header.
-- `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/kit.ts`, `scripts/delegate/test_board_json.py` — tests.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/delegate/board_json.py`, `mods/unit-board/types/board.d.ts`, `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`.
-- `test` — `mods/unit-board/tests/board.test.tsx`, `mods/unit-board/tests/kit.ts`, `scripts/delegate/test_board_json.py`, from this Spec alone: a standing plan with a ledger fixture gives the ticket phase and its merged count; a missing ledger gives 0; an ordinary plan keeps the plan phase; both headings at a 76-column pane.
-
-**Constraints from prior phases:** `/showrunner:unit_board` opens the board (phase 11). The mod opens only on demand and does no work while closed. Earlier layout rules do not change.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, basedpyright 0/0, the full merge gate. After promotion, a live capture at 170x50 from the remove-running-section showrunner checkout: the cargo-liner-style units show `Ticket <id> · <n> merged`.
+**Files:** `scripts/delegate/board_json.py`, `mods/unit-board/types/board.d.ts`, `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`, tests.
+**Gotchas:** never construct `style_ledger.Ledger` from the board: it opens the database with `BEGIN IMMEDIATE`. The default sqlite busy timeout (5 s) made a locked ledger stall each standing unit.
