@@ -176,6 +176,31 @@ def scheduled_prompt(minutes: int, zone: str, doc: Path, slug: str) -> str:
     return prompt
 
 
+def adopt_moved_state(production: Production) -> list[str]:
+    """Copy the scratchpad state the state directory lacks and rewrite a tick prompt that differs.
+
+    Every registration and dailies call runs this first, so a showrunner started before the state
+    moved out of its scratchpad needs no step (showrunner, 2026-10-19). A failure only skips it.
+    """
+    done: list[str] = []
+    try:
+        copied = showrunners.adopt_session_state(production.slug)
+        if copied:
+            done.append(f"copied {', '.join(copied)} to {showrunners.session_state_dir(production.slug)}")
+        prompt_file = showrunners.SHOWRUNNER_STATE_DIR / production.slug / "prompt.txt"
+        if not prompt_file.exists():
+            return done
+        schedule = update_schedule(production.doc.read_text(encoding="utf-8").splitlines())
+        minutes = schedule.minutes if isinstance(schedule, ScheduledUpdates) else DEFAULT_MINUTES
+        prompt = scheduled_prompt(minutes, str(production.zone), production.doc, production.slug)
+        if prompt_file.read_text(encoding="utf-8") != prompt:
+            _ = prompt_file.write_text(prompt, encoding="utf-8")
+            done.append(f"rewrote {prompt_file} from produce.md")
+    except (OSError, UnicodeError, RegistrationFailure) as error:
+        done.append(f"state move skipped: {error}")
+    return done
+
+
 def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
@@ -579,6 +604,8 @@ def main() -> int:
     action = cast(str, args.action)
     try:
         production = read_production(cast(Path, args.production))
+        for line in adopt_moved_state(production):
+            report("state-dir", "ok", line)
         if action == "register":
             register(production)
         elif action == "time":

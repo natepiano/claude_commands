@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -147,26 +146,10 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
     return state
 
 
-# The showrunner state a scratchpad held before showrunners.session_state_dir; load copies each one that is absent.
-SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", "dailies_judgment.json",
-                 "dailies_state.json")
-
-
 def move_session_state(slug: str, scratch: Path) -> None:
-    """Copy each state file the scratchpad holds and the state directory does not; a copy never replaces one."""
-    target = showrunners.session_state_dir(slug)
-    target.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
-    for name in SESSION_STATE:
-        source, destination = scratch / name, target / name
-        if destination.exists() or not source.exists():
-            continue
-        if source.is_dir():
-            _ = shutil.copytree(source, destination)
-        else:
-            _ = shutil.copy2(source, destination)
-        copied.append(name)
-    report("state-dir", "ok", f"{target}" + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
+    copied = showrunners.copy_session_state(slug, scratch)
+    report("state-dir", "ok", f"{showrunners.session_state_dir(slug)}"
+           + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
 
 
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
