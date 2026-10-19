@@ -514,13 +514,6 @@ _READ_LIMITS = BatchLimits(25, 5000, 10)
 _STRUCTURE_LIMITS = BatchLimits(6, 3000, 5)
 
 
-def files_at(repo: Path, tip: str, paths: tuple[str, ...]) -> frozenset[str]:
-    """The paths that are files at the tip."""
-    if not paths:
-        return frozenset()
-    return frozenset(path for path in git(repo, "ls-tree", "-r", "-z", "--name-only", tip, "--", *paths).split("\0") if path)
-
-
 def read_slices(repo: Path, tip: str, files: tuple[str, ...], limits: BatchLimits = _READ_LIMITS) -> tuple[tuple[str, ...], ...]:
     """Keep directories together, splitting only an oversized directory."""
     directories: dict[str, list[str]] = defaultdict(list)
@@ -1037,6 +1030,8 @@ def _select_phase(
         decisions = style_proposals.approved_decisions(folder, unit)
     directories = style_proposals.workspace_directories(ledger) if decisions else ()
     tip = synced_tip(ledger)
+    decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
+    closed = False
     for issue in decisions:
         rule = issue.value("style_rule")
         definition = definitions.get(rule)
@@ -1048,7 +1043,7 @@ def _select_phase(
                          and isinstance(finding.build_ticket, style_ledger.NoBuildTicket))
         if not findings:
             continue
-        present = files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
+        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
         by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
         gone: dict[str, list[str]] = defaultdict(list)
         for finding in findings:
@@ -1061,6 +1056,9 @@ def _select_phase(
             words = f"{path} is not in synced commit {tip}"
             _ = ledger.decline_findings(finding_ids, words)
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
+        if gone and style_proposals.close_finished_decision(ledger, issue.path):
+            closed = True
+            continue
         outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}
         if outside:
             print(f"waiting {issue.path}: outside pilot scope")
@@ -1081,7 +1079,13 @@ def _select_phase(
         ledger.ticket_assign(ticket_id, branch)
         style_proposals.proposal_command("start", str(issue.path))
         write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-        return PhaseWritten(ticket_id)
+        decision_phase = PhaseWritten(ticket_id)
+        break
+    # As complete does, one renumber follows every decision this refill closed.
+    if closed:
+        style_proposals.renumber()
+    if isinstance(decision_phase, PhaseWritten):
+        return decision_phase
     candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo),
                                    first_files=first_files)
     if not candidates:

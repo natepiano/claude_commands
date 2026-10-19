@@ -411,13 +411,15 @@ Each ticket permits its own approved findings and proven rename references.
 Other findings stay held. Package checks still run. The parent schedules
 changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
 Refill waives a finding whose file is not in the synced commit, and prints the
-file and the commit. Refill does not assign a queued proposal ticket that was
+file and the commit. When no finding of the decision is left to build, refill
+closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
 
 After each merge and at startup, run `style_proposals.py complete --repo
-<style checkout>`. A decision closes only when all its findings are built or
-waived. Decline only with `style_proposals.py decline --repo <style checkout>
+<style checkout>`. It closes only approved decisions, and only when all their
+findings are built or waived. It also closes an approved decision with no merged
+ticket when no finding is left to build. Decline only with `style_proposals.py decline --repo <style checkout>
 --issue <issue> --words '<the user's words>'`. It stores the answer and waives
 the findings still filed to the decision. Built findings stay built. Later
 findings are waived with the same words. Changed inputs stay stale.
@@ -432,7 +434,8 @@ through `/new_style`, or drops the idea with `style_proposals.py drop-candidate
 --parent <slug> --dry-run` before migrating old style issues. Migration moves
 only the findings filed to each old issue. A moved finding takes the answer of
 its decision: a declined decision waives it with the stored words, and a
-decision closed as built opens again with its approval. Migration leaves an
+decision closed as built opens again with its approval. A decision closed with
+nothing left to build also opens again with its approval for a later finding. Migration leaves an
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
 
 ## Lifetime

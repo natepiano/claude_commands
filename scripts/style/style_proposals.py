@@ -30,7 +30,7 @@ from add_style import StandingStyleProduction, standing_style_production
 from issues import Issue, frontmatter, open_issues, plain
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
                             decision_answer, fill_ranking, refresh_decision, require_generated_body)
-from unit_files import unit_file_holders
+from unit_files import git, unit_file_holders
 from user_zone import user_zone
 
 
@@ -126,16 +126,21 @@ def decision_key(finding: style_ledger.HeldFinding, directories: tuple[str, ...]
 
 
 UNSAFE_NAME = re.compile(r"[^\w .-]")
+UNSAFE_CRATE_LABEL = re.compile(r"[^\w.+-]")
+PLAIN_CRATE = re.compile(r"[A-Za-z0-9_./-]+")
 
 
 def batch_name(key: DecisionKey) -> str:
     label = UNSAFE_NAME.sub("-", PurePosixPath(key.rule).stem).strip(" .-") or "rule"
     # The root crate has no crate part, so no crate path can give its name.
     if key.crate != ".":
-        crate = UNSAFE_NAME.sub("-", key.crate).strip(" .-")
-        # Two crate paths can give one safe text, so a changed path adds a hash of the path.
-        # A plain name cannot hold the parentheses, so no plain path gives a hashed name.
-        label += f" {crate}" if crate == key.crate else f" {crate} ({hashlib.sha256(key.crate.encode()).hexdigest()[:8]})"
+        # A plain crate path shows each "/" as "+". A plain path holds no "+", so two plain paths give two labels.
+        shown = key.crate.replace("/", "+")
+        crate = UNSAFE_CRATE_LABEL.sub("-", shown).strip(".-")
+        # Any other path can give the label of a plain path, so it adds a hash of the path.
+        # A plain label cannot hold the parentheses, so no plain path gives a hashed name.
+        plain_path = PLAIN_CRATE.fullmatch(key.crate) is not None and crate == shown
+        label += f" {crate}" if plain_path else f" {crate} ({hashlib.sha256(key.crate.encode()).hexdigest()[:8]})"
     return f"style {label} {key.blob[:8]}.md"
 
 
@@ -323,6 +328,12 @@ def find_decision(proposals: Path, key: DecisionKey) -> Path:
     return issue
 
 
+# The close reasons of a decision with no finding left to build.
+BUILT_REASON = "built in "
+NOTHING_LEFT_REASON = "nothing left to build: "
+FINISHED_REASONS = (BUILT_REASON, NOTHING_LEFT_REASON)
+
+
 @dataclass(frozen=True)
 class FilingResult:
     filed: tuple[Path, ...]
@@ -337,7 +348,7 @@ class WaiveWithAnswer:
 
 @dataclass(frozen=True)
 class ReopenBuiltDecision:
-    """The decision is closed as built. A finding that joins it reopens it with its approval."""
+    """The decision is closed as finished. A finding that joins it reopens it with its approval."""
 
 
 @dataclass(frozen=True)
@@ -355,14 +366,19 @@ def join_action(issue: Path) -> JoinAction:
     if isinstance(answer, DeclinedDecision):
         return WaiveWithAnswer(answer.words)
     closed = fields.get("status") == ["closed"]
-    if closed and not fields.get("reason", [""])[0].startswith("built in ") and not fields.get("as_built"):
+    if closed and not fields.get("reason", [""])[0].startswith(FINISHED_REASONS) and not fields.get("as_built"):
         raise style_ledger.LedgerError("closed decision is not built")
     require_generated_body(issue)
     return ReopenBuiltDecision() if closed else JoinOpenDecision()
 
 
 def apply_answer(ledger: style_ledger.Ledger, issue: Path, action: JoinAction, finding_ids: tuple[str, ...]) -> None:
-    """Waive the joining findings of a declined decision, or reopen a built one."""
+    """Waive the joining findings of a declined decision, or reopen a built one.
+
+    The answer acts only on pending findings, so with none it does nothing.
+    """
+    if not finding_ids:
+        return
     if isinstance(action, WaiveWithAnswer):
         _ = ledger.decline_findings(finding_ids, action.words)
     elif isinstance(action, ReopenBuiltDecision):
@@ -450,33 +466,65 @@ def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
             if fill_ranking(issue.path, ranking):
                 ranked += 1
                 print(f"ranked {issue.path}")
-        except (style_ledger.LedgerError, OSError, UnicodeError) as error:
+        except (style_ledger.LedgerError, Refusal, OSError, UnicodeError) as error:
             print(f"skipped {issue.path}: {error}")
     print(f"ranked {ranked} issues")
 
 
+def files_at(repo: Path, tip: str, paths: tuple[str, ...]) -> frozenset[str]:
+    """The paths that are files at the tip."""
+    if not paths:
+        return frozenset()
+    return frozenset(path for path in git(repo, "ls-tree", "-r", "-z", "--name-only", tip, "--", *paths).split("\0") if path)
+
+
+def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
+    """Close an open, approved decision when every one of its findings is built or waived. True when it closes.
+
+    A legacy proposal issue is not a decision, so it stays open for migrate.
+    """
+    if not issue.is_file():
+        return False
+    decision = Issue(issue, frontmatter(issue))
+    if (not is_decision(decision) or decision.value("status") != "open"
+            or not isinstance(decision_answer(decision), ApprovedDecision)):
+        return False
+    findings = issue_findings(ledger, issue)
+    if not findings or not all(isinstance(item.state, (style_ledger.Built, style_ledger.Waived)) for item in findings):
+        return False
+    tickets = sorted(ticket["id"] for ticket in ledger.proposal_tickets()
+                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == issue)
+    if tickets:
+        reason = BUILT_REASON + ", ".join(tickets)
+    else:
+        # Refill waives a finding whose file is gone, so nothing was built.
+        commit = ledger.synced_commit()
+        paths = tuple(sorted({item.path for item in findings}))
+        removed = sorted(set(paths) - files_at(ledger.repo, commit, paths))
+        reason = NOTHING_LEFT_REASON + (f"{', '.join(removed)} not in synced commit {commit}" if removed
+                                        else "every finding is waived")
+    proposal_command("close", str(issue), "--reason", reason)
+    print(f"closed {issue}: {reason}")
+    return True
+
+
 def complete(ledger: style_ledger.Ledger) -> None:
-    merged: dict[Path, list[str]] = defaultdict(list)
-    for ticket in ledger.proposal_tickets():
-        if ticket["state"] == "merged":
-            merged[Path(ticket["proposal"])].append(ticket["id"])
-    for issue, tickets in sorted(merged.items()):
-        findings = issue_findings(ledger, issue)
-        if findings and all(isinstance(item.state, (style_ledger.Built, style_ledger.Waived)) for item in findings):
-            if frontmatter(issue).get("status") == ["open"]:
-                proposal_command("close", str(issue), "--reason", "built in " + ", ".join(sorted(tickets)))
-    if merged:
+    closed = [issue for issue in ledger.proposal_paths() if close_finished_decision(ledger, issue)]
+    # Complete and refill both close decisions. A close whose renumber failed is not seen again,
+    # so any merged build renumbers once more.
+    if closed or any(ticket["state"] == "merged" for ticket in ledger.proposal_tickets()):
         renumber()
 
 
 def decline(ledger: style_ledger.Ledger, issue: Path, words: str) -> None:
+    # The answer goes first, so a stop after it never leaves an approved decision with its findings waived.
+    if decision_answer(Issue(issue, frontmatter(issue))) != DeclinedDecision(words):
+        proposal_command("decline-answer", str(issue), "--words", words)
     filed = tuple(finding.finding_id for finding in issue_findings(ledger, issue)
                   if isinstance(finding.state, style_ledger.Filed))
     for finding_id, outcome in ledger.decline_findings(filed, words).items():
         if isinstance(outcome, style_ledger.InputChangedSinceJudged):
             print(f"not re-recorded {finding_id}: input changed since judged")
-    if decision_answer(Issue(issue, frontmatter(issue))) != DeclinedDecision(words):
-        proposal_command("decline-answer", str(issue), "--words", words)
     if frontmatter(issue).get("status") != ["closed"]:
         proposal_command("close", str(issue), "--reason", f"declined: {words}")
     renumber()
@@ -584,7 +632,7 @@ def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_ru
         pending[key] = tuple(finding.finding_id for finding in findings if isinstance(finding.state, style_ledger.Filed))
         if isinstance(action, WaiveWithAnswer):
             print(f"waive {len(pending[key])} findings in {issue}: declined: {action.words}")
-        elif isinstance(action, ReopenBuiltDecision):
+        elif isinstance(action, ReopenBuiltDecision) and pending[key]:
             print(f"reopen {issue}")
         decisions[key] = issue
         actions[key] = action
