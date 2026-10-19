@@ -884,6 +884,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
         f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
+        "Add `--input-scope file` only to a crate or module cell of a Rust source file.",
+        "Use it only for a `clean` or `exception` verdict based on that file alone.",
+        "Without this flag, changes to any file in the crate or module scope can make the verdict stale.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",

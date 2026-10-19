@@ -172,6 +172,209 @@ class StyleLedgerTests(unittest.TestCase):
             "--after", "new_name", "--rule-blob", rule_blob or self.blob(rule), "--ticket", ticket,
         ).stdout.strip()
 
+    def test_file_scope_verdict_crate_clean_tracks_only_its_file_and_rule(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.record(rule, self.sources[1], self.initial_tip)
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        self.set_tip(self.commit("Change sibling"))
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        self.assertEqual(self.states(rule)[self.sources[1]], "stale")
+        self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository())
+                              if row.rule_id == rule).current, 1)
+        self.write(self.sources[0], "pub fn own_file_changed() {}\n")
+        tip = self.commit("Change judged file")
+        self.set_tip(tip)
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+        ledger.record(rule, self.sources[0], tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        _ = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n# Revised rule\n")
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+    def test_file_scope_verdict_module_exception_tracks_only_its_file_and_rule(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, sibling, _, base = self.structure_module()
+        self.set_tip(base)
+        ledger = self.ledger()
+        ledger.record(rule, path, base, self.blob(rule), "exception",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.record(rule, sibling, base, "exception")
+        self.write(sibling, "pub fn sibling_changed() {}\n")
+        self.set_tip(self.commit("Change module sibling"))
+        self.assertEqual(self.states(rule)[path], "current")
+        self.assertEqual(self.states(rule)[sibling], "stale")
+        self.write(path, "pub fn own_file_changed() {}\n")
+        tip = self.commit("Change module file")
+        self.set_tip(tip)
+        self.assertEqual(self.states(rule)[path], "stale")
+        ledger.record(rule, path, tip, self.blob(rule), "exception",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        _ = self.rule("structure", "tier: D\nfamily: modules\n# Revised rule\n")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_file_scope_verdict_rejects_other_verdicts(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        ledger = self.ledger()
+        for verdict in ("held", "fixed", "waived"):
+            with self.subTest(verdict=verdict), self.assertRaisesRegex(style_ledger.LedgerError, verdict):
+                ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), verdict,
+                              input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.assertEqual(ledger.latest_held_judgments(), {})
+
+    def test_file_scope_verdict_rejects_manifest_crate_and_excluded_paths(self) -> None:
+        manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        read = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        ledger = self.ledger()
+        for rule, path in ((manifest, "crates/alpha"), (manifest, self.sources[0]),
+                           (structure, "crates/alpha"), (read, "crates/alpha/vendor/embedded.rs")):
+            with self.subTest(rule=rule, path=path), self.assertRaises(style_ledger.LedgerError):
+                ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean",
+                              input_scope=style_ledger.DeclaredInputScope.FILE)
+
+    def test_file_scope_verdict_already_file_scope_preserves_behavior(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        self.set_tip(self.commit("Change sibling"))
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        self.write(self.sources[0], "pub fn own_file_changed() {}\n")
+        self.set_tip(self.commit("Change judged file"))
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+        listed = self.rule("shell", "tier: B\nfamily: values\ninput_scope: crate\ncandidates:\n"
+                           + "  kind: regex\n  pattern: cargo test\n  globs: ['*.sh']\n  surface: whole\n")
+        script = "crates/alpha/check.sh"
+        self.write(script, "cargo test\n")
+        tip = self.commit("Add already file-scoped shell site")
+        self.set_tip(tip)
+        ledger.record(listed, script, tip, self.blob(listed), "exception",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.write(self.sources[0], "pub fn unrelated_change() {}\n")
+        self.set_tip(self.commit("Change source outside shell cell"))
+        self.assertEqual(self.states(listed), {script: "current"})
+        self.write(script, "cargo test --workspace\n")
+        self.set_tip(self.commit("Change shell cell"))
+        self.assertEqual(self.states(listed), {script: "stale"})
+
+    def test_file_scope_verdict_no_op_keeps_older_ancestor_current(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean")
+        _ = self.git("checkout", "-q", "-b", "outside")
+        self.write("README.md", "Unmerged work\n")
+        unmerged = self.commit("Work outside the synced branch")
+        ledger.record(rule, self.sources[0], unmerged, self.blob(rule), "exception",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        cell = next(cell for cell in ledger.cells(rule=rule) if cell.path == self.sources[0])
+        self.assertEqual(cell.state, "current")
+
+    def test_file_scope_verdict_cli_passes_declaration_and_persists_file_fingerprint(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        _ = self.cli("record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+                     "--rule-blob", self.blob(rule), "--verdict", "exception", "--ticket", "outside",
+                     "--worker", "test", "--input-scope", "file")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            row = cast(tuple[str, str], connection.execute("SELECT declared_scope,input_fingerprint FROM judgments").fetchone())
+        self.assertEqual(row, ("file", self.git("rev-parse", f"{self.initial_tip}:{self.sources[0]}")))
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        self.set_tip(self.commit("Change sibling"))
+        status = cast(LedgerStatus, json.loads(self.cli("status", "--json").stdout))
+        cell = next(cell for cell in status["cells"] if cell["rule"] == rule and cell["path"] == self.sources[0])
+        self.assertEqual(cell["state"], "current")
+
+    def test_file_scope_verdict_migration_ten_keeps_version_nine_rows_unmarked(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        database = self.root / "version-nine.sqlite3"
+        with closing(sqlite3.connect(database)) as connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number <= 9:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (9)")
+            for index, path in enumerate(self.sources[:2]):
+                _ = connection.execute(
+                    'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,'
+                    + 'verdict_detail,ticket,worker,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                    (rule, self.blob(rule), "crate", self.git("rev-parse", f"{self.initial_tip}:crates/alpha"),
+                     path, self.initial_tip, "clean", "original detail", f"ticket-{index}", "test", "2026-01-01"))
+            connection.commit()
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            with closing(sqlite3.connect(database)) as connection:
+                rows = cast(list[tuple[str, str, str]], connection.execute(
+                    "SELECT path,declared_scope,verdict_detail FROM judgments ORDER BY id").fetchall())
+                version = cast(tuple[int], connection.execute("SELECT version FROM schema_version").fetchone())
+            self.assertEqual(version, (10,))
+            self.assertEqual(rows, [(path, "rule", "original detail") for path in self.sources[:2]])
+            self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+            ledger.set_tip(self.commit("Change sibling after migration"))
+            self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[self.sources[0]], "stale")
+
+    def test_file_scope_verdict_awaiting_merge_tracks_file_on_style_branch(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "style/main")
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(self.sources[0], "pub fn checked() {}\n")
+        checked = self.commit("Change judged file on style branch")
+        self.ledger().record(rule, self.sources[0], checked, self.blob(rule), "clean",
+                             input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        style_tip = self.commit("Advance style branch sibling")
+        self.assertEqual(self.states(rule)[self.sources[0]], "awaiting merge")
+        self.set_tip(style_tip)
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        self.write(self.sources[0], "pub fn changed_again() {}\n")
+        _ = self.commit("Advance style branch judged file")
+        self.set_tip(self.initial_tip)
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+    def test_file_scope_verdict_latest_declaration_supersedes_both_directions(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        ledger = self.ledger()
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "exception")
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        tip = self.commit("Change sibling")
+        self.set_tip(tip)
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+
+    def test_file_scope_verdict_checkpoint_preserves_declaration(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
+        ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="names-1",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.write(path, "pub fn ticket_changed() {}\n")
+        checkpoint = self.commit("Ticket edit")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.ticket_merge("names-1")
+        self.write(self.sources[1], "pub fn later_sibling_changed() {}\n")
+        ledger.set_tip(self.commit("Change sibling after checkpoint"), "main")
+        self.assertEqual(self.states(rule)[path], "current")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            rows = cast(list[tuple[str, str, str]], connection.execute(
+                'SELECT "commit",declared_scope,input_fingerprint FROM judgments ORDER BY id').fetchall())
+        self.assertEqual(rows, [
+            (self.initial_tip, "file", self.git("rev-parse", f"{self.initial_tip}:{path}")),
+            (checkpoint, "file", self.git("rev-parse", f"{checkpoint}:{path}")),
+        ])
+
     def test_latest_held_judgments_selects_each_cells_latest_commit_and_excludes_later_non_held_verdicts(self) -> None:
         rule = self.rule("read")
         other_rule = self.rule("other-read")
@@ -341,6 +544,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.close()
         with closing(sqlite3.connect(database)) as connection:
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
+            _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -886,7 +1090,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(9,)])
+        self.assertEqual(versions, [(10,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -2189,7 +2393,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(9,)])
+        self.assertEqual(versions, [(10,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -2427,7 +2631,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(9,)])
+        self.assertEqual(versions, [(10,)])
 
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
@@ -2488,6 +2692,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE IF EXISTS sync_waits")
             _ = connection.execute("DROP TABLE IF EXISTS ticket_yields")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
+            _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:
