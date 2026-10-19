@@ -348,6 +348,18 @@ class UnitRenameTests(unittest.TestCase):
         self.assert_refused(result, "gamma-unit's session is named builder-report, not gamma")
         self.assertIn("is still labelled builder-report", result.stderr)
 
+    def test_a_verify_that_passes_closes_the_journal(self) -> None:
+        _ = self.seed_record(name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        end = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit's session is named builder-report, not gamma")
+        self.assertEqual(self.journal()["done"], False)
+        end()
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        self.assert_ok(self.rename("verify"))
+        self.assertEqual(self.journal()["done"], True)
+        self.assert_ok(self.rename("plan", "gamma", "delta"))
+
     def test_apply_waits_while_the_unit_is_stopping(self) -> None:
         _ = self.seed_record(progress="waiting")
         result = self.rename("apply")

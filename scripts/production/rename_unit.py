@@ -928,6 +928,9 @@ def verify(slug: str, old: str, new: str) -> UnitRename:
     if recorded.step < step_number(_verify) - 1:
         raise RenameRefused(f"{recorded.old} to {recorded.new} is at step {recorded.step}; finish it with apply")
     _verify(recorded, lambda: None)
+    # A verify that passes finishes the rename, so the next rename is not refused as resuming this one.
+    recorded.step = len(STEPS)
+    _save(path, recorded)
     return recorded
 
 
