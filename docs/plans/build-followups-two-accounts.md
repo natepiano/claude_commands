@@ -2108,3 +2108,34 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - With no refusal on record, a fresh reading with room is enough, also when it was taken before the failure. A recorded refusal still blocks such a reading.
 - The unreadable-thread cleanup test started a real app-server from its scratch HOME after a long suite run (its fake epoch made the process look older than the synthetic sign-in). Its `ensure_server` is now pinned to the stub port.
 - `scripts.agents.test_codex_mesh` ran about 20 minutes, and this phase's merge gate took 1258 s, where the Phase 75 gates took about 300 s. Reported to the showrunner; not diagnosed.
+
+### Phase 77 — A follow with no stored refusal returns at once  · status: done
+
+**Depends on:** Phase 76
+
+#### Work Order
+
+**Goal:** Phase 76 made an owed continuation on an account with no stored refusal return `WorkerWaitingOnLiveTurn("no fresh reading shows room on the account")`. The follow loops read that result as a turn that will end, so a follow after an unstored quota refusal now waits until `CALL_TIMEOUT_SECS` (300 s) for a turn that never opens. test-threads found it: four tests took 300 s each and the merge gate went from about 300 s to 1260 s. The showrunner's decision (2026-10-19): the seat can wait and be checked again, but the follow must not wait on a live turn when none is open. It returns at once and says that the seat waits for room.
+
+**Constraints from prior phases:**
+- `codex_mesh._move_idle_worker` (~3906) returns the Phase 76 wait. Follow handlers: `_on_quiet_poll` path ~3103 (`if quota_owed and isinstance(moved, WorkerWaitingOnLiveTurn): return StreamStep.NEXT_FRAME`) and ~3470 (`if owed and isinstance(moved, WorkerWaitingOnLiveTurn): time.sleep(RESIDENT_POLL_SECS)`). Other callers of `_move_worker`/`_move_idle_worker`: ~2413, ~2605, ~3042-3045, ~3460, ~3479-3500 (`_finish_one_turn_launch`), ~3979-4011, ~3127 (`_keep_resident_on_selected_server`).
+- `_hold_messages_for_next_launch` (~3057) closes the thread to messages and keeps the held ones for the next launch.
+- The tests `test_followed_turn_reports_its_refusing_account_once`, `test_started_refusal_keeps_the_account_after_its_server_record_disappears`, `test_replacement_conversations_first_refusal_names_the_target_account` and `test_submission_refusal_routes_then_reports_the_exited_command` patch `_report_quota_refusal`, so no refusal is stored.
+
+**Spec:**
+1. A new frozen result `WorkerWaitingForRoom(reason: str)` joins `WorkerMoveResult`. It is not a live turn. `_move_idle_worker` returns it for a known account with no stored refusal and no fresh reading with room. The `"the refused account has not recovered"` path and the unknown-account path do not change.
+2. Every caller handles it explicitly and none waits on a live turn for it. A follow or a one-turn launch writes one log line `<seat> waits for room on <account>: <reason>; the continuation stays owed`, keeps `continuation_owed` and the held messages for the next dispatch, and finishes at once. A resident logs the same line once and stays resident. A dispatch entry point (~3985) exits at once with that line, not `state unknown`.
+3. The four tests store their refusal (through the real refusal record in the scratch HOME, or by patching `refusals.load`), so each tests the path its name gives, and each runs in well under a second again.
+4. One new test: a follow with an owed continuation, no stored refusal and no fresh reading returns at once (assert it does not reach `CALL_TIMEOUT_SECS`, for example with a small patched timeout and a check that the stream finished by the result, not the deadline), logs the wait line, and leaves `continuation_owed` True.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the new result and its handling.
+- `scripts/agents/test_codex_mesh.py` — the four tests and the new test.
+
+**Workers:** 1 writer. impl owns both files.
+
+**Verification:** `scripts.agents.test_codex_mesh scripts.accounts.test_refusals scripts.accounts.test_refusal_watch` with a scratch HOME; report the codex_mesh suite time. basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:**
+- **Returns at once:** the new test passes, and the four named tests each run in under a second.
+- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes near its earlier time (about 300 s).

@@ -2795,11 +2795,13 @@ def _resume_account_move(
     client: Client,
     marker: AccountMoveMarker,
     *, submission: QuotaContinuationTurn | UnrelatedWorkerTurn = UNRELATED_WORKER_TURN,
-) -> MovedWorker:
+) -> MovedWorker | WorkerWaitingForRoom:
     """Resume the marked worker and acknowledge its accepted continuation."""
     try:
         resumed = _start_workers_turn(
             args, session_dir, name, thread_id, client, ACCOUNT_MOVE_CONTINUATION, submission=submission)
+        if isinstance(resumed, WorkerWaitingForRoom):
+            return resumed
         if not resumed.turn_id:
             raise SystemExit("account move continuation returned no turn id")
         _ = _update_roster_if_expected(
@@ -2853,6 +2855,7 @@ class TurnStream:
     run_outcome: RunOutcome = field(default_factory=RunCompleted)
     pending_refusal: PendingQuotaRefusal | NoPendingQuotaRefusal = field(default_factory=NoPendingQuotaRefusal)
     reported_turns: set[tuple[CodexServingState, str, str]] = field(default_factory=set)
+    room_wait_logged: bool = False
 
 
 class StreamStep(Enum):
@@ -2944,11 +2947,11 @@ def _stream_turn(
     with _pending_file(session_dir, name) as handle:
         _write_pending(handle, initial_thread_id, _pending_for_thread(handle, initial_thread_id))
     try:
-        _start_streamed_turn(stream, prompt)
         with log_path.open("a", encoding="utf-8") as log:
             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread {stream.thread_id}\n")
             log.flush()
-            stopped = _stream_frames(stream, log)
+            started = _start_streamed_turn(stream, prompt, log)
+            stopped = _stream_frames(stream, log) if started is StreamStep.NEXT_FRAME else None
         if stopped is not None:
             return stopped
         return _finish_stream(stream)
@@ -2962,7 +2965,7 @@ def _stream_turn(
         stream.client.close()
 
 
-def _start_streamed_turn(stream: TurnStream, prompt: str) -> None:
+def _start_streamed_turn(stream: TurnStream, prompt: str, log: TextIO) -> StreamStep:
     """Name the thread, submit its first turn and mark it running on the roster."""
     # The roster is written before this call: a disconnect after thread
     # creation must still leave its id reachable.
@@ -2970,8 +2973,11 @@ def _start_streamed_turn(stream: TurnStream, prompt: str) -> None:
         _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id, "name": stream.name})
     initial_move = (_read_account_move(stream.session_dir, stream.name, stream.thread_id)
                     if _attr(stream.args, "account_move") is True else NoAccountMove())
-    _adopt_started_turn(stream, _start_workers_turn(
-        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, prompt))
+    started = _start_workers_turn(
+        stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, prompt)
+    if isinstance(started, WorkerWaitingForRoom):
+        return _wait_for_room(stream, log, started)
+    _adopt_started_turn(stream, started)
     if not stream.turn_id:
         raise SystemExit("codex_mesh: turn/start returned no turn id")
     if isinstance(initial_move, AccountMoveMarker):
@@ -2987,6 +2993,7 @@ def _start_streamed_turn(stream: TurnStream, prompt: str) -> None:
         },
         RosterOnThread(stream.thread_id),
     )
+    return StreamStep.NEXT_FRAME
 
 
 def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
@@ -3015,6 +3022,7 @@ def _stream_frames(stream: TurnStream, log: TextIO) -> FailedWithThread | None:
 def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
     """Watch the server, thread and turn a submission landed on."""
     stream.client, stream.port = started.client, started.port
+    stream.room_wait_logged = False
     stream.thread_id, stream.turn_id = started.thread_id, started.turn_id
     stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, started)
     if stream.follow:
@@ -3024,6 +3032,7 @@ def _adopt_started_turn(stream: TurnStream, started: MovedWorker) -> None:
 def _adopt_moved_worker(stream: TurnStream, moved: MovedWorker) -> bool:
     """Watch the server a move landed on; true when it left a turn or a continuation to watch."""
     stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
+    stream.room_wait_logged = False
     stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
     if not (moved.turn_id or _continuation_is_owed(stream.session_dir, stream.name)):
         return False
@@ -3046,12 +3055,16 @@ def _move_worker(stream: TurnStream) -> WorkerMoveResult:
     return moved
 
 
-def _resume_marked_account_move(stream: TurnStream, marker: AccountMoveMarker) -> None:
+def _resume_marked_account_move(stream: TurnStream, log: TextIO, marker: AccountMoveMarker) -> StreamStep:
     """Open the marked move's continuation and forget the answer of the turn it replaced."""
-    _adopt_started_turn(stream, _resume_account_move(
+    resumed = _resume_account_move(
         stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, marker,
-        submission=_quota_retry_submission(stream.pending_refusal, stream.thread_id, marker.turn_id)))
+        submission=_quota_retry_submission(stream.pending_refusal, stream.thread_id, marker.turn_id))
+    if isinstance(resumed, WorkerWaitingForRoom):
+        return _wait_for_room(stream, log, resumed)
+    _adopt_started_turn(stream, resumed)
     stream.failure = stream.followed_failure = stream.final_answer = ""
+    return StreamStep.NEXT_FRAME
 
 
 def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str) -> None:
@@ -3067,6 +3080,27 @@ def _hold_messages_for_next_launch(stream: TurnStream, log: TextIO, reason: str)
         log.flush()
 
 
+def _wait_for_room(stream: TurnStream, log: TextIO, waiting: WorkerWaitingForRoom) -> StreamStep:
+    """Keep the task owed without watching an idle thread as a live turn."""
+    if stream.client is not waiting.client or stream.thread_id != waiting.thread_id:
+        stream.room_wait_logged = False
+    stream.client, stream.port, stream.thread_id = waiting.client, waiting.port, waiting.thread_id
+    account = stream.client.serving.account
+    label = account.label if isinstance(account, KnownCodexAccount) else "unknown account"
+    line = f"{stream.name} waits for room on {label}: {waiting.reason}; the continuation stays owed"
+    if not stream.room_wait_logged:
+        _ = log.write(f"[{_now_stamp()}] mesh: {line}\n")
+        log.flush()
+        stream.room_wait_logged = True
+    if stream.resident:
+        return StreamStep.NEXT_FRAME
+    _hold_messages_for_next_launch(stream, log, waiting.reason)
+    # Keep recovery here. A stopped-command handoff would clear continuation_owed.
+    stream.pending_refusal = NoPendingQuotaRefusal()
+    stream.failure = line
+    return StreamStep.FINISH
+
+
 def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep:
     """No frame arrived within one poll: catch a move, an unseen end or a resident off its server."""
     if not stream.resume_owed:
@@ -3074,8 +3108,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep:
     account_move = _read_account_move(stream.session_dir, stream.name, stream.thread_id)
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and _ended_unseen(stream.client, stream.thread_id)):
-        _resume_marked_account_move(stream, account_move)
-        return StreamStep.NEXT_FRAME
+        return _resume_marked_account_move(stream, log, account_move)
     if not stream.resident and time.time() < stream.deadline:
         return _finish_if_ended_unseen(stream, log)
     if stream.end_marker.exists():
@@ -3097,6 +3130,8 @@ def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
             and not stream.end_marker.exists()):
         return StreamStep.NEXT_FRAME
     moved = _move_worker(stream)
+    if isinstance(moved, WorkerWaitingForRoom):
+        return _wait_for_room(stream, log, moved)
     if isinstance(moved, WorkerThreadStateUnknown):
         _hold_messages_for_next_launch(stream, log, moved.reason)
     else:
@@ -3128,10 +3163,13 @@ def _keep_resident_on_selected_server(stream: TurnStream, log: TextIO) -> None:
             and not _continuation_is_owed(stream.session_dir, stream.name)):
         return
     moved = _move_worker(stream)
-    if isinstance(moved, WorkerThreadStateUnknown):
+    if isinstance(moved, WorkerWaitingForRoom):
+        _ = _wait_for_room(stream, log, moved)
+    elif isinstance(moved, WorkerThreadStateUnknown):
         _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} cannot move: {moved.reason}; waiting\n")
         log.flush()
     elif isinstance(moved, MovedWorker):
+        stream.room_wait_logged = False
         changed = moved.port != stream.port or moved.thread_id != stream.thread_id
         stream.client, stream.port, stream.thread_id = moved.client, moved.port, moved.thread_id
         stream.pending_refusal = _pending_after_worker_start(stream.pending_refusal, moved)
@@ -3218,8 +3256,7 @@ def _on_turn_end(
     _settle_quota_continuation(stream, notice_turn, turn_outcome)
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and (not notice_turn or notice_turn == account_move.turn_id)):
-        _resume_marked_account_move(stream, account_move)
-        return StreamStep.NEXT_FRAME
+        return _resume_marked_account_move(stream, log, account_move)
     if _interrupted_for_held_work(method, params, stream.session_dir, stream.name, stream.thread_id):
         turn_outcome = TurnCompleted()
     if isinstance(turn_outcome, TurnFailed):
@@ -3286,9 +3323,12 @@ def _continue_after_context_overflow(stream: TurnStream, log: TextIO, notice_tur
         f"[{_now_stamp()}] context window filled; starting one continuation turn\n"
     )
     log.flush()
-    _adopt_started_turn(stream, _start_workers_turn(
+    started = _start_workers_turn(
         stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client, continuation,
-        submission=_quota_retry_submission(stream.pending_refusal, stream.thread_id, notice_turn or stream.turn_id)))
+        submission=_quota_retry_submission(stream.pending_refusal, stream.thread_id, notice_turn or stream.turn_id))
+    if isinstance(started, WorkerWaitingForRoom):
+        return _wait_for_room(stream, log, started)
+    _adopt_started_turn(stream, started)
     _ = _update_roster_if_expected(
         stream.session_dir,
         stream.name,
@@ -3366,11 +3406,15 @@ def _resume_owed_turn(stream: TurnStream, log: TextIO, *, refused_for_capacity: 
         stopped = _capacity_launcher_stopped(stream, log)
         if stopped is not None:
             return stopped
-    _adopt_started_turn(stream, _start_workers_turn(
+    started = _start_workers_turn(
         stream.args, stream.session_dir, stream.name, stream.thread_id, stream.client,
         "Your last turn stopped because the model was at capacity. Continue from where you stopped; your edits are already in the tree.",
         submission=stream.capacity_submission,
-    ))
+    )
+    if isinstance(started, WorkerWaitingForRoom):
+        stream.resume_owed = False
+        return _wait_for_room(stream, log, started)
+    _adopt_started_turn(stream, started)
     stream.resume_owed = False
     return StreamStep.NEXT_FRAME
 
@@ -3458,6 +3502,8 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
     owed = _continuation_is_owed(stream.session_dir, stream.name)
     if stream.resident or held_messages or owed:
         moved = _move_worker(stream)
+        if isinstance(moved, WorkerWaitingForRoom):
+            return _wait_for_room(stream, log, moved)
         if isinstance(moved, WorkerThreadStateUnknown):
             if stream.resident:
                 _ = log.write(f"[{_now_stamp()}] mesh: {stream.name} cannot move: {moved.reason}; waiting\n")
@@ -3492,6 +3538,8 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id):
         return StreamStep.NEXT_FRAME
     moved = _move_worker(stream)
+    if isinstance(moved, WorkerWaitingForRoom):
+        return _wait_for_room(stream, log, moved)
     if isinstance(moved, WorkerThreadStateUnknown):
         _hold_messages_for_next_launch(stream, log, moved.reason)
         return StreamStep.FINISH
@@ -3578,6 +3626,16 @@ class WorkerWaitingOnLiveTurn:
 
 
 @dataclass(frozen=True)
+class WorkerWaitingForRoom:
+    """The idle thread owes a continuation and waits for account room."""
+
+    reason: str
+    client: Client
+    port: int
+    thread_id: str
+
+
+@dataclass(frozen=True)
 class WorkerAwaitingQuotaRecovery(MovedWorker):
     """The thread resumed, but the destination refused its owed continuation."""
 
@@ -3612,7 +3670,7 @@ class WorkerThreadStateUnknown:
     refusal_reported: bool = False
 
 
-WorkerMoveResult = MovedWorker | WorkerWaitingOnLiveTurn | WorkerThreadStateUnknown
+WorkerMoveResult = MovedWorker | WorkerWaitingOnLiveTurn | WorkerWaitingForRoom | WorkerThreadStateUnknown
 
 
 class WorkerMoveUncertain(SystemExit):
@@ -3903,7 +3961,7 @@ def _move_idle_worker(
                 if isinstance(identity, UnknownCodexAccount):
                     return WorkerThreadStateUnknown("quota handoff did not establish a recoverable account; continuation is held")
                 if refusals.key("codex", identity.login) not in refusals.load():
-                    return WorkerWaitingOnLiveTurn("no fresh reading shows room on the account")
+                    return WorkerWaitingForRoom("no fresh reading shows room on the account", client, old_port, thread_id)
                 return WorkerWaitingOnLiveTurn("the refused account has not recovered")
             if isinstance(client.serving, NotBoundCodexServer):
                 _ = _bind_serving_server(client, session_dir, started_here=_fresh)
@@ -3974,13 +4032,15 @@ def _start_workers_turn(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str,
     client: Client, message: str,
     *, submission: QuotaContinuationTurn | UnrelatedWorkerTurn = UNRELATED_WORKER_TURN,
-) -> MovedWorker:
+) -> MovedWorker | WorkerWaitingForRoom:
     initial_client = client
     quota_recovery: WorkerAwaitingQuotaRecovery | NoSubmissionQuotaRefusal = NoSubmissionQuotaRefusal()
     try:
         deadline = time.monotonic() + _as_float(_attr(args, "timeout"), 86400.0)
         while time.monotonic() < deadline:
             result = _move_resident(args, session_dir, name, thread_id, client, message=message)
+            if isinstance(result, WorkerWaitingForRoom):
+                return result
             if isinstance(result, WorkerThreadStateUnknown):
                 raise WorkerMoveUncertain(thread_id, result)
             if isinstance(result, MovedWorker) and not isinstance(result, WorkerAwaitingQuotaRecovery):
