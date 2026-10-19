@@ -59,6 +59,11 @@ DEFAULT_MODULE_TIME_LIMIT_S = 1800
 # type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
 # later dates report new diagnostics in bake_textures.py.
 TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+# basedpyright is one large job, not a module: the full tree peaked at 2.64 GiB (77 s, 2026-10-19)
+# and scripts/production at 0.79 GiB. Admission reserves its last sampled peak for the same dirs,
+# times TYPES_PEAK_MARGIN for growth between samples, or this when none is recorded.
+TYPES_MEMORY_MIB = 3072
+TYPES_PEAK_MARGIN = 1.2
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
 # Python restores these dispositions before exec, including an inherited SIG_IGN.
@@ -137,6 +142,8 @@ class SampledRSSAdmission:
     # growing; subsequently retain the largest measured module/subprocess peak.
     headroom_mib: float = float(MODULE_MEMORY_MIB * 2)
     job_memory_mib: dict[int, float] = field(default_factory=dict)
+    # Jobs reserved at a known size; their samples never raise the per-module headroom.
+    fixed_mib: dict[int, float] = field(default_factory=dict)
     peak_mib: float = 0.0
     next_sample_at: float = 0.0
 
@@ -146,25 +153,30 @@ class SampledRSSAdmission:
     @property
     def reserved_mib(self) -> float:
         # A small startup sample does not release a running job's reservation.
-        return sum(max(0.0, self.headroom_mib - measured) for measured in self.job_memory_mib.values())
+        return sum(max(0.0, self.fixed_mib.get(pid, self.headroom_mib) - measured)
+                   for pid, measured in self.job_memory_mib.items())
 
     def observe(self, now: float, aggregate_mib: float, job_memory_mib: dict[int, float]) -> None:
         self.latest_mib = aggregate_mib
         self.peak_mib = max(self.peak_mib, aggregate_mib)
-        self.headroom_mib = max([self.headroom_mib, *job_memory_mib.values()])
+        self.headroom_mib = max([self.headroom_mib, *(measured for pid, measured in job_memory_mib.items()
+                                                      if pid not in self.fixed_mib)])
         self.job_memory_mib = job_memory_mib.copy()
         self.next_sample_at = now + MEMORY_SAMPLE_SECONDS
 
     def admits(self, jobs_running: bool) -> bool:
         return not jobs_running or self.latest_mib + self.reserved_mib + self.headroom_mib <= self.cap_mib
 
-    def reserve(self, pid: int) -> None:
+    def reserve(self, pid: int, expected_mib: float = 0.0) -> None:
         self.job_memory_mib[pid] = 0.0
+        if expected_mib:
+            self.fixed_mib[pid] = expected_mib
 
     def release(self, pid: int) -> None:
         # Keep the last aggregate sample until the next scan; it may still
         # include this finished job, which conservatively delays admission.
         _ = self.job_memory_mib.pop(pid, 0.0)
+        _ = self.fixed_mib.pop(pid, 0.0)
 
 
 class GateRefused(Exception):
@@ -267,12 +279,12 @@ def process_memory_mib(roots: set[int]) -> dict[int, float]:
     return totals
 
 
-def module_timings_path() -> Path:
-    return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser() / "module_seconds.json"
+def gate_state_dir() -> Path:
+    return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
 
 
 def typecheck_venv_path() -> Path:
-    return module_timings_path().parent / "typecheck-venv"
+    return gate_state_dir() / "typecheck-venv"
 
 
 def typecheck_python() -> Path | str:
@@ -303,7 +315,7 @@ def typecheck_python() -> Path | str:
         return python
 
 
-def previous_module_seconds(path: Path) -> dict[str, float]:
+def read_measures(path: Path) -> dict[str, float]:
     try:
         value = cast(object, json.loads(path.read_text()))
     except (OSError, ValueError):
@@ -314,12 +326,12 @@ def previous_module_seconds(path: Path) -> dict[str, float]:
             if isinstance(key, str) and isinstance(seconds, (int, float)) and seconds >= 0}
 
 
-def save_module_seconds(path: Path, seconds: dict[str, float]) -> None:
+def save_measures(path: Path, measures: dict[str, float]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
         temporary = Path(output.name)
         try:
-            _ = output.write(json.dumps(seconds, sort_keys=True) + "\n")
+            _ = output.write(json.dumps(measures, sort_keys=True) + "\n")
             output.close()
             _ = temporary.replace(path)
         finally:
@@ -360,8 +372,12 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
     print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
-    timings_path = module_timings_path()
-    timings = previous_module_seconds(timings_path)
+    timings_path = gate_state_dir() / "module_seconds.json"
+    timings = read_measures(timings_path)
+    types_peaks_path = gate_state_dir() / "types_peak_mib.json"
+    types_peaks = read_measures(types_peaks_path)
+    types_key = " ".join(type_dirs)
+    types_peak_mib = 0.0
     modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
                                   -timings.get(f"{item[0]}/{item[1].name}", 0)))
     pending = deque(modules)
@@ -393,7 +409,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                                       {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
                     for job in running:
                         measured = sample.get(job.process.pid, 0.0)
-                        if job.suite != "types" and measured > largest_module_peak_mib:
+                        if job.suite == "types":
+                            types_peak_mib = max(types_peak_mib, measured)
+                        elif measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.path.name}"
                         if measured > memory_cap_mib and not job.killed_for:
@@ -424,7 +442,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         output.close()
                         raise
                     running.append(RunningGateJob(suite, path, process, started, output, log))
-                    admission.reserve(process.pid)
+                    admission.reserve(process.pid, (types_peaks[types_key] * TYPES_PEAK_MARGIN
+                                                    if types_key in types_peaks else TYPES_MEMORY_MIB)
+                                      if suite == "types" else 0.0)
                 for job in running[:]:
                     status = job.process.poll()
                     if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
@@ -447,6 +467,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     if status == 5 and re.search(r"^Ran 0 tests in", captured, re.MULTILINE) and "NO TESTS RAN" in captured:
                         status = 0
                     if job.suite == "types":
+                        if not job.killed_for and types_peak_mib:
+                            types_peaks[types_key] = types_peak_mib
                         status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
                     else:
                         timings[f"{job.suite}/{job.path.name}"] = finished - job.started
@@ -461,7 +483,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
             for job in running:
                 kill_job_group(job)
                 job.output.close()
-            save_module_seconds(timings_path, timings)
+            save_measures(timings_path, timings)
+            save_measures(types_peaks_path, types_peaks)
     elapsed = time.monotonic() - began
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)

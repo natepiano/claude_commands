@@ -50,6 +50,10 @@ if name == "basedpyright":
             if time.monotonic() >= deadline:
                 raise SystemExit("type job never overlapped a module")
             time.sleep(0.01)
+    if (state / "types-hold").exists():
+        # Outlive several 0.25 s memory samples so the runner records this job's peak.
+        import time
+        time.sleep(1.5)
     if (state / "types-red").exists():
         print("fixture type error")
         print("1 error, 0 warnings, 0 notes")
@@ -488,6 +492,7 @@ class MergeGateTests(unittest.TestCase):
 
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
+        self.write(self.state / "types-hold", "hold")
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         head = self.git(self.checkout, "rev-parse", "HEAD")
@@ -510,6 +515,8 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(len(type_calls), 1)
         venv = self.state / "runner" / "typecheck-venv"
         self.assertEqual(type_calls[0]["args"], ["--pythonpath", str(venv / "bin" / "python"), "scripts/production"])
+        peaks = cast(dict[str, float], json.loads((self.state / "runner" / "types_peak_mib.json").read_text()))
+        self.assertEqual(list(peaks), ["scripts/production"])
         self.assertEqual(type_calls[0]["cwd"], str(self.checkout))
         for suite in EXPECTED_SUITES:
             self.assertRegex(result.stdout, rf"(?m)^{suite}: OK \d+\.\d+s$")
@@ -863,6 +870,19 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(admission.headroom_mib, 240.0)
         self.assertEqual(admission.reserved_mib, 224.0)
         self.assertFalse(admission.admits(True))
+
+    def test_a_job_reserved_at_a_known_size_holds_it_and_leaves_module_headroom_alone(self) -> None:
+        admission = merge_gate.SampledRSSAdmission(4096)
+        admission.observe(100.0, 0.0, {})
+        admission.reserve(1, 3072.0)
+        self.assertEqual(admission.reserved_mib, 3072.0)
+        self.assertTrue(admission.admits(True))
+        admission.observe(100.25, 2700.0, {1: 2700.0})
+        self.assertEqual(admission.headroom_mib, 96.0)
+        self.assertEqual(admission.reserved_mib, 372.0)
+        self.assertTrue(admission.admits(True))
+        admission.release(1)
+        self.assertEqual(admission.fixed_mib, {})
 
     def test_memory_scan_schedule_uses_controlled_quarter_second_clock(self) -> None:
         admission = merge_gate.SampledRSSAdmission(3072)
