@@ -2091,3 +2091,33 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `load()` seeds the links from the old `read_source_directory` and `weekly_read_skip_directory` fields. It writes only the directory map.
 - A failed identity read stays unmarked when its directory has no link and the caller knows no login, for example a first failed Codex identity read on an old store. The next good read makes the link.
 - The one pool review found a blocker: a failed read with no login was dropped on a store written before this phase, and also when two directories shared a login. The directory links fixed it.
+
+### Phase 76 — A held quota continuation recovers when its account has room  · status: done
+
+**Depends on:** Phase 75
+
+#### Work Order
+
+**Goal:** a Codex seat that owes a quota continuation is no longer held for good when its serving account has no refusal on record. The showrunner reported it 2026-10-19: berth-parallel's seat `cargo-liner-berth-parallel-mac` stays at `state unknown (quota handoff did not establish a recoverable account; continuation is held); no turn resubmitted`. codex1 ran out at 01:45, the work moved back to Codex at 01:47, and at 01:47:55 the turn ended on an ImportError (`refusals.py` → `usage_store.py`, mid-promotion of Phase 75). So no refusal was ever written. The workers account (codex2) is at 100%.
+
+**Constraints from prior phases:**
+- `codex_mesh._move_idle_worker` (~3896): when the roster says `continuation_owed` and `_quota_continuation_ready` is False, an unknown account or an account with no entry in `refusals.load()` returns `WorkerThreadStateUnknown` (raised as `WorkerMoveUncertain`, permanent). An account with a refusal that is not resolved returns `WorkerWaitingOnLiveTurn("the refused account has not recovered")`, which is checked again at the next attempt.
+- `_quota_continuation_ready` (~3784) returns True when the selected workers home is not the serving home. Otherwise it needs a refusal that `refusals.resolved()` accepts. `refusals.stored_reading("codex", login, now)` gives `FreshReading` (weekly and optional five-hour windows with `left`), `StaleReading` or `NoReading`.
+
+**Spec:**
+1. In `_quota_continuation_ready`, a known serving account with no refusal on record is ready when `stored_reading` is a `FreshReading` and each of its windows has `left > 0`.
+2. In `_move_idle_worker`, a known account with no refusal on record and no fresh reading with room returns `WorkerWaitingOnLiveTurn` with a short reason (for example `"no fresh reading shows room on the account"`), so the next attempt checks again. An `UnknownCodexAccount` stays `WorkerThreadStateUnknown` as today.
+3. When the continuation becomes ready, the existing path submits `Continue where you stopped.` on the same thread and clears `continuation_owed`. No new state file, no roster hand edit.
+4. Tests: (a) owed continuation, serving home is the workers home, no refusal, a fresh reading with room → the turn starts with `Continue where you stopped.` and `continuation_owed` is False; (b) the same with a stale or empty reading → waiting, not unknown, and the roster still owes the continuation; then a fresh reading with room on the next attempt → the turn starts; (c) an unknown account → still unknown. Each of (a) and (b) fails without the fix.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the ready check and the no-refusal branch.
+- `scripts/agents/test_codex_mesh.py` — the tests.
+
+**Workers:** 1 writer. impl owns both files.
+
+**Verification:** `scripts.agents.test_codex_mesh scripts.accounts.test_refusals scripts.accounts.test_refusal_watch` with a scratch HOME (use the test files that exist); basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:**
+- **Recovers:** an owed continuation on an account with no refusal and a fresh reading with room starts its turn; without a fresh reading it waits and recovers on a later attempt.
+- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
