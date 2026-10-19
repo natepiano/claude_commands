@@ -4,20 +4,27 @@
     change_review.py check --repo R --checkpoint C --previous P --merge-branch B
     change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
     change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed>" --check "<how to check it>" [--merged M]
+    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M]
+    change_review.py edit [--production DOC] [--list L] --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row C<n> --verdict "<the user's words>"
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
 
-A checkpoint(...) commit names what the user sees change and how to check it, one line each:
-`Change-Review: <what you see change> | <how to check it>`, or `Change-Review: none — <why nothing
-visible changes>`. A checkpoint that changes only Markdown needs none. A pushed checkpoint that
+A checkpoint(...) commit tells a person with no context what changed, how to try it and what they
+see, one line each: `Change-Review: <what changed for you> | <how to try it: where and what to type> |
+<what you see>`, three parts split on " | ", where "where" names the machine (natedev or the Mac) and
+the session (a terminal, a showrunner session, a unit session or any Claude session). For example:
+`Change-Review: Panels keep their shields | In a natedev terminal, run `hana` | Each panel shows its
+shield`. A line with another number of parts, or an empty part, is refused. `Change-Review: none —
+<why nothing visible changes>` names a change the user cannot see. A checkpoint that changes only
+Markdown needs none. A pushed checkpoint that
 missed its line is covered by a later one carrying the lines and `Change-Review-Covers: <hash>`. The merge gate refuses a
 unit's checkpoint without one, then adds one row per visible line under the list's "## To review":
-the next C number, the push date and the merged hash, and "not yet" when the table has an "On the
-Mac build" column. `add` writes one row for a change no checkpoint line carries; `show` prints the
-rows still to review; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
+the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
+see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
+row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
+its id, Merged cell and position; `show` prints the rows still to review; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
 date. Every write holds a lock on the list's directory, and the first write to a missing list
 creates it from the skeleton. Every write sets the frontmatter's date_modified and adds the
 writing production's doc to its productions. A list in a git work tree is committed alone after
@@ -29,7 +36,7 @@ child production's rows go to its root's list. A production opts in with a `- **
 <path>` line in its Production Context. While the root showrunner runs, its session name names the
 list; otherwise the line's path does. `list-path` prints the list and `showrunner` the name, each
 from the calling showrunner's update timer when no doc is given; add, show and verdict find the
-list the same way unless --list names one. Every write names its production, the same way.
+list the same way unless --list names one; edit does too. Every write names its production, the same way.
 """
 from __future__ import annotations
 
@@ -58,6 +65,8 @@ SECTION = "## To review"
 REVIEWED = "## Reviewed"
 CHECK = "How to check"
 NOT_YET = "not yet"
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
+SEPARATOR = " | "
 SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
 CHECKED_FROM = 1792036800
@@ -96,6 +105,12 @@ Result = TypeVar("Result")
 class Visible:
     change: str
     check: str
+    see: str
+
+    def how(self) -> str:
+        """The row's How to check cell: how to try the change, then what the user sees."""
+        stop = "" if self.check.endswith((".", "!", "?", ":")) else "."
+        return f"{self.check}{stop} You see: {self.see}"
 
 
 @dataclass(frozen=True)
@@ -127,9 +142,9 @@ def parse(value: str) -> Entry:
     text = value.strip()
     if (none := _NONE.match(text)) is not None:
         return Invisible(none.group("why").strip())
-    change, separator, check = text.partition(" | ")
-    if separator and change.strip() and check.strip() and " | " not in check:
-        return Visible(change.strip(), check.strip())
+    parts = [part.strip() for part in text.split(SEPARATOR)]
+    if len(parts) == 3 and all(parts):
+        return Visible(parts[0], parts[1], parts[2])
     return Malformed(text)
 
 
@@ -148,11 +163,11 @@ def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
         return ""
     found = entries(message)
     if not found:
-        return (f"no {TRAILER} line: add `{TRAILER}: <what you see change> | <how to check it>` "
-                + f"or `{TRAILER}: none — <why nothing visible changes>`")
+        return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return f"{TRAILER} line {bad[0]!r} is neither `<change> | <how to check>` nor `none — <why>`"
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}: "
+                + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
     return ""
 
 
@@ -420,7 +435,7 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
-                                     "On the Mac build": NOT_YET, CHECK: _cell(item.check)})
+                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how())})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
         return rows
@@ -453,14 +468,36 @@ def lands(verdict: str) -> bool:
     return _LANDS.match(verdict.strip()) is not None
 
 
+def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
+    """The To review table's column names and the index of `row` in it; a row not there is refused."""
+    columns, first, end = _table(path, lines, SECTION)
+    index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+    if index is None:
+        raise ChangeReviewError(f"{row} is not on the list to review")
+    return columns, index
+
+
+def edit_row(path: Path, row: str, item: Visible, day: date, production: Path) -> str:
+    """Rewrite the Change and How to check cells of `row` in To review; return the row written.
+
+    The row keeps its id, its Merged cell, every other cell and its place in the table.
+    """
+
+    def write(lines: list[str]) -> str:
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        written = _row(path, columns, {**cells, "Change": _cell(item.change), CHECK: _cell(item.how())})
+        lines[index] = written + "\n"
+        return written
+
+    return _edit(path, production, day, write, lambda _: f"edit {row}")
+
+
 def record_verdict(path: Path, row: str, verdict: str, day: date, production: Path) -> str:
     """Move `row` from To review to the top of the Reviewed table; return its Merged cell."""
 
     def write(lines: list[str]) -> str:
-        columns, first, end = _table(path, lines, SECTION)
-        index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
-        if index is None:
-            raise ChangeReviewError(f"{row} is not on the list to review")
+        columns, index = _to_review(path, lines, row)
         cells = dict(zip(columns, _cells(lines.pop(index))))
         reviewed, top, _ = _table(path, lines, REVIEWED)
         _insert(lines, top, [_row(path, reviewed, {"#": row, "Change": cells.get("Change", ""),
@@ -549,6 +586,7 @@ class CommandLine(argparse.Namespace):
     since: str = ""
     change: str = ""
     check: str = ""
+    see: str = ""
     row: str = ""
     verdict: str = ""
     production: str = ""
@@ -559,21 +597,34 @@ def _list(options: CommandLine) -> Path:
     return Path(options.list).expanduser() if options.list else production_list(options.production)
 
 
+def _visible(options: CommandLine) -> Visible:
+    """The change, how to try it and what the user sees, from --change, --check and --see."""
+    return Visible(_words("change", options.change), _words("check", options.check), _words("see", options.see))
+
+
+def _row_option(options: CommandLine) -> str:
+    """The row id --row names, such as C3."""
+    row = options.row.strip()
+    if _ROW.match(row) is None:
+        raise ChangeReviewError(f"--row {row!r} is not a row id such as C3")
+    return row
+
+
 def _run(options: CommandLine) -> int:
     match options.action:
         case "add":
-            doc = production_doc(options.production)
-            rows = append_rows(_list(options), [Visible(_words("change", options.change),
-                                                        _words("check", options.check))],
-                               today(), options.merged.strip(), doc)
+            item = _visible(options)
+            rows = append_rows(_list(options), [item], today(), options.merged.strip(),
+                               production_doc(options.production))
             print(row_id(rows[0]))
+        case "edit":
+            row, item = _row_option(options), _visible(options)
+            print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
         case "show":
             waiting = pending(_list(options))
             print("\n\n".join(describe(row) for row in waiting) if waiting else "nothing to review")
         case "verdict":
-            row = options.row.strip()
-            if _ROW.match(row) is None:
-                raise ChangeReviewError(f"--row {row!r} is not a row id such as C3")
+            row = _row_option(options)
             verdict = _words("verdict", options.verdict)
             merged = record_verdict(_list(options), row, verdict, today(), production_doc(options.production))
             print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
@@ -600,11 +651,11 @@ def _run(options: CommandLine) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "show", "verdict", "list-path",
-                                                   "showrunner"))
+    _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
+                                                   "list-path", "showrunner"))
     _ = parser.add_argument("--repo", default=".")
-    for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "row",
-                 "verdict", "production"):
+    for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
+                 "row", "verdict", "production"):
         _ = parser.add_argument(f"--{name}", default="")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))
