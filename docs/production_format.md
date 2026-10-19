@@ -126,6 +126,11 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
   `proposal`; required for a style production, which files held changes there;
   otherwise omit when the production keeps none
+- **Improvement queue:** <path to the improvement ledger>; optional; open lines
+  still to decide or hand out show as `N projects` in the `For you:` line
+- **Efficiency ledger:** <path to a nightly-review style ledger>; optional; its
+  proposed and deferred lines show as `N efficiency proposals` in the `For you:`
+  line on the status line and in the dailies footer
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py

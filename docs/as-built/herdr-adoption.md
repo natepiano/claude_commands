@@ -234,6 +234,7 @@ Run the nine suites on the Mac with a scratch home. Run the command from the roo
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
+- The prompt goes in only when the composer is empty. Every composer check reads `pane read --source visible --format ansi` and drops faint text (SGR 2, until 22 or 0; colour arguments of 38/48/58 are skipped), because a new session shows a faint hint such as `Try "fix lint errors"` in its empty composer. Read as plain text, that hint looked like input, and add_unit's efficiency launch waited out its limit twice (2026-10-19).
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - `start_new_server` is exclusive and raises `SessionTaken` on a taken name. Launchers that create a session use it. Adopting starts are only for restoring into a recorded server.
 - Restored workspaces are cleared on every server spawn. Restart closes only workspaces that pass the untouched startup-shell test, never one it did not create.
