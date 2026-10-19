@@ -24,7 +24,6 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
@@ -1544,24 +1543,8 @@ def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_Pan
             and members[0].evidence is _StartupShellEvidence.UNTOUCHED)
 
 
-def _herdr_resumes_agents() -> bool:
-    """False only when herdr's config sets `[session] resume_agents_on_restore = false`."""
-    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "config.toml"
-    try:
-        session = tomllib.loads(path.read_text(encoding="utf-8")).get("session")
-    except (OSError, tomllib.TOMLDecodeError):
-        return True
-    return not (isinstance(session, dict) and cast(dict[str, object], session).get("resume_agents_on_restore") is False)
-
-
 def _clear_restored_workspaces(client: Herdr) -> None:
-    """A server we just spawned holds restored layout, never live work.
-
-    The shared session keeps its layout for `pane_restore.py` only when herdr resumes no agent
-    itself: else herdr would resume each pane on the server's account (herdr review, 2026-10-19).
-    """
-    if client.session == shared_session() and not _herdr_resumes_agents():
-        return
+    """A server we just spawned holds restored layout, never live work."""
     result = client.result("workspace", "list")
     workspaces = [json_text(json_object(item, "herdr workspace").get("workspace_id"),
                             "herdr workspace id")
@@ -1582,19 +1565,7 @@ def _server_unit_active(name: str) -> bool:
     ]).returncode == 0
 
 
-def _installed_server_unit(name: str) -> bool:
-    """True when a unit file defines the server's unit (the boot unit); a transient unit does not count."""
-    shown = run_program([
-        os.environ.get("SYSTEMCTL", "systemctl"), "--user", "show", "-p", "FragmentPath", "--value", server_unit(name),
-    ])
-    path = shown.stdout.strip()
-    return shown.returncode == 0 and bool(path) and "/transient/" not in path
-
-
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
-    # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
-    if client.session == shared_session() and _installed_server_unit(client.session):
-        return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
         "--collect", *client.argv("server"),

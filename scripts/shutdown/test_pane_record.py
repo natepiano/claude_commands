@@ -65,8 +65,7 @@ class PaneRecordTests(unittest.TestCase):
             "pane_id": "w1:p2", "session_id": "sid-alpha", "config_dir": str(self.root / ".claude3"),
             "cwd": "/work/alpha", "name": "alpha", "model": "opus", "remote_control": True,
             "environment": {"ENABLE_TOOL_SEARCH": "true", "SHOWRUNNER_UNIT": "demo",
-                            "SHOWRUNNER_UNIT_ID": "alpha-unit"},
-            "flags_read": True, "ended": False})
+                            "SHOWRUNNER_UNIT_ID": "alpha-unit"}})
 
     def test_a_new_start_replaces_its_own_pane_and_keeps_the_others(self) -> None:
         for pane, session_id in (("w1:p2", "sid-alpha"), ("w2:p1", "sid-ups"), ("w1:p2", "sid-alpha-2")):

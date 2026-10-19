@@ -1799,34 +1799,6 @@ class HerdrTests(unittest.TestCase):
                     ["--session", "fixture", "workspace", "close", "w2"],
                 ])
 
-    def test_the_shared_session_starts_its_boot_unit_and_keeps_its_restored_layout(self) -> None:
-        shared = self.root / "config/herdr/shared-session"
-        shared.parent.mkdir(parents=True)
-        _ = shared.write_text("fixture\n")
-        self.configure(["--user", "show", "-p", "FragmentPath", "--value", "herdr-fixture.service"],
-                       "/etc/systemd/user/herdr-fixture.service\n")
-        self.responses["--session fixture status server"] = [
-            {"stdout": "status: stopped\n", "code": 0},
-            {"stdout": "status: running\n", "code": 0},
-        ]
-        _ = self.responses_path.write_text(json.dumps(self.responses))
-        started = [
-            ["--session", "fixture", "status", "server"],
-            ["--user", "show", "-p", "FragmentPath", "--value", "herdr-fixture.service"],
-            ["--user", "start", "herdr-fixture.service"],
-            ["--session", "fixture", "status", "server"],
-            ["--user", "is-active", "herdr-fixture.service"],
-        ]
-        # While herdr resumes agents itself, the restored layout is cleared as for any session.
-        _ = herdr.start_server("fixture", 10_000)
-        self.assertEqual(self.commands(), [*started, ["--session", "fixture", "workspace", "list"]])
-        _ = shared.with_name("config.toml").write_text("[session]\nresume_agents_on_restore = false\n")
-        self.log.unlink()
-        _ = self.responses_path.write_text(json.dumps(self.responses | {"--session fixture status server": [
-            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0}]}))
-        _ = herdr.start_server("fixture", 10_000)
-        self.assertEqual(self.commands(), started)
-
     def test_spawned_servers_report_session_and_workspace_when_close_fails(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({
             "result": {"workspaces": [{"workspace_id": "w1"}]},

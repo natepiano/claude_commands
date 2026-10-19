@@ -337,7 +337,7 @@ Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. After a reboot, the herdr boot unit and `pane_restore.py` bring each pane back on its own account (`docs/as-built/herdr-restore.md`).
+again and retargets the instance. A reboot needs nothing.
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.

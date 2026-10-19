@@ -28,84 +28,15 @@ The settings.json entry, one more SessionStart item:
 {"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-pane-record.py\""}]}
 ```
 
-## Pane restore (checkpoint 2)
+## Still to come (checkpoint 2)
 
-- Each entry also holds `flags_read` (false when the hook found no Claude argv, as on the Mac
-  without `/proc`) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
-  SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
-  crash does not. An end only marks the entry of the same conversation.
-- `pane_record.py seed [--session NAME]` writes the entries of the Claudes running now: the argv
-  and cwd from herdr's `pane process-info`, the environment from `/proc/<pid>/environ`, and the
-  conversation id from `<config>/sessions/<pid>.json`. Linux only. It needs no
-  `report-agent-session`: a restore takes the id from the entry and checks herdr's
-  `agent_session` only when the pane has one.
-- `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` (the shared session by
-  default) first waits for the server (`herdr.start_server`, which adopts it). For each pane with
-  an entry, it resumes the conversation unless a reason below holds, and prints the reason:
-  - herdr's `agent_session` names another conversation;
-  - the entry is `ended` (closed by hand);
-  - a shutdown record holds the session (`shutdown.py up` brings it back);
-  - the conversation already runs (`sessions.live_sessions` or `running_sessions`);
-  - `flags_read` is false (entries written before the field are read as true off the Mac);
-  - the account has no transcript of the conversation;
-  - the pane runs a program.
-- A resume opens a tab with `herdr.open_tab` in the pane's workspace, with the pane's label and
-  cwd, and the entry's marks plus `named_account_environment(config_dir)`. It then runs
-  `start_agent` with `--resume <id>`, `-n`, `--remote-control`, `--model` from the entry, and
-  `--settings '{"disableAgentView": true}'`, with no opening prompt. Then it closes the restored
-  tab, found by its `terminal_id`: `order_tabs` gives moved panes new ids. A failed start closes
-  the new tab and keeps the restored one. Any failure makes the exit status 1.
-- `herdr._clear_restored_workspaces` returns at once for `shared_session()`: the restore needs
-  the layout. Every other session is cleared as before.
-- `herdr._submit_server`, for the shared session only, starts `herdr-<name>.service` with
-  `systemctl --user start` when a unit file defines it (`systemctl show -p FragmentPath`, not
-  under `/transient/`). Otherwise it runs `systemd-run` as before. A transient unit cannot start
-  under the boot unit's name.
-
-Settings entry for the user, one more SessionEnd item:
-
-```json
-{"hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-end-pane-record.py\""}]}
-```
-
-Steps on natedev, in order, after promotion:
-
-1. herdr `~/.config/herdr/config.toml`: add `[session]` with `resume_agents_on_restore = false`,
-   then `herdr --session agents server reload-config`.
-2. `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_record.py seed` once.
-3. The nixos units (`modules/linux/agent-sessions.nix` or a new `herdr.nix`) below, then rebuild.
-   The shared server running now is the transient unit `herdr-agents.service` that
-   `systemd-run` made, the same name. Not tested: how the rebuild treats a unit file under the name
-   of an active transient unit. After the rebuild, check `systemctl --user status
-   herdr-agents.service` and that only one `herdr --session agents server` runs. The boot unit
-   takes over at the next reboot.
-
-```nix
-systemd.user.services.herdr-agents = {
-  description = "The shared herdr session, from login";
-  wantedBy = [ "default.target" ];
-  serviceConfig = {
-    Environment = "PATH=/etc/profiles/per-user/${username}/bin:/run/current-system/sw/bin";
-    ExecStart = "/etc/profiles/per-user/${username}/bin/herdr --session agents server";
-    # The restore takes minutes; its own unit keeps it out of this unit's start time.
-    ExecStartPost = "/run/current-system/sw/bin/systemctl --user start --no-block herdr-agents-restore.service";
-    Restart = "on-failure";
-    RestartSec = 5;
-  };
-};
-systemd.user.services.herdr-agents-restore = {
-  description = "Resume each herdr pane's Claude on its own account";
-  after = [ "herdr-agents.service" ];
-  serviceConfig = {
-    Type = "oneshot";
-    Environment = "PATH=/etc/profiles/per-user/${username}/bin:/run/current-system/sw/bin";
-    ExecStart = "%h/.claude/scripts/lib/py %h/.claude/scripts/shutdown/pane_restore.py";
-  };
-};
-```
-
-## Still to come
-
-- The Mac: a launchd agent, the Mac desktop rule for herdr, and the flags read with
-  `ps -o ppid=,args= -p <pid>` (herdr review, 2026-10-19).
+- `shutdown.py restore-panes`: for each restored pane with `agent_session` and an entry, open a
+  tab in the same workspace with the old label (`open_tab` gives the environment and
+  `HERDR_AGENT_PANE`), start Claude with `--resume <id>`, close the restored tab, order the tabs.
+  A down marker leaves the pane down; an id with no transcript is skipped and named.
+- `_clear_restored_workspaces` skips the shared session, at all four places it runs.
+- herdr `[session] resume_agents_on_restore = false`, applied with `herdr server reload-config`.
+- The boot unit `herdr-agents.service` (nixos repo), started through `systemctl --user start`
+  when its unit file exists, with `Restart=on-failure`.
+- The Mac: a launchd agent and the Mac desktop rule for herdr, a later checkpoint.
 - Last: retire `agent-sessions-snapshot.timer` after one real reboot restores every pane.
