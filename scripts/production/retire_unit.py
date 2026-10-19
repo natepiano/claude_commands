@@ -8,7 +8,8 @@ unit's worktree has uncommitted work or its branch has a commit the merge branch
 The `Project started` line the /unit:direct recorder adds to a plan, alone in its file's diff, is not
 uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
 
-- each Claude session that works in the worktree (the unit director and its Claude seats) stops
+- each Claude session that works in the worktree (the unit director and its Claude seats), and the
+  director of each of the worktree's runs wherever it works, stops
   through `shutdown.py down`, which asks it to pause and stops it at its ready mark, and its
   restore is then forgotten, so no restart brings it back;
 - each run of the worktree that has an app-server stops it and ends its Codex seats
@@ -232,9 +233,13 @@ def proc_start(pid: int) -> str:
     return stat.rsplit(")", 1)[-1].split()[19]
 
 
-def claude_sessions(worktree: Path) -> tuple[SessionRecord, ...]:
-    inside = set(unit_move.processes_inside(worktree))
-    return tuple(item for item in sessions.live_sessions() if item["pid"] in inside)
+def claude_sessions(worktree: Path, ids: frozenset[str]) -> tuple[SessionRecord, ...]:
+    """The live sessions working inside the worktree, and the sessions named by id wherever they work.
+
+    A unit director can work outside its worktree, so the run's director is found by its id.
+    """
+    inside: set[int] = set(unit_move.processes_inside(worktree)) if unit_move.exists(worktree) else set()
+    return tuple(item for item in sessions.live_sessions() if item["pid"] in inside or item["sessionId"] in ids)
 
 
 def _json(path: Path) -> dict[str, object]:
@@ -315,10 +320,11 @@ def mac_claims(worktree: Path) -> tuple[MacClaim, ...]:
 
 
 def gather(unit: Unit) -> Found:
-    claude = claude_sessions(unit.worktree) if unit_move.exists(unit.worktree) else ()
     runs = runs_of(unit.worktree)
+    directors = frozenset(unit_runs.director(folder) for folder in runs) - {""}
+    claude = claude_sessions(unit.worktree, directors)
     claims = mac_claims(unit.worktree)
-    ids = {item["sessionId"] for item in claude} | {unit_runs.director(folder) for folder in runs}
+    ids = {item["sessionId"] for item in claude} | directors
     known = {item["pid"] for item in claude} | {claim.pid for claim in claims}
     inside = unit_move.processes_inside(unit.worktree) if unit_move.exists(unit.worktree) else []
     return Found(claude, mesh_runs(runs), reviewers(unit), holds(ids), reservations(unit.worktree), claims,
@@ -373,14 +379,15 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float) -> list[str]:
         pending = {item["session"]["session_id"] for item in shutdown_record.all_session_records()}
     except (shutdown_record.InvalidRecord, OSError) as error:
         return [f"{describe_session(item)}: shutdown records unreadable: {error}" for item in found.claude]
-    ids = [item["sessionId"] for item in found.claude if item["sessionId"] not in pending]
+    ids_found = [item["sessionId"] for item in found.claude]
+    ids = [session_id for session_id in ids_found if session_id not in pending]
     if ids:
         started = run([sys.executable, str(SHUTDOWN), "down", "--here", "--only", ",".join(ids)])
         if started.returncode:
             return [f"{describe_session(item)}: shutdown down refused: {failure(started)}" for item in found.claude]
     deadline = time.monotonic() + wait_minutes * 60
     while True:
-        live = {item["sessionId"] for item in claude_sessions(unit.worktree)}
+        live = {item["sessionId"] for item in claude_sessions(unit.worktree, frozenset(ids_found))}
         still = [item for item in found.claude if item["sessionId"] in live]
         if not still or time.monotonic() >= deadline:
             break
