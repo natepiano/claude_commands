@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
@@ -369,13 +370,51 @@ class NoComposer:
     """The visible screen has no current input box."""
 
 
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def _prompt_screen(screen: str) -> str:
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen)
+    return _ESCAPE.sub("", screen)
+
+
+def _faint_after(parameters: str, faint: bool) -> bool:
+    """The faint state after one SGR sequence; colour arguments (38/48/58 ;5;n or ;2;r;g;b) are skipped."""
+    values = parameters.split(";")
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value in {"", "0", "22"}:
+            faint = False
+        elif value == "2":
+            faint = True
+        elif value in {"38", "48", "58"} and index + 1 < len(values):
+            index += {"5": 2, "2": 4}.get(values[index + 1], 0)
+        index += 1
+    return faint
+
+
+def _typed_text(screen: str) -> str:
+    """The screen without escapes and without faint text, which is Claude's placeholder hint, never input."""
+    kept: list[str] = []
+    faint, position = False, 0
+    for match in _SGR.finditer(screen):
+        segment = _ESCAPE.sub("", screen[position:match.start()])
+        kept.append("".join(char for char in segment if char in "\r\n") if faint else segment)
+        faint = _faint_after(match.group(1), faint)
+        position = match.end()
+    segment = _ESCAPE.sub("", screen[position:])
+    kept.append("".join(char for char in segment if char in "\r\n") if faint else segment)
+    return "".join(kept)
 
 
 def _composer_input(screen: str) -> ComposerInput | NoComposer:
-    """Parse the final live composer, excluding old input and its footer."""
+    """Parse the final live composer, excluding old input and its footer.
+
+    An ANSI screen (`--format ansi`) lets faint placeholder text such as `Try "fix lint errors"` read as empty.
+    """
     lines = _prompt_screen(screen).splitlines()
+    typed = _typed_text(screen).splitlines()
     closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
     if not closing_borders:
         return NoComposer()
@@ -389,7 +428,7 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
     # Column-zero output below the last box makes that box scrollback.
     if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
         return NoComposer()
-    region = lines[top_borders[-1] + 1:closing]
+    region = typed[top_borders[-1] + 1:closing]
     region[0] = re.sub(r"^[❯>]\s*", "", region[0])
     return ComposerInput("\n".join(line.strip() for line in region))
 
@@ -1121,8 +1160,9 @@ class Herdr:
                         for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
-        screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
-        composer = _composer_input(screen)
+        raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+        screen = _prompt_screen(raw)
+        composer = _composer_input(raw)
         if isinstance(composer, ComposerInput) and not composer.text.strip():
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
@@ -1148,11 +1188,11 @@ class Herdr:
 
     def prompt_in_input(self, pane: str, text: str) -> bool:
         """Read only the visible composer's last input region, never transcript scrollback."""
-        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible"))
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
         return isinstance(composer, ComposerInput) and composer.contains(text)
 
     def prompt_input_empty(self, pane: str) -> bool:
-        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible"))
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
         return isinstance(composer, ComposerInput) and not composer.text.strip()
 
     def _wait_for_submit(self, cursor: TranscriptCursor, text: str, deadline: float) -> PromptSubmitOutcome:
@@ -1253,8 +1293,9 @@ class Herdr:
                     result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
                     if isinstance(result, PromptSubmitted):
                         return bound_outcome(result)
-                    screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
-                    composer = _composer_input(screen)
+                    raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+                    screen = _prompt_screen(raw)
+                    composer = _composer_input(raw)
                     if time.monotonic() >= deadline:
                         return deadline_failure()
                     if isinstance(cursor.readability, TranscriptUnreadable):
@@ -1543,8 +1584,29 @@ def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_Pan
             and members[0].evidence is _StartupShellEvidence.UNTOUCHED)
 
 
+def _herdr_resumes_agents() -> bool:
+    """False only when herdr's config sets `[session] resume_agents_on_restore = false`."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "config.toml"
+    try:
+        session = tomllib.loads(path.read_text(encoding="utf-8")).get("session")
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return not (isinstance(session, dict) and cast(dict[str, object], session).get("resume_agents_on_restore") is False)
+
+
+def keeps_restored_layout(session: str) -> bool:
+    """The shared session keeps a restored layout while herdr resumes no agent itself."""
+    return session == shared_session() and not _herdr_resumes_agents()
+
+
 def _clear_restored_workspaces(client: Herdr) -> None:
-    """A server we just spawned holds restored layout, never live work."""
+    """A server we just spawned holds restored layout, never live work.
+
+    The shared session keeps its layout for `pane_restore.py` only when herdr resumes no agent
+    itself: else herdr would resume each pane on the server's account (herdr review, 2026-10-19).
+    """
+    if keeps_restored_layout(client.session):
+        return
     result = client.result("workspace", "list")
     workspaces = [json_text(json_object(item, "herdr workspace").get("workspace_id"),
                             "herdr workspace id")
@@ -1565,7 +1627,19 @@ def _server_unit_active(name: str) -> bool:
     ]).returncode == 0
 
 
+def _installed_server_unit(name: str) -> bool:
+    """True when a unit file defines the server's unit (the boot unit); a transient unit does not count."""
+    shown = run_program([
+        os.environ.get("SYSTEMCTL", "systemctl"), "--user", "show", "-p", "FragmentPath", "--value", server_unit(name),
+    ])
+    path = shown.stdout.strip()
+    return shown.returncode == 0 and bool(path) and "/transient/" not in path
+
+
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
+    # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
+    if client.session == shared_session() and _installed_server_unit(client.session):
+        return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
         "--collect", *client.argv("server"),

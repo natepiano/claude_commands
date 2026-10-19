@@ -33,11 +33,20 @@ Verdict = Literal["clean", "fixed", "exception", "held", "waived"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
 
 
+class DeclaredInputScope(StrEnum):
+    RULE = "rule"
+    FILE = "file"
+
+
 class CellInputScope(StrEnum):
     FILE = "file"
     CRATE = "crate"
     MANIFEST = "manifest"
     MODULE = "module"
+
+
+def _comparison_scope(declared: DeclaredInputScope, scope: CellInputScope) -> CellInputScope:
+    return CellInputScope.FILE if declared == DeclaredInputScope.FILE else scope
 
 
 def _cell_scope(rule: Rule, path: str, tip: RepositoryTip) -> CellInputScope:
@@ -309,6 +318,7 @@ class Judgment:
     commit: str
     verdict: Verdict
     input_scope: CellInputScope
+    declared_scope: DeclaredInputScope
 
 
 @dataclass(frozen=True)
@@ -555,6 +565,7 @@ MIGRATIONS = {
         );
     """,
     9: "ALTER TABLE tickets ADD COLUMN cells TEXT NOT NULL DEFAULT '[]';",
+    10: "ALTER TABLE judgments ADD COLUMN declared_scope TEXT NOT NULL DEFAULT 'rule';",
 }
 
 
@@ -614,6 +625,7 @@ class Ledger:
         return self._fingerprints[key]
 
     def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str) -> bool:
+        scope = _comparison_scope(row.declared_scope, scope)
         try:
             previous = (row.input_fingerprint if row.input_scope == scope
                         else self._fingerprint(self._tip(row.commit), scope, path))
@@ -881,13 +893,13 @@ class Ledger:
         # Commits inherited at the start or merged from another branch are not ours.
         own_commits = set(_git(self.repo, "rev-list", "--first-parent", checkpoint,
                                "^" + ticket["base"]).splitlines())
-        rows = cast(list[tuple[int, str, str, str]], self._connection.execute(
-            'SELECT j.id,j.rule,j.path,j."commit" FROM judgments j WHERE j.ticket=? '
+        rows = cast(list[tuple[int, str, str, str, str]], self._connection.execute(
+            'SELECT j.id,j.rule,j.path,j."commit",j.declared_scope FROM judgments j WHERE j.ticket=? '
             + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.ticket=j.ticket '
             + 'AND latest.rule=j.rule AND latest.path=j.path ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
             (ticket["id"],),
         ).fetchall())
-        for judgment_id, rule, path, judged_commit in rows:
+        for judgment_id, rule, path, judged_commit, declared in rows:
             try:
                 definition = self._component_rule(rule)
                 if definition.family != ticket["family"] or judged_commit == checkpoint:
@@ -898,13 +910,13 @@ class Ledger:
                                           "^" + judged_commit, "--", path).splitlines())
                 if not changed_commits <= own_commits:
                     continue
-                scope = _cell_scope(definition, path, tip)
+                scope = _comparison_scope(DeclaredInputScope(declared), _cell_scope(definition, path, tip))
                 fingerprint = self._fingerprint(tip, scope, path)
             except LedgerError:
                 continue
             _ = self._connection.execute(
-                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
-                + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,? FROM judgments WHERE id=? '
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope) '
+                + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,?,declared_scope FROM judgments WHERE id=? '
                 + 'ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) DO NOTHING',
                 (scope, fingerprint, checkpoint, datetime.now(timezone.utc).isoformat(), judgment_id),
             )
@@ -1127,8 +1139,8 @@ class Ledger:
                 _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
                 return InputChangedSinceJudged()
             path = tip.crate(finding.path) if definition.tier == "D" and definition.input_scope == "manifest" else finding.path
-            rows = cast(list[tuple[int, str, str, str, str, str, str, str, str]], self._connection.execute(
-                'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint FROM judgments '
+            rows = cast(list[tuple[int, str, str, str, str, str, str, str, str, str]], self._connection.execute(
+                'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint,declared_scope FROM judgments '
                 + "WHERE rule=? AND path=? AND verdict='held' ORDER BY recorded_at DESC,id DESC",
                 (finding.rule, path),
             ).fetchall())
@@ -1141,7 +1153,7 @@ class Ledger:
                 "SELECT id FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
                 (finding.rule, path),
             ).fetchone())[0]
-            held_row = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]))
+            held_row = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]), DeclaredInputScope(row[9]))
             try:
                 unchanged = (self._judgment_inputs_match(held_row, tip, _cell_scope(definition, path, tip), path)
                              and self._is_ancestor(row[3], tip.commit))
@@ -1346,8 +1358,11 @@ class Ledger:
 
     def record(
         self, rule: str, path: str, commit: str, rule_blob: str, verdict: Verdict,
-        detail: str = "", ticket: str = "", worker: str = "",
+        detail: str = "", ticket: str = "", worker: str = "", *,
+        input_scope: DeclaredInputScope = DeclaredInputScope.RULE,
     ) -> None:
+        if input_scope == DeclaredInputScope.FILE and verdict not in ("clean", "exception"):
+            raise LedgerError(f"{verdict}: file input scope requires clean or exception")
         self._catalog = rule_catalog.load_rules(self.repo)
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
@@ -1384,6 +1399,13 @@ class Ledger:
                 raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
+        if input_scope == DeclaredInputScope.FILE:
+            if scope == CellInputScope.FILE:
+                input_scope = DeclaredInputScope.RULE
+            elif scope == CellInputScope.MANIFEST or path not in tip.rust_files:
+                raise LedgerError(f"{rule}: {path}: file input scope requires an included Rust file, not a manifest or crate cell")
+            else:
+                scope = _comparison_scope(input_scope, scope)
         fingerprint = self._fingerprint(tip, scope, path)
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -1392,11 +1414,11 @@ class Ledger:
             ).fetchone():
                 raise LedgerError(f"{ticket}: {path} was yielded")
             _ = self._connection.execute(
-                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
-                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
-                + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at',
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
+                + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at,declared_scope=excluded.declared_scope',
                 (rule, rule_blob, scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
-                 datetime.now(timezone.utc).isoformat()),
+                 datetime.now(timezone.utc).isoformat(), input_scope),
             )
 
     def latest_held_judgments(self) -> dict[tuple[str, str], str]:
@@ -1426,11 +1448,11 @@ class Ledger:
             )
 
     def _judgments(self, rule: str, path: str) -> tuple[Judgment, ...]:
-        rows = cast(list[tuple[str, str, str, Verdict, str]], self._connection.execute(
-            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
+        rows = cast(list[tuple[str, str, str, Verdict, str, str]], self._connection.execute(
+            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
         ).fetchall())
-        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope))
-                     for blob, fingerprint, commit, verdict, scope in rows)
+        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared))
+                     for blob, fingerprint, commit, verdict, scope, declared in rows)
 
     def _judgment_state(self, rule: Rule, path: str, tip: RepositoryTip) -> tuple[CellState, str]:
         rows = self._judgments(rule.rule_id, path)
@@ -1439,7 +1461,7 @@ class Ledger:
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
         style_branch = branches[0][0] if branches else ""
         for row in rows:
-            if row.rule_blob != rule.blob:
+            if row.declared_scope != rows[0].declared_scope or row.rule_blob != rule.blob:
                 continue
             try:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
@@ -1591,6 +1613,7 @@ class LedgerArguments(argparse.Namespace):
     commit: str = ""
     rule_blob: str = ""
     verdict: Verdict = "clean"
+    input_scope: DeclaredInputScope = DeclaredInputScope.RULE
     detail: str = ""
     ticket: str = ""
     worker: str = ""
@@ -1686,6 +1709,7 @@ def main() -> None:
     _ = record.add_argument("--rule-blob", default="")
     _ = record.add_argument("--verdict", choices=("clean", "fixed", "exception", "held", "waived"), required=True)
     _ = record.add_argument("--detail", default="")
+    _ = record.add_argument("--input-scope", choices=(DeclaredInputScope.FILE,), type=DeclaredInputScope, default=DeclaredInputScope.RULE)
     lint = commands.add_parser("lint-record")
     _ = lint.add_argument("--tip", required=True)
     _ = lint.add_argument("--tool", choices=("clippy", "mend", "rustfmt"), required=True)
@@ -1765,7 +1789,8 @@ def main() -> None:
             if args.command == "set-tip":
                 ledger.set_tip(args.tip, args.style_branch)
             elif args.command == "record":
-                ledger.record(args.rule, args.path, args.commit, args.rule_blob, args.verdict, args.detail, args.ticket, args.worker)
+                ledger.record(args.rule, args.path, args.commit, args.rule_blob, args.verdict, args.detail, args.ticket, args.worker,
+                              input_scope=args.input_scope)
             elif args.command == "lint-record":
                 value = cast(object, json.loads(Path(args.diagnostics).read_text()))
                 if not isinstance(value, dict) or any(not isinstance(key, str) or type(count) is not int or count < 0
