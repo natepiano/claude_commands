@@ -91,6 +91,17 @@ class AgentNotesTests(unittest.TestCase):
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
             return agent_notes.update_alert_pass(selection, agent_accounts.observe_workers_home())
 
+    def test_held_usage_adds_no_note_message_or_quota_change(self) -> None:
+        note = self.note("claude2.md", "main@example.invalid",
+            "weekly_remaining_usage: 75\nweekly_usage_checked_at: 2026-10-19T08:09:00+00:00\n")
+        before = note.path.read_bytes()
+        report = Report("Claude", email="main@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.HELD)
+        messages = apply_quota_and_write([note], report, self.now)
+        self.assertEqual(messages, [])
+        self.assertEqual(note.path.read_bytes(), before)
+        self.assertFalse((self.root / "readings.jsonl").exists())
+
     def test_unmapped_workers_keep_observations_without_selecting_the_signed_in_home(self) -> None:
         self.codex_login(self.root / ".codex", "spare@example.invalid")
         note = self.note("codex2.md", "spare@example.invalid")

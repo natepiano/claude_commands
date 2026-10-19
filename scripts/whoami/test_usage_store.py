@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 import json
 import os
 import tempfile
@@ -186,6 +188,7 @@ class UsageStoreTests(unittest.TestCase):
                                (429, UsageReadOutcome.RATE_LIMITED_429),
                                (503, UsageReadOutcome.ERROR)):
             with self.subTest(code=code):
+                usage_store.store_file().unlink(missing_ok=True)
                 good = Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10, RESETS)])
                 usage_store.save([good], READ)
                 with (patch.object(agent_accounts, "command_json", return_value={
@@ -268,6 +271,61 @@ class UsageStoreTests(unittest.TestCase):
         unknown = held["unknown"]
         assert "weekly" in unknown
         self.assertEqual(unknown["weekly"]["at"], READ.isoformat())
+
+    def test_held_save_keeps_readings_outcomes_and_attempt_fields_byte_identical(self) -> None:
+        claim = usage_store.claim_read("main@example.invalid", READ)
+        assert isinstance(claim, agent_accounts.UsageReadClaim)
+        report = Report("Claude", email="main@example.invalid", usage_read_outcome=UsageReadOutcome.RATE_LIMITED_429)
+        usage_store.finish_read("main@example.invalid", claim, report)
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quotas=[Quota("Weekly", 10, RESETS)])], READ)
+        before = usage_store.store_file().read_bytes()
+        held = Report("Claude", email="main@example.invalid",
+            source=agent_accounts.ClaudeDirectorySource(self.home / ".claude3"),
+            usage_read_outcome=UsageReadOutcome.HELD)
+        stored = usage_store.load()
+        self.assertFalse(usage_store.merge(stored, [held], READ + timedelta(seconds=1)))
+        usage_store.save([held], READ + timedelta(seconds=1))
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        self.assertEqual(stored["main@example.invalid"].get("attempted_at"), READ.isoformat())
+        self.assertEqual(stored["main@example.invalid"].get("attempt_outcome"), UsageReadOutcome.RATE_LIMITED_429)
+
+    def test_a_late_save_of_a_good_read_keeps_a_newer_failed_attempt(self) -> None:
+        login = "main@example.invalid"
+        first = usage_store.claim_read(login, READ)
+        assert isinstance(first, agent_accounts.UsageReadClaim)
+        good = Report("Claude", email=login, usage_read_claim=first,
+            usage_read_outcome=UsageReadOutcome.OK, quotas=[Quota("Weekly", 30, RESETS)])
+        usage_store.finish_read(login, first, good)
+        later = READ + timedelta(seconds=91)
+        second = usage_store.claim_read(login, later)
+        assert isinstance(second, agent_accounts.UsageReadClaim)
+        failed = Report("Claude", email=login, usage_read_claim=second,
+            usage_read_outcome=UsageReadOutcome.RATE_LIMITED_429)
+        usage_store.finish_read(login, second, failed)
+        before = usage_store.store_file().read_bytes()
+        usage_store.save([good], later + timedelta(seconds=1), {"claude2": login})
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        stored = usage_store.load()[login]
+        self.assertEqual(stored.get("read_outcome"), UsageReadOutcome.RATE_LIMITED_429)
+        self.assertEqual(stored.get("weekly", {}).get("at"), READ.isoformat())
+        labelled = cast(dict[str, dict[str, dict[str, object]]], json.loads(usage_store.label_file().read_text()))
+        self.assertEqual(labelled["claude2"]["weekly"]["at"], int(READ.timestamp()))
+
+    def test_two_saves_keep_both_logins_under_the_same_lock(self) -> None:
+        start = Barrier(2)
+
+        def save(login: str) -> None:
+            _ = start.wait(timeout=2)
+            usage_store.save([Report("Claude", email=login,
+                quotas=[Quota("Weekly", 10, RESETS)])], READ)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(save, "first@example.invalid")
+            second = pool.submit(save, "second@example.invalid")
+            first.result(timeout=3)
+            second.result(timeout=3)
+        self.assertEqual(set(usage_store.load()), {"first@example.invalid", "second@example.invalid"})
 
     def test_load_drops_what_it_cannot_read(self) -> None:
         self.assertEqual(usage_store.load(), {})
