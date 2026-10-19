@@ -171,6 +171,21 @@ class RetireUnitTests(unittest.TestCase):
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(self.doc.read_text(encoding="utf-8"), before)
 
+    def test_the_recorders_project_started_line_is_not_uncommitted_work(self) -> None:
+        plan = self.worktree / "work.txt"
+        recorded = plan.read_text(encoding="utf-8") + "- **Project started:** 2026-10-18T22:00:00-04:00\n"
+        _ = plan.write_text(recorded, encoding="utf-8")
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would remove: worktree {self.worktree}", output.splitlines())
+        # A line a person wrote beside it is still uncommitted work.
+        _ = plan.write_text(recorded + "a note\n", encoding="utf-8")
+        code, output = self.retire("--dry-run")
+        self.assertEqual(code, 1)
+        self.assertIn(f"refused: uncommitted work in {self.worktree}: work.txt", output)
+
     def test_dry_run_lists_the_seat_the_worker_and_the_reviewer_and_changes_nothing(self) -> None:
         before = self.doc.read_text(encoding="utf-8")
 
