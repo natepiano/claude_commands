@@ -91,8 +91,11 @@ Loop/verbose only:
    ten-second deadline: invoke no retry.
 6. **Standing plans:** rerun the ticket's
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket <id>`
-   before staging. Exit 1 (a review or error) retains the reservation and
-   returns to repair. On exit 0, stage only this phase's code paths from
+   before staging. Exit 1 is a review: it retains the reservation and returns
+   to repair. Exit 2 means the gate could not run (`error: <reason>`, such as a
+   locked ledger): retain the reservation, do not repair, and rerun the gate.
+   If the same error comes back, stop and report it.
+   On exit 0, stage only this phase's code paths from
    `git status --porcelain`, handling renamed paths as pairs; never name the
    plan doc, `docs/style-production/` or pinned rule files in `git add`.
    Commit exactly the gated tree once using the message below, then capture

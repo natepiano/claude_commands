@@ -417,6 +417,7 @@ def approved_reference_file(
 
 
 def gate(repo: Path, ticket_id: str) -> int:
+    """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
         with style_ledger.open_ledger(repo) as ledger:
             origin = ledger.ticket_origin(ticket_id)
@@ -429,7 +430,7 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
-                return 0 if result.returncode == 0 else 1
+                return result.returncode if result.returncode in (0, 2) else 1
             fields = frontmatter(origin.issue)
             decision = Issue(origin.issue, fields)
             answer = decision_answer(decision)
@@ -457,13 +458,16 @@ def gate(repo: Path, ticket_id: str) -> int:
                         f"{path} (change is not an approved rename reference)" for path in refused))
             print("approved proposal")
             return 0
-    except (OSError, ValueError, sqlite3.Error) as error:
+    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+        print(f"error: {error}")
+        return 2
+    except ValueError as error:
         print(f"review: {error}")
         return 1
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         rows = cast(list[tuple[str]], connection.execute("SELECT tip FROM sync WHERE id=1").fetchall())
     if not rows:
         raise style_ledger.LedgerError("no synced tip; run set-tip first")
@@ -471,7 +475,7 @@ def synced_tip(ledger: style_ledger.Ledger) -> str:
 
 
 def synced_style_branch(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         rows = cast(list[tuple[str]], connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
     return rows[0][0] if rows else ""
 
@@ -486,20 +490,20 @@ def coverage_footprint_base(repo: Path, ledger: style_ledger.Ledger, recorded_ba
     if resolved.returncode == 1:
         return recorded_base
     if resolved.returncode:
-        raise style_ledger.LedgerError(resolved.stderr.strip() or "git rev-parse failed")
+        raise style_ledger.CheckCouldNotRun(resolved.stderr.strip() or "git rev-parse failed")
     merged = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD", resolved.stdout.strip()],
                             capture_output=True, text=True, check=False)
     if merged.returncode == 1:
         return recorded_base
     if merged.returncode:
-        raise style_ledger.LedgerError(merged.stderr.strip() or "git merge-base failed")
+        raise style_ledger.CheckCouldNotRun(merged.stderr.strip() or "git merge-base failed")
     base = merged.stdout.strip()
     ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", recorded_base, base],
                               capture_output=True, text=True, check=False)
     if ancestry.returncode == 1:
         return recorded_base
     if ancestry.returncode:
-        raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
+        raise style_ledger.CheckCouldNotRun(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
     return base
 
 
@@ -968,7 +972,7 @@ PHASE = re.compile(r"(?ms)^### Phase \d+ — (?P<id>[^\s]+)[^\n]*(?:\n|\Z).*?(?=
 
 
 def discard_finished(ledger: style_ledger.Ledger, text: str) -> tuple[str, tuple[str, ...]]:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         states = dict(cast(list[tuple[str, str]], connection.execute("SELECT id,state FROM tickets").fetchall()))
     changes: list[str] = []
     def keep(match: re.Match[str]) -> str:

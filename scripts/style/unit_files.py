@@ -26,7 +26,7 @@ class UnitWorktree:
 def git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
     if result.returncode:
-        raise style_ledger.LedgerError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+        raise style_ledger.CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout
 
 

@@ -30,6 +30,10 @@ class FootprintError(Exception):
     pass
 
 
+class CheckCouldNotRun(Exception):
+    """A git command failed, so the change was not judged."""
+
+
 @dataclass(frozen=True)
 class Token:
     value: str
@@ -115,7 +119,7 @@ def git(repo: Path, *arguments: str, input_text: str = "") -> str:
     result = subprocess.run(["git", "-C", str(repo), *arguments], input=input_text,
                             capture_output=True, text=True, errors="surrogateescape", check=False)
     if result.returncode:
-        raise FootprintError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+        raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout
 
 
@@ -130,7 +134,7 @@ def folded_base(repo: Path, base: str, head: str) -> str:
             if result.returncode == 1:
                 raise FootprintError("merge in range")
             if result.returncode:
-                raise FootprintError(f"git merge-tree: {result.stderr.strip()} (exit {result.returncode})")
+                raise CheckCouldNotRun(f"git merge-tree: {result.stderr.strip()} (exit {result.returncode})")
             tree = result.stdout.splitlines()[0]
             # Subsequent folds need ancestry, not merely the intermediate tree.
             environment = dict(os.environ, GIT_AUTHOR_NAME="Style footprint", GIT_AUTHOR_EMAIL="style@example.invalid",
@@ -139,7 +143,7 @@ def folded_base(repo: Path, base: str, head: str) -> str:
                                     input="Fold merged-in work for style comparison\n", capture_output=True,
                                     text=True, env=environment, check=False)
             if commit.returncode:
-                raise FootprintError(commit.stderr.strip())
+                raise CheckCouldNotRun(commit.stderr.strip())
             current = commit.stdout.strip()
     return current
 
@@ -1738,7 +1742,7 @@ def worktree_commit(repo: Path) -> str:
             result = subprocess.run(["git", "-C", str(repo), *arguments], env=environment,
                                     capture_output=True, text=True, check=False)
             if result.returncode:
-                raise FootprintError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+                raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
             return result.stdout.strip()
 
         _ = snapshot_git("add", "-A", "--", ":/")
@@ -1780,7 +1784,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(prefix + "mechanical")
         return int(needs_review)
-    except (FootprintError, OSError, ValueError, StopIteration) as error:
+    except (CheckCouldNotRun, OSError, StopIteration) as error:
+        print(f"error: {error}")
+        return 2
+    except (FootprintError, ValueError) as error:
         print(f"review: {error}")
         return 1
 

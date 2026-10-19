@@ -1530,8 +1530,10 @@ The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
 worktree. Run it again at <CheckpointCommit/> step 6 before staging. The gate and
 `ticket checkpoint` refuse unjudged owned cells, naming each one. Coverage
 selection runs the mechanical filter at the ticket's recorded base; an approved
-proposal permits only files of its approved findings. Exit 1 retains the
-reservation and returns to repair. Exit 0 permits committing exactly that tree,
+proposal permits only files of its approved findings. Exit 1 prints `review:`,
+retains the reservation and returns to repair. Exit 2 prints `error:` when the
+gate could not run, such as a locked ledger: retain the reservation and rerun
+it; if the same error comes back, stop and report it. Exit 0 permits committing exactly that tree,
 then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit>`
 before marking the phase done. Both gates run this one command, so they cannot drift.
 </StandingPlanRefill>

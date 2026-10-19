@@ -32,6 +32,8 @@ from rules import Family, InputScope, MemberReach, Rule, Tier
 CellState = Literal["current", "stale", "open", "awaiting merge"]
 Verdict = Literal["clean", "fixed", "exception", "held", "waived"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
+# How long every ledger connection waits for another writer's lock before it fails.
+BUSY_TIMEOUT_SECONDS = 30
 
 
 class DeclaredInputScope(StrEnum):
@@ -70,6 +72,10 @@ def _cell_scope(rule: Rule, path: str, tip: RepositoryTip) -> CellInputScope:
 
 class LedgerError(ValueError):
     """A ledger operation cannot represent the requested check."""
+
+
+class CheckCouldNotRun(LedgerError):
+    """A git command failed or the ledger schema is newer than this script; the request is not at fault."""
 
 
 @dataclass(frozen=True)
@@ -389,7 +395,7 @@ def _git(repo: Path, *arguments: str) -> str:
         ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False,
     )
     if result.returncode:
-        raise LedgerError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+        raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout.rstrip("\n")
 
 
@@ -633,23 +639,27 @@ class Ledger:
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
-        self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=30)
-        _ = self._connection.execute("PRAGMA foreign_keys=ON")
-        _ = self._connection.execute("BEGIN IMMEDIATE")
-        _ = self._connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
-        versions = cast(list[tuple[int]], self._connection.execute("SELECT version FROM schema_version").fetchall())
-        version = versions[0][0] if versions else 0
-        if version > max(MIGRATIONS):
+        self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
+        try:
+            _ = self._connection.execute("PRAGMA foreign_keys=ON")
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            _ = self._connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+            versions = cast(list[tuple[int]], self._connection.execute("SELECT version FROM schema_version").fetchall())
+            version = versions[0][0] if versions else 0
+            if version > max(MIGRATIONS):
+                raise CheckCouldNotRun(f"unsupported ledger schema version {version}")
+            for number, migration in sorted(MIGRATIONS.items()):
+                if number > version:
+                    for statement in migration.split(";"):
+                        if statement.strip():
+                            _ = self._connection.execute(statement)
+                    _ = self._connection.execute("DELETE FROM schema_version")
+                    _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
+            self._connection.commit()
+        except BaseException:
+            # A locked or newer ledger fails here; close so the caller holds no connection.
             self.close()
-            raise LedgerError(f"unsupported ledger schema version {version}")
-        for number, migration in sorted(MIGRATIONS.items()):
-            if number > version:
-                for statement in migration.split(";"):
-                    if statement.strip():
-                        _ = self._connection.execute(statement)
-                _ = self._connection.execute("DELETE FROM schema_version")
-                _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
-        self._connection.commit()
+            raise
 
     def close(self) -> None:
         self._connection.close()
@@ -1803,8 +1813,9 @@ def preview_ledger(repo: Path) -> Generator[Ledger]:
     with tempfile.TemporaryDirectory(prefix="style-ledger-preview-") as directory:
         database = Path(directory) / "ledger.sqlite"
         if location.database.exists():
-            with (closing(sqlite3.connect(location.database.resolve().as_uri() + "?mode=ro", uri=True)) as source,
-                  closing(sqlite3.connect(database)) as destination):
+            with (closing(sqlite3.connect(location.database.resolve().as_uri() + "?mode=ro", uri=True,
+                                          timeout=BUSY_TIMEOUT_SECONDS)) as source,
+                  closing(sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)) as destination):
                 source.backup(destination)
         with Ledger(location.repo, database) as ledger:
             yield ledger
