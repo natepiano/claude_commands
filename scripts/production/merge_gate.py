@@ -9,7 +9,8 @@ plus the runner itself. Startup samples never discard reservations.
 Samples are at least 0.25 seconds apart. One job is always allowed to progress;
 an observed overshoot makes the run red. This is admission on samples, not an
 OS allocation limit; growth between samples can still exceed the cap. A job whose
-own sampled memory goes over the cap is killed at that sample and fails the run.
+own sampled memory goes over the cap is killed at that sample and fails the run, and so is
+a job still running at the module time limit (default 1800 s).
 --tests-only runs the same suite runner without performing any git operations.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -49,6 +50,10 @@ TEST_SUITES = (
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
 MODULE_MEMORY_MIB = 48
+# A module still running this long is killed and the run is red: a hung module holds every gate
+# behind it. The slowest measured module took 387 s at load 152 (delegate/test_verify_mac_offload.py,
+# 2026-10-18); the limit is about 4.6 times that.
+DEFAULT_MODULE_TIME_LIMIT_S = 1800
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
 # Python restores these dispositions before exec, including an inherited SIG_IGN.
@@ -82,6 +87,7 @@ class GateArguments(argparse.Namespace):
     mac_repo: str = ""
     settings_blob: str = ""
     memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB
+    module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
 
 
@@ -297,9 +303,12 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
-def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = ()) -> GateRun:
+def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
+               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
+    if module_time_limit_s <= 0:
+        raise GateRefused("module time limit must be positive")
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
@@ -377,6 +386,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     admission.reserve(process.pid)
                 for job in running[:]:
                     status = job.process.poll()
+                    if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
+                        job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
+                        print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                        kill_job_group(job)
+                        status = job.process.poll()
                     if status is None:
                         continue
                     finished = time.monotonic()
@@ -552,7 +566,7 @@ def merge_checkpoint(args: GateArguments) -> int:
             abort = git(repo, "merge", "--abort")
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
-        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs)
+        suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s))
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
         check_settings(repo, "HEAD", str(args.settings_blob))
@@ -633,6 +647,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
                             help="sampled memory admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+    _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
+                            help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
     args = cast(GateArguments, parser.parse_args(argv))
     if not args.tests_only:
@@ -643,7 +659,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with rollback_signals():
             if args.tests_only:
-                return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib)).passed else 1
+                return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
+                                       module_time_limit_s=float(args.module_time_limit_s)).passed else 1
             return merge_checkpoint(args)
     except (GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

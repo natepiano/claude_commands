@@ -627,6 +627,24 @@ class MergeGateTests(unittest.TestCase):
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), MODULES)
 
+    def test_a_module_still_running_at_the_time_limit_is_killed_and_the_gate_is_red(self) -> None:
+        self.write(self.state / "hold-module", "hold")
+        result = self.run_gate("--tests-only", "--module-time-limit-s", "2")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^hooks/test_first\.py killed: still running after 2 s, the module time limit$")
+        self.assertRegex(result.stdout, r"(?m)^hooks: RED ")
+        held = int((self.state / "module-held").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(held, 0)
+        starts = [row for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(len(starts), MODULES)
+
+    def test_nonpositive_module_time_limit_refuses_without_running_modules(self) -> None:
+        result = self.run_gate("--tests-only", "--module-time-limit-s", "0")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("module time limit must be positive", result.stdout + result.stderr)
+        self.assertEqual(self.module_events(), [])
+
     def test_a_sample_counts_swapped_memory(self) -> None:
         with mock.patch.object(merge_gate, "swapped_kib", return_value=1024 * 1024):
             sample = merge_gate.process_memory_mib({os.getpid()})
