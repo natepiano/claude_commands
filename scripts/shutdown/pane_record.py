@@ -16,8 +16,9 @@ restore leaves a Claude closed by hand closed.
 `seed` writes the entries for the Claudes already running, read from herdr's process info.
 
 Linux reads a process from /proc. The Mac has no /proc: it reads the parent with `ps` and the
-arguments and environment from the kernel's KERN_PROCARGS2 record. Of an environment, only the
-names below are kept; every other value is dropped as it is read and never written or printed.
+arguments and environment from the kernel's KERN_PROCARGS2 record, split by
+`account.procargs2_parts`. Of an environment, only the names below are kept; every other value is
+dropped as it is read and never written or printed.
 """
 
 from __future__ import annotations
@@ -140,28 +141,12 @@ def _environment(parts: Sequence[bytes]) -> dict[str, str]:
     return {key: value for key, _, value in pairs if _needed(key)}
 
 
-def procargs(raw: bytes) -> tuple[list[str], dict[str, str]]:
-    """The arguments and the needed environment in a KERN_PROCARGS2 record.
-
-    The record is argc, the executable path, NUL padding, argc arguments, then the environment,
-    each string NUL-terminated.
-    """
-    argc = int.from_bytes(raw[:4], sys.byteorder)
-    parts = raw[4:].split(b"\0")[1:]
-    start = next((index for index, part in enumerate(parts) if part), len(parts))
-    arguments = parts[start:start + argc]
-    if len(arguments) < argc:
-        raise ValueError("short KERN_PROCARGS2 record")
-    rest = parts[start + argc:]
-    end = next((index for index, part in enumerate(rest) if not part), len(rest))
-    return [os.fsdecode(part) for part in arguments], _environment(rest[:end])
-
-
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
-    from account import kern_procargs2
+    from account import kern_procargs2, procargs2_parts
 
-    return procargs(kern_procargs2(pid))
+    parts = procargs2_parts(kern_procargs2(pid), _needed)
+    return list(parts.arguments), parts.environment
 
 
 def _parent(pid: int) -> int:

@@ -266,6 +266,22 @@ class AccountTests(unittest.TestCase):
                 self.assertIsInstance(account.mac_process_record(321), account.ProcessEnvironmentUnread)
                 self.assertIsInstance(account.process_codex_home(321), account.ProcessEnvironmentUnread)
 
+    def test_a_kernel_record_keeps_the_arguments_and_only_the_kept_environment(self) -> None:
+        payload = (int(5).to_bytes(4, sys.byteorder, signed=True) + b"/opt/claude/bin/claude\0\0\0\0"
+                   + b"claude\0--name\0alpha unit\0--model\0\0"
+                   + b"CLAUDE_CONFIG_DIR=/Users/n/.claude3\0CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-private\0"
+                   + b"SHOWRUNNER_UNIT_ID=alpha-unit\0HOME=/Users/n\0\0executable_path=/opt/claude/bin/claude\0\0\0")
+        parts = account.procargs2_parts(payload, lambda name: name == "CLAUDE_CONFIG_DIR" or name.startswith("SHOWRUNNER_"))
+        self.assertEqual(parts.executable, Path("/opt/claude/bin/claude"))
+        self.assertEqual(parts.arguments, ("claude", "--name", "alpha unit", "--model", ""))
+        self.assertEqual(parts.environment, {"CLAUDE_CONFIG_DIR": "/Users/n/.claude3", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertNotIn("private", repr(parts))
+
+    def test_a_short_kernel_record_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            _ = account.procargs2_parts(int(9).to_bytes(4, sys.byteorder, signed=True) + b"/bin/claude\0\0claude\0",
+                                        lambda _: True)
+
     def test_legacy_note_alone_still_resolves_the_spaced_account_label(self) -> None:
         self.write_note("claude 2.md", "legacy@example.invalid")
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
