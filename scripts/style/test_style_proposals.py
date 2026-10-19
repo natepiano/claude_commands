@@ -141,7 +141,8 @@ class StyleProposalsTests(unittest.TestCase):
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         finding = ledger.hold(rule, f"{crate}/src/lib.rs", line, f"site {line}", kind, "value", "count", blob, ticket)
         if record:
-            ledger.record(rule, finding.path, self.tip, blob, "held", ticket=ticket, worker="test")
+            ledger.record(rule, finding.path, self.tip, blob, "held", ticket=ticket, worker="test",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
         return finding
 
     def file(self, ledger: style_ledger.Ledger) -> tuple[Path, ...]:
@@ -619,7 +620,8 @@ class StyleProposalsTests(unittest.TestCase):
             ledger.set_tip(self.tip, "style/main")
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == self.rename)
             finding = ledger.hold(self.rename, "alpha/src/gone.rs", 1, "site 1", "rename", "value", "count", blob, "outside")
-            ledger.record(self.rename, finding.path, self.tip, blob, "held", ticket="outside", worker="test")
+            ledger.record(self.rename, finding.path, self.tip, blob, "held", ticket="outside", worker="test",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
             _ = ledger.decline_findings((finding.finding_id,), f"{finding.path} is not in synced commit")
