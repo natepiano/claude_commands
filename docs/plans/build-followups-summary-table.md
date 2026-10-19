@@ -26,37 +26,14 @@ Source: the user, via berth-parallel and the showrunner, 2026-10-19: "i want to 
 
 ### Phase 1 — The summary table in every report  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** every dual-layout `progress` report and every `_print_last_recorded` report prints the summary table, with or without `--tables`. Only the round table and its `Earlier:` line need `--tables`.
-
-**Spec:**
-
-1. `scripts/delegate/progress_history.py`
-   - The progress path: compute `summary` when `uses_dual_layout or tables`. The legacy layout keeps `if tables`.
-   - `_print_last_recorded`: print `_summary_table(...)` always. Its `_phase_section(..., tables=tables)` call stays as it is, so the round table stays behind `--tables`.
-   - Update the docstrings that say the clocks table needs `--tables`, and the `--tables` help text (`include the round table`).
-2. `commands/unit/report.md`
-   - Step 5: copy the summary table byte for byte in every report. `tables` adds the round table, `Earlier:` and the verification gate lines.
-   - Step 6: put the summary table after the ETA line in every report; `tables` puts the round table after it.
-   - Update the `tables` sentence near line 28 to match.
-3. `scripts/delegate/test_progress_history.py`
-   - `test_short_progress_keeps_promises_stage_and_worker_narration_without_tables` and the other short-report tests that assert no `|` lines: assert the summary table header and its Project and Phase rows are present, and that the round table is absent.
-   - Add one test for `_print_last_recorded` without `--tables`: the summary table prints, the round table does not.
-   - Keep one legacy-layout test that shows no table without `--tables`, or add one.
+- In the dual (unit) layout, `progress` prints the summary table (`_summary_table`: a Project row and a Phase row) after the ETA line, with or without `--tables`. The progress path computes `summary` when `uses_dual_layout or tables`; the legacy layout keeps `if tables`.
+- `_print_last_recorded` (between windows, and for an activity open after its phase closed) always prints the summary table with the last recorded clocks. Its `_phase_section(..., tables=tables)` call is unchanged, so the round table and its `Earlier:` line still need `--tables`.
+- The `--tables` help text is `include the round table`.
+- `/unit:report` step 5 copies the summary table byte for byte in every report; step 6 puts it after the ETA line. `tables` adds the round table after the summary table, plus `Earlier:` and the verification gate lines.
 
 **Files:**
-- `scripts/delegate/progress_history.py` — the summary table prints in every dual-layout report; docstrings and `--tables` help
-- `scripts/delegate/test_progress_history.py` — short-report tests expect the summary table; one new test between windows; one legacy test
+- `scripts/delegate/progress_history.py` — the summary table in every dual-layout report; docstrings and `--tables` help
+- `scripts/delegate/test_progress_history.py` — short-report tests require the summary header and its Project and Phase rows and no round table; a between-windows test without `--tables`; a legacy-layout test with no table
 - `commands/unit/report.md` — steps 5 and 6 and the `tables` sentence
-
-**Workers:** 1 writer. The change is small and one file depends on the next, so nothing splits.
-- `impl` — all three files
-
-**Acceptance gate:** `python3 -m unittest scripts.delegate.test_progress_history` green; basedpyright 0 errors, 0 warnings on the two Python files; a dual-layout `progress` call without `--tables` prints the summary table and no round table.
-
-**Not in scope:** the as-built docs (the run's as-built pass updates `plan-delegate-progress-history.md`, `unit-board.md`, `agent-registry.md`, `conversation-pause.md`, `phase-tables.md` and `showrunner-automation.md`).
-
-**Verification:** `python3 -m unittest scripts.delegate.test_progress_history`, then basedpyright on the two Python files. The director runs `merge_gate --tests-only` at the gate.
