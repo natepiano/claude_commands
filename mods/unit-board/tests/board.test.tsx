@@ -50,6 +50,9 @@ function emptyBoxes(value: unknown): number {
   return (node(value).type === "Box" && lines(value).every(line => !line.trim()) ? 1 : 0)
     + children(value).reduce<number>((count, child) => count + emptyBoxes(child), 0);
 }
+function textSpans(value: unknown): string[] {
+  return node(value).type === "Text" ? lines(value) : children(value).flatMap(textSpans);
+}
 function unit(key: string, state: BoardUnit["state"]): BoardUnit {
   return { ...fixture().units[0]!, key, state };
 }
@@ -123,6 +126,24 @@ function longUnit(): BoardData {
 // Run the same layout assertions against both engine element surfaces.
 describe("board layout", () => {
   for (const surface of ["terminal", "desktop"] as const) {
+    test(`${surface}: board empty ticket title leaves no title gap at 76 columns`, async ($, on) => {
+      const data = fixture();
+      const active = data.units[0]!;
+      active.phase = { kind: "ticket", id: "names-unit-63", title: "", merged: 62 };
+      active.phases = [];
+      active.stage = "Build";
+      const ui = await render($, on, surface, data, false, 76);
+      const tree = await ui.drawn();
+      const ticketSpans = textSpans(tree).filter(span => span.includes("Ticket names-unit-63"));
+
+      expect(ticketSpans).toHaveLength(1);
+      // The open button may reserve two cells; an absent title adds none.
+      expect(ticketSpans[0]).toMatch(/Ticket names-unit-63 · 62 merged {0,2}$/);
+      expect(ticketSpans[0]!.match(/names-unit-63/g)).toHaveLength(1);
+      expect(cellWidth(lines(tree).find(row => row.includes("Ticket names-unit-63"))!))
+        .toBeLessThanOrEqual(76);
+    });
+
     for (const detail of [false, true]) {
       for (const merged of [0, 62]) {
         test(`${surface}: ${detail ? "unit" : "board"} ticket heading shows ${merged} merged at 76 columns`, async ($, on) => {
