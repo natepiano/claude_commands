@@ -1,4 +1,4 @@
-/** Stored status from accounts.py status --json --stored --with-login. */
+/** Stored status from accounts.py status --json --stored. */
 export interface StoredAccount {
   label: string;
   tool: 'claude' | 'codex';
@@ -8,7 +8,6 @@ export interface StoredAccount {
   credits: number | 'unlimited' | null;
   use_credits: boolean;
   read_at: string | null;
-  login?: string | null;
 }
 export interface StoredAccountsStatus {
   accounts: StoredAccount[];
