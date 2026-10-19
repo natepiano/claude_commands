@@ -24,7 +24,13 @@ missing file or one without frontmatter it exits 2: report the line.
 
 ## File
 
-A finished proposal becomes an issue through `/issue`: tag `proposal` beside
+A style decision is filed by `style_proposals.py file`, never `/issue`.
+It covers one rule and crate under one rule text. The user answers once;
+later findings under that text keep the answer. Use `style_proposals.py sites`
+for all findings and `candidates` for off-rule ideas. A candidate is never a
+proposal; drop one with `style_proposals.py drop-candidate --idea "<text>"`. Other finished proposals become issues through `/issue`.
+
+For other proposals, tag `proposal` beside
 `issue`, and `proposed_by` the unit or session that wrote it. Drafts stay out.
 The writer proposes all five ranking values (`backlog_goal`,
 `backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort`) at
@@ -47,34 +53,30 @@ Never ask star by star, and never through a form.
 
 ## Approve
 
-On the user's approval, send the issue path to the unit that builds it. The
-unit writes the work into its plan as phases that cite the issue, puts the issue
-on the plan's `> **Issues:**` header line (`~/.claude/docs/delegate_plan_format.md`),
-and replies with the plan path and phases. Then:
+For a style decision, record the user's approval with its unit's own plan
+copy and no phase numbers:
 
 ```sh
-… proposal_issue.py approve <issue> --showrunner "<name>" --unit <unit> --plan "<plan path> Phase N–M"
+… proposal_issue.py approve <issue> --showrunner "<name>" --unit <unit> --plan "<unit plan copy>"
 ```
 
-- `--showrunner`: this session's name as `showrunners.py name <slug>` prints it
-  (`hana`, `natedev`), never the production slug.
-- `--unit`: the unit's full name in the production doc's **Units** table
-  (`trunk-unit`).
-
-The stage stays backlog until the work starts. A proposal the user declines
-closes through `/close_issue` with its reason, except an issue tagged `style`:
-decline it only through the command below, never `/close_issue`.
+Refill builds its approved findings in small tickets. The decision stays open
+until every finding is built or waived. Decline only through:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/style/style_proposals.py decline --repo <style checkout> --issue <issue> --words '<the user’s words>'
 ```
 
+For other proposals, send the approved issue to the unit that builds it.
+The unit adds phases that cite it and puts it on the plan's `> **Issues:**`
+line. Record that plan and its phases with the same `approve` command.
+`--showrunner` is the session name from `showrunners.py name <slug>`;
+`--unit` is the full name in the production's Units table. The stage stays
+backlog until work starts. Other declined proposals close through `/close_issue`.
+
 ## Start and close
 
-The unit's run does both:
-
-- **start**: `/unit:direct` <PrepareSession/> marks each issue on the plan's
-  Issues line active.
-- **close**: the end-of-run as-built pass
-  (`~/.claude/docs/delegate/final_gate_commit.md` → <RunAsBuilt/>) sets
-  `as_built` to the doc it wrote and closes each issue.
+Style refill marks a decision active. Run `style_proposals.py complete` after
+each merge; it closes the decision when all findings are built or waived.
+For other proposals, `/unit:direct` marks plan issues active, and its final
+as-built pass closes them with the as-built doc.
