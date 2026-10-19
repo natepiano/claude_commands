@@ -120,24 +120,19 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 ### Phase 5 — Throwaway experiments  · status: done
 **Depends on:** Phase 3, Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** a measured gain for each candidate from Phases 3 and 4 whose estimate rests on an assumption a test can settle.
-
-**Spec:**
-- Pick at most five candidates by expected weekly tokens × uncertainty. Each experiment states its question, setup, the number it reads and its own token cost.
-- Allowed setups: a scratch `CLAUDE_CONFIG_DIR` copy with one change, a headless `claude -p` run on a fixed prompt read from a real session's first request (start size with and without the change); `compaction_replay` under other limits; a replay script over stored turns; a Codex thread on a scratch worktree with a shortened start prompt. Never a real session, account move, or edit to live config.
-- Budget per Invariants (3M weighted tokens in total).
-- Output: one row per experiment: change, measured saving per request or per thread, scaled to weekly tokens with a range; `token-study/5-experiments/report.md`; setups kept under `token-study/experiments/`.
+- `~/.local/state/nightly-review/token-study/5-experiments/report.md` (outside git) holds five offline replay experiments over the week 2026-10-12..19, one row each with before/after numbers, a weekly projection with range, a same-work check, and its own cost. Halves: `5-experiments/claude/claude.md` and `5-experiments/codex/codex.md`; setups, results and verification files are in `token-study/experiments/<name>/`.
+- No live model run was made: observed savings are 0 and experiment model cost is 0. Every gain is a replay projection whose range starts at 0.
+- Projections (weighted tokens/week): Codex wait-run collapse 37,638,356.80 (0.51983%; 4.32% of the wait-only exposure). Claude one pause notice per context 1,488,675.10 (the strict rule removes 0). Codex identical-read reference 13,378.65 (0–246,797.33). Codex review compaction limits: none, because no modeled limit beats observed cost and the instruction-availability check fails at every boundary.
+- A request is removable from a wait run only when its tool output is timing-only and its assistant message carries no work. A message is a pause notice only when its whole body is the notice.
 
 **Files:**
-- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/5-experiments/` and `token-study/experiments/` (outside git).
+- `docs/plans/build-followups-efficiency.md` — this record; the study lives outside git
 
-**Workers:** 2 writers (no test lane), one experiment set each; the unit director assigns experiments by family, gives each experiment its own folder `token-study/experiments/<name>/` with its verification files, splits the 3M budget between the writers before launch, and owns the merged `5-experiments/report.md`.
+**Binds later work:** Ranked proposals label every gain "modeled", never "measured". The largest untested lever is the number of wait turns per fix/impl job (about 750M exposure).
 
-**Constraints from prior phases:** the candidates and their estimated gains come from "The fixed cost of every request" (`token-study/3-fixed/report.md`) and "What the turns do" (`token-study/4-turns/report.md`). Phase 4's largest exposures (weighted tokens/week, lower bound 0, not savings): Codex wait-only 872,250,459.96 (empty `write_stdin` 446M, sleep tool 270M, wait tool 126M; fix role 484M); Codex repeat file reads 262,157,700.33; first request after compaction, Codex 268,446,616.37 and Claude 99,646,720.72 (Codex review compacts at p50 9 requests; its start carries a 15,818-token Work Order); Claude skill reread 184,706,534.08 (`unit:direct` source Read co-carried with the invoked copy, 30.4M); Claude notification-only 63,541,446.27 (repeated pause notices). Price a saving from the billed tokens of the requests it removes, never from Phase 4's exposure. The start residual (Claude 15–30%, Codex 21–28%) has no tokenizer on natedev; do not pick it. The store's `fix_pass` is 0 on every review pass, so no experiment can count review rounds from it.
-
-**Acceptance gate:** each experiment reports before/after numbers, its cost and a pass/fail against its estimate, plus a check that the work still comes out the same (the removed instructions, tool access or task result are still available where the work needs them: Artifact was called 5 times in Phase 3's week); observed savings are kept apart from replay projections (`compaction_replay` models cost, not equal work); total cost under budget; Invariants checks as Phase 2.
+**Ruled out:** dropping the director's `direct.md` re-Read after compaction (the copy in context holds only 260/707 and 236/710 of the required lines); raising Codex review compaction limits on cost-model evidence alone.
 
 ### Phase 6 — Ranked proposals  · status: todo
 **Depends on:** Phase 5
@@ -160,6 +155,6 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Workers:** nothing splits: the unit director writes the ranking and the ledger lines from the phase reports; no worker opens.
 
-**Constraints from prior phases:** all phase reports. Phase 2's weighted per checkpoint is a descriptive comparison only; a claim that a change does the same work needs matched tasks or unchanged acceptance outcomes.
+**Constraints from prior phases:** all phase reports. Phase 5 (`token-study/5-experiments/report.md`) measured no observed saving: every gain is a replay projection with range starting at 0, so label it "modeled", never "measured". Its projections (weighted/week): Codex wait-run collapse 37,638,356.80 (0.51983%, 4.32% of the 872M wait-only exposure); Claude one pause notice per context 1,488,675.10; Codex identical-read reference 13,378.65 (0–246,797.33); Codex review compaction limits none (no limit beats observed cost; instruction check fails). Do not propose dropping the director's `direct.md` re-Read after compaction (the copy in context lacks needed lines). The largest untested lever is wait turns per fix/impl job (about 750M exposure); propose it as not measurable with that reason. Phase 3–4 exposures are upper bounds, not gains. Phase 2's weighted per checkpoint is a descriptive comparison only; a claim that a change does the same work needs matched tasks or unchanged acceptance outcomes.
 
 **Acceptance gate:** every proposal has a gain with range and evidence; the open token findings listed in Key files each have a disposition; the For you row's efficiency count equals the net count after every ledger change (new lines up, superseded or gone lines down), checked against the rendered row; the showrunner has the table.
