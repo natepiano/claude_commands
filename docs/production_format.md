@@ -101,7 +101,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   minutes when the user asks for a schedule; each update reports every unit in full; the
   update timer reads N from this line, `on demand` runs no timer and a dailies runs only
   when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
-  timer and no footer unless asked)
+  timer unless asked)
 - **Merge tests:** <backticked commands run in the showrunner checkout on every merge,
   besides the changed packages' tests, e.g. `./verify.sh test -p app`; text after the
   first unbackticked `(` is commentary>; `—` if none. Each command runs with no shell;

@@ -1927,7 +1927,7 @@ class SettleTests(ShutdownTestCase):
     def test_begin_timer_stop_failure_takes_only_that_owner_out(self) -> None:
         first, second = top_level("first", "First", timers=["timer-first"]), top_level("second", "Second")
         def snapshot(owner: inventory.Session) -> list[record.TimerRestore]:
-            return [record.TimerRestore(instance="timer-first", was_enabled=True, footer={"kind": "no footer"})] if owner["session_id"] == "first" else []
+            return [record.TimerRestore(instance="timer-first", was_enabled=True)] if owner["session_id"] == "first" else []
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])),
             patch.object(settle, "_notifier_enabled", return_value=True),
@@ -1994,7 +1994,7 @@ class SettleTests(ShutdownTestCase):
         stopping = session_shutdown(top_level("stopping", "Stopping"), progress={"kind": "stopping", "at": NOW})
         waiting = session_shutdown(top_level("waiting", "Waiting"))
         for saved in (stopped, stopping, waiting):
-            saved["timers"] = [record.TimerRestore(instance=saved["session"]["session_id"], was_enabled=True, footer={"kind": "no footer"})]
+            saved["timers"] = [record.TimerRestore(instance=saved["session"]["session_id"], was_enabled=True)]
             self.save(saved)
         with patch.object(settle, "run_notifier") as notifier, patch.object(settle, "_retire_shutdown_messages"):
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 1)
@@ -2005,7 +2005,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_cancel_after_stop_claim_leaves_paused_worker_and_timers_intact(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
-        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True, footer={"kind": "no footer"})]
+        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True)]
         self.save(saved)
         entered, release = threading.Event(), threading.Event()
         def kill(_pid: int, _signal: int) -> None:
@@ -2145,7 +2145,7 @@ class SettleTests(ShutdownTestCase):
             self.save(session_shutdown(owner, progress={"kind": "stopped", "at": NOW}, then="restart"))
         def confirm(saved: record.SessionShutdown, at: str, live: bool) -> None:
             if saved["session"]["session_id"] == "second":
-                raise OSError("footer restore failed")
+                raise OSError("confirm failed")
             self.fake_confirm(saved, at, live)
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
@@ -2163,7 +2163,7 @@ class SettleTests(ShutdownTestCase):
         self.assertIsNone(record.find_session(LOGIN, "first"))
         failed = record.find_session(LOGIN, "second")
         assert failed is not None
-        self.assertEqual(failed["progress"], {"kind": "restart failed", "at": NOW, "reason": "footer restore failed"})
+        self.assertEqual(failed["progress"], {"kind": "restart failed", "at": NOW, "reason": "confirm failed"})
         outcomes = cast(list[record.SessionShutdown], cast(object, report.call_args.args[0]))
         self.assertEqual(next(item for item in outcomes if item["session"]["session_id"] == "first")["progress"]["kind"], "restarted")
 
@@ -2843,16 +2843,15 @@ class SettleTests(ShutdownTestCase):
         self.assertNotEqual(launch_threads["detached"], caller)
         self.assertEqual(record.session_records(LOGIN), [])
 
-    def test_cancel_restores_enabled_timers_footers_and_retires_queued_messages(self) -> None:
+    def test_cancel_restores_enabled_timers_and_retires_queued_messages(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"))
         saved["settle_message"] = {"kind": "queued", "at": NOW, "reason": "busy"}
-        saved["timers"] = [record.TimerRestore(instance="enabled", was_enabled=True, footer={"kind": "footer", "slug": "production"}),
-                           record.TimerRestore(instance="off", was_enabled=False, footer={"kind": "no footer"})]
+        saved["timers"] = [record.TimerRestore(instance="enabled", was_enabled=True),
+                           record.TimerRestore(instance="off", was_enabled=False)]
         self.save(saved)
-        with patch.object(settle, "run_notifier") as timers, patch.object(settle, "_restore_footer") as footer, patch.object(settle, "_retire_shutdown_messages") as retire, patch.object(settle, "send_message", return_value={"kind": "sent"}) as send:
+        with patch.object(settle, "run_notifier") as timers, patch.object(settle, "_retire_shutdown_messages") as retire, patch.object(settle, "send_message", return_value={"kind": "sent"}) as send:
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
         timers.assert_called_once_with("start", "enabled")
-        footer.assert_called_once_with("production")
         retire.assert_called_once_with(LOGIN, "owner")
         self.assertIn("cancelled by the user: continue where you were", cast(str, send.call_args.args[2]))
         self.assertIsNone(record.find_session(LOGIN, "owner"))
@@ -3616,7 +3615,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_cancel_only_live_failed_stop_restores_resources_and_names_running_session(self) -> None:
         saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
-        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True, footer={"kind": "no footer"})]
+        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True)]
         saved["settle_message"] = {"kind": "sent", "at": NOW}
         sibling = session_shutdown(top_level("other", "Other"))
         self.save(saved)
@@ -3660,7 +3659,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_cancel_only_failed_stop_lost_to_stop_claim_keeps_timers_and_names_stopping(self) -> None:
         saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
-        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True, footer={"kind": "no footer"})]
+        saved["timers"] = [record.TimerRestore(instance="timer", was_enabled=True)]
         self.save(saved)
         withdraw = record.withdraw_failed_stop
         def stop_first(login: str, identity: str, check: Callable[[record.SessionShutdown], bool], restore: Callable[[record.SessionShutdown], None]) -> record.SessionWithdrawn | record.SessionRetained:

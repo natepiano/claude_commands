@@ -1,9 +1,9 @@
-"""The footer's counts line: how much waits on the user, read at render time and never stored.
+"""The counts line: how much waits on the user, read at render time and never stored.
 
-Changes are the rows still to review on the list the doc's Change review line names, proposals the
-open proposal issues in its Proposals folder, and projects the improvement-queue lines still to
-decide or hand out, for a doc with an Improvement queue line. Questions are counted only where no
-Waiting on block carries them, so each count is shown once.
+The status line and the dailies report's own footer show it; no reply carries it (user,
+2026-10-18). Changes are the rows still to review on the list the doc's Change review line names,
+proposals the open proposal issues in its Proposals folder, and projects the improvement-queue
+lines still to decide or hand out, for a doc with an Improvement queue line.
 """
 from __future__ import annotations
 

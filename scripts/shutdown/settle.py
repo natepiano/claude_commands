@@ -33,9 +33,8 @@ import note_file
 from inventory import Inventory, Session, inventory
 from launch_permission import shutdown_state_root
 import record as store
-from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
+from record import SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
-import showrunner_footer
 import showrunners
 import sessions
 import stop as stop_work
@@ -380,45 +379,12 @@ def _notifier_enabled(instance: str) -> bool:
     except (OSError, UnicodeError):
         return False
 
-def _restore_footer(slug: str) -> None:
-    showrunner_footer.set_footer_state(slug, showrunner_footer.FooterState.ON)
-
 def _pause_timers(session_id: str) -> list[TimerRestore]:
     released = conversation_pause.release(session_id)
     if isinstance(released, conversation_pause.NoPauseRecord):
         return []
-    footers = set(released.footers)
     restore = not isinstance(released.phase, conversation_pause.KeptOff)
-    timers: list[TimerRestore] = []
-    for instance in released.instances:
-        slug = instance.removeprefix("showrunner-")
-        footer: ShowrunnerFooter | NoFooter
-        if restore and instance.startswith("showrunner-") and slug in footers:
-            footer = {"kind": "footer", "slug": slug}
-            footers.remove(slug)
-        else:
-            footer = {"kind": "no footer"}
-        timers.append(
-            {
-                "instance": instance,
-                "was_enabled": restore,
-                "footer": footer,
-            }
-        )
-    for slug in sorted(footers):
-        instance = f"showrunner-{slug}"
-        timers.append(
-            {
-                "instance": instance,
-                "was_enabled": _notifier_enabled(instance),
-                "footer": (
-                    {"kind": "footer", "slug": slug}
-                    if restore
-                    else {"kind": "no footer"}
-                ),
-            }
-        )
-    return timers
+    return [{"instance": instance, "was_enabled": restore} for instance in released.instances]
 
 def _session_timer_snapshot(session: Session) -> list[TimerRestore]:
     timers = _pause_timers(session["session_id"])
@@ -431,7 +397,6 @@ def _session_timer_snapshot(session: Session) -> list[TimerRestore]:
             {
                 "instance": instance,
                 "was_enabled": enabled,
-                "footer": {"kind": "no footer"},
             }
         )
     return timers
@@ -1044,9 +1009,6 @@ def _restore_record(saved: SessionShutdown) -> None:
     for timer in saved["timers"]:
         if timer["was_enabled"]:
             run_notifier("start", timer["instance"])
-        footer = timer["footer"]
-        if footer["kind"] == "footer":
-            _restore_footer(footer["slug"])
     _retire_shutdown_messages(saved["login"], saved["session"]["session_id"])
     if saved["settle_message"]["kind"] in {"sent", "queued"}:
         _ = send_message(f"session:{saved['session']['session_id']}",
