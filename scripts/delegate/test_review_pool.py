@@ -746,10 +746,37 @@ class ReviewPoolTests(unittest.TestCase):
     def test_retire_ends_every_reviewer_of_the_unit_and_no_other(self) -> None:
         self.seed({"code1": self.idle("unit"), "ui1": {**self.idle("unit"), "type": "ui"},
                    "code2": self.idle("other"), "code3": self.idle("unit-unit")})
-        other = self.reviewer("code2")
-        self.assertEqual(sorted(self.succeed("retire", "--unit", "unit").splitlines()), ["code1", "code3", "ui1"])
-        self.assertEqual(self.reviewers(), {"code2": other})
-        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")), ["code1", "code3", "ui1"])
+        kept = {name: self.reviewer(name) for name in ("code2", "code3")}
+        self.assertEqual(sorted(self.succeed("retire", "--unit", "unit").splitlines()), ["code1", "ui1"])
+        self.assertEqual(self.reviewers(), kept)
+        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")), ["code1", "ui1"])
+
+    def units_table(self, *units: str) -> None:
+        """Register the production's doc with a Units table of these ids."""
+        doc = self.root / "production-production.md"
+        _ = doc.write_text("\n".join(["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                       "| --- | --- | --- | --- | --- | --- |",
+                                       *(f"| {unit} | p.md | /w/{unit} | {unit} | — | — |" for unit in units)]) + "\n",
+                           encoding="utf-8")
+        instance = self.root / "notifier/showrunner-production"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:sid-production\nCHECK=zsh /x/production_check.sh {doc}\n", encoding="utf-8")
+
+    def test_retire_of_one_unit_leaves_a_unit_whose_name_extends_it(self) -> None:
+        self.units_table("handler-enh", "handler-enh-unit")
+        self.seed({"code7": self.idle("handler-enh"), "code3": self.idle("handler-enh-unit")})
+        kept = self.reviewer("code3")
+        self.assertEqual(self.succeed("retire", "--unit", "handler-enh").splitlines(), ["code7"])
+        self.assertEqual(self.reviewers(), {"code3": kept})
+
+    def test_a_short_name_resolves_to_its_units_row_for_retire_and_allocate(self) -> None:
+        self.units_table("trunk-unit")
+        _ = self.prime()
+        allocation = self.allocate(unit="trunk")
+        self.assertEqual(self.reviewer(str(allocation["reviewer"]))["lease"], {"unit": "trunk-unit", "ordinal": 1})
+        self.release(str(allocation["reviewer"]))
+        self.assertEqual(self.succeed("retire", "--unit", "trunk").splitlines(), [allocation["reviewer"]])
 
     def test_retire_removes_a_reservation_whose_owner_died(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])

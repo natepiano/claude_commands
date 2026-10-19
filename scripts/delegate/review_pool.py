@@ -537,10 +537,11 @@ def command_allocate(args: PoolArguments) -> int:
     production = _production(str(args.production))
     pid = int(args.pid)
     _prime_standing(production, args.type)
+    unit = _unit_id(production.directory.name, str(args.unit))
     with production.locked() as pool:
         generation = pool.generation
         _require_finished_stop(pool)
-        name, reviewer, source = _choose(pool, args.type, str(args.unit), pid)
+        name, reviewer, source = _choose(pool, args.type, unit, pid)
         template_name = pool.templates[args.type].name
     newly_forked = not reviewer.thread_id
     if newly_forked:
@@ -571,7 +572,7 @@ def command_allocate(args: PoolArguments) -> int:
                 current.thread_id = thread_id
                 if source == template_name:
                     # A template fork has none of the unit's context: its lease starts again at the first review.
-                    current.lease = UnitLease(str(args.unit), 1)
+                    current.lease = UnitLease(unit, 1)
                     current.prime_hash = pool.templates[args.type].prime_hash
                 reviewer = current
         if not thread_id:
@@ -612,21 +613,37 @@ def command_release(args: PoolArguments) -> int:
     return 0
 
 
-def _same_unit(lease: UnitLease, unit: str) -> bool:
-    # Lease names predate one spelling: some directors gave `trunk`, others `trunk-unit`.
-    return lease.unit.removesuffix("-unit") == unit.removesuffix("-unit")
+def _unit_id(slug: str, unit: str) -> str:
+    """The Units table id a caller means: `trunk` is `trunk-unit` when only that row exists.
+
+    A unit absent from the table, or a production with no readable doc, keeps the name given.
+    """
+    doc = timer_docs().get(slug)
+    if doc is None:
+        return unit
+    production_scripts = str(Path(__file__).resolve().parents[1] / "production")
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
+    import production_units
+
+    try:
+        rows = production_units.unit_table(doc.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError, ValueError, production_units.Refusal):
+        return unit
+    ids = {production_units.cell_value(cells.get("Unit", "")) for cells in rows}
+    return unit if unit in ids or f"{unit}-unit" not in ids else f"{unit}-unit"
 
 
 def command_retire(args: PoolArguments) -> int:
     """End the unit's reviewers; one still reviewing keeps its turn and is left in place."""
     production = _production(str(args.production))
-    unit = str(args.unit)
+    unit = _unit_id(production.directory.name, str(args.unit))
     pid = os.getpid()
     with production.locked(write=False) as pool:
         _require_finished_stop(pool)
         generation = pool.generation
         names = [name for name, reviewer in pool.reviewers.items()
-                 if isinstance(reviewer.lease, UnitLease) and _same_unit(reviewer.lease, unit)]
+                 if isinstance(reviewer.lease, UnitLease) and reviewer.lease.unit == unit]
     for name in names:
         with production.locked() as pool:
             _generation(pool, generation)
