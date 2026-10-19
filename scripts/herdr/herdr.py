@@ -1544,7 +1544,12 @@ def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_Pan
 
 
 def _clear_restored_workspaces(client: Herdr) -> None:
-    """A server we just spawned holds restored layout, never live work."""
+    """A server we just spawned holds restored layout, never live work.
+
+    The shared session keeps its layout: `pane_restore.py` resumes each pane on its own account.
+    """
+    if client.session == shared_session():
+        return
     result = client.result("workspace", "list")
     workspaces = [json_text(json_object(item, "herdr workspace").get("workspace_id"),
                             "herdr workspace id")
@@ -1565,7 +1570,19 @@ def _server_unit_active(name: str) -> bool:
     ]).returncode == 0
 
 
+def _installed_server_unit(name: str) -> bool:
+    """True when a unit file defines the server's unit (the boot unit); a transient unit does not count."""
+    shown = run_program([
+        os.environ.get("SYSTEMCTL", "systemctl"), "--user", "show", "-p", "FragmentPath", "--value", server_unit(name),
+    ])
+    path = shown.stdout.strip()
+    return shown.returncode == 0 and bool(path) and "/transient/" not in path
+
+
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
+    # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
+    if client.session == shared_session() and _installed_server_unit(client.session):
+        return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
         "--collect", *client.argv("server"),

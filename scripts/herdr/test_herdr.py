@@ -1799,6 +1799,26 @@ class HerdrTests(unittest.TestCase):
                     ["--session", "fixture", "workspace", "close", "w2"],
                 ])
 
+    def test_the_shared_session_starts_its_boot_unit_and_keeps_its_restored_layout(self) -> None:
+        shared = self.root / "config/herdr/shared-session"
+        shared.parent.mkdir(parents=True)
+        _ = shared.write_text("fixture\n")
+        self.configure(["--user", "show", "-p", "FragmentPath", "--value", "herdr-fixture.service"],
+                       "/etc/systemd/user/herdr-fixture.service\n")
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0},
+            {"stdout": "status: running\n", "code": 0},
+        ]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        _ = herdr.start_server("fixture", 10_000)
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "status", "server"],
+            ["--user", "show", "-p", "FragmentPath", "--value", "herdr-fixture.service"],
+            ["--user", "start", "herdr-fixture.service"],
+            ["--session", "fixture", "status", "server"],
+            ["--user", "is-active", "herdr-fixture.service"],
+        ])
+
     def test_spawned_servers_report_session_and_workspace_when_close_fails(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({
             "result": {"workspaces": [{"workspace_id": "w1"}]},
