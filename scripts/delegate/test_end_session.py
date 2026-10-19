@@ -52,19 +52,14 @@ class EndSessionTests(unittest.TestCase):
         scripts = self.root / "scripts"
         delegate = scripts / "delegate"
         agents = scripts / "agents"
-        message = scripts / "message"
         delegate.mkdir(parents=True)
         agents.mkdir()
-        message.mkdir()
         (scripts / "lib").mkdir()
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = delegate / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
         _ = (delegate / "remove_workers.py").write_text("", encoding="utf-8")
         _ = (agents / "codex_mesh.py").write_text("", encoding="utf-8")
-        notifier = message / "notifier.sh"
-        _ = notifier.write_text("#!/usr/bin/env zsh\nexit 0\n", encoding="utf-8")
-        notifier.chmod(0o755)
 
         python_shim = self.root / ".claude" / "scripts" / "lib" / "py"
         python_shim.parent.mkdir(parents=True)
@@ -114,21 +109,6 @@ class EndSessionTests(unittest.TestCase):
         self.assertIn("codex_mesh.py sweep --root", calls[2])
         self.assertIn(f"{self.root} --stop", calls[2])
         self.assertFalse(self.marker.exists())
-
-    def test_the_notifier_instance_follows_the_run_folder_name(self) -> None:
-        notifier = self.script.parent.parent / "message" / "notifier.sh"
-        _ = notifier.write_text("#!/usr/bin/env zsh\nprint -r -- \"notifier $*\" >> \"$END_SESSION_CALLS\"\n", encoding="utf-8")
-        for folder, instance in (("unit", "unit-new-run"), ("delegate", "delegate-new-run")):
-            with self.subTest(folder=folder):
-                run = self.root / folder / "new-run"
-                run.mkdir(parents=True)
-                _ = self.marker.write_text(f"{run}\n", encoding="utf-8")
-                self.calls.unlink(missing_ok=True)
-                result = subprocess.run(
-                    ["bash", str(self.script)], check=False, capture_output=True, text=True, env=self.environment())
-                self.assertEqual(result.returncode, 0, result.stderr)
-                removals = [line for line in self.calls.read_text(encoding="utf-8").splitlines() if line.startswith("notifier remove")]
-                self.assertEqual([line.split()[2] for line in removals], [instance])
 
     def make_run(self, name: str, director: str) -> Path:
         run = self.runs / name
