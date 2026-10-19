@@ -4,7 +4,7 @@
 
 > **As-built disposition: create**
 
-> **Production: build-followups** — unit `two-accounts-unit`; production doc `docs/plans/build-followups-production.md`
+> **Production: build-followups** — unit `accounts-unit`; production doc `docs/plans/build-followups-production.md`
 
 ## Source
 
