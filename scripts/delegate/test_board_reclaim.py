@@ -109,6 +109,25 @@ class BoardReclaimTests(unittest.TestCase):
                       (self.root / "board.log").read_text())
         self.assert_guard_file()
 
+    def test_a_waiter_whose_pid_ends_stops_waiting(self) -> None:
+        holder = self.holder_process()
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid)),
+                             "acquired cargo")
+        run = self.holder_process()
+        waiter = subprocess.Popen(
+            ["bash", str(BOARD), "acquire", str(self.root), "next", "cargo",
+             "--pid", str(run.pid), "--wait", "600"],
+            env={**os.environ, "PLAN_DELEGATE_NOW_EPOCH": "1000"},
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        run.kill()
+        _ = run.wait(timeout=5)
+
+        _, errors = waiter.communicate(timeout=10)
+        self.assertEqual(waiter.returncode, 4, errors)
+        self.assertIn(f"gone cargo: pid {run.pid} ended while it waited", errors)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(holder.pid))
+
     def test_reclaims_zombie_holder(self) -> None:
         holder = self.holder_process()
         self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(holder.pid)),
@@ -288,6 +307,30 @@ class BoardReclaimTests(unittest.TestCase):
         self.assertEqual(unrelated_release.returncode, 1,
                          unrelated_release.stdout + unrelated_release.stderr)
         self.assertEqual((self.lock / "holder_pid").read_text(), str(second.pid))
+
+    def test_a_reclaimed_holder_record_outlives_a_release_and_acquire(self) -> None:
+        # verify.sh gives the token back for each memory wait, so the token can
+        # change hands again before the reclaimed holder releases.
+        first = self.holder_process()
+        second = self.holder_process()
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(first.pid),
+                                        "--hold", "10"), "acquired cargo")
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(second.pid),
+                                        "--wait", "0", epoch=1011),
+                             "acquired cargo (reclaimed from holder)")
+        self.assertEqual(self.board("release", "holder", "cargo", "--pid", str(second.pid)).returncode, 0)
+        self.assert_acquired(self.board("acquire", "holder", "cargo", "--pid", str(second.pid)),
+                             "acquired cargo")
+
+        old_release = self.board("release", "holder", "cargo", "--pid", str(first.pid))
+        self.assertEqual(old_release.returncode, 3, old_release.stdout + old_release.stderr)
+        self.assertEqual((self.lock / "holder_pid").read_text(), str(second.pid))
+
+        # A record whose holder is gone is dropped at the next release.
+        first.kill()
+        _ = first.wait(timeout=5)
+        self.assertEqual(self.board("release", "holder", "cargo", "--pid", str(second.pid)).returncode, 0)
+        self.assertFalse((self.root / "locks" / "cargo.reclaimed").exists())
 
 
 if __name__ == "__main__":

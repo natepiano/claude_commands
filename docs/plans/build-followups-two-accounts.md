@@ -2167,3 +2167,22 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `write` needs the caller to hold `read_lock`. A second flock on the lock file in one thread blocks, so never take the lock inside a path that already holds it.
 - The extra passes still run the snapshot's notes refresh (in `/etc/nixos/modules/linux/agent-sessions-snapshot.py`, outside this repo); they now read nothing. The showrunner routes the change that skips it.
 - The one pool review found one blocker (a late save of an older good read cleared a newer 429) and one minor (a store error cost the read). Both are fixed with tests.
+
+### Phase 80 — The accounts table has no Login column and no roles line  · status: done
+
+#### As-built
+
+- The no-argument `accounts.py status` table has the columns Folder, Label, Role, Weekly left, Weekly resets, On credits, Credits left, Read. It has no Login column and no `units: …, showrunners: …` line; it starts with its header row. The user asked for both (2026-10-19): the logins were masked, and the top line repeated the Role column.
+- `status --with-login` is removed (the unit-board mod stopped passing it in its phase 16). `render_status_json` has no `with_login` parameter, and the JSON has no `login` field.
+- A row with no folder, no login or an unreadable folder gets one note: `* <label>: not set up: no folder holds this account`, `* <label>: not logged in` or `* <label>: its folder could not be read`, unless a folder or sign-in note already explains it (`_account_state_notes`). It has no login address.
+- Each unconfigured Claude group gets `accounts: <group> has no account; run accounts.py move <group> <claudeN>` beside the Codex workers note. A configured group gets no note. The JSON problems list carries the same lines.
+
+**Files:**
+- `scripts/accounts/accounts.py` — the columns, the removed line and flag, the state and group notes.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py` — tests.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/as-built/unit-board.md` — text.
+
+**Gotchas:**
+- `group_status_line` stays: placement still prints it.
+- `accounts.py status` notes can still name a login (the "no account note, not selectable … with login:" line), so never run it to find a label.
+- The one pool review found one minor (a row lost its reason with the Login column). The merge gate found that status no longer said a group was not configured. Both are fixed with tests.

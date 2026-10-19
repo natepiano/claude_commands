@@ -60,7 +60,49 @@ describe("board geometry", () => {
       phase("3", "todo"), phase("4", "gated")]);
     expect(small.map(cell => cell.ch).join("")).toBe("█▓░▒");
     const large = Array.from({ length: 45 }, (_, index) => phase(String(index + 1), index < 44 ? "done" : "todo"));
-    expect(stripCells(large).map(cell => cell.ch).join("")).toContain("44/45 done");
+    expect(stripCells(large)).toHaveLength(20);
+    expect(stripCells(large).map(cell => cell.ch).join("")).toBe("█".repeat(19) + "░");
+  });
+
+  test("twenty phases retain one state-colored cell each, and phase twenty-one is bucketed", () => {
+    const phases = Array.from({ length: 20 }, (_, index) => phase(String(index + 1), "done"));
+    phases[19]!.status = "gated";
+    expect(stripCells(phases)).toHaveLength(20);
+    expect(stripCells(phases)[19]).toEqual({ ch: "▒", tone: "warning" });
+    phases.push(phase("21", "open"));
+    expect(stripCells(phases)).toHaveLength(20);
+    expect(stripCells(phases)[19]).toEqual({ ch: "▓", tone: "suggestion" });
+  });
+
+  test("132-phase buckets use exact floor boundaries and open gated todo done precedence", () => {
+    const phases = Array.from({ length: 132 }, (_, index) => phase(String(index + 1), "done"));
+    // [0, 6), [6, 13), [13, 19), [19, 26): exercise every precedence pair.
+    phases[0]!.status = "todo";
+    phases[1]!.status = "gated";
+    phases[5]!.status = "open";
+    phases[6]!.status = "todo";
+    phases[12]!.status = "gated";
+    phases[13]!.status = "todo";
+    // A marker exactly at floor(19*132/20)=125 must be in the final cell.
+    phases[125]!.status = "open";
+    const cells = stripCells(phases);
+    expect(cells).toHaveLength(20);
+    expect(cells.slice(0, 4)).toEqual([
+      { ch: "▓", tone: "suggestion" }, { ch: "▒", tone: "warning" },
+      { ch: "░", tone: "inactive" }, { ch: "█", tone: "success" },
+    ]);
+    expect(cells.slice(3, 19).every(cell => cell.ch === "█" && cell.tone === "success")).toBe(true);
+    expect(cells[19]).toEqual({ ch: "▓", tone: "suggestion" });
+  });
+
+  test("ruler keeps its now mark neutral, future inactive and the unreached promise green", () => {
+    const ruler = rulerCells(fixture().units[0]!, NOW / 1000, 100, -240);
+    const mark = ruler.track.find(cell => cell.ch === "│")!;
+    expect(mark.tone).toBe("default");
+    expect(ruler.track.find(cell => cell.ch === "●")?.tone).toBe("success");
+    const future = ruler.track.filter(cell => cell.ch === "─");
+    expect(future.length).toBeGreaterThan(0);
+    expect(future.every(cell => cell.tone === "inactive")).toBe(true);
   });
 
   test("ruler starts at phase start and leaves ten percent beyond the latest horizon", () => {
@@ -99,7 +141,8 @@ describe("board geometry", () => {
     const now = ruler.track.findIndex(cell => cell.ch === "│");
     expect(promise).toBeGreaterThan(0);
     expect(now).toBeGreaterThan(promise);
-    expect(ruler.track[now]?.tone).toBe("error");
+    expect(ruler.track[now]?.tone).toBe("default");
+    expect(ruler.track[promise]?.tone).toBe("error");
     expect(ruler.track.filter(cell => cell.ch === "○").length).toBe(2);
     expect(ruler.track.some(cell => cell.ch === "━")).toBe(true);
     expect(ruler.labels).toContain("15:00");
@@ -117,8 +160,8 @@ describe("board geometry", () => {
 
   test("style runs preserve every glyph and split exactly where its theme tone changes", () => {
     const runs = runsOf([{ ch: "━", tone: "success" }, { ch: "━", tone: "success" },
-      { ch: "│", tone: "error" }, { ch: "─", tone: "subtle" }]);
+      { ch: "│", tone: "error" }, { ch: "─", tone: "inactive" }]);
     expect(runs).toEqual([{ text: "━━", tone: "success" }, { text: "│", tone: "error" },
-      { text: "─", tone: "subtle" }]);
+      { text: "─", tone: "inactive" }]);
   });
 });

@@ -13,6 +13,7 @@
 #   board.sh post    <session_dir> <agent> <kind> <message...>
 #   board.sh read    <session_dir> [--since N] [--from AGENT] [--kind KIND]
 #   board.sh acquire <session_dir> <agent> <resource> [--pid PID] [--hold SECONDS] [--wait SECONDS]
+#                    (with --pid, the wait ends when that pid is gone: exit 4)
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #                    (without --pid, a token recorded for a live pid is refused)
 #   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS]
@@ -314,8 +315,14 @@ cmd_acquire() {
   local deadline=$(( $(now_epoch) + wait_secs ))
 
   while :; do
+    # A waiter whose run has ended would take the token for a dead pid.
+    if [[ -n "$holder_pid" ]] && pid_is_gone "$holder_pid"; then
+      printf 'gone %s: pid %s ended while it waited\n' "$resource" "$holder_pid" >&2
+      return 4
+    fi
     if mkdir "$dir" 2>/dev/null; then
       write_lock_meta "$dir" "$agent" "$hold" "$holder_pid"
+      mv -f "${session_dir}/locks/${resource}.reclaimed" "$dir/reclaimed_holders" 2>/dev/null || true
       cmd_post "$session_dir" "$agent" claim "token ${resource} acquired for up to ${hold}s"
       printf 'acquired %s\n' "$resource"
       return 0
@@ -440,6 +447,19 @@ cmd_release() {
   if ! cleanup_owned_group "$dir"; then
     exec 9>&-
     return 1
+  fi
+  # verify.sh gives the token back for each memory wait, so a reclaimed holder
+  # may release after the token changed hands again: its record outlives this
+  # lock while that holder still runs, and the next acquire takes it in.
+  local line kept=""
+  if [[ -f "$dir/reclaimed_holders" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == *$'\t'* ]] || continue
+      pid_is_gone "${line##*$'\t'}" || kept+="${line}"$'\n'
+    done < "$dir/reclaimed_holders"
+  fi
+  if [[ -n "$kept" ]]; then
+    printf '%s' "$kept" > "${session_dir}/locks/${resource}.reclaimed"
   fi
   rm -rf "$dir"
   (( guarded == 0 )) || exec 9>&-

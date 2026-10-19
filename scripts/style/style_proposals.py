@@ -12,7 +12,8 @@ import sys
 import tempfile
 import tomllib
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -26,10 +27,11 @@ import coverage_report
 import rules
 import style_ledger
 import style_rules
+from approved_renames import RenameNotApplied
 from add_style import StandingStyleProduction, standing_style_production
 from issues import Issue, frontmatter, open_issues, plain
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
-                            decision_answer, fill_ranking, refresh_decision, require_generated_body)
+                            UnansweredDecision, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import git, unit_file_holders
 from user_zone import user_zone
 
@@ -562,97 +564,262 @@ class LegacyIssue:
     owned: tuple[style_ledger.HeldFinding, ...]
 
 
-def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_run: bool = False) -> None:
+def off_rule_issues(ledger: style_ledger.Ledger, proposals: Path) -> tuple[Path, ...]:
+    """The open issues that a style unit filed by hand through `/issue`, by name. Migrate never writes them."""
+    proposer = style_slug(ledger.repo)
+    # A unit files as `<unit> (<style slug>)`; the filing code files as the slug alone.
+    filers = frozenset((proposer, f"({proposer})"))
+    named = frozenset(ledger.proposal_paths())
+    # An issue that lists findings is an old style issue, and migrate takes it.
+    return tuple(issue.path for issue in open_issues(proposals, "issue")
+                 if issue.value("proposed_by").rsplit(" ", 1)[-1] in filers and not issue.path.name.startswith("style ")
+                 and not issue.fields.get("style_findings") and issue.path not in named)
+
+
+@dataclass(frozen=True)
+class NewDecision:
+    """The decision does not exist yet. It takes each field that all its old issues agree on."""
+    inherited: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class DecisionMove:
+    """One decision and the findings that move into it."""
+    key: DecisionKey
+    issue: Path
+    findings: tuple[style_ledger.HeldFinding, ...]
+    join: NewDecision | JoinAction
+    # The findings that take the decision's answer.
+    pending: tuple[str, ...]
+    # The count of findings that no earlier run moved.
+    move_count: int
+
+
+@dataclass(frozen=True)
+class OldIssueClose:
+    issue: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class ResumeMigration:
+    """Migrate takes the findings filed to each old issue, and again those an earlier run that stopped moved."""
+
+
+@dataclass(frozen=True)
+class FileBuiltAgain:
+    """Reopen takes the built findings that are not in the code, and the findings still filed to the issue."""
+    finding_ids: frozenset[str]
+
+
+MoveScope = ResumeMigration | FileBuiltAgain
+
+
+@dataclass(frozen=True)
+class MovePlan:
+    """What a move of old issues' findings into their decisions writes. Making the plan writes nothing."""
+    sources: tuple[LegacyIssue, ...]
+    moves: tuple[DecisionMove, ...]
+    closes: tuple[OldIssueClose, ...]
+    # Built findings that are not in the code. The move files them again before it moves them.
+    refile: frozenset[str]
+    # Each old issue that keeps its findings, with the reason.
+    refusals: tuple[str, ...]
+    # The decision of each finding that the move takes from an old issue.
+    decisions: Mapping[str, Path]
+    # The refused and kept lines of the old issues, in order.
+    issue_lines: tuple[str, ...]
+
+
+def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue], scope: MoveScope) -> MovePlan:
+    """Plan the move of the findings scope takes from each old issue into their decisions, and each open issue's close."""
     all_findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
     open_tickets = tuple(ticket for ticket in ledger.proposal_tickets()
                          if ticket["state"] not in style_ledger.FINAL_TICKET_STATES)
     holding = {Path(ticket["proposal"]): ticket for ticket in open_tickets}
     open_ids = {ticket["id"] for ticket in open_tickets}
+    refile = scope.finding_ids if isinstance(scope, FileBuiltAgain) else frozenset[str]()
     directories = workspace_directories(ledger)
+    lines: list[str] = []
+    refusals: list[str] = []
     sources: list[LegacyIssue] = []
     keys: dict[str, DecisionKey] = {}
     origin: dict[str, Issue] = {}
     moved_before: set[str] = set()
-    for issue in open_issues(proposals, "style"):
+    for issue in issues:
         identities = tuple(dict.fromkeys(issue.fields.get("style_findings", [])))
         if not identities:
             continue
+        # An earlier run that stopped moved these findings from this issue. Reopen moves only what it files again.
+        moved = ledger.moved_findings(issue.path) if isinstance(scope, ResumeMigration) else {}
+        taken = frozenset(identity for identity in identities if identity in moved or identity in refile or (
+            identity in all_findings and isinstance(state := all_findings[identity].state, style_ledger.Filed)
+            and state.proposal == issue.path))
+        # Migrate leaves an old issue whole while any of its findings is being built; reopen looks only at what it takes.
+        checked = identities if isinstance(scope, ResumeMigration) else tuple(sorted(taken))
         if issue.path in holding:
             ticket = holding[issue.path]
-            print(f"refused {issue.path}: live build ticket {ticket['id']} ({ticket['state']})")
+            refusals.append(f"{issue.path}: live build ticket {ticket['id']} ({ticket['state']})")
+        elif any(identity not in all_findings for identity in identities):
+            refusals.append(f"{issue.path}: unknown findings")
+        elif any(isinstance(build := all_findings[identity].build_ticket, style_ledger.BuildTicket)
+                 and build.ticket in open_ids for identity in checked):
+            refusals.append(f"{issue.path}: live build ticket")
+        else:
+            owned: list[style_ledger.HeldFinding] = []
+            for finding in (all_findings[identity] for identity in identities):
+                if finding.finding_id in taken:
+                    owned.append(finding)
+                    keys[finding.finding_id] = decision_key(finding, directories)
+                    origin[finding.finding_id] = issue
+                else:
+                    lines.append(f"kept {finding.finding_id}: {state_name(finding)}, not filed to {issue.path}")
+            moved_before.update(moved)
+            sources.append(LegacyIssue(issue, tuple(owned)))
             continue
-        if any(identity not in all_findings for identity in identities):
-            print(f"refused {issue.path}: unknown findings")
-            continue
-        listed = tuple(all_findings[identity] for identity in identities)
-        if any(isinstance(item.build_ticket, style_ledger.BuildTicket) and
-               item.build_ticket.ticket in open_ids for item in listed):
-            print(f"refused {issue.path}: live build ticket")
-            continue
-        # An earlier run that stopped moved these findings from this issue.
-        moved = ledger.moved_findings(issue.path)
-        owned: list[style_ledger.HeldFinding] = []
-        for finding in listed:
-            if finding.finding_id in moved or (isinstance(finding.state, style_ledger.Filed)
-                                               and finding.state.proposal == issue.path):
-                owned.append(finding)
-                keys[finding.finding_id] = decision_key(finding, directories)
-                origin[finding.finding_id] = issue
-            else:
-                print(f"kept {finding.finding_id}: {state_name(finding)}, not filed to {issue.path}")
-        moved_before.update(moved)
-        sources.append(LegacyIssue(issue, tuple(owned)))
+        lines.append(f"refused {refusals[-1]}")
     groups: dict[DecisionKey, list[style_ledger.HeldFinding]] = defaultdict(list)
     for source in sources:
         for finding in source.owned:
             groups[keys[finding.finding_id]].append(finding)
-    writer = decision_writer(ledger, proposals, parent)
-    decisions: dict[DecisionKey, Path] = {}
-    actions: dict[DecisionKey, JoinAction] = {}
-    pending: dict[DecisionKey, tuple[str, ...]] = {}
-    created = moved_count = closed = 0
+    moves: list[DecisionMove] = []
     for key, findings in sorted(groups.items()):
         issue = find_decision(proposals, key)
-        action: JoinAction = JoinOpenDecision()
-        if not issue.exists():
-            created += 1
-            print(f"create {issue}")
-            if not dry_run:
-                origins = sorted({origin[finding.finding_id].path: origin[finding.finding_id] for finding in findings}.values(),
-                                 key=lambda item: item.path)
-                inherited = {name: origins[0].value(name) for name in sorted(INHERITED_FIELDS)
-                             if origins[0].value(name) and all(item.value(name) == origins[0].value(name) for item in origins)}
-                _ = writer.create(key, tuple(findings), inherited)
+        join: NewDecision | JoinAction
+        if issue.exists():
+            join = join_action(issue)
         else:
-            action = join_action(issue)
-        count = sum(finding.finding_id not in moved_before for finding in findings)
-        moved_count += count
-        print(f"move {count} findings to {issue}")
+            origins = sorted({origin[finding.finding_id].path: origin[finding.finding_id] for finding in findings}.values(),
+                             key=lambda item: item.path)
+            join = NewDecision({name: origins[0].value(name) for name in sorted(INHERITED_FIELDS)
+                                if origins[0].value(name) and all(item.value(name) == origins[0].value(name) for item in origins)})
         # A finding still filed has not yet taken the decision's answer.
-        pending[key] = tuple(finding.finding_id for finding in findings if isinstance(finding.state, style_ledger.Filed))
-        if isinstance(action, WaiveWithAnswer):
-            print(f"waive {len(pending[key])} findings in {issue}: declined: {action.words}")
-        elif isinstance(action, ReopenBuiltDecision) and pending[key]:
-            print(f"reopen {issue}")
-        decisions[key] = issue
-        actions[key] = action
+        pending = tuple(finding.finding_id for finding in findings
+                        if isinstance(finding.state, style_ledger.Filed) or finding.finding_id in refile)
+        moves.append(DecisionMove(key, issue, tuple(findings), join, pending,
+                                  sum(finding.finding_id not in moved_before for finding in findings)))
+    decisions = {finding.finding_id: move.issue for move in moves for finding in move.findings}
+    closes: list[OldIssueClose] = []
+    for source in sources:
+        # A closed old issue that reopen repairs keeps its close reason.
+        if source.issue.value("status") != "open":
+            continue
+        names = sorted({decisions[finding.finding_id].name for finding in source.owned})
+        closes.append(OldIssueClose(source.issue.path, "merged into " + ", ".join(names) if names else "no filed findings"))
+    return MovePlan(tuple(sources), tuple(moves), tuple(closes), refile, tuple(refusals), decisions, tuple(lines))
+
+
+def run_moves(ledger: style_ledger.Ledger, proposals: Path, parent: str, plan: MovePlan,
+              say: Callable[[str], None], *, dry_run: bool) -> None:
+    """Say each line of a planned move just before its write, and write it unless dry run.
+
+    A built decision opens before any finding moves into it, so a stop never leaves a pending finding in a closed decision.
+    """
+    for line in plan.issue_lines:
+        say(line)
+    writer = decision_writer(ledger, proposals, parent)
+    for move in plan.moves:
+        if isinstance(move.join, NewDecision):
+            say(f"create {move.issue}")
+            if not dry_run:
+                _ = writer.create(move.key, move.findings, move.join.inherited)
+        say(f"move {move.move_count} findings to {move.issue}")
+        if isinstance(move.join, WaiveWithAnswer):
+            say(f"waive {len(move.pending)} findings in {move.issue}: declined: {move.join.words}")
+        elif isinstance(move.join, ReopenBuiltDecision) and move.pending:
+            say(f"reopen {move.issue}")
+            if not dry_run:
+                apply_answer(ledger, move.issue, move.join, move.pending)
     if not dry_run:
-        for source in sources:
+        if plan.refile:
+            ledger.return_to_filed(sorted(plan.refile))
+        for source in plan.sources:
             if source.owned:
                 ledger.move_issue_findings(source.issue.path, {
-                    finding.finding_id: decisions[keys[finding.finding_id]] for finding in source.owned})
-        for key, issue in sorted(decisions.items()):
-            apply_answer(ledger, issue, actions[key], pending[key])
-        for issue in sorted(set(decisions.values())):
+                    finding.finding_id: plan.decisions[finding.finding_id] for finding in source.owned})
+        for move in plan.moves:
+            if isinstance(move.join, WaiveWithAnswer):
+                apply_answer(ledger, move.issue, move.join, move.pending)
+        for issue in sorted(set(plan.decisions.values())):
             writer.refresh(Issue(issue, frontmatter(issue)))
-    for source in sources:
-        names = sorted({decisions[keys[finding.finding_id]].name for finding in source.owned})
-        reason = "merged into " + ", ".join(names) if names else "no filed findings"
-        print(f"close {source.issue.path}: {reason}")
-        closed += 1
+    for close in plan.closes:
+        say(f"close {close.issue}: {close.reason}")
         if not dry_run:
-            proposal_command("close", str(source.issue.path), "--reason", reason)
-    print(f"totals: create {created}, move {moved_count}, close {closed}")
+            proposal_command("close", str(close.issue), "--reason", close.reason)
+
+
+def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_run: bool = False) -> None:
+    plan = plan_moves(ledger, proposals, open_issues(proposals, "style"), ResumeMigration())
+    run_moves(ledger, proposals, parent, plan, print, dry_run=dry_run)
+    off_rule = off_rule_issues(ledger, proposals)
+    for issue in off_rule:
+        print(f"skipped: off-rule {issue}")
+    created = sum(isinstance(move.join, NewDecision) for move in plan.moves)
+    moved = sum(move.move_count for move in plan.moves)
+    print(f"totals: create {created}, move {moved}, close {len(plan.closes)}, off-rule {len(off_rule)}")
+
+
+def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bool = False) -> None:
+    """Set each built rename of the issue that is not in the synced code back to filed, in an approved decision.
+
+    Every refusal comes before the first write.
+    """
+    building = [ticket["id"] for ticket in ledger.proposal_tickets()
+                if Path(ticket["proposal"]) == issue and ticket["state"] not in style_ledger.FINAL_TICKET_STATES]
+    if building:
+        raise style_ledger.LedgerError(f"{issue}: open ticket {building[0]} builds it")
+    commit = ledger.synced_commit()
+    # Until a sync takes in a merged ticket, the synced code lacks its renames.
+    unsynced = ledger.unsynced_merges(issue)
+    if unsynced:
+        raise style_ledger.LedgerError(f"{issue}: merged ticket {unsynced[0]['id']} is not in synced commit "
+                                       + f"{commit[:7]}; sync first")
+    source = Issue(issue, frontmatter(issue))
+    if not isinstance(decision_answer(source), ApprovedDecision):
+        raise style_ledger.LedgerError(f"{issue}: not approved")
+    decision = is_decision(source)
+    # A run that stopped before the move leaves an old issue's findings filed to it.
+    unbuilt = tuple(finding for finding in issue_findings(ledger, issue)
+                    if (isinstance(finding.state, style_ledger.Built)
+                        or not decision and isinstance(finding.state, style_ledger.Filed))
+                    and isinstance(ledger.applied_check(finding, commit), RenameNotApplied))
+    if not unbuilt:
+        print("nothing to reopen: every built finding is applied")
+        return
+    built = frozenset(finding.finding_id for finding in unbuilt if isinstance(finding.state, style_ledger.Built))
+    if decision:
+        decisions = {finding.finding_id: issue for finding in unbuilt}
+        if not dry_run:
+            # Open the decision first: a stop before the findings are filed again leaves it built, so complete closes it.
+            if source.value("status") != "open":
+                proposal_command("reopen", str(issue))
+            ledger.return_to_filed(sorted(built))
+    else:
+        listed = set(source.fields.get("style_findings", []))
+        missing = sorted(finding.finding_id for finding in unbuilt if finding.finding_id not in listed)
+        if missing:
+            raise style_ledger.LedgerError(f"{issue}: style_findings does not list {', '.join(missing)}")
+        plan = plan_moves(ledger, issue.parent, [source], FileBuiltAgain(built))
+        if plan.refusals:
+            raise style_ledger.LedgerError("; ".join(plan.refusals))
+        # Every move of reopen carries pending findings, so each decision must take them with an approval.
+        for move in plan.moves:
+            if isinstance(move.join, NewDecision):
+                continue
+            answer = decision_answer(Issue(move.issue, frontmatter(move.issue)))
+            if isinstance(answer, DeclinedDecision):
+                raise style_ledger.LedgerError(f"{issue}: decision {move.issue} is declined")
+            if isinstance(answer, UnansweredDecision):
+                raise style_ledger.LedgerError(f"{issue}: decision {move.issue} has no answer")
+        decisions = plan.decisions
+        # Reopen prints only its own lines; the notices of a new decision go to stderr.
+        with redirect_stdout(sys.stderr):
+            run_moves(ledger, issue.parent, parent, plan, lambda _: None, dry_run=dry_run)
+    for finding in unbuilt:
+        print(f"filed again {finding.finding_id} in {decisions[finding.finding_id]}: "
+              + f"{finding.before} -> {finding.after} not applied in {finding.path}")
+    if not dry_run:
+        renumber()
 
 
 def main(argv: list[str]) -> int:
@@ -669,6 +836,10 @@ def main(argv: list[str]) -> int:
     _ = sub.add_parser("candidates")
     showing = sub.add_parser("sites")
     _ = showing.add_argument("--issue", type=Path, required=True)
+    reopening = sub.add_parser("reopen")
+    _ = reopening.add_argument("--issue", type=Path, required=True)
+    _ = reopening.add_argument("--parent", required=True)
+    _ = reopening.add_argument("--dry-run", action="store_true")
     migration = sub.add_parser("migrate")
     _ = migration.add_argument("--proposals", type=Path, required=True)
     _ = migration.add_argument("--parent", required=True)
@@ -682,7 +853,7 @@ def main(argv: list[str]) -> int:
         _ = command.add_argument("--repo", type=Path, default=Path.cwd())
     args = cast(ProposalArguments, parser.parse_args(argv))
     try:
-        source = (style_ledger.preview_ledger(args.repo) if args.command == "migrate" and args.dry_run
+        source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen") and args.dry_run
                   else style_ledger.open_ledger(args.repo))
         with source as ledger:
             if args.command == "file":
@@ -704,6 +875,8 @@ def main(argv: list[str]) -> int:
                 drop_candidate(ledger, args.idea)
             elif args.command == "migrate":
                 migrate(ledger, args.proposals.expanduser().resolve(), args.parent, dry_run=args.dry_run)
+            elif args.command == "reopen":
+                reopen(ledger, args.issue.expanduser().resolve(), args.parent, dry_run=args.dry_run)
             else:
                 complete(ledger)
         return 0

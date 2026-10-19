@@ -85,13 +85,14 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 | --- | --- |
 | `hooks/register.tsx` | Every direct engine call: commands, pane lifecycle, timers, state, render hooks. |
 | `hooks/data.ts` | `refreshIfChanged`, `snapshotPaths`, `loadBoard`, `loadAccounts`, `resolveUserZone` and their narrow service interfaces (`BoardLoader`, `AccountsLoader`, `UserZoneSettings`, `RefreshFiles`). |
-| `hooks/geometry.ts` | Pure layout: `stripCells`, `rulerCells`, `labelRuns`, `runsOf`, `clockText`, `signedMinutes`, `duration`, plus the text fitters:
+| `hooks/geometry.ts` | Pure layout: `stripCells`, `rulerCells`, `runsOf`, `clockText`, `shortTime`, `elapsedText`, `signedMinutes`, `duration`, plus the text fitters:
 
 - `cellWidth` counts terminal cells: wide and emoji characters 2, combining marks 0.
-- `fitText` flattens line breaks and tabs to one space, then cuts with `…`.
+- `wrappedLines(text, columns, continuationIndent)` wraps at spaces to `columns` cells, never cuts.
+- `fitText` flattens line breaks and tabs to one space, then cuts with `…` (the detail view's step labels only).
 - `doneText(keys, width, label)` gives `<label>: a, b, +N more`.
-- `overdueText` gives ` · overdue Nm|Nh Mm|Nd Mh`. |
-| `hooks/board.tsx` | `BoardView`, `RulerView` and the shared text helpers `etaText`, `gateText`, `finishText`, `workersText`. |
+- `overdueText` gives ` · overdue <elapsedText>`; `elapsedText` gives `Nm`, `Nh Mm` or `Nd Mh`. |
+| `hooks/board.tsx` | `BoardView`, `RulerView` (the detail view's ruler), `healthTone`, and the detail view's text helpers `etaText`, `gateText`, `finishText`. |
 | `hooks/unit.tsx` | `UnitView`: one unit's detail. |
 | `hooks/accounts.tsx` | `AccountsView`, `accountsTable`, `accountDisplay` and the display types. |
 | `types/board.d.ts`, `types/accounts.d.ts` | Wire contracts of the generator and of `accounts.py`. |
@@ -100,7 +101,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 **Commands.**
 
-- `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd> --session <$.session.id()>` (the open pane keeps both, so every refresh passes them), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `Run /showrunner:unit_board in a showrunner session.`; it replies `Unit board opened.` `open` buttons on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
+- `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd> --session <$.session.id()>` (the open pane keeps both, so every refresh passes them), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `Run /showrunner:unit_board in a showrunner session.`; it replies `Unit board opened.` Pressing a unit name on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
 - A mod command name allows only letters, digits, `_` and `-`, so [`commands/showrunner/unit_board.md`](../../commands/showrunner/unit_board.md) gives the name. The mod answers it with a `command.run` hook on `{ command: 'showrunner:unit_board' }` that returns `{ text }` and never calls `next`, so no model turn starts. In a session without the mod, the file's body makes the model reply one line naming `unit-board@nate-local`.
 - `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
 - `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh.
@@ -123,28 +124,26 @@ type RefreshPaths =
   | { kind: 'discovery'; sources: string[]; loadedAt: number } // sources vs the load time
 ```
 
-It stats each source; one newer than its reference (or a failed stat) runs the generator once and stores the result. `isOpen` is checked before every stat, before the generator and before the set. The board ticks on a `$.clock.every(10_000)` timer and on `turn.complete`; an unchanged board tick only moves `now`, so the ruler's now mark advances without a process. The accounts pane ticks on its own 10 s timer, with a `busy` guard, and ignores `turn.complete`. `loadAccounts` watches `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json`, `~/.claude/config/accounts.json` and `~/.local/state/accounts/role_map_cache.json` as one `discovery` path; a missing input is watched through its nearest existing parent directory. `ui.close` (any origin) cancels the pane's timer and drops its state.
+It stats each source; one newer than its reference (or a failed stat) runs the generator once and stores the result. `isOpen` is checked before every stat, before the generator and before the set. The board ticks on a `$.clock.every(10_000)` timer and on `turn.complete`; an unchanged board tick only moves `now`, so `in 2h 16m`/`late …` and the detail ruler's now mark advance without a process. The accounts pane ticks on its own 10 s timer, with a `busy` guard, and ignores `turn.complete`. `loadAccounts` watches `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json`, `~/.claude/config/accounts.json` and `~/.local/state/accounts/role_map_cache.json` as one `discovery` path; a missing input is watched through its nearest existing parent directory. `ui.close` (any origin) cancels the pane's timer and drops its state.
 
-**Views.** Views draw the `as_of` snapshot and never recompute an ETA. Colours are theme keys only (`success`, `error`, `warning`, `suggestion`, `inactive`, `subtle`).
+**Views.** Views draw the `as_of` snapshot and never recompute an ETA (`in …`/`late …` is display arithmetic on recorded times). Colours are theme keys only. Facts draw in the default colour; `inactive` is the only grey, for labels (`workers`, `as of`), separators and history. There is no `subtle` and no `dimColor`: the user found the dim grey hard to read.
 
 - Board, per production:
-  - A heading with the unit count and `as of`.
-  - Then each unit that is running, or waiting on a gate. It gets a header line: state dot, key, then the phase (`Phase <id>/<of>  <title>`, or `Ticket <id> · <merged> merged  <title>` on a standing plan), or the stage when no phase is running, then `open`.
-  - Under the header, for a running phase:
-    - the strip (`█` done, `▓` open, `░` todo, `▒` gated) with the stage;
-    - the ETA line, with `· overdue …` once it has passed;
-    - the gate line;
-    - `done by`/`after G<k>`;
-    - the ruler;
-    - a workers line, grouped by role (else slot) and state, and left out when every worker has ended.
-  - With no phase running, the stage shows once, in the header, and the line under it is the strip alone, when the strip has cells.
-  - Run-done units fold into `Done: …`, and plain standing-by units into `Standing by: …`. Both lines come last and end `+N more` when they pass the width.
-- `BoardView(elements, columns, bodyRows, …)` never draws past `bodyRows`.
-  - The fold lines are reserved first.
-  - Running blocks then go compact from the last one up. A compact block is the header, then a line with stage, ETA and overdue first and the strip last.
-  - Then the gaps between blocks drop.
-  - Then one `+N more running: …` line takes the rest.
-- Ruler (`rulerCells`): from the start of the open row with the current phase id to `max(promise, now, start + 1s)` plus 10 %; `○` for each trail entry, `●` for `eta.at`, `│` for now; labels via `labelRuns`, where a later mark displaces whole earlier labels.
+  - A header: the production in bold; on the right `N units · K late · as of HH:MM`, with `K late` (in `error`) only when K > 0.
+  - Every unit, sorted by `key` (`localeCompare`, `sensitivity: 'base'`), one blank row apart, the first one too. No `Done:` or `Standing by:` fold lines and no `open` label: the unit name (bold, a plain `Button`) opens the unit.
+  - The dot is `healthTone`: `error` when the ETA or the predicted run end is past; else `warning` when a phase is gated or an open phase has no ETA; else `suggestion` running, `success` run finished, `inactive` otherwise.
+  - A unit with an open phase:
+    - line 1: `● <key>  Phase <id>  <title>` (no `/<of>`), or `Ticket <id> · <n> merged  <title>`;
+    - line 2: the strip, `<done>/<total>` (total = `phases.length`), the stage (left out when it is `Phase|Ticket <id> running`), ` · fix rounds <n>[ + 1 running]` only when `n > 0` (`warning` at 3 or more); right-aligned `ETA <time> · in <elapsed>`, `ETA <time> · late <elapsed>` in `error`, or `no ETA` in `warning`;
+    - the gate line `Phase <id> waits on <gate>[ until <time>]: <waits_on>` in `warning`;
+    - line 3: `workers` and counts by state (running `suggestion`, idle, paused `warning`, then others by name); right-aligned `run ends <time>` (`error` with ` · late …` when past), `run ended <time>` or `run ends after <gate>`.
+  - A unit with no open phase is one line: `● <key>  <stage> · <done>/<total> · run ends|ended <time>`.
+  - The strip (`stripCells`) is one cell per phase up to 20; above 20 it is 20 cells, cell `i` covering phases `[⌊i·n/20⌋, ⌊(i+1)·n/20⌋)` and showing open, else gated, else todo, else done (`█` done `success`, `▓` open `suggestion`, `░` todo `inactive`, `▒` gated `warning`).
+  - Times (`shortTime`, from `at` and `utc_offset_minutes`): same local day `18:00`, within six days `Sat 18:41`, else `24 Oct`.
+  - Nothing is cut: lines wrap (titles indented 2 under line 1). A right part that does not fit beside its left part with 2 spaces goes on its own row, indented 2. No row is wider than the pane.
+  - No ruler: the detail view keeps it and the full ETA history.
+- `BoardView(elements, columns, bodyRows, …)` never draws past `bodyRows`, counting wrapped rows at their real height. First it drops line 3 from the bottom unit up, then the gaps, then whole units from the bottom, named in one `+N more: …` line.
+- Ruler (`rulerCells`): from the start of the open row with the current phase id to `max(promise, now, start + 1s)` plus 10 %; `○` for each trail entry, `●` for `eta.at`, `│` for now; labels where a later mark displaces whole earlier labels. The future track and old ETAs are `inactive`; the now mark `│` is the default colour (red is only for late); the ETA dot and its label are `success` before it is reached and `error` after.
 - `UnitView(elements, columns, bodyRows, …)` draws:
   - the heading (`Phase N of M · <stage>`, `Ticket <id> · <n> merged · <stage>` on a standing plan, or the stage alone), the title, the plan path when it exists, the summary;
   - ETA with overdue, gate and finish, then the ruler;
@@ -176,7 +175,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - **Nothing shows by itself.** A pane opens only from its slash command or a press inside an open pane, and closes from its command, Escape or its close mark. No pane at `session.start`, no `AbovePrompt` band, no status line, no toast.
 - **A closed pane does no work.** With a pane closed there is no timer, no `$.fs` call and no `$.process.run` for it; with no board pane open, `turn.complete` passes straight to `next`, and it never refreshes accounts. While open, refresh is `$.fs.stat` of existing files, and a process starts only on open or when a stat shows a change.
 - **No new long-running process.** No daemon, service or timer job exists outside the mod; the generator and `accounts.py` are one-shot runs.
-- **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and runs `accounts.py` without `--with-login`, so no login address reaches the mod.
+- **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and `accounts.py status --json` has no login field, so no login address reaches the mod.
 - **A failed accounts run shows a fixed reason**, never process output, in the pane, a command reply, a log, a toast or a message.
 - **User-facing times use the user zone.** Python writes them with `astimezone(user_zone())`; the mod resolves the zone in `scripts/lib/user_zone.py`'s order; board times use the production's registered zone. `scripts/lib/test_user_zone` scans every script.
 - **The ETA is the latest stated promise**, never the schedule end an overdue phase is advanced to. `eta.at`, `first` and `trail` hold promises only; `schedule_end` is never a trail entry; the ruler's ETA mark is `eta.at`.
@@ -203,7 +202,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - A failed stat counts as a change: a `failed` board pane retries each tick while a source stays newer than the board file, and recovers on the next good run.
 - A close during a pending `session.start` load or zone lookup must not restart the accounts timer; the lifecycle counter guards it.
 - The mod runs the generator and `accounts.py` installed under `~/.claude/scripts`, not a worktree's copy, so a live check of the mod proves only promoted code; a contract change can only be checked live after it reaches main.
-- `accounts.py status` with no flags prints login addresses. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
+- `accounts.py status` with no flags can print login addresses in its problem notes. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
 - A fresh checkout's `tsc` reports `TS2307` for `claude-code` until a live session loads the folder and the engine writes `mods/unit-board/.claude-plugin/types/`.
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.
@@ -224,5 +223,7 @@ The accounts view draws `accounts.py`'s stored status straight to the screen. It
 The terminal report leaves out the round table because it answers questions most ticks do not ask; the board carries the visual view, and `tables` keeps the full recorder output one word away.
 
 A standing plan shows its ticket and a merged count, not `Phase N/total`, because it holds one ticket phase at a time and refill discards each merged one: `Phase 63/1` read as phase 63 of 1 when it was the 63rd ticket. The merged count, not a total, is the progress a ticket queue has.
+
+The board lists units by name and keeps each one to three short lines because the user found it hard to read (2026-10-19): units were sorted by state, most text was dim grey, and titles and worker lists were cut off. Three design reviewers agreed on the rest: colour carries meaning (the dot is health, red is only for late), every fact is in readable text, worker names move to the detail view in favour of counts by state, and the ruler, whose labels repeated the same now time on every unit, moves to the detail view. `Phase <id>` drops `/<of>` because a plan that grew read `Phase 32/31`; the total is beside the bar instead.
 
 The board finds its production from the session id before the working directory, because a showrunner session need not run inside its production's checkout: the natedev showrunner runs in `/etc/nixos` with its doc under `~/.claude`. The update timer is addressed to the session id, so `showrunners.production_of` answers exactly.

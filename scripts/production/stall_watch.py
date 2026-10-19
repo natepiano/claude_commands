@@ -57,6 +57,11 @@ PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
 # "make this edit to panes.py" reads as "edit panes.py".
 EDIT_ASK = re.compile(r"make (?:this|these) edits? to (?P<file>.+)")
 BASH_PROMPT_TITLE = "Bash command"
+# Claude Code's auto-mode banner on a prompt it denies by itself when a countdown ends, so no one has to answer:
+# "⚠ Claude Code will automatically deny this request in 0:41, to avoid blocking progress on an unattended session."
+AUTO_DENY_BANNER = re.compile(r"^⚠ Claude Code will automatically deny this request in \d+:\d{2}\b")
+# A permission prompt fits in the pane's bottom 40 lines.
+PROMPT_LINES = 40
 UNKNOWN_REQUEST = "go on with its work"
 FRAME = " \t│┃|╭╮╰╯─"
 
@@ -303,9 +308,14 @@ def save_prompt(path: Path, prompt: PromptWait) -> None:
     os.replace(temporary, path)
 
 
+def auto_denied(pane: str) -> bool:
+    """Whether the permission prompt at the pane's bottom shows the auto-deny banner."""
+    return any(AUTO_DENY_BANNER.match(line.strip(FRAME)) for line in pane.splitlines()[-PROMPT_LINES:])
+
+
 def prompt_request(pane: str) -> str:
     """What the permission prompt at the pane's bottom asks to do, worded to follow "asks permission to"."""
-    lines = [line.strip(FRAME) for line in pane.splitlines()[-40:]]
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-PROMPT_LINES:]]
     asked = [(index, found) for index, line in enumerate(lines) if (found := PROMPT_QUESTION.search(line))]
     if not asked:
         return UNKNOWN_REQUEST
@@ -316,7 +326,7 @@ def prompt_request(pane: str) -> str:
         return f"edit {edit['file']}"
     if ask != "proceed":
         return ask
-    above = [line for line in lines[:index] if line]
+    above = [line for line in lines[:index] if line and not AUTO_DENY_BANNER.match(line)]
     if BASH_PROMPT_TITLE not in above:
         return UNKNOWN_REQUEST
     # Claude Code shows the command below the title, then its description, if it has one.
@@ -452,10 +462,14 @@ def tick(now: float) -> None:
                 blocked = False
             if blocked:
                 # It waits on the user, not on itself: the idle clock starts again after the prompt.
-                prompt = read_prompt(waiting, now)
-                save_prompt(waiting, prompt)
                 save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                            bump_sent=False, tell_sent=False, reported_status=""))
+                # Claude Code denies a prompt with the auto-deny banner by itself: the user gets no alert.
+                if auto_denied(pane):
+                    waiting.unlink(missing_ok=True)
+                    continue
+                prompt = read_prompt(waiting, now)
+                save_prompt(waiting, prompt)
                 if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
                     pending.append(prompt_alert(waiting, name, pane, prompt["since"], zone))
                 continue

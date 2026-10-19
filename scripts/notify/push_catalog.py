@@ -24,7 +24,9 @@ ENTRIES = (
     PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
         ActionTemplate("answer the open form"),
         "Reason: {operation} is blocked because {session}'s claude session is showing a form and it can't proceed.\n\n"
-        + "Or stop it instead, and the {operation} goes on without it. In a terminal on {machine}: {command}",
+        + "Answer the form (recommended): the session pauses, and the {operation} goes on.\n\n"
+        + "Stop the session: it ends, its uncommitted work stays, and the {operation} goes on without it. "
+        + "In a terminal on {machine}, run:\n\n{command}",
         (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
             "operation": "restart",
             "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),),
