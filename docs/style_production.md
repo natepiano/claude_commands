@@ -359,6 +359,12 @@ Each finding must preserve behavior using only its own edits; another finding's
 call-site changes cannot complete its rename. Changed documented usage, including
 block documentation, requires review. Glob imports prevent proving a rename's
 identity, and public glob re-exports prevent establishing module privacy.
+The gate shortens constant paths through added imports only when both paths match.
+It proves `Mode::Old` and `Self::Old` variant renames only when no other item has the enum's name.
+Attributes or unsupported derives that observe variant names prevent proof.
+It proves a local `let` rename only when its name is used after the statement, in its own block.
+It clears a changed condition line only when its tokens match after proven rewrites.
+It permits lint names to be removed from `allow` and `expect` attributes, including whole attributes.
 Generic signature brackets and attributes on unrelated items alone do not
 require review. Derive changes count as trait implementation changes.
 Changes inside macro invocations require review even when only spacing changes;
