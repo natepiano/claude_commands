@@ -932,7 +932,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         root = SCRIPT.parents[2]
         produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
         dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
-        self.assertIn("`DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`", produce)
+        self.assertIn("`DAILIES_STATE_DIR` — `<STATE_DIR>/dailies_input_state`", produce)
         calls = cast(list[str], re.findall(r"`([^`]*scripts/production/waiting\.py[^`]*)`", produce))
         for action in ("scratch-test", "agenda", "eta-request"):
             matches = [call for call in calls if f"waiting.py {action}" in call]
@@ -940,11 +940,11 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             self.assertTrue(all("--state-dir DAILIES_STATE_DIR" in call for call in matches), action)
         builder = re.search(r"dailies_input\.py.*?--state-dir ([^\s\\]+)", dailies, re.S)
         self.assertIsNotNone(builder)
-        self.assertEqual(builder.group(1) if builder else "", "<scratchpad>/dailies_input_state")
+        self.assertEqual(builder.group(1) if builder else "", "<STATE_DIR>/dailies_input_state")
 
     def test_showrunner_says_an_unmeasured_eta_request_cannot_repeat(self) -> None:
         produce = (SCRIPT.parents[2] / "commands/showrunner/produce.md").read_text(encoding="utf-8")
-        unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **Waiting on block.**", 1)[0]
+        unmeasured = produce.split("**Unmeasured ETAs.**", 1)[1].split("- **No footer.**", 1)[0]
         self.assertNotIn("Ask again only if", unmeasured)
         self.assertIn("the command will not repeat the request", unmeasured)
 

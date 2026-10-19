@@ -91,8 +91,6 @@ from session_types import (
     WorkerSession as WorkerSession,
     TopLevelSession as TopLevelSession,
     Session as Session,
-    ShowrunnerFooter as ShowrunnerFooter,
-    NoFooter as NoFooter,
     TimerRestore as TimerRestore,
     CodexSessionId as CodexSessionId,
     CodexResumePicker as CodexResumePicker,
@@ -747,6 +745,48 @@ def _checkout(cwd: str) -> CheckoutState:
     }
 
 
+_LAST_STEP_BYTES = 262_144
+_STEP_FIELDS = ("description", "command", "file_path", "pattern", "url", "prompt")
+_STEP_TEXT = 200
+
+
+def last_tool_call(config_dir: Path, session_id: str) -> str:
+    """Name the transcript's last tool call as `<tool>: <its first descriptive input>`, or "" when none shows."""
+    path = transcript_path(config_dir, session_id)
+    if path is None:
+        return ""
+    try:
+        with path.open("rb") as transcript:
+            size = transcript.seek(0, os.SEEK_END)
+            _ = transcript.seek(max(0, size - _LAST_STEP_BYTES))
+            lines = transcript.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = cast(object, json.loads(line))
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or cast(dict[str, object], entry).get("type") != "assistant":
+            continue
+        message = cast(dict[str, object], entry).get("message")
+        content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in reversed(cast(list[object], content)):
+            if not isinstance(block, dict) or cast(dict[str, object], block).get("type") != "tool_use":
+                continue
+            call = cast(dict[str, object], block)
+            name = call.get("name")
+            arguments = call.get("input")
+            detail = next((value for field in _STEP_FIELDS
+                           if isinstance(arguments, dict)
+                           and isinstance(value := cast(dict[str, object], arguments).get(field), str) and value), "")
+            text = f"{name}: {detail}" if isinstance(name, str) and detail else name if isinstance(name, str) else ""
+            return " ".join(text.split())[:_STEP_TEXT]
+    return ""
+
+
 def transcript_path(config_dir: Path, session_id: str) -> Path | None:
     """Find the newest main transcript, without visiting subagent directories."""
     newest: Path | None = None
@@ -1085,7 +1125,6 @@ def _snapshot_timers() -> _SnapshotTimers:
 
 
 def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[TimerRestore]:
-    import showrunner_footer
     try:
         pause = conversation_pause.read_record(conversation_pause.record_path(owner["session_id"]))
     except FileNotFoundError:
@@ -1094,23 +1133,10 @@ def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[Ti
     if isinstance(pause, conversation_pause.PauseRecord):
         restore = not isinstance(pause.phase, conversation_pause.KeptOff)
         for instance in pause.instances:
-            restores[instance] = TimerRestore(instance=instance, was_enabled=restore,
-                footer=NoFooter(kind="no footer"))
-        for slug in pause.footers:
-            instance = f"showrunner-{slug}"
-            timer = restores.setdefault(instance, TimerRestore(instance=instance,
-                was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
-            if restore:
-                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+            restores[instance] = TimerRestore(instance=instance, was_enabled=restore)
     for instance in owner["timers"]:
-        timer = restores.setdefault(instance, TimerRestore(instance=instance,
-            was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
-        if instance.startswith("showrunner-") and isinstance(pause, conversation_pause.NoPauseRecord):
-            slug = instance.removeprefix("showrunner-")
-            try:
-                _ = showrunner_footer.switch_path(slug).stat()
-            except FileNotFoundError:
-                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+        _ = restores.setdefault(instance, TimerRestore(instance=instance,
+            was_enabled=timers.enabled.get(instance, False)))
     return list(restores.values())
 
 

@@ -13,7 +13,7 @@
 **Refusals before merging** (`merge_checkpoint`):
 - tracked uncommitted changes. Untracked files never block (`--untracked-files=no`), because each showrunner keeps a LOG there; a merge that would overwrite an untracked file fails and is aborted.
 - checkout not on the merge branch.
-- HEAD not equal to `origin/<merge branch>` after the fetch. Fetches use explicit `+refs/heads/X:refs/remotes/origin/X` refspecs.
+- HEAD not `origin/<merge branch>` plus only local production doc commits after the fetch. `check_local_doc_commits` accepts a non-merge commit whose subject starts `production(` (`add_unit.commit_paths` makes them for add_unit, promote_showrunner and retire_unit, and leaves their push to the gate). Each one is printed, rolled back to on red, and pushed with the merge (2026-10-18: retire_unit's commit stopped every merge). Fetches use explicit `+refs/heads/X:refs/remotes/origin/X` refspecs.
 - checkpoint not an ancestor of `origin/<unit branch>`.
 - previous checkpoint not an ancestor of the checkpoint.
 
@@ -21,7 +21,7 @@
 
 **Run, then check before push.** `run_suites` runs. Then `settings.json` at HEAD must match the approved blob prefix (`--settings-blob`, an 8–40 hex hash), and `origin/main` must be an ancestor of HEAD. Only then does the gate push the merge branch and print `Pushed <branch>: <short hash>`.
 
-**Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <origin merge branch>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
+**Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
 
 **Suite runner** (`run_suites(repo, memory_cap_mib, type_dirs) -> GateRun`):
 - `TEST_SUITES` (a tuple in the script) is the single list of suites: `lib hooks message accounts whoami agents build_hold mac_test usage bevy_upgrade production delegate buildlog lint nightly_review build_targets shutdown feature_log model_study herdr notify statusline`. Modules are `scripts/<suite>/test_*.py`, found non-recursively: 168 modules today.
@@ -32,7 +32,7 @@
 - The basedpyright job (`types`) is queued first, on `type_dirs`. It passes on exit 0 or 3 (pyrightconfig names a `.venv` no checkout has) with the line `0 errors, 0 warnings, 0 notes`.
 - `MERGE_GATE_PYTHON` and `MERGE_GATE_BASEDPYRIGHT` override the interpreter and the type checker; tests use these.
 - **Ordering cache.** `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/module_seconds.json` maps `suite/module.py` to the last run's seconds. Modules with no recorded time start first, then the rest longest first. The cache is rewritten atomically after every run, red ones included.
-- **Admission** (`SampledRSSAdmission`). Every 0.25 s or more the runner sums RSS from `/proc` over its own process tree (every job) and over each job's tree separately. `headroom` starts at 96 MiB (2 × `MODULE_MEMORY_MIB` 48) and then holds the largest job tree seen. A running job reserves `max(0, headroom − its measured RSS)`, so a small startup sample never releases its reservation. A new job is admitted when `latest aggregate + sum of reservations + headroom ≤ cap`. With nothing running, one job is always admitted. A sampled peak above the cap makes the run red (`GateRun.memory_within_cap`).
+- **Admission** (`SampledRSSAdmission`). Every 0.25 s or more the runner sums resident plus swapped memory (`stat` RSS and `status` VmSwap) from `/proc` over its own process tree (every job) and over each job's tree separately. `headroom` starts at 96 MiB (2 × `MODULE_MEMORY_MIB` 48) and then holds the largest job tree seen. A running job reserves `max(0, headroom − its measured RSS)`, so a small startup sample never releases its reservation. A new job is admitted when `latest aggregate + sum of reservations + headroom ≤ cap`. With nothing running, one job is always admitted. A sampled peak above the cap makes the run red (`GateRun.memory_within_cap`).
 - **Cleanup.** When a job's leader exits, the runner SIGKILLs the job's whole process group, which catches leaked children. On any exit it kills and reaps every running group before the tmpfs dir is removed. It never kills a process outside its own groups.
 - **Report.** For each suite, `OK` or `RED` and its wall time; each red module's exit code and full output; then the basedpyright verdict and output, total time, sampled peak GiB against the cap, the largest module's peak and name, and one-minute load at start, maximum and end. `GateRun.passed` is true when all jobs exited 0 and memory stayed within the cap.
 
@@ -134,7 +134,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 |---|---|
 | Memory cap | 4096 MiB (`DEFAULT_MEMORY_CAP_MIB`) |
 | Initial per-job reservation | 96 MiB |
-| RSS sampling interval | 0.25 s or more; scheduler loop sleeps 0.05 s |
+| Memory sampling interval | 0.25 s or more; scheduler loop sleeps 0.05 s |
 | Fixture hang guards | 300 s (`wait_until`, `communicate_launcher`, script launches, follow tests) |
 | Agents quota-handoff start timeout | 30 s, so socket round trips under load never race the five-second task deadline |
 | Mac fast-forward | ssh `ConnectTimeout=10`, 25 s limit |
@@ -152,7 +152,8 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 
 - **Inherited SIGINT.** A suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores. `SUITE_BOOTSTRAP` resets dispositions for gate jobs; a signal test still restores `SIG_DFL` itself.
 
-- **Admission is not an OS limit.** It works on RSS samples, so a module that grows suddenly can still pass the cap; that turns the run red rather than killing anything.
+- **Admission is not an OS limit.** It works on samples, so a module can grow past the cap between two samples. A job whose own sample is over the cap is killed at once (its group gets SIGKILL), its result starts `killed: sampled memory <X> GiB is over the <cap> GiB cap`, and the run is red. Before 2026-10-18 an overrun only turned the run red at the end: a shutdown module looping on a failed fake grew to 28 GiB in 56 minutes (10 GiB of it resident, the rest in swap) and filled natedev's swap.
+- **Module time limit.** A module still running `DEFAULT_MODULE_TIME_LIMIT_S` (1800 s, `--module-time-limit-s`) after it starts is killed the same way; its result starts `killed: still running after 1800 s, the module time limit`, and the run is red. A hung module would otherwise hold every gate behind it. The limit is about 4.6 times the slowest measured module: delegate/test_verify_mac_offload.py took 387 s at load 152 (2026-10-18).
 
 - **macOS has no inotify.** `local_release_wait` and `wait_until` fall back to interval polling there.
 
@@ -176,7 +177,7 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 
 - **The cost was process launches.** Measured `setUpClass` cost was negligible; production ran about 26,000 execs (about 15,000 git, about 4,000 Python) and delegate about 22,000. Each fix therefore removes launches (in-process CLI, per-class git seeds, shell fakes, interpreter cache) or removes fixed waits, rather than reworking setup.
 - **One job per module, not per suite.** Whole suites in parallel are bounded by delegate (about 7.5 min). Per-module jobs are bounded by the slowest module, so further speed comes from shortening the slowest modules.
-- **Admission on sampled RSS with a held reservation.** The measured peak (2.0–2.5 GiB) is well under the 36 GB available. A sampled cap with a per-job reservation keeps the gate within a stated budget without cgroups, and one job always runs, so a cap below one module's size cannot deadlock.
+- **Admission on sampled memory with a held reservation.** The measured peak (2.0–2.5 GiB) is well under the 36 GB available. A sampled cap with a per-job reservation keeps the gate within a stated budget without cgroups, and one job always runs, so a cap below one module's size cannot deadlock.
 - **In-process CLI over subprocess.** A `python3 <script>.py` launch cost 380–440 ms, about 150 ms of it import. Running the real `main()` in-process keeps the parser, handlers and child commands real; the one subprocess case per script keeps the launch contract covered.
 - **The interpreter cache is fixed in the fixtures, not in `lib/py`.** The cache misses only because tests point HOME at a temp dir; production resolution was already correct.
 - **One shared restore implementation.** Delegate reuses `scripts.production.cli_fixture.invoke_cli` through `recorder_fixture` rather than keeping its own copy; one implementation of environment, signal and binding restore is simpler to keep correct.

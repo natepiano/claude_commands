@@ -41,7 +41,6 @@ import herdr
 from fake_herdr import CommandResponse
 import conversation_pause
 import settle
-import showrunner_footer
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
 import shutdown
@@ -617,8 +616,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_target_process_confirms_move_even_when_timer_restoration_is_pending(self) -> None:
         saved = self.moved_record()
-        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True,
-            footer=record.NoFooter(kind="no footer"))]
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         _ = record.update_session(LOGIN, saved["session"]["session_id"],
             lambda current: current.update(timers=saved["timers"]))
         owner = saved["session"]
@@ -3166,6 +3164,18 @@ class RestartTests(ShutdownTestCase):
                 if owner["kind"] == "unit":
                     self.assertIn("/unit:direct", note)
 
+    def test_a_move_note_names_the_step_a_mid_turn_stop_cut_off(self) -> None:
+        for cut_off, step in (("Bash: Run the tests", "; your last step was Bash: Run the tests."), ("", ".")):
+            with self.subTest(cut_off=cut_off):
+                saved = entry(top_level("cut-off"), where=record.WhereNotSaid(kind="not said"))
+                saved["target"], saved["source_label"], saved["why"] = "claude2", "claude3", "weekly limit reached"
+                saved["cut_off"] = cut_off
+                note = restart.restart_note(saved, RESTARTED)
+                self.assertIn(f"The move stopped you in the middle of a turn{step} Check whether that step finished", note)
+        unbroken = entry(top_level("between-turns"), where=record.WhereNotSaid(kind="not said"))
+        unbroken["target"] = "claude2"
+        self.assertNotIn("middle of a turn", restart.restart_note(unbroken, RESTARTED))
+
     def test_notes_use_the_stop_dates_zone_and_explain_a_missing_where(self) -> None:
         october = entry(top_level('october'), where=record.WhereSaid(kind='said', text="quoted 'work' and $()", at=STOPPED))
         october_note = restart.restart_note(records_for_test([october])[0], RESTARTED)
@@ -3789,8 +3799,7 @@ class RestartTests(ShutdownTestCase):
                       state=record.SessionStopping(kind="stopping", at=STOPPED))
         saved["target"] = "claude3"
         saved["where"] = record.WhereSaid(kind="said", at=STOPPED, text="resume the repair")
-        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True,
-                                       footer=record.NoFooter(kind="no footer"))]
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
         def cleanup(current: SessionShutdown) -> SessionShutdown:
             self.assertEqual(current["progress"]["kind"], "stopping")
@@ -4261,8 +4270,7 @@ class RestartTests(ShutdownTestCase):
         item = snapshot["sessions"][0]
         assert item["agent"] == "claude"
         saved = record.snapshot_restore_record(snapshot, item)
-        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True,
-            footer=record.NoFooter(kind="no footer"))]
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
         with (patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)) as launch,
               patch.object(restart, "_send_restart_note", side_effect=OSError("sender unavailable")) as sender,
@@ -4554,7 +4562,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_manually_resumed_session_restores_timers_and_is_archived_without_launch(self) -> None:
         saved = entry(top_level("manual"), state=record.SessionNeedsManualRestart(kind="manual restart", command="resume"))
-        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True, footer=record.NoFooter(kind="no footer"))]
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
         with patch.object(settle, "run_notifier") as timers:
             self.assertEqual(self.run_restarts(live=frozenset({"manual"})), (0, []))
@@ -4579,7 +4587,7 @@ class RestartTests(ShutdownTestCase):
         saved = entry(top_level("owner"), state=record.SessionRestoredTimersPending(
             kind="timers pending", at=STOPPED, timers=[record.PendingTimer(instance="pending", reason="failed")],
         ), timers=[
-            TimerRestore(instance=name, was_enabled=True, footer=record.NoFooter(kind="no footer"))
+            TimerRestore(instance=name, was_enabled=True)
             for name in ("done", "pending")
         ])
         self.create([saved])
@@ -4592,8 +4600,7 @@ class RestartTests(ShutdownTestCase):
         saved = self.moved_record("timer-retry-owner")
         saved["progress"] = record.SessionRestarting(kind="restarting", at=STOPPED,
             prior=record.SessionStopped(kind="stopped", at=STOPPED))
-        saved["timers"] = [TimerRestore(instance="pending", was_enabled=True,
-            footer=record.NoFooter(kind="no footer"))]
+        saved["timers"] = [TimerRestore(instance="pending", was_enabled=True)]
         _ = record.update_session(LOGIN, saved["session"]["session_id"],
             lambda current: current.update(progress=saved["progress"], timers=saved["timers"]))
         live = self.running_on(saved, self.root / ".claude3")
@@ -4652,7 +4659,7 @@ class RestartTests(ShutdownTestCase):
         saved = entry(top_level("snapshot-owner"), state=record.SessionRestoredTimersPending(
             kind="timers pending", at=STOPPED, timers=[record.PendingTimer(instance="pending", reason="failed")],
         ), timers=[
-            TimerRestore(instance=name, was_enabled=True, footer=record.NoFooter(kind="no footer"))
+            TimerRestore(instance=name, was_enabled=True)
             for name in ("done", "pending")
         ])
         saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED, recovery=record.RecoveryEvidenceNotRecorded(kind="not recorded"))
@@ -4711,7 +4718,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_queued_showrunner_note_keeps_its_timers_stopped(self) -> None:
         saved = entry(showrunner("owner"))
-        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True, footer=record.NoFooter(kind="no footer"))]
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True)]
         self.create([saved])
         with patch.object(restart, "_send_restart_note", return_value=settle.MessageQueued(kind="queued", reason="not ready")), patch.object(settle, "run_notifier") as timers:
             restart.confirm_entry(saved, RESTARTED, True)
@@ -4874,7 +4881,7 @@ class RestartTests(ShutdownTestCase):
         saved = entry(top_level("owner", host=inventory.HerdrHost(kind="herdr", herdr_session="owner", pane_id="w1:p1", presentation="detached")), state=record.SessionRestoredTimersPending(
             kind="timers pending", at=STOPPED, timers=[record.PendingTimer(instance="pending", reason="failed")],
         ), timers=[
-            TimerRestore(instance=name, was_enabled=True, footer=record.NoFooter(kind="no footer"))
+            TimerRestore(instance=name, was_enabled=True)
             for name in ("done", "pending")
         ])
         self.create([saved])
@@ -4936,7 +4943,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_timer_failure_records_pending_work_without_another_launch(self) -> None:
         saved = entry(top_level("owner", host=inventory.HerdrHost(kind="herdr", herdr_session="owner", pane_id="w1:p1", presentation="detached")), timers=[
-            TimerRestore(instance="timer", was_enabled=True, footer=record.NoFooter(kind="no footer")),
+            TimerRestore(instance="timer", was_enabled=True),
         ])
         self.create([saved])
         with patch.object(settle, "run_notifier", side_effect=RuntimeError("notifier unavailable")):
@@ -4951,15 +4958,12 @@ class RestartTests(ShutdownTestCase):
         timer.assert_called_once_with("start", "timer")
         self.assertEqual(record.session_records(LOGIN), [])
 
-    def test_disabled_timer_keeps_its_footer_restore_without_starting_the_timer(self) -> None:
-        saved = entry(top_level("owner"), timers=[TimerRestore(
-            instance="disabled", was_enabled=False, footer=record.ShowrunnerFooter(kind="footer", slug="demo"),
-        )])
+    def test_disabled_timer_stays_off_on_restart(self) -> None:
+        saved = entry(top_level("owner"), timers=[TimerRestore(instance="disabled", was_enabled=False)])
         self.create([saved])
-        with patch.object(settle, "run_notifier") as timer, patch.object(showrunner_footer, "set_footer_state") as footer:
+        with patch.object(settle, "run_notifier") as timer:
             restart.confirm_entry(saved, RESTARTED, True)
         timer.assert_not_called()
-        footer.assert_called_once_with("demo", showrunner_footer.FooterState.ON)
 
     def test_restart_with_alerts_disabled_does_not_send_a_phone_alert(self) -> None:
         saved = entry(top_level("owner"))
@@ -5183,7 +5187,7 @@ class RestartTests(ShutdownTestCase):
 
 
     def test_unconfirmed_cleanup_prevents_launch_and_timer_restore(self) -> None:
-        saved = entry(unit("owner"), timers=[TimerRestore(instance="timer", was_enabled=True, footer=record.NoFooter(kind="no footer"))])
+        saved = entry(unit("owner"), timers=[TimerRestore(instance="timer", was_enabled=True)])
         saved["stop_issues"] = [record.UnitSessionLeftRunning(
             kind="unit session left running", at=STOPPED, host="herdr",
             session_name="herdr-owner", cause="stop not confirmed",
@@ -5343,7 +5347,7 @@ class RestartTests(ShutdownTestCase):
         for live in (False, True):
             with self.subTest(live=live), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / f"confirm-{live}")}):
                 saved = entry(top_level("owner"), timers=[TimerRestore(
-                    instance="timer", was_enabled=True, footer=record.NoFooter(kind="no footer"),
+                    instance="timer", was_enabled=True,
                 )])
                 saved["progress"] = record.SessionRestarting(
                     kind="restarting", at=STOPPED, prior=record.SessionStopped(kind="stopped", at=STOPPED),
@@ -5362,7 +5366,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_timer_completion_does_not_overwrite_a_replacement_claim(self) -> None:
         saved = entry(top_level("owner"), timers=[TimerRestore(
-            instance="timer", was_enabled=True, footer=record.NoFooter(kind="no footer"),
+            instance="timer", was_enabled=True,
         )])
         saved["progress"] = record.SessionRestarting(
             kind="restarting", at=STOPPED, prior=record.SessionStopped(kind="stopped", at=STOPPED),

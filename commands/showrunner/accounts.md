@@ -1,6 +1,6 @@
 ---
 description: Show account groups, move a group or ad hoc session, or swap Codex workers.
-argument-hint: '[--detail | exec claudeN|codexN|units|showrunners|workers [args…] | pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | cutover-home claudeN|codexN [--undo] | role workers | set-role workers codexN | swap workers codexN [--dry-run]]'
+argument-hint: '[--detail | exec claudeN|codexN|units|showrunners|workers [args…] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | cutover-home claudeN|codexN [--undo] | role workers | set-role workers codexN | swap workers codexN [--dry-run]]'
 ---
 
 # Accounts
@@ -21,7 +21,6 @@ and print its output exactly as it comes, with nothing added.
 - `setup codexN`: links the home, finishes its first startup (up to 20 minutes: run it in the background), then prints the login command.
   Keep `CODEX_HOME` on the login command; never sign in to shared `~/.codex`.
 - `cutover-home codexN [--undo]`: journal and rename `~/.codex/auth.json` into its numbered home, or back. Refuses while a process uses the home losing the login, naming its pid; stop it, then rerun. Rerun interruptions to finish. After cutover on both machines, `~/.codex` holds no login: the executable without `CODEX_HOME` is signed out, while the `codex` alias uses `exec workers`. Bare `--undo` remains Claude-only.
-- `pick claude|codex [--explain]`: picks room with the soonest weekly reset; `--keep <label>` keeps a working account, and repeated `--exclude <label>` skips accounts.
 - `placement --explain`: room and each group's destination on refusal. Low or 0% is room until refused; healthy groups stay put.
 - natedev holds the role map for both machines. Mac writes run over `ssh natedev`; reads fetch it once per command and cache it beside `groups.json`. Offline reads print `role map from <local time>; natedev unreachable`; without a cache they refuse. A mapped account missing or signed out here refuses launches with its setup or login step; status prints that problem under the table. Never substitute another account.
 - Configuration decides every new and resumed launch: `claude-unit` and `role unit` use units; `role showrunner` uses showrunners. Set it with `accounts.py move <group> claudeN`; an unconfigured group refuses with that command.

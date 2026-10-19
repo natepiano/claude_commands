@@ -14,7 +14,7 @@ from banned_words_lib import HOOK_CONFIG, hooks_enabled
 
 GOVERNED_HOOKS = (
     ("PostToolUse", "post-tool-use-banned-words.py", "blocks and messages the violation"),
-    ("Stop", "stop-assistant-prose-banned-words.py", "scans the emitted turn"),
+    ("Stop", "stop-assistant-prose-banned-words.py", "logs matches in the emitted turn, never blocks"),
 )
 DEFAULT_CONFIG = """# Banned-word hook enforcement — on or off.
 #

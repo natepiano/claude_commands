@@ -9,7 +9,7 @@ In film, dailies are what the executive producer watches each day to see how
 the shoot is going. Here the showrunner reports the production to the executive
 producer: the user. Run it in the showrunner session during `/showrunner:produce`,
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
-`MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
+`MERGE_BRANCH`, `NOTIFIER`, `UPDATES`, `STATE_DIR`) it uses.
 
 **Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]`. With
 no length, `gantt`. With any other argument, name the choices and stop.
@@ -41,7 +41,7 @@ schedule runs: the builder touches no clock, the report names no next run,
 and step 2 below does nothing. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
-   `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
+   `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
    The input builder reads that file and prints `flags first:` for SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, and a DECISION. Put these
    first in the report.
@@ -123,11 +123,11 @@ carries the topic with that reason.
 ```sh
 python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
-  --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
+  --judgment <STATE_DIR>/dailies_judgment.json --state-dir <STATE_DIR>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
-  --render-state <scratchpad>/dailies_state.json [--user-run] [--expand <child|all>]
+  --render-state <STATE_DIR>/dailies_state.json [--user-run] [--expand <child|all>]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
-  --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
+  --state <STATE_DIR>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 
 - The builder runs the notifier script beside it, the one `NOTIFIER` names;
@@ -320,12 +320,12 @@ unless it names another plan's document. User, 2026-10-02.
   not be read. A row from `expand` carries no style line. A showrunner with
   nothing below it gets none of this.
 - **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude1: 40%; runs out about Tue 07:10 EDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
-- **Footer:** the reply footer (`/showrunner:produce` → Footer), from
-  `next_run`, the build-holder files, the Mac block file, `OUTSTANDING` and whether
-  any subject has `needed:`. A due item below this production also keeps it
-  from saying `nothing needed`, and the two tree bullets (`reports to <root>`,
-  `<slug>: needs-user list unreadable`) appear as in a reply. The report ends with that footer. The Waiting on
-  block follows it, as in every reply.
+- **Footer:** the report ends with its own closing bullets, from `next_run`,
+  the build-holder files, the Mac block file, `OUTSTANDING` and whether any
+  subject has `needed:`. A due item below this production also keeps it from
+  saying `nothing needed`, and the two tree bullets (`reports to <root>`,
+  `<slug>: needs-user list unreadable`) appear there. No reply carries this
+  footer and no `Waiting on:` block follows it (user, 2026-10-18).
 
 ## Length
 
@@ -385,6 +385,10 @@ For every length:
   The renderer refuses the plumbing words it knows (`PLUMBING`: berth,
   reservation, holder, file holds, file clashes, writer, tester, retake,
   re-shoot). That list is a net, not the rule: the read is the rule.
+  In the open-for-the-user list, `update_registration.py questions` refuses a
+  new or changed item with one of them. A stored item with one is named
+  (`questions: reword — <item>: …`) and the write goes on: reword it on the
+  next update.
 - Do no other work in this turn, except the `/unit:eta` requests, the two
   steps in Status check and clock, acting on a BLOCK past its limit
   (`/showrunner:produce` → Dependencies, rule 4), and compacting a unit

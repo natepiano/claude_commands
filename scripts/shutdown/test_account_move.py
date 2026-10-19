@@ -513,8 +513,10 @@ class AccountMoveTests(ShutdownTestCase):
                 self.assertIn("shutdown.py ready --where", text)
             return {"kind": "sent"}
 
-        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown:
+        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop",
+                    forced: bool = False) -> record.SessionShutdown:
             self.assertEqual(idle_reason, "not an idle stop")
+            self.assertFalse(forced)
             events.append("stop")
             self.assertEqual(saved["progress"]["kind"], "ready")
             checkpoint = saved["where"]
@@ -543,6 +545,7 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(settle, "merge_in_progress", return_value=False),
               patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "requester-outside-group"}),
               patch.object(subprocess, "run", side_effect=request),
+              patch.object(settle, "_carry_trust"),
               patch.object(settle, "send_message", side_effect=delivered),
               patch.object(runner_registry, "current_name", return_value="parent-runner"),
               patch.object(stop_work, "stop_session", side_effect=stopped) as stop):
@@ -568,7 +571,7 @@ class AccountMoveTests(ShutdownTestCase):
             saved = record.session_records(report["login"])[0]
             self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                   settle.StopSession)
-            _ = settle._stop_after_telling(saved)  # pyright: ignore[reportPrivateUsage]
+            _ = settle._stop_after_telling(saved, settle.StopSession())  # pyright: ignore[reportPrivateUsage]
             stop.assert_called_once()
         self.assertTrue(events[1].startswith(f"{director['name']} is stopping:"), events)
         self.assertEqual(events[-1], "stop")
@@ -823,19 +826,30 @@ class AccountMoveTests(ShutdownTestCase):
         empty = refusals.FreshReading(refusals.ReadingWindow(0,
             refusals.KnownReset(at + timedelta(days=1)), at), refusals.NoWindow(), "")
         for group in (False, True):
-            with self.subTest(group=group):
-                before = self.disk_state()
-                with (patch.object(refusals, "stored_reading", return_value=empty),
-                      patch.object(subprocess, "run") as process):
-                    result, output, error = self.batch_cli() if group else self.cli()
-                self.assertNotEqual(result, 0)
-                self.assertIn("claude3 is out of usage", output + error)
-                self.assertIn("weekly 0% left", output + error)
-                self.assertIn("resets", output + error)
-                self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick", output + error)
-                self.assertIn("in this terminal", output + error)
-                self.assertEqual(self.disk_state(), before)
-                process.assert_not_called()
+            for has_room in (False, True):
+                with self.subTest(group=group, has_room=has_room):
+                    def reading(_tool: str, login: str, _now: datetime) -> refusals.FreshReading:
+                        if not has_room or login == "target@example.invalid":
+                            return empty
+                        days = 2 if login == "default@example.invalid" else 3
+                        return refusals.FreshReading(refusals.ReadingWindow(50,
+                            refusals.KnownReset(at + timedelta(days=days)), at), refusals.NoWindow(), "")
+
+                    before = self.disk_state()
+                    with (patch.object(refusals, "stored_reading", side_effect=reading),
+                          patch.object(subprocess, "run") as process):
+                        result, output, error = self.batch_cli() if group else self.cli()
+                    self.assertNotEqual(result, 0)
+                    self.assertIn("claude3 is out of usage", output + error)
+                    self.assertIn("weekly 0% left", output + error)
+                    self.assertIn("resets", output + error)
+                    if has_room:
+                        self.assertIn("; claude2 has room", output + error)
+                    else:
+                        self.assertIn("; no claude account has room; the earliest reset is", output + error)
+                    self.assertNotIn("pick", output + error)
+                    self.assertEqual(self.disk_state(), before)
+                    process.assert_not_called()
 
     def test_target_with_exhausted_window_and_credits_can_still_be_previewed(self) -> None:
         at = datetime.now(timezone.utc)

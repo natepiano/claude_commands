@@ -15,7 +15,7 @@ type OpenAccountsPane = { timer: Timer; busy: boolean; paths: RefreshPaths[]; zo
 const PANES = { plugin: 'unit-board', key: 'panes' } as const;
 
 type Selection = { kind: 'board' } | { kind: 'unit'; production: string; unit: string };
-type OpenPane = { timer: Timer; cwd: string; busy: boolean; paths: RefreshPaths[]; selection: Selection };
+type OpenPane = { timer: Timer; cwd: string; session: string; busy: boolean; paths: RefreshPaths[]; selection: Selection };
 
 function boardCalls($: EngineInterface): BoardLoader {
   return {
@@ -35,11 +35,9 @@ function viewState(data: BoardSnapshot<BoardData>, selection: Selection, now: nu
 }
 
 function commandSelection(data: BoardSnapshot<BoardData>, wanted: string): Selection {
-  const key = wanted || data.focus;
-  if (!key) return { kind: 'board' };
-  const focused = data.focus ? data.boards[0] : undefined;
-  const board = focused?.units.some(unit => unit.key === key) ? focused : data.boards.find(board => board.units.some(unit => unit.key === key));
-  return board ? { kind: 'unit', production: board.production, unit: key } : { kind: 'board' };
+  if (!wanted) return { kind: 'board' };
+  const board = data.boards.find(board => board.units.some(unit => unit.key === wanted));
+  return board ? { kind: 'unit', production: board.production, unit: wanted } : { kind: 'board' };
 }
 
 function retainWatch(active: OpenPane, path: RefreshPaths) {
@@ -75,7 +73,7 @@ const tick = async ($: EngineInterface, opened: Map<string, OpenPane>, id: strin
     const state = await readPane($, id);
     if (!state || !isOpen()) return;
     const regenerated = await refreshIfChanged({ stat: path => $.fs.stat(path) }, active.paths,
-      () => loadBoard(boardCalls($), active.cwd, isOpen, path => retainWatch(active, path)), async data => {
+      () => loadBoard(boardCalls($), active.cwd, active.session, isOpen, path => retainWatch(active, path)), async data => {
         const now = await $.clock.now() / 1000;
         if (!isOpen()) return;
         active.paths = snapshotPaths(data);
@@ -91,10 +89,10 @@ const tick = async ($: EngineInterface, opened: Map<string, OpenPane>, id: strin
     await put($, id, { kind: 'failed', reason: String(error) }, isOpen);
   } finally { active.busy = false; }
 };
-const startTimer = ($: EngineInterface, opened: Map<string, OpenPane>, id: string, cwd: string) => {
+const startTimer = ($: EngineInterface, opened: Map<string, OpenPane>, id: string, cwd: string, session: string) => {
   const previous = opened.get(id);
   previous?.timer.cancel();
-  opened.set(id, { cwd, busy: false, paths: previous?.paths ?? [], selection: previous?.selection ?? { kind: 'board' },
+  opened.set(id, { cwd, session, busy: false, paths: previous?.paths ?? [], selection: previous?.selection ?? { kind: 'board' },
     timer: $.clock.every(10_000, () => { void tick($, opened, id); }) });
 };
 const select = async ($: EngineInterface, opened: Map<string, OpenPane>, id: string, selection: Selection) => {
@@ -169,11 +167,10 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const lifecycle = ++accountsLifecycle;
-    await $.command.register({ name: PANE, description: 'Show the production board pane' });
     await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
     const panes = await $.ui.panes();
     if (panes.some(pane => pane.id === PANE)) {
-      startTimer($, opened, PANE, e.cwd);
+      startTimer($, opened, PANE, e.cwd, await $.session.id());
       const active = opened.get(PANE)!;
       const state = await readPane($, PANE);
       if (state?.kind === 'board' || state?.kind === 'unit') {
@@ -195,23 +192,24 @@ export const register: Register = on => {
     }
     return next(e);
   });
-  on('command.run', { command: PANE }, async ($, e) => {
+  on('command.run', { command: 'showrunner:unit_board' }, async ($, e) => {
     const wanted = e.args.trim();
     if (wanted === 'close') {
       await $.ui.close({ id: PANE });
       return { text: 'Unit board closed.' };
     }
     const cwd = await $.session.cwd();
+    const session = await $.session.id();
     opened.get(PANE)?.timer.cancel();
     opened.delete(PANE);
     await $.ui.open({ id: PANE, title: 'Units', closeOnEscape: true });
-    startTimer($, opened, PANE, cwd);
+    startTimer($, opened, PANE, cwd, session);
     const active = opened.get(PANE)!;
     const isOpen = () => opened.get(PANE) === active;
     active.busy = true;
     await put($, PANE, { kind: 'loading' }, isOpen);
     try {
-      const data = await loadBoard(boardCalls($), cwd, isOpen, path => retainWatch(active, path));
+      const data = await loadBoard(boardCalls($), cwd, session, isOpen, path => retainWatch(active, path));
       if (isOpen()) {
         active.paths = snapshotPaths(data);
         active.selection = commandSelection(data, wanted);

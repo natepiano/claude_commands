@@ -30,17 +30,16 @@ production's own plumbing words (PLUMBING).
          identifies an occurrence in a repeated hour.
 --chart  sets the chart mode in CHART_CONF, which every showrunner's dailies
          read; with no input file it only sets the mode.
---footer prints the separated bullet footer before every showrunner reply's
-         Waiting on block and at every report's end, at the current time in
-         --zone. Its Agents bullets
+--footer prints the separated bullet footer that ends every report, alone,
+         at the current time in --zone; the checks use it, and no reply
+         carries it (user, 2026-10-18). Its Agents bullets
          use the report's words. Hold lines come from BUILD_HOLD_DIR or
          ~/.local/state/build-hold and MAC_TEST_STATE_DIR or
          ~/.local/state/mac-test.
 --outstanding  JSON list of what waits on the user, `[{"since":
          "YYYY-MM-DDTHH:MM", "text": "..."}]`; outstanding items suppress
-         ` - nothing needed`; the showrunner's Waiting on block, which this
-         renderer does not print, shows only their count. A missing file is an
-         empty list.
+         ` - nothing needed`; the status line shows only their count. A
+         missing file is an empty list.
 --below  With --footer, once per production below a root showrunner: that
          production's list. Its due items count with --outstanding. A list
          that cannot be read adds the bullet `<slug>: needs-user list
@@ -970,12 +969,18 @@ def check_words(line: str, key: str, where: str) -> None:
 
 
 def check_plumbing(line: str, name: str) -> None:
+    problem = plumbing(line)
+    if problem is not None:
+        raise InputError(f"{name}: {problem}")
+
+
+def plumbing(line: str) -> str | None:
+    """Why the line fails the plumbing check, or None when it passes."""
     found = PLUMBING.search(line)
-    if found is not None:
-        raise InputError(
-            f"{name}: {found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
-            + "say what changes in the app, or leave it out"
-        )
+    if found is None:
+        return None
+    return (f"{found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
+            + "say what changes in the app, or leave it out")
 
 
 def read_outstanding(path: Path | None) -> list[Outstanding]:
@@ -999,7 +1004,8 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
             raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
-        check_plumbing(text, f"{where}.text")
+        # The plumbing check runs when `update_registration.py questions` writes an item, not here:
+        # a stored item that fails it must not take the whole list down.
         timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
         since_at = datetime.fromisoformat(since)
         question = fields.get("question")
@@ -1501,7 +1507,7 @@ def release_progress(cycle: HoldCycle, zone: ZoneInfo) -> str:
 
 
 def hold_line(holder: Holder, now: datetime, zone: ZoneInfo, cycle: HoldCycle | None = None) -> str:
-    """A holder's line, shared by reports and reply footers: who holds builds, why, since when and until when."""
+    """A holder's line, in a report's footer: who holds builds, why, since when and until when."""
     since = holder.since.astimezone(zone)
     head = f"{BUILD_HOLD_MARK}: {holder.name} holds builds since {since:%H:%M} {since:%Z} for {holder.purpose}"
     if cycle is not None and cycle["release_started_at"] and holder.key in cycle["holders"]:
@@ -1534,7 +1540,7 @@ def mac_block_line(
     block: PendingMacBlock | ActiveMacBlock | UnreadableMacBlock,
     zone: ZoneInfo,
 ) -> str:
-    """A Mac block line shared by reports and reply footers."""
+    """A Mac block line in a report's footer."""
     if isinstance(block, UnreadableMacBlock):
         return f"Mac block: its state file cannot be read ({block.path})"
     since = block.since.astimezone(zone)
@@ -1657,7 +1663,7 @@ def footer(
     nothing_needed: bool, agent_lines: list[str], unreadable: Sequence[str] = (), root: str = "",
     counts: str | None = None
 ) -> list[str]:
-    """The separated update footer shared by replies and dailies reports.
+    """The separated update footer that ends a dailies report.
 
     `outstanding` already holds the lower productions' items for a root. `unreadable` names each
     lower production whose list could not be read, and `root` the root a lower showrunner is under.
@@ -1677,7 +1683,7 @@ def footer(
     if not isinstance(mac_block, NoMacBlock):
         items.append(mac_block_line(mac_block, zone))
     items.extend(line.removeprefix("- ") for line in agent_lines if line and line != "### Agents")
-    # By name, so a report and a reply name the same lists in the same order however each walked the tree.
+    # By name, so the lists keep one order however the tree was walked.
     items.extend(f"{slug}: {UNREADABLE_LIST}" for slug in sorted(unreadable))
     if root:
         items.append(f"reports to {root}")
@@ -1693,7 +1699,7 @@ def footer(
 
 
 def doc_counts(doc: Path | None) -> str | None:
-    """The counts line for a production doc; the Waiting on block carries the question count."""
+    """The counts line for a production doc; the status line carries the question count."""
     import footer_counts
 
     return None if doc is None else footer_counts.counts_line(footer_counts.read_counts(doc))

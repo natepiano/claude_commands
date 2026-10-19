@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / 
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+# Where Claude Code keeps each session scratchpad, as /tmp/claude-<uid>/<project>/<session id>/scratchpad.
+SCRATCH_ROOT = Path(os.environ.get("SHOWRUNNER_SCRATCH_ROOT") or "/tmp")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 PARENT_FILE = "parent"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -228,6 +231,59 @@ def production_slug(doc: str) -> str:
     return slug
 
 
+def session_state_dir(slug: str) -> Path:
+    """The showrunner's own state, which a new session id, a restart and a reboot keep; a wrap deletes it."""
+    return SHOWRUNNER_STATE_DIR / slug / "session"
+
+
+# The showrunner state a scratchpad held before session_state_dir.
+SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", "dailies_judgment.json",
+                 "dailies_state.json")
+
+
+def copy_session_state(slug: str, scratch: Path) -> list[str]:
+    """Copy each state file the scratchpad holds and the state directory does not; a copy never replaces one."""
+    target = session_state_dir(slug)
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for name in SESSION_STATE:
+        source, destination = scratch / name, target / name
+        if destination.exists() or not source.exists():
+            continue
+        if source.is_dir():
+            _ = shutil.copytree(source, destination)
+        else:
+            _ = shutil.copy2(source, destination)
+        copied.append(name)
+    return copied
+
+
+def timer_scratch(slug: str) -> Path | None:
+    """The scratchpad of the session the production's update timer is addressed to, when it exists."""
+    try:
+        target = _fields(NOTIFIER_STATE_DIR / f"showrunner-{slug}" / "conf").get("TARGET", "")
+    except (OSError, UnicodeError):
+        return None
+    session_id = target.removeprefix("session:")
+    if not session_id or session_id == target:
+        return None
+    return next((path for path in sorted(SCRATCH_ROOT.glob(f"claude-*/*/{session_id}/scratchpad"))
+                 if path.is_dir()), None)
+
+
+def adopt_session_state(slug: str) -> list[str]:
+    """Bring a showrunner's scratchpad state into its state directory once, with no step by anyone.
+
+    Only the state files the directory lacks are looked for, so a showrunner that has moved costs one
+    stat per file.
+    """
+    target = session_state_dir(slug)
+    if all((target / name).exists() for name in SESSION_STATE):
+        return []
+    scratch = timer_scratch(slug)
+    return copy_session_state(slug, scratch) if scratch is not None else []
+
+
 def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
     """Map a former production name to its current slug; leave other slugs unchanged."""
     timers: list[Timer] = []
@@ -292,15 +348,21 @@ def named(showrunner: str) -> Showrunner:
     raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
 
 
-def timer_slugs(state_dir: Path | None = None) -> set[str]:
-    """Every production with a complete update timer, whether or not its showrunner runs."""
-    found: set[str] = set()
+def timer_docs(state_dir: Path | None = None) -> dict[str, Path]:
+    """Each production with a complete update timer, by slug, with its doc, whether or not its showrunner runs."""
+    found: dict[str, Path] = {}
     for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
         try:
-            found.add(_timer(instance).slug)
+            timer = _timer(instance)
         except (OSError, KeyError, ValueError, UnicodeError):
             continue
+        found[timer.slug] = timer.doc
     return found
+
+
+def timer_slugs(state_dir: Path | None = None) -> set[str]:
+    """Every production with a complete update timer, whether or not its showrunner runs."""
+    return set(timer_docs(state_dir))
 
 
 def _stored_parent(child: str) -> str:

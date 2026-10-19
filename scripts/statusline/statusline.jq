@@ -21,11 +21,13 @@
 #             first: "<session> - unit director …" for a unit director, "<session> showrunner"
 #             for a showrunner.
 #             Line 2: "<account> | 5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
-#             each piece only when present, each " until ..." only when its window carries a reset time.
+#             each piece only when present, the 5-hour piece only when under 10% is left,
+#             each " until ..." only when its window carries a reset time.
 #             Line 3, when present: this session's "For you: …" counts row, from
 #             the "<session id> <row>" lines in $counts that statusline.sh reads
 #             from each showrunner's counts cache, with each count in bold.
-#             ANSI colors wrap the role, account, tokens and percentages only.
+#             ANSI colors wrap the role (with the session name before it), account, tokens
+#             and percentages only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
 
@@ -158,11 +160,12 @@ def usage($config; $label; $window; $fmt):
       | (if $role == "unit director" and ($showrunner_name | type) == "string"
             and $showrunner_name != ""
          then $role + " for " + $showrunner_name else $role end)
-      | color($colors; "role." + ($role | gsub(" "; "-")))
       | if $session_name == null then .
         elif $role == "showrunner" then $session_name + " " + .
         elif $role == "unit director" then $session_name + " - " + .
-        else . end),
+        else . end
+      # The session name takes the role's color.
+      | color($colors; "role." + ($role | gsub(" "; "-")))),
      $base,
      (.context_window as $context
       | (($context.total_input_tokens // 0) | commas)
@@ -177,7 +180,10 @@ def usage($config; $label; $window; $fmt):
      (if $account == "" or ($account | contains("@")) then empty
       elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
       else $account end | . as $label | color($colors; "account." + $label)),
-     usage($colors; "5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
+     # The 5-hour window shows only when under 10% of it is left (user, 2026-10-18).
+     (window("five_hour"; .rate_limits.five_hour?) as $five_hour
+      | select((remaining($five_hour) // 100) < 10)
+      | usage($colors; "5-hour"; $five_hour; "%H:%M")),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
 | ((.session_id // "") as $id

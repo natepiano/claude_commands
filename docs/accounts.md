@@ -30,7 +30,7 @@ The status line's first row shows this session's account label, after its role. 
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows natedev's shared role map. An unset workers role refuses to launch; it never falls back to `~/.codex`. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
-Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
+Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. A good read clears the star and footnote. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
 `status --json` prints `{"accounts": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the lines below the normal table. Each account has `label`, `tool` (`claude` or `codex`), `roles`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
 
@@ -196,7 +196,7 @@ A source with no fresh reading prints `move when idle (<source> no fresh reading
 Before any group change or shutdown write, the target must pass its home and sign-in checks. A fresh reading with no credits and a window at 0 refuses:
 
 ```text
-accounts: <target> is out of usage (weekly 0% left, resets Sat 8:59 AM); pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude <target> in this terminal
+accounts: claude3 is out of usage (weekly 0% left, resets Sat 8:59 AM); claude2 has room
 ```
 
 A stale or missing reading permits the move and prints `no fresh usage reading for <target> (last <n> minutes ago)`. A missing or ambiguous local session, a worker, a grouped session (the refusal names `accounts.py move <group> <target>`), a session already on the target, and an unreadable account or shutdown state also refuse. A session on the other machine moves from there. Workers move with their unit director.
@@ -219,7 +219,7 @@ Numbered Claude aliases through `accounts.py exec` use the terminal supervisor w
 
 ## Picking an account
 
-`/showrunner:accounts pick claude --explain` shows each candidate's weekly and 5-hour readings, its reset, and why it was picked or skipped. Use `pick codex` for Codex, repeat `--exclude "<label>"` to omit accounts, or use `--keep "<label>"` to retain a session's account while it has room.
+Automatic moves choose an account with room. The ranking chooses the soonest weekly reset, then the most weekly allowance left, then the account label. It keeps the current account while it has room when the caller asks it to. `/showrunner:accounts placement --explain` shows each Claude account's readings and the reason it was chosen or skipped.
 
 Claude accounts have room until they have an unresolved provider refusal. Without a next-move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with a next-move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 

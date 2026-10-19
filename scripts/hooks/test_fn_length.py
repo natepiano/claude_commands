@@ -561,6 +561,28 @@ class CodexApplyPatchTests(SyntheticPackageTests):
             self.assertEqual(edit.files, ("crate/src/new.rs", "crate/src/moved.rs"))
         self.assertIsInstance(fn_length_lib.applied_rust_edits("{}"), fn_length_lib.IgnoredEdit)
 
+    def test_patch_parser_uses_final_extensions_and_keeps_first_file_order(self) -> None:
+        command = (
+            "*** Begin Patch\r\n"
+            "*** Update File: crate/src/old.rs\r\n"
+            "*** Move to: crate/notes.txt\r\n"
+            "*** Update File: crate/template.txt\r\n"
+            "*** Move to: crate/src/generated.rs\r\n"
+            "*** Update File: crate/src/lib.rs\r\n"
+            "*** Add File: crate/src/added.rs\r\n"
+            "*** Update File: crate/src/lib.rs\r\n"
+            "*** End Patch\r\n"
+        )
+        edit = fn_length_lib.applied_rust_edits(json.dumps({
+            "tool_name": "apply_patch", "cwd": str(self.workspace),
+            "tool_input": {"command": command},
+        }))
+        self.assertIsInstance(edit, fn_length_lib.AppliedRustEdits)
+        if isinstance(edit, fn_length_lib.AppliedRustEdits):
+            self.assertEqual(edit.files, (
+                "crate/src/generated.rs", "crate/src/lib.rs", "crate/src/added.rs",
+            ))
+
     def test_update_file_blocks_and_logs_codex(self) -> None:
         self.write_function(101)
         result = self.run_patch("*** Begin Patch\n*** Update File: crate/src/lib.rs\n@@\n*** End Patch\n")

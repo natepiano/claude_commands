@@ -22,8 +22,6 @@ from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
 from session_types import Session, parse_session
 from session_types import (
-    ShowrunnerFooter as ShowrunnerFooter,
-    NoFooter as NoFooter,
     TimerRestore as TimerRestore,
     CodexSessionId as CodexSessionId,
     CodexResumePicker as CodexResumePicker,
@@ -508,6 +506,8 @@ class SessionShutdown(TypedDict):
     why: NotRequired[str]
     # Set by rename_unit while the unit is stopped: the restart note tells the session its new names.
     renamed: NotRequired[str]
+    # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
+    cut_off: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -715,23 +715,14 @@ def _conductor(value: object, place: str) -> _LegacyConductor:
     return cast(_LegacyConductor, cast(object, values))
 
 
-def _footer(value: object, place: str) -> ShowrunnerFooter | NoFooter:
-    values = _mapping(value, place)
-    kind = _kind(values, place, frozenset({"footer", "no footer"}))
-    if kind == "footer":
-        _ = _string(_required(values, "slug", place), f"{place}.slug")
-    return cast(ShowrunnerFooter | NoFooter, cast(object, values))
-
-
 def _timer(value: object, place: str) -> TimerRestore:
     values = _mapping(value, place)
     _ = _string(_required(values, "instance", place), f"{place}.instance")
     _ = _boolean(
         _required(values, "was_enabled", place), f"{place}.was_enabled"
     )
-    values["footer"] = _footer(
-        _required(values, "footer", place), f"{place}.footer"
-    )
+    # A record written while reply footers existed also has `footer`, which nothing restores now.
+    _ = values.pop("footer", None)
     return cast(TimerRestore, cast(object, values))
 
 
@@ -1159,7 +1150,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
-    for field in ("source_label", "why", "renamed"):
+    for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (

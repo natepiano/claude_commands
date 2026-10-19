@@ -18,7 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -462,9 +462,6 @@ class CommandLine(argparse.Namespace):
     session: str = ""
     source: str = ""
     target: str = ""
-    tool: str = "claude"
-    exclude: list[str] = []
-    keep: str = ""
     explain: bool = False
     why: str = ""
     detail: bool = False
@@ -3011,8 +3008,9 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                 if isinstance(window, ReadingWindow) and window.left <= 0:
                     reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
-                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); "
-                        + f"pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude {shlex.quote(destination.label)} in this terminal")
+                    chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
+                    room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
+                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
         return MoveTargetReady(destination)
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
@@ -3641,9 +3639,17 @@ def _stored_usage(
                    if status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now)]
     if stale or stale_codex:
         with ThreadPoolExecutor() as pool:
-            reads = [pool.submit(agent_accounts.claude_live, config_dir) for config_dir in stale]
-            reads.extend(pool.submit(_codex_live, home) for home in stale_codex)
-            reports = [read.result() for read in reads]
+            reads: list[tuple[Future[agent_accounts.Report],
+                              agent_accounts.ClaudeDirectorySource | agent_accounts.CodexHomeSource, str]] = [
+                     (pool.submit(agent_accounts.claude_live, status.config_dir),
+                      agent_accounts.ClaudeDirectorySource(status.config_dir), status.login)
+                     for status in statuses if status.config_dir in stale]
+            reads.extend((pool.submit(_codex_live, status.home),
+                          agent_accounts.CodexHomeSource(status.home), status.login)
+                         for status in codex if status.home in stale_codex)
+            reports = [replace(read.result(), source=directory,
+                               last_known_login=agent_accounts.KnownUsageLogin(login))
+                       for read, directory, login in reads]
         for report in reports:
             startup = report.codex_startup
             if isinstance(startup, agent_accounts.CodexStartupFailure):
@@ -3696,6 +3702,7 @@ class StatusRow:
     on_credits: str
     use_credits: bool
     read_at: datetime | StatusUnavailable
+    read_outcome: agent_accounts.UsageReadOutcome
 
 
 @dataclass(frozen=True)
@@ -3705,6 +3712,7 @@ class StatusReading:
     group_line: str
     detail_lines: tuple[str, ...]
     zone: tzinfo
+    checked_at: datetime
 
 
 class StatusAccountDocument(TypedDict):
@@ -3759,6 +3767,7 @@ def _status_row(
     on_credits = NO_VALUE
     login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
     if login:
+        read_at = _read_at(usage) or StatusUnavailable()
         if isinstance(status, CodexStatus) and isinstance(status.startup, agent_accounts.CodexStartupFailure):
             weekly = StatusUnavailable(status.startup.setup_command)
         else:
@@ -3770,7 +3779,6 @@ def _status_row(
             else:
                 weekly = StatusUnavailable("unavailable")
                 resets = StatusUnavailable("unavailable")
-            read_at = _read_at(usage) or StatusUnavailable()
             if (window is not None and isinstance(read_at, datetime)
                     and (reset := _stored_time(window["resets"])) is not None and reset <= now):
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
@@ -3779,10 +3787,11 @@ def _status_row(
     return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
         weekly, resets, credits, on_credits,
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
-        read_at)
+        read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
+        else agent_accounts.UsageReadOutcome.OK)
 
 
-def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
+def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tuple[str, ...]:
     weekly = row.weekly_left_percent
     reset = row.resets_at
     credits = row.credits
@@ -3794,12 +3803,21 @@ def _status_row_cells(row: StatusRow, zone: tzinfo) -> tuple[str, ...]:
             weekly_cell += ": no session to refresh its login"
     else:
         weekly_cell = weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%"
+    failed = row.read_outcome != agent_accounts.UsageReadOutcome.OK
+    if isinstance(read, StatusUnavailable):
+        read_cell = read.cell
+    else:
+        local = read.astimezone(zone)
+        date_format = "%m-%d %H:%M %Z" if failed and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
+        read_cell = local.strftime(date_format)
+    if failed:
+        read_cell += "*"
     return (row.folder, row.label, row.login_cell, role_cell,
         weekly_cell,
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
-        read.cell if isinstance(read, StatusUnavailable) else read.astimezone(zone).strftime("%H:%M %Z"))
+        read_cell)
 
 
 def render_status_json(reading: StatusReading, *, with_login: bool = False) -> str:
@@ -3817,9 +3835,24 @@ def render_status_json(reading: StatusReading, *, with_login: bool = False) -> s
     return json.dumps(StatusDocument(accounts=accounts, problems=list(reading.notes)))
 
 
+def _read_failure_note(row: StatusRow) -> str:
+    match row.read_outcome:
+        case agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            reason = "login token expired; start a session on it to refresh"
+        case agent_accounts.UsageReadOutcome.REFUSED_401:
+            reason = "usage read refused (401); start a session on it to check its login"
+        case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
+            reason = "usage read refused (rate limit); the next read is in 2 minutes"
+        case agent_accounts.UsageReadOutcome.ERROR:
+            reason = "usage read failed; the next read is in 2 minutes"
+        case agent_accounts.UsageReadOutcome.OK:
+            return ""
+    return f"* {row.label}: {reason}"
+
+
 def render_status_table(reading: StatusReading) -> str:
     return "\n".join([reading.group_line,
-        _render_table([_status_row_cells(row, reading.zone) for row in reading.rows]), "",
+        _render_table([_status_row_cells(row, reading.zone, reading.checked_at) for row in reading.rows]), "",
         *reading.notes, *reading.detail_lines])
 
 
@@ -3897,6 +3930,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     )
     home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
     notes = [
+        *(_read_failure_note(row) for row in rows if row.read_outcome != agent_accounts.UsageReadOutcome.OK),
         *role_problems,
         *([f"~/.claude holds a login; {home_step}"]
           if account.claude_account(main_config_dir()) is not None else []),
@@ -3914,7 +3948,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*live_lines,
             *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), group_status_line(groups), detail_lines, zone)
+    return StatusReading(rows, tuple(notes), group_status_line(groups), detail_lines, zone, now)
 
 
 @role_map.role_map_command
@@ -4125,11 +4159,6 @@ def _parser() -> argparse.ArgumentParser:
     _ = status.add_argument("--detail", action="store_true", default=argparse.SUPPRESS)
     placer = commands.add_parser("placement")
     _ = placer.add_argument("--explain", action="store_true")
-    picker = commands.add_parser("pick")
-    _ = picker.add_argument("tool", choices=("claude", "codex"))
-    _ = picker.add_argument("--exclude", action="append", default=[])
-    _ = picker.add_argument("--keep", default="")
-    _ = picker.add_argument("--explain", action="store_true")
     exec_command = commands.add_parser("exec")
     _ = exec_command.add_argument("--probe", action="store_true", help="mark the session as a throwaway probe: no shutdown, restart or move for it ever pushes to the phone")
     _ = exec_command.add_argument("label")
@@ -4248,14 +4277,6 @@ def main(argv: list[str]) -> int:
         if options.action == "placement":
             print(placement_report())
             return 0
-        if options.action == "pick":
-            chosen = pick(cast(Literal["claude", "codex"], options.tool), datetime.now(timezone.utc),
-                          exclude=frozenset(options.exclude), keep=KeepAccount(options.keep) if options.keep else NoKeep())
-            print(chosen.label if isinstance(chosen, PickedAccount) else no_room_line(options.tool, chosen))
-            if options.explain:
-                for reason in chosen.reasons:
-                    print(_pick_explanation(reason))
-            return 0 if isinstance(chosen, PickedAccount) else 1
         if options.action == "exec":
             exec_account(options.label, options.claude_args, probe=options.probe)
             return 0

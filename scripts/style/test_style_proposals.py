@@ -442,7 +442,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(fields["backlog_goal"], [])
             self.assertTrue(all(len(path.name) <= 50 for path in paths))
             self.assertEqual(len(open_issues(self.proposals, "proposal")), ledger.summary().proposals)
-            self.assertEqual(len(proposals_table.issue_rows(self.proposals)), ledger.summary().proposals)
+            self.assertEqual(len(proposals_table.issue_rows(open_issues(self.proposals, "proposal"))), ledger.summary().proposals)
             before = {path: path.read_bytes() for path in paths}
             self.assertEqual(self.file(ledger), ())
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
@@ -675,7 +675,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(frontmatter(issue)["reason"], ["declined: Keep the API"])
             self.assertEqual(ledger.summary().proposals, 0)
             self.assertEqual(open_issues(self.proposals, "proposal"), [])
-            self.assertEqual(proposals_table.issue_rows(self.proposals), [])
+            self.assertEqual(proposals_table.issue_rows(open_issues(self.proposals, "proposal")), [])
             calls = len(self.calls)
             style_proposals.decline(ledger, issue, "Keep the API")
             self.assertEqual(len(self.calls), calls)

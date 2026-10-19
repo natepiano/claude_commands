@@ -773,6 +773,37 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 journal = self.home / ".local/state/accounts/moves.jsonl"
                 self.assertFalse(journal.exists() and journal.stat().st_size)
 
+    def test_a_stop_covers_this_machine_unless_the_other_machine_or_a_session_is_named(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        cases: tuple[tuple[tuple[str, ...], bool], ...] = (
+            ((), True), (("--here",), True), (("--also", "mac"), False),
+            (("--restart", "--to", "claude3"), False),
+        )
+        for arguments, here in cases:
+            for verb in ("down", "now"):
+                if verb == "now" and "--to" in arguments:
+                    continue
+                with (self.subTest(verb=verb, arguments=arguments),
+                      patch.object(shutdown, "named_claude_account", return_value=selected),
+                      patch.object(shutdown, "inventory", return_value=report),
+                      patch.object(settle, verb, return_value=0) as stop):
+                    self.assertEqual(shutdown.main([verb, LABEL, *arguments]), 0)
+                    self.assertEqual(stop.call_args.args[1], here)
+        with (patch.object(shutdown, "named_claude_account", return_value=selected),
+              patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("peer-id",), report)),
+              patch.object(settle, "down", return_value=0) as down):
+            self.assertEqual(shutdown.main(["down", LABEL, "--only", "peer-id"]), 0)
+        self.assertFalse(down.call_args.args[1])
+        for arguments in (("--also", "natedev"), ("--also", "mac", "--here")):
+            errors = io.StringIO()
+            with (self.subTest(arguments=arguments),
+                  patch.object(shutdown, "named_claude_account", return_value=selected),
+                  patch.object(settle, "down") as down, redirect_stderr(errors)):
+                self.assertEqual(shutdown.main(["down", LABEL, *arguments]), 2)
+            down.assert_not_called()
+            self.assertIn("--also names the other machine (mac)", errors.getvalue())
+
     def test_down_passes_refusal_window_and_aware_reset_or_hand_origin_to_settle(self) -> None:
         from scripts.accounts import accounts
         from datetime import datetime
@@ -1438,7 +1469,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "inventory", return_value=report),
         ):
             self.assertEqual(shutdown.main(["down", LABEL]), 0)
-        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="")
+        down.assert_called_once_with(selected, True, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="")
 
 
 
