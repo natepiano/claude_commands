@@ -380,7 +380,32 @@ class StyleFootprintTests(unittest.TestCase):
                 if count == 99:
                     self.assert_mechanical(base)
                 else:
-                    self.assertIn("check 5", self.assert_review(base))
+                    self.assertEqual(
+                        self.assert_review(base),
+                        "review: check 5: src/lib.rs: 200 or more changed lines (size only)\n",
+                    )
+
+    def comment_fixture(self, modules: tuple[str, ...], lines: int) -> str:
+        self.write("src/lib.rs", "".join(f"mod {module};\n" for module in modules))
+        for module in modules:
+            self.write(f"src/{module}.rs", "// Read the value.\n" * lines + "fn value() {}\n")
+        base = self.commit()
+        for module in modules:
+            path = self.repo / f"src/{module}.rs"
+            _ = path.write_text(path.read_text().replace("Read the value", "Load the value"))
+        _ = self.commit()
+        return base
+
+    def test_changed_line_limit_counts_each_file_not_the_whole_diff(self) -> None:
+        base = self.comment_fixture(tuple(f"part{index}" for index in range(19)), 8)
+        self.assert_mechanical(base)
+
+    def test_each_file_over_the_changed_line_limit_gives_its_own_reason(self) -> None:
+        base = self.comment_fixture(("first", "second"), 100)
+        self.assertEqual(self.assert_review(base), (
+            "review: check 5: src/first.rs: 200 or more changed lines (size only); "
+            "check 5: src/second.rs: 200 or more changed lines (size only)\n"
+        ))
 
     def test_condition_literal_control_flow_and_serialized_name_changes_require_review(self) -> None:
         changes = (
