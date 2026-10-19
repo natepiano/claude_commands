@@ -69,29 +69,18 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 ### Phase 2 — Where the tokens go  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a token map for the window: every weighted token placed by production, role, model, family, machine and token class, with the top sinks named.
-
-**Spec:**
-- Bring the store current (`collect.py`, one pass, only when `usage_report.py weighted` Sources show a source older than 1 h).
-- Totals: `weighted` by `role,model`, by `unit` (folded to production with the four production docs), by `machine`, by `day`. Shares: `cache_read_share`, `context_share`, `output_share`, `wait_share`, `status_share`, `compaction_reread_share`, `before_first_edit_share`, each by role.
-- Work done: `weighted_per_checkpoint` by production and unit; `weighted_per_finding_closed`, `weighted_per_review_round` by role. This is the "same work" yardstick for every later gain.
-- Split weighted tokens by token class (uncached input, cache write, cache read, output) per role, so later phases know whether a sink is context size (cache reads × requests), new context (cache writes) or output.
-- Name the 10 largest sinks as (production, role, class) cells with weekly weighted tokens and share.
-- Report `token-study/2-map/report.md`; scripts in `token-study/2-map/work/`.
+- `~/.local/state/nightly-review/token-study/2-map/report.md` (outside git) maps the week 2026-10-12..19, both machines, both families: 7,240,515,495 weighted tokens, Claude 56.1% and Codex 43.9%, by role, model, production, unit, machine, day and token class, with shares by role and the top 10 (production, role, class) sinks. Cache reads are 60% of all cost.
+- Yardsticks: 706 checkpoints counted from the git history of every production repository (10,255,688 weighted each; build-followups 4,444,459, tool-based-ui 24,478,002), 2,114 findings closed (3,425,031 each), 1,136 review rounds (6,373,693 each).
+- Scripts and data: `2-map/claude/work/` (Claude cells, `cells.jsonl`) and `2-map/codex/work/` (Codex cells, `cube.csv`; checkpoints, `git_checkpoints.py`).
 
 **Files:**
-- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/2-map/` (outside git).
+- `docs/plans/build-followups-efficiency.md` — this record; the study lives outside git
 
-**Workers:** 2 writers (no test lane), split by family.
-- `impl` — Claude turns (showrunners, directors, interactive, subagents).
-- `test` opens as `impl` — Codex turns (workers by role, reviewers by lens).
-The unit director merges the two halves into `report.md`.
+**Binds later work:** every later gain is stated against these role and production totals and the git-based per-checkpoint yardstick. Codex fix, impl and test workers spend 27–36% of weighted tokens on waiting turns; reviewers 27% on compaction rereads.
 
-**Constraints from prior phases:** Delegation Context **Invariants** bind every study phase.
-
-**Acceptance gate:** the per-cell totals sum to `usage_report.py weighted` for the window within 1%; every number cites its query; `git -C ~/.claude status --porcelain` and every production repo's status are unchanged from phase start; the worktree diff holds only this plan.
+**Gotchas:** the usage store holds only `.claude` checkpoints, so checkpoints come from each production repository's git history. Codex logs record no cache writes: Claude cache write and Codex uncached input are the same kind of cost.
 
 ### Phase 3 — The fixed cost of every request  · status: todo
 **Depends on:** Phase 2
