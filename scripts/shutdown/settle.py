@@ -464,11 +464,15 @@ def merge_in_progress(session: Session) -> bool:
         return False
     return result.returncode == 0
 
-def blocker(session: Session) -> ReadinessCheck:
-    """Check whether outstanding work prevents this session from stopping."""
+def blocker(session: Session, *, moving: bool = False) -> ReadinessCheck:
+    """Check whether outstanding work prevents this session from stopping.
+
+    A move keeps the checkout on this machine, so commits not yet pushed never hold it.
+    """
     checkout = session["checkout"]
     if (
-        checkout["kind"] == "git"
+        not moving
+        and checkout["kind"] == "git"
         and checkout["upstream"]["kind"] == "tracking"
         and checkout["upstream"]["ahead"] > 0
     ):
@@ -737,7 +741,8 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
         progress += f" · to {target}: {record.get('why', '')}"
     if record["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} and not isinstance(owner, _StatusUnobserved) and owner["kind"] == "matching session":
         try:
-            detail = ", ".join(_hold_details(owner, record["progress"]["kind"], local_observation=local_observation))
+            detail = ", ".join(_hold_details(owner, record["progress"]["kind"], local_observation=local_observation,
+                                             moving=bool(target)))
         except Exception:
             detail = record["progress"]["kind"]
         if detail and detail != record["progress"]["kind"]:
@@ -857,7 +862,8 @@ def stoppable_status(status: str) -> bool:
     return status in _STOPPABLE_STATUSES
 
 
-def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True) -> list[str]:
+def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True,
+                  moving: bool = False) -> list[str]:
     """Return observed hold conditions without delivery state."""
     if owner["kind"] == "session account unreadable":
         return ["account unreadable"]
@@ -872,7 +878,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     if local_observation and progress != "held by usage limit" and _showing_form(session):
         details.append(SHOWING_FORM)
     checkout = session["checkout"]
-    if checkout["kind"] == "git" and checkout["upstream"]["kind"] == "tracking":
+    if not moving and checkout["kind"] == "git" and checkout["upstream"]["kind"] == "tracking":
         ahead = checkout["upstream"]["ahead"]
         if ahead:
             head = checkout["head"]
@@ -889,7 +895,8 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
 
 def hold_reason(saved: SessionShutdown, owner: stop_work.FreshSession, *, local_observation: bool = True) -> str:
     """Describe the condition preventing this owner from advancing."""
-    details = _hold_details(owner, saved["progress"]["kind"], local_observation=local_observation)
+    details = _hold_details(owner, saved["progress"]["kind"], local_observation=local_observation,
+                            moving=bool(saved.get("target")))
     message = saved["settle_message"]
     if owner["kind"] == "matching session" and message["kind"] == "queued":
         details.append(f"message queued: {message['reason']}")
@@ -925,7 +932,7 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
                 return StopSession()
             if owner["session"]["status"] in _STOPPABLE_STATUSES and all(
                 worker["status"] == "idle" for worker in owner["workers"]
-            ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
+            ) and blocker(owner["session"], moving=bool(saved.get("target")))["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 if progress in {"ready", "held by usage limit"}:
                     return StopSession()
                 message = saved["settle_message"]
@@ -990,7 +997,7 @@ def ready(where: str) -> int:
         if owner["kind"] != "matching session":
             print(f"this session is not in a fresh inventory of {saved['label']}: {owner['kind']}", file=sys.stderr)
             return 2
-        check = blocker(owner["session"])
+        check = blocker(owner["session"], moving=bool(saved.get("target")))
         if check["kind"] == "blocked":
             print(check["reason"], file=sys.stderr)
             return 2
@@ -1241,7 +1248,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     from scripts.accounts import accounts
     origin_arguments = accounts.move_origin_arguments(origin)
     ids = tuple(only)
-    if not _warm():
+    # A move never waits on cold keys: the session keeps its commits on the same machine.
+    if not target and not _warm():
         retry = ["down", account.login]
         if here:
             retry.append("--here")
@@ -1249,10 +1257,6 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             retry.extend(("--only", ",".join(ids)))
         if then == "restart":
             retry.append("--restart")
-        if target:
-            retry.extend(("--to", target, "--why", why, *origin_arguments))
-            if move_id:
-                retry.extend(("--move-id", move_id))
         if alerts == "none":
             retry.append("--no-alert")
         print(f"GitHub keys are cold; in a terminal on {_machine()}: github-warm-status; github-warmup. Then in a terminal on {_machine()}: {shutdown_command(*retry)}", file=sys.stderr)
