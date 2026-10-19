@@ -25,18 +25,11 @@ HANG_SECONDS = 300
 
 class CargoInvocation(TypedDict):
     args: list[str]
-    call_id: str
 
 
 class TaploInvocation(TypedDict):
     args: list[str]
     cwd: str
-
-
-class ClippyReplayRound(TypedDict):
-    stream: str
-    status: int
-    before: dict[str, str]
 
 
 CargoTargetMetadata = TypedDict("CargoTargetMetadata", {
@@ -70,56 +63,42 @@ import sys
 
 arguments = sys.argv[1:]
 with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({"args": arguments, "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
+    output.write(json.dumps({"args": arguments}) + "\n")
 if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
     raise SystemExit("unexpected cargo invocation: " + repr(arguments))
-# A file changes while this stage runs: mend's own rewrite, or a writer's edit.
-if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")]:
+# A file changes during mend or judgment, after any clippy fix.
+if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")] and (
+    arguments[0] != "clippy" or "--fix" not in arguments
+):
     with Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").open("a", encoding="utf-8") as source:
         source.write("// changed during " + arguments[0] + "\n")
 if arguments[:1] == ["clippy"]:
-    events = [json.loads(line)["args"] for line in
-              Path(os.environ["TEST_CARGO_EVENTS"]).read_text(encoding="utf-8").splitlines()]
-    if "--message-format=json" in arguments:
-        replay_index = sum("--message-format=json" in args for args in events) - 1
-        rounds = json.loads(os.environ.get("TEST_CLIPPY_JSON_ROUNDS", "[]"))
-        if rounds:
-            if replay_index >= len(rounds):
-                raise SystemExit("unexpected extra JSON replay")
-            replay = rounds[replay_index]
-            for name, expected in replay["before"].items():
-                if Path(name).read_text(encoding="utf-8") != expected:
-                    raise SystemExit("JSON replay did not read the preceding round's edits")
-            print(replay["stream"])
-            raise SystemExit(replay["status"])
-        if replay_index == 0:
-            print(os.environ["TEST_CLIPPY_JSON"])
-            raise SystemExit(int(os.environ.get("TEST_CLIPPY_JSON_STATUS", "101")))
-        print(json.dumps({"reason": "build-finished", "success": True}))
-        raise SystemExit(0)
-    judgments = sum(args[:1] == ["clippy"] and "--message-format=json" not in args for args in events)
-    status = int(os.environ.get("TEST_CLIPPY_STATUS", "0"))
-    if judgments > 1:
-        status = int(os.environ.get("TEST_CLIPPY_SECOND_STATUS", str(status)))
-        for name, expected in json.loads(os.environ.get("TEST_REWRITTEN_SOURCES", "{}")).items():
-            if Path(name).read_text(encoding="utf-8") != expected:
-                raise SystemExit("final judgment did not read all expected rewrites")
-    diagnostic = os.environ.get("TEST_CLIPPY_DIAGNOSTIC", "")
-    if status and diagnostic:
-        wording = "can" if diagnostic == "can" else "may"
-        print(f"error: multiply and add expressions {wording} be calculated more efficiently and accurately", file=sys.stderr)
-        lint = "suboptimal_flops" if diagnostic in ("may", "can") else "unreadable_literal"
-        print("  = help: https://rust-lang.github.io/rust-clippy/master/index.html#" + lint, file=sys.stderr)
-    raise SystemExit(status)
+    source = Path(os.environ["PACKAGE_ROOT"], os.environ.get("TEST_FIX_FILE", "src/lib.rs"))
+    if "--fix" in arguments:
+        if "TEST_FIX_SOURCE" in os.environ:
+            source.write_text(os.environ["TEST_FIX_SOURCE"], encoding="utf-8")
+        steps = json.loads(os.environ.get("TEST_FIX_STEPS", "{}"))
+        before = source.read_text(encoding="utf-8") if source.exists() else ""
+        if before in steps:
+            source.write_text(steps[before], encoding="utf-8")
+        if "TEST_FIX_APPEND" in os.environ:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(os.environ["TEST_FIX_APPEND"])
+        raise SystemExit(int(os.environ.get("TEST_CLIPPY_FIX_STATUS", "0")))
+    if "TEST_CLIPPY_EXPECT_SOURCE" in os.environ:
+        if source.read_text(encoding="utf-8") != os.environ["TEST_CLIPPY_EXPECT_SOURCE"]:
+            raise SystemExit(101)
+    raise SystemExit(int(os.environ.get("TEST_CLIPPY_STATUS", "0")))
 if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
     events = [json.loads(line)["args"] for line in
               Path(os.environ["TEST_CARGO_EVENTS"]).read_text(encoding="utf-8").splitlines()]
-    if any("--message-format=json" in args for args in events):
-        for name, expected in json.loads(os.environ.get("TEST_REWRITTEN_SOURCES", "{}")).items():
-            if Path(name).read_text(encoding="utf-8") != expected:
-                raise SystemExit("format ran before the multiply-add suggestions were applied")
+    if any(args[:1] == ["clippy"] and "--fix" in args for args in events):
+        if "TEST_FMT_SOURCE" in os.environ:
+            Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").write_text(
+                os.environ["TEST_FMT_SOURCE"], encoding="utf-8",
+            )
 '''
 
 
@@ -142,6 +121,7 @@ raise SystemExit(status)
 
 GIT_STUB = r'''
 import os
+from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
@@ -163,6 +143,9 @@ elif "diff" in arguments and "--name-only" in arguments:
 elif "status" in arguments:
     if os.environ.get("TEST_GIT_DIRTY"):
         sys.stdout.write(" M src/lib.rs\0")
+    untracked = os.environ.get("TEST_GIT_UNTRACKED", "")
+    if untracked and Path(os.environ["PACKAGE_ROOT"], untracked).exists():
+        sys.stdout.write("?? " + untracked + "\0")
 elif "ls-files" not in arguments:
     raise SystemExit(1)
 '''
@@ -256,7 +239,6 @@ class VerifyLintScopeTests(unittest.TestCase):
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
             "BUILDLOG_MEMINFO": str(self.root / "missing-meminfo"),
-            "MUL_ADD_REWRITE_LOG_DIR": str(self.root / "rewrite-logs"),
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
@@ -327,323 +309,120 @@ class VerifyLintScopeTests(unittest.TestCase):
                   for line in self.events.read_text(encoding="utf-8").splitlines()]
         return [event["args"] for event in events]
 
-    def configure_mul_add_failure(self, *, wording: str = "may") -> dict[str, str]:
-        sources = {
-            "src/lib.rs": (
-                "pub fn product(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"
-                "pub fn offset(x: f64, y: f64, z: f64) -> f64 { x + y * z }\n"
-            ),
-            "src/other.rs": "pub fn other(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n",
-        }
-        expected: dict[str, str] = {}
-        records: list[dict[str, object]] = []
-        for name, source in sources.items():
-            _ = (self.root / name).write_text(source, encoding="utf-8")
-            rewritten = source
-            children: list[dict[str, object]] = []
-            for old, replacement in (("a * b + c", "a.mul_add(b, c)"), ("x + y * z", "y.mul_add(z, x)")):
-                if old not in source:
-                    continue
-                start = source.encode().index(old.encode())
-                children.append({"spans": [{
-                    "file_name": name, "byte_start": start, "byte_end": start + len(old.encode()),
-                    "suggested_replacement": replacement, "suggestion_applicability": "MachineApplicable",
-                }]})
-                rewritten = rewritten.replace(old, replacement)
-            expected[str(self.root / name)] = rewritten
-            records.append({"reason": "compiler-message", "message": {
-                "code": {"code": "clippy::suboptimal_flops"}, "spans": [], "children": children,
-            }})
-        records.append({"reason": "build-finished", "success": False})
-        self.environment.update({
-            "TEST_CLIPPY_STATUS": "41",
-            "TEST_CLIPPY_SECOND_STATUS": "0",
-            "TEST_CLIPPY_DIAGNOSTIC": wording,
-            "TEST_CLIPPY_JSON": "\n".join(json.dumps(record) for record in records),
-            "TEST_CLIPPY_JSON_STATUS": "101",
-            "TEST_REWRITTEN_SOURCES": json.dumps(expected),
-        })
-        return expected
+    def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
+        scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
+        self.assertEqual(self.calls("clippy"), [
+            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+             *scope, "--", "-D", "warnings"],
+        ] * fix_passes + [[*scope, "--", "-D", "warnings"]])
 
-    def assert_rewrite_clippy_calls(self, *, replays: int = 2) -> None:
-        judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
-        rewrite = [
-            "--workspace", "--all-targets", "--all-features", "--keep-going", "--message-format=json",
-            "--", "-D", "warnings",
-        ]
-        self.assertEqual(self.calls("clippy"), [judgment, *([rewrite] * replays), judgment])
+    def lint_stages(self) -> list[list[str]]:
+        return [args for args in self.cargo_calls()
+                if args[0] in ("clippy", "doc") or
+                (args[:2] == ["+nightly", "fmt"] and "--version" not in args)]
 
-    def replay_round(
-        self, name: str, source: str, replacements: list[tuple[str, str]],
-    ) -> ClippyReplayRound:
-        spans: list[dict[str, object]] = []
-        for old, replacement in replacements:
-            start = source.encode().index(old.encode())
-            spans.append({
-                "file_name": name, "byte_start": start, "byte_end": start + len(old.encode()),
-                "suggested_replacement": replacement, "suggestion_applicability": "MachineApplicable",
-            })
-        records: list[dict[str, object]] = [{"reason": "compiler-message", "message": {
-            "code": {"code": "clippy::suboptimal_flops"}, "spans": [], "children": [{"spans": spans}],
-        }}, {"reason": "build-finished", "success": False}]
-        return {"stream": "\n".join(json.dumps(record) for record in records), "status": 101,
-                "before": {str(self.root / name): source}}
-
-    def configure_replay_rounds(
-        self, sources: dict[str, str], rounds: list[ClippyReplayRound], expected: dict[str, str],
-    ) -> None:
-        _ = self.configure_mul_add_failure()
-        for name, source in sources.items():
-            path = self.root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text(source, encoding="utf-8")
-        self.environment.update({
-            "BUILDLOG_OFF": "0",
-            "TEST_CLIPPY_JSON_ROUNDS": json.dumps(rounds),
-            "TEST_REWRITTEN_SOURCES": json.dumps({str(self.root / name): source
-                                                   for name, source in expected.items()}),
-        })
-
-    def saved_rewrite_lines(self) -> list[str]:
-        events = [cast(CargoInvocation, json.loads(line))
-                  for line in self.events.read_text(encoding="utf-8").splitlines()]
-        call_ids = {event["call_id"] for event in events if "--message-format=json" in event["args"]}
-        self.assertEqual(len(call_ids), 1)
-        call_id = call_ids.pop()
-        self.assertTrue(call_id)
-        path = Path(self.environment["MUL_ADD_REWRITE_LOG_DIR"]) / f"{call_id}.log"
-        return path.read_text(encoding="utf-8").splitlines()
-
-    def test_chained_sum_replays_the_skipped_inner_term_and_saves_both_rounds(self) -> None:
-        name = "src/lib.rs"
-        original = "fn sum() -> f64 { a * x + b * y + c * z }\n"
-        outer = original.replace("a * x + b * y + c * z", "c.mul_add(z, a * x + b * y)")
-        final = outer.replace("a * x + b * y", "a.mul_add(x, b * y)")
-        rounds = [
-            self.replay_round(name, original, [
-                ("a * x + b * y + c * z", "c.mul_add(z, a * x + b * y)"),
-                ("a * x + b * y", "a.mul_add(x, b * y)"),
-            ]),
-            self.replay_round(name, outer, [("a * x + b * y", "a.mul_add(x, b * y)")]),
-            self.replay_round(name, final, []),
-        ]
-        self.configure_replay_rounds({name: original}, rounds, {name: final})
-        result = self.verify("lint", "sample")
-        self.assert_rewrite_clippy_calls(replays=3)
-        self.assertEqual((self.root / name).read_text(encoding="utf-8"), final)
-        reports = ["verify.sh: rewrote 1 multiply-add(s) in 1 file(s) (1 skipped: overlapping)",
-                   "verify.sh: rewrote 1 multiply-add(s) in 1 file(s)"]
-        self.assertEqual(self.saved_rewrite_lines(), reports)
-        self.assertEqual([line for line in result.stdout.splitlines()
-                          if line.startswith("verify.sh: rewrote")], reports)
-        self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
-                         [["fmt", "-p", "sample"], ["fmt", "-p", "sample"]])
-        self.assertNotIn("changed nothing", result.stdout)
-        self.assertNotIn("after 5 rounds", result.stdout)
-
-    def test_downstream_crate_first_reported_in_second_round_is_rewritten(self) -> None:
-        first, downstream = "src/lib.rs", "downstream/src/lib.rs"
-        original = "fn sum() -> f64 { a * b + c }\n"
-        final = original.replace("a * b + c", "a.mul_add(b, c)")
-        rounds = [self.replay_round(first, original, [("a * b + c", "a.mul_add(b, c)")]),
-                  self.replay_round(downstream, original, [("a * b + c", "a.mul_add(b, c)")]),
-                  self.replay_round(downstream, final, [])]
-        rounds[1]["before"][str(self.root / first)] = final
-        self.configure_replay_rounds({first: original, downstream: original}, rounds,
-                                     {first: final, downstream: final})
-        _ = self.verify("lint", "sample")
-        self.assert_rewrite_clippy_calls(replays=3)
-        for name in (first, downstream):
-            self.assertEqual((self.root / name).read_text(encoding="utf-8"), final)
-        self.assertEqual(self.saved_rewrite_lines(), [
-            "verify.sh: rewrote 1 multiply-add(s) in 1 file(s)",
-            "verify.sh: rewrote 1 multiply-add(s) in 1 file(s)",
+    def test_unchanged_tree_runs_one_fix_pass_before_judgment_and_rustdoc(self) -> None:
+        result = self.verify("lint", "--workspace")
+        self.assert_fix_and_judgment_calls()
+        self.assertEqual(self.lint_stages(), [
+            ["+nightly", "fmt", "--all"],
+            ["clippy", *self.calls("clippy")[0]],
+            ["+nightly", "fmt", "--all"],
+            ["clippy", *self.calls("clippy")[1]],
+            ["doc", "--no-deps", "--jobs", "8", "-p", "sample"],
         ])
+        self.assertIn("style-lint: clippy start", result.stdout.splitlines())
+        self.assertIn("style-lint: clippy passed", result.stdout.splitlines())
 
-    def test_five_successful_rounds_stop_at_the_cap_then_format_and_judge(self) -> None:
-        name = "src/lib.rs"
-        expression = "a * b + (" * 5 + "c" + ")" * 5
-        source = original = f"fn sum() -> f64 {{ {expression} }}\n"
-        rounds: list[ClippyReplayRound] = []
-        for depth in range(5, 0, -1):
-            old = "a * b + (" * depth + "c" + ")" * depth
-            inner = "a * b + (" * (depth - 1) + "c" + ")" * (depth - 1)
-            replacement = f"a.mul_add(b, {inner})"
-            rounds.append(self.replay_round(name, source, [(old, replacement)]))
-            source = source.replace(old, replacement)
-        self.configure_replay_rounds({name: original}, rounds, {name: source})
-        result = self.verify("lint", "sample")
-        self.assert_rewrite_clippy_calls(replays=5)
-        self.assertEqual((self.root / name).read_text(encoding="utf-8"), source)
-        self.assertEqual(result.stdout.splitlines().count(
-            "verify.sh: stopped the multiply-add rewrite after 5 rounds"), 1)
-        self.assertEqual(self.saved_rewrite_lines(), [
-            "verify.sh: rewrote 1 multiply-add(s) in 1 file(s)",
-        ] * 5)
-        self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
-                         [["fmt", "-p", "sample"], ["fmt", "-p", "sample"]])
-
-    def test_later_round_failure_keeps_edits_and_still_formats_and_judges(self) -> None:
-        for failure in ("replay", "incomplete", "missing_file"):
-            with self.subTest(failure=failure):
-                name = "src/lib.rs"
-                original = "fn sum() -> f64 { a * b + c }\n"
-                final = original.replace("a * b + c", "a.mul_add(b, c)")
-                first = self.replay_round(name, original, [("a * b + c", "a.mul_add(b, c)")])
-                later = self.replay_round(name, final, [])
-                if failure == "replay":
-                    later["status"] = 44
-                elif failure == "incomplete":
-                    later["stream"] = later["stream"].rsplit("\n", 1)[0]
-                else:
-                    later["stream"] = self.replay_round(
-                        "missing.rs", original, [("a * b + c", "a.mul_add(b, c)")],
-                    )["stream"]
-                self.configure_replay_rounds({name: original}, [first, later], {name: final})
-                final_status = 0 if failure == "replay" else 43
-                self.environment["TEST_CLIPPY_SECOND_STATUS"] = str(final_status)
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
-                self.assertEqual(result.returncode, final_status, result.stdout + result.stderr)
-                self.assert_rewrite_clippy_calls()
-                self.assertEqual((self.root / name).read_text(encoding="utf-8"), final)
-                self.assertIn("verify.sh: clippy's multiply-add rewrite failed; see the output above",
-                              (result.stdout + result.stderr).splitlines())
-                self.assertEqual(self.saved_rewrite_lines(), [
-                    "verify.sh: rewrote 1 multiply-add(s) in 1 file(s)",
-                ])
+    def test_fix_exposes_another_fix_before_the_first_judgment(self) -> None:
+        original = "pub fn sum(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"
+        first_fix = original.replace("a * b + c", "a.mul_add(b, c)")
+        final_fix = first_fix.replace("pub fn", "pub const fn")
+        self.environment.update({
+            "TEST_GIT_DIRTY": "1",
+            "TEST_FIX_STEPS": json.dumps({original: first_fix, first_fix: final_fix}),
+            "TEST_CLIPPY_EXPECT_SOURCE": final_fix,
+        })
+        for cache_enabled in (False, True):
+            with self.subTest(cache_enabled=cache_enabled):
+                if cache_enabled:
+                    _ = self.enable_cache()
+                _ = (self.root / "src/lib.rs").write_text(original, encoding="utf-8")
+                _ = self.verify("lint", "sample")
+                # Two passes change the source; the third confirms no change.
+                self.assert_fix_and_judgment_calls(fix_passes=3)
+                self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), final_fix)
+                self.assertEqual(len(self.calls("doc")), 1)
                 self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
-                                 [["fmt", "-p", "sample"], ["fmt", "-p", "sample"]])
-                self.assertEqual(len(self.calls("doc")), 1 if final_status == 0 else 0)
+                                 [["fmt", "-p", "sample"]] * 4)
 
-    def test_macro_body_suggestion_stays_unchanged_without_a_second_judgment(self) -> None:
-        _ = self.configure_mul_add_failure()
-        source = "macro_rules! sum { () => { a * b + c }; }\n"
-        _ = (self.root / "src/lib.rs").write_text(source, encoding="utf-8")
-        replay = self.replay_round("src/lib.rs", source, [("a * b + c", "a.mul_add(b, c)")])
-        replay["stream"] = replay["stream"].replace('"MachineApplicable"', '"MaybeIncorrect"')
-        self.environment["TEST_CLIPPY_JSON_ROUNDS"] = json.dumps([replay])
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
-        self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), source)
-        self.assertEqual(["--message-format=json" in args for args in self.calls("clippy")], [False, True])
-        self.assertTrue(all("--keep-going" in args for args in self.calls("clippy")))
-        self.assertIn("verify.sh: clippy's multiply-add rewrite changed nothing", result.stdout.splitlines())
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
-        self.assertEqual(self.calls("doc"), [])
-
-    def test_mul_add_failure_rewrites_formats_and_judges_again(self) -> None:
-        for wording, json_status, features in (("may", "101", []), ("can", "0", ["--features", "a"])):
-            with self.subTest(wording=wording, json_status=json_status):
-                expected = self.configure_mul_add_failure(wording=wording)
-                self.environment["TEST_CLIPPY_JSON_STATUS"] = json_status
-                result = self.verify("lint", "sample", *features)
-                self.assert_rewrite_clippy_calls()
-                stages = [args[:2] if args[0] == "+nightly" else args[:1]
-                          for args in self.cargo_calls()
-                          if args[0] in ("clippy", "doc") or
-                          (args[:2] == ["+nightly", "fmt"] and "--version" not in args)]
-                self.assertEqual(stages, [
-                    ["+nightly", "fmt"], ["clippy"], ["clippy"], ["clippy"],
-                    ["+nightly", "fmt"], ["clippy"], ["doc"],
-                ])
-                self.assertEqual(self.calls("+nightly")[-1], ["fmt", "-p", "sample"])
-                self.assertEqual(result.stdout.splitlines().count(
-                    "verify.sh: rewrote 3 multiply-add(s) in 2 file(s)"), 1)
-                for name, source in expected.items():
-                    self.assertEqual(Path(name).read_text(encoding="utf-8"), source)
-                self.assert_workspace_taplo_check()
-
-    def test_failure_without_mul_add_link_keeps_status_without_rewrite(self) -> None:
-        self.environment.update({"TEST_CLIPPY_STATUS": "42", "TEST_CLIPPY_DIAGNOSTIC": "other"})
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
-        self.assertEqual(self.calls("clippy"), [[
-            "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
-        ]])
-        self.assertEqual(self.calls("doc"), [])
-        self.assertNotIn("verify.sh: rewrote", result.stdout)
-
-    def test_second_judgment_failure_keeps_its_status_and_stops(self) -> None:
-        _ = self.configure_mul_add_failure()
-        self.environment["TEST_CLIPPY_SECOND_STATUS"] = "43"
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 43, result.stdout + result.stderr)
-        self.assert_rewrite_clippy_calls()
-        self.assertEqual(self.calls("doc"), [])
-
-    def test_zero_rewrites_keep_first_status_without_second_judgment(self) -> None:
-        _ = self.configure_mul_add_failure()
-        self.environment["TEST_CLIPPY_JSON"] = json.dumps({"reason": "build-finished", "success": True})
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
-        self.assertEqual(["--message-format=json" in args for args in self.calls("clippy")], [False, True])
-        self.assertIn("verify.sh: clippy's multiply-add rewrite changed nothing",
-                      (result.stdout + result.stderr).splitlines())
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
-        self.assertEqual(self.calls("doc"), [])
-
-    def test_failed_json_replay_keeps_first_status_and_leaves_sources_untouched(self) -> None:
-        for failure in ("status", "incomplete"):
-            with self.subTest(failure=failure):
-                expected = self.configure_mul_add_failure()
-                original = {name: Path(name).read_bytes() for name in expected}
-                if failure == "status":
-                    self.environment["TEST_CLIPPY_JSON_STATUS"] = "44"
-                else:
-                    self.environment["TEST_CLIPPY_JSON"] = self.environment["TEST_CLIPPY_JSON"].rsplit("\n", 1)[0]
+    def test_changing_tree_stops_after_three_fix_passes_and_failed_lint_runs_again(self) -> None:
+        cache = self.enable_cache()
+        self.environment.update({
+            "TEST_FIX_FILE": "src/fix-progress.rs",
+            "TEST_GIT_UNTRACKED": "src/fix-progress.rs",
+            "TEST_FIX_APPEND": "// fix pass\n",
+            "TEST_CLIPPY_STATUS": "101",
+        })
+        for call in (1, 2):
+            with self.subTest(call=call):
                 result = self.invoke_verify("lint", "sample", cwd=self.root)
-                self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
-                self.assertEqual(["--message-format=json" in args for args in self.calls("clippy")], [False, True])
-                self.assertIn("verify.sh: clippy's multiply-add rewrite failed; see the output above",
-                              (result.stdout + result.stderr).splitlines())
-                self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
+                self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+                self.assertNotIn("FAIL (recorded)", result.stdout)
+                self.assert_fix_and_judgment_calls(fix_passes=3)
+                self.assertEqual(list(cache.glob("*.fail")), [])
                 self.assertEqual(self.calls("doc"), [])
-                self.assertNotIn("verify.sh: rewrote", result.stdout)
-                for name, source in original.items():
-                    self.assertEqual(Path(name).read_bytes(), source)
+                self.assertEqual((self.root / "src/fix-progress.rs").read_text(encoding="utf-8"),
+                                 "// fix pass\n" * (3 * call))
 
-    def test_applier_failure_keeps_first_verdict_without_second_judgment(self) -> None:
-        _ = self.configure_mul_add_failure()
-        (self.root / "src/other.rs").unlink()
-        result = self.invoke_verify("lint", "sample", cwd=self.root)
-        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
-        self.assertIn("verify.sh: clippy's multiply-add rewrite failed; see the output above",
-                      (result.stdout + result.stderr).splitlines())
-        self.assertEqual(["--message-format=json" in args for args in self.calls("clippy")], [False, True])
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
-        self.assertEqual(self.calls("doc"), [])
-
-    def test_rewrite_count_is_saved_under_its_buildlog_call_id(self) -> None:
-        _ = self.configure_mul_add_failure()
-        self.environment["BUILDLOG_OFF"] = "0"
-        _ = self.verify("lint", "sample")
-        events = [cast(CargoInvocation, json.loads(line))
-                  for line in self.events.read_text(encoding="utf-8").splitlines()]
-        call_ids = {event["call_id"] for event in events if "--message-format=json" in event["args"]}
-        self.assertEqual(len(call_ids), 1)
-        call_id = call_ids.pop()
-        self.assertTrue(call_id)
-        logs = list(Path(self.environment["MUL_ADD_REWRITE_LOG_DIR"]).glob("*.log"))
-        self.assertEqual([path.name for path in logs], [f"{call_id}.log"])
-        self.assertEqual(logs[0].read_text(encoding="utf-8"),
-                         "verify.sh: rewrote 3 multiply-add(s) in 2 file(s)\n")
-
-    def test_failed_count_log_save_does_not_fail_lint(self) -> None:
-        _ = self.configure_mul_add_failure()
-        self.environment["BUILDLOG_OFF"] = "0"
-        parent = self.root / "blocked-log-directory"
-        _ = parent.write_text("a file prevents creating the log directory", encoding="utf-8")
-        self.environment["MUL_ADD_REWRITE_LOG_DIR"] = str(parent / "logs")
-        result = self.verify("lint", "sample")
-        self.assert_rewrite_clippy_calls()
-        self.assertIn("verify.sh: rewrote 3 multiply-add(s) in 2 file(s)", result.stdout.splitlines())
-        self.assertEqual(len(self.calls("doc")), 1)
-
-    def test_rewritten_tree_is_cached_after_second_judgment(self) -> None:
+    def test_passing_judgment_at_fix_pass_limit_is_cached(self) -> None:
         cache = self.dirty_cache()
-        _ = self.configure_mul_add_failure()
+        self.environment["TEST_FIX_APPEND"] = "// fix pass\n"
+        _ = self.verify("lint", "sample")
+        self.assert_fix_and_judgment_calls(fix_passes=3)
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
         result = self.verify("lint", "sample")
-        self.assert_rewrite_clippy_calls()
+        self.assertIn("PASS (recorded)", result.stdout)
+        self.assertFalse(self.clippy_ran())
+
+    def test_failed_fix_still_formats_and_returns_judgment_status(self) -> None:
+        self.environment["TEST_CLIPPY_FIX_STATUS"] = "41"
+        for judgment_status in (0, 43):
+            with self.subTest(judgment_status=judgment_status):
+                self.environment["TEST_CLIPPY_STATUS"] = str(judgment_status)
+                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                self.assertEqual(result.returncode, judgment_status, result.stdout + result.stderr)
+                self.assert_fix_and_judgment_calls()
+                stages = self.lint_stages()
+                self.assertEqual(stages[:4], [
+                    ["+nightly", "fmt", "-p", "sample"],
+                    ["clippy", *self.calls("clippy")[0]],
+                    ["+nightly", "fmt", "-p", "sample"],
+                    ["clippy", *self.calls("clippy")[1]],
+                ])
+                self.assertEqual(len(self.calls("doc")), 1 if judgment_status == 0 else 0)
+
+    def test_check_lint_only_judges_without_fixes(self) -> None:
+        _ = self.verify("lint", "--workspace", "--check")
+        self.assertEqual(self.calls("clippy"), [[
+            "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings",
+        ]])
+        self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fail-on-warn"]])
+        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "--all", "--check"]])
+        self.assertEqual(self.calls("doc"), [])
+        self.assert_workspace_taplo_check()
+
+    def test_fixed_and_formatted_tree_is_cached(self) -> None:
+        cache = self.dirty_cache()
+        formatted = "pub fn value() -> u8 {\n    2\n}\n"
+        self.environment.update({
+            "TEST_FIX_SOURCE": "pub fn value()->u8{2}\n",
+            "TEST_FMT_SOURCE": formatted,
+        })
+        result = self.verify("lint", "sample")
+        self.assert_fix_and_judgment_calls(fix_passes=2)
+        self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), formatted)
         self.assertNotIn("the tree changed while lint ran", result.stdout)
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)
 
@@ -651,38 +430,31 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.assertIn("PASS (recorded)", result.stdout)
         self.assertFalse(self.clippy_ran())
 
-    def test_example_mul_add_failure_never_runs_rewrite(self) -> None:
-        _ = self.configure_mul_add_failure()
-        result = self.invoke_verify("example", "sample", "plain", cwd=self.root)
-        self.assertEqual(result.returncode, 41, result.stdout + result.stderr)
-        self.assertEqual(self.calls("clippy"), [[
-            "--workspace", "--example", "plain", "--", "-D", "warnings",
-        ]])
-        self.assertNotIn("verify.sh: rewrote", result.stdout)
-
     def test_lint_matches_ci_and_preserves_other_stages(self) -> None:
         _ = self.verify("lint", "sample")
         self.assert_workspace_taplo_check()
-        self.assertEqual(self.calls("clippy"), [
-            ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
-        ])
+        self.assert_fix_and_judgment_calls()
         self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
+        self.assertEqual(self.calls("+nightly"), [
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+        ])
         self.assertEqual(self.calls("doc"), [["--no-deps", "--jobs", "8", "-p", "sample"]])
 
     def test_features_reach_mend_and_doc_but_do_not_narrow_clippy(self) -> None:
         _ = self.verify("lint", "sample", "--features", "a")
         self.assert_workspace_taplo_check()
-        self.assertEqual(self.calls("clippy"), [
-            ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
-        ])
+        self.assert_fix_and_judgment_calls()
         self.assertEqual(self.calls("mend"), [[
             "--all-targets", "--workspace", "--fix", "--features", "sample/a"
         ]])
         self.assertEqual(self.calls("doc"), [[
             "--no-deps", "--jobs", "8", "-p", "sample", "--features", "sample/a"
         ]])
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
+        self.assertEqual(self.calls("+nightly"), [
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+        ])
 
     def test_example_keeps_its_single_target_and_required_features(self) -> None:
         for example, features in (("plain", []), ("featured", ["--features", "sample/a"])):
@@ -698,7 +470,6 @@ class VerifyLintScopeTests(unittest.TestCase):
 
     def test_clippy_off_names_the_full_scope_without_running_it(self) -> None:
         self.write_config(clippy="off")
-        _ = self.configure_mul_add_failure()
         for features in ([], ["--features", "a"]):
             with self.subTest(features=features):
                 result = self.verify("lint", "sample", *features)
@@ -858,74 +629,12 @@ buildlog_end() { :; }
 sweep_after_step() { :; }
 '''
 
-    def test_json_stdout_stays_separate_and_both_logs_are_complete_on_return(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            script = self.command_stubs() + self.function_body("run_json_stdout") + "\n"
-            script += self.function_body("run_once") + r'''
-buildlog_end() { cp "$2" inner-complete.log; }
-emit() {
-    printf '{"reason":"build-finished"}\n'
-    local i
-    for ((i=0; i<1000; i++)); do printf 'cargo stderr %s\n' "$i" >&2; done
-    return 101
-}
-LINT_JSON_STDOUT=1
-if run_json_stdout outer.log run_once emit; then status=0; else status=$?; fi
-cp outer.log outer-complete.log
-exit "$status"
-'''
-            result = self.shell(script, root)
-            self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
-            self.assertEqual(result.stdout, '{"reason":"build-finished"}\n')
-            errors = "".join(f"cargo stderr {index}\n" for index in range(1000))
-            self.assertEqual(result.stderr, "+ emit\n" + errors)
-            for name in ("inner-complete.log", "outer-complete.log"):
-                logged = (root / name).read_text(encoding="utf-8")
-                self.assertIn(result.stdout, logged)
-                self.assertEqual([line for line in logged.splitlines() if line.startswith("cargo stderr")],
-                                 errors.splitlines())
-            self.assertIn("+ emit\n", (root / "outer-complete.log").read_text(encoding="utf-8"))
-
-    def test_concurrent_json_and_stderr_keep_complete_lines_in_both_logs(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            script = self.command_stubs() + self.function_body("run_json_stdout") + "\n"
-            script += self.function_body("run_once") + r'''
-buildlog_end() { cp "$2" inner-complete.log; }
-emit() {
-    local i
-    for ((i=0; i<1000; i++)); do
-        printf '{"diagnostic":%s,"message":"concurrent output"}\n' "$i"
-        printf 'cargo stderr %s\n' "$i" >&2
-    done
-    return 101
-}
-LINT_JSON_STDOUT=1
-if run_json_stdout outer.log run_once emit; then status=0; else status=$?; fi
-cp outer.log outer-complete.log
-exit "$status"
-'''
-            result = self.shell(script, root)
-            self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
-            messages = [f'{{"diagnostic":{index},"message":"concurrent output"}}'
-                        for index in range(1000)]
-            errors = [f"cargo stderr {index}" for index in range(1000)]
-            self.assertEqual(result.stdout.splitlines(), messages)
-            self.assertEqual(result.stderr.splitlines(), ["+ emit", *errors])
-            for name, count in (("inner-complete.log", 2000), ("outer-complete.log", 2001)):
-                with self.subTest(log=name):
-                    lines = (root / name).read_text(encoding="utf-8").splitlines()
-                    self.assertEqual([line for line in lines if line.startswith("{")], messages)
-                    self.assertEqual([line for line in lines if line.startswith("cargo stderr")], errors)
-                    self.assertEqual(len(lines), count)
-
     def test_shell_libraries_use_no_named_descriptor_redirections(self) -> None:
         for path in (SCRIPTS / "lint" / "invoke.sh", VERIFY):
             with self.subTest(path=path):
                 self.assertNotRegex(path.read_text(encoding="utf-8"), r"\{[A-Za-z_][A-Za-z_0-9]*\}[<>]")
 
-    def assert_command_status_with_failed_tee(self, *, json_stdout: bool) -> None:
+    def test_ordinary_step_returns_command_status_when_tee_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binary = root / "bin"
@@ -935,18 +644,45 @@ exit "$status"
             tee.chmod(0o755)
             for status in (0, 47):
                 with self.subTest(status=status):
-                    script = self.command_stubs() + self.function_body("run_json_stdout") + "\n"
-                    script += self.function_body("run_once")
-                    script += f"\nLINT_JSON_STDOUT={int(json_stdout)}\n"
+                    script = self.command_stubs() + self.function_body("run_once")
                     script += f'\nexport PATH="$PWD/bin:$PATH"\nif run_once bash -c "exit {status}"; then result=0; else result=$?; fi\nexit "$result"\n'
                     result = self.shell(script, root)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
-    def test_ordinary_step_returns_command_status_when_tee_fails(self) -> None:
-        self.assert_command_status_with_failed_tee(json_stdout=False)
+    def test_clippy_fix_preserves_extra_lints_and_run_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = "set -euo pipefail\n"
+            script += self.function_body("invoke_clippy") + "\n"
+            script += self.function_body("invoke_clippy_fix") + r'''
+lint_config_enabled() { return 0; }
+run() { printf '%s\n' "$@"; return 47; }
+invoke_clippy_fix -p sample --lib -- -A clippy::type_complexity
+'''
+            result = self.shell(script, root)
+            self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+                "-p", "sample", "--lib", "--", "-D", "warnings", "-A", "clippy::type_complexity",
+            ])
 
-    def test_json_step_returns_command_status_when_tee_fails(self) -> None:
-        self.assert_command_status_with_failed_tee(json_stdout=True)
+    def test_clippy_fix_off_prints_skip_notice_without_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = "set -euo pipefail\n"
+            script += self.function_body("invoke_clippy") + "\n"
+            script += self.function_body("invoke_clippy_fix") + r'''
+lint_config_enabled() { return 1; }
+lint_config_skip_notice() { printf 'SKIPPED: %s\n' "$2"; }
+run() { printf 'unexpected run\n'; return 99; }
+invoke_clippy_fix --workspace --all-targets --all-features --keep-going
+'''
+            result = self.shell(script, root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "SKIPPED: cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs"
+                + " --workspace --all-targets --all-features --keep-going",
+            ])
 
 
 if __name__ == "__main__":
