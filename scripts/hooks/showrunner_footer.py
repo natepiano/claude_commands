@@ -47,10 +47,6 @@ ASK_ONCE = ("A question for the user is asked once, in full, when it first comes
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
 
 
-# A turn the user did not start passes with exactly this reply when nothing needs the user.
-NOTHING_FOR_USER = "nothing needs the user: reply with -"
-
-
 # The switch file's content when a conversation pause turned the footer off. A switch turned off
 # on purpose is empty, so the pause's resume leaves it off.
 PAUSE_MARK = "paused by a conversation pause\n"
@@ -230,33 +226,6 @@ class ReportItem(TypedDict):
 
 def reports_path(slug: str) -> Path:
     return state_root() / "reports" / f"{slug}.json"
-
-
-def live_reports(slug: str, now: datetime) -> list[ReportItem]:
-    """The production's reports whose `until` has not passed; a naive `until` is in the user's zone."""
-    try:
-        raw = cast(object, json.loads(reports_path(slug).read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as error:
-        raise FooterError(f"{slug}: reports unreadable: {error}") from error
-    if not isinstance(raw, list):
-        raise FooterError(f"{slug}: expected a reports list")
-    live: list[ReportItem] = []
-    for entry in cast(list[object], raw):
-        fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
-        text, until = fields.get("text"), fields.get("until")
-        if not isinstance(text, str) or not isinstance(until, str):
-            raise FooterError(f"{slug}: a report needs text and until")
-        try:
-            ends = datetime.fromisoformat(until)
-        except ValueError as error:
-            raise FooterError(f"{slug}: report until {until!r} is not ISO") from error
-        if ends.tzinfo is None:
-            ends = ends.replace(tzinfo=ZoneInfo(user_zone_name()))
-        if ends > now:
-            live.append(ReportItem(text=text, until=until))
-    return live
 
 
 def state_root() -> Path:
@@ -580,18 +549,6 @@ def outstanding_texts(slugs: set[str]) -> list[str]:
     return texts
 
 
-def carries_registered(instance_dirs: list[str], reply: str) -> bool:
-    """Whether the reply names an item registered for the user: an open item or a report."""
-    slugs = with_below(instance_slugs(instance_dirs))
-    now = datetime.now(ZoneInfo(user_zone_name()))
-    texts = [*(pending_question_text(item) for instance in instance_dirs
-               for item in read_pending_reviewed(Path(instance))),
-             *outstanding_texts(slugs),
-             *(report["text"] for slug in sorted(slugs) for report in live_reports(slug, now))]
-    compared = normalised(reply)
-    return any(text.strip() and normalised(text) in compared for text in texts)
-
-
 def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyReady | QuestionReplyBlocked:
     accepted: list[str] = []
     slugs: set[str] = set()
@@ -636,13 +593,10 @@ def block_reason(instance_dirs: list[str], reply: str,
     checked = check_reviewed_text(instance_dirs, reply)
     if isinstance(checked, QuestionReplyBlocked):
         return checked.reason
-    # A turn the user did not start reaches the user only with an auto-mode denial or a registered
-    # item; otherwise the reply is exactly "-", which carries no footer.
-    if turn is not None and turn.machine_only:
-        if reply.strip() == "-":
-            return None
-        if not turn.denied and not carries_registered(instance_dirs, reply):
-            return NOTHING_FOR_USER
+    # A turn the user did not start may be answered with exactly "-", which carries no footer.
+    # Any other reply is checked as usual (user, 2026-10-18: a "-"-only rule blocked a useful status).
+    if turn is not None and turn.machine_only and reply.strip() == "-":
+        return None
     return footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
 
 
