@@ -56,7 +56,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - Resolve (`showrunners.registered_showrunners()`): `--cwd` inside a showrunner checkout gives that production, then each production in `showrunners.descendants_of(slug)` (nearest level first), each only when registered. `--production <slug>` gives the same list. Any other `--cwd`, a unit worktree included, gives no files.
 - `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
 - The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/delegate/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
-- `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase {id, of, title}` or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
+- `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; `merged` counts the unit's `merged` tickets in the style ledger) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;
   - a `finding_batch_dispatched` not yet landed in the open phase instance, as `Repair round <dispatched batches>`;
@@ -75,7 +75,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
   - Roster entries that become one slot merge into the entry its `impl_worker_<slot>.json` names, else the last in roster order. Roster `revision` values are per-entry counters, never compared.
   - `doing` is less a leading `launcher: ` and a trailing `; summary at …` or `; findings in …`, stripped and cut to 80 characters.
 - `eta.at`/`first`/`trail` are stated promises only; `schedule_end` is the chain's end and never a trail entry.
-- `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
+- `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_runs` `.jsonl`, a standing unit's style ledger, the production doc, plus each session dir, the run roots and the history `runs/` dir (or the history root while `runs/` is missing), so a run that starts later moves a watched mtime.
 
 ### The mod
 
@@ -129,7 +129,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 
 - Board, per production:
   - A heading with the unit count and `as of`.
-  - Then each unit that is running, or waiting on a gate. It gets a header line: state dot, key, then the phase `id/of` and title, or the stage when no phase is running, then `open`.
+  - Then each unit that is running, or waiting on a gate. It gets a header line: state dot, key, then the phase (`Phase <id>/<of>  <title>`, or `Ticket <id> · <merged> merged  <title>` on a standing plan), or the stage when no phase is running, then `open`.
   - Under the header, for a running phase:
     - the strip (`█` done, `▓` open, `░` todo, `▒` gated) with the stage;
     - the ETA line, with `· overdue …` once it has passed;
@@ -146,7 +146,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
   - Then one `+N more running: …` line takes the rest.
 - Ruler (`rulerCells`): from the start of the open row with the current phase id to `max(promise, now, start + 1s)` plus 10 %; `○` for each trail entry, `●` for `eta.at`, `│` for now; labels via `labelRuns`, where a later mark displaces whole earlier labels.
 - `UnitView(elements, columns, bodyRows, …)` draws:
-  - the heading (`Phase N of M · <stage>`, or the stage alone), the title, the plan path when it exists, the summary;
+  - the heading (`Phase N of M · <stage>`, `Ticket <id> · <n> merged · <stage>` on a standing plan, or the stage alone), the title, the plan path when it exists, the summary;
   - ETA with overdue, gate and finish, then the ruler;
   - the trail as `HH:MM said HH:MM → …`, then the strip;
   - `This phase` steps, each label fitted to one row with two spaces before its time;
@@ -206,6 +206,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - `accounts.py status` with no flags prints login addresses. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
 - A fresh checkout's `tsc` reports `TS2307` for `claude-code` until a live session loads the folder and the engine writes `mods/unit-board/.claude-plugin/types/`.
 - Tests patch `plan_history.now_epoch` for the clock.
+- The board reads the style ledger with `sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0)`, never through `style_ledger.Ledger`, which takes a write lock (`BEGIN IMMEDIATE`) and loads the rule catalog. SQLite's default 5 s busy timeout made a locked ledger stall each standing unit in turn; `timeout=0` gives 0 at once.
 
 ## Why
 
@@ -220,3 +221,5 @@ The panes open only on demand because the user asked for it, and a closed pane c
 The accounts view draws `accounts.py`'s stored status straight to the screen so login addresses reach the user without passing through a model reply, a log or a message. It reads stored values (`--stored`) rather than probing accounts, and reruns only when one of its four input files changes, so an open pane spends no quota and no network.
 
 The terminal report got shorter because the tables answered questions most ticks do not ask; the board carries the visual view, and `tables` keeps the full recorder output one word away.
+
+A standing plan shows its ticket and a merged count, not `Phase N/total`, because it holds one ticket phase at a time and refill discards each merged one: `Phase 63/1` read as phase 63 of 1 when it was the 63rd ticket. The merged count, not a total, is the progress a ticket queue has.
