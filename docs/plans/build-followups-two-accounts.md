@@ -2128,32 +2128,17 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 78 — A launcher sees a refused thread as ended  · status: done
 
-**Depends on:** Phase 77
+#### As-built
 
-#### Work Order
-
-**Goal:** Style's seat `claude-build-followups-style-impl2` stayed attached for about 3 hours after codex1 reached zero (2026-10-19 01:45 EDT). Its last two turns were refused for the usage limit. After a refused turn the app-server sets the thread status to `systemError`, not `idle`. `codex_mesh._ended_unseen` accepts only `idle`. So the launcher's quiet poll did not resume the account move to codex2 that was marked at 01:46. It also did not finish, and it did not take the run result held for it at 01:49. It polled with no log line until style stopped it. The showrunner's decision (2026-10-19): a usage-limit refusal ends the attached launcher or routes the turn, and a delivery held for an attached launcher does not wait without limit. Fix the cause: a thread with no active turn is ended, whatever its status name.
-
-**Constraints from prior phases:**
-- `_read_live_turn` (~4377) already treats `idle`, `notLoaded` and `systemError` as "no turn is active" (from app-server/src/thread_status.rs). `_ended_unseen` (~1936) accepts only `idle`. The reset command (~6618) refuses any status other than `idle`, so it refuses a refused thread.
-- `_quota_continuation_finished` (~2889) needs `idle` together with a completed continuation turn. A continuation that completes leaves the thread `idle`, so this check does not change.
-- `_on_quiet_poll` (~3104) resumes a marked account move only when `_ended_unseen` is true. `_finish_if_ended_unseen` (~3121) waits while `_waiting_on_detached_run` is true, then moves or finishes only when `_ended_unseen` is true.
-- The fake server in `test_codex_mesh.py` (~748) already reports `systemError` for threads in `error_threads`.
-
-**Spec:**
-1. One private predicate names the thread statuses that hold no active turn (`idle`, `notLoaded`, `systemError`). `_read_live_turn`, `_ended_unseen` and the reset check use it. No other status check changes.
-2. A launcher whose watched thread has status `systemError` and has an account-move marker resumes the move on the next quiet poll, the same as for an `idle` thread.
-3. A one-turn launcher or follow whose watched thread has status `systemError`, with a result held for it after its detached run ends, goes through `_finish_if_ended_unseen` the same as for an `idle` thread. It moves the worker, waits for room (Phase 77) or finishes. It does not poll until the stream deadline.
-4. Reset accepts a `systemError` thread as it accepts an `idle` one.
+- `codex_mesh._thread_has_no_active_turn(status)` names the app-server thread states with no active turn: `idle`, `notLoaded` and `systemError`. `_ended_unseen`, `_read_live_turn` and reset use it.
+- A refused thread (status `systemError`) with an account-move marker resumes the move on the next quiet poll. A result held after a detached run ends goes through `_finish_if_ended_unseen`: the worker moves, waits for room or finishes. Reset accepts a refused or unloaded thread.
+- `_move_idle_worker` returns `WorkerWaitingForRoom("the refused account has not recovered", ...)` for an owed continuation on an unchanged account with a stored refusal. `WorkerWaitingOnLiveTurn` now means only a live turn. A follow or one-turn launch logs the wait once, keeps the continuation and the held messages, and finishes. A later account move resumes the continuation through its detached resume.
+- The showrunner reported it (2026-10-19): style's seat `claude-build-followups-style-impl2` stayed attached about 3 hours after codex1 reached zero.
 
 **Files:**
-- `scripts/agents/codex_mesh.py` — the predicate and its three callers.
-- `scripts/agents/test_codex_mesh.py` — regression tests for Spec 2, 3 and 4.
+- `scripts/agents/codex_mesh.py` — the predicate, its three callers and the stored-refusal room wait.
+- `scripts/agents/test_codex_mesh.py` — regressions for the marked move, the held result (follow and one-turn launch, with and without a stored refusal) and reset; six refusal tests now expect the room wait, not the timeout handoff.
 
-**Workers:** 1 writer. impl owns both files.
-
-**Verification:** `scripts.agents.test_codex_mesh scripts.agents.test_mesh_runs scripts.accounts.test_refusals scripts.accounts.test_refusal_watch` with a scratch HOME. Report the codex_mesh suite time. basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **Refused thread ends:** the Spec 2 and Spec 3 tests fail on the old `_ended_unseen` and pass after the change. Each finishes well inside its patched deadline, so the result ends the stream, not the deadline.
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- After a refused turn the app-server reports the thread as `systemError`, not `idle`. A status check that accepts only `idle` waits on a refused thread without limit.
+- The one pool review found one blocker (the stored-refusal path still returned `WorkerWaitingOnLiveTurn`). It is fixed with regression tests. The first new tests fail on the old code.
