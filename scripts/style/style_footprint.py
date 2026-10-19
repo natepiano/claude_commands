@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -639,97 +640,779 @@ def shapes(source: str, public_only: bool, *, glob_reexported: bool = False) -> 
     return tuple(result)
 
 
-def rename_map(changes: tuple[FileChange, ...], sources: RevisionTree) -> dict[str, str]:
-    renames: dict[str, str] = {}
-    definitions: set[tuple[str, str]] = set()
+@dataclass(frozen=True)
+class TokenRewrite:
+    start: int
+    end: int
+    replacement: tuple[Token, ...]
+
+
+@dataclass(frozen=True)
+class ImportProof:
+    before: tuple[TokenRewrite, ...] = ()
+    after: tuple[TokenRewrite, ...] = ()
+
+
+@dataclass(frozen=True)
+class LintAttribute:
+    start: int
+    end: int
+    level: str
+    inner: bool
+    names: frozenset[tuple[str, ...]]
+    reason: tuple[Token, ...]
+
+
+@dataclass(frozen=True)
+class LintAttributeProof:
+    before: tuple[TokenRewrite, ...] = ()
+    after: tuple[TokenRewrite, ...] = ()
+
+
+@dataclass(frozen=True)
+class FileTokenRewrites:
+    before: tuple[TokenRewrite, ...]
+    after: tuple[TokenRewrite, ...]
+
+
+@dataclass(frozen=True)
+class UseItem:
+    start: int
+    end: int
+    paths: tuple[tuple[str, ...], ...]
+    attributed: bool
+
+
+@dataclass(frozen=True)
+class FunctionRename:
+    path: str
+    start: int
+    end: int
+    old: str
+    new: str
+
+
+@dataclass(frozen=True)
+class CrateRename:
+    old: str
+    new: str
+
+
+@dataclass(frozen=True)
+class EnumVariantRename:
+    enum: str
+    old: str
+    new: str
+
+
+@dataclass(frozen=True)
+class EnumBody:
+    name: str
+    start: int
+    end: int
+    variants: tuple[int, ...]
+    attributed_variants: frozenset[int]
+    safe_attributes: bool
+
+
+@dataclass(frozen=True)
+class FileNormalization:
+    rewrites: FileTokenRewrites
+    renames: tuple[TokenRewrite, ...]
+    lint_attributes: LintAttributeProof
+
+
+def rewrite_tokens(source: tuple[Token, ...], rewrites: tuple[TokenRewrite, ...]) -> tuple[Token, ...]:
+    result = list(source)
+    for rewrite in sorted(rewrites, key=lambda item: item.start, reverse=True):
+        result[rewrite.start:rewrite.end] = rewrite.replacement
+    return tuple(result)
+
+
+def closing(words: tuple[str, ...], start: int) -> int:
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    stack = [pairs[words[start]]]
+    for index in range(start + 1, len(words)):
+        word = words[index]
+        if word in pairs:
+            stack.append(pairs[word])
+        elif word in {"}", ")", "]"}:
+            if not stack or word != stack.pop():
+                return len(words)
+            if not stack:
+                return index
+    return len(words)
+
+
+def lint_attributes(source: tuple[Token, ...]) -> tuple[LintAttribute, ...]:
+    words = tuple(token.value for token in source)
+    result: list[LintAttribute] = []
+    for start, end in attribute_spans(words):
+        inner = words[start + 1] == "!"
+        name = start + 3 if inner else start + 2
+        if name + 3 >= end or words[name] not in {"allow", "expect"} or words[name + 1] != "(":
+            continue
+        if words[end - 2:end] != (")", "]"):
+            continue
+        arguments: list[tuple[Token, ...]] = []
+        begin = name + 2
+        for index in range(begin, end - 2):
+            if words[index] == ",":
+                arguments.append(source[begin:index])
+                begin = index + 1
+        if begin < end - 2:
+            arguments.append(source[begin:end - 2])
+        names: set[tuple[str, ...]] = set()
+        reason: tuple[Token, ...] = ()
+        valid = True
+        for argument in arguments:
+            values = tuple(token.value for token in argument)
+            if len(argument) == 3 and values[:2] == ("reason", "=") and argument[2].kind == "literal":
+                if reason or not (values[2].startswith('"') or RAW_STRING.match(values[2])):
+                    valid = False
+                    break
+                reason = argument
+            elif argument and len(argument) % 2 and all(
+                token.kind == "identifier" if index % 2 == 0 else token.value == "::"
+                for index, token in enumerate(argument)
+            ):
+                names.add(values)
+            else:
+                valid = False
+                break
+        if valid:
+            result.append(LintAttribute(start, end, words[name], inner, frozenset(names), reason))
+    return tuple(result)
+
+
+def prove_lint_removals(change: FileChange) -> LintAttributeProof:
+    old, new = tokens(change.before), tokens(change.after)
+    old_attributes, new_attributes = lint_attributes(old), lint_attributes(new)
+
+    def units(source: tuple[Token, ...], attributes: tuple[LintAttribute, ...]) -> tuple[tuple[int, int], ...]:
+        spans = {item.start: item.end for item in attributes}
+        result: list[tuple[int, int]] = []
+        cursor = 0
+        while cursor < len(source):
+            end = spans.get(cursor, cursor + 1)
+            result.append((cursor, end))
+            cursor = end
+        return tuple(result)
+
+    old_units, new_units = units(old, old_attributes), units(new, new_attributes)
+    old_by_start = {item.start: item for item in old_attributes}
+    new_by_start = {item.start: item for item in new_attributes}
+    matcher = difflib.SequenceMatcher(None, tuple(old[start:end] for start, end in old_units),
+                                     tuple(new[start:end] for start, end in new_units), autojunk=False)
+    before: list[TokenRewrite] = []
+    after: list[TokenRewrite] = []
+    for operation, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        removed = old_units[old_start:old_end]
+        added = new_units[new_start:new_end]
+        if any(span[0] not in old_by_start for span in removed) or any(
+            span[0] not in new_by_start for span in added
+        ):
+            continue
+        pending: list[TokenRewrite] = []
+        cursor = 0
+        for span in removed:
+            previous = old_by_start[span[0]]
+            if cursor < len(added):
+                following = new_by_start[added[cursor][0]]
+                if (previous.level == following.level and previous.inner == following.inner
+                        and following.names <= previous.names and following.reason in {(), previous.reason}):
+                    pending.append(TokenRewrite(following.start, following.end, ()))
+                    cursor += 1
+        if cursor == len(added):
+            before.extend(TokenRewrite(start, end, ()) for start, end in removed)
+            after.extend(pending)
+    return LintAttributeProof(tuple(before), tuple(after))
+
+
+def original_rewrites(source: tuple[Token, ...], omitted: tuple[TokenRewrite, ...],
+                      rewrites: tuple[TokenRewrite, ...]) -> tuple[TokenRewrite, ...]:
+    origins = [index for index in range(len(source)) if not any(item.start <= index < item.end for item in omitted)]
+    return omitted + tuple(TokenRewrite(origins[item.start], origins[item.end - 1] + 1, item.replacement)
+                           for item in rewrites)
+
+
+def use_paths(words: tuple[str, ...], prefix: tuple[str, ...] = ()) -> tuple[tuple[str, ...], ...]:
+    # Unknown syntax (aliases, globs, incomplete groups) has no proof.
+    if not words:
+        return ()
+    if "{" in words:
+        begin = words.index("{")
+        end = closing(words, begin)
+        if end != len(words) - 1 or (begin and words[begin - 1] != "::"):
+            return ()
+        stem = words[:begin - 1] if begin else ()
+        if any(word != "::" and not IDENTIFIER.fullmatch(word) for word in stem):
+            return ()
+        head = prefix + tuple(word for word in stem if word != "::")
+        result: list[tuple[str, ...]] = []
+        cursor, depth = begin + 1, 0
+        for index in range(begin + 1, end + 1):
+            if words[index] == "{":
+                depth += 1
+            elif words[index] == "}":
+                depth -= 1
+            if (words[index] == "," and depth == 0) or index == end:
+                part = words[cursor:index]
+                if part:
+                    paths = use_paths(part, head)
+                    if not paths:
+                        return ()
+                    result.extend(paths)
+                cursor = index + 1
+        return tuple(result)
+    if any((index % 2 == 0 and not IDENTIFIER.fullmatch(word)) or
+           (index % 2 == 1 and word != "::") for index, word in enumerate(words)) or len(words) % 2 == 0:
+        return ()
+    return (prefix + words[::2],)
+
+
+def use_items(words: tuple[str, ...]) -> tuple[UseItem, ...]:
+    result: list[UseItem] = []
+    spans = attribute_spans(words)
+    for index, word in enumerate(words):
+        if word != "use":
+            continue
+        end = next((i for i in range(index + 1, len(words)) if words[i] == ";"), len(words))
+        start = index
+        if index and words[index - 1] == "pub":
+            start = index - 1
+        elif index and words[index - 1] == ")":
+            start = next((i for i in range(index - 1, -1, -1)
+                          if words[i:i + 2] == ("pub", "(") and closing(words, i + 1) == index - 1), index)
+        attributed = any(finish == start for _, finish in spans)
+        while any(finish == start for _, finish in spans):
+            start = next(begin for begin, finish in spans if finish == start)
+        result.append(UseItem(start, min(end + 1, len(words)), use_paths(words[index + 1:end]), attributed))
+    return tuple(result)
+
+
+def plain_use(words: tuple[str, ...], item: UseItem) -> bool:
+    return bool(item.paths) and not item.attributed and words[item.start] == "use"
+
+
+def qualified_import_sites(source: tuple[Token, ...], uses: tuple[UseItem, ...],
+                           added: set[tuple[str, ...]]) -> tuple[TokenRewrite, ...]:
+    words = tuple(token.value for token in source)
+    use_indices = {i for item in uses for i in range(item.start, item.end)}
+    aliases: dict[str, set[tuple[str, ...]]] = {}
+    for item in uses:
+        if plain_use(words, item):
+            for path in item.paths:
+                aliases.setdefault(path[-1], set()).add(path)
+    replacements: list[TokenRewrite] = []
+    cursor = 0
+    while cursor < len(words):
+        if cursor in use_indices or not IDENTIFIER.fullmatch(words[cursor]):
+            cursor += 1
+            continue
+        end = cursor + 1
+        while end + 1 < len(words) and words[end] == "::" and IDENTIFIER.fullmatch(words[end + 1]):
+            end += 2
+        segments = words[cursor:end:2]
+        if len(segments) > 1:
+            resolved = segments
+            if segments[0] not in {"crate", "self", "super", "std", "core", "alloc"}:
+                options = aliases.get(segments[0], set())
+                resolved = next(iter(options)) + segments[1:] if len(options) == 1 else ()
+            if resolved in added and not any(
+                not plain_use(words, item) and segments[0] in words[item.start:item.end] for item in uses
+            ):
+                replacements.append(TokenRewrite(cursor, end, (source[end - 1],)))
+        cursor = end
+    return tuple(replacements)
+
+
+def prove_imports(change: FileChange) -> ImportProof:
+    old, new = tokens(change.before), tokens(change.after)
+    before, after = tuple(t.value for t in old), tuple(t.value for t in new)
+    old_uses, new_uses = use_items(before), use_items(after)
+    remaining = list(new_uses)
+    removed_items: list[UseItem] = []
+    unchanged_items: list[UseItem] = []
+    for item in old_uses:
+        match = next((other for other in remaining if before[item.start:item.end] == after[other.start:other.end]), None)
+        if match is None:
+            removed_items.append(item)
+        else:
+            remaining.remove(match)
+            unchanged_items.append(item)
+    added_items = tuple(remaining)
+    if not removed_items and not added_items:
+        return ImportProof()
+    if any("*" in words[item.start:item.end] for words, items in ((before, old_uses), (after, new_uses))
+           for item in items):
+        return ImportProof()
+    if any(not plain_use(before, item) for item in removed_items) or any(
+        not plain_use(after, item) for item in added_items
+    ):
+        return ImportProof()
+    if any(path[-1] in before[unchanged.start:unchanged.end] for item in added_items for path in item.paths
+           for unchanged in unchanged_items):
+        return ImportProof()
+    old_paths = {path for item in old_uses for path in item.paths}
+    new_paths = {path for item in new_uses for path in item.paths}
+    added, removed = new_paths - old_paths, old_paths - new_paths
+    if len({path[-1] for path in added}) != len(added):
+        return ImportProof()
+    old_use_indices = {i for item in old_uses for i in range(item.start, item.end)}
+    new_use_indices = {i for item in new_uses for i in range(item.start, item.end)}
+    for path in removed:
+        if any(word == path[-1] and i not in new_use_indices for i, word in enumerate(after)):
+            return ImportProof()
+    for path in added:
+        name = path[-1]
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            return ImportProof()
+        if any(name in before[item.start:item.end] for item in old_uses):
+            return ImportProof()
+        if any(word == name and i not in old_use_indices and
+               (i == 0 or before[i - 1] != "::") and
+               (i + 1 == len(before) or before[i + 1] != "::") for i, word in enumerate(before)):
+            return ImportProof()
+    old_sites = qualified_import_sites(old, old_uses, added)
+    new_sites = qualified_import_sites(new, new_uses, added)
+    used = {tuple(before[site.start:site.end:2])[-1] for site in old_sites}
+    if used != {path[-1] for path in added}:
+        return ImportProof()
+    return ImportProof(tuple(TokenRewrite(item.start, item.end, ()) for item in removed_items) + old_sites,
+                       tuple(TokenRewrite(item.start, item.end, ()) for item in added_items) + new_sites)
+
+
+def function_bodies(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
+    result: list[tuple[int, int]] = []
+    for index, word in enumerate(words):
+        if word == "fn":
+            begin = next((i for i in range(index + 1, len(words)) if words[i] in {"{", ";"}), len(words))
+            if begin < len(words) and words[begin] == "{":
+                result.append((index, closing(words, begin) + 1))
+    return tuple(result)
+
+
+def enum_bodies(words: tuple[str, ...]) -> tuple[EnumBody, ...]:
+    result: list[EnumBody] = []
+    attributes = decorated_items(words)
+    allowed = {"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"}
+    for index, word in enumerate(words[:-1]):
+        if word != "enum":
+            continue
+        begin = next((i for i in range(index + 2, len(words)) if words[i] in {"{", ";"}), len(words))
+        if begin == len(words) or words[begin] != "{":
+            continue
+        end = closing(words, begin)
+        variants: list[int] = []
+        attributed_variants: set[int] = set()
+        spans = dict(attribute_spans(words))
+        cursor = begin + 1
+        while cursor < end:
+            attributed = cursor in spans
+            while cursor in spans:
+                cursor = spans[cursor]
+            if cursor < end and IDENTIFIER.fullmatch(words[cursor]):
+                variants.append(cursor)
+                if attributed:
+                    attributed_variants.add(cursor)
+            while cursor < end and words[cursor] != ",":
+                if words[cursor] in {"{", "(", "["}:
+                    cursor = closing(words, cursor)
+                cursor += 1
+            cursor += 1
+        safe = True
+        attached = attributes.get(index, ())
+        for start, finish in attribute_spans(attached):
+            attribute = attached[start:finish]
+            if len(attribute) < 6 or attribute[2:4] != ("derive", "(") or any(
+                name not in allowed and name != "," for name in attribute[4:-2]
+            ):
+                safe = False
+        result.append(EnumBody(words[index + 1], begin, end, tuple(variants), frozenset(attributed_variants), safe))
+    return tuple(result)
+
+
+def impl_bodies(words: tuple[str, ...], enum: str) -> tuple[tuple[int, int], ...]:
+    bodies: list[tuple[int, int]] = []
+    for index, word in enumerate(words):
+        if word != "impl":
+            continue
+        begin = next((i for i in range(index + 1, len(words)) if words[i] in {"{", ";"}), len(words))
+        header = words[index + 1:begin]
+        target = header[header.index("for") + 1:] if "for" in header else header
+        if target and target[0] == "<":
+            depth, cursor = 1, 1
+            while cursor < len(target) and depth:
+                depth += (target[cursor] == "<") - (target[cursor] == ">")
+                cursor += 1
+            target = target[cursor:]
+        finish = next((i for i, part in enumerate(target) if part in {"<", "where"}), len(target))
+        target = target[:finish]
+        if target and target[-1] == enum and all(
+            IDENTIFIER.fullmatch(part) or part == "::" for part in target
+        ) and begin < len(words) and words[begin] == "{":
+            bodies.append((begin, closing(words, begin)))
+    return tuple(bodies)
+
+
+def variant_sites(words: tuple[str, ...], enum: str, name: str) -> frozenset[int]:
+    sites = {i for body in enum_bodies(words) if body.name == enum for i in body.variants if words[i] == name}
+    impls = impl_bodies(words, enum)
+    for index, word in enumerate(words):
+        if word != name or index < 2 or words[index - 1] != "::":
+            continue
+        qualifier = words[index - 2]
+        if (qualifier == enum and (index < 3 or words[index - 3] != "::")) or (
+            qualifier == "Self" and any(start < index < end for start, end in impls)
+        ):
+            sites.add(index)
+    for item in use_items(words):
+        # Flatten each leaf separately, retaining its original token index.
+        prefixes: list[tuple[str, ...]] = [()]
+        path: list[str] = []
+        for index in range(item.start, item.end):
+            word = words[index]
+            if word in {"use", "pub", "::"}:
+                continue
+            if word == "{":
+                prefixes.append(prefixes[-1] + tuple(path))
+                path = []
+            elif word in {",", "}", ";"}:
+                path = []
+                if word == "}" and len(prefixes) > 1:
+                    _ = prefixes.pop()
+            elif IDENTIFIER.fullmatch(word):
+                path.append(word)
+                if word == name and (prefixes[-1] + tuple(path))[-2:] == (enum, name):
+                    sites.add(index)
+    imported = [path for item in use_items(words) for path in item.paths if path[-1] == name]
+    if len(imported) == 1 and imported[0][-2:] == (enum, name):
+        # A bare imported variant is safe only without a competing binding.
+        definitions = {"let", "mut", "fn", "const", "static", "struct", "enum", "type", "mod"}
+        if not any(index and words[index - 1] in definitions for index, word in enumerate(words) if word == name):
+            sites.update(index for index, word in enumerate(words) if word == name and
+                         (index == 0 or words[index - 1] not in {"::", "."}) and
+                         (index + 1 == len(words) or words[index + 1] not in {"::", ":"}))
+    return frozenset(sites)
+
+
+def shorthand_field(words: tuple[str, ...], index: int) -> bool:
+    if not index or index + 1 == len(words) or words[index - 1] not in {"{", ","} or words[index + 1] not in {"}", ","}:
+        return False
+    for begin in range(index - 1, -1, -1):
+        if words[begin] == "{" and closing(words, begin) >= index:
+            if not begin:
+                return False
+            boundary = next((i + 1 for i in range(begin - 1, -1, -1) if words[i] in {";", "{", "}"}), 0)
+            header = words[boundary:begin]
+            nested = header.count("(") != header.count(")") or header.count("[") != header.count("]")
+            if not nested and set(header) & {"fn", "if", "while", "match", "for"}:
+                return False
+            owner = words[begin - 1]
+            return owner == ">" or bool(IDENTIFIER.fullmatch(owner) and owner not in {
+                "else", "loop", "unsafe", "async", "try", "const", "return", "break",
+            })
+    return False
+
+
+def local_binding_is_safe(old: tuple[Token, ...], new: tuple[Token, ...], index: int,
+                          start: int, end: int) -> bool:
+    words = tuple(token.value for token in old)
+    old_name, new_name = words[index], new[index].value
+    let = index - 2 if words[index - 1] == "mut" else index - 1
+    if not let or words[let - 1] not in {"{", ";", "}"}:
+        return False
+    blocks = [(begin, closing(words, begin)) for begin in range(start, let) if words[begin] == "{"
+              and closing(words, begin) > let]
+    if not blocks:
+        return False
+    block_start, block_end = min(blocks, key=lambda block: block[1] - block[0])
+    cursor = let + 1
+    while cursor < block_end and words[cursor] != ";":
+        if words[cursor] in {"(", "[", "{"}:
+            cursor = closing(words, cursor)
+        cursor += 1
+    if cursor >= block_end:
+        return False
+    if new_name in words[start:end] or any(token.value == old_name for token in new[start:end]):
+        return False
+    if "fn" in words[start + 1:end] or "macro_rules" in words[start:end]:
+        return False
+    capture = re.compile(r"\{" + re.escape(old_name) + r"(?=[}:])")
+    if any(token.kind == "literal" and capture.search(token.value)
+           for token in (*old[start:end], *new[start:end])):
+        return False
+    for occurrence in range(start, end):
+        if words[occurrence] != old_name or occurrence == index:
+            continue
+        if not cursor < occurrence < block_end or occurrence <= block_start:
+            return False
+        binding = words[occurrence - 1] == "let" or words[occurrence - 2:occurrence] == ("let", "mut")
+        if not binding and (words[occurrence - 1] in {".", "::"} or words[occurrence + 1] in {"::", "!", ":"}):
+            return False
+    return True
+
+
+def enum_name_is_unique(originals: dict[str, str], owned: dict[str, str], enum: str) -> bool:
+    kinds = {"struct", "enum", "union", "type", "trait", "const", "static", "mod", "fn"}
+    for revised in (False, True):
+        definitions: list[str] = []
+        for path, source in originals.items():
+            words = tuple(token.value for token in tokens(owned.get(path, source) if revised else source))
+            for index, word in enumerate(words[:-1]):
+                name = index + 2 if word == "static" and words[index + 1] == "mut" else index + 1
+                if word in kinds and name < len(words) and words[name] == enum:
+                    definitions.append(word)
+        if definitions != ["enum"]:
+            return False
+    return True
+
+
+def enum_sites_have_import(words: tuple[str, ...], enum: str, names: tuple[str, ...]) -> bool:
+    if any(body.name == enum for body in enum_bodies(words)) or not any(
+        variant_sites(words, enum, name) for name in names
+    ):
+        return True
+    uses = use_items(words)
+    return not any("*" in words[item.start:item.end] for item in uses) and any(
+        not item.attributed and any(path[0] in {"crate", "self", "super"} and path[-1] == enum for path in item.paths)
+        for item in uses
+    )
+
+
+def prove_renames(changes: tuple[FileChange, ...], sources: RevisionTree,
+                  imports: dict[str, ImportProof]) -> dict[str, tuple[TokenRewrite, ...]]:
+    empty: dict[str, tuple[TokenRewrite, ...]] = {}
+    crates = {sources.crate(change.path) for change in changes}
+    if len(changes) > 10 or len(crates) != 1:
+        return empty
+    crate = next(iter(crates))
+    pairs: dict[str, tuple[tuple[Token, ...], tuple[Token, ...]]] = {}
+    locals_found: list[FunctionRename] = []
+    variants: set[EnumVariantRename] = set()
+    globals_found: set[CrateRename] = set()
     for change in changes:
-        before, after = tokens(change.before), tokens(change.after)
-        if len(before) != len(after):
-            return {}
-        words = tuple(token.value for token in before)
+        proof = imports[change.path]
+        old = rewrite_tokens(tokens(change.before), proof.before)
+        new = rewrite_tokens(tokens(change.after), proof.after)
+        pairs[change.path] = old, new
+        if len(old) != len(new):
+            return empty
+        words = tuple(t.value for t in old)
+        for index, (left, right) in enumerate(zip(old, new)):
+            if left == right:
+                continue
+            if left.kind != "identifier" or right.kind != "identifier":
+                return empty
+            variant = next((body for body in enum_bodies(words) if index in body.variants), None)
+            if variant is not None:
+                if not variant.safe_attributes or index in variant.attributed_variants:
+                    return empty
+                variants.add(EnumVariantRename(variant.name, left.value, right.value))
+            elif index and (words[index - 1] == "let" or
+                            (index > 1 and words[index - 2:index] == ("let", "mut"))):
+                bodies = [(start, end) for start, end in function_bodies(words) if start < index < end]
+                if not bodies:
+                    return empty
+                start, end = min(bodies, key=lambda body: body[1] - body[0])
+                rename = FunctionRename(change.path, start, end, left.value, right.value)
+                if rename not in locals_found:
+                    if not local_binding_is_safe(old, new, index, start, end):
+                        return empty
+                    locals_found.append(rename)
+            elif index and words[index - 1] in {"fn", "const", "static", "struct", "enum", "type", "trait"}:
+                globals_found.add(CrateRename(left.value, right.value))
+    if len({rename.old for rename in globals_found}) != len(globals_found) or len(
+        {rename.new for rename in globals_found}
+    ) != len(globals_found):
+        return empty
+    originals = {path: sources.text(path) for path in sources.paths
+                 if (globals_found or (variants and path.endswith(".rs"))) and sources.crate(path) == crate}
+    owned = {change.path: change.after for change in changes}
+    for rename in globals_found:
+        if any(re.search(r"\b" + re.escape(rename.new) + r"\b", source) or
+               re.search(r"\b" + re.escape(rename.old) + r"\b", owned.get(path, source))
+               for path, source in originals.items()):
+            return empty
+    for rename in variants:
+        definitions = [body for source in originals.values() for body in enum_bodies(tuple(t.value for t in tokens(source)))
+                       if body.name == rename.enum]
+        if len(definitions) != 1 or not definitions[0].safe_attributes or not enum_name_is_unique(
+            originals, owned, rename.enum,
+        ):
+            return empty
+        for path, source in originals.items():
+            words = tuple(t.value for t in tokens(source))
+            imports_variant = any(path[-2:] == (rename.enum, rename.old)
+                                  for item in use_items(words) for path in item.paths)
+            if any(words[index] == rename.new for body in enum_bodies(words) if body.name == rename.enum
+                   for index in body.variants) or (imports_variant and any(
+                       word == rename.new and (index == 0 or words[index - 1] != "::")
+                       for index, word in enumerate(words)
+                   )):
+                return empty
+            if any("*" in words[item.start:item.end] and
+                   any(words[i:i + 2] == (qualifier, "::") for qualifier in {rename.enum, "Self"}
+                       for i in range(item.start, item.end - 1)) for item in use_items(words)):
+                return empty
+            remaining = tuple(t.value for t in tokens(owned.get(path, source)))
+            if not all(enum_sites_have_import(version, rename.enum, (rename.old, rename.new))
+                       for version in (words, remaining)):
+                return empty
+            if variant_sites(remaining, rename.enum, rename.old) or any(
+                remaining[index - 2:index] == (rename.enum, "::")
+                for index, word in enumerate(remaining) if word == rename.old
+            ):
+                return empty
+    result: dict[str, tuple[TokenRewrite, ...]] = {}
+    for path, (old, new) in pairs.items():
+        words = tuple(t.value for t in old)
         attributes = attribute_spans(words)
         decorated = decorated_items(words)
-        # Uses may bind an imported item with the same spelling, even through
-        # self:: when a glob brought that item into the module's namespace.
         has_glob = re.search(r"\buse\b[^;]*\*", " ".join(words)) is not None
-        macro_ends: list[str] = []
-        for index, (old, new) in enumerate(zip(before, after)):
-            if old.value in {"(", "[", "{"} and (macro_ends or (index and before[index - 1].value == "!")):
-                macro_ends.append({"(": ")", "[": "]", "{": "}"}[old.value])
-            elif macro_ends and old.value == macro_ends[-1]:
-                _ = macro_ends.pop()
-            if old == new:
+        replacements: list[TokenRewrite] = []
+        for index, (left, right) in enumerate(zip(old, new)):
+            if left == right:
                 continue
-            if old.kind != "identifier" or new.kind != "identifier":
-                return {}
+            previous = words[index - 1] if index else ""
+            variant_match = any(left.value == rename.old and right.value == rename.new and
+                                index in variant_sites(words, rename.enum, rename.old) for rename in variants)
+            local_match = any(rename.path == path and rename.start <= index < rename.end and
+                              left.value == rename.old and right.value == rename.new for rename in locals_found)
+            global_match = CrateRename(left.value, right.value) in globals_found
+            definition = previous in {"fn", "const", "static", "struct", "enum", "type", "trait", "let"}
             if any(start <= index < end for start, end in attributes) or index - 1 in decorated:
-                return {}  # Attributes on the renamed item can observe its name.
-            previous = before[index - 1].value if index else ""
-            following = before[index + 1].value if index + 1 < len(before) else ""
-            definition = previous in {"fn", "let", "const", "static", "struct", "enum", "type", "trait"}
-            if has_glob and not definition:
-                return {}
-            if macro_ends or previous == ".":
-                return {}
-            if previous == "::" and (index < 2 or before[index - 2].value not in {"self", "super", "crate"}):
-                return {}
-            if previous in {"{", ","} and following in {"}", ","}:
-                return {}  # A shorthand field also names a potentially foreign field.
-            if renames.get(old.value, new.value) != new.value:
-                return {}
-            renames[old.value] = new.value
-            if definition:
-                definitions.add((old.value, new.value))
-    if len(set(renames.values())) != len(renames) or any(pair not in definitions for pair in renames.items()):
-        return {}
-    crates = {sources.crate(change.path) for change in changes}
-    if len(crates) != 1 or len(changes) > 10:
-        return {}
-    crate = next(iter(crates))
-    owned = {change.path: change.after for change in changes}
-    for old, new in renames.items():
-        for path in sources.paths:
-            if sources.crate(path) == crate:
-                original = sources.text(path)
-                if re.search(r"\b" + re.escape(new) + r"\b", original) or re.search(
-                    r"\b" + re.escape(old) + r"\b", owned.get(path, original)
-                ):
-                    return {}
-    return renames
+                return empty
+            if previous == "." or (has_glob and not definition and not variant_match):
+                return empty
+            if not variant_match:
+                if previous == "::" and (index < 2 or words[index - 2] not in {"self", "super", "crate"}):
+                    return empty
+                if shorthand_field(words, index):
+                    return empty
+            if not (variant_match or local_match or global_match):
+                return empty
+            replacements.append(TokenRewrite(index, index + 1, (right,)))
+        result[path] = tuple(replacements)
+    return result
+
+
+def normalizations(changes: tuple[FileChange, ...], sources: RevisionTree) -> dict[str, FileNormalization]:
+    lint_proofs = {change.path: prove_lint_removals(change) for change in changes}
+    prepared = tuple(FileChange(
+        change.status, change.old_path, change.path,
+        " ".join(token.value for token in rewrite_tokens(tokens(change.before), lint_proofs[change.path].before)),
+        " ".join(token.value for token in rewrite_tokens(tokens(change.after), lint_proofs[change.path].after)),
+        change.hunks,
+    ) for change in changes)
+    imports = {change.path: prove_imports(change) for change in prepared}
+    renames = prove_renames(prepared, sources, imports)
+    return {change.path: FileNormalization(FileTokenRewrites(
+        original_rewrites(tokens(change.before), lint_proofs[change.path].before, imports[change.path].before),
+        original_rewrites(tokens(change.after), lint_proofs[change.path].after, imports[change.path].after),
+    ), renames.get(change.path, ()), lint_proofs[change.path]) for change in changes}
+
+
+def normalized_source(change: FileChange, proof: FileNormalization) -> tuple[Token, ...]:
+    return rewrite_tokens(rewrite_tokens(tokens(change.before), proof.rewrites.before), proof.renames)
+
+
+def line_tokens(source: str, line: int, rewrites: tuple[TokenRewrite, ...]) -> tuple[Token, ...]:
+    lines = source.splitlines(keepends=True)
+    start = len(tokens("".join(lines[:line - 1])))
+    end = len(tokens("".join(lines[:line])))
+    # Full-file token indices keep local renames inside their function.
+    return tuple(
+        token for index, original in enumerate(tokens(source)) if start <= index < end
+        for token in next((rewrite.replacement if index == rewrite.start else ()
+                           for rewrite in rewrites if rewrite.start <= index < rewrite.end), (original,))
+    )
+
+
+def flagged_hunks(change: FileChange, proof: FileNormalization) -> bool:
+    old = tokens(change.before)
+    # Rename indices follow proven removals. Map them back for hunk comparisons.
+    origins = list(range(len(old)))
+    for rewrite in sorted(proof.rewrites.before, key=lambda item: item.start, reverse=True):
+        origins[rewrite.start:rewrite.end] = [rewrite.end - 1] * len(rewrite.replacement)
+    renames = tuple(TokenRewrite(origins[item.start], origins[item.start] + 1, item.replacement) for item in proof.renames)
+    before_rewrites = proof.rewrites.before + renames
+    offset = 0
+    for hunk in change.hunks:
+        new_start = hunk.old_start + (not hunk.old_count) + offset
+        removed_lines = tuple(" ".join(token.value for token in line_tokens(
+            change.before, hunk.old_start + index, proof.lint_attributes.before,
+        )) for index in range(len(hunk.removed))) if proof.lint_attributes.before else hunk.removed
+        added_lines = tuple(" ".join(token.value for token in line_tokens(
+            change.after, new_start + index, proof.lint_attributes.after,
+        )) for index in range(len(hunk.added))) if proof.lint_attributes.after else hunk.added
+        if len(hunk.removed) == len(hunk.added):
+            for index, (removed, added) in enumerate(zip(removed_lines, added_lines)):
+                if line_tokens(change.before, hunk.old_start + index, before_rewrites) != line_tokens(
+                    change.after, new_start + index, proof.rewrites.after
+                ) and behavior_flagged(removed + "\n" + added):
+                    return True
+        elif behavior_flagged("\n".join((*removed_lines, *added_lines))):
+            return True
+        offset += len(hunk.added) - hunk.old_count
+    return False
+
+
+def changed_text_without_lint_attributes(change: FileChange, proof: LintAttributeProof) -> str:
+    if not proof.before:
+        return "\n".join(line for hunk in change.hunks for line in (*hunk.removed, *hunk.added))
+    lines: list[str] = []
+    offset = 0
+    for hunk in change.hunks:
+        new_start = hunk.old_start + (not hunk.old_count) + offset
+        for source, start, count, rewrites in (
+            (change.before, hunk.old_start, len(hunk.removed), proof.before),
+            (change.after, new_start, len(hunk.added), proof.after),
+        ):
+            lines.extend(" ".join(token.value for token in line_tokens(source, start + index, rewrites))
+                         for index in range(count))
+        offset += len(hunk.added) - hunk.old_count
+    return "\n".join(lines)
 
 
 def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
     reasons: list[str] = []
-    renames = rename_map(finding.changes, before)
+    proofs = normalizations(finding.changes, before)
     changed_lines = sum(len(hunk.removed) + len(hunk.added) for change in finding.changes for hunk in change.hunks)
     if changed_lines >= 200:
         reasons.append("check 5: 200 or more changed lines")
     if len(finding.changes) > 10 or len({before.crate(change.path) for change in finding.changes}) > 1:
-        if renames or any(tokens(change.before) != tokens(change.after) for change in finding.changes):
+        if any(tokens(change.before) != tokens(change.after) for change in finding.changes):
             reasons.append("check 4: rename exceeds one crate or 10 files")
     for change in finding.changes:
-        lines = "\n".join(line for hunk in change.hunks for line in (*hunk.removed, *hunk.added))
+        proof = proofs[change.path]
+        lines = changed_text_without_lint_attributes(change, proof.lint_attributes)
         words = {token.value for token in tokens(lines)}
-        if change.status is not FileStatus.MODIFIED or "mod" in words:
+        lint_only = bool(proof.lint_attributes.before) and rewrite_tokens(
+            tokens(change.before), proof.lint_attributes.before,
+        ) == rewrite_tokens(tokens(change.after), proof.lint_attributes.after)
+        if change.status is not FileStatus.MODIFIED or ("mod" in words and not lint_only):
             reasons.append("check 1: file or module layout changes")
         glob_reexported = before.has_public_glob(before.crate(change.path))
         public_before = shapes(change.before, True, glob_reexported=glob_reexported)
         public_after = shapes(change.after, True, glob_reexported=glob_reexported)
         if before.externally_reachable(change.path) and public_before != public_after:
             reasons.append("check 2: externally reachable item changes")
-        old_shapes = shapes(change.before, False)
-        normalized = tuple(tuple(renames.get(word, word) for word in shape) for shape in old_shapes)
-        if normalized != shapes(change.after, False):
+        normalized = normalized_source(change, proof)
+        if shapes(" ".join(token.value for token in normalized), False) != shapes(change.after, False):
             reasons.append("check 3: type, fields, variants, generics or trait impl changes")
-        if behavior_flagged(lines):
+        if flagged_hunks(change, proof):
             reasons.append("check 6: condition, literal or control flow flagged")
         if changes_macro_invocation(change):
             reasons.append("check 6: macro invocation requires review")
         if documented_text(change.before) != documented_text(change.after) or re.search(r"#\s*\[\s*(?:serde|reflect)|\brename\s*=", lines):
             reasons.append("check 6: serialized, reflected, configured or documented name flagged")
-        old_tokens, new_tokens = without_derives(tokens(change.before)), without_derives(tokens(change.after))
-        normalized_tokens = tuple(Token(renames.get(token.value, token.value), token.kind) for token in old_tokens)
-        if normalized_tokens != new_tokens or any(token.kind == "unknown" for token in (*old_tokens, *new_tokens)):
+        old_tokens = without_derives(normalized)
+        new_tokens = without_derives(rewrite_tokens(tokens(change.after), proof.rewrites.after))
+        if old_tokens != new_tokens or any(token.kind == "unknown" for token in (*old_tokens, *new_tokens)):
             reasons.append("check 6: call target, method or other change not proven equivalent")
         if not change.path.endswith(".rs") and change.before != change.after:
             reasons.append("check 6: non-Rust change requires review")
