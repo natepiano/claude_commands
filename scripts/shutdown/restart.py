@@ -1143,7 +1143,15 @@ def _herdr_launch(
             # The restored panes no shutdown record owns come back on their own accounts.
             import pane_restore
 
-            _ = pane_restore.restore(name, dry_run=False)
+            try:
+                left = pane_restore.restore(name, dry_run=False)
+            except herdr.HerdrFailure as error:
+                left, reason = 1, f": {error}"
+            else:
+                reason = ""
+            if left:
+                print(f"{name} restart issue: pane restore left panes not resumed{reason}; run "
+                      + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py")
         client = herdr.Herdr(name)
         agents = client.agents()
         if any((isinstance(destination, NewHerdrSession)

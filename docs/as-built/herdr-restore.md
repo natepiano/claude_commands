@@ -62,7 +62,8 @@ The settings.json entry, one more SessionStart item:
 - `restart._herdr_launch` runs `pane_restore.restore` once, when its launch started the shared
   server (`ServerCreated` or `WindowServerCreated`) and the layout is kept. The restore leaves
   the sessions that a shutdown record holds, and restart then resumes each of them in its
-  recorded pane: the restored pane at a shell closes first.
+  recorded pane: the restored pane at a shell closes first. A restore that leaves a pane not
+  resumed prints a restart issue that names the command to run it again.
 - `herdr._submit_server`, for the shared session only, starts `herdr-<name>.service` with
   `systemctl --user start` when a unit file defines it (`systemctl show -p FragmentPath`, not
   under `/transient/`). Otherwise it runs `systemd-run` as before. A transient unit cannot start

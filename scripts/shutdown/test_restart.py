@@ -1459,6 +1459,13 @@ class RestartTests(ShutdownTestCase):
                 result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 self.assertIsInstance(result, restart.SessionLaunched)
                 self.assertEqual(restore.call_args_list, restored)
+        for failed in (1, herdr.HerdrFailure("pane list refused")):
+            with (self.subTest(failed=failed), patch.object(herdr, "restore_server", return_value=herdr.ServerCreated()),
+                  patch.object(herdr, "keeps_restored_layout", return_value=True),
+                  patch.object(pane_restore, "restore", side_effect=[failed]), redirect_stdout(io.StringIO()) as output):
+                result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                self.assertIn("writing restart issue: pane restore left panes not resumed", output.getvalue())
 
     def test_ssh_mac_refusal_keeps_claude_records_restartable_and_reaches_peer_json(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
