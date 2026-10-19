@@ -1010,7 +1010,7 @@ signal.pause()
                 self.assertEqual(self.routing_record()["target"], "natedev")
 
     def test_declined_mac_attempt_announces_only_local_execution(self) -> None:
-        for reason in ("busy", "blocked", "battery"):
+        for reason in ("busy", "blocked", "disk"):
             with self.subTest(reason=reason):
                 self.clear_observations()
                 result = self.verify("test", "sample", "--no-cache", extra={

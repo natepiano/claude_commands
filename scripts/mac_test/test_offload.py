@@ -407,8 +407,8 @@ class OffloadSettingsTests(unittest.TestCase):
                     self.assertTrue(result.reason)
 
     def test_resource_probe_needs_no_process_count_and_ignores_legacy_counts(self) -> None:
-        wire = "power=ac\nfree_gib=120\nhost=Mac\nrc=0\n"
-        expected = offload.ProbeSnapshot("ac", 120.0, "Mac")
+        wire = "free_gib=120\nhost=Mac\nrc=0\n"
+        expected = offload.ProbeSnapshot(120.0, "Mac")
         self.assertEqual(offload.parse_probe(wire), expected)
         self.assertEqual(offload.parse_probe("procs=12\n" + wire), expected)
         self.assertEqual(offload.parse_probe("procs=unreadable\n" + wire), expected)
@@ -618,7 +618,6 @@ class OffloadCommandTests(unittest.TestCase):
             "probe_error": "",
             "probe_delay_s": 0.0,
             "probe_lines": [
-                "power=ac",
                 "free_gib=120",
                 "host=Mac",
                 "rc=0",
@@ -1083,7 +1082,6 @@ raise SystemExit(offload.main())
     def test_other_build_processes_do_not_decline_mac_tests(self) -> None:
         self.fixture["probe_lines"] = [
             "procs=1",
-            "power=ac",
             "free_gib=120",
             "host=Mac",
             "rc=0",
@@ -1115,25 +1113,19 @@ raise SystemExit(offload.main())
         self.assertEqual(remote_words[lint_index + 1 :], ["nextest"])
         self.assertIn("alternate-mac:.local/state/mac-test/mirror/hana/", self.events_for("rsync")[0]["args"])
 
-    def test_battery_and_low_disk_decline_after_probe(self) -> None:
-        for original, replacement, reason in (
-            ("power=ac", "power=battery", "battery"),
-            ("free_gib=120", "free_gib=59", "disk"),
-        ):
-            with self.subTest(reason=reason):
-                self.fixture["probe_lines"] = [
-                    replacement if line == original else line
-                    for line in [
-                        "power=ac",
-                        "free_gib=120",
-                        "host=Mac",
-                        "rc=0",
-                    ]
-                ]
-                self.sync_fixture()
-                self.assert_declined(self.command(), reason)
-                self.assertEqual(self.events_for("rsync"), [])
-                self.clear_events()
+    def test_low_disk_declines_after_probe(self) -> None:
+        self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
+        self.sync_fixture()
+        self.assert_declined(self.command(), "disk")
+        self.assertEqual(self.events_for("rsync"), [])
+
+    def test_battery_power_does_not_decline_mac_tests(self) -> None:
+        self.assertNotIn("pmset", offload.probe_script(offload.KnownRepository("hana")))
+        self.fixture["probe_lines"] = ["power=battery", "free_gib=120", "host=Mac", "rc=0"]
+        self.sync_fixture()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_wire("passed", "")
 
     def test_claim_exit_reasons_never_reach_external_commands(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
