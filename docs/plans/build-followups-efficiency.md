@@ -100,58 +100,39 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Gotchas:** a Codex thread resumed in a new rollout file must keep the retention its compactions decided (`3-fixed/codex/work/scan_rollouts.py`, checked by `check_parser.py`); restoring all start parts on resume overstated cost by 1,272,628 weighted tokens a week.
 
-### Phase 4 — What the turns do  · status: todo
+### Phase 4 — What the turns do  · status: done
 **Depends on:** Phase 2, Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** the work patterns that spend tokens without moving work forward, across all four productions, each with tokens per week and the sessions that show it.
-
-**Spec:**
-- Sample per production: the showrunner session and the two most expensive unit directors and two Codex workers of the window (Phase 2's sinks), read from transcripts and rollouts. Write a sampling manifest (session ids, why chosen); add targeted sessions for roles or patterns the sample misses (reviewers, repair loops that did not converge). Scale each pattern to the week from a population count or an explicit scaling denominator with its uncertainty; keep Phase 2's Mac-coverage caveat.
-- Measure, each as weighted tokens per week and share:
-  - turns with no new work: waits, status checks, polls, update ticks, idle re-wakes (`activity` dimension plus transcript reading);
-  - context growth: requests per session before compaction, context size at each request, compaction re-reads (re-measure the 10-13 and 10-16 `/unit:direct` and `/showrunner:produce` findings);
-  - large tool results kept in context (file reads, build and test logs, `git` output), and the same file read more than once in one context;
-  - messaging between sessions: showrunner ↔ unit relays, broadcasts (re-measure `/build_hold` 24.2M), reviewer round trips;
-  - review and repair loops: rounds per finding, rounds that did not converge;
-  - model and effort per role against the work it did (an Opus turn that only relays).
-- Follow up Phase 3's leads, reusing its measurements rather than counting again: tokenize one real start per family to explain the start residual (Claude 15–30%, Codex 21–28%); how long showrunner cross-session messages stay in context (5,780 tokens per carrying request); the large Codex review starts (47,083 tokens, 15,818-token Work Orders); the director skill listing (4,620 tokens at start, 500 carried) after compaction. Name what stays unexplained where no tokenizer or runtime material is available; keep in-window starts apart from the older director cohort.
-- Compare productions on `weighted_per_checkpoint`; explain the spread, keeping observed differences apart from demonstrated causes.
-- Output: one row per pattern with evidence (session ids, turn counts). Each family writes its own folder, `token-study/4-turns/claude/` and `token-study/4-turns/codex/`; the unit director merges them into `token-study/4-turns/report.md`.
+- `~/.local/state/nightly-review/token-study/4-turns/report.md` (outside git) measures, for the week 2026-10-12..19 on both machines, the turn patterns that spend tokens without moving work forward. Both halves count every request (Claude 167,627; Codex 217,204) and match Phase 2's totals exactly. Each half takes Phase 3's reserve first (Claude 879,937,859.98; Codex 250,573,210.01), so no token is counted twice.
+- Disjoint patterns: 2,499,756,881.23 weighted tokens/week (34.52%). Claude carries 678,423,479.84 and Codex 1,821,333,401.39. These are exposures with a lower bound of 0, not savings.
+- Largest: Codex wait-only turns 872,250,459.96 (12.05%; empty `write_stdin` 446M, sleep 270M, wait tool 126M). Then Codex repeated file reads 262,157,700.33 and the first request after compaction (Codex 268,446,616.37; Claude 99,646,720.72). Claude skill rereads are 184,706,534.08 and notification-only turns 63,541,446.27. Codex idle re-wakes come to 372,400.55, information-only peer messages to 128,065.83, and update ticks to 0.
+- Scripts and data: `4-turns/claude/work/` and `4-turns/codex/work/` (`scan_patterns.py`, `check_patterns.py` with timing and replay regression checks), plus a manifest per half.
 
 **Files:**
-- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/4-turns/` (outside git).
+- `docs/plans/build-followups-efficiency.md` — this record; the study lives outside git
 
-**Workers:** 2 writers (no test lane).
-- `impl` — Claude sessions (showrunners, directors, subagents).
-- `test` opens as `impl` — Codex workers and reviewers.
+**Binds later work:** Phase 5 picks experiments from these exposures and prices any saving from the billed tokens of the requests it removes. The start residual (Claude 15–30%, Codex 21–28%) stays unexplained, because no tokenizer is available on natedev.
 
-**Constraints from prior phases:** Phase 2's sinks pick the sample. Phase 3's fixed costs are carried-cost estimates (estimated sizes, average input price), not savings: price an avoided turn from that request's billed tokens in the ledger, and keep component-removal estimates apart. Any Codex rollout scan reuses `token-study/3-fixed/codex/work/scan_rollouts.py` retention: a compaction after a file's last selected request still applies to the resumed file, and replayed messages decide which original blocks survive; a new scanner carries the equivalent resume/compaction checks of `3-fixed/codex/work/check_parser.py` (the old reset overstated cost by 1,272,627.79 weighted tokens/week).
+**Gotchas:** `fix_pass` is 0 on every review pass, so review rounds cannot be counted from the store. A Codex tool output enters input on the request after the call that produced it. A resumed thread replays its outputs, so they are keyed by call id and content.
 
-**Acceptance gate:** each pattern names at least two sessions as evidence and its weekly tokens; the patterns do not count one token twice with Phase 3 (the report says how overlap was removed); Invariants checks as Phase 2.
-
-### Phase 5 — Throwaway experiments  · status: todo
+### Phase 5 — Throwaway experiments  · status: done
 **Depends on:** Phase 3, Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** a measured gain for each candidate from Phases 3 and 4 whose estimate rests on an assumption a test can settle.
-
-**Spec:**
-- Pick at most five candidates by expected weekly tokens × uncertainty. Each experiment states its question, setup, the number it reads and its own token cost.
-- Allowed setups: a scratch `CLAUDE_CONFIG_DIR` copy with one change, a headless `claude -p` run on a fixed prompt read from a real session's first request (start size with and without the change); `compaction_replay` under other limits; a replay script over stored turns; a Codex thread on a scratch worktree with a shortened start prompt. Never a real session, account move, or edit to live config.
-- Budget per Invariants (3M weighted tokens in total).
-- Output: one row per experiment: change, measured saving per request or per thread, scaled to weekly tokens with a range; `token-study/5-experiments/report.md`; setups kept under `token-study/experiments/`.
+- `~/.local/state/nightly-review/token-study/5-experiments/report.md` (outside git) holds five offline replay experiments over the week 2026-10-12..19, one row each with before/after numbers, a weekly projection with range, a same-work check, and its own cost. Halves: `5-experiments/claude/claude.md` and `5-experiments/codex/codex.md`; setups, results and verification files are in `token-study/experiments/<name>/`.
+- No live model run was made: observed savings are 0 and experiment model cost is 0. Every gain is a replay projection whose range starts at 0.
+- Projections (weighted tokens/week): Codex wait-run collapse 37,638,356.80 (0.51983%; 4.32% of the wait-only exposure). Claude one pause notice per context 1,488,675.10 (the strict rule removes 0). Codex identical-read reference 13,378.65 (0–246,797.33). Codex review compaction limits: none, because no modeled limit beats observed cost and the instruction-availability check fails at every boundary.
+- A request is removable from a wait run only when its tool output is timing-only and its assistant message carries no work. A message is a pause notice only when its whole body is the notice.
 
 **Files:**
-- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/5-experiments/` and `token-study/experiments/` (outside git).
+- `docs/plans/build-followups-efficiency.md` — this record; the study lives outside git
 
-**Workers:** 2 writers (no test lane), one experiment set each; the unit director assigns experiments by family, gives each experiment its own folder `token-study/experiments/<name>/` with its verification files, splits the 3M budget between the writers before launch, and owns the merged `5-experiments/report.md`.
+**Binds later work:** Ranked proposals label every gain "modeled", never "measured". The largest untested lever is the number of wait turns per fix/impl job (about 750M exposure).
 
-**Constraints from prior phases:** the candidates and their estimated gains come from "The fixed cost of every request" and "What the turns do".
-
-**Acceptance gate:** each experiment reports before/after numbers, its cost and a pass/fail against its estimate, plus a check that the work still comes out the same (the removed instructions, tool access or task result are still available where the work needs them: Artifact was called 5 times in Phase 3's week); observed savings are kept apart from replay projections (`compaction_replay` models cost, not equal work); total cost under budget; Invariants checks as Phase 2.
+**Ruled out:** dropping the director's `direct.md` re-Read after compaction (the copy in context holds only 260/707 and 236/710 of the required lines); raising Codex review compaction limits on cost-model evidence alone.
 
 ### Phase 6 — Ranked proposals  · status: todo
 **Depends on:** Phase 5
@@ -174,6 +155,6 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Workers:** nothing splits: the unit director writes the ranking and the ledger lines from the phase reports; no worker opens.
 
-**Constraints from prior phases:** all phase reports. Phase 2's weighted per checkpoint is a descriptive comparison only; a claim that a change does the same work needs matched tasks or unchanged acceptance outcomes.
+**Constraints from prior phases:** all phase reports. Phase 5 (`token-study/5-experiments/report.md`) measured no observed saving: every gain is a replay projection with range starting at 0, so label it "modeled", never "measured". Its projections (weighted/week): Codex wait-run collapse 37,638,356.80 (0.51983%, 4.32% of the 872M wait-only exposure); Claude one pause notice per context 1,488,675.10; Codex identical-read reference 13,378.65 (0–246,797.33); Codex review compaction limits none (no limit beats observed cost; instruction check fails). Do not propose dropping the director's `direct.md` re-Read after compaction (the copy in context lacks needed lines). The largest untested lever is wait turns per fix/impl job (about 750M exposure); propose it as not measurable with that reason. Phase 3–4 exposures are upper bounds, not gains. Phase 2's weighted per checkpoint is a descriptive comparison only; a claim that a change does the same work needs matched tasks or unchanged acceptance outcomes.
 
 **Acceptance gate:** every proposal has a gain with range and evidence; the open token findings listed in Key files each have a disposition; the For you row's efficiency count equals the net count after every ledger change (new lines up, superseded or gone lines down), checked against the rendered row; the showrunner has the table.

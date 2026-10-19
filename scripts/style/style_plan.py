@@ -31,8 +31,9 @@ import rules
 import style_ledger
 import style_footprint
 import style_proposals
-from issues import frontmatter
+from issues import Issue, frontmatter
 from production_units import Refusal, production_field
+from proposal_issue import ApprovedDecision, decision_answer
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 
 FAMILIES: tuple[rules.Family, ...] = ("modules", "names", "values", "types")
@@ -430,11 +431,18 @@ def gate(repo: Path, ticket_id: str) -> int:
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
                 return 0 if result.returncode == 0 else 1
             fields = frontmatter(origin.issue)
-            findings = style_proposals.issue_findings(ledger, origin.issue)
-            if (fields.get("status") != ["open"] or fields.get("unit") != [origin.unit] or not fields.get("plan")
-                    or set(fields.get("style_findings", [])) != set(origin.finding_ids)
+            decision = Issue(origin.issue, fields)
+            answer = decision_answer(decision)
+            if not origin.finding_ids:
+                raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
+            by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
+            if any(identity not in by_id for identity in origin.finding_ids):
+                raise style_ledger.LedgerError("proposal ticket findings changed")
+            findings = tuple(by_id[identity] for identity in origin.finding_ids)
+            if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
+                    or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
                     or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
-                           for finding in findings)):
+                           or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
                 raise style_ledger.LedgerError("proposal approval or filed findings changed")
             allowed = {finding.path for finding in findings}
             outside = changed_files(repo) - allowed
@@ -883,6 +891,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
+        "Hold a finding only when the cited rule's text requires the change.",
+        f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
         f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
         "Add `--input-scope file` only to a crate or module cell of a Rust source file.",
         "Use it only for a `clean` or `exception` verdict based on that file alone.",
@@ -933,7 +943,9 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                   and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
             if ticket["kind"] == "structure" and ticket["cells"] else ())
     if ticket["kind"] == "proposal":
-        held = style_proposals.issue_findings(ledger, Path(ticket["proposal"]))
+        identities = set(ticket["finding_ids"])
+        held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
+                     if finding.finding_id in identities)
     phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
@@ -974,11 +986,22 @@ class NoAvailableWork:
     pass
 
 
+def made_before_decisions(ticket_id: str) -> str:
+    """Why a proposal ticket with no finding ids cannot build, and what to do."""
+    return f"{ticket_id}: made before decisions; drop it with style_ledger.py ticket drop, then run migrate"
+
+
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
+    definitions: Mapping[str, rules.Rule],
 ) -> PhaseWritten | NoAvailableWork | WaitingForStructure:
-    queued = ledger.queued_tickets(unit)
+    queued: list[style_ledger.TicketRecord] = []
+    for ticket in ledger.queued_tickets(unit):
+        if ticket["kind"] == "proposal" and not ticket["finding_ids"]:
+            print("waiting " + made_before_decisions(ticket["id"]))
+        else:
+            queued.append(ticket)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
         if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
@@ -1000,28 +1023,69 @@ def _select_phase(
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
     except Refusal:
-        issue = style_proposals.NoApprovedProposal()
+        decisions: tuple[Issue, ...] = ()
     else:
         if not folder.is_absolute():
             folder = doc.parent.parent / folder
-        issue = style_proposals.approved_issue(folder, unit, ledger)
-    if not isinstance(issue, style_proposals.NoApprovedProposal):
-        findings = style_proposals.issue_findings(ledger, issue.path)
-        if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != issue.path for finding in findings):
-            raise style_ledger.LedgerError(f"{issue.path}: every approved finding must be filed")
-        if any(not crate_in_scope(scope, style_proposals.crate_for(ledger, finding.path)) for finding in findings):
+        decisions = style_proposals.approved_decisions(folder, unit)
+    directories = style_proposals.workspace_directories(ledger) if decisions else ()
+    tip = synced_tip(ledger)
+    decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
+    closed = False
+    for issue in decisions:
+        rule = issue.value("style_rule")
+        definition = definitions.get(rule)
+        if definition is None:
+            print(f"waiting {issue.path}: rule {rule} not in the catalog")
+            continue
+        findings = tuple(finding for finding in ledger.proposal_findings(issue.path)
+                         if isinstance(finding.state, style_ledger.Filed)
+                         and isinstance(finding.build_ticket, style_ledger.NoBuildTicket))
+        if not findings:
+            continue
+        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
+        by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
+        gone: dict[str, list[str]] = defaultdict(list)
+        for finding in findings:
+            if finding.path in present:
+                by_file[finding.path].append(finding)
+            else:
+                gone[finding.path].append(finding.finding_id)
+        # A finding in a removed file can never build, so it is waived and the decision can close.
+        for path, finding_ids in sorted(gone.items()):
+            words = f"{path} is not in synced commit {tip}"
+            _ = ledger.decline_findings(finding_ids, words)
+            print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
+        if gone and style_proposals.close_finished_decision(ledger, issue.path):
+            closed = True
+            continue
+        outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}
+        if outside:
             print(f"waiting {issue.path}: outside pilot scope")
-        elif any(busy.contains(finding.path) for finding in findings):
+        held = {path for path in by_file if path not in outside and busy.contains(path)}
+        if held:
             print(f"waiting {issue.path}: files busy")
-        else:
-            ticket_id = ledger.next_ticket_id(unit)
-            ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(ledger, findings[0].path),
-                              sorted({finding.path for finding in findings}), sorted({finding.rule for finding in findings}),
-                              proposal=str(issue.path))
-            ledger.ticket_assign(ticket_id, branch)
-            style_proposals.proposal_command("start", str(issue.path))
-            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-            return PhaseWritten(ticket_id)
+        available = tuple(sorted(set(by_file) - outside - held))
+        if not available:
+            continue
+        limits = (_STRUCTURE_LIMITS if any(style_proposals.proposal_kind(finding, definition) == "restructure"
+                                           for finding in findings) else _READ_LIMITS)
+        files = read_slices(repo, tip, available, limits)[0]
+        selected_findings = tuple(finding for path in files for finding in by_file[path])
+        ticket_id = ledger.next_ticket_id(unit)
+        ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(directories, files[0]),
+                          list(files), sorted({finding.rule for finding in selected_findings}),
+                          proposal=str(issue.path), finding_ids=tuple(finding.finding_id for finding in selected_findings))
+        ledger.ticket_assign(ticket_id, branch)
+        style_proposals.proposal_command("start", str(issue.path))
+        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        decision_phase = PhaseWritten(ticket_id)
+        break
+    # As complete does, one renumber follows every decision this refill closed.
+    if closed:
+        style_proposals.renumber()
+    if isinstance(decision_phase, PhaseWritten):
+        return decision_phase
     candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo),
                                    first_files=first_files)
     if not candidates:
@@ -1095,8 +1159,11 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
             return board
+        # One catalog read serves both refill passes.
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                 definitions)
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
@@ -1105,7 +1172,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         if isinstance(board, berth_board.BoardUnavailable):
             return board
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files)
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                 definitions)
         if isinstance(selected, PhaseWritten):
             ledger.clear_sync_wait(unit)
             return selected
