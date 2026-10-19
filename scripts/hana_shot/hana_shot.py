@@ -456,6 +456,7 @@ class LaunchState(TypedDict):
     log: str
     binary: str
     started: str
+    uncommitted_paths: NotRequired[list[str]]
 
 
 Vec3 = tuple[float, float, float]
@@ -1934,6 +1935,55 @@ def panic_lines(log: Path) -> list[str]:
     return found[:40]
 
 
+def uncommitted_build_paths(root: Path, executable: Path) -> list[str]:
+    """Dirty crate paths that predate the binary, or every dirty path before a build."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "crates/"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    dirty: dict[str, bool] = {}
+    records = iter(result.stdout.split(b"\0"))
+    for record in records:
+        if len(record) < 4:
+            continue
+        status = record[:2]
+        path = os.fsdecode(record[3:])
+        if path.startswith("crates/"):
+            dirty[path] = b"D" in status
+        if b"R" in status or b"C" in status:
+            # In -z format the destination comes first, followed by the original path.
+            original = os.fsdecode(next(records, b""))
+            if b"R" in status and original.startswith("crates/"):
+                dirty[original] = True
+    try:
+        if not executable.is_file():
+            return sorted(dirty)
+        built_ns = executable.stat().st_mtime_ns
+    except OSError:
+        return []
+    included: list[str] = []
+    for path, deleted in dirty.items():
+        if deleted:
+            included.append(path)
+            continue
+        try:
+            if (root / path).stat().st_mtime_ns <= built_ns:
+                included.append(path)
+        except OSError:
+            continue
+    return sorted(included)
+
+
+def build_paths_label(paths: list[str]) -> str:
+    label = ", ".join(paths[:10])
+    return label + (f", and {len(paths) - 10} more" if len(paths) > 10 else "")
+
+
 def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchState, subprocess.Popen[bytes]]:
     """Start a Hana build on a test port with scratch config and wait until the scene shows."""
     check_port(port)
@@ -1943,8 +1993,16 @@ def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchS
     if root is None or not (root / "crates" / "hana").is_dir():
         raise Refused("run inside a Hana worktree or pass --worktree")
     executable = Path(binary).expanduser().resolve() if binary else root / "target" / "debug" / "hana"
+    uncommitted_paths = uncommitted_build_paths(root, executable)
     if not executable.is_file():
-        raise Refused(f"no Hana binary at {executable}; build it first (cargo build -p hana)")
+        hint = f"; crates/ has uncommitted edits a build will include: {build_paths_label(uncommitted_paths)}" if uncommitted_paths else ""
+        raise Refused(f"no Hana binary at {executable}; build it first (cargo build -p hana){hint}")
+    if uncommitted_paths:
+        print(
+            f"hana_shot: warning: {executable} was built after uncommitted edits in crates/, "
+            + f"so this Hana runs that code: {build_paths_label(uncommitted_paths)}",
+            file=sys.stderr,
+        )
     scratch = Path(tempfile.mkdtemp(prefix=f"hana-shot-{port}-"))
     config = scratch / "config"
     config.mkdir()
@@ -1971,6 +2029,8 @@ def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchS
         "binary": str(executable),
         "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if uncommitted_paths:
+        state["uncommitted_paths"] = uncommitted_paths
     state_path = launch_state_path(port)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     _ = state_path.write_text(json.dumps(state))

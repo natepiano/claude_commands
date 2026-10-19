@@ -420,3 +420,38 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 - Hana's orbit pitch clamp keeps the camera from a vertical face axis, so that axis is refused.
 - The trunk Frame time panel faces local +z and is only yawed (2.4°), not tilted; the tilted case is proven by the unit tests, not live.
 - The fake BRP server returns only requested components, so a test reading the target's `GlobalTransform` must request it.
+
+### Phase 12 — `/hana_shot launch` says when its binary holds uncommitted code · status: done
+
+**Source:** showrunner finding from demo, 2026-10-19: the disk sweeper emptied `target/release`, a live run rebuilt `hana` from a worktree with another phase's uncommitted `crates/` edits, and nothing said so; the run failed at Show (1 run, about 12 min of natedev hold). The rebuild was the demo's own brief; the guard in its driver is demo-unit's. This phase adds the same guard to `hana_shot launch`.
+
+#### Work Order
+
+**Goal:** a shot never shows uncommitted Hana code without a warning that names the files.
+
+**Spec:**
+- New pure function `uncommitted_build_paths(root: Path, executable: Path) -> list[str]` in `scripts/hana_shot/hana_shot.py`. It runs `git -C <root> status --porcelain=v1 -z --untracked-files=all -- crates/` (one call, short timeout, stdin closed). It returns repository-relative paths, sorted:
+  - with the binary present: each modified, added or untracked file whose mtime is at or before the binary's mtime (the build saw it), plus each deleted path (its removal cannot be dated);
+  - with the binary missing: every dirty path under `crates/`.
+  - A git failure, a non-git root or a timeout returns `[]`: the check never blocks a launch.
+- `launch`: after it resolves `executable`, call it once.
+  - Binary present and the list non-empty: print one warning to stderr before the start, `hana_shot: warning: <binary> was built after uncommitted edits in crates/, so this Hana runs that code: <paths>`. Name at most 10 paths, then `and N more`. The launch continues.
+  - Binary missing: the existing refusal keeps its text and, when the list is non-empty, adds `; crates/ has uncommitted edits a build will include: <paths>` with the same 10-path cap.
+  - Add `uncommitted_paths: list[str]` to `LaunchState` only when non-empty (optional key).
+- No other command changes. No refusal is added.
+- `commands/hana_shot.md`: one sentence under launch about the warning.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py`
+- `scripts/hana_shot/test_hana_shot.py`
+- `commands/hana_shot.md`
+
+**Workers:** one — `impl` writes the code and its tests.
+
+**Tests:** in a temporary git repository with `crates/hana/` and a fake binary file, using `os.utime` for mtimes: clean tree gives `[]`; a modified file older than the binary is named; one newer than the binary is not; an untracked file older than the binary is named; a deleted file is named; a non-git directory gives `[]`; a missing binary names every dirty path. One `launch` test: missing binary plus a dirty tree refuses with the paths in the text. One `launch` test: present binary plus a dirty tree prints the warning (stop the launch before `Popen` with a stub, as the existing launch tests do, or patch `subprocess.Popen`). No live Hana: the natedev Hana ban holds.
+
+**Verification:**
+- `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'` from the worktree root.
+- `basedpyright scripts/hana_shot/hana_shot.py scripts/hana_shot/test_hana_shot.py` ends `0 errors, 0 warnings, 0 notes`.
+
+**Acceptance gate:** the tests above pass; the merge gate's tests pass on the checkpoint tree.
