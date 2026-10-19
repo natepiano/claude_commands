@@ -196,7 +196,7 @@ CODEX_ROLE = "workers"
 # A table cell with nothing to show: the folder has no login, or is not set up.
 NO_VALUE = "—"
 TABLE_HEADINGS = (
-    "Folder", "Label", "Login", "Role", "Weekly left", "Weekly resets",
+    "Folder", "Label", "Role", "Weekly left", "Weekly resets",
     "On credits", "Credits left", "Read",
 )
 # A stored reading older than this is read again before the table shows it.
@@ -467,7 +467,6 @@ class CommandLine(argparse.Namespace):
     detail: bool = False
     as_json: bool = False
     stored: bool = False
-    with_login: bool = False
     change: str = ""
 
 
@@ -3694,7 +3693,6 @@ class StatusRow:
     tool: Literal["claude", "codex"]
     folder: str
     login: str
-    login_cell: str
     roles: tuple[str, ...]
     weekly_left_percent: float | StatusUnavailable | WeeklyNotReadSince
     resets_at: datetime | StatusUnavailable
@@ -3710,7 +3708,6 @@ class StatusRow:
 class StatusReading:
     rows: tuple[StatusRow, ...]
     notes: tuple[str, ...]
-    group_line: str
     detail_lines: tuple[str, ...]
     zone: tzinfo
     checked_at: datetime
@@ -3725,7 +3722,6 @@ class StatusAccountDocument(TypedDict):
     credits: float | Literal["unlimited"] | None
     use_credits: bool
     read_at: str | None
-    login: NotRequired[str | None]
 
 
 class StatusDocument(TypedDict):
@@ -3759,8 +3755,6 @@ def _status_row(
     roles: tuple[str, ...],
 ) -> StatusRow:
     tool = "codex" if isinstance(status, CodexStatus) else "claude"
-    login_cell = ("not set up" if not status.is_set_up else "unavailable" if not status.account_is_safe_to_inspect
-                  else status.login or "not logged in")
     weekly: float | StatusUnavailable | WeeklyNotReadSince = StatusUnavailable()
     resets: datetime | StatusUnavailable = StatusUnavailable()
     credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
@@ -3785,7 +3779,7 @@ def _status_row(
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now)
-    return StatusRow(status.label, tool, status.folder, login, login_cell, roles,
+    return StatusRow(status.label, tool, status.folder, login, roles,
         weekly, resets, credits, on_credits,
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
         read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
@@ -3814,7 +3808,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tup
         read_cell = local.strftime(date_format)
     if failed:
         read_cell += "*"
-    return (row.folder, row.label, row.login_cell, role_cell,
+    return (row.folder, row.label, role_cell,
         weekly_cell,
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
@@ -3822,7 +3816,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tup
         read_cell)
 
 
-def render_status_json(reading: StatusReading, *, with_login: bool = False) -> str:
+def render_status_json(reading: StatusReading) -> str:
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
@@ -3831,8 +3825,6 @@ def render_status_json(reading: StatusReading, *, with_login: bool = False) -> s
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat())
-        if with_login:
-            item["login"] = row.login or None
         accounts.append(item)
     return json.dumps(StatusDocument(accounts=accounts, problems=list(reading.notes)))
 
@@ -3857,8 +3849,7 @@ def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
 
 
 def render_status_table(reading: StatusReading) -> str:
-    return "\n".join([reading.group_line,
-        _render_table([_status_row_cells(row, reading.zone, reading.checked_at) for row in reading.rows]), "",
+    return "\n".join([_render_table([_status_row_cells(row, reading.zone, reading.checked_at) for row in reading.rows]), "",
         *reading.notes, *reading.detail_lines])
 
 
@@ -3876,9 +3867,32 @@ def _render_table(rows: list[tuple[str, ...]]) -> str:
     ])
 
 
+def _account_state_notes(status: AccountStatus | CodexStatus) -> list[str]:
+    """Explain an empty row unless a folder or sign-in check already explains it."""
+    if status.is_set_up and status.account_is_safe_to_inspect and status.login:
+        return []
+    directory = status.home if isinstance(status, CodexStatus) else status.config_dir
+    identity = directory / ("auth.json" if isinstance(status, CodexStatus) else ".claude.json")
+    for problem in status.problems:
+        if any(problem.startswith(f"accounts: {path} {reason}")
+               for path in (str(directory), status.folder, str(identity))
+               for reason in ("is missing", "is not a directory", "is a link", "is not logged in")):
+            return []
+        if any(problem.startswith(f"accounts: could not {action} {path}:")
+               for action in ("read", "inspect") for path in (str(directory), str(identity))):
+            return []
+    if not status.is_set_up:
+        reason = "not set up: no folder holds this account"
+    elif not status.account_is_safe_to_inspect:
+        reason = "its folder could not be read"
+    else:
+        reason = "not logged in"
+    return [f"* {status.label}: {reason}"]
+
+
 def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
     """What is wrong or unusual in one folder. Nothing for a folder in order."""
-    notes = list(status.problems)
+    notes = [*status.problems, *_account_state_notes(status)]
     if detail and status.unclassified:
         notes.append(f"{status.folder}: unclassified: {', '.join(status.unclassified)}")
     mcp_differences = [
@@ -3920,6 +3934,8 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     group_directories: dict[ClaudeGroup, Path] = {}
     for group in CLAUDE_GROUPS:
         label = group_label(groups, group)
+        if isinstance(label, GroupNotConfigured):
+            role_problems.append(f"accounts: {group} has no account; run accounts.py move {group} <claudeN>")
         if isinstance(label, str) and _label_is(label, "claude"):
             try:
                 group_directories[group] = _claude_role_selection(group, label).dir
@@ -3944,6 +3960,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
           if _codex_home_login(accounts_home() / ".codex") else []),
         *(note for status in statuses for note in _status_notes(status, detail=detail)),
         *(problem for status in codex for problem in status.problems),
+        *(note for status in codex for note in _account_state_notes(status)),
         *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
           for status in codex if detail and status.unclassified),
     ]
@@ -3954,7 +3971,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*live_lines,
             *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), group_status_line(groups), detail_lines, zone, now)
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now)
 
 
 @role_map.role_map_command
@@ -4150,7 +4167,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = next_hold.add_argument("next_position", type=position)
     _ = next_hold.add_argument("hold_mode", type=next_moves.parse_hold_mode)
     _ = next_hold.add_argument("--expect", dest="next_expect", nargs=2, default=[], metavar=("PERCENT", "TARGET"))
-    parser.set_defaults(action="status", as_json=False, stored=False, with_login=False)
+    parser.set_defaults(action="status", as_json=False, stored=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
@@ -4161,7 +4178,6 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     _ = status.add_argument("--json", dest="as_json", action="store_true")
     _ = status.add_argument("--stored", action="store_true")
-    _ = status.add_argument("--with-login", action="store_true")
     _ = status.add_argument("--detail", action="store_true", default=argparse.SUPPRESS)
     placer = commands.add_parser("placement")
     _ = placer.add_argument("--explain", action="store_true")
@@ -4212,8 +4228,6 @@ def main(argv: list[str]) -> int:
     options = cast(CommandLine, parser.parse_args(argv))
     if options.as_json and options.detail:
         parser.error("--json and --detail cannot be used together")
-    if options.with_login and not options.as_json:
-        parser.error("--with-login requires --json")
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
@@ -4326,7 +4340,7 @@ def main(argv: list[str]) -> int:
         if options.action == "status":
             source: UsageSource = StoredUsageOnly() if options.stored else RefreshStaleUsage()
             if options.as_json:
-                print(render_status_json(read_status(source=source), with_login=options.with_login))
+                print(render_status_json(read_status(source=source)))
             else:
                 print(status_report(detail=options.detail, source=source))
             return 0

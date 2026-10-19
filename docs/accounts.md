@@ -20,10 +20,11 @@ The status line's first row shows this session's account label, after its role. 
 
 | Column | Shows |
 | --- | --- |
+| Folder | The account folder. |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
-| Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
 | Role | `units` and/or `showrunners` for the selected Claude groups; `workers` for the Codex home in use, `spare` for the other Codex homes. |
-| Weekly left | Percent of the weekly window left, with its reset time. A dash when the account has no weekly window. |
+| Weekly left | Percent of the weekly window left. A dash when the account has no weekly window. |
+| Weekly resets | When the weekly window resets. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
@@ -34,7 +35,11 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 
 `status --json` prints `{"accounts": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the lines below the normal table. Each account has `label`, `tool` (`claude` or `codex`), `roles`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
 
-The default JSON has no login or folder fields. `status --json --with-login` adds `login`, the table's signed-in login or null, without another read. `--with-login` requires `--json`; `--json` cannot be combined with `--detail`.
+The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
+
+Lines below the table also say when an account is not set up, is not logged in, or has a folder that could not be read. These notes use the account label, with no login address. An existing folder or sign-in check gives the reason instead when it already explains the row. The JSON `problems` list has the same lines.
+
+Each Claude group with no account has a note: `accounts: units has no account; run accounts.py move units <claudeN>` (or `showrunners`). A configured group has no such note; its account has the group in the Role column. The JSON `problems` list has the same notes.
 
 `status --stored`, with or without `--json`, skips every live usage read, subprocess and network call. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
 
