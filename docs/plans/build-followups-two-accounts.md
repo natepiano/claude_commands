@@ -2145,48 +2145,25 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 79 — One usage read at a time, in clear words  · status: done
 
-**Depends on:** Phase 78
+#### As-built
 
-#### Work Order
-
-**Goal:** At 08:11 EDT 2026-10-19 the accounts table showed "claude1: usage read refused (rate limit); the next read is in 2 minutes" for claude1, claude2 and claude3. The user read it as a quota refusal. It was not: the usage service refused our reads. The cause is our own readers. During the units move, the paused sessions ran `shutdown.py status` 8 times and `shutdown.py ready --where` about 20 times. Each run started the full agent-sessions snapshot, which reads every Claude login live. That gave 6 overlapping all-account passes (18 reads in 24 s), and then every login got HTTP 429. The timer journal shows more 429s at 08:12:45 and 08:14:07. The showrunner approved this fix (2026-10-19 08:34 EDT): (1) a failed read is told in clear words, with no "refused"; (2) the readers share one read: a login that another process read a short time ago is not read again.
-
-**Constraints from prior phases:**
-- `agent_accounts.claude_live` (~704) is the only caller of `https://api.anthropic.com/api/oauth/usage`. It reads one login per call. `live_reports` (~1078) calls it once per Claude directory, in threads (`asyncio.to_thread`), so the hold must work across threads and across processes.
-- The 429/401/error mapping is at ~755–760 (`UsageReadOutcome`, ~305). Phase 75 added the outcome to the store (`usage_store.merge`, `read_outcome`) and the footnotes to `accounts._read_failure_note` (~3838). The JSON problems list (`render_status_json`) carries the same note strings.
-- `usage_store.load`/`merge`/`write` take no lock today. `save` is called by `agent_notes.update_alert_pass` (~372). `whoami.main` reads live and does not save.
-- `usage_store` imports `agent_accounts`. A call from `claude_live` into `usage_store` must not make an import cycle at module load.
-- The agent-sessions timer runs the snapshot (and so a full read pass) every 2 minutes. The hold for a good read must be shorter than that, or the timer holds its own reads.
-- `five_hour.watch` and `agent_notes` treat a report without a 5-hour window or quotas as "no new reading" today (a 429 report). A held report must have the same effect, and it is not a failure.
-- Out of scope: `scripts/shutdown/inventory.py`. Its snapshot run also starts the agent-notes refresh, but that refresh is in `/etc/nixos/modules/linux/agent-sessions-snapshot.py`, outside this repo, and this phase's hold makes those extra passes read nothing. The showrunner routes that change.
-
-**Spec:**
-1. **One claim per read.** Before `urlopen`, after the login is known, `claude_live` takes an exclusive `fcntl.flock` on `~/.local/state/agent-notes/usage.lock` (beside `usage.json`). Under the lock it reads the login's last attempt. If the last attempt is less than 90 seconds old, or less than 10 minutes old and its outcome was 429, it does not read. Otherwise it records `attempted_at` = now for the login, releases the lock, and reads. The lock is never held during the HTTP call.
-2. **Every outcome is kept.** After the read, `claude_live` records the attempt's outcome (ok, 429, 401, error) for the login under the same lock. This holds for callers that do not save (whoami). A stale-token skip makes no HTTP call and records no attempt.
-3. **A held read.** A read the hold stops returns a report with a new outcome, `UsageReadOutcome.HELD`, and no quotas. It sets no `quota_problem` and adds no agent-notes message. `usage_store.merge` changes nothing for a held login: its readings, `read_outcome` and attempt fields stay as they are. The accounts table and the status line show the stored reading as they do now.
-4. **The store under the lock.** `usage_store.save` does its load, merge and write under the same lock, so two passes do not lose each other's readings. The new fields go in `StoredUsage` and survive `merge` of a later report.
-5. **Clear words.** `_read_failure_note` gives, with times in the table's zone:
-   - 429: `* claude1: the usage service is busy, so this shows the reading from 08:09; next try after 08:21` (the next try is the 429 attempt time plus 10 minutes). With no stored reading: `* claude1: the usage service is busy and no reading is stored yet; next try after 08:21`.
-   - error: `* claude1: the usage read failed, so this shows the reading from 08:09; next try in 2 min`. With no stored reading: `* claude1: the usage read failed and no reading is stored yet; next try in 2 min`.
-   - 401: `* claude1: the usage service did not accept this login; start a session on it to check it`.
-   - stale token: unchanged.
-   - An old store with no attempt time: the 429 line ends `; next try in 2 min`.
-   No note uses the word "refused" for a usage read. The JSON problems list carries the same strings.
+- `agent_accounts.claude_live` claims each read with `usage_store.claim_read` under an `fcntl.flock` on `~/.local/state/agent-notes/usage.lock`. A login attempted less than 90 s ago, or less than 10 minutes after a 429, is not read: the report has outcome `HELD`, no quotas and no `quota_problem`. `merge`, `agent_notes.apply` and the accounts table change nothing for it. The lock is never held during the HTTP call.
+- `usage_store.finish_read` keeps the attempt outcome (`attempted_at`, `attempt_outcome`) and the reading for every claimed read, also for callers that do not save (whoami). A claimed report carries its `UsageReadClaim`; a claim older than the stored `attempted_at` changes nothing in `merge`.
+- `save`, `claim_read`, `finish_read` and `quota_alert._save_codex_readings` do their load, merge and write under the lock. `write` is a plain replace and takes no lock.
+- A store error in the claim reads without a hold; one in the finish keeps the live report. Each prints one stderr line.
+- `accounts._read_failure_note` says "the usage service is busy, so this shows the reading from HH:MM; next try after HH:MM" (429 attempt time plus 10 minutes), "the usage read failed, so this shows the reading from HH:MM; next try in 2 min", and "the usage service did not accept this login; start a session on it to check it". With no stored reading the first two say "... and no reading is stored yet". The JSON problems list carries the same lines.
+- Cause (2026-10-19 08:11 EDT): during the units move, about 28 `shutdown.py status` and `ready --where` runs each started the full snapshot, which read every Claude login. Six overlapping passes made 18 reads in 24 s, and every login got 429.
 
 **Files:**
-- `scripts/whoami/agent_accounts.py` — the claim, the attempt record and `HELD`.
-- `scripts/whoami/usage_store.py` — the lock, the attempt fields, `merge` for `HELD`, `save` under the lock.
-- `scripts/accounts/accounts.py` — the note wording.
-- `scripts/whoami/agent_notes.py` — only if a held report needs a change there.
-- `scripts/whoami/quota_alert.py` — the Codex save holds the store lock (added in review).
-- `scripts/whoami/test_agent_accounts.py`, `scripts/whoami/test_usage_store.py`, `scripts/accounts/test_accounts.py`, `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_quota_alert.py` — tests.
+- `scripts/whoami/agent_accounts.py` — `HELD`, the claim types and the claim and finish around the HTTP call.
+- `scripts/whoami/usage_store.py` — the lock, the attempt fields, `claim_read`, `finish_read`, `merge` for held and stale claims, `save` under the lock.
+- `scripts/whoami/quota_alert.py` — the Codex save under the lock.
+- `scripts/whoami/agent_notes.py` — a held report writes nothing.
+- `scripts/accounts/accounts.py` — the footnote words and the attempt time on each row.
+- Tests: `scripts/whoami/test_agent_accounts.py`, `test_usage_store.py`, `test_quota_alert.py`, `test_agent_notes.py`, `scripts/accounts/test_accounts.py`.
 
-**Workers:** 1 writer. impl owns all files.
-
-**Verification:** `scripts.accounts.test_accounts scripts.whoami.test_usage_store scripts.whoami.test_agent_accounts scripts.whoami.test_agent_notes scripts.whoami.test_five_hour scripts.whoami.test_quota_alert` with a scratch HOME. Tests never call the real usage service: patch `urlopen`. basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **One read:** two `claude_live` calls for one login in a row (threads, and a second process or a second open of the lock) make one HTTP call; the second returns `HELD`. A call 91 s later reads. After a 429, a call 9 minutes later is held and one 10 minutes later reads.
-- **Held changes nothing:** `merge`/`save` of a held report leaves the stored entry byte-identical; `agent_notes` adds no message for it.
-- **Words:** each Spec 5 line, in the table notes and the JSON problems list; no note contains "refused".
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- The 90 s hold must stay shorter than the 2-minute agent-sessions timer, or the timer holds its own reads.
+- `write` needs the caller to hold `read_lock`. A second flock on the lock file in one thread blocks, so never take the lock inside a path that already holds it.
+- The extra passes still run the snapshot's notes refresh (in `/etc/nixos/modules/linux/agent-sessions-snapshot.py`, outside this repo); they now read nothing. The showrunner routes the change that skips it.
+- The one pool review found one blocker (a late save of an older good read cleared a newer 429) and one minor (a store error cost the read). Both are fixed with tests.
