@@ -43,6 +43,8 @@ MIN_CALIBRATION_SAMPLES = 5
 # waited, and an overnight wait counted in full turned a phase with an hour left into one
 # finishing the next evening (herdr-trial, 2026-10-15).
 IDLE_GRACE_SECONDS = 30 * 60
+# A worker finished this long ago drops out of the report's worker lines.
+FINISHED_WORKER_SECONDS = 10 * 60
 # How far apart two entered percentages may sit and still calibrate each other.
 # The entered percent is itself off by about plan_history.DEFAULT_PERCENT_SPREAD, so history
 # ten points either side describes the same moment of a phase as well as history
@@ -1356,6 +1358,14 @@ def _start_phase(args: argparse.Namespace) -> None:
     # leaves every open phase open: each closes only by its own finish-phase.
     if _open_phase_named(state, phase_id) is not None:
         return
+    # The phase count reads the plan's headings, so a phase the plan lacks makes
+    # every later report disagree with its own phase number.
+    missing_from = _phase_missing_from_plan(state, phase_id)
+    if missing_from is not None:
+        raise SystemExit(
+            f"Phase {phase_id} has no heading in {missing_from}. Add "
+            + f"`### Phase {phase_id} — <title>  · status: todo` under ## Phases, then start it."
+        )
     started_at = _optional_epoch(args, "started_at", "--started-at", now)
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
@@ -3557,10 +3567,15 @@ def _delegate_note(
         for window in model_windows
         if window["slot"] and (worker_cells or window["status"] in LIVE_WINDOW_STATUSES)
     }
+    ended = {window["slot"]: window["started_at"] + window["elapsed"] for window in model_windows if window["slot"]}
     lines: list[str] = []
     for position, slot in enumerate(slots, start=1):
         agent, said = live.get(slot), activity.get(slot)
         if agent is None and said is None:
+            continue
+        # A worker whose stretch ended long ago is not news, and its row crowds out the live ones.
+        if (worker_cells and worker_cells[position - 1].endswith(" done")
+                and now - max(ended.get(slot, 0.0), said["at"] if said else 0.0) > FINISHED_WORKER_SECONDS):
             continue
         if said is None:
             # Launched and yet to narrate. Naming that is the useful answer: a
@@ -3897,8 +3912,48 @@ def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     if plan_doc:
         candidate = Path(plan_doc).expanduser()
         if candidate.is_absolute():
-            return _count_plan_phases(candidate)
+            return _with_unlisted_phase(_count_plan_phases(candidate), state, candidate.resolve())
     return {"available": False, "reason": "no plan doc"}
+
+
+def _run_plan_path(state: dict[str, object]) -> Path | None:
+    """The plan this run's phase ids come from, which the project plan may not be."""
+    plan_doc = _string(state.get("plan_doc"))
+    if not plan_doc:
+        return None
+    return plan_history.resolve_plan_path(Path(_string(state.get("working_dir")) or str(Path.cwd())), plan_doc)
+
+
+def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], counted: Path) -> dict[str, object]:
+    """The counts with the run's phase added when the plan has no heading for it.
+
+    Start-phase refuses such a phase, so this only covers a phase opened before that
+    rule. Without it a report reads "19 of 31 done" beside "Phase 32".
+    """
+    phase = _object_dict(state.get("phase"))
+    phase_id = _string(phase.get("id")) if phase is not None else ""
+    order = counts.get("order")
+    if (phase is None or phase_id in ("", "ad hoc") or not isinstance(order, list)
+            or phase_id in order or _run_plan_path(state) != counted):
+        return counts
+    finished = _string(phase.get("status")) == "completed"
+    done, todo = _integer(counts.get("done")), _integer(counts.get("todo"))
+    return {
+        **counts,
+        "done": done + int(finished),
+        "todo": todo + int(not finished),
+        "total": done + todo + 1,
+        "order": [*order, phase_id],
+    }
+
+
+def _phase_missing_from_plan(state: dict[str, object], phase_id: str) -> Path | None:
+    """The run's plan when it lists phases and none of them is `phase_id`."""
+    plan = _run_plan_path(state)
+    if plan is None or phase_id == "ad hoc":
+        return None
+    order = _count_plan_phases(plan).get("order")
+    return plan if isinstance(order, list) and phase_id not in order else None
 
 
 def _reported_window(

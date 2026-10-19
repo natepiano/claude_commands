@@ -109,7 +109,8 @@ Everything below is the contract.
    closed while the round continues; `done` means its stretch ended. With
    `tables`, the round table adds timing and history for the last three stages;
    use `timeline` for stages named by `Earlier:`.
-7. Write the worker table yourself: one row per worker the recorder listed, columns
+7. Write the worker table yourself: one row per worker the recorder listed (it leaves
+   out a worker that finished over 10 minutes ago), columns
    `#`, `Role`, `Model`, `Effort`, `Details`. Take the number and the slot from
    the worker's label, the model and effort from the recorder when it names them
    and `-` when it does not. `Details` is a sentence of yours, not the worker's,
@@ -155,35 +156,43 @@ Everything below is the contract.
    | 1 | impl | gpt-5.6-sol | xhigh | starting its verification build |
    | 2 | test | gpt-5.6-sol | xhigh | fixing six compile errors its new identity tests turned up |
    ```
-8. Add two or three ordinary-English sentences under <UserFacingText/>: open
-   with what this phase gives the person using the tool, then its movement and
-   what remains. One topic per sentence, no more than two clauses; when a topic
-   holds more than two items, give the count and what they have in common.
-   When the opening is not the default, or a worker is doing something other than
-   its name, say so in those words: "the test worker is writing the catalyst
-   side".
+8. Add three or four short sentences in Simplified Technical English, under
+   <UserFacingText/>. A reader who has seen nothing else must follow them. Use
+   this order:
+   1. What this phase gives the person who uses the tool.
+   2. Where the phase is, and what is left.
+   3. When it lands.
+
+   One topic per sentence, no more than two clauses. When a topic holds more
+   than two items, give the count and what they have in common. When a worker
+   is doing something other than its name, say so: "the test worker is writing
+   the catalyst side".
+
+   Never write:
+   - test-case or scene names (`scale-6`, `S6-S12`), finding ids, lane or gate names;
+   - the team's own terms: fail-first runs, a lint try, red test lines, closure,
+     passes, tokens;
+   - an account of a missed time ("my 15:30 time has passed"). Give the new
+     time only;
+   - logs, filenames, or work measured in lines, insertions or file counts.
 
    Not this:
 
    ```text
-   The repair pass has landed its production changes: an edge whose successor
-   has already ended now reports as ended rather than still waiting on its
-   predecessor, ancestry questions are narrowed to the reservations that
-   actually have something ordered after them, and an unrelated missing commit
-   no longer poisons a whole batch of ancestry answers.
+   The tests passed on the Mac at 15:22: 416 of 416, with the long-end case,
+   the normal scale-6 case, and the scale-4.2 case, which now counts within two
+   frames. The table's three red test lines are the planned fail-first runs and
+   a lint try that did not start. My 15:30 time has passed, and I commit and
+   push as soon as lint passes.
    ```
 
    This:
 
    ```text
-   This phase lets one worktree's work be ordered behind another's — start here
-   only once that branch is done. The repair pass fixed four cases where the
-   tool gave the wrong answer about whether the waiting side was still blocked.
-   Tests for that ordering come next, then verification.
+   This phase makes a cable count as plugged in as soon as its plug reaches the
+   jack, at every cable length and size. All tests pass. The last check is lint,
+   which waits for the build machine. It lands about 16:45.
    ```
-
-   Do not paste logs or filenames, or quantify work in lines, insertions, or
-   file counts.
 
 **Questions about work already finished** — how many fix passes there have been,
 how long a review took, what an earlier phase ran — are answered by
