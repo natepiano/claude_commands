@@ -562,6 +562,18 @@ class LegacyIssue:
     owned: tuple[style_ledger.HeldFinding, ...]
 
 
+def off_rule_issues(ledger: style_ledger.Ledger, proposals: Path) -> tuple[Path, ...]:
+    """The open issues that a style unit filed by hand through `/issue`, by name. Migrate never writes them."""
+    proposer = style_slug(ledger.repo)
+    # A unit files as `<unit> (<style slug>)`; the filing code files as the slug alone.
+    filers = frozenset((proposer, f"({proposer})"))
+    named = frozenset(ledger.proposal_paths())
+    # An issue that lists findings is an old style issue, and migrate takes it.
+    return tuple(issue.path for issue in open_issues(proposals, "issue")
+                 if issue.value("proposed_by").rsplit(" ", 1)[-1] in filers and not issue.path.name.startswith("style ")
+                 and not issue.fields.get("style_findings") and issue.path not in named)
+
+
 def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_run: bool = False) -> None:
     all_findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
     open_tickets = tuple(ticket for ticket in ledger.proposal_tickets()
@@ -652,7 +664,10 @@ def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_ru
         closed += 1
         if not dry_run:
             proposal_command("close", str(source.issue.path), "--reason", reason)
-    print(f"totals: create {created}, move {moved_count}, close {closed}")
+    off_rule = off_rule_issues(ledger, proposals)
+    for issue in off_rule:
+        print(f"skipped: off-rule {issue}")
+    print(f"totals: create {created}, move {moved_count}, close {closed}, off-rule {len(off_rule)}")
 
 
 def main(argv: list[str]) -> int:

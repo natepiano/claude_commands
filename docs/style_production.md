@@ -437,6 +437,8 @@ its decision: a declined decision waives it with the stored words, and a
 decision closed as built opens again with its approval. A decision closed with
 nothing left to build also opens again with its approval for a later finding. Migration leaves an
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
+Migration does not change an off-rule issue that a style unit filed through
+`/issue`; it lists the issue as `skipped: off-rule <path>` and counts it in its totals.
 
 ## Lifetime
 
