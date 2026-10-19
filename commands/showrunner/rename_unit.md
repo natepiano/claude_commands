@@ -7,10 +7,10 @@ argument-hint: "<old> <new>"
 
 Run from the showrunner session, at any time, also in the middle of a phase. `<old>` is the unit's id or its stem.
 `<new>` can be an id or a stem, and it becomes `<stem>-unit`. The script lives at
-`~/.claude/scripts/production/rename_unit.py`; `<scratch>` is your scratchpad:
+`~/.claude/scripts/production/rename_unit.py`. It finds the showrunner state in `STATE_DIR`:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/rename_unit.py" <plan|apply|verify> <slug> <old> <new> --scratch <scratch>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/rename_unit.py" <plan|apply|verify> <slug> <old> <new>
 ```
 
 1. Run `plan`. It writes nothing, and it either refuses or prints every step with its old and new values.

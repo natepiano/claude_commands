@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plan, apply and verify one unit's rename, journaled so a refusal resumes where it stopped.
 
-Usage: rename_unit.py plan|apply|verify <slug> <old> <new> --scratch <showrunner scratchpad>
+Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunner state directory>]
 
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
 `<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, stops
@@ -835,10 +835,12 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("slug")
     _ = parser.add_argument("old")
     _ = parser.add_argument("new")
-    _ = parser.add_argument("--scratch", required=True, help="the showrunner's scratchpad directory")
+    _ = parser.add_argument("--scratch", help="the showrunner state directory; the production's own by default")
     args = parser.parse_args(argv)
     action, slug = cast(str, args.action), cast(str, args.slug)
-    old, new, scratch = cast(str, args.old), cast(str, args.new), Path(cast(str, args.scratch))
+    given = cast(str | None, args.scratch)
+    old, new = cast(str, args.old), cast(str, args.new)
+    scratch = Path(given) if given else showrunners.session_state_dir(slug)
     try:
         rename = (plan(slug, old, new, scratch) if action == "plan" else apply(slug, old, new, scratch)
                   if action == "apply" else verify(slug, old, new))

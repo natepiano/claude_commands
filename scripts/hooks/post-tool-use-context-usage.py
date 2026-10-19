@@ -54,7 +54,7 @@ from context_usage import (
 DEBUG_LOG = Path("/tmp/claude/context-hook-debug.jsonl")
 
 
-def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | None:
+def build_context(tokens: int, window: int | None, is_subagent: bool, showrunner: Path | None = None) -> str | None:
     """The line handed to the agent, or None when there is nothing to say."""
     mode = os.environ.get("CLAUDE_CONTEXT_HOOK_MODE", "dynamic")
     label = "Your context usage" if is_subagent else "Context usage"
@@ -86,13 +86,24 @@ def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | N
             "what you completed, what you did not get to, and the exact next "
             "step someone else would take."
         )
-    return (
+    opening = (
         f"{label}: {tokens:,} / {trigger:,} tokens ({percent}%) — "
         f"auto-compaction fires at {trigger:,}, not at the {window:,} window "
         f"({OUTPUT_RESERVE_TOKENS + PRECOMPUTE_RESERVE_TOKENS:,} is held back). "
         "This is not a reason to stop or to end your turn: compaction only "
         "happens on the next request, so ending the turn here is what prevents "
         "it. Keep working straight through it. "
+    )
+    if showrunner is not None:
+        # A showrunner's state lives in its state file and log, which the
+        # PreCompact and SessionStart hooks (showrunner-compaction.py) carry over.
+        return opening + (
+            "You are a showrunner: write no handoff doc. Put each action you owe, "
+            "with what sets it off, in the `next` list of your showrunner state "
+            f"file ({showrunner}). Before the compaction, a hook writes the STATE "
+            "block from it, and after it, a hook tells you to resume from it."
+        )
+    return opening + (
         "If you are partway through a task, write a handoff doc first: what you "
         "were doing, what is done, what is left, the files and decisions "
         "involved, and the exact next step. Save it to a durable file in the "
@@ -108,6 +119,17 @@ def build_context(tokens: int, window: int | None, is_subagent: bool) -> str | N
         "wake-up is a request like any other, so compaction fires there without "
         "you holding the turn open for it."
     )
+
+
+def showrunner_state(session_id: str) -> Path | None:
+    """The state file of the showrunner whose update timer names this session, else None."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+    import showrunners
+
+    doc = showrunners.production_of(session_id) if session_id else None
+    if doc is None:
+        return None
+    return showrunners.session_state_dir(showrunners.production_slug(str(doc))) / "showrunner_state.json"
 
 
 def log_debug(
@@ -153,7 +175,11 @@ def main() -> None:
     if reading is None:
         return
     tokens = estimate_tokens(reading, response)
-    context = build_context(tokens, window, bool(payload.get("agent_id")))
+    is_subagent = bool(payload.get("agent_id"))
+    # The timer lookup runs only past the handoff point, never on an ordinary tool call.
+    showrunner = (showrunner_state(payload.get("session_id", ""))
+                  if window is not None and not is_subagent and tokens >= handoff_threshold(window) else None)
+    context = build_context(tokens, window, is_subagent, showrunner)
     if context is None:
         return
     print(

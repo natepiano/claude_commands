@@ -9,7 +9,7 @@ In film, dailies are what the executive producer watches each day to see how
 the shoot is going. Here the showrunner reports the production to the executive
 producer: the user. Run it in the showrunner session during `/showrunner:produce`,
 whose state (`PRODUCTION_DOC`, `LOG`, `ZONE`, `UNITS`, `CHECKOUT`,
-`MERGE_BRANCH`, `NOTIFIER`, `UPDATES`) it uses.
+`MERGE_BRANCH`, `NOTIFIER`, `UPDATES`, `STATE_DIR`) it uses.
 
 **Usage:** `/showrunner:dailies [gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]`. With
 no length, `gantt`. With any other argument, name the choices and stop.
@@ -41,7 +41,7 @@ schedule runs: the builder touches no clock, the report names no next run,
 and step 2 below does nothing. Two steps do that:
 
 1. **Check every unit.** Save the status script's complete output before Gather:
-   `zsh ~/.claude/scripts/production/unit_status.sh <scratchpad>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
+   `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <ZONE> --production PRODUCTION_DOC > <scratchpad>/unit_status.txt`.
    The input builder reads that file and prints `flags first:` for SESSION GONE,
    CLAUDE NOT RUNNING, FORM WAITING, a usage limit, and a DECISION. Put these
    first in the report.
@@ -123,11 +123,11 @@ carries the topic with that reason.
 ```sh
 python3 ~/.claude/scripts/production/dailies_input.py \
   --production <PRODUCTION_DOC> --status <scratchpad>/unit_status.txt \
-  --judgment <scratchpad>/dailies_judgment.json --state-dir <scratchpad>/dailies_input_state \
+  --judgment <STATE_DIR>/dailies_judgment.json --state-dir <STATE_DIR>/dailies_input_state \
   --out <scratchpad>/dailies_input.json --length <gantt|simple|page|elaborate> \
-  --render-state <scratchpad>/dailies_state.json [--user-run] [--expand <child|all>]
+  --render-state <STATE_DIR>/dailies_state.json [--user-run] [--expand <child|all>]
 python3 ~/.claude/scripts/production/dailies_render.py <scratchpad>/dailies_input.json \
-  --state <scratchpad>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
+  --state <STATE_DIR>/dailies_state.json --log <LOG> --outstanding <OUTSTANDING>
 ```
 
 - The builder runs the notifier script beside it, the one `NOTIFIER` names;

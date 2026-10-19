@@ -146,9 +146,17 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
     return state
 
 
-def load(production: Production, lines: list[str], resume: bool) -> None:
+def move_session_state(slug: str, scratch: Path) -> None:
+    copied = showrunners.copy_session_state(slug, scratch)
+    report("state-dir", "ok", f"{showrunners.session_state_dir(slug)}"
+           + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
+
+
+def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
+    if scratch is not None:
+        move_session_state(production.slug, scratch)
     if not resume and not isinstance(doc_status(lines), ProductionRunning):
         return
     if production.log.exists():
@@ -537,6 +545,7 @@ def main() -> int:
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
+    _ = parser.add_argument("--scratch", type=Path, help="load: the scratchpad whose state moves to the state directory")
     # Accepted and unused: a showrunner started before its name was looked up still passes it.
     _ = parser.add_argument("--session")
     _ = parser.add_argument("--ci-green")
@@ -555,7 +564,7 @@ def main() -> int:
         production = read_production(cast(Path, args.production))
         lines = doc_lines(production)
         if action == "load":
-            load(production, lines, cast(bool, args.resume))
+            load(production, lines, cast(bool, args.resume), cast(Path | None, args.scratch))
         elif action == "open":
             open_production(production, lines)
         elif action == "promote-main":
