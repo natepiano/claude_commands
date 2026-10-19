@@ -218,7 +218,16 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("'chore(demo): rename unit alpha-unit to gamma-unit'", result.stdout)
 
     def test_apply_moves_every_place(self) -> None:
+        records = self.home / ".local/state/herdr-panes"
+        for session, panes in (("agents", {"w1:p2": "alpha-unit", "w1:p3": "beta-unit"}),
+                               ("work", {"w2:p1": "alpha-unit"})):
+            self.write(records / f"{session}.json", json.dumps(
+                {pane: {"environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()}))
         self.assert_ok(self.rename("apply", "alpha-unit", "gamma-unit"))
+        # The old pane's entry would resume the old name; the relaunched unit records its new pane.
+        self.assertEqual(json.loads((records / "agents.json").read_text()),
+                         {"w1:p3": {"environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
+        self.assertEqual(json.loads((records / "work.json").read_text()), {})
         new = self.rust / "claude-demo-gamma"
         self.assertFalse((self.rust / "claude-demo-alpha").exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=new), "demo-gamma")

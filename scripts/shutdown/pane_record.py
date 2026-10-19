@@ -110,6 +110,20 @@ def end(session: str, pane_id: str, session_id: str) -> None:
         _save(session, entries)
 
 
+def forget_unit(unit_id: str) -> list[str]:
+    """Drop every entry of a unit's director, in each session's record; a rename relaunches it in a new pane."""
+    dropped: list[str] = []
+    for path in sorted(RECORD_DIR.glob("*.json")):
+        with _locked(path.stem):
+            entries = read(path.stem)
+            kept = {pane: entry for pane, entry in entries.items()
+                    if entry["environment"].get("SHOWRUNNER_UNIT_ID") != unit_id}
+            if len(kept) != len(entries):
+                _save(path.stem, kept)
+                dropped.extend(f"{path.stem}:{pane}" for pane in entries if pane not in kept)
+    return dropped
+
+
 def _parent(pid: int) -> int:
     stat = (PROC / str(pid) / "stat").read_text()
     return int(stat.rsplit(")", 1)[1].split()[1])

@@ -16,9 +16,9 @@ from typing import NamedTuple
 # Under the state root: logs, reports and archives that keep a unit's old names as history.
 STATE_HISTORY = (
     "shutdown/", "nightly-review/", "message/log.jsonl", "message/relay/", "message/keys.json",
-    "message/queue/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/", "plan-delegate/runs/",
-    "plan-delegate/review_turns/", "model-study/", "claude-model-study/", "screenshot-analysis/",
-    "plan-backlog/", "usage-model/",
+    "message/queue/", "message/postmaster/replies/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/",
+    "plan-delegate/runs/", "plan-delegate/review_turns/", "model-study/", "claude-model-study/",
+    "screenshot-analysis/", "plan-backlog/", "usage-model/",
     # Rebuilt from its sources on the next board refresh.
     "unit-board/",
 )
