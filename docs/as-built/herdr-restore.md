@@ -30,13 +30,12 @@ The settings.json entry, one more SessionStart item:
 
 ## Pane restore (checkpoint 2)
 
-- Each entry also holds `flags_read` (false when the hook found no Claude argv, as on the Mac
-  without `/proc`) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
+- Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
   SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
   crash does not. An end only marks the entry of the same conversation.
 - `pane_record.py seed [--session NAME]` writes the entries of the Claudes running now: the argv
-  and cwd from herdr's `pane process-info`, the environment from `/proc/<pid>/environ`, and the
-  conversation id from `<config>/sessions/<pid>.json`. Linux only. It needs no
+  and cwd from herdr's `pane process-info`, the environment of the process, and the
+  conversation id from `<config>/sessions/<pid>.json`. It needs no
   `report-agent-session`: a restore takes the id from the entry and checks herdr's
   `agent_session` only when the pane has one.
 - `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` (the shared session by
@@ -119,8 +118,14 @@ Steps on natedev, in order, after promotion:
 }
 ```
 
+- The Mac has no `/proc`. There `pane_record` reads a parent with `ps -o ppid= -p <pid>`, and the
+  arguments and environment from the kernel's KERN_PROCARGS2 record (`account.kern_procargs2`,
+  parsed by `pane_record.procargs`). On both machines an environment keeps only
+  `CLAUDE_CONFIG_DIR` and the names the entry keeps; every other value, a token included, is
+  dropped as it is read. The Mac hides the environment of a system binary such as `/bin/zsh`,
+  never of Claude.
+
 ## Still to come
 
-- The Mac: a launchd agent, the Mac desktop rule for herdr, and the flags read with
-  `ps -o ppid=,args= -p <pid>` (herdr review, 2026-10-19).
+- The Mac: a launchd agent and the Mac desktop rule for herdr.
 - Last: retire `agent-sessions-snapshot.timer` after one real reboot restores every pane.
