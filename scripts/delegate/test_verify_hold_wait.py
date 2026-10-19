@@ -26,9 +26,17 @@ from scripts.delegate import test_verify_mac_offload
 
 VERIFY = Path(__file__).with_name("verify.sh")
 TARGETS = VERIFY.parent.parent / "build_targets" / "build_targets.py"
+INVOKE = VERIFY.parent.parent / "lint" / "invoke.sh"
 CYCLE_ID = "c" * 32
 # Completion depends on events; this deadline only diagnoses a hung fixture.
 HANG_GUARD_S = 300
+VERIFY_WAITING = "; waiting (tests that can run on the Mac"
+LINT_STEP = 'set -euo pipefail; source "$1"; sweep_after_step() { :; }; run_once cargo check'
+# The same step, but a child of the step first writes the call ids it got from
+# its environment to the file in $2: the build log's record.py is such a child.
+LINT_STEP_PROBE = ('set -euo pipefail; source "$1"; probe=$2; sweep_after_step() { :; }; '
+                   + 'cargo() { sh -c \'printf "%s|%s" "${BUILDLOG_CALL_ID-}" "${BUILDLOG_HOLD_CALL_ID-}"\' > "$probe"; '
+                   + 'command cargo "$@"; }; run_once cargo check')
 
 
 class WaitObservation(TypedDict):
@@ -145,11 +153,11 @@ class VerifyHoldWaitTests(unittest.TestCase):
             "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
         })
 
-    def hold(self) -> None:
+    def hold(self, key: str = "hana") -> None:
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         holders.mkdir(exist_ok=True)
         now = datetime.now().astimezone().isoformat()
-        _ = (holders / "hana").write_text(json.dumps({"holder": "hana", "since": now, "for": "render checks", "release_eta": "unknown"}))
+        _ = (holders / key).write_text(json.dumps({"holder": "hana", "since": now, "for": "render checks", "release_eta": "unknown"}))
         self.cycle_file.parent.mkdir(parents=True, exist_ok=True)
         _ = (self.cycle_file.parent.parent / "current").write_text(CYCLE_ID)
         cycle: build_hold.HoldCycle = {
@@ -172,14 +180,15 @@ class VerifyHoldWaitTests(unittest.TestCase):
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
 
-    def wait_for_call(self, process: subprocess.Popen[str]) -> build_hold.ReleaseEntry:
+    def wait_for_call(self, process: subprocess.Popen[str],
+                      announcement: str = VERIFY_WAITING) -> build_hold.ReleaseEntry:
         deadline = time.monotonic() + HANG_GUARD_S
         while time.monotonic() < deadline:
             if self.cycle_file.exists():
                 cycle = read_cycle_file(self.cycle_file)
                 for entry in cycle["entries"]:
                     if entry.get("calls", []):
-                        self.wait_for_waiting_diagnostic(process)
+                        self.wait_for_waiting_diagnostic(process, announcement)
                         return entry
             if process.poll() is not None:
                 code, output = self.finish(process)
@@ -187,7 +196,8 @@ class VerifyHoldWaitTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Verification did not register its call")
 
-    def wait_for_waiting_diagnostic(self, process: subprocess.Popen[str]) -> None:
+    def wait_for_waiting_diagnostic(self, process: subprocess.Popen[str],
+                                    announcement: str = VERIFY_WAITING) -> None:
         # Registration precedes the first waiting announcement. Releasing before
         # that announcement can legitimately record zero waiting seconds.
         assert process.stderr is not None
@@ -198,7 +208,7 @@ class VerifyHoldWaitTests(unittest.TestCase):
         with selectors.DefaultSelector() as events:
             _ = events.register(process.stderr, selectors.EVENT_READ)
             _ = events.register(process.stdout, selectors.EVENT_READ)
-            while "; waiting (tests that can run on the Mac" not in captured + output:
+            while announcement not in captured + output:
                 remaining = deadline - time.monotonic()
                 ready = events.select(max(0, remaining))
                 if remaining <= 0 or not ready:
@@ -371,19 +381,88 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
                 remaining = [call["call_id"] for entry in read_cycle_file(self.cycle_file)["entries"] for call in entry.get("calls", [])]
                 self.assertEqual(remaining, ["peer"])
 
-    def test_standalone_and_mac_runners_do_not_register_local_waiters(self) -> None:
+    def test_mac_runner_does_not_register_a_local_waiter(self) -> None:
         self.hold()
-        invoke = VERIFY.parent.parent / "lint" / "invoke.sh"
-        for caller in ("lint", "verify-mac"):
+        before = self.cycle_file.read_bytes()
+        environment = {**self.fixture.environment, "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_CALL_ID": "remote-call"}
+        result = subprocess.run(
+            ["bash", "-c", LINT_STEP, "bash", str(INVOKE)],
+            cwd=self.fixture.root, env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_S,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.cycle_file.read_bytes(), before)
+        self.assertEqual([event["args"][0] for event in self.fixture.cargo_events()], ["check"])
+
+    def start_lint_step(self, caller: str, extra: dict[str, str] | None = None,
+                        probe: Path | None = None) -> subprocess.Popen[str]:
+        """One compiling lint step, as `caller` runs it: no BUILDLOG_CALL_ID."""
+        shell = [LINT_STEP_PROBE, "bash", str(INVOKE), str(probe)] if probe else [LINT_STEP, "bash", str(INVOKE)]
+        process = subprocess.Popen(
+            ["bash", "-c", *shell],
+            cwd=self.fixture.root, env={**self.fixture.environment, "BUILDLOG_CALLER": caller,
+                                        "BUILDLOG_CALL_ID": "", **(extra or {})},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        self.addCleanup(self.stop_process, process)
+        return process
+
+    def test_lint_step_without_a_call_id_waits_for_the_release(self) -> None:
+        # The release wakes the wait; no poll comes in time.
+        self.fixture.environment["BUILD_TARGETS_POLL_S"] = "3600"
+        probe = self.fixture.root / "step-call-ids"
+        for caller, speaker in (("cargo-port", "lint (cargo-port)"), ("", "lint")):
             with self.subTest(caller=caller):
-                before = self.cycle_file.read_bytes()
-                environment = {**self.fixture.environment, "BUILDLOG_CALLER": caller, "BUILDLOG_CALL_ID": "remote-call" if caller == "verify-mac" else ""}
-                result = subprocess.run(
-                    ["bash", "-c", 'set -euo pipefail; source "$1"; sweep_after_step() { :; }; run_once cargo check', "bash", str(invoke)],
-                    cwd=self.fixture.root, env=environment, capture_output=True, text=True, check=False, timeout=HANG_GUARD_S,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(self.cycle_file.read_bytes(), before)
+                self.fixture.cargo_events_path.unlink(missing_ok=True)
+                self.hold()
+                process = self.start_lint_step(caller, probe=probe)
+                entry = self.wait_for_call(process, f"{speaker}: natedev is held by hana for render checks; waiting")
+                self.assertTrue(entry["session_id"].startswith("verify:v"), entry["session_id"])
+                self.assertRegex(entry["calls"][0]["call_id"], r"^v[0-9]{8}T[0-9]{6}-[0-9]+-[0-9]+$")
+                self.assertEqual(self.fixture.cargo_events(), [])
+                grant_call(self.cycle_file)
+                code, output = self.finish(process)
+                self.assertEqual(code, 0, output)
+                self.assertNotIn("verify.sh", output)
+                self.assertNotIn("Mac", output)
+                self.assertEqual([event["args"][0] for event in self.fixture.cargo_events()], ["check"])
+                # The gate's mark ends the call's turn under the id lint made for it.
+                self.assertEqual(read_cycle_file(self.cycle_file)["entries"][0]["state"], "MemoryGateReturned")
+                # Lint keeps that id out of the build log: the caller has no call record.
+                self.assertEqual(probe.read_text(), "|")
+
+    def test_lint_step_with_no_hold_starts_no_hold_check(self) -> None:
+        holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
+        starts = self.count_python_starts()
+        for state in ("missing", "empty"):
+            with self.subTest(holders=state):
+                if state == "empty":
+                    holders.mkdir()
+                code, output = self.finish(self.start_lint_step("cargo-port"))
+                self.assertEqual(code, 0, output)
+                self.assertEqual(self.hold_commands(starts), [])
+
+    def test_holder_session_lint_step_passes_its_own_hold(self) -> None:
+        self.hold("holder-session")
+        before = self.cycle_file.read_bytes()
+        process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": "holder-session"})
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("natedev is held", output)
+        self.assertEqual(self.cycle_file.read_bytes(), before)
+        self.assertEqual([event["args"][0] for event in self.fixture.cargo_events()], ["check"])
+
+    def test_holder_session_lint_step_waits_while_another_hold_is_in_force(self) -> None:
+        self.hold()
+        holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
+        _ = (holders / "holder-session").write_text((holders / "hana").read_text())
+        process = self.start_lint_step("cargo-port", {"CLAUDE_CODE_SESSION_ID": "holder-session"})
+        entry = self.wait_for_call(process, "lint (cargo-port): natedev is held by hana")
+        self.assertEqual(entry["session_id"], "holder-session")
+        self.assertEqual(self.fixture.cargo_events(), [])
+        grant_call(self.cycle_file)
+        code, output = self.finish(process)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([event["args"][0] for event in self.fixture.cargo_events()], ["check"])
 
     def observe_waits(self) -> Path:
         observer = self.fixture.root / "python-observer"
