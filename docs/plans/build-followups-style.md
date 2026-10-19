@@ -592,7 +592,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `load-rust-style.sh` is a zsh script; bash fails on it by design.
 - The base already carries two basedpyright errors (missing `bpy` and `PIL` imports), so a `0 errors` gate reads as "no new diagnostics".
 
-### Phase 19 — Roll-out  · status: todo
+### Phase 19 — Roll-out  · status: done
 **Depends on:** Phase 16, Phase 17, Phase 18
 **Blocked by:** pilot pass (as Phase 18).
 
