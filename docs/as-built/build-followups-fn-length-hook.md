@@ -6,7 +6,7 @@ A set of agent-session tools in `~/.claude`, all Python (standard library) or zs
 
 - A PostToolUse hook that blocks an editing agent the moment an edit leaves a Rust function over clippy's `too_many_lines` limit.
 
-- A Stop hook that blocks a showrunner reply asking the user a question not recorded and reviewed first, and an adhoc-review pause of the dailies. The reply footer it once checked is gone (user, 2026-10-18).
+- An adhoc-review pause of the dailies. The showrunner question Stop hook is retired (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"), and the reply footer it once checked is gone (user, 2026-10-18).
 
 - Cargo-token hygiene: each verify step runs in its own process group that a release or reclaim stops.
 
@@ -55,12 +55,10 @@ An install that removes nothing makes no extra app-server calls for cleanup. A s
 
 ### Showrunner question hook
 
-The reply footer, its `Waiting on:` block, the footers-off switch and `/showrunner:footer` are gone (user, 2026-10-18: "i want footers gone for good"). The user reads the counts in the status line. What is left checks the questions a showrunner reply asks.
+The reply footer, its `Waiting on:` block, the footers-off switch and `/showrunner:footer` are gone (user, 2026-10-18: "i want footers gone for good"). The user reads the counts in the status line. The question check is retired too (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"): what is left reads productions for the status line's counts row and the review pause.
 
-Files: `scripts/hooks/stop-showrunner-footer.py`, `scripts/hooks/showrunner_footer.py`, `scripts/production/footer_counts.py`, the Open-questions list and The hook bullets of `commands/showrunner/produce.md`. The files keep their names because `settings.json` names the hook path. The hook is the last entry of `settings.json`'s Stop group, after `stop-assistant-prose-banned-words.py`; `stop-conversation-pause.py` is earlier, straight after `stop-delegate-continue.py`.
+Files: `scripts/hooks/showrunner_footer.py`, `scripts/production/footer_counts.py`, the Open-questions list and The hook bullets of `commands/showrunner/produce.md`. `scripts/hooks/stop-showrunner-footer.py` exits 0 at once; it stays only while `settings.json` names it, as the last entry of the Stop group.
 
-- **Stop hook entry.** `stop-showrunner-footer.py` imports only `json`, `os`, `sys` and `typing` until it knows the session is a showrunner. It reads `StopPayload` (`session_id`, `last_assistant_message`, `agent_id`) and passes when `agent_id` is present or the session id or reply is empty. A session is a showrunner when a `showrunner-*` notifier instance's `conf` (under `NOTIFIER_STATE_DIR` or `~/.local/state/notifier`) holds `TARGET=session:<id>`. It prints `{"decision": "block", "reason": …}` from `block_reason`. Any exception prints `stop-showrunner-footer: <type>: <message>` to stderr and exits 0.
-- **Check.** `block_reason(instance_dirs: list[str], reply: str) -> str | None` runs `check_reviewed_text`: a reply missing a pending reviewed question, or asking the user anything unregistered, is blocked (`docs/as-built/message-clarity.md`, Question review in showrunner replies). A pending item leaves the file once a reply carries it, even a reply blocked for something else.
 - **Production.** `read_production(instance_dir) -> Production | None` takes the doc from the last token of the instance's `CHECK`, requires `Status: PRODUCTION — running`, takes the zone from the user's zone setting (`scripts/lib/user_zone.py`; the doc's `- **User zone:**` line is not read), and builds `schedule` from state: `ScheduledDailies(next_due)` when `ENABLED=1`, else `NoDailiesSchedule.PAUSED_OR_UNSCHEDULED`. Anything unreadable gives `None` (the production is skipped).
 - **Open questions.** `open_questions(productions) -> int | None` counts the items now due in every production's needs-user file: an item with no `after`, or whose `after` is at or before now in the production's zone. It is `None` when a file cannot be read.
 - **Counts line (2026-10-16, showrunner's footer-counts plan).** `scripts/production/footer_counts.py` reads each count at render time and stores none: `changes` is `len(change_review.pending(list))` for the list `change_review.list_path(doc)` names, `proposals` is `len(proposals_folder.open_proposals(doc))`: the open `proposal` issues in the folder the Proposals line names whose proposer is this production's own. Productions share one folder (`~/rust/hanadocs/issues`), so `owners(doc)` is the slug and Units of this doc and of each production below it (`showrunners.descendants_of`, docs from `showrunners.timer_docs()`), and `proposer(issue)` is `proposed_by`, or the production in `unit (production)` (showrunner, 2026-10-18: 365 of 417 open proposals were cargo-liner-style's and showed in tool-based-ui). `sources` also names each production doc below, since a unit added there changes the count. `/showrunner:proposals` lists the same issues. And `projects`, for a doc with `- **Improvement queue:** <ledger>`, counts ledger lines `- <date> <title> (<file>) — <status>` whose status starts with `proposed`, or with `accepted` and holds none of `assigned`, `applied`, `built`, `declined`. A source that cannot be read counts 0. `counts_line` writes `For you: 2 changes to review, 1 proposal, 3 projects, 1 question`, zero counts left out, None when all are zero. The status line's counts row adds the open questions (`showrunner_footer.counts_line`, questions from `open_questions`). The dailies report's own footer (`dailies_render.py --footer`) shows the line too; no reply carries it.
@@ -129,17 +127,13 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 ## Invariants
 
-- The Stop hook fails open: any error prints one stderr line and exits 0 with no output. It fires only in a session a running production's `showrunner-*` instance targets, and the non-showrunner path stays on the entry point's own imports plus one `conf` read per instance.
-
 - The fn-length hook passes edits with no `Cargo.toml`, unreadable TOML, unknown payloads or internal errors. Unclosed function bodies are skipped; complete earlier functions remain measurable. An internal error prints one `fn-length hook error: <type>: <message>` `systemMessage` and exits 0.
 
 - The hook mirrors clippy exactly: same count, same threshold source, same exemptions, and it fires only where the package's Cargo lints enable `too_many_lines`, so it never blocks code clippy passes. Approved exceptions pass as clippy lets them.
 
 - One checker (`fn_length_lib`) and one hook command string serve Claude and Codex.
 
-- `settings.json` order: the `Edit|MultiEdit|Write` group keeps basedpyright first with the fn-length hook after it; the Stop group keeps `stop-showrunner-footer.py` after the banned-words hook. An edit to either group keeps every entry.
-
-- The Stop hook reads the reply from `last_assistant_message`, never `transcript_path` (at Stop time the transcript lacks the turn's last entry).
+- `settings.json` order: the `Edit|MultiEdit|Write` group keeps basedpyright first with the fn-length hook after it. An edit to either group keeps every entry.
 
 - `config/showrunners.json` holds settings only and no script writes it; readers call `load_settings` or `load_settings_from(CONFIG)` on the live checkout's machine-local file. The file stays untracked (`.gitignore` names it).
 
@@ -160,8 +154,6 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 - **fn-length import cost dominates.** `tomllib` loads only when the manifest text names `lints` or a clippy config names the threshold; `dataclasses` and `pathlib` stay off the Rust path (an import test pins this). Classes in `fn_length_lib` are plain `__slots__` classes because frozen dataclasses alone broke the 20 ms budget.
 
 - **fn-length blind spots.** Functions inside `macro_rules!` or `name! { … }` bodies are never measured (clippy sees expanded code the scan cannot expand). Edits made through shell commands (`sed`, heredocs) and growth from rustfmt reflowing a function measured at or under the limit are not seen. A failed `blocks.jsonl` append is silent and never changes the verdict. `cfg(test)` modules in package-root `examples/` targets are skipped because clippy never lints them.
-
-- **Stop hook cost.** A Stop hook runs at every turn end in every session; the non-showrunner path costs about 4 ms on a quiet machine (bare launch 22 ms quiet, 45–62 ms loaded). Compare cost readings with interleaved bare and hook runs; load swamps any other delta. Replies sent before `<StartUpdates/>` registers the notifier instance are not checked.
 
 - **basedpyright** exits 3 in every checkout (`pyrightconfig.json` names a `.venv` no checkout has); read its last output line (`0 errors, 0 warnings, 0 notes`), not its exit status. `scripts/hooks` is a pyright execution environment with itself on `extraPaths`, so tests import `fn_length_lib` directly.
 
@@ -191,7 +183,7 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 - **The success threshold is 75% fewer** `too_many_lines` failed steps per 100 hana clippy steps and 75% less sole-cause worker time per day, leaving room for the edits the hook cannot see (shell edits, rustfmt growth).
 
-- **A Stop hook for asked questions, not a prompt rule.** A rule that lives only in a prompt is one an agent can drop; the hook checks every showrunner reply for an ask that was not recorded and reviewed. The reply footer it once checked is gone (user, 2026-10-18).
+- **No Stop hook for asked questions** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The reply footer it once checked is gone (user, 2026-10-18).
 
 - **The switch is a file keyed by production slug** so it survives compaction, resume and a retargeted notifier instance; the review pause records what it changed so `resume` restores only that, and per-action states make a failed pause retryable.
 
