@@ -342,7 +342,7 @@ Apply a fix without asking only when all mechanical criteria hold:
 3. No type gains or loses a field, variant, generic parameter or trait impl,
    and no new type, trait or error type appears.
 4. A rename's sites are in one crate and at most 10 files.
-5. The finding's diff is under 200 changed lines.
+5. Each file in the finding has under 200 changed lines.
 6. Behavior is preserved: no condition, literal value or control flow changes
    meaning, and no serialized, reflected or configured name changes (serde and
    reflect names, config keys, documented usage).
