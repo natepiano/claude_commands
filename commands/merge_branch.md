@@ -41,27 +41,7 @@ This script performs a real `git merge --no-commit --no-ff` followed by `git mer
 - If `merge_feasible` is `false`, conflicts exist on overlapping hunks — both rebase and merge would hit them. STOP and ask the user to resolve manually.
 - If `already_up_to_date` is `true`, the source branch is fully contained in the current branch. Tell the user the merge is a no-op (`Already up to date — ${SOURCE_BRANCH} is an ancestor of ${current_branch}`) and STOP.
 
-Capture from the JSON: `ff_possible`, `source_worktree`, `current_branch`,
-`current_tracks_origin`, and `current_upstream`.
-
-**STEP 2.5: Style-flow detection**
-
-If `${SOURCE_BRANCH}` is `refactor/style` or starts with `refactor/style/`, set STYLE_FLOW.
-
-If `current_tracks_origin` is `true`, announce:
-
-> Style-fix branch detected. On successful merge I will run `/validate_and_push`; on successful
-> validate_and_push I will run `/worktree_delete` on `${source_worktree}` (branch `${SOURCE_BRANCH}`).
-> A failure at any step stops the chain — later steps will not run.
-
-If `current_tracks_origin` is `false`, announce:
-
-> Style-fix branch detected. Current branch is not tracking `origin` (`current_upstream`:
-> `${current_upstream}`), so on successful merge I will skip `/validate_and_push` and proceed
-> directly to `/worktree_delete` on `${source_worktree}` (branch `${SOURCE_BRANCH}`).
-
-If `current_upstream` is empty, say "no upstream" instead of showing an empty value.
-If `source_worktree` is empty, omit the worktree_delete part of the announcement and skip STEP 7 later.
+Capture from the JSON: `ff_possible`, `source_worktree`, and `current_branch`.
 
 **STEP 3: Branch by ff-possibility**
 
@@ -108,25 +88,6 @@ Otherwise (ff-possible from the start, or after a successful **rebase-source**):
 
 Run `git merge --ff-only ${SOURCE_BRANCH}` with `dangerouslyDisableSandbox: true`. This will fast-forward; no merge commit is created.
 
-Report success to user, including which path was taken (ff-only, rebase-source + ff-only, rebase-current, or explicit `--no-ff` merge).
+If the merge command fails, report the error and STOP.
 
-If the merge command failed, report the error and STOP — do not run STEP 6 or 7.
-If STYLE_FLOW is not set, STOP here. Otherwise continue to STEP 6.
-
-**STEP 6: Chained validate_and_push (STYLE_FLOW only)**
-
-Runs only after a successful STEP 5 merge and only when `current_tracks_origin` is `true`.
-Invoke the `validate_and_push` skill via the Skill tool and follow its instructions, including
-its `needs_pr_branch` handling. If any validation, push, CI, or merge step fails, report the
-failing step and STOP — do not delete the worktree.
-
-If `current_tracks_origin` is `false`, skip `validate_and_push`, report that the current branch is
-not tracking `origin` (`current_upstream`, or "no upstream" if empty), and continue to STEP 7.
-
-**STEP 7: Chained worktree_delete (STYLE_FLOW only)**
-
-Runs only after STEP 6 reports its success summary or after STEP 6 is skipped because
-`current_tracks_origin` is `false`. Invoke the `worktree_delete` skill via the Skill tool with
-`${source_worktree}` / `${SOURCE_BRANCH}` as the target. All of that skill's gates remain in
-force — protected-branch check, uncommitted-changes check, unpushed-commits check, and the
-explicit final confirmation. If any gate fails or the user does not confirm, STOP.
+Report success to the user, including which path was taken (ff-only, rebase-source + ff-only, or explicit `--no-ff` merge). STOP.

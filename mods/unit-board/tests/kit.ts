@@ -29,7 +29,7 @@ export function fixture(): BoardData {
   open.start = time(-60, "17:00");
   return { production: "show", as_of: time(0, "18:00"), zone: "America/New_York",
     utc_offset_minutes: -240, sources: [RUN, DISCOVERY], units: [{
-      key: "alpha", plan: "plan.md", state: "running", phase: { id: "2", of: 3, title: "Delivery 2" },
+      key: "alpha", plan: "plan.md", state: "running", phase: { kind: "plan", id: "2", of: 3, title: "Delivery 2" },
       phases: [done, open, phase("3", "todo")], finish: { kind: "predicted", at: time(42, "18:42") },
       stage: "Repair round 2", summary: "Finishing the retry path",
       eta: { at: time(30, "18:30"), first: time(-45, "17:15"),
@@ -68,7 +68,7 @@ export function hostEngine(on: On) {
   return { opened, closed, forbidden };
 }
 
-export function engineFiles(on: On, focus: string | null = null) {
+export function engineFiles(on: On) {
   const host = hostEngine(on);
   const clock = mock.clock(on, { now: NOW });
   mock.env(on, { HOME: "/test-home", XDG_STATE_HOME: "/test-state" });
@@ -96,7 +96,7 @@ export function engineFiles(on: On, focus: string | null = null) {
       mtimes.set(path, clock.now());
       return path;
     });
-    return { value: { exitCode: 0, stdout: JSON.stringify({ files: paths, focus, watch: [REGISTRY] }), stderr: "",
+    return { value: { exitCode: 0, stdout: JSON.stringify({ files: paths, watch: [REGISTRY] }), stderr: "",
       isStdoutTruncated: false, isStderrTruncated: false } };
   });
   on("fs.read", (_$, e) => {
@@ -176,7 +176,7 @@ export function lifecycleHarness() {
       calls.push("process");
       signal();
       await pending;
-      return { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], focus: null, watch: [REGISTRY] }), stderr: "" };
+      return { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }), stderr: "" };
     } },
   };
   // The registered hooks use only these services. Keep the partial host at this

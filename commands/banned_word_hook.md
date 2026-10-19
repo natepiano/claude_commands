@@ -31,7 +31,7 @@ The two hooks stay registered in `~/.claude/settings.json` permanently:
 | Event | Hook | Role |
 |---|---|---|
 | `PostToolUse` | `post-tool-use-banned-words.py` | blocks until the violation is fixed, messages it and bumps the counter |
-| `Stop` | `stop-assistant-prose-banned-words.py` | scans the turn just emitted and blocks until it is rewritten |
+| `Stop` | `stop-assistant-prose-banned-words.py` | logs each match in the turn just emitted to `~/.claude/state/forbidden-word-prose.log` and bumps the counter; never blocks |
 
 Each one calls `hooks_enabled()` in `scripts/hooks/banned_words_lib.py` before
 scanning anything, and that function reads `config/banned_words.conf`. Setting

@@ -6,8 +6,11 @@ import argparse
 import json
 import os
 import re
+import sqlite3
+import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +44,22 @@ def read_object(path: Path) -> dict[str, object]:
         return fields(cast(object, json.loads(path.read_text(encoding="utf-8"))))
     except (OSError, UnicodeError, ValueError):
         return {}
+
+
+@dataclass(frozen=True)
+class TicketInProgress:
+    id: str
+
+
+@dataclass(frozen=True)
+class NoTicketInProgress:
+    pass
+
+
+@dataclass(frozen=True)
+class UnitTicketProgress:
+    merged: int = 0
+    open_ticket: TicketInProgress | NoTicketInProgress = NoTicketInProgress()
 
 
 @dataclass(frozen=True)
@@ -204,7 +223,7 @@ def phase_steps(events: list[dict[str, object]], clock: BoardClock, current: pha
     return result
 
 
-def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase) -> str:
+def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.DonePhase | phase_table.OpenPhase | phase_table.TodoPhase], current: phase_table.OpenPhase | phase_table.NoOpenPhase, ticket: TicketInProgress | NoTicketInProgress) -> str:
     events = [event for event in events if isinstance(current, phase_table.OpenPhase)
               and event.get("phase_instance_id") == current.instance_id]
     open_passes: dict[str, dict[str, object]] = {}
@@ -238,7 +257,7 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
     if isinstance(step, units_table.OpenStep):
         return step.label
     if isinstance(current, phase_table.OpenPhase):
-        return f"Phase {current.phase} running"
+        return f"Ticket {ticket.id} running" if isinstance(ticket, TicketInProgress) else f"Phase {current.phase} running"
     if state == "run-finished":
         return "Run done"
     for row in rows:
@@ -247,6 +266,39 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
         if not isinstance(row, phase_table.DonePhase):
             break
     return "Standing by"
+
+
+def is_standing_plan(plan: Path) -> bool:
+    try:
+        return any(line.startswith("> **Standing:**") for line in plan.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError):
+        return False
+
+
+def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> UnitTicketProgress:
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        if common.returncode or not common.stdout.strip():
+            return UnitTicketProgress()
+        main_repo = Path(common.stdout.rstrip("\n")).parent
+        state = Path(os.environ.get("STYLE_LEDGER_STATE_DIR", str(Path.home() / ".local/state/style"))).expanduser()
+        database = state / main_repo.name / "ledger.sqlite"
+        if not database.exists():
+            return UnitTicketProgress()
+        sources.add(database)
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0)) as connection:
+            row = cast(tuple[int, str | None], connection.execute(
+                """SELECT
+                    (SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'),
+                    (SELECT id FROM tickets WHERE unit = ? AND state IN ('assigned', 'checkpointed')
+                     ORDER BY created_at DESC LIMIT 1)""", (unit_name, unit_name),
+            ).fetchone())
+            return UnitTicketProgress(row[0], TicketInProgress(row[1]) if row[1] else NoTicketInProgress())
+    except (OSError, UnicodeError, subprocess.TimeoutExpired, sqlite3.Error):
+        return UnitTicketProgress()
 
 
 def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[str, object]:
@@ -283,11 +335,25 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
     current = record.current
+    unit_name = value(cells.get("Unit", ""))
+    standing = is_standing_plan(record.plan)
+    tickets = unit_ticket_progress(worktree, unit_name, sources) if standing else UnitTicketProgress()
+    ticket = tickets.open_ticket
+    current_phase: dict[str, object] | None = None
+    if isinstance(current, phase_table.OpenPhase):
+        if standing:
+            if isinstance(ticket, NoTicketInProgress):
+                title_id = re.match(rf"{re.escape(unit_name)}-\d+(?=\s|$)", current.title)
+                ticket = TicketInProgress(title_id[0] if title_id else current.phase)
+            title = re.sub(rf"^{re.escape(ticket.id)}(?:\s+—(?:\s+|$)|\s+|$)", "", current.title, count=1)
+            current_phase = {"kind": "ticket", "id": ticket.id, "title": title, "merged": tickets.merged}
+        else:
+            current_phase = {"kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title}
     summary = next((text(event.get("activity")) for event in reversed(events) if event.get("event_type") == "progress_reported"), "")
-    return {"key": value(cells.get("Unit", "")).removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
-            "phase": {"id": current.phase, "of": len(record.phases), "title": current.title} if isinstance(current, phase_table.OpenPhase) else None,
+    return {"key": unit_name.removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
+            "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
-            "stage": stage(events, state, record.phases, current), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
+            "stage": stage(events, state, record.phases, current, ticket), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}
 
 
@@ -295,22 +361,16 @@ def checkout(document: Path) -> Path:
     return next((path for path in document.parents if (path / ".git").exists()), document.parent.parent if document.parent.name == "docs" else document.parent)
 
 
-def resolve(cwd: str, production: str) -> tuple[list[showrunners.Showrunner], str | None]:
+def resolve(cwd: str, production: str) -> list[showrunners.Showrunner]:
     registered = showrunners.registered_showrunners()
-    if production:
-        return [runner for runner in registered if runner["slug"] == production], None
-    directory = Path(cwd).expanduser().resolve()
-    for runner in registered:
-        document = Path(runner["doc"])
-        rows = production_units.live_unit_table(document.read_text(encoding="utf-8").splitlines(), runner["slug"])
-        for cells in rows:
-            worktree = Path(production_units.cell_value(cells.get("Worktree", ""))).expanduser().resolve()
-            if directory.is_relative_to(worktree):
-                return [runner], production_units.cell_value(cells.get("Unit", "")).removesuffix("-unit")
-    for runner in registered:
-        if directory.is_relative_to(checkout(Path(runner["doc"]))):
-            return [runner], None
-    return [runner for runner in registered if runner["session"]], None
+    if not production:
+        directory = Path(cwd).expanduser().resolve()
+        production = next((runner["slug"] for runner in registered
+                           if directory.is_relative_to(checkout(Path(runner["doc"])))), "")
+    by_slug = {runner["slug"]: runner for runner in registered}
+    if production not in by_slug:
+        return []
+    return [by_slug[slug] for slug in [production, *showrunners.descendants_of(production)] if slug in by_slug]
 
 
 def build(runner: showrunners.Showrunner) -> dict[str, object]:
@@ -343,15 +403,18 @@ def main(arguments: list[str]) -> int:
     _ = group.add_argument("--cwd", default="")
     _ = group.add_argument("--production", default="")
     args = parser.parse_args(arguments)
-    runners, focus = resolve(cast(str, args.cwd), cast(str, args.production))
+    runners = resolve(cast(str, args.cwd), cast(str, args.production))
     root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
     for runner in runners:
         path = root / f"{runner['slug']}.json"
         write_board(path, build(runner))
         files.append(str(path))
-    watch = existing_sources({showrunners.NOTIFIER_STATE_DIR})
-    print(json.dumps({"files": files, "focus": focus, "watch": watch}))
+    watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
+    watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
+                         for runner in showrunners.registered_showrunners())
+    watch = existing_sources(watch_sources)
+    print(json.dumps({"files": files, "watch": watch}))
     return 0
 
 

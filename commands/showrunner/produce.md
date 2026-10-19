@@ -306,13 +306,10 @@ State:
   check passes a reply after any Stop-hook block, and the hook passes on errors.
 
   A turn the user did not start (only cross-session messages, the update tick
-  among them, or task notifications) gets exactly `-` as its reply when nothing
-  needs the user; `-` carries no footer. Such a turn reaches the user only when
-  a tool call in it was refused by auto mode (surface it) or when the reply
-  names a registered item: an `OUTSTANDING` item, or a `report_to_user` item
-  whose `until` has not passed. A fault the user would see is registered first.
-  Any other reply is blocked with `nothing needs the user: reply with -`, the
-  retry included.
+  among them, or task notifications) can get exactly `-` as its reply when
+  nothing in it is of use to the user; `-` carries no footer. A reply with a
+  result or status the user can use goes out as usual, with the footer when
+  footers are on.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
   footer for this showrunner. A new production starts with it off. Run them when the user says "footers off" or

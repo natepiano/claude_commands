@@ -1171,7 +1171,8 @@ def remove_call(key: str, call_id: str, *, cycle_id: str = "") -> None:
             save_cycle(cycle)
 
 
-def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0) -> str:
+def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = "", cycle_id: str = "", generation: int = 0,
+              launch: bool = False) -> str:
     if not session_id:
         return "NoSessionId"
     if not has_holder_file(holder_directory()):
@@ -1195,6 +1196,12 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
                  or state == "MemoryGateReturned" and outcome in {"Granted", "TimedOut", "MeminfoUnavailable"})
                 and confirm_delivery(entry, cycle.get("holder_generation", 1))):
                 save_cycle(cycle)
+            if (not call_id and not launch and entry["active_call_id"]
+                    and isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued))):
+                # The session builds on its own while a queued call has not reached its memory
+                # gate: the build takes the session's turn, and the queued calls wait only on their gates.
+                # An app launch is no build and leaves the call's turn as it is.
+                end_session_turn(entry, cycle.get("holder_generation", 1))
             if entry["active_call_id"] != call_id:
                 continue
             previous = read_release_state(entry)
@@ -1243,9 +1250,11 @@ def answer_nothing_to_build(session_id: str) -> str:
         if ((not cycle.get("holder_signature", "") or cycle.get("holder_signature", "") == holders_signature())
             and confirm_delivery(entry, cycle.get("holder_generation", 1))):
             save_cycle(cycle)
-        if entry["active_call_id"] or not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
+        if not isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)):
             return f"nothing-to-build ignored: {entry_text(entry)}"
-        entry["session_pending"] = False
+        # An active call that has not reached its memory gate does not hold the answer back:
+        # the session's turn ends, and its queued calls each wait only on their own memory gate.
+        end_session_turn(entry, cycle.get("holder_generation", 1))
         store_release_state(entry, NothingToBuild(datetime.now(timezone.utc)))
         save_cycle(cycle)
         return f"{entry_text(entry)}; the release stops waiting for this session"
@@ -1345,8 +1354,21 @@ def not_reached_detail(cycle: HoldCycle) -> str:
     return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
 
 
-def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime) -> None:
-    """A released turn that outlives its limit, or whose session left, ends; it never holds another session."""
+def end_session_turn(entry: ReleaseEntry, generation: int) -> None:
+    """The session's turn ends: each call it queued is admitted now and waits only on its own memory gate."""
+    for call in entry["calls"]:
+        call["admitted_generation"] = generation
+    entry["active_call_id"] = ""
+    entry["session_pending"] = False
+    entry["session_admitted_generation"] = generation
+
+
+def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime, generation: int) -> None:
+    """A released turn that outlives its limit, or whose session left, ends; it never holds another session.
+
+    A lapse ends the session's whole turn, not just the active call, so a session with queued
+    calls that never start holds the release one limit, not one limit per call.
+    """
     state = read_release_state(entry)
     match state:
         case RecipientGone() | DeliveryFailed() if entry["active_call_id"]:
@@ -1361,8 +1383,7 @@ def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime)
         case _:
             return
     if now >= deadline:
-        entry["active_call_id"] = ""
-        entry["session_pending"] = False
+        end_session_turn(entry, generation)
         store_release_state(entry, NoAdmissionAck(released_at))
     elif (not entry["active_call_id"] and not isinstance(state, (RecipientGone, DeliveryFailed))
           and isinstance(socket_for(entry["session_id"]), RecipientGone)):
@@ -1427,7 +1448,7 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
     queue_told_sessions(cycle)
     for entry in entries:
         prune_calls(entry)
-        end_lapsed_turn(entry, now, release_start)
+        end_lapsed_turn(entry, now, release_start, generation)
         if not in_progress(entry) and (has_pending_call(entry, generation) or entry["session_pending"]):
             store_release_state(entry, AwaitingRelease())
         if isinstance(read_release_state(entry), AwaitingRelease):
@@ -1605,6 +1626,7 @@ def main(arguments: list[str]) -> int:
     _ = mark.add_argument("--call-id", default="")
     _ = mark.add_argument("--cycle-id", default="")
     _ = mark.add_argument("--generation", type=int, default=0)
+    _ = mark.add_argument("--launch", action="store_true")
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
     _ = recipient.add_argument("--name", required=True)
@@ -1680,7 +1702,8 @@ def main(arguments: list[str]) -> int:
             owner = OwningSession(cast(str, options.session_id)) if hasattr(options, "session_id") else owning_session()
             session_id = waiter_key(call_id) if call_id and not hasattr(options, "session_id") else owner.session_id if isinstance(owner, OwningSession) else ""
             print(mark_gate(session_id, cast(str, options.state), cast(str, options.outcome),
-                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation)))
+                            call_id=call_id, cycle_id=cast(str, options.cycle_id), generation=cast(int, options.generation),
+                            launch=cast(bool, options.launch)))
         elif action == "record-recipient":
             record_recipients([(cast(str, options.name), cast(str, options.session_id))])
         else:

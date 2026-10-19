@@ -221,7 +221,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - Unit directors launch only on Claude. `production` has only `[production.claude]`; `claude --resume` never runs without resolved flags.
 
-- `agents_config.sh` is bash only (call it through `bash -c`) and must keep working under `/bin/bash` 3.2 (no associative arrays, no `${var,,}`); the style-fix pipeline runs it unattended every ten minutes on both machines.
+- `agents_config.sh` is bash only (call it through `bash -c`) and must keep working under `/bin/bash` 3.2 (no associative arrays, no `${var,,}`).
 
 ## Calibration and gotchas
 
