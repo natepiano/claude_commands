@@ -11,7 +11,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
@@ -1976,6 +1979,137 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(rows, [(self.initial_tip, "fixed"), (checkpoint, "fixed")])
         self.assertEqual(other_commits, [(self.initial_tip,)])
 
+    def record_while_stalled(self, stalled: str, write: Callable[[style_ledger.Ledger], object]) -> None:
+        """A second ledger records a verdict while write waits 2 s in style_ledger.<stalled>."""
+        original = cast(Callable[..., object], getattr(style_ledger, stalled))
+        started = threading.Event()
+
+        def stall(*arguments: object) -> object:
+            if not started.is_set():
+                started.set()
+                time.sleep(2)
+            return original(*arguments)
+
+        _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.5))
+        rule = self.rule("concurrent")
+        recorder = self.ledger()
+        failures: list[BaseException] = []
+
+        def run() -> None:
+            # A connection serves only the thread that opened it.
+            try:
+                with style_ledger.open_ledger(self.repo) as writer:
+                    _ = write(writer)
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch.object(style_ledger, stalled, side_effect=stall):
+            thread = threading.Thread(target=run)
+            thread.start()
+            self.assertTrue(started.wait(10))
+            recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
+                            ticket="unit-1", worker="test-worker")
+            thread.join()
+        self.assertEqual(failures, [])
+        self.assertEqual(self.states(rule)[self.sources[2]], "current")
+
+    def test_set_tip_holds_no_write_lock_while_it_lists_sites(self) -> None:
+        listed = self.rule(
+            "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: marker\n  surface: whole\n",
+        )
+        self.set_tip(self.initial_tip)
+        self.write(self.sources[0], "pub fn marker() {}\n")
+        tip = self.commit("Add a marker")
+        self.record_while_stalled("enumerate_candidates", lambda ledger: ledger.set_tip(tip))
+        ledger = self.ledger()
+        self.assertEqual(ledger.synced_commit(), tip)
+        self.assertEqual({site.path for site in ledger.listed_sites(listed)}, {self.sources[0]})
+
+    def test_checkpoint_holds_no_write_lock_while_it_restamps(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        _ = ledger.ticket_base("names-1")
+        self.record(rule, path, self.initial_tip, "fixed", ticket="names-1")
+        self.write(path, "pub fn renamed() -> u32 { 1 }\n")
+        checkpoint = self.commit("Ticket checkpoint")
+        self.record_while_stalled("_fingerprint", lambda writer: writer.ticket_checkpoint("names-1", checkpoint))
+        self.assertEqual(ledger.ticket_open("names")[0]["checkpoint"], checkpoint)
+        self.assertIn(checkpoint, {judgment.commit for judgment in ledger.latest_ticket_judgments("names-1")})
+
+    def test_mark_built_holds_no_write_lock_while_it_checks_the_code(self) -> None:
+        rule, issue, _ = self.decision_findings()
+        ledger = self.ledger()
+        finding = ledger.hold(rule, self.sources[0], 3, "value", "type", "u32", "u64", self.blob(rule), "outside")
+        ledger.file_held(finding.finding_id, issue)
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        ledger.ticket_assign("names-1", "main")
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_checkpoint("names-1", self.initial_tip)
+        _ = ledger.ticket_merge("names-1")
+        self.record_while_stalled("applied_check", lambda writer: writer.mark_built(finding.finding_id))
+        built = next(item for item in ledger.proposal_findings(issue) if item.finding_id == finding.finding_id)
+        self.assertIsInstance(built.state, style_ledger.Built)
+
+    def test_decline_holds_no_write_lock_while_it_checks_judged_inputs(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[0]
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        finding = ledger.hold(rule, path, 1, "Rename value", "rename", "value", "amount", self.blob(rule), "outside")
+        ledger.record(rule, path, self.initial_tip, self.blob(rule), "held", ticket="outside")
+        self.record_while_stalled("_fingerprint", lambda writer: writer.decline_findings((finding.finding_id,), "declined"))
+        self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Waived)
+        self.assertIsInstance(ledger.newest_held_judgment(rule, path), style_ledger.NoHeldJudgment)
+
+    def judge_while_loading_rules(self, changes: int) -> tuple[style_ledger.Ledger, str, mock.MagicMock]:
+        """A names-1 ticket ready to checkpoint, and a catalog load whose first changes calls record a newer verdict for it."""
+        rule = self.rule("read")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        _ = ledger.ticket_base("names-1")
+        self.record(rule, path, self.initial_tip, "fixed", ticket="names-1")
+        self.write(path, "pub fn renamed() -> u32 { 1 }\n")
+        checkpoint = self.commit("Ticket checkpoint")
+        original = rules.load_rules
+        loads: list[Path | None] = []
+
+        def load(repo: Path | None) -> tuple[rules.Rule, ...]:
+            # The checkpoint loads the catalog once per attempt, after it reads and before it locks.
+            loads.append(repo)
+            if len(loads) <= changes:
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute(
+                        'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope) '
+                        + 'SELECT rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,?,?,declared_scope '
+                        + "FROM judgments WHERE ticket='names-1' LIMIT 1",
+                        (f"worker-{len(loads)}", datetime.now(timezone.utc).isoformat()))
+            return original(repo)
+
+        return ledger, checkpoint, self.enterContext(mock.patch.object(rules, "load_rules", side_effect=load))
+
+    def test_checkpoint_starts_again_when_its_judgments_change_before_the_lock(self) -> None:
+        ledger, checkpoint, load = self.judge_while_loading_rules(1)
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual(ledger.ticket_open("names")[0]["checkpoint"], checkpoint)
+        self.assertEqual({judgment.commit for judgment in ledger.latest_ticket_judgments("names-1")}, {checkpoint})
+
+    def test_checkpoint_refuses_after_its_judgments_change_on_every_attempt(self) -> None:
+        ledger, checkpoint, load = self.judge_while_loading_rules(style_ledger.LOCK_ATTEMPTS)
+        with self.assertRaisesRegex(style_ledger.ChangedBeforeLock, "names-1: the ticket changed while it became checkpointed; rerun"):
+            ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertEqual(load.call_count, style_ledger.LOCK_ATTEMPTS)
+        self.assertEqual(ledger.ticket_open("names")[0]["state"], "assigned")
+
     def test_checkpoint_keeps_verdicts_stale_and_reissues_when_an_outside_commit_changed_the_path(self) -> None:
         rule = self.rule("read")
         path = self.sources[0]
@@ -2922,13 +3056,33 @@ class StyleLedgerTests(unittest.TestCase):
             _ = path.write_text(path.read_text() + "Concurrent edit\n")
             return catalog
 
-        with mock.patch.object(rules, "load_rules", side_effect=catalog_then_edit):
-            with self.assertRaisesRegex(style_ledger.LedgerError, second + ": rule changed while pinning; rerun"):
+        with mock.patch.object(rules, "load_rules", side_effect=catalog_then_edit) as load:
+            with self.assertRaisesRegex(style_ledger.ChangedBeforeLock, second + ": rule changed while pinning; rerun"):
                 ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [first, second])
+        self.assertEqual(load.call_count, style_ledger.LOCK_ATTEMPTS)
         self.assertEqual(ledger.queued_tickets("read"), ())
         with closing(sqlite3.connect(ledger.database)) as connection:
             texts = cast(list[tuple[str]], connection.execute("SELECT blob FROM rule_texts").fetchall())
         self.assertEqual(texts, [])
+
+    def test_rule_edit_during_one_pinning_attempt_pins_the_edited_text(self) -> None:
+        rule = self.rule("first")
+        ledger = self.ledger()
+        path = self.rule_dir / "first.md"
+        catalog = rules.load_rules(self.repo)
+        original = rules.load_rules
+
+        def edit_once(repo: Path | None) -> tuple[rules.Rule, ...]:
+            if repo == self.repo and not path.read_text().endswith("Concurrent edit\n"):
+                _ = path.write_text(path.read_text() + "Concurrent edit\n")
+                return catalog
+            return original(repo)
+
+        with mock.patch.object(rules, "load_rules", side_effect=edit_once) as load:
+            ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        self.assertEqual(load.call_count, 2)
+        pinned, = ledger.pinned_rule_texts("read-1")
+        self.assertEqual(pinned.text, path.read_bytes())
 
     def test_ticket_start_is_recorded_once_and_survives_reopening_and_branch_deletion(self) -> None:
         rule = self.rule("read")
