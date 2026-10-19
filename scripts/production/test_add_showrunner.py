@@ -246,7 +246,7 @@ class AddShowrunnerTests(unittest.TestCase):
         }
         responses[f"--session {slug} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
-        responses[f"--session {slug} pane read w1:p1 --source visible"] = CommandResponse(
+        responses[f"--session {slug} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
         responses[f"--session {slug} agent prompt w1:p1 {prompt}"] = CommandResponse(

@@ -167,7 +167,8 @@ class PromptSubmissionTests(unittest.TestCase):
         return {"agent_status": status if ready else "starting", "interactive_ready": ready}
 
     def read_screen(self, *arguments: str) -> str:
-        self.assertEqual(arguments, ("pane", "read", "destination:p1", "--source", "visible"))
+        self.assertIn(arguments, {("pane", "read", "destination:p1", "--source", "visible"),
+                                  ("pane", "read", "destination:p1", "--source", "visible", "--format", "ansi")})
         return self.screen
 
     def write_turn(self, text: str, *, kind: str = "user", meta: bool = False,
@@ -663,7 +664,11 @@ class PromptSubmissionTests(unittest.TestCase):
             ("─── named composer ─\n❯ \xa0\n────────\n  footer", True, False),
             ("─── named composer ─\n❯ resume the saved work\n  ---\n  > quoted line\n────────\n  footer", False, True),
             ("────────\n  > resume the saved work\n────────", False, False),
-            ("────────\n❯ resume the saved work\n────────\nAssistant output", False, False))
+            ("────────\n❯ resume the saved work\n────────\nAssistant output", False, False),
+            # A new session's faint hint is not input, but coloured or bold typed text is.
+            ("────────\r\n❯\xa0\x1b[0m\x1b[2mTry \"fix lint errors\"\x1b[0m\r\n────────\r\n  footer", True, False),
+            ("────────\n❯ \x1b[38;2;200;100;50mresume the saved work\x1b[0m\n────────", False, True),
+            ("────────\n❯ \x1b[1;2mhint\x1b[22mresume the saved work\x1b[0m\n────────", False, True))
         for screen, empty, contains in cases:
             with self.subTest(screen=screen):
                 self.screen = screen

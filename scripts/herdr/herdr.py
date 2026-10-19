@@ -369,13 +369,51 @@ class NoComposer:
     """The visible screen has no current input box."""
 
 
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def _prompt_screen(screen: str) -> str:
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen)
+    return _ESCAPE.sub("", screen)
+
+
+def _faint_after(parameters: str, faint: bool) -> bool:
+    """The faint state after one SGR sequence; colour arguments (38/48/58 ;5;n or ;2;r;g;b) are skipped."""
+    values = parameters.split(";")
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value in {"", "0", "22"}:
+            faint = False
+        elif value == "2":
+            faint = True
+        elif value in {"38", "48", "58"} and index + 1 < len(values):
+            index += {"5": 2, "2": 4}.get(values[index + 1], 0)
+        index += 1
+    return faint
+
+
+def _typed_text(screen: str) -> str:
+    """The screen without escapes and without faint text, which is Claude's placeholder hint, never input."""
+    kept: list[str] = []
+    faint, position = False, 0
+    for match in _SGR.finditer(screen):
+        segment = _ESCAPE.sub("", screen[position:match.start()])
+        kept.append("".join(char for char in segment if char in "\r\n") if faint else segment)
+        faint = _faint_after(match.group(1), faint)
+        position = match.end()
+    segment = _ESCAPE.sub("", screen[position:])
+    kept.append("".join(char for char in segment if char in "\r\n") if faint else segment)
+    return "".join(kept)
 
 
 def _composer_input(screen: str) -> ComposerInput | NoComposer:
-    """Parse the final live composer, excluding old input and its footer."""
+    """Parse the final live composer, excluding old input and its footer.
+
+    An ANSI screen (`--format ansi`) lets faint placeholder text such as `Try "fix lint errors"` read as empty.
+    """
     lines = _prompt_screen(screen).splitlines()
+    typed = _typed_text(screen).splitlines()
     closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
     if not closing_borders:
         return NoComposer()
@@ -389,7 +427,7 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
     # Column-zero output below the last box makes that box scrollback.
     if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
         return NoComposer()
-    region = lines[top_borders[-1] + 1:closing]
+    region = typed[top_borders[-1] + 1:closing]
     region[0] = re.sub(r"^[❯>]\s*", "", region[0])
     return ComposerInput("\n".join(line.strip() for line in region))
 
@@ -1121,8 +1159,9 @@ class Herdr:
                         for _, row in reader.read_turns())
         if not ready:
             return PromptInputNotReady("destination session is still loading")
-        screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
-        composer = _composer_input(screen)
+        raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+        screen = _prompt_screen(raw)
+        composer = _composer_input(raw)
         if isinstance(composer, ComposerInput) and not composer.text.strip():
             return PromptInputReady(screen, idle)
         return PromptInputNotReady("destination has no empty composer", screen)
@@ -1148,11 +1187,11 @@ class Herdr:
 
     def prompt_in_input(self, pane: str, text: str) -> bool:
         """Read only the visible composer's last input region, never transcript scrollback."""
-        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible"))
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
         return isinstance(composer, ComposerInput) and composer.contains(text)
 
     def prompt_input_empty(self, pane: str) -> bool:
-        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible"))
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
         return isinstance(composer, ComposerInput) and not composer.text.strip()
 
     def _wait_for_submit(self, cursor: TranscriptCursor, text: str, deadline: float) -> PromptSubmitOutcome:
@@ -1253,8 +1292,9 @@ class Herdr:
                     result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
                     if isinstance(result, PromptSubmitted):
                         return bound_outcome(result)
-                    screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
-                    composer = _composer_input(screen)
+                    raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+                    screen = _prompt_screen(raw)
+                    composer = _composer_input(raw)
                     if time.monotonic() >= deadline:
                         return deadline_failure()
                     if isinstance(cursor.readability, TranscriptUnreadable):
