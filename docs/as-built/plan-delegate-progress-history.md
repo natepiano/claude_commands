@@ -305,9 +305,11 @@ review records its pass under the slot `pool_<reviewer>`
 worktree, and the branch when it differs: the phase heading, one ETA line, the
 verification block's gate notes when there is one, one `- **Agent N**` line per
 worker, the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
-`--tables` adds two tables to it: the clocks table above the phase heading, and
-the round table with its `Earlier:` line under the ETA line. `/unit:report
-tables` passes `--tables`; ordinary reports and notifier ticks do not. The
+In the dual layout the clocks table prints above the phase heading in every
+report. `--tables` adds the round table with its `Earlier:` line under the ETA
+line. The legacy layout prints the clocks table only under `--tables`.
+`/unit:report tables` passes `--tables`; ordinary reports and notifier ticks do
+not. The
 worktree line carries no position: how far through the plan the run is belongs
 to the clocks table's Phases column, and a plan with deferred earlier phases or
 retired ids puts the active phase at an ordinal that matches neither number.
@@ -537,7 +539,7 @@ promise. With neither, or under a gate with no clear time, both read `—`.
 An active phase with no pass or activity open — reviews closed, repair writers
 not started — still gets every section. `progress` (`_print_last_recorded`)
 reads the phase's last `progress_reported` event and prints the short report
-from it, and under `--tables` the clocks table: that call's
+from it, with the clocks table: that call's
 percentages, unchanged clocks, and calibration spread, with elapsed and ETA
 measured at the event's timestamp and each arrival's day named from now. The
 `Phases` cell counts the plan as it stands. A `*Percentages and clocks as of <time>,
@@ -555,8 +557,8 @@ project clock.
 A missing phase, or a closed phase with no open activity, is refused with
 `No active phase to report`. When the last phase is closed and an activity is
 still open, `progress` prints the short report from that phase's last recorded
-values, both tables too under `--tables`, and shows the activity as the stage
-line.
+values, clocks table included, and shows the activity as the stage line. The
+round table needs `--tables`.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the

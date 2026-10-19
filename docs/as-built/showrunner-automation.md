@@ -267,7 +267,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - Idle: `IDLE_LIMIT` is 80 characters; `idle.until` is a naive local time in the report's zone, compared with the renderer's naive local now.
 
-- Recorder: `_event` stamps the phase in state on every event, active or closed; nothing else carries an activity's phase. When the last phase is closed but an activity is open, `progress` prints the short report from that phase's last recorded values, with the clocks and round tables only under `--tables`, and shows the activity as the stage line. `No active phase to report: …` remains for a missing or closed phase with no open activity.
+- Recorder: `_event` stamps the phase in state on every event, active or closed; nothing else carries an activity's phase. When the last phase is closed but an activity is open, `progress` prints the short report from that phase's last recorded values, clocks table included, and shows the activity as the stage line. The round table needs `--tables`. `No active phase to report: …` remains for a missing or closed phase with no open activity.
 
 - The recorder other units run is the main checkout's copy under `~/.claude/scripts/delegate/`; a change in a worktree reaches them, and their `review-trial` line, only when promoted.
 
