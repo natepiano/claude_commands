@@ -252,6 +252,20 @@ class StylePlanTests(unittest.TestCase):
             + "A cell is recorded only after both judges have judged it: held when either judge holds a finding in it, ",
             self.plan.read_text())
 
+    def test_written_phase_limits_file_scope_verdicts_to_file_local_clean_or_exception(self) -> None:
+        _ = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket_id = self.ledger().ticket_open("names-unit")[0]["id"]
+        self.assertIn(
+            f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; "
+            + "the ledger takes its pinned rule blob.\n"
+            + "Add `--input-scope file` only to a crate or module cell of a Rust source file.\n"
+            + "Use it only for a `clean` or `exception` verdict based on that file alone.\n"
+            + "Without this flag, changes to any file in the crate or module scope can make the verdict stale.\n",
+            self.plan.read_text(),
+        )
+
     def test_written_names_read_phase_uses_two_blind_judges_for_small_and_large_slices(self) -> None:
         rule = self.rule("read")
         files = list(self.sources[:2]) + [f"crates/alpha/src/extra_{index}.rs" for index in range(11)]

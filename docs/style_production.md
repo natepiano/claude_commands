@@ -183,7 +183,9 @@ Bootstrap and sync store the style branch with
 without one, unmerged judgments read `stale`.
 
 Fingerprints use committed Git objects at the rule's `file`, `crate` or
-`manifest` scope. The manifest scope covers the workspace root and member
+`manifest` scope. A `clean` or `exception` verdict with `--input-scope file` uses
+the file's own fingerprint. It stays current when other files in its crate or
+module change. The manifest scope covers the workspace root and member
 manifests; crate `.` covers only its own files. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
