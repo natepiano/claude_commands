@@ -2052,37 +2052,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 74 — The pick verb leaves the accounts command line  · status: done
 
-**Depends on:** Phase 73
+#### As-built
 
-#### Work Order
-
-**Goal:** `accounts.py` has no `pick` verb. The user reads `/showrunner:accounts` and never runs `pick`, and no script calls it (the user via the showrunner, 2026-10-18: "i don't think that i ever need to use this myself as i can just look at accounts"; "give it the change to the /showrunner:accounts command"). The ranking stays, because the automatic moves use it. A refused move names the account with room, not a command.
-
-**Constraints from prior phases:**
-- `pick()` (`scripts/accounts/accounts.py` ~1570), `KeepAccount`, `PickedAccount`, `PickReason`, `no_room_line` (~2019) and `_pick_explanation` (~2025) stay. `placement` (~1997), `refusal_watch.py` ~840 and `scripts/whoami/quota_alert.py` (which passes `KeepAccount`) call them.
-- The CLI is the subparser at ~4128 and the `main` branch at ~4251.
-- `check_move_target` (~2998) returns `MoveRefused("accounts: <label> is out of usage (<window> <n>% left, resets <time>); pick another: … accounts.py pick claude --exclude <label> in this terminal")` when the target's fresh reading has 0% in a window and no credits.
-- Change review C4 (0% = no room in pick) is closed by the room-until-refusal rule; this phase does not touch it.
-
-**Spec:**
-1. Remove the `pick` subparser and its `main` branch. `accounts.py pick …` exits with argparse's invalid-choice error.
-2. `check_move_target`'s refusal keeps its first clause and replaces `pick another: …` with the result of `pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())`: `<label> has room` when an account is picked, else the `no_room_line("claude", …)` text. Example: `accounts: claude3 is out of usage (weekly 0% left, resets Sat 8:59 AM); claude2 has room`.
-3. Tests that ran the verb (`PickerTests.cli` in `test_accounts.py` ~4867 and the CLI tuples at ~316, ~5013, ~5227, ~5246) call `pick()` and `_pick_explanation` directly or drop the `pick` tuples, so the ranking keeps its coverage. A new test pins that `pick` is no longer a verb. `test_account_move.py` ~821 asserts the new text in both branches (an account with room; none with room).
-4. Docs: `commands/showrunner/accounts.md` drops `pick …` from argument-hint and its bullet. `docs/accounts.md` ~199 shows the new refusal text, and "Picking an account" (~220) says how the soonest-reset account with room is chosen and points at `placement --explain` for the per-account reasons, with no verb. The plan's as-built lines that name the verb (about lines 100, 617, 946 and 947) say it was removed in this phase.
+- `accounts.py` has no `pick` verb; `accounts.py pick …` exits 2 with argparse's invalid-choice error. `/showrunner:accounts` lists no `pick`. The user asked for this through the showrunner (2026-10-18): they read `/showrunner:accounts` and never run `pick`.
+- `pick()`, `KeepAccount`, `PickedAccount`, `PickReason`, `no_room_line` and `_pick_explanation` stay. The automatic moves (`refusal_watch.py`), `placement --explain` and `quota_alert.py` call them.
+- `check_move_target` refuses a target that is out of usage with `accounts: <target> is out of usage (<window> <n>% left, resets <time>); <label> has room`. It gets `<label>` from `pick("claude", now, exclude={target}, keep=NoKeep())`. When no account has room, it ends with `no_room_line` (`no claude account has room; the earliest reset is <time>`).
+- `docs/accounts.md` "Picking an account" gives the ranking (soonest weekly reset, then most weekly room, then label) and points at `placement --explain` for each account's reason.
 
 **Files:**
-- `scripts/accounts/accounts.py` — remove the verb; new refusal text.
-- `scripts/accounts/test_accounts.py` — tests off the verb; the no-verb test.
-- `scripts/shutdown/test_account_move.py` — the new refusal text.
-- `commands/showrunner/accounts.md` — no pick.
-- `docs/accounts.md` — the refusal text and the picking section.
-- `docs/plans/build-followups-two-accounts.md` — as-built lines.
+- `scripts/accounts/accounts.py` — no verb; the refusal names the account with room.
+- `scripts/accounts/test_accounts.py` — the picker tests call `pick()` directly; `test_pick_is_not_a_command`.
+- `scripts/shutdown/test_account_move.py` — both refusal texts, for a hand move and a group move.
+- `commands/showrunner/accounts.md`, `docs/accounts.md` — no verb; the new refusal text.
 
-**Workers:** 1 writer. impl owns all six files.
-
-**Verification:** `scripts.accounts.test_accounts scripts.accounts.test_refusal_watch scripts.shutdown.test_account_move scripts.whoami.test_quota_alert` with a scratch HOME; basedpyright 0/0 on the changed Python files.
-
-**Acceptance gate:**
-- **No verb:** `accounts.py pick claude` exits 2 with an invalid-choice error.
-- **Refusal names room:** the exhausted-target move test passes with `claude2 has room` (or the no-room line) and no `pick` in the text.
-- **Suites:** the four suites pass, basedpyright reports 0/0, and the merge gate on natedev passes.
+**Gotchas:**
+- `test_launch_accounts.py`'s shell-launch guard still rejects `accounts.py pick` in a launcher script. It guards against the verb coming back, so it stays.
+- The refusal now runs the ranking. A defect in a candidate home that makes `pick()` raise changes the refusal into that error. The move is still refused.
+- C4 (0% means no room in pick) stays closed under the room-until-refusal rule. This phase did not change it.
