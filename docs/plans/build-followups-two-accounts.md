@@ -2094,30 +2094,17 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 76 — A held quota continuation recovers when its account has room  · status: done
 
-**Depends on:** Phase 75
+#### As-built
 
-#### Work Order
-
-**Goal:** a Codex seat that owes a quota continuation is no longer held for good when its serving account has no refusal on record. The showrunner reported it 2026-10-19: berth-parallel's seat `cargo-liner-berth-parallel-mac` stays at `state unknown (quota handoff did not establish a recoverable account; continuation is held); no turn resubmitted`. codex1 ran out at 01:45, the work moved back to Codex at 01:47, and at 01:47:55 the turn ended on an ImportError (`refusals.py` → `usage_store.py`, mid-promotion of Phase 75). So no refusal was ever written. The workers account (codex2) is at 100%.
-
-**Constraints from prior phases:**
-- `codex_mesh._move_idle_worker` (~3896): when the roster says `continuation_owed` and `_quota_continuation_ready` is False, an unknown account or an account with no entry in `refusals.load()` returns `WorkerThreadStateUnknown` (raised as `WorkerMoveUncertain`, permanent). An account with a refusal that is not resolved returns `WorkerWaitingOnLiveTurn("the refused account has not recovered")`, which is checked again at the next attempt.
-- `_quota_continuation_ready` (~3784) returns True when the selected workers home is not the serving home. Otherwise it needs a refusal that `refusals.resolved()` accepts. `refusals.stored_reading("codex", login, now)` gives `FreshReading` (weekly and optional five-hour windows with `left`), `StaleReading` or `NoReading`.
-
-**Spec:**
-1. In `_quota_continuation_ready`, a known serving account with no refusal on record is ready when `stored_reading` is a `FreshReading` and each of its windows has `left > 0`.
-2. In `_move_idle_worker`, a known account with no refusal on record and no fresh reading with room returns `WorkerWaitingOnLiveTurn` with a short reason (for example `"no fresh reading shows room on the account"`), so the next attempt checks again. An `UnknownCodexAccount` stays `WorkerThreadStateUnknown` as today.
-3. When the continuation becomes ready, the existing path submits `Continue where you stopped.` on the same thread and clears `continuation_owed`. No new state file, no roster hand edit.
-4. Tests: (a) owed continuation, serving home is the workers home, no refusal, a fresh reading with room → the turn starts with `Continue where you stopped.` and `continuation_owed` is False; (b) the same with a stale or empty reading → waiting, not unknown, and the roster still owes the continuation; then a fresh reading with room on the next attempt → the turn starts; (c) an unknown account → still unknown. Each of (a) and (b) fails without the fix.
+- `codex_mesh._quota_continuation_ready`: a known serving account with no refusal on record is ready when `refusals.stored_reading` is a `FreshReading` and every window it holds has `left > 0`. A recorded refusal still needs `refusals.resolved()`.
+- `codex_mesh._move_idle_worker`: an owed continuation that is not ready on a known account with no refusal returns `WorkerWaitingOnLiveTurn("no fresh reading shows room on the account")`. The roster keeps `continuation_owed`, and the next attempt checks again. An `UnknownCodexAccount` still returns `WorkerThreadStateUnknown`.
+- The showrunner reported the defect (2026-10-19): berth-parallel's Mac seat was held for good after its refusal write failed on an ImportError during the Phase 75 promotion. After this phase is live, the seat recovers at its director's next `implement.sh --to` dispatch.
 
 **Files:**
-- `scripts/agents/codex_mesh.py` — the ready check and the no-refusal branch.
-- `scripts/agents/test_codex_mesh.py` — the tests.
+- `scripts/agents/codex_mesh.py` — the ready rule and the wait branch.
+- `scripts/agents/test_codex_mesh.py` — recovery with and without a five-hour window; missing, stale and zero-room readings wait and recover later; an unknown account sends nothing; the cleanup test pins `ensure_server` to its stub port.
 
-**Workers:** 1 writer. impl owns both files.
-
-**Verification:** `scripts.agents.test_codex_mesh scripts.accounts.test_refusals scripts.accounts.test_refusal_watch` with a scratch HOME (use the test files that exist); basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **Recovers:** an owed continuation on an account with no refusal and a fresh reading with room starts its turn; without a fresh reading it waits and recovers on a later attempt.
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- With no refusal on record, a fresh reading with room is enough, also when it was taken before the failure. A recorded refusal still blocks such a reading.
+- The unreadable-thread cleanup test started a real app-server from its scratch HOME after a long suite run (its fake epoch made the process look older than the synthetic sign-in). Its `ensure_server` is now pinned to the stub port.
+- `scripts.agents.test_codex_mesh` ran about 20 minutes, and this phase's merge gate took 1258 s, where the Phase 75 gates took about 300 s. Reported to the showrunner; not diagnosed.
