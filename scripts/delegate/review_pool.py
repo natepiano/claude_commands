@@ -537,7 +537,7 @@ def command_allocate(args: PoolArguments) -> int:
     production = _production(str(args.production))
     pid = int(args.pid)
     _prime_standing(production, args.type)
-    unit = _unit_id(production.directory.name, str(args.unit))
+    unit = _lease_unit(production, str(args.unit))
     with production.locked() as pool:
         generation = pool.generation
         _require_finished_stop(pool)
@@ -613,6 +613,14 @@ def command_release(args: PoolArguments) -> int:
     return 0
 
 
+def _lease_unit(production: ProductionPool, unit: str) -> str:
+    """The lease name a caller means: a name some reviewer is leased under wins, else its Units row."""
+    with production.locked(write=False) as pool:
+        if any(isinstance(reviewer.lease, UnitLease) and reviewer.lease.unit == unit for reviewer in pool.reviewers.values()):
+            return unit
+    return _unit_id(production.directory.name, unit)
+
+
 def _unit_id(slug: str, unit: str) -> str:
     """The Units table id a caller means: `trunk` is `trunk-unit` when only that row exists.
 
@@ -637,7 +645,7 @@ def _unit_id(slug: str, unit: str) -> str:
 def command_retire(args: PoolArguments) -> int:
     """End the unit's reviewers; one still reviewing keeps its turn and is left in place."""
     production = _production(str(args.production))
-    unit = _unit_id(production.directory.name, str(args.unit))
+    unit = _lease_unit(production, str(args.unit))
     pid = os.getpid()
     with production.locked(write=False) as pool:
         _require_finished_stop(pool)

@@ -770,6 +770,13 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.succeed("retire", "--unit", "handler-enh").splitlines(), ["code7"])
         self.assertEqual(self.reviewers(), {"code3": kept})
 
+    def test_retire_of_a_leased_short_name_leaves_the_units_row_it_would_resolve_to(self) -> None:
+        self.units_table("handler-enh-unit")
+        self.seed({"code7": self.idle("handler-enh"), "code3": self.idle("handler-enh-unit")})
+        kept = self.reviewer("code3")
+        self.assertEqual(self.succeed("retire", "--unit", "handler-enh").splitlines(), ["code7"])
+        self.assertEqual(self.reviewers(), {"code3": kept})
+
     def test_a_short_name_resolves_to_its_units_row_for_retire_and_allocate(self) -> None:
         self.units_table("trunk-unit")
         _ = self.prime()
