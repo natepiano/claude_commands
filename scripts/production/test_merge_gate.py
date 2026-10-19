@@ -329,6 +329,27 @@ class MergeGateTests(unittest.TestCase):
         self.assert_refused_before_gate(self.run_gate())
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
 
+    def test_a_local_production_doc_commit_goes_out_with_the_merge(self) -> None:
+        # retire_unit, add_unit and promote_showrunner leave their doc commit to the next merge push.
+        self.write(self.checkout / "local.txt", "retired\n")
+        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Local doc commit goes out with this merge: {local[:12]}", result.stdout)
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), head)
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [head, local, self.checkpoint])
+
+    def test_a_red_gate_keeps_the_local_production_doc_commit(self) -> None:
+        self.write(self.checkout / "local.txt", "retired\n")
+        local = self.commit(self.checkout, "production(fixture): retire alpha-unit")
+        self.write(self.state / "modify-tracked", "modify")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local)
+        self.assert_not_pushed()
+
     def test_merge_checkout_behind_origin_is_refused(self) -> None:
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
         result = self.run_gate()

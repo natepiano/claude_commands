@@ -476,6 +476,23 @@ def notify_style(repo: Path, branch: str, tip: str) -> None:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)
 
 
+# add_unit.commit_paths commits a production doc change on the merge branch and leaves its push to
+# this gate (user, 2026-10-08: a push of its own starts CI). Its subjects start with this.
+DOC_COMMIT_HEAD = "production("
+
+
+def check_local_doc_commits(repo: Path, origin: str) -> None:
+    """The merge HEAD is origin's merge branch plus only production doc commits, which go out with the merge."""
+    if git(repo, "merge-base", "--is-ancestor", origin, "HEAD").returncode:
+        raise GateRefused("merge HEAD differs from origin merge branch")
+    ahead = checked_git(repo, "log", "--format=%H %P%x09%s", f"{origin}..HEAD")
+    for line in ahead.splitlines():
+        hashes, _, subject = line.partition("\t")
+        if len(hashes.split()) != 2 or not subject.startswith(DOC_COMMIT_HEAD):
+            raise GateRefused(f"merge HEAD differs from origin merge branch: {hashes.split()[0][:12]} {subject}")
+        print(f"Local doc commit goes out with this merge: {hashes.split()[0][:12]} {subject}", flush=True)
+
+
 def merge_checkpoint(args: GateArguments) -> int:
     repo = Path(str(args.repo)).resolve()
     # Untracked files (each showrunner's LOG) never block; a merge that would
@@ -485,9 +502,8 @@ def merge_checkpoint(args: GateArguments) -> int:
     if checked_git(repo, "branch", "--show-current") != args.merge_branch:
         raise GateRefused("checkout is not on the merge branch")
     fetch_branches(repo, args.merge_branch, args.unit_branch)
-    baseline = checked_git(repo, "rev-parse", f"origin/{args.merge_branch}")
-    if checked_git(repo, "rev-parse", "HEAD") != baseline:
-        raise GateRefused("merge HEAD differs from origin merge branch")
+    baseline = checked_git(repo, "rev-parse", "HEAD")
+    check_local_doc_commits(repo, f"origin/{args.merge_branch}")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
