@@ -5,12 +5,15 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import sys
 import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import proposal_issue
 from user_zone import user_zone
@@ -100,6 +103,40 @@ class ProposalIssueTests(unittest.TestCase):
         arguments[arguments.index("--findings") + 1] = "c"
         self.assertEqual(self.run_cli(*arguments)[0], 2)
         self.assertEqual(issue.read_bytes(), original)
+
+    def test_create_with_rules_writes_json_list_and_recovery_checks_only_findings(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        body = self.root / "body.md"
+        _ = body.write_text("# Keep rule lines\nRule: global:rust/names.md\n")
+        issue = self.root / "linked.md"
+        urls = "https://github.com/o/r/blob/main/b.md,https://github.com/o/r/blob/main/a.md"
+        args = ["create", str(issue), "--project", "sample", "--short", "s", "--proposed-by", "style",
+                "--findings", "one", "--rules", urls, "--template", str(template), "--body-file", str(body)]
+        code, _, error = self.run_cli(*args)
+        self.assertEqual(code, 0, error)
+        from issues import frontmatter
+        self.assertEqual(frontmatter(issue)["style_rules"], sorted(urls.split(",")))
+        original = issue.read_bytes()
+        args[args.index("--rules") + 1] = "https://github.com/o/r/blob/main/changed.md"
+        self.assertEqual(self.run_cli(*args)[0], 0)
+        self.assertEqual(issue.read_bytes(), original)
+
+    def test_rules_sets_list_preserving_other_keys_and_body_bytes(self) -> None:
+        url = "https://github.com/o/r/blob/main/rust/names.md"
+        for existing in ("", 'style_rules: ["old"]\n'):
+            with self.subTest(existing=existing):
+                original = ISSUE.replace("---\n# body", existing + "---\n# body").replace("\n", "\r\n")
+                _ = self.issue.write_bytes(original.encode())
+                code, _, error = self.run_cli("rules", str(self.issue), "--rules", url)
+                self.assertEqual(code, 0, error)
+                expected = original.replace('date_modified: "[[2026-10-01]]"', f"date_modified: {self.today()}")
+                line = f'style_rules: ["{url}"]\r\n'
+                expected = expected.replace(existing.replace("\n", "\r\n"), line) if existing else expected.replace("---\r\n# body", line + "---\r\n# body")
+                self.assertEqual(self.issue.read_bytes(), expected.encode())
+                stamp = self.issue.stat().st_mtime_ns
+                self.assertEqual(self.run_cli("rules", str(self.issue), "--rules", url)[0], 0)
+                self.assertEqual(self.issue.stat().st_mtime_ns, stamp)
 
     def test_close_accepts_a_reason_instead_of_an_as_built_path(self) -> None:
         code, _, err = self.run_cli("close", str(self.issue), "--reason", "declined: keep the API")
