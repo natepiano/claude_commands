@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 from dataclasses import dataclass
 from importlib import import_module
 from datetime import datetime
@@ -108,6 +109,7 @@ class RoutedToClaude(RoutingCommon):
     cause: Literal["refusal", "credits off", "auto"]
     why: str
     moved: list[str]
+    claude_account: NotRequired[str]
 
 
 class RoutedBack(RoutingCommon):
@@ -153,6 +155,10 @@ def _valid(value: object) -> bool:
         if kind == "routed to claude" and (fields.get("cause") not in ("refusal", "credits off", "auto")
                                                or not isinstance(fields.get("why"), str)):
             return False
+        if "claude_account" in fields:
+            target = fields["claude_account"]
+            if not isinstance(target, str) or not re.fullmatch(r"claude[1-9][0-9]*", target):
+                return False
         if kind == "routing not restored":
             if fields.get("outcome") not in ("partial", "failed"):
                 return False
@@ -254,7 +260,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
                 rows.append(row)
             except (ValueError, UnicodeError):
                 if index == len(lines) - 1 and not line.endswith(b"\n"):
-                    print(f"next moves: skipping torn final line in {path}")
+                    print(f"account moves: skipping torn final line in {path}")
                     continue
                 raise
         failed = {row.get("move_id") for row in rows if row.get("kind") == "failed"}
@@ -271,7 +277,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     except FileNotFoundError:
         return RecordedAutoEntries(frozenset())
     except (OSError, ValueError, UnicodeError) as error:
-        print(f"next moves: cannot read recorded workers moves: {error}")
+        print(f"account moves: cannot read recorded workers moves: {error}")
         return UnreadableMoveJournal()
 
 
@@ -364,7 +370,7 @@ def read_journal() -> list[JournalEntry]:
             value = cast(object, json.loads(line))
         except ValueError:
             if index == len(lines) - 1 and not line.endswith("\n"):
-                print(f"next moves: skipping torn final line in {store_file()}")
+                print(f"account moves: skipping torn final line in {store_file()}")
             continue
         if isinstance(value, dict):
             legacy = cast(dict[str, object], value)

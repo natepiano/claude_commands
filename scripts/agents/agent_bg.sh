@@ -4,6 +4,7 @@
 #
 # Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file>
 #                    <log_file> <id_file> [model] [poll_secs]
+#   env AGENT_BG_WORKERS=1        use the workers account route
 #   env AGENT_BG_EFFORT=<effort>  adds --effort to the launch
 #   env AGENT_BG_DETACH=1         return once the session is registered, with
 #                                 its id in <id_file>, instead of waiting for
@@ -198,7 +199,11 @@ else:
 fi
 
 source "$(dirname "${BASH_SOURCE[0]}")/claude_account.sh"
-claude_launch_environment || exit 1
+if [[ "${AGENT_BG_WORKERS:-0}" == "1" ]]; then
+  claude_launch_environment workers || exit 1
+else
+  claude_launch_environment || exit 1
+fi
 
 # `claude --bg` runs the session in a spare process of one long-lived per-user
 # daemon, so the session inherits the environment of whichever launch started
@@ -228,7 +233,7 @@ fi
 
 banner="$(cd "${WORKING_DIR}" \
             && env -u PLAN_DELEGATE_BOARD_DIR -u PLAN_DELEGATE_TEAM_ROLE -u AGENTS_CONFIG_FILE \
-                   -u PLAN_DELEGATE_RESOLVES_ROUND \
+                   -u PLAN_DELEGATE_RESOLVES_ROUND -u AGENT_BG_WORKERS \
                    "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
 

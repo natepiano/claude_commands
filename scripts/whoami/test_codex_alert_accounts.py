@@ -131,7 +131,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                         self.assertEqual(rendered.body, body)
                         self.assertEqual(rendered.action, ActionRequired(
                             "Optional: to move them at 1% instead, type in the natedev session: "
-                            + f"/next_moves when workers reach 1% switch to {fallback}"))
+                            + f"/account_moves when workers reach 1% switch to {fallback}"))
 
     def test_codex_reminder_catalog_examples_match_the_three_chosen_texts(self) -> None:
         entry = next(entry for entry in catalog() if entry.id == "quota.codex_next_move")
@@ -156,7 +156,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                 self.assertEqual((rendered.title, rendered.body), (title, body))
                 self.assertEqual(rendered.action, ActionRequired(
                     "Optional: to move them at 1% instead, type in the natedev session: "
-                    + f"/next_moves when workers reach 1% switch to {fallback}"))
+                    + f"/account_moves when workers reach 1% switch to {fallback}"))
 
     def test_scheduled_codex_move_fires_once_consumes_entry_and_keeps_auto_role_reason(self) -> None:
         source, target = self.account(1), self.account(2)

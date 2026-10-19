@@ -2186,3 +2186,26 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `group_status_line` stays: placement still prints it.
 - `accounts.py status` notes can still name a login (the "no account note, not selectable … with login:" line), so never run it to find a label.
 - The one pool review found one minor (a row lost its reason with the Login column). The merge gate found that status no longer said a group was not configured. Both are fixed with tests.
+
+### Phase 81 — Account moves: the new name, and workers to any account  · status: done
+
+#### As-built
+
+- `/next_moves` is `/account_moves` (`commands/account_moves.md`); the docs, the showrunner accounts skill, the push texts and the log lines (`account moves: …`) use the new name. The CLI subcommand stays `accounts.py next`, because the Mac sends it to natedev over ssh. The state file stays `next_moves.json` and the module `next_moves.py`.
+- A workers entry takes a numbered Claude account, a numbered Codex account, or bare `claude` (user, 2026-10-19). `DelegateToClaude.account` is `ClaudeWorkersTarget(label)` or `DefaultClaudeAccount()`. A named account is checked for setup and login when it is added (`claude_workers_account`) and again when the entry runs; a failed check blocks the head entry with its reason.
+- When a named entry runs, `switch_to_claude` writes the route to the role map before the registry edit: `workers_claude: {"label": "claude4", "until": "<source weekly reset>"}`. Quota state (`AccountCodexQuotaFallback.claude_account`) and the routing journal (`RoutedToClaude.claude_account`) keep it as history. The route is rolled back only when a successful read-back shows nothing moved; a rollback error is added to the switch failure. `switch_back` clears it early; otherwise it ends at `until`.
+- Worker launches read the route from the role map on both machines (`account_for_unscoped_launch(..., workers=True)`): `agent_exec.sh`, `cli_agent.sh`, and `agent_bg.sh` with `AGENT_BG_WORKERS=1`, which only `delegate/implement.sh`'s Claude worker launch sets; agent_bg removes the flag from the child. Friend sessions and the berth fixer keep the caller or showrunners account. An unreadable map with no cache refuses the launch. A route with no `until`, or past it, is the default.
+- Bare `claude` and the automatic fallback with no entry keep their old choice: a Codex account with room first, then Claude on the caller or showrunners account.
+
+**Files:**
+- `scripts/accounts/next_moves.py`, `scripts/accounts/accounts.py`, `scripts/accounts/role_map.py`, `scripts/accounts/moves.py` — targets, checks, the shared route, the launch resolver.
+- `scripts/whoami/quota_alert.py` — the named switch, rollback and history.
+- `scripts/agents/claude_account.sh`, `scripts/agents/agent_exec.sh`, `scripts/agents/agent_bg.sh`, `scripts/cli_agent/cli_agent.sh`, `scripts/delegate/implement.sh` — worker launches.
+- `scripts/accounts/test_next_moves.py`, `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/agents/test_agent_exec.sh` — tests.
+- `commands/account_moves.md`, `commands/showrunner/accounts.md`, `docs/accounts.md`, `docs/quota_alerts.md`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — text.
+
+**Gotchas:**
+- A Mac on older code ignores `workers_claude` (the decoder skips unknown keys), so it keeps the caller account until it updates.
+- Subagents inside a Claude session always use that session's account; a route cannot move them.
+- One pool review and two closure reviews found 8 issues (delegate launches ignored the route, the Mac could not see it, friends took it, a failed read-back undid it, lost state kept it, a rollback error escaped, a doc example used a wrong CLI name). Each fix has a test.
+- `test_codex_mesh` `test_follow_cli_accepts_each_new_flag_independently` failed once under gate load and passed 3 of 3 alone.

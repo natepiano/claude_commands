@@ -3327,6 +3327,27 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.run_cli("next", "remove", "workers", "1")[0], 0)
         self.assertEqual(next_moves.read_next_moves(), ())
 
+    def test_workers_queue_checks_numbered_claude_setup_and_login_before_storing(self) -> None:
+        self.write_note("claude4", "workers@example.invalid")
+        code, output, error = self.run_cli("next", "add", "workers", "1", "claude4")
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("accounts.py setup claude4", error)
+        self.assertEqual(next_moves.read_next_moves(), ())
+        _ = (self.home / ".claude.json").write_text("{}")
+        self.assertEqual(accounts.setup("claude4"), [])
+        code, _, error = self.run_cli("next", "add", "workers", "1", "claude4")
+        self.assertEqual(code, 1)
+        self.assertIn("claude and /login", error)
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.login_directory("claude4", "workers@example.invalid")
+        code, output, error = self.run_cli("next", "add", "workers", "1", "claude4")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("→ claude4", output)
+        code, listed, error = self.run_cli("next", "list")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("→ claude4", listed)
+
     def test_workers_next_cli_rejects_hold_unknown_account_and_remote_invalid_entry(self) -> None:
         for arguments in (("workers", "1", "claude", "--hold-minutes", "5"),
                           ("workers", "1", "codex99"), ("workers", "1", "claude2")):
