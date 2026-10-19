@@ -52,7 +52,7 @@
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
 | hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
-| efficiency-unit | docs/plans/build-followups-efficiency.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
+| efficiency-unit | docs/as-built/token-efficiency-study.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 
 ## Hub files
 
