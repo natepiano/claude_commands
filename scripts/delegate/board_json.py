@@ -361,8 +361,13 @@ def checkout(document: Path) -> Path:
     return next((path for path in document.parents if (path / ".git").exists()), document.parent.parent if document.parent.name == "docs" else document.parent)
 
 
-def resolve(cwd: str, production: str) -> list[showrunners.Showrunner]:
+def resolve(cwd: str, production: str, session: str = "") -> list[showrunners.Showrunner]:
     registered = showrunners.registered_showrunners()
+    if not production:
+        document = showrunners.production_of(session)
+        if document is not None:
+            production = next((runner["slug"] for runner in registered
+                               if Path(runner["doc"]).expanduser().resolve() == document.expanduser().resolve()), "")
     if not production:
         directory = Path(cwd).expanduser().resolve()
         production = next((runner["slug"] for runner in registered
@@ -402,8 +407,9 @@ def main(arguments: list[str]) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     _ = group.add_argument("--cwd", default="")
     _ = group.add_argument("--production", default="")
+    _ = parser.add_argument("--session", default="")
     args = parser.parse_args(arguments)
-    runners = resolve(cast(str, args.cwd), cast(str, args.production))
+    runners = resolve(cast(str, args.cwd), cast(str, args.production), cast(str, args.session))
     root = Path(os.environ.get("UNIT_BOARD_DIR") or str(Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")) / "unit-board")).expanduser().resolve()
     files: list[str] = []
     for runner in runners:

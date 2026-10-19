@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from "claude-code/testing";
 import type { Engine, Mounted } from "claude-code/testing";
 import type { CommandRunInput, RenderSurface, TurnCompleteInput } from "claude-code";
 import { refreshIfChanged } from "../hooks/data";
-import { BOARD, CWD, DISCOVERY, drawnText, engineFiles, fixture, hostEngine, lifecycleHarness, NOW, REGISTRY, RUN, time } from "./kit";
+import { BOARD, CWD, DISCOVERY, drawnText, engineFiles, fixture, hostEngine, lifecycleHarness, NOW, REGISTRY, RUN, SESSION, time } from "./kit";
 
 const command = (args = ""): CommandRunInput => ({ command: "showrunner:unit_board", args,
   origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 170 } });
@@ -91,7 +91,7 @@ describe("unit board commands and lifetime", () => {
       const result = await $.command.run(command());
       expect(result.text).toBe("Unit board opened.");
       expect(fake.processes).toEqual([["/test-home/.claude/scripts/lib/py",
-        "/test-home/.claude/scripts/delegate/board_json.py", "--cwd", CWD]]);
+        "/test-home/.claude/scripts/delegate/board_json.py", "--cwd", CWD, "--session", SESSION]]);
       expect(fake.opened).toEqual(["unit-board"]);
       const ui = await mount($, surface);
       let text = drawnText(await ui.drawn());
@@ -199,6 +199,41 @@ describe("unit board commands and lifetime", () => {
     expect(fake.reads).toEqual([]);
     expect(fake.stats).toEqual([]);
     expect(fake.processes).toEqual([]);
+  });
+
+  test("opening the board passes the current session id to the generator", async ($, on) => {
+    const fake = engineFiles(on);
+    fake.setSession("command-showrunner-id");
+
+    await $.command.run(command());
+
+    expect(fake.processes.length).toBe(1);
+    const argv = fake.processes[0]!;
+    expect(argv).toContain("--cwd");
+    expect(argv[argv.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(argv).toContain("--session");
+    expect(argv[argv.indexOf("--session") + 1]).toBe("command-showrunner-id");
+  });
+
+  test("session start reads the resumed session id and retains it for changed-source refreshes", async ($, on) => {
+    const fake = engineFiles(on);
+    await $.command.run(command());
+    fake.setSession("resumed-showrunner-id");
+    fake.clear();
+
+    await $.session.start(start);
+    fake.clear();
+    fake.setSession("later-service-id");
+    fake.mtimes.set(RUN, NOW + 1);
+    await fake.clock.advance(10_000);
+
+    expect(fake.processes.length).toBe(1);
+    const refreshed = fake.processes[0]!;
+    expect(refreshed).toContain("--cwd");
+    expect(refreshed[refreshed.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(refreshed).toContain("--session");
+    expect(refreshed[refreshed.indexOf("--session") + 1]).toBe("resumed-showrunner-id");
+    expect(fake.reads).toEqual([BOARD]);
   });
 
   test("session restart with an existing pane resumes one refresh loop", async ($, on) => {
