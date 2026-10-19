@@ -64,7 +64,7 @@ else:
     import record as shutdown_record
     from record import SessionShutdown
 
-RESERVED = frozenset({"review-unit", add_unit.NIGHTLY_REVIEW_UNIT})
+RESERVED = frozenset({add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.
 EDITED_COLUMNS = {"## Hub files": ("Owner unit", "Other units that touch it"), "## Gates": ("Waiting", "Waits on")}
 PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept", "old_session")
@@ -775,7 +775,7 @@ def _describe_merge_rename(r: UnitRename) -> str:
 
 
 def _describe_state(r: UnitRename) -> str:
-    return ("state: report scratch, stall-watch stretch, reviewer leases and memory, run record, open proposals, "
+    return ("state: report scratch, stall-watch stretch, reviewer leases, run record, open proposals, "
             + f"phase notes: {r.old} -> {r.new}")
 
 

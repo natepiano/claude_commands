@@ -240,14 +240,6 @@ class NoMarkedUnit:
     """No session carries the requested unit's marks."""
 
 
-def is_review_unit(unit: str, lines: list[str]) -> bool:
-    """Whether `unit` is the review unit of the production doc whose lines these are.
-
-    The review unit runs `/review:direct` and is idle by design between reviews.
-    """
-    return unit == "review-unit" and any(line.startswith("- **Review pool:** ") for line in lines)
-
-
 def read_production(path: Path) -> Production:
     """Read the production fields shared with merge_checkpoint.py."""
     try:
@@ -670,7 +662,6 @@ def prompt_for(request: UnitLaunch) -> str:
             prompt += " " + request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
         return prompt
     plan = request.plan_path.as_posix()
-    review_unit = is_review_unit(request.identity.unit, production.doc.read_text(encoding="utf-8").splitlines())
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
         identity = (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
@@ -680,12 +671,8 @@ def prompt_for(request: UnitLaunch) -> str:
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             note = request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
             return f"{identity} {note}"
-        if review_unit:
-            return f"{identity} Run /review:direct {doc}."
         return f"{identity} Run /unit:direct {plan}."
     if isinstance(request.plan, PlanGiven):
-        if review_unit:
-            return f"/review:direct {doc}"
         return f"/unit:direct {plan}"
     return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "
@@ -699,7 +686,7 @@ def host_session_name(request: UnitLaunch) -> str:
     """The destination name, limited to characters supported by named herdr sessions.
 
     A new launch's name leads with the production slug, since every production may have a unit of
-    the same name (each has a review-unit). A restore keeps the name its session was recorded under
+    the same name (each had a review-unit). A restore keeps the name its session was recorded under
     when that name leads with the slug; a record from before the slug led, such as `review`, would
     take another production's live session of that name, so it gets the new launch's name instead.
     """
