@@ -3560,7 +3560,7 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
         self.assertTrue(push.message.startswith("Session: Display name\nAction: "))
-        self.assertIn("in a terminal on natedev:", push.body.casefold())
+        self.assertIn("in a terminal on natedev, run:", push.body.casefold())
 
     def test_holdout_push_uses_the_canonical_label_without_the_login_email(self) -> None:
         for reason, expected_id in (("showing a form", "shutdown.holdout"), ("waiting", "shutdown.holdout_unanswered")):
@@ -4078,7 +4078,7 @@ class SettleTests(ShutdownTestCase):
         self.assertIn("Held", push.title)
         self.assertIn("shutdown", push.title)
         self.assertIn("is blocked", push.title)
-        self.assertIn("in a terminal on mac:", push.body.casefold())
+        self.assertIn("in a terminal on mac, run:", push.body.casefold())
         self.assertIn(f"now {LABEL} --here --only held", push.body)
         self.assertIn(f"now {LOGIN} --here --only held", cast(str, sender.call_args.args[2]))
 
