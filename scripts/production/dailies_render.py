@@ -969,12 +969,18 @@ def check_words(line: str, key: str, where: str) -> None:
 
 
 def check_plumbing(line: str, name: str) -> None:
+    problem = plumbing(line)
+    if problem is not None:
+        raise InputError(f"{name}: {problem}")
+
+
+def plumbing(line: str) -> str | None:
+    """Why the line fails the plumbing check, or None when it passes."""
     found = PLUMBING.search(line)
-    if found is not None:
-        raise InputError(
-            f"{name}: {found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
-            + "say what changes in the app, or leave it out"
-        )
+    if found is None:
+        return None
+    return (f"{found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
+            + "say what changes in the app, or leave it out")
 
 
 def read_outstanding(path: Path | None) -> list[Outstanding]:
@@ -998,7 +1004,8 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
             raise InputError(f"{where}.after: expected YYYY-MM-DDTHH:MM")
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
-        check_plumbing(text, f"{where}.text")
+        # The plumbing check runs when `update_registration.py questions` writes an item, not here:
+        # a stored item that fails it must not take the whole list down.
         timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
         since_at = datetime.fromisoformat(since)
         question = fields.get("question")
