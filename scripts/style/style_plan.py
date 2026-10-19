@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from enum import Enum
+from itertools import accumulate
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import cast
@@ -26,6 +27,9 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
+from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
+                              MissingFile, NoQualifiedRename, RenameNotApplied, UncertainScan, applied_check,
+                              approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
@@ -218,23 +222,16 @@ def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, bo
     return BusyFiles(board, busy)
 
 
-@dataclass(frozen=True)
-class ApprovedRename:
-    parent: str
-    old: str
-    new: str
-
-
 def approved_rename_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[ApprovedRename, ...]:
     pairs: list[ApprovedRename] = []
     for finding in findings:
-        before, after = finding.before.split("::"), finding.after.split("::")
-        if (finding.kind != "rename" or len(before) < 2 or len(before) != len(after)
-                or before[:-1] != after[:-1] or before[-1] == after[-1]
-                or not style_footprint.IDENTIFIER.fullmatch(before[-1])
-                or not style_footprint.IDENTIFIER.fullmatch(after[-1])):
+        # A file rename's edits in other files are judged by approved_module_file.
+        if isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename):
+            continue
+        pair = approved_rename(finding.kind, finding.before, finding.after)
+        if isinstance(pair, NoQualifiedRename):
             return ()
-        pairs.append(ApprovedRename(before[-2], before[-1], after[-1]))
+        pairs.append(pair)
     return tuple(pairs)
 
 
@@ -293,27 +290,6 @@ def approved_reference_qualifier(
     return parent != "Self" and parent == pair.parent
 
 
-def approved_declaration_sites(words: tuple[str, ...], pair: ApprovedRename) -> frozenset[int]:
-    sites = {index for body in style_footprint.enum_bodies(words) if body.name == pair.parent
-             for index in body.variants if words[index] == pair.old}
-    bodies = list(style_footprint.impl_bodies(words, pair.parent))
-    for index, word in enumerate(words[:-2]):
-        if word in {"mod", "trait"} and words[index + 1] == pair.parent:
-            start = next((i for i in range(index + 2, len(words)) if words[i] in {"{", ";"}), len(words))
-            if start < len(words) and words[start] == "{":
-                bodies.append((start, style_footprint.closing(words, start)))
-    for start, end in bodies:
-        cursor = start + 1
-        while cursor < end:
-            if words[cursor] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
-                if cursor + 1 < end and words[cursor + 1] == pair.old:
-                    sites.add(cursor + 1)
-            if words[cursor] in {"{", "(", "["}:
-                cursor = style_footprint.closing(words, cursor)
-            cursor += 1
-    return frozenset(sites)
-
-
 def unique_rename_mentions(
     repo: Path, pairs: tuple[ApprovedRename, ...], finding_files: set[str],
 ) -> frozenset[ApprovedRename]:
@@ -338,7 +314,8 @@ def unique_rename_mentions(
         words = tuple(token.value for token in source)
         use_parents = use_reference_parents(words)
         for pair in tuple(unique):
-            declarations = approved_declaration_sites(words, pair) if path in finding_files else frozenset[int]()
+            found = declaration_sites(words, path, pair, pair.old) if path in finding_files else UncertainScan()
+            declarations = found.sites if isinstance(found, Declarations) else frozenset[int]()
             for index, token in enumerate(source):
                 if token.kind != "identifier" or token.value != pair.old:
                     continue
@@ -416,7 +393,458 @@ def approved_reference_file(
     return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
 
 
+def approved_file_renames(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[FileRename, ...]:
+    return tuple(moved for finding in findings
+                 if isinstance(moved := file_rename(finding.kind, finding.path, finding.after), FileRename))
+
+
+@dataclass(frozen=True)
+class NoCrateRoot:
+    """No folder above the renamed file holds a `lib.rs` or `main.rs`."""
+
+
+@dataclass(frozen=True)
+class Library:
+    """The library target of the renamed file's crate, by the name that paths in other crates start with."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class NoLibrary:
+    """The renamed file's crate has no library target the gate can name, so no path outside the crate names its modules."""
+
+
+@dataclass(frozen=True)
+class OutsideCrate:
+    """The file is not a module file of the renamed file's crate, so its `crate`, `self` and `super` paths do not resolve."""
+
+
+CrateModule = tuple[str, ...] | OutsideCrate
+
+
+@dataclass(frozen=True)
+class UnresolvedPath:
+    """The path does not start at `crate`, `self` or `super`, or its file is outside the crate, so it names no known module."""
+
+
+@dataclass(frozen=True)
+class UseTrees:
+    """The path before each segment and glob of the file's `use` items, and the `use` keyword of each segment and alias."""
+
+    prefixes: Mapping[int, tuple[str, ...]]
+    keywords: Mapping[int, int]
+
+
+@dataclass(frozen=True)
+class ModuleBinding:
+    """An item, import or alias that binds the renamed module's name in one inline module scope of a file."""
+
+    scope: tuple[InlineModule, ...]
+    renamed: bool
+
+
+@dataclass(frozen=True)
+class GlobImport:
+    """A `*` import in one inline module scope, and the module path it imports from."""
+
+    scope: tuple[InlineModule, ...]
+    source: tuple[str, ...] | UnresolvedPath
+
+
+# The anchors that start a path the gate resolves from the file's own module.
+PATH_ANCHORS = frozenset({"crate", "self", "super"})
+# The item keywords whose name is in the type namespace, where a module name lives.
+TYPE_ITEM_KEYWORDS = frozenset({"mod", "struct", "enum", "union", "trait", "type"})
+# The words after a `use` leaf.
+USE_LEAF_ENDS = frozenset({";", ",", "}", "as"})
+
+
+def crate_root(repo: Path, moved: FileRename) -> PurePosixPath | NoCrateRoot:
+    """The nearest folder above the renamed file that holds a crate root file."""
+    for folder in PurePosixPath(moved.old).parents:
+        if any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs")):
+            return folder
+    return NoCrateRoot()
+
+
+def crate_library(repo: Path, root: PurePosixPath) -> Library | NoLibrary:
+    """The library of the crate whose root files are in root: its `[lib]` name, else its package name in snake case."""
+    manifest = repo / root.parent / "Cargo.toml"
+    if not (repo / root / "lib.rs").is_file() or not manifest.is_file():
+        return NoLibrary()
+    try:
+        data: dict[str, object] = tomllib.loads(manifest.read_text())
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return NoLibrary()
+    for table in (data.get("lib"), data.get("package")):
+        if isinstance(table, dict) and isinstance(name := cast(dict[str, object], table).get("name"), str):
+            return Library(name.replace("-", "_"))
+    return NoLibrary()
+
+
+def crate_module(path: str, root: PurePosixPath) -> CrateModule:
+    """The module path of a Rust file under the crate root folder: `()` for the crate root file."""
+    file = PurePosixPath(path)
+    if file.suffix != ".rs" or not file.is_relative_to(root):
+        return OutsideCrate()
+    folders = file.relative_to(root).parent.parts
+    if folders[:1] == ("bin",):
+        # Each file in `bin` is the root of a crate of its own.
+        return OutsideCrate()
+    if not folders and file.stem in {"lib", "main"}:
+        return ()
+    return folders if file.stem == "mod" else (*folders, file.stem)
+
+
+def resolved_module(prefix: tuple[str, ...], module: CrateModule) -> tuple[str, ...] | UnresolvedPath:
+    """The module that a path starting at `crate`, `self` or `super` names from module."""
+    if isinstance(module, OutsideCrate) or not prefix or prefix[0] not in PATH_ANCHORS:
+        return UnresolvedPath()
+    rest = prefix[1:]
+    base = () if prefix[0] == "crate" else module
+    if prefix[0] == "super":
+        rest = prefix
+        while rest and rest[0] == "super":
+            if not base:
+                return UnresolvedPath()
+            base, rest = base[:-1], rest[1:]
+    return UnresolvedPath() if PATH_ANCHORS & set(rest) else base + rest
+
+
+def use_trees(words: tuple[str, ...], starts: frozenset[int]) -> UseTrees:
+    prefixes: dict[int, tuple[str, ...]] = {}
+    keywords: dict[int, int] = {}
+    for keyword, word in enumerate(words):
+        if word != "use" or keyword not in starts:
+            continue
+        groups: list[tuple[str, ...]] = [()]
+        path: list[str] = []
+        cursor = keyword + 1
+        while cursor < len(words) and words[cursor] != ";":
+            part = words[cursor]
+            if part == "{":
+                groups.append(groups[-1] + tuple(path))
+                path = []
+            elif part in {"}", ","}:
+                if part == "}" and len(groups) > 1:
+                    _ = groups.pop()
+                path = []
+            elif part == "as":
+                cursor += 1
+                keywords[cursor] = keyword
+            elif part != "::":
+                prefixes[cursor] = groups[-1] + tuple(path)
+                keywords[cursor] = keyword
+                path.append(part)
+            cursor += 1
+    return UseTrees(prefixes, keywords)
+
+
+@dataclass(frozen=True)
+class RenamedModuleScan:
+    """One Rust file read at HEAD, and the module file rename whose references the scan finds in it."""
+
+    words: tuple[str, ...]
+    module: CrateModule
+    parent: tuple[str, ...]
+    stem: str
+    library: Library | NoLibrary
+
+    def sites(self) -> frozenset[int]:
+        """The words that name the renamed module: its `mod` line and the path segments that name it.
+
+        A word is a site only when the scan is certain; the gate keeps every other word unchanged.
+        """
+        words, stem = self.words, self.stem
+        starts = item_starts(words)
+        modules = inline_modules(words, starts)
+        trees = use_trees(words, starts)
+        depths = (0, *accumulate((word == "{") - (word == "}") for word in words))
+        bindings: list[ModuleBinding] = []
+        globs: list[GlobImport] = []
+        block_bindings = False
+        for index, word in enumerate(words[:-1]):
+            if index == 0 or word not in {"*", stem}:
+                continue
+            # A binding is in the scope of its `use` keyword, or of the keyword just before its name.
+            anchor = trees.keywords.get(index, index - 1)
+            scope = enclosing(modules, anchor)
+            if word == "*":
+                if index in trees.prefixes:
+                    globs.append(GlobImport(scope, resolved_module(trees.prefixes[index], self.scope_module(scope))))
+                continue
+            renamed = self.mod_line(index, starts, modules)
+            if index in trees.prefixes and words[index + 1] in {";", ",", "}"}:
+                renamed = self.names_parent(trees.prefixes[index], self.scope_module(scope))
+            elif not (renamed or words[index - 1] == "as"
+                      or (words[index - 1] in TYPE_ITEM_KEYWORDS and index - 1 in starts)
+                      or words[index - 2:index] == ("extern", "crate")):
+                continue
+            if depths[anchor] == len(scope):
+                bindings.append(ModuleBinding(scope, renamed))
+            else:
+                block_bindings = True
+        found: set[int] = set()
+        for index, word in enumerate(words[:-1]):
+            if index == 0 or word != stem or words[index - 1] == "." or words[index + 1:index + 3] == ("::", "<"):
+                continue
+            scope = enclosing(modules, index)
+            if self.mod_line(index, starts, modules):
+                found.add(index)
+            elif index in trees.prefixes and (trees.prefixes[index] or words[index - 1] == "::"):
+                if (words[index + 1] == "::" or words[index + 1] in USE_LEAF_ENDS) and self.names_parent(
+                        trees.prefixes[index], self.scope_module(enclosing(modules, trees.keywords[index]))):
+                    found.add(index)
+            elif words[index + 1] == "::":
+                prefix = self.qualifier(index)
+                if ((prefix and self.names_parent(prefix, self.scope_module(scope)))
+                        or (not prefix and words[index - 1] != "::" and not block_bindings
+                            and self.bound_in(scope, tuple(bindings), tuple(globs)))):
+                    found.add(index)
+        return frozenset(found)
+
+    def scope_module(self, scope: tuple[InlineModule, ...]) -> CrateModule:
+        if isinstance(self.module, OutsideCrate):
+            return self.module
+        return self.module + tuple(module.name for module in scope)
+
+    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> bool:
+        """Whether the word at index is the name in the renamed module's `mod <name>;` line."""
+        return (self.words[index - 1:index] == ("mod",) and index - 1 in starts
+                and self.words[index + 1:index + 2] == (";",)
+                and self.scope_module(enclosing(modules, index)) == self.parent)
+
+    def names_parent(self, prefix: tuple[str, ...], module: CrateModule) -> bool:
+        """Whether a path prefix read in module names the renamed module's parent.
+
+        A plain prefix such as `ledger` names it from a child of module inside the crate, and from the library's name in
+        a file outside the crate.
+        """
+        if prefix and prefix[0] in PATH_ANCHORS:
+            return resolved_module(prefix, module) == self.parent
+        if not prefix or PATH_ANCHORS & set(prefix):
+            return False
+        if isinstance(module, OutsideCrate):
+            return isinstance(self.library, Library) and prefix == (self.library.name, *self.parent)
+        return module + prefix == self.parent
+
+    def qualifier(self, index: int) -> tuple[str, ...]:
+        """The path segments joined by `::` before the word at index."""
+        segments: list[str] = []
+        while index >= 2 and self.words[index - 1] == "::" and style_footprint.IDENTIFIER.fullmatch(self.words[index - 2]):
+            segments.insert(0, self.words[index - 2])
+            index -= 2
+        return () if index >= 1 and self.words[index - 1] == "::" else tuple(segments)
+
+    def bound_in(self, scope: tuple[InlineModule, ...], bindings: tuple[ModuleBinding, ...],
+                 globs: tuple[GlobImport, ...]) -> bool:
+        """Whether the stem names the renamed module in scope: every binding there does, or with none, a glob brings it.
+
+        A glob from an outer inline module scope of the file brings what that scope binds.
+        """
+        bound = tuple(binding.renamed for binding in bindings if binding.scope == scope)
+        if bound:
+            return all(bound)
+        for glob in globs:
+            if glob.scope != scope:
+                continue
+            if glob.source == self.parent or any(
+                    glob.source == self.scope_module(scope[:depth]) and self.bound_in(scope[:depth], bindings, globs)
+                    for depth in range(len(scope))):
+                return True
+        return False
+
+
+def without_trailing_commas(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words without a comma that ends a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
+
+    A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
+    does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
+    a tuple, where `(x,)` and `(x)` differ, so its comma stays.
+    """
+    droppable: list[bool] = []
+    dropped: set[int] = set()
+    for index, word in enumerate(words):
+        if word in {"(", "[", "{"}:
+            lead = words[index - 1] if index else ""
+            droppable.append(word != "(" or lead in {">", ")", "]"} or (
+                style_footprint.IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS))
+        elif word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",):
+            dropped.add(index - 1)
+    return tuple(word for index, word in enumerate(words) if index not in dropped)
+
+
+def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words of a `use` item with the entries of each brace group in sorted order."""
+    result: list[str] = []
+    cursor = 0
+    while cursor < len(words):
+        if words[cursor] != "{":
+            result.append(words[cursor])
+            cursor += 1
+            continue
+        end = style_footprint.closing(words, cursor)
+        entries: list[tuple[str, ...]] = []
+        start = inner = cursor + 1
+        while inner < end:
+            if words[inner] == "{":
+                inner = style_footprint.closing(words, inner)
+            elif words[inner] == ",":
+                entries.append(sorted_use_groups(words[start:inner]))
+                start = inner + 1
+            inner += 1
+        entries.append(sorted_use_groups(words[start:end]))
+        result.append("{")
+        for position, entry in enumerate(sorted(entry for entry in entries if entry)):
+            result.extend((",", *entry) if position else entry)
+        result.append("}")
+        cursor = end + 1
+    return tuple(result)
+
+
+def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
+    """The first and last word of each `use` item and `mod <name>;` item, attributes and visibility included, in order.
+
+    An item with a `macro_use` attribute is left out: its place decides where its macros can be used.
+    """
+    starts = item_starts(words)
+    attributes = {end: start for start, end in style_footprint.attribute_spans(words)}
+    visibilities = {style_footprint.closing(words, index + 1) + 1: index for index, word in enumerate(words[:-1])
+                    if word == "pub" and words[index + 1] == "("}
+    items: list[tuple[int, int]] = []
+    for keyword, word in enumerate(words):
+        if keyword not in starts:
+            continue
+        if word == "use":
+            end = next((index for index in range(keyword, len(words)) if words[index] == ";"), len(words))
+        elif word == "mod" and words[keyword + 2:keyword + 3] == (";",):
+            end = keyword + 2
+        else:
+            continue
+        start = visibilities.get(keyword, keyword - 1 if words[keyword - 1:keyword] == ("pub",) else keyword)
+        while start in attributes:
+            start = attributes[start]
+        if end < len(words) and "macro_use" not in words[start:keyword]:
+            items.append((start, end))
+    return tuple(items)
+
+
+def module_runs(words: tuple[str, ...]) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """The runs of adjacent module items, each item by its first and last word, in order."""
+    runs: list[list[tuple[int, int]]] = []
+    for start, end in module_items(words):
+        if runs and runs[-1][-1][1] + 1 == start:
+            runs[-1].append((start, end))
+        else:
+            runs.append([(start, end)])
+    return tuple(tuple(run) for run in runs)
+
+
+def canonical_order(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words with trailing commas dropped, use group entries sorted and each run of adjacent module items sorted.
+
+    None of these changes the code, and rustfmt makes them when a rename changes a name's sort order or line length.
+    """
+    words = without_trailing_commas(words)
+    result: list[str] = []
+    cursor = 0
+    for run in module_runs(words):
+        result.extend(words[cursor:run[0][0]])
+        result.extend(word for item in sorted(sorted_use_groups(words[start:end + 1]) for start, end in run)
+                      for word in item)
+        cursor = run[-1][1] + 1
+    result.extend(words[cursor:])
+    return tuple(result)
+
+
+def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...]) -> tuple[str | tuple[str, ...], ...]:
+    """The stripped lines of the comments between the code tokens, in order.
+
+    The lines from the start of a run of module items to its last word are one sorted entry: canonical_order sorts the
+    run's items, and their comments move with them.
+    """
+    ends = (0, *(span.end for span in spans))
+    starts = (*(span.start for span in spans), len(text))
+    gaps = tuple(tuple(line.strip() for line in text[end:start].splitlines() if line.strip())
+                 for end, start in zip(ends, starts, strict=True))
+    entries: list[str | tuple[str, ...]] = []
+    cursor = 0
+    for run in module_runs(tuple(span.token.value for span in spans)):
+        first, last = run[0][0], run[-1][1]
+        entries.extend(line for gap in gaps[cursor:first] for line in gap)
+        entries.append(tuple(sorted(line for gap in gaps[first:last + 1] for line in gap)))
+        cursor = last + 1
+    entries.extend(line for gap in gaps[cursor:] for line in gap)
+    return tuple(entries)
+
+
+def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
+    """Whether a Rust file outside the findings changes only the `mod` lines and module paths of approved file renames,
+    and the qualified references of approved renames.
+
+    The file's HEAD words with each module site renamed, then each qualified reference, must equal its worktree words in
+    canonical order, and no comment changes. A qualified reference reads its parent from the HEAD words.
+    """
+    target = repo / path
+    if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
+        return False
+    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
+    if result.returncode:
+        return False
+    try:
+        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return False
+    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    if len(old) != len(style_footprint.tokens(before)) or len(new) != len(style_footprint.tokens(after)):
+        return False
+    words = tuple(span.token.value for span in old)
+    renamed = list(words)
+    for moved in moves:
+        root = crate_root(repo, moved)
+        if isinstance(root, NoCrateRoot):
+            return False
+        module = crate_module(moved.old, root)
+        if isinstance(module, OutsideCrate):
+            return False
+        scan = RenamedModuleScan(words, crate_module(path, root), module[:-1], moved.old_stem, crate_library(repo, root))
+        for index in scan.sites():
+            renamed[index] = moved.new_stem
+    if tuple(renamed) == words:
+        return False
+    use_parents = use_reference_parents(words)
+    for index, word in enumerate(words):
+        for pair in pairs:
+            if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
+                renamed[index] = pair.new
+    return (canonical_order(tuple(renamed)) == canonical_order(tuple(span.token.value for span in new))
+            and comment_lines(before, old) == comment_lines(after, new))
+
+
+def outside_refusal(path: str, moves: tuple[FileRename, ...]) -> str:
+    """Why the gate refuses a changed file outside the findings: a person moves a renamed module's folder of children."""
+    for moved in moves:
+        for folder in moved.module_folders:
+            if path.startswith(folder + "/"):
+                return f"{path} (in {folder}/, the folder of a renamed module: a person moves it)"
+    return f"{path} (change is not an approved rename reference)"
+
+
+def worktree_file(repo: Path, path: str) -> bytes | Folder | MissingFile:
+    target = repo / path
+    if target.is_dir():
+        return Folder()
+    return target.read_bytes() if target.is_file() else MissingFile()
+
+
+def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedCheck:
+    """Whether the finding's change is in the worktree."""
+    return applied_check(finding.kind, finding.before, finding.after, finding.path, lambda path: worktree_file(repo, path))
+
+
 def gate(repo: Path, ticket_id: str) -> int:
+    """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
         with style_ledger.open_ledger(repo) as ledger:
             origin = ledger.ticket_origin(ticket_id)
@@ -429,7 +857,7 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
-                return 0 if result.returncode == 0 else 1
+                return result.returncode if result.returncode in (0, 2) else 1
             fields = frontmatter(origin.issue)
             decision = Issue(origin.issue, fields)
             answer = decision_answer(decision)
@@ -444,26 +872,36 @@ def gate(repo: Path, ticket_id: str) -> int:
                     or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
                            or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
                 raise style_ledger.LedgerError("proposal approval or filed findings changed")
-            allowed = {finding.path for finding in findings}
+            moves = approved_file_renames(findings)
+            allowed = {finding.path for finding in findings} | {moved.new for moved in moves}
             outside = changed_files(repo) - allowed
             if outside:
                 pairs = approved_rename_pairs(findings)
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
                 refused = [path for path in sorted(outside)
-                           if path not in modified or not approved_reference_file(repo, path, pairs, unique)]
+                           if path not in modified or not (approved_reference_file(repo, path, pairs, unique)
+                                                           or approved_module_file(repo, path, moves, pairs))]
                 if refused:
                     raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
-                        f"{path} (change is not an approved rename reference)" for path in refused))
+                        outside_refusal(path, moves) for path in refused))
+            unapplied = tuple(finding for finding in findings if isinstance(worktree_check(repo, finding), RenameNotApplied))
+            if unapplied:
+                for finding in unapplied:
+                    print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
+                return 1
             print("approved proposal")
             return 0
-    except (OSError, ValueError, sqlite3.Error) as error:
+    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+        print(f"error: {error}")
+        return 2
+    except ValueError as error:
         print(f"review: {error}")
         return 1
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         rows = cast(list[tuple[str]], connection.execute("SELECT tip FROM sync WHERE id=1").fetchall())
     if not rows:
         raise style_ledger.LedgerError("no synced tip; run set-tip first")
@@ -471,7 +909,7 @@ def synced_tip(ledger: style_ledger.Ledger) -> str:
 
 
 def synced_style_branch(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         rows = cast(list[tuple[str]], connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
     return rows[0][0] if rows else ""
 
@@ -486,20 +924,20 @@ def coverage_footprint_base(repo: Path, ledger: style_ledger.Ledger, recorded_ba
     if resolved.returncode == 1:
         return recorded_base
     if resolved.returncode:
-        raise style_ledger.LedgerError(resolved.stderr.strip() or "git rev-parse failed")
+        raise style_ledger.CheckCouldNotRun(resolved.stderr.strip() or "git rev-parse failed")
     merged = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD", resolved.stdout.strip()],
                             capture_output=True, text=True, check=False)
     if merged.returncode == 1:
         return recorded_base
     if merged.returncode:
-        raise style_ledger.LedgerError(merged.stderr.strip() or "git merge-base failed")
+        raise style_ledger.CheckCouldNotRun(merged.stderr.strip() or "git merge-base failed")
     base = merged.stdout.strip()
     ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", recorded_base, base],
                               capture_output=True, text=True, check=False)
     if ancestry.returncode == 1:
         return recorded_base
     if ancestry.returncode:
-        raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
+        raise style_ledger.CheckCouldNotRun(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
     return base
 
 
@@ -888,15 +1326,18 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
              + "renamed item, and leave mentions of other items with the same name. "
              + "Change nothing else in those files. "
              if approved_rename_pairs(held_findings) else "")
+          + ("For a file rename, rename the file, then update its `mod` line and each path that names the module "
+             + "in other files; change nothing else in those files, comments included. "
+             if approved_file_renames(held_findings) else "")
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
         "Hold a finding only when the cited rule's text requires the change.",
         f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
         f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
-        "Add `--input-scope file` only to a crate or module cell of a Rust source file.",
-        "Use it only for a `clean` or `exception` verdict based on that file alone.",
-        "Without this flag, changes to any file in the crate or module scope can make the verdict stale.",
+        "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
+        "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
+        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
@@ -968,7 +1409,7 @@ PHASE = re.compile(r"(?ms)^### Phase \d+ — (?P<id>[^\s]+)[^\n]*(?:\n|\Z).*?(?=
 
 
 def discard_finished(ledger: style_ledger.Ledger, text: str) -> tuple[str, tuple[str, ...]]:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         states = dict(cast(list[tuple[str, str]], connection.execute("SELECT id,state FROM tickets").fetchall()))
     changes: list[str] = []
     def keep(match: re.Match[str]) -> str:

@@ -140,7 +140,6 @@ class UnitRenameTests(unittest.TestCase):
             name: {"type": "codex", "thread_id": f"thread-{name}", "prime_hash": "h",
                    "lease": {"unit": unit, "ordinal": 3}, "busy_pid": None, "reviews": 2}
             for name, unit in (("r1", "alpha-unit"), ("r2", "mul_add-unit"))}}))
-        self.write(self.root / "state/review-pool/demo/memory/alpha-unit.md", "alpha memory\n")
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),
@@ -218,7 +217,16 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("'chore(demo): rename unit alpha-unit to gamma-unit'", result.stdout)
 
     def test_apply_moves_every_place(self) -> None:
+        records = self.home / ".local/state/herdr-panes"
+        for session, panes in (("agents", {"w1:p2": "alpha-unit", "w1:p3": "beta-unit"}),
+                               ("work", {"w2:p1": "alpha-unit"})):
+            self.write(records / f"{session}.json", json.dumps(
+                {pane: {"environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()}))
         self.assert_ok(self.rename("apply", "alpha-unit", "gamma-unit"))
+        # The old pane's entry would resume the old name; the relaunched unit records its new pane.
+        self.assertEqual(json.loads((records / "agents.json").read_text()),
+                         {"w1:p3": {"environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
+        self.assertEqual(json.loads((records / "work.json").read_text()), {})
         new = self.rust / "claude-demo-gamma"
         self.assertFalse((self.rust / "claude-demo-alpha").exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=new), "demo-gamma")
@@ -247,7 +255,6 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "gamma-unit", "ordinal": 3})
         self.assertEqual(pool["reviewers"]["r1"]["thread_id"], "thread-r1")
         self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
-        self.assertTrue((self.root / "state/review-pool/demo/memory/gamma-unit.md").exists())
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
         self.assertEqual((started["working_dir"], started["branch"], started["plan_doc"]),
                          (str(new), "demo-gamma", f"{new}/docs/plans/alpha.md"))
@@ -410,7 +417,7 @@ class UnitRenameTests(unittest.TestCase):
 
     def test_refusals(self) -> None:
         cases = [
-            (("alpha", "review-unit"), "is known to code"),
+            (("alpha", "nightly-review-unit"), "is known to code"),
             (("alpha", "mul_add"), "already in the Units table"),
             (("alpha", "bad name"), "letters, numbers"),
             (("missing", "gamma"), "expected one Units row"),

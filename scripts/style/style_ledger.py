@@ -26,17 +26,29 @@ from typing import Literal, TypedDict, cast
 
 import rules as rule_catalog
 import style_rules
+from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
 Verdict = Literal["clean", "fixed", "exception", "held", "waived"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
+# How long every ledger connection waits for another writer's lock before it fails.
+BUSY_TIMEOUT_SECONDS = 30
 
 
 class DeclaredInputScope(StrEnum):
     RULE = "rule"
     FILE = "file"
+
+
+@dataclass(frozen=True)
+class UndeclaredInputScope:
+    """The judge gave no input scope; a cell that allows file scope refuses a scoped verdict."""
+
+
+UNDECLARED_INPUT_SCOPE = UndeclaredInputScope()
+SCOPED_VERDICTS: tuple[Verdict, ...] = ("clean", "exception", "held")
 
 
 class CellInputScope(StrEnum):
@@ -61,6 +73,10 @@ def _cell_scope(rule: Rule, path: str, tip: RepositoryTip) -> CellInputScope:
 
 class LedgerError(ValueError):
     """A ledger operation cannot represent the requested check."""
+
+
+class CheckCouldNotRun(LedgerError):
+    """A git command failed or the ledger schema is newer than this script; the request is not at fault."""
 
 
 @dataclass(frozen=True)
@@ -260,6 +276,21 @@ class HeldFinding:
 
 
 @dataclass(frozen=True)
+class FindingNotBuilt:
+    """A merged ticket's finding that stays filed for a later ticket."""
+
+    finding_id: str
+    cause: RenameNotApplied | NoAppliedCheck
+
+
+def not_built_line(repo: Path, item: FindingNotBuilt) -> str:
+    if isinstance(item.cause, RenameNotApplied):
+        return f"not built {item.finding_id}: rename not applied in {item.cause.path}"
+    return (f"not built {item.finding_id}: {item.cause.kind} has no applied check; mark it built with "
+            + f"style_ledger.py held built --repo {repo} --id {item.finding_id} after checking")
+
+
+@dataclass(frozen=True)
 class NoPendingHandoffs:
     """Every hand-off has reached the branch point."""
 
@@ -380,7 +411,7 @@ def _git(repo: Path, *arguments: str) -> str:
         ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False,
     )
     if result.returncode:
-        raise LedgerError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+        raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout.rstrip("\n")
 
 
@@ -624,23 +655,27 @@ class Ledger:
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
-        self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=30)
-        _ = self._connection.execute("PRAGMA foreign_keys=ON")
-        _ = self._connection.execute("BEGIN IMMEDIATE")
-        _ = self._connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
-        versions = cast(list[tuple[int]], self._connection.execute("SELECT version FROM schema_version").fetchall())
-        version = versions[0][0] if versions else 0
-        if version > max(MIGRATIONS):
+        self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
+        try:
+            _ = self._connection.execute("PRAGMA foreign_keys=ON")
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            _ = self._connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+            versions = cast(list[tuple[int]], self._connection.execute("SELECT version FROM schema_version").fetchall())
+            version = versions[0][0] if versions else 0
+            if version > max(MIGRATIONS):
+                raise CheckCouldNotRun(f"unsupported ledger schema version {version}")
+            for number, migration in sorted(MIGRATIONS.items()):
+                if number > version:
+                    for statement in migration.split(";"):
+                        if statement.strip():
+                            _ = self._connection.execute(statement)
+                    _ = self._connection.execute("DELETE FROM schema_version")
+                    _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
+            self._connection.commit()
+        except BaseException:
+            # A locked or newer ledger fails here; close so the caller holds no connection.
             self.close()
-            raise LedgerError(f"unsupported ledger schema version {version}")
-        for number, migration in sorted(MIGRATIONS.items()):
-            if number > version:
-                for statement in migration.split(";"):
-                    if statement.strip():
-                        _ = self._connection.execute(statement)
-                _ = self._connection.execute("DELETE FROM schema_version")
-                _ = self._connection.execute("INSERT INTO schema_version VALUES (?)", (number,))
-        self._connection.commit()
+            raise
 
     def close(self) -> None:
         self._connection.close()
@@ -885,7 +920,27 @@ class Ledger:
             )
             _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
 
-    def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> None:
+    def applied_check(self, finding: HeldFinding, commit: str) -> AppliedCheck:
+        """Whether the finding's change is in the code at commit."""
+        return applied_check(finding.kind, finding.before, finding.after, finding.path,
+                             lambda path: self._file_at(commit, path))
+
+    def _file_at(self, commit: str, path: str) -> bytes | Folder | MissingFile:
+        """What is at path in commit: a file's bytes, a folder or nothing. A git error raises, so it never reads as nothing."""
+        entry = _git(self.repo, "ls-tree", commit, "--", path)
+        if not entry:
+            return MissingFile()
+        # An entry reads `<mode> <type> <object>\t<path>`.
+        if entry.split()[1] == "tree":
+            return Folder()
+        shown = subprocess.run(["git", "-C", str(self.repo), "show", f"{commit}:{path}"], capture_output=True, check=False)
+        if shown.returncode:
+            raise CheckCouldNotRun(shown.stderr.decode(errors="replace").strip() or f"git show {commit}:{path} failed")
+        return shown.stdout
+
+    def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> tuple[FindingNotBuilt, ...]:
+        """Move the ticket to target. A proposal merge returns each of its findings that stays filed."""
+        not_built: list[FindingNotBuilt] = []
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             ticket = self._ticket(id)
@@ -895,7 +950,7 @@ class Ledger:
                     raise LedgerError(f"{id}: assigned to branch {ticket['branch']}")
                 if target == "checkpointed" and ticket["checkpoint"] != commit:
                     raise LedgerError(f"{id}: checkpointed at {ticket['checkpoint']}")
-                return
+                return ()
             predecessor = {"assigned": "queued", "checkpointed": "assigned", "merged": "checkpointed"}
             if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
                 raise LedgerError(f"{id}: cannot become {target} from {state}")
@@ -911,10 +966,24 @@ class Ledger:
                 if active:
                     raise LedgerError(f"{id}: unit {ticket['unit']} already has {active[0]['id']} in state {active[0]['state']}")
             if target == "merged" and ticket["kind"] == "proposal":
-                _ = self._connection.execute(
-                    "UPDATE held_findings SET state='built',updated_at=? WHERE build_ticket=? AND state='filed'",
-                    (_now(), id),
-                )
+                now = _now()
+                rows = cast(list[tuple[str]], self._connection.execute(
+                    "SELECT finding_id FROM held_findings WHERE build_ticket=? AND state='filed' ORDER BY finding_id", (id,),
+                ).fetchall())
+                for (finding_id,) in rows:
+                    check = self.applied_check(self._held(finding_id), ticket["checkpoint"])
+                    if isinstance(check, AppliedInCode):
+                        _ = self._connection.execute(
+                            "UPDATE held_findings SET state='built',updated_at=? WHERE finding_id=?", (now, finding_id),
+                        )
+                        continue
+                    if isinstance(check, RenameNotApplied):
+                        # The next refill takes the finding into a new ticket.
+                        _ = self._connection.execute(
+                            "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                        )
+                    # A finding with no check keeps the merged ticket, so refill skips it until a person marks it built.
+                    not_built.append(FindingNotBuilt(finding_id, check))
             if target == "dropped" and ticket["kind"] == "proposal":
                 _ = self._connection.execute(
                     "UPDATE held_findings SET build_ticket='',updated_at=? WHERE build_ticket=? AND state='filed'",
@@ -925,11 +994,12 @@ class Ledger:
                 (target, branch if target == "assigned" else ticket["branch"],
                  commit if target == "checkpointed" else ticket["checkpoint"], _now(), id),
             )
+        return tuple(not_built)
 
     def ticket_assign(self, id: str, branch: str) -> None:
         branch = "refs/heads/" + branch.removeprefix("refs/heads/")
         _ = _git(self.repo, "check-ref-format", branch)
-        self._ticket_transition(id, "assigned", branch=branch)
+        _ = self._ticket_transition(id, "assigned", branch=branch)
 
     def ticket_base(self, id: str) -> str:
         """Remember the assigned branch's start before publishing its first phase."""
@@ -945,7 +1015,7 @@ class Ledger:
             return base
 
     def ticket_checkpoint(self, id: str, commit: str) -> None:
-        self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
+        _ = self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
 
     def _restamp_checkpoint_judgments(self, ticket: TicketRecord, checkpoint: str) -> None:
         """Carry this ticket's verdicts across edits made only by this ticket."""
@@ -984,10 +1054,18 @@ class Ledger:
                 (scope, fingerprint, checkpoint, datetime.now(timezone.utc).isoformat(), judgment_id),
             )
 
-    def ticket_merge(self, id: str) -> None:
+    def ticket_merge(self, id: str) -> tuple[FindingNotBuilt, ...]:
+        """Mark the ticket merged. A proposal finding becomes built only when its change is in the checkpoint.
+
+        Each run, also on a merged ticket, returns the findings that wait for a person to mark them built.
+        """
         ticket = self._ticket(id)
         if ticket["state"] == "merged":
-            return
+            # Merge clears the build ticket of a rename that is not applied, so a finding that keeps it has no check.
+            rows = cast(list[tuple[str, FindingKind]], self._connection.execute(
+                "SELECT finding_id,kind FROM held_findings WHERE build_ticket=? AND state='filed' ORDER BY finding_id", (id,),
+            ).fetchall())
+            return tuple(FindingNotBuilt(finding_id, NoAppliedCheck(kind)) for finding_id, kind in rows)
         if ticket["state"] != "checkpointed":
             raise LedgerError(f"{id}: cannot become merged from {ticket['state']}")
         rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -995,7 +1073,7 @@ class Ledger:
         branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
         if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
             raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
-        self._ticket_transition(id, "merged")
+        return self._ticket_transition(id, "merged")
 
     def wait_for_sync(self, unit: str) -> None:
         with self._connection:
@@ -1031,8 +1109,15 @@ class Ledger:
         ).fetchall())
         return tuple(self._ticket(row[0]) for row in rows)
 
+    def unsynced_merges(self, proposal: Path) -> tuple[TicketRecord, ...]:
+        """The merged tickets of the proposal whose checkpoint the synced commit does not hold."""
+        commit = self.synced_commit()
+        return tuple(ticket for ticket in self.proposal_tickets()
+                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == proposal
+                     and not self._is_ancestor(ticket["checkpoint"], commit))
+
     def ticket_drop(self, id: str) -> None:
-        self._ticket_transition(id, "dropped")
+        _ = self._ticket_transition(id, "dropped")
 
     def ticket_open(self, unit: str) -> tuple[TicketRecord, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
@@ -1346,6 +1431,43 @@ class Ledger:
                 raise LedgerError(f"{finding_id}: cannot file finding in state {state}")
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
+    def mark_built(self, finding_id: str) -> None:
+        """Mark a filed finding built after a person checked that its change is in the code.
+
+        The finding needs a merged build ticket, and a rename must be applied at that ticket's checkpoint.
+        """
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            finding = self._held(finding_id)
+            if isinstance(finding.state, Built):
+                return
+            if not isinstance(finding.state, Filed):
+                state = "waived" if isinstance(finding.state, Waived) else "unfiled"
+                raise LedgerError(f"{finding_id}: cannot mark a {state} finding built")
+            if not isinstance(finding.build_ticket, BuildTicket):
+                raise LedgerError(f"{finding_id}: no merged build ticket")
+            ticket = self._ticket(finding.build_ticket.ticket)
+            if ticket["state"] not in FINAL_TICKET_STATES:
+                raise LedgerError(f"{finding_id}: build ticket {ticket['id']} still holds the finding")
+            if ticket["state"] != "merged":
+                raise LedgerError(f"{finding_id}: no merged build ticket")
+            check = self.applied_check(finding, ticket["checkpoint"])
+            if isinstance(check, RenameNotApplied):
+                raise LedgerError(f"{finding_id}: rename not applied in {check.path} at {ticket['id']} checkpoint")
+            _ = self._connection.execute("UPDATE held_findings SET state='built',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+
+    def return_to_filed(self, finding_ids: Iterable[str]) -> None:
+        """Set built findings whose change is not in the code back to filed, with no build ticket."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            now = _now()
+            for finding_id in finding_ids:
+                if not isinstance(self._held(finding_id).state, Built):
+                    raise LedgerError(f"{finding_id}: finding is not built")
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET state='filed',build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                )
+
     def waive_held(self, finding_id: str) -> None:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
@@ -1384,8 +1506,9 @@ class Ledger:
         tickets = cast(list[tuple[str, str, str, str]], self._connection.execute("SELECT id,branch,state,checkpoint FROM tickets WHERE state IN ('assigned','checkpointed') ORDER BY id").fetchall())
         for id, branch, state, checkpoint in tickets:
             if state == "checkpointed" and self._is_ancestor(checkpoint, style_tip):
-                self.ticket_merge(id)
+                not_built = self.ticket_merge(id)
                 changes.append(f"ticket {id}: checkpointed -> merged")
+                changes.extend(not_built_line(self.repo, item) for item in not_built)
             elif state == "assigned":
                 result = subprocess.run(["git", "-C", str(self.repo), "show-ref", "--verify", "--quiet", branch], check=False, capture_output=True)
                 if result.returncode == 1:
@@ -1522,10 +1645,10 @@ class Ledger:
     def record(
         self, rule: str, path: str, commit: str, rule_blob: str, verdict: Verdict,
         detail: str = "", ticket: str = "", worker: str = "", *,
-        input_scope: DeclaredInputScope = DeclaredInputScope.RULE,
+        input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE,
     ) -> None:
-        if input_scope == DeclaredInputScope.FILE and verdict not in ("clean", "exception"):
-            raise LedgerError(f"{verdict}: file input scope requires clean or exception")
+        if input_scope == DeclaredInputScope.FILE and verdict not in SCOPED_VERDICTS:
+            raise LedgerError(f"{verdict}: file input scope requires clean, exception or held")
         self._catalog = rule_catalog.load_rules(self.repo)
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
@@ -1562,10 +1685,18 @@ class Ledger:
                 raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
-        if input_scope == DeclaredInputScope.FILE:
+        file_scope_allowed = scope in (CellInputScope.CRATE, CellInputScope.MODULE) and path in tip.rust_files
+        if isinstance(input_scope, UndeclaredInputScope):
+            if file_scope_allowed and verdict in SCOPED_VERDICTS:
+                raise LedgerError(
+                    f"{rule}: {path}: say --input-scope file (the verdict rests on this file alone; "
+                    + "it stays current when other files change) or --input-scope rule "
+                    + "(the verdict rests on the rule's crate or module scope)")
+            input_scope = DeclaredInputScope.RULE
+        elif input_scope == DeclaredInputScope.FILE:
             if scope == CellInputScope.FILE:
                 input_scope = DeclaredInputScope.RULE
-            elif scope == CellInputScope.MANIFEST or path not in tip.rust_files:
+            elif not file_scope_allowed:
                 raise LedgerError(f"{rule}: {path}: file input scope requires an included Rust file, not a manifest or crate cell")
             else:
                 scope = _comparison_scope(input_scope, scope)
@@ -1786,8 +1917,9 @@ def preview_ledger(repo: Path) -> Generator[Ledger]:
     with tempfile.TemporaryDirectory(prefix="style-ledger-preview-") as directory:
         database = Path(directory) / "ledger.sqlite"
         if location.database.exists():
-            with (closing(sqlite3.connect(location.database.resolve().as_uri() + "?mode=ro", uri=True)) as source,
-                  closing(sqlite3.connect(database)) as destination):
+            with (closing(sqlite3.connect(location.database.resolve().as_uri() + "?mode=ro", uri=True,
+                                          timeout=BUSY_TIMEOUT_SECONDS)) as source,
+                  closing(sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)) as destination):
                 source.backup(destination)
         with Ledger(location.repo, database) as ledger:
             yield ledger
@@ -1801,7 +1933,7 @@ class LedgerArguments(argparse.Namespace):
     commit: str = ""
     rule_blob: str = ""
     verdict: Verdict = "clean"
-    input_scope: DeclaredInputScope = DeclaredInputScope.RULE
+    input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE
     detail: str = ""
     ticket: str = ""
     worker: str = ""
@@ -1901,7 +2033,7 @@ def main() -> None:
     _ = record.add_argument("--rule-blob", default="")
     _ = record.add_argument("--verdict", choices=("clean", "fixed", "exception", "held", "waived"), required=True)
     _ = record.add_argument("--detail", default="")
-    _ = record.add_argument("--input-scope", choices=(DeclaredInputScope.FILE,), type=DeclaredInputScope, default=DeclaredInputScope.RULE)
+    _ = record.add_argument("--input-scope", choices=tuple(DeclaredInputScope), type=DeclaredInputScope, default=UNDECLARED_INPUT_SCOPE)
     candidate = commands.add_parser("candidate")
     for field in ("ticket", "site", "idea"):
         _ = candidate.add_argument(f"--{field}", required=True)
@@ -1928,7 +2060,7 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "file", "waive", "list")),
+        ("held", ("add", "file", "waive", "built", "list")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -2020,7 +2152,8 @@ def main() -> None:
                 elif args.action == "checkpoint":
                     ledger.ticket_checkpoint(args.id, args.commit)
                 elif args.action == "merge":
-                    ledger.ticket_merge(args.id)
+                    for item in ledger.ticket_merge(args.id):
+                        print(not_built_line(ledger.repo, item))
                     if ledger.sync_waits():
                         _wake_sync_waiters(ledger.repo, args.id)
                 elif args.action == "drop":
@@ -2059,6 +2192,8 @@ def main() -> None:
                     ledger.file_held(args.id, Path(args.proposal))
                 elif args.action == "waive":
                     ledger.waive_held(args.id)
+                elif args.action == "built":
+                    ledger.mark_built(args.id)
                 else:
                     findings = ledger.held_findings(HeldFindingsInState(args.state) if args.state else AllHeldFindings())
                     if args.json:

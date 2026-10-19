@@ -204,7 +204,6 @@ PY="${SCRIPT_DIR}/../lib/py"
 POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
 MESH_SESSION_DIR="${SESSION_DIR}"
 POOL_ALLOCATED=0
-POOL_PROMPT_FILE=""
 MESH_CLAIMED=0
 TURN_THREAD_ID=""
 LEASE_ORDINAL=0
@@ -506,9 +505,6 @@ finish_review_exit() {
     "$PY" "${POOL_HELPER}" release --production "${POOL_PRODUCTION}" \
       --reviewer "${REVIEW_WORKER}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
   fi
-  if [[ -n "${POOL_PROMPT_FILE}" ]]; then
-    rm -f "${POOL_PROMPT_FILE}"
-  fi
   exit "${code}"
 }
 
@@ -614,7 +610,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
     --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
     --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
     "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
-    # The pool's last line is its reason (`no primed code template`); the director acts on it.
+    # The pool's last line is its reason (`no primed code template: <cause>`); the director acts on it.
     echo "ERROR: pool allocation failed: $(tail -n 1 "${LOG_FILE}"); see ${LOG_FILE}." >&2
     exit 1
   fi
@@ -632,20 +628,6 @@ if [[ -n "${POOL_TYPE}" ]]; then
   TEAM_SLOT="pool_${REVIEW_WORKER}"
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
-  # A reviewer's thread already holds the unit memory after its first turn.
-  if [[ "${LEASE_ORDINAL}" -eq 1 ]]; then
-    POOL_PROMPT_FILE="$(mktemp "${ARTIFACT_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
-    "$PY" "${POOL_HELPER}" unit-memory --production "${POOL_PRODUCTION}" \
-      --unit "${POOL_UNIT}" > "${POOL_PROMPT_FILE}" 2>>"${LOG_FILE}"
-    if [[ -s "${POOL_PROMPT_FILE}" ]]; then
-      printf '\n\n' >> "${POOL_PROMPT_FILE}"
-      cat "${PROMPT_FILE}" >> "${POOL_PROMPT_FILE}"
-      PROMPT_FILE="${POOL_PROMPT_FILE}"
-    else
-      rm -f "${POOL_PROMPT_FILE}"
-      POOL_PROMPT_FILE=""
-    fi
-  fi
 fi
 
 if [[ -n "${REVIEW_WORKER}" ]]; then

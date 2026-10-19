@@ -176,7 +176,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - **Nothing shows by itself.** A pane opens only from its slash command or a press inside an open pane, and closes from its command, Escape or its close mark. No pane at `session.start`, no `AbovePrompt` band, no status line, no toast.
 - **A closed pane does no work.** With a pane closed there is no timer, no `$.fs` call and no `$.process.run` for it; with no board pane open, `turn.complete` passes straight to `next`, and it never refreshes accounts. While open, refresh is `$.fs.stat` of existing files, and a process starts only on open or when a stat shows a change.
 - **No new long-running process.** No daemon, service or timer job exists outside the mod; the generator and `accounts.py` are one-shot runs.
-- **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and runs `accounts.py` without `--with-login`, so no login address reaches the mod.
+- **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and `accounts.py status --json` has no login field, so no login address reaches the mod.
 - **A failed accounts run shows a fixed reason**, never process output, in the pane, a command reply, a log, a toast or a message.
 - **User-facing times use the user zone.** Python writes them with `astimezone(user_zone())`; the mod resolves the zone in `scripts/lib/user_zone.py`'s order; board times use the production's registered zone. `scripts/lib/test_user_zone` scans every script.
 - **The ETA is the latest stated promise**, never the schedule end an overdue phase is advanced to. `eta.at`, `first` and `trail` hold promises only; `schedule_end` is never a trail entry; the ruler's ETA mark is `eta.at`.
@@ -203,7 +203,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - A failed stat counts as a change: a `failed` board pane retries each tick while a source stays newer than the board file, and recovers on the next good run.
 - A close during a pending `session.start` load or zone lookup must not restart the accounts timer; the lifecycle counter guards it.
 - The mod runs the generator and `accounts.py` installed under `~/.claude/scripts`, not a worktree's copy, so a live check of the mod proves only promoted code; a contract change can only be checked live after it reaches main.
-- `accounts.py status` with no flags prints login addresses. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
+- `accounts.py status` with no flags can print login addresses in its problem notes. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
 - A fresh checkout's `tsc` reports `TS2307` for `claude-code` until a live session loads the folder and the engine writes `mods/unit-board/.claude-plugin/types/`.
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.

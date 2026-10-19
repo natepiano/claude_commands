@@ -20,9 +20,10 @@ from scripts.whoami import account, agent_accounts
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
-EXAMPLE_FIRST_LINE = "unassigned | claude_commands | 182,340 | Opus 5.5 high"
-# The account leads the second line, before the quota windows.
-ACCOUNT_FIRST_LINE = "unassigned | claude_commands | 182,340 | Opus 5.5 high"
+EXAMPLE_FIRST_LINE = "unassigned | /tmp/claude_commands"
+ACCOUNT_FIRST_LINE = EXAMPLE_FIRST_LINE
+# The account leads the second line, then the model and tokens, then the quota windows.
+MODEL_TOKENS = "Opus 5.5 high | 182,340"
 
 
 class AccountTests(unittest.TestCase):
@@ -596,7 +597,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(
             self.render_status_line(document, "claude2"),
             ACCOUNT_FIRST_LINE
-            + "\nclaude2 | 5-hour 3% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
+            + f"\nclaude2 | {MODEL_TOKENS} | 5-hour 3% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
         )
 
     def test_status_line_without_reset_times_names_no_reset(self) -> None:
@@ -609,7 +610,7 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(
             self.render_status_line(document, "claude2"),
-            ACCOUNT_FIRST_LINE + "\nclaude2 | 5-hour 3% left | weekly 41% left\n",
+            ACCOUNT_FIRST_LINE + f"\nclaude2 | {MODEL_TOKENS} | 5-hour 3% left | weekly 41% left\n",
         )
 
     def test_status_line_floors_and_clamps_remaining_percentage(self) -> None:
@@ -628,13 +629,13 @@ class AccountTests(unittest.TestCase):
                 self.assertEqual(
                     self.render_status_line(document),
                     EXAMPLE_FIRST_LINE
-                    + f"\nweekly {remaining_percentage}% left\n",
+                    + f"\n{MODEL_TOKENS} | weekly {remaining_percentage}% left\n",
                 )
 
-    def test_status_line_puts_the_account_alone_on_line_two_when_limits_are_absent(self) -> None:
+    def test_status_line_puts_the_account_before_the_model_when_limits_are_absent(self) -> None:
         self.assertEqual(
             self.render_status_line(self.status_line_input(), "claude2"),
-            ACCOUNT_FIRST_LINE + "\nclaude2\n",
+            ACCOUNT_FIRST_LINE + f"\nclaude2 | {MODEL_TOKENS}\n",
         )
 
     def test_status_line_prints_windows_without_an_account_argument(self) -> None:
@@ -647,7 +648,7 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(
             self.render_status_line(document),
-            EXAMPLE_FIRST_LINE + "\n5-hour 5% left | weekly 40% left\n",
+            EXAMPLE_FIRST_LINE + f"\n{MODEL_TOKENS} | 5-hour 5% left | weekly 40% left\n",
         )
 
     def test_status_line_omits_a_null_or_missing_window(self) -> None:
@@ -674,7 +675,7 @@ class AccountTests(unittest.TestCase):
                 document = self.status_line_input() | {"rate_limits": rate_limits}
                 self.assertEqual(
                     self.render_status_line(document),
-                    EXAMPLE_FIRST_LINE + f"\n{expected_second_line}\n",
+                    EXAMPLE_FIRST_LINE + f"\n{MODEL_TOKENS} | {expected_second_line}\n",
                 )
 
     def test_status_line_omits_a_window_without_used_percentage(self) -> None:
@@ -699,10 +700,10 @@ class AccountTests(unittest.TestCase):
                 document = self.status_line_input() | {"rate_limits": rate_limits}
                 self.assertEqual(
                     self.render_status_line(document),
-                    EXAMPLE_FIRST_LINE + f"\n{expected_second_line}\n",
+                    EXAMPLE_FIRST_LINE + f"\n{MODEL_TOKENS} | {expected_second_line}\n",
                 )
 
-    def test_status_line_has_no_empty_second_line_without_any_parts(self) -> None:
+    def test_status_line_has_the_model_and_tokens_alone_on_line_two_without_other_parts(self) -> None:
         documents = (
             self.status_line_input(),
             self.status_line_input() | {"rate_limits": None},
@@ -711,13 +712,13 @@ class AccountTests(unittest.TestCase):
             with self.subTest(document=document):
                 self.assertEqual(
                     self.render_status_line(document),
-                    EXAMPLE_FIRST_LINE + "\n",
+                    EXAMPLE_FIRST_LINE + f"\n{MODEL_TOKENS}\n",
                 )
 
     def test_status_line_omits_an_empty_account_label(self) -> None:
         self.assertEqual(
             self.render_status_line(self.status_line_input(), ""),
-            EXAMPLE_FIRST_LINE + "\n",
+            EXAMPLE_FIRST_LINE + f"\n{MODEL_TOKENS}\n",
         )
 
 
