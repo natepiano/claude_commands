@@ -157,6 +157,14 @@ State:
     - the order of promotions to a shared destination: the parent of the
       productions promoting;
     - disk room and quota: the root, always.
+  - **Give the Mac to one unit with a Mac hold, never with words.** Run
+    `/build:mac block <why> [hours N]`, or tell that unit to run
+    `/build:hold hold <why> target mac`. Tests skip a held Mac by themselves,
+    `/build:targets` shows the hold, and it ends at its expiry. Never tell
+    units "make no Mac claim" or to run tests with `--local`: nothing records
+    that, and nothing ends it. On 2026-10-18 such a ruling, a day old, kept a
+    unit's tests waiting on a held natedev while the Mac was free. `verify.sh`
+    refuses a `--local` reason that names a reservation (user, 2026-10-18).
   - **Your wrap holds while a lower showrunner still runs** and reports to
     you: its showrunner wraps first, or you detach it
     (`showrunners.py detach <child>`). Once it runs, wrap removes your link
