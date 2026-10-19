@@ -2069,3 +2069,36 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `test_launch_accounts.py`'s shell-launch guard still rejects `accounts.py pick` in a launcher script. It guards against the verb coming back, so it stays.
 - The refusal now runs the ranking. A defect in a candidate home that makes `pick()` raise changes the refusal into that error. The move is still refused.
 - C4 (0% means no room in pick) stays closed under the room-until-refusal rule. This phase did not change it.
+
+### Phase 75 — A failed read shows a star and a footnote  · status: done
+
+**Depends on:** Phase 74
+
+#### Work Order
+
+**Goal:** the accounts status table's Read column tells the user when the latest usage read failed. The user (via the showrunner, 2026-10-19): "i think it hould say login token expired but that's too long - i don't want a column for that - so we should show the read time for everytning that worked and maybe an * footnote for when it wasn't read and why with a succinct description". Today claude4 showed "20:15 EDT" from 10-17, because its login token expired and the 2-minute timer skips it on purpose.
+
+**Constraints from prior phases:**
+- The timer skips a login with a stale token: `StaleTokenSkip` (`scripts/whoami/agent_accounts.py` ~709-714). The store records it as `weekly_read_skip: "stale_token"` and keeps the old reading times (`scripts/whoami/usage_store.py` ~42-50, ~167). `accounts.py` reads it at ~3679 and ~3791.
+- HTTP 401 and 429 errors also keep the old numbers and record no cause today.
+- The status table columns are at `accounts.py` ~200 ("Read" is the last column). No new column.
+
+**Spec:**
+1. The store records the outcome of the latest read attempt for each login: ok, stale token skipped, refused 401, rate-limited 429, or another error. Use a closed set of values, decoded into a domain type. A successful read clears the failure.
+2. Read shows the time of the last successful read. When the latest attempt failed, Read shows that time with the date when it is not today (for example `10-17 20:15 EDT`) plus `*`.
+3. Under the table, print one footnote line per failed account, short, in Simplified Technical English, for example `* claude4: login token expired; start a session on it to refresh` and `* claude2: usage read refused (rate limit); the next read is in 2 minutes`. No footnote when every read succeeded.
+4. Tests pin each cause's star and footnote, the date form, and that a later successful read removes both. `docs/accounts.md` names the star and the footnote.
+
+**Files:**
+- `scripts/whoami/agent_accounts.py`, `scripts/whoami/usage_store.py` — record the attempt outcome.
+- `scripts/accounts/accounts.py` — the Read cell and the footnote.
+- `scripts/whoami/test_usage_store.py`, `scripts/accounts/test_accounts.py` — tests.
+- `docs/accounts.md` — the star and footnote.
+
+**Workers:** 1 writer. impl owns all files.
+
+**Verification:** `scripts.accounts.test_accounts scripts.whoami.test_usage_store scripts.whoami.test_agent_accounts scripts.whoami.test_quota_alert` with a scratch HOME (use the test files that exist); basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:**
+- **Star:** a stale-token, 401 or 429 attempt gives Read `<old time>*` and one footnote line; a later good read clears both.
+- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.

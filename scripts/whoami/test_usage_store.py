@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
+from email.message import Message
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
 import usage_store
-from agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip
+import agent_accounts
+from agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
 
 READ = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 RESETS = datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc)
@@ -39,6 +44,7 @@ class UsageStoreTests(unittest.TestCase):
 
         self.assertEqual(usage_store.load(), {"main@example.invalid": {
             "five_hour": {"left": 64.0, "resets": "2026-10-12T16:30:00+00:00", "at": "2026-10-12T14:30:00+00:00"},
+            "read_outcome": UsageReadOutcome.OK,
             "weekly": {"left": 70.5, "resets": "2026-10-15T16:00:00+00:00", "at": "2026-10-12T14:30:00+00:00"},
         }})
         self.assertEqual(usage_store.store_file(), self.home / ".local/state/agent-notes/usage.json")
@@ -98,6 +104,7 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(stored["codex:main@example.invalid"], {
             "five_hour": {"left": 75.0, "resets": "2026-10-12T15:30:00+00:00", "at": "2026-10-12T14:30:00+00:00"},
             "weekly": {"left": 0.0, "resets": "2026-10-15T16:00:00+00:00", "at": "2026-10-12T14:30:00+00:00"},
+            "read_outcome": UsageReadOutcome.OK,
             "credits": {"balance": "13446", "at": "2026-10-12T14:30:00+00:00"},
         })
 
@@ -111,13 +118,14 @@ class UsageStoreTests(unittest.TestCase):
         usage_store.save([without], READ + timedelta(minutes=2))
 
         self.assertEqual(usage_store.load()["codex:main@example.invalid"], {
+            "read_outcome": UsageReadOutcome.OK,
             "weekly": {"left": 19.0, "resets": "2026-10-15T16:00:00+00:00", "at": "2026-10-12T14:32:00+00:00"},
             "credits": {"balance": "unlimited", "at": "2026-10-12T14:32:00+00:00"},
         })
 
-    def test_a_refused_read_changes_nothing(self) -> None:
+    def test_a_refused_read_records_failure_but_keeps_the_last_good_windows(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])], READ)
-        before = usage_store.store_file().read_text(encoding="utf-8")
+        before = usage_store.load()["main@example.invalid"]
 
         usage_store.save([
             Report("Claude", email="main@example.invalid",
@@ -127,7 +135,10 @@ class UsageStoreTests(unittest.TestCase):
                    quota_problem="Weekly quota: unavailable (Codex usage API failed)"),
         ], READ + timedelta(minutes=2))
 
-        self.assertEqual(usage_store.store_file().read_text(encoding="utf-8"), before)
+        held = usage_store.load()["main@example.invalid"]
+        self.assertEqual(held.get("weekly"), before.get("weekly"))
+        self.assertEqual(held.get("five_hour"), before.get("five_hour"))
+        self.assertEqual(usage_store.latest_read_outcome(held), UsageReadOutcome.ERROR)
 
     def test_stale_token_skip_round_trips_without_changing_last_good_readings(self) -> None:
         usage_store.save([Report("Claude", email="Main@Example.invalid",
@@ -139,7 +150,9 @@ class UsageStoreTests(unittest.TestCase):
             RESETS + timedelta(minutes=2), {"claude2": "main@example.invalid"})
         held = usage_store.load()["main@example.invalid"]
         self.assertIsInstance(usage_store.weekly_read_skip(held), StaleTokenSkip)
-        self.assertEqual({key: value for key, value in held.items() if key != "weekly_read_skip"}, before)
+        self.assertEqual(held.get("weekly"), before.get("weekly"))
+        self.assertEqual(held.get("five_hour"), before.get("five_hour"))
+        self.assertEqual(usage_store.latest_read_outcome(held), UsageReadOutcome.STALE_TOKEN)
         self.assertEqual(json.loads(usage_store.label_file().read_text()), labels)
         self.assertFalse(usage_store.merge(usage_store.load(), [Report("Claude", email="main@example.invalid",
             weekly_read_skip=StaleTokenSkip())], RESETS + timedelta(minutes=4)))
@@ -154,7 +167,9 @@ class UsageStoreTests(unittest.TestCase):
             RESETS + timedelta(minutes=2))
         held = usage_store.load()["main@example.invalid"]
         self.assertIsInstance(usage_store.weekly_read_skip(held), NoWeeklyReadSkip)
-        self.assertEqual(held, before)
+        self.assertEqual(held.get("weekly"), before.get("weekly"))
+        self.assertEqual(held.get("five_hour"), before.get("five_hour"))
+        self.assertEqual(usage_store.latest_read_outcome(held), UsageReadOutcome.ERROR)
 
     def test_a_successful_read_clears_the_stale_token_skip_and_saves_new_usage(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", weekly_read_skip=StaleTokenSkip())], READ)
@@ -165,6 +180,94 @@ class UsageStoreTests(unittest.TestCase):
         assert "weekly" in held
         self.assertEqual(held["weekly"]["left"], 63)
         self.assertEqual(held["weekly"]["at"], (READ + timedelta(minutes=2)).isoformat())
+
+    def test_http_failures_keep_their_cause_and_a_good_read_clears_it(self) -> None:
+        for code, expected in ((401, UsageReadOutcome.REFUSED_401),
+                               (429, UsageReadOutcome.RATE_LIMITED_429),
+                               (503, UsageReadOutcome.ERROR)):
+            with self.subTest(code=code):
+                good = Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10, RESETS)])
+                usage_store.save([good], READ)
+                with (patch.object(agent_accounts, "command_json", return_value={
+                        "loggedIn": True, "email": "main@example.invalid", "authMethod": "claude.ai"}),
+                      patch.object(agent_accounts, "claude_credentials", return_value={
+                        "claudeAiOauth": {"accessToken": "fixture"}}),
+                      patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                        "https://fixture.invalid", code, "fixture failure", Message(), None))):
+                    failed = agent_accounts.claude_live(self.home / ".claude2")
+                usage_store.save([failed], READ + timedelta(minutes=2))
+                held = usage_store.load()["main@example.invalid"]
+                assert "weekly" in held
+                self.assertEqual(usage_store.latest_read_outcome(held), expected)
+                self.assertEqual(held["weekly"]["at"], READ.isoformat())
+                self.assertEqual(held["weekly"]["left"], 90)
+                usage_store.save([good], READ + timedelta(minutes=4))
+                held = usage_store.load()["main@example.invalid"]
+                assert "weekly" in held
+                self.assertEqual(usage_store.latest_read_outcome(held), UsageReadOutcome.OK)
+                self.assertEqual(held["weekly"]["at"], (READ + timedelta(minutes=4)).isoformat())
+
+    def test_identity_failure_marks_the_last_login_read_in_that_directory(self) -> None:
+        source = agent_accounts.ClaudeDirectorySource(self.home / ".claude2")
+        usage_store.save([Report("Claude", email="main@example.invalid", source=source,
+            quotas=[Quota("Weekly", 10, RESETS)])], READ)
+        usage_store.save([Report("Claude", source=source, problem="auth status failed")], READ + timedelta(minutes=2))
+        held = usage_store.load()["main@example.invalid"]
+        assert "weekly" in held
+        self.assertEqual(usage_store.latest_read_outcome(held), UsageReadOutcome.ERROR)
+        self.assertEqual(held["weekly"]["at"], READ.isoformat())
+        # After a directory changes login, later failures must not affect its old login.
+        usage_store.save([Report("Claude", email="new@example.invalid", source=source,
+            quotas=[Quota("Weekly", 20, RESETS)])], READ + timedelta(minutes=4))
+        usage_store.save([Report("Claude", source=source, problem="auth status failed")], READ + timedelta(minutes=6))
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["new@example.invalid"]), UsageReadOutcome.ERROR)
+        stored = usage_store.load()
+        self.assertEqual(stored.directory_logins[usage_store.directory_key("Claude", str(source.directory))],
+                         "new@example.invalid")
+
+    def test_timer_identity_failure_uses_its_known_account_with_an_old_store(self) -> None:
+        directory = self.home / ".claude2"
+        login = "main@example.invalid"
+        path = usage_store.store_file()
+        path.parent.mkdir(parents=True)
+        window = {"left": 50, "resets": RESETS.isoformat(), "at": READ.isoformat()}
+        _ = path.write_text(json.dumps({login: {"weekly": window}}))
+        identity = agent_accounts.NumberedAccount("claude2", directory, login)
+        selection = agent_accounts.ClaudeAccountsInUse(identity, True,
+            (agent_accounts.CheckedNamedClaudeAccount("claude2", directory, identity),),
+            frozenset())
+        with (patch.object(agent_accounts, "claude_on_disk", return_value=Report("Claude")),
+              patch.object(agent_accounts, "codex_homes", return_value=[]),
+              patch.object(agent_accounts, "claude_live", return_value=Report("Claude",
+                  source=agent_accounts.ClaudeDirectorySource(directory), problem="identity unavailable"))):
+            reports = asyncio.run(agent_accounts.live_reports(selection, self.home / ".codex"))
+        usage_store.save(reports, READ + timedelta(minutes=2))
+        stored = usage_store.load()
+        self.assertEqual(usage_store.latest_read_outcome(stored[login]), UsageReadOutcome.ERROR)
+        self.assertEqual(stored[login].get("weekly"), window)
+
+    def test_unlinked_identity_failure_does_not_guess_a_login(self) -> None:
+        usage_store.save([Report("Claude", email="main@example.invalid",
+            quotas=[Quota("Weekly", 10, RESETS)])], READ)
+        before = usage_store.load()
+        usage_store.save([Report("Claude", source=agent_accounts.ClaudeDirectorySource(self.home / ".unknown"),
+            problem="identity unavailable")], READ + timedelta(minutes=2))
+        self.assertEqual(usage_store.load(), before)
+
+    def test_old_and_unknown_outcomes_decode_without_losing_good_readings(self) -> None:
+        path = usage_store.store_file()
+        path.parent.mkdir(parents=True)
+        window = {"left": 50, "resets": RESETS.isoformat(), "at": READ.isoformat()}
+        _ = path.write_text(json.dumps({
+            "old": {"weekly": window}, "skipped": {"weekly": window, "weekly_read_skip": "stale_token"},
+            "unknown": {"weekly": window, "read_outcome": "new unknown result"}}))
+        held = usage_store.load()
+        self.assertEqual(usage_store.latest_read_outcome(held["old"]), UsageReadOutcome.OK)
+        self.assertEqual(usage_store.latest_read_outcome(held["skipped"]), UsageReadOutcome.STALE_TOKEN)
+        self.assertEqual(usage_store.latest_read_outcome(held["unknown"]), UsageReadOutcome.ERROR)
+        unknown = held["unknown"]
+        assert "weekly" in unknown
+        self.assertEqual(unknown["weekly"]["at"], READ.isoformat())
 
     def test_load_drops_what_it_cannot_read(self) -> None:
         self.assertEqual(usage_store.load(), {})
