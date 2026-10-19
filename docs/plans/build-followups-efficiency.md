@@ -117,7 +117,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Gotchas:** `fix_pass` is 0 on every review pass, so review rounds cannot be counted from the store. A Codex tool output enters input on the request after the call that produced it. A resumed thread replays its outputs, so they are keyed by call id and content.
 
-### Phase 5 — Throwaway experiments  · status: todo
+### Phase 5 — Throwaway experiments  · status: done
 **Depends on:** Phase 3, Phase 4
 
 #### Work Order
