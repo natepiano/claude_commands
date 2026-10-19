@@ -214,6 +214,11 @@ class NoHeldJudgment:
     """There is no held judgment for this finding's cell."""
 
 
+@dataclass(frozen=True)
+class UnknownRule:
+    """The finding's rule is not in the catalog, so no judgment cell can be named for it."""
+
+
 # What declining one finding did to the held judgment of its cell.
 DeclineOutcome = CellWaived | CellStillHeld | InputChangedSinceJudged | NoHeldJudgment
 
@@ -1186,6 +1191,13 @@ class Ledger:
         ).fetchall())
         return tuple(self._held(row[0]) for row in rows)
 
+    def proposal_paths(self) -> tuple[Path, ...]:
+        """Every issue that holds a finding, in any state."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT DISTINCT proposal FROM held_findings WHERE proposal<>'' ORDER BY proposal",
+        ).fetchall())
+        return tuple(Path(row[0]) for row in rows)
+
     def moved_findings(self, source: Path) -> dict[str, Path]:
         """The decision of each finding that a migration moved from source."""
         rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -1263,12 +1275,12 @@ class Ledger:
             now = _now()
             _ = self._connection.executemany("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?",
                                              [(now, finding.finding_id) for finding in findings])
-            definitions: dict[str, Rule | None] = {}
+            definitions: dict[str, Rule | UnknownRule] = {}
             for rule in sorted({finding.rule for finding in findings}):
                 try:
                     definitions[rule] = self._component_rule(rule)
                 except LedgerError:
-                    definitions[rule] = None
+                    definitions[rule] = UnknownRule()
 
             def cell_path(definition: Rule, path: str) -> str:
                 return tip.crate(path) if definition.tier == "D" and definition.input_scope == "manifest" else path
@@ -1277,12 +1289,12 @@ class Ledger:
                 "SELECT rule,path FROM held_findings WHERE state NOT IN ('waived','built')",
             ).fetchall())
             still_held = {(rule, cell_path(definition, path)) for rule, path in remaining
-                          if (definition := definitions.get(rule)) is not None}
+                          if rule in definitions and isinstance(definition := definitions[rule], Rule)}
             cells: dict[tuple[str, str], tuple[Rule, list[HeldFinding]]] = {}
             outcomes: dict[str, DeclineOutcome] = {}
             for finding in findings:
                 definition = definitions[finding.rule]
-                if definition is None:
+                if isinstance(definition, UnknownRule):
                     outcomes[finding.finding_id] = InputChangedSinceJudged()
                 else:
                     cells.setdefault((finding.rule, cell_path(definition, finding.path)), (definition, []))[1].append(finding)

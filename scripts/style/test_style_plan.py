@@ -80,6 +80,8 @@ class StylePlanTests(unittest.TestCase):
         showrunner_plan.parent.mkdir(parents=True)
         _ = showrunner_plan.write_text(self.plan_header() + "Showrunner copy differs.\n")
         _ = self.enterContext(mock.patch.object(berth_board, "read_board", return_value=self.board()))
+        # Renumber edits the real vault, so no test runs it.
+        _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
 
     def production(self, branch: str, checkout: Path, parent: str) -> str:
         return "\n".join([
@@ -2242,6 +2244,57 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_proposals, "renumber")):
             style_proposals.complete(ledger)
         command.assert_called_once_with("close", str(issue), "--reason", f"built in {ticket['id']}")
+
+    def refill_closing(self) -> tuple[int, str, str, int]:
+        """Run refill with only the real close command, so a decision it closes is closed on disk.
+
+        The last value is the count of renumber calls.
+        """
+        original = style_proposals.proposal_command
+
+        def command(*args: str) -> None:
+            if args[0] == "close":
+                original(*args)
+        with (mock.patch.object(style_proposals, "proposal_command", side_effect=command),
+              mock.patch.object(style_proposals, "renumber") as renumber):
+            return *self.run_next(), renumber.call_count
+
+    def test_decision_refill_closes_a_decision_whose_only_finding_is_in_a_removed_file(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, (self.sources[1],), "rename")
+        _ = self.git("rm", "-q", self.sources[1])
+        self.commit_to_every_checkout()
+        code, output, errors, renumbers = self.refill_closing()
+        self.assertEqual(code, 0, errors)
+        reason = f"nothing left to build: {self.sources[1]} not in synced commit {self.tip}"
+        self.assertIn(f"closed {issue}: {reason}\n", output)
+        self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [reason]))
+        self.assertEqual(style_proposals.approved_decisions(issue.parent, "names-unit"), ())
+        # No build merged, so complete does not renumber; the refill that closed the decision does, once.
+        self.assertEqual(renumbers, 1)
+
+    def test_decision_refill_closes_a_built_decision_whose_last_finding_is_in_a_removed_file(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:2], "rename")
+        ledger = self.ledger()
+        built, gone = (next(finding for finding in ledger.proposal_findings(issue) if finding.path == path)
+                       for path in self.sources[:2])
+        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [built.path], [rule],
+                          proposal=str(issue), finding_ids=(built.finding_id,))
+        ledger.ticket_assign("names-unit-1", "main")
+        ledger.ticket_checkpoint("names-unit-1", self.tip)
+        ledger.ticket_merge("names-unit-1")
+        _ = self.git("rm", "-q", gone.path)
+        self.commit_to_every_checkout()
+        code, output, errors, renumbers = self.refill_closing()
+        self.assertEqual(code, 0, errors)
+        self.assertIn(f"closed {issue}: built in names-unit-1\n", output)
+        self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], ["built in names-unit-1"]))
+        self.assertEqual(style_proposals.approved_decisions(issue.parent, "names-unit"), ())
+        # Complete renumbers for the merged build, and the refill that closed the decision renumbers once.
+        self.assertEqual(renumbers, 2)
 
     def test_decision_refill_skips_a_queued_ticket_made_before_decisions(self) -> None:
         rule = self.rule("read")

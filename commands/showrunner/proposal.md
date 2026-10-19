@@ -77,6 +77,9 @@ backlog until work starts. Other declined proposals close through `/close_issue`
 ## Start and close
 
 Style refill marks a decision active. Run `style_proposals.py complete` after
-each merge; it closes the decision when all findings are built or waived.
+each merge. It closes only approved decisions, when all findings are built or
+waived. It also closes an approved decision with no merged ticket when no
+finding is left to build. A decision closed with nothing left to build opens
+again with its approval for a later finding, as a decision closed as built does.
 For other proposals, `/unit:direct` marks plan issues active, and its final
 as-built pass closes them with the as-built doc.
