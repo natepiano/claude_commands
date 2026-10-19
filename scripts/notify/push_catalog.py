@@ -8,6 +8,19 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    # Stall-watch examples use unit names from the build-followups production doc, and requests as
+    # stall_watch.prompt_request words them from a Claude Code permission prompt.
+    PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} stopped until you answer",
+        ActionTemplate("On {machine}, open the {unit} herdr tab and answer its prompt"),
+        "The Claude coding session {unit} on {machine} wants to {request}. It needs your permission first. "
+        + "It has waited since {since} and does no work until you answer.\n\n"
+        + "Yes: the session does that and goes on with its work.\n\n"
+        + "No: the session does not do that, and asks you what to do instead.",
+        (PushExample("typical", {"unit": "enh-showrunner", "machine": "natedev", "since": "21:40 EDT",
+            "request": "run a shell command to read part of a saved output"}),
+         PushExample("edit", {"unit": "herdr-panes", "machine": "natedev", "since": "06:05 EDT",
+            "request": "edit panes.py"})),
+        session=SessionTemplate("{unit}")),
     PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
         ActionTemplate("answer the open form"),
         "Reason: {operation} is blocked because {session}'s claude session is showing a form and it can't proceed.\n\n"

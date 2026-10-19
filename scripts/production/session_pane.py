@@ -28,6 +28,11 @@ def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: boo
     return Herdr(place.session).read(place.pane, lines, joined=joined, ansi=ansi)
 
 
+def agent_status(place: Place) -> str:
+    """herdr's state for the agent in the place's pane, such as `working`, `idle` or `blocked`; empty for none."""
+    return next((agent["agent_status"] for agent in Herdr(place.session).agents() if agent["pane_id"] == place.pane), "")
+
+
 def type_place(place: Place, text: str) -> None:
     Herdr(place.session).prompt(place.pane, text)
 
