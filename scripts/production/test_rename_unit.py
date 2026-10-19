@@ -416,18 +416,45 @@ class UnitRenameTests(unittest.TestCase):
         self.assertNotIn("demo-log", self.git("show", "--name-only", "--format=", "HEAD"))
         self.assertEqual((self.checkout / "docs/plans/demo-log.md").read_text(), "alpha-unit merged phase 2\n")
 
-    def test_refuses_an_unmerged_checkpoint(self) -> None:
+    def test_a_mid_phase_rename_keeps_the_commits_and_the_uncommitted_work(self) -> None:
+        # User, 2026-10-18: a unit is renamed at any time, not only between phases.
+        _ = self.seed_record()
         worktree = self.rust / "claude-demo-alpha"
         self.write(worktree / "work.md", "phase work\n")
         _ = self.git("add", "work.md", cwd=worktree)
         _ = self.git("commit", "-m", "checkpoint(demo-alpha): phase 1", cwd=worktree)
-        self.assert_refused(self.rename("plan"), "checkpoint not merged yet")
-
-    def test_refuses_an_open_phase(self) -> None:
+        checkpoint = self.git("rev-parse", "HEAD", cwd=worktree)
+        self.write(worktree / "work.md", "phase work\nmore, not committed\n")
+        self.write(worktree / "draft.md", "a new file\n")
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, run.read_text() + json.dumps(
             {"event_type": "phase_started", "phase_instance_id": "p2", "phase_id": "2"}) + "\n")
-        self.assert_refused(self.rename("plan"), "is in phase 2")
+
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+
+        new = self.rust / "claude-demo-gamma"
+        self.assertEqual((new / "work.md").read_text(), "phase work\nmore, not committed\n")
+        self.assertEqual((new / "draft.md").read_text(), "a new file\n")
+        # The branch kept its tip: no merge went into work in progress.
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), checkpoint)
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/demo-gamma").split()[0], checkpoint)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "demo-alpha"), "")
+        self.assertEqual(self.journal()["kept"], "phase 2 is open")
+        self.assertIn("| gamma-unit | docs/plans/alpha.md |", self.doc.read_text())
+        started = cast(dict[str, object], json.loads(run.read_text().splitlines()[0]))
+        self.assertEqual(started["working_dir"], str(new))
+        self.assertIn("Your work was in progress (phase 2 is open), so your branch kept its commits and took no "
+                      + "merge: the rename commit comes with your next merge of demo.", cast(str, self.record()["renamed"]))
+
+    def test_uncommitted_work_between_phases_also_keeps_the_tip(self) -> None:
+        worktree = self.rust / "claude-demo-alpha"
+        tip = self.git("rev-parse", "HEAD", cwd=worktree)
+        self.write(worktree / "draft.md", "a new file\n")
+        self.assert_ok(self.rename("apply"))
+        new = self.rust / "claude-demo-gamma"
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), tip)
+        self.assertEqual((new / "draft.md").read_text(), "a new file\n")
+        self.assertEqual(self.journal()["kept"], "the worktree has uncommitted work")
 
     def test_refuses_an_unfinished_production_rename(self) -> None:
         self.write(self.state / SLUG / "rename.json", '{"done": false}\n')

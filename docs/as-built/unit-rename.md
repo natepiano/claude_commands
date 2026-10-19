@@ -28,7 +28,13 @@ steps:
    change it, so every rename is a relaunch. While the stop settles, apply exits 2 and a rerun
    resumes. Refused up front: the new id already running, a Claude that cannot be read, and
    processes inside the worktree of a unit with no Claude to stop.
-2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree.
+2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree. While the unit's
+   work is in progress (`_in_progress`: an open phase in its run record, or `git status --porcelain`
+   output), nothing is merged: a failed merge's `--abort` can lose uncommitted work. The journal's
+   `kept` holds the reason, `merged` is the old tip, and step 6 takes that tip as `unit_tip`. The
+   unit takes both merges at its own next merge of the merge branch (user, 2026-10-18: a rename
+   works at any time, mid-phase too; the plan's refusals of an open phase and of a checkpoint not
+   merged are gone).
 3. **Git.** The new branch is pushed and the worktree moved, which repairs it and copies
    `cargoBerthTarget`.
 4. **Claude.** Transcript folders move, and the trust entry is copied in every config dir.
@@ -52,7 +58,10 @@ steps:
    - `host.unit`;
    - the cwd, plan path and worker cwds under the worktree;
    - the Claude and herdr names, while they are still the defaults;
-   - `renamed`, which `restart.restart_note` puts first in the resumed prompt.
+   - `renamed`, which `restart.restart_note` puts first in the resumed prompt. With `kept` set it
+     also says the branch took no merge and the paused Codex seats now work in the new worktree.
+     `implement.sh` passes `--cwd <working dir>` on every follow-up, so a resumed seat's turns run
+     there and not in the path its thread started in.
 
    `restart._unit_argv` still reads the plan from the Units row.
 10. **Relaunch.** `shutdown.py restart --only <session> --here` brings the unit back. The rename

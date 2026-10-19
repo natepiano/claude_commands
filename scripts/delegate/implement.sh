@@ -490,7 +490,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
       --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
-      --role "${PASS_KIND}" \
+      --role "${PASS_KIND}" --cwd "${WORKING_DIR}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
       --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \

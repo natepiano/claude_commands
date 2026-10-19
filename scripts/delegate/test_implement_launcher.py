@@ -60,6 +60,8 @@ roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
 if verb in ('compact', 'can-follow', 'follow'):
     with (session / 'mesh_events.txt').open('a') as events:
         events.write(verb + '\\n')
+if verb == 'follow':
+    (session / 'follow_cwd.txt').write_text(option('--cwd'))
 if verb == 'start':
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
@@ -995,6 +997,8 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(self.repair_outcome(session_dir), "landed")
         self.assertEqual(self.open_passes(session_dir)["impl"]["kind"], "fix")
         self.assertEqual(self.open_passes(session_dir)["impl"]["status"], "completed")
+        # A renamed unit's seat works in the worktree the launcher names, not the one its thread began in.
+        self.assertEqual((session_dir / "follow_cwd.txt").read_text(encoding="utf-8"), str(self.working_dir))
         message = (session_dir / "follow_message.txt").read_text(encoding="utf-8")
         self.assertIn("Write the retry path.", message)
         self.assertIn("impl_summary_impl.txt", message)
