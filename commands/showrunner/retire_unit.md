@@ -23,7 +23,7 @@ Then it stops everything the unit owns. It finds each thing by its own record, n
 pattern, and prints one line for each thing it stops and for each thing it leaves running, with
 the reason:
 
-1. Each Claude session that works in the worktree, the unit director and its Claude seats, stops
+1. Each Claude session that works in the worktree, the unit director and its Claude seats, and the director of each of the worktree's runs wherever it works, stops
    through `shutdown.py down`: it pauses and stops at its ready mark. Its restore is then forgotten,
    so no restart brings it back.
 2. Each run of the worktree with an app-server stops it and ends its Codex seats.
