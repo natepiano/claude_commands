@@ -233,9 +233,13 @@ State:
     For add-ons, give each number `current`, `next` or `drop`: build it in
     this run, save it for later, or drop it. An add-on that fixes a wrong
     result is `current`.
-  - A unit's finished proposal is filed as a hanadocs issue through `/issue`,
-    with `proposed_by` and its proposed stars, and reaches the user only when
-    they ask (`/showrunner:proposal`).
+  - Style tools file one decision per rule and crate under one rule text.
+    `/showrunner:proposals` lists decisions; `style_proposals.py sites` shows a
+    decision's sites. Rule candidates are not proposals: `style_proposals.py
+    candidates` lists them; make a rule with `/new_style` or drop one with
+    `style_proposals.py drop-candidate --idea "<text>"`. The user answers a
+    decision once. Other finished proposals use `/issue`. Show proposals only
+    when asked (`/showrunner:proposal`).
   - Tell a unit what to do and change in its design without being asked, when
     you see a better answer.
   - Your answer goes as your own message. Never begin it `From the user (via
