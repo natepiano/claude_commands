@@ -32,6 +32,9 @@ class ProposalsTableTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        # No live update timer names a production below the test's own.
+        _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
+        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of", return_value=[]))
 
     @contextlib.contextmanager
     def runs_of(self, runs: dict[Path, list[Path]]) -> Generator[None]:
@@ -85,7 +88,7 @@ class ProposalsTableTests(unittest.TestCase):
                        "tags: [issue, proposal]", "proposed_by:", "unit: widget-unit")
         _ = self.issue("unowned build", "date_created: 2026-10-12", "stage: active", "status: open",
                        'tags: ["issue", "proposal"]', "unit: ")
-        self.assertEqual(proposals_table.issue_rows(self.root / "issues"), [
+        self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "issues", "proposal")), [
             Row("organon-unit", "selection widgets toggle", "2026-10-09", REVIEW_STATE),
             Row("demo-unit", "camera jack panel", "2026-10-10", "approved, not started: docs/plans/jacks.md Phase 4–6"),
             Row("—", "rich text", "2026-10-11", "being built by widget-unit"),
@@ -98,8 +101,8 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.issue("research notes", "status: open", "tags: [issue, proposal]", folder="issues/rich text")
         _ = self.write("issues/no frontmatter.md", "status: open\ntags: [proposal]\n")
         _ = self.write("issues/unclosed.md", "---\nstatus: open\ntags: [proposal]\n")
-        self.assertEqual(proposals_table.issue_rows(self.root / "issues"), [])
-        self.assertEqual(proposals_table.issue_rows(self.root / "absent"), [])
+        self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "issues", "proposal")), [])
+        self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "absent", "proposal")), [])
 
     def test_a_wiki_link_value_reads_as_its_alias_or_target(self) -> None:
         self.assertEqual([issues.plain(value) for value in (
@@ -206,9 +209,13 @@ class ProposalsTableTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
-        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n")
+        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n\n"
+                         + "## Units\n\n| Unit | Plan |\n| --- | --- |\n| footer-unit | `docs/plans/footers.md` |\n")
         _ = self.issue("footer colours", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
                        "proposed_by: footer-unit", folder="trunk/issues")
+        # Another production's proposal in the same folder is not this one's.
+        _ = self.issue("style rule", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
+                       "proposed_by: cargo-liner-style", folder="trunk/issues")
         plan = self.write("unit/docs/plans/footers.md", "# Plan\n")
         _ = self.write("backlog/ledger.md", "- 2026-10-11 Codex dots — proposed\n")
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer\n")

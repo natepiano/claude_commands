@@ -2,7 +2,8 @@
 
 The status line and the dailies report's own footer show it; no reply carries it (user,
 2026-10-18). Changes are the rows still to review on the list the doc's Change review line names,
-proposals the open proposal issues in its Proposals folder, and projects the improvement-queue
+proposals the open proposal issues in its Proposals folder that are its own (see
+proposals_folder), and projects the improvement-queue
 lines still to decide or hand out, for a doc with an Improvement queue line.
 """
 from __future__ import annotations
@@ -12,7 +13,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import change_review
-import issues
 import proposals_folder
 from production_units import Refusal, production_field
 
@@ -43,8 +43,7 @@ def changes(doc: Path) -> int:
 
 
 def proposals(doc: Path) -> int:
-    folder = proposals_folder.issues_folder(doc)
-    return 0 if folder is None or not folder.is_dir() else len(issues.open_issues(folder, proposals_folder.PROPOSAL_TAG))
+    return len(proposals_folder.open_proposals(doc))
 
 
 def open_project(line: str) -> bool:
@@ -99,11 +98,12 @@ def sources(doc: Path) -> list[Path]:
     except OSError:
         queue = None
     found = [doc, *(path for path in (listed, folder, queue) if path is not None)]
-    if folder is not None:
-        try:
-            found.extend(issue.path for issue in issues.open_issues(folder, proposals_folder.PROPOSAL_TAG))
-        except OSError:
-            pass
+    # A unit added below changes which proposals are this production's.
+    found.extend(proposals_folder.owner_docs(doc)[1:])
+    try:
+        found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+    except OSError:
+        pass
     return found
 
 

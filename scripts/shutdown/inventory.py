@@ -745,6 +745,48 @@ def _checkout(cwd: str) -> CheckoutState:
     }
 
 
+_LAST_STEP_BYTES = 262_144
+_STEP_FIELDS = ("description", "command", "file_path", "pattern", "url", "prompt")
+_STEP_TEXT = 200
+
+
+def last_tool_call(config_dir: Path, session_id: str) -> str:
+    """Name the transcript's last tool call as `<tool>: <its first descriptive input>`, or "" when none shows."""
+    path = transcript_path(config_dir, session_id)
+    if path is None:
+        return ""
+    try:
+        with path.open("rb") as transcript:
+            size = transcript.seek(0, os.SEEK_END)
+            _ = transcript.seek(max(0, size - _LAST_STEP_BYTES))
+            lines = transcript.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = cast(object, json.loads(line))
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or cast(dict[str, object], entry).get("type") != "assistant":
+            continue
+        message = cast(dict[str, object], entry).get("message")
+        content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in reversed(cast(list[object], content)):
+            if not isinstance(block, dict) or cast(dict[str, object], block).get("type") != "tool_use":
+                continue
+            call = cast(dict[str, object], block)
+            name = call.get("name")
+            arguments = call.get("input")
+            detail = next((value for field in _STEP_FIELDS
+                           if isinstance(arguments, dict)
+                           and isinstance(value := cast(dict[str, object], arguments).get(field), str) and value), "")
+            text = f"{name}: {detail}" if isinstance(name, str) and detail else name if isinstance(name, str) else ""
+            return " ".join(text.split())[:_STEP_TEXT]
+    return ""
+
+
 def transcript_path(config_dir: Path, session_id: str) -> Path | None:
     """Find the newest main transcript, without visiting subagent directories."""
     newest: Path | None = None

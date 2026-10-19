@@ -487,6 +487,176 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.commit()
         self.assert_mechanical(base)
 
+    def test_import_scope_allows_an_explicit_import_beside_a_module_glob(self) -> None:
+        self.write("src/constants.rs", 'pub(crate) const KEYMAP_FILE: &str = "keys";\n')
+        before = ("mod constants;\n"
+                  + "#[cfg(test)]\nmod tests {\n    use super::*;\n"
+                  + "    fn first() -> &'static str { crate::constants::KEYMAP_FILE }\n"
+                  + "    fn second() -> &'static str { crate::constants::KEYMAP_FILE }\n}\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        after = before.replace("    use super::*;", "    use super::*;\n    use crate::constants::KEYMAP_FILE;")
+        self.write("src/lib.rs", after.replace("{ crate::constants::KEYMAP_FILE }", "{ KEYMAP_FILE }"))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_scope_allows_a_root_constant_with_a_child_module_glob(self) -> None:
+        self.write("src/constants.rs", 'pub(crate) const LINTS_PAUSED_MARKER: &str = "paused";\n')
+        before = ("mod constants;\n"
+                  + "fn marker() -> &'static str { crate::constants::LINTS_PAUSED_MARKER }\n"
+                  + "#[cfg(test)]\nmod tests { use super::*; fn check() {} }\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", "use crate::constants::LINTS_PAUSED_MARKER;\n" + before.replace(
+            "{ crate::constants::LINTS_PAUSED_MARKER }", "{ LINTS_PAUSED_MARKER }",
+        ))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_scope_allows_a_std_constant_with_a_child_module_glob(self) -> None:
+        before = ("fn epoch() -> std::time::SystemTime { std::time::UNIX_EPOCH }\n"
+                  + "#[cfg(test)]\nmod tests { use super::*; fn check() {} }\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", "use std::time::UNIX_EPOCH;\n" + before.replace(
+            "{ std::time::UNIX_EPOCH }", "{ UNIX_EPOCH }",
+        ))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_scope_refuses_a_glob_in_the_site_function(self) -> None:
+        self.write("src/constants.rs", 'pub(crate) const KEYMAP_FILE: &str = "keys";\n')
+        before = ("mod constants;\n"
+                  + "fn marker() -> &'static str { use self::constants::*; crate::constants::KEYMAP_FILE }\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", "use crate::constants::KEYMAP_FILE;\n" + before.replace(
+            "; crate::constants::KEYMAP_FILE }", "; KEYMAP_FILE }",
+        ))
+        _ = self.commit()
+        _ = self.assert_review(base)
+
+    def test_import_scope_refuses_sites_in_a_different_module(self) -> None:
+        self.write("src/lib.rs", "mod constants;\nmod columns;\nmod reader;\n")
+        self.write("src/constants.rs", "pub(crate) const COL_DISK: usize = 1;\n")
+        self.write("src/columns.rs", "pub(crate) const COL_DISK: usize = 1;\n")
+        self.write("src/reader/columns.rs", "pub(crate) const COL_DISK: usize = 2;\n")
+        for qualified, glob in (
+            ("crate::constants::COL_DISK", ""),
+            ("super::columns::COL_DISK", "use super::*; "),
+        ):
+            with self.subTest(qualified=qualified):
+                before = ("mod columns;\n"
+                          + "mod tests { " + glob + "fn read() -> usize { " + qualified + " } }\n")
+                self.write("src/reader.rs", before)
+                base = self.commit()
+                self.write("src/reader.rs", "use " + qualified + ";\n" + before.replace(
+                    "{ " + qualified + " }", "{ COL_DISK }",
+                ))
+                _ = self.commit()
+                _ = self.assert_review(base)
+
+    def test_import_scope_refuses_an_import_inside_a_function(self) -> None:
+        before = "fn epoch() -> std::time::SystemTime { std::time::UNIX_EPOCH }\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace(
+            "{ std::time::UNIX_EPOCH }", "{ use std::time::UNIX_EPOCH; UNIX_EPOCH }",
+        ))
+        _ = self.commit()
+        _ = self.assert_review(base)
+
+    def test_import_scope_keeps_plain_root_shortening_mechanical(self) -> None:
+        self.write("src/constants.rs", 'pub(crate) const KEYMAP_FILE: &str = "keys";\n')
+        before = ("mod constants;\n"
+                  + "fn marker() -> &'static str { crate::constants::KEYMAP_FILE }\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", "use crate::constants::KEYMAP_FILE;\n" + before.replace(
+            "{ crate::constants::KEYMAP_FILE }", "{ KEYMAP_FILE }",
+        ))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_cfg_accepts_the_same_guard_on_the_import_and_function(self) -> None:
+        before = ('#[cfg(target_os = "macos")]\n'
+                  + "fn query_macos_monotonic_process_start() -> u32 { libc::RUSAGE_INFO_V0 }\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", '#[cfg(target_os = "macos")]\nuse libc::RUSAGE_INFO_V0;\n'
+                   + before.replace("{ libc::RUSAGE_INFO_V0 }", "{ RUSAGE_INFO_V0 }"))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_cfg_accepts_matching_guards_with_a_known_std_root(self) -> None:
+        before = '#[cfg(unix)]\nfn epoch() -> std::time::SystemTime { std::time::UNIX_EPOCH }\n'
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", "#[cfg(unix)]\nuse std::time::UNIX_EPOCH;\n" + before.replace(
+            "{ std::time::UNIX_EPOCH }", "{ UNIX_EPOCH }",
+        ))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_cfg_refuses_missing_or_different_site_guards(self) -> None:
+        for guard in ("", "#[cfg(unix)]\n"):
+            with self.subTest(guard=guard):
+                before = guard + "fn epoch() -> std::time::SystemTime { std::time::UNIX_EPOCH }\n"
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", '#[cfg(target_os = "macos")]\nuse std::time::UNIX_EPOCH;\n'
+                           + before.replace("{ std::time::UNIX_EPOCH }", "{ UNIX_EPOCH }"))
+                _ = self.commit()
+                _ = self.assert_review(base)
+
+    def test_import_cfg_refuses_other_or_multiple_import_attributes(self) -> None:
+        for attributes in (
+            "#[allow(unused_imports)]\n",
+            "#[cfg_attr(unix, allow(unused_imports))]\n",
+            "#[cfg(unix)]\n#[allow(unused_imports)]\n",
+            "#[cfg(unix)]\n#[cfg(unix)]\n",
+        ):
+            with self.subTest(attributes=attributes):
+                before = '#[cfg(unix)]\nfn epoch() -> std::time::SystemTime { std::time::UNIX_EPOCH }\n'
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", attributes + "use std::time::UNIX_EPOCH;\n" + before.replace(
+                    "{ std::time::UNIX_EPOCH }", "{ UNIX_EPOCH }",
+                ))
+                _ = self.commit()
+                _ = self.assert_review(base)
+
+    def test_import_external_root_accepts_a_word_used_only_as_a_path_root(self) -> None:
+        before = "fn query() -> u32 { libc::RUSAGE_INFO_V0 }\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", "use libc::RUSAGE_INFO_V0;\n" + before.replace(
+            "{ libc::RUSAGE_INFO_V0 }", "{ RUSAGE_INFO_V0 }",
+        ))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_import_external_root_refuses_words_with_other_roles(self) -> None:
+        for other in (
+            "mod libc {}\n",
+            "use a::libc;\n",
+            "extern crate libc;\n",
+            "fn other() { let libc = 1; consume(libc); }\n",
+            "use a::{libc, Other};\n",
+            "use a::other as libc;\n",
+            "fn other() { consume(a::libc::OTHER); }\n",
+            "fn other() { libc!(); }\n",
+        ):
+            with self.subTest(other=other):
+                before = other + "fn query() -> u32 { libc::RUSAGE_INFO_V0 }\n"
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", "use libc::RUSAGE_INFO_V0;\n" + before.replace(
+                    "{ libc::RUSAGE_INFO_V0 }", "{ RUSAGE_INFO_V0 }",
+                ))
+                _ = self.commit()
+                _ = self.assert_review(base)
+
     def test_plain_local_rename_with_uses_after_its_statement_is_mechanical(self) -> None:
         before = "fn read() -> u32 { let total = 3; total + total }\n"
         self.write("src/lib.rs", before)
@@ -780,8 +950,6 @@ class StyleFootprintTests(unittest.TestCase):
              "fn already_bare() { consume(COL_DISK); }\n"),
             ("use crate::columns;", "columns::COL_DISK", "use crate::columns::COL_DISK;",
              "const COL_DISK: usize = 7;\n"),
-            ("use crate::columns;\nuse crate::other::*;", "columns::COL_DISK",
-             "use crate::columns::COL_DISK;", ""),
             ("use crate::columns;", "columns::COL_DISK",
              '#[cfg(feature = "disk")]\nuse crate::columns::COL_DISK;', ""),
         )
@@ -796,6 +964,19 @@ class StyleFootprintTests(unittest.TestCase):
                 self.write("src/reader.rs", added + "\n" + before.replace(expression, "COL_DISK"))
                 _ = self.commit()
                 self.assertIn("check 6", self.assert_review(base))
+
+    def test_added_explicit_import_beats_a_glob_in_the_same_module(self) -> None:
+        self.write("src/lib.rs", "mod columns;\nmod other;\nmod reader;\n")
+        self.write("src/columns.rs", "pub(crate) const COL_DISK: usize = 1;\n")
+        self.write("src/other.rs", "pub(crate) const COL_DISK: usize = 2;\n")
+        before = ("use crate::columns;\nuse crate::other::*;\n"
+                  + "fn read() { consume(columns::COL_DISK); }\n")
+        self.write("src/reader.rs", before)
+        base = self.commit()
+        self.write("src/reader.rs", "use crate::columns::COL_DISK;\n"
+                   + before.replace("columns::COL_DISK", "COL_DISK"))
+        _ = self.commit()
+        self.assert_mechanical(base)
 
     def test_import_rewrite_refuses_removing_a_still_used_import(self) -> None:
         before = ("use crate::columns;\n"

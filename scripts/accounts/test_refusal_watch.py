@@ -2984,6 +2984,7 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(settle, "run_inventory", return_value=report),
               patch.object(settle, "_session_timer_snapshot", return_value=[]),
               patch.object(settle, "_retire_shutdown_messages"),
+              patch.object(settle, "_carry_trust"),
               patch.object(settle, "_launch_conductor", side_effect=fail_conductor) as conductor,
               patch.object(record, "create_session", wraps=record.create_session) as created):
             _ = self.cli()

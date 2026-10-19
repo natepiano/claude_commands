@@ -462,9 +462,6 @@ class CommandLine(argparse.Namespace):
     session: str = ""
     source: str = ""
     target: str = ""
-    tool: str = "claude"
-    exclude: list[str] = []
-    keep: str = ""
     explain: bool = False
     why: str = ""
     detail: bool = False
@@ -3011,8 +3008,9 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                 if isinstance(window, ReadingWindow) and window.left <= 0:
                     reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
-                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); "
-                        + f"pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude {shlex.quote(destination.label)} in this terminal")
+                    chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
+                    room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
+                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
         return MoveTargetReady(destination)
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
@@ -4125,11 +4123,6 @@ def _parser() -> argparse.ArgumentParser:
     _ = status.add_argument("--detail", action="store_true", default=argparse.SUPPRESS)
     placer = commands.add_parser("placement")
     _ = placer.add_argument("--explain", action="store_true")
-    picker = commands.add_parser("pick")
-    _ = picker.add_argument("tool", choices=("claude", "codex"))
-    _ = picker.add_argument("--exclude", action="append", default=[])
-    _ = picker.add_argument("--keep", default="")
-    _ = picker.add_argument("--explain", action="store_true")
     exec_command = commands.add_parser("exec")
     _ = exec_command.add_argument("--probe", action="store_true", help="mark the session as a throwaway probe: no shutdown, restart or move for it ever pushes to the phone")
     _ = exec_command.add_argument("label")
@@ -4248,14 +4241,6 @@ def main(argv: list[str]) -> int:
         if options.action == "placement":
             print(placement_report())
             return 0
-        if options.action == "pick":
-            chosen = pick(cast(Literal["claude", "codex"], options.tool), datetime.now(timezone.utc),
-                          exclude=frozenset(options.exclude), keep=KeepAccount(options.keep) if options.keep else NoKeep())
-            print(chosen.label if isinstance(chosen, PickedAccount) else no_room_line(options.tool, chosen))
-            if options.explain:
-                for reason in chosen.reasons:
-                    print(_pick_explanation(reason))
-            return 0 if isinstance(chosen, PickedAccount) else 1
         if options.action == "exec":
             exec_account(options.label, options.claude_args, probe=options.probe)
             return 0

@@ -385,6 +385,10 @@ For every length:
   The renderer refuses the plumbing words it knows (`PLUMBING`: berth,
   reservation, holder, file holds, file clashes, writer, tester, retake,
   re-shoot). That list is a net, not the rule: the read is the rule.
+  In the open-for-the-user list, `update_registration.py questions` refuses a
+  new or changed item with one of them. A stored item with one is named
+  (`questions: reword — <item>: …`) and the write goes on: reword it on the
+  next update.
 - Do no other work in this turn, except the `/unit:eta` requests, the two
   steps in Status check and clock, acting on a BLOCK past its limit
   (`/showrunner:produce` → Dependencies, rule 4), and compacting a unit

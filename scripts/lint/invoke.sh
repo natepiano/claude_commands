@@ -9,6 +9,8 @@
 #
 # Callers own scope (--workspace vs -p <pkg>, target selection); this file
 # owns how each tool always runs once scoped.
+# invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
+# judges the result. Delegate verdict keys include this policy file.
 
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 LINT_INVOKE_SOURCED=1
@@ -204,32 +206,8 @@ buildlog_finish_memory() {
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
 
-# Record both streams without putting stderr into a JSON consumer's stdout.
-run_json_stdout() (
-    local log=$1 stream_dir stderr_pid status=0
-    shift
-    : > "$log" || return $?
-    stream_dir="$(mktemp -d)" || return $?
-    trap 'rm -rf "$stream_dir"' EXIT
-    mkfifo "$stream_dir/stderr" || return $?
-    # An ordinary background process can be waited for on Bash 3.2 too.
-    tee -a "$log" < "$stream_dir/stderr" >&2 &
-    stderr_pid=$!
-    # Two tee writers can insert stdout chunks inside stderr lines in the log.
-    # Stream stdout to its caller now, then append its copy after stderr drains.
-    "$@" 2> "$stream_dir/stderr" | tee "$stream_dir/stdout" || status=${PIPESTATUS[0]}
-    # Drain stderr before callers inspect or remove the completed step's log.
-    wait "$stderr_pid" || true
-    cat "$stream_dir/stdout" >> "$log" || true
-    return "$status"
-)
-
 run_once() {
-    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
-        printf '+ %s\n' "$*" >&2
-    else
-        printf '+ %s\n' "$*"
-    fi
+    printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
         build_hold_wait_local || return $?
     fi
@@ -298,13 +276,8 @@ run_once() {
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
-    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
-        run_json_stdout "$log" buildlog_exec "$@"
-        status=$?
-    else
-        buildlog_exec "$@" 2>&1 | tee "$log"
-        status=${PIPESTATUS[0]}
-    fi
+    buildlog_exec "$@" 2>&1 | tee "$log"
+    status=${PIPESTATUS[0]}
     set -e
     buildlog_finish_memory "$status" "$sampler_pid"
     if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
@@ -542,11 +515,9 @@ invoke_clippy() {
         ${clippy_args[@]+"${clippy_args[@]}"}
 }
 
-# Replay the judging diagnostics as JSON; only apply_mul_add.py selects fixes.
-invoke_clippy_mul_add_json() {
-    lint_config_enabled clippy || return 0
-    local LINT_JSON_STDOUT=1
-    invoke_clippy "$@" --message-format=json
+# Use the same scope, lint arguments, gating, and run wrapper as judgment.
+invoke_clippy_fix() {
+    invoke_clippy --fix --allow-dirty --allow-staged --allow-no-vcs "$@"
 }
 
 invoke_mend() {

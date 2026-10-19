@@ -15,7 +15,9 @@ a stop can wait up to 20 minutes for the unit director to reach its ready mark.
 When it finishes, print its output exactly as it comes, with nothing added.
 
 It refuses, and changes nothing, when the unit's worktree has uncommitted work or its branch (here
-or on origin) has a commit the merge branch does not have. The refusal names each one.
+or on origin) has a commit the merge branch does not have. The refusal names each one. The
+`Project started` line that the `/unit:direct` recorder adds to a plan, and never commits, is not
+uncommitted work when it is the file's only change.
 
 Then it stops everything the unit owns. It finds each thing by its own record, never by a name
 pattern, and prints one line for each thing it stops and for each thing it leaves running, with

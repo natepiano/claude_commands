@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -9,7 +10,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast, final, override
 
@@ -69,6 +72,8 @@ class UnitRenameTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
             "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
+            # No waits by default: a test that needs one sets it.
+            "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
@@ -174,6 +179,20 @@ class UnitRenameTests(unittest.TestCase):
                    "--scratch", str(self.root / "scratch")]
         return subprocess.run(command, cwd=self.checkout, env={**self.env, "RENAME_TEST_REFUSE": refuse},
                               capture_output=True, text=True, check=False, timeout=120)
+
+    def start_apply(self) -> subprocess.Popen[str]:
+        """apply in the background, so the test can act as the shutdown path while it waits."""
+        process = subprocess.Popen([sys.executable, str(SCRIPT), "apply", SLUG, "alpha", "gamma", "--scratch",
+                                    str(self.root / "scratch")], cwd=self.checkout, env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.kill)
+        return process
+
+    def wait_for(self, ready: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + 60
+        while not ready():
+            self.assertLess(time.monotonic(), deadline, "timed out")
+            time.sleep(0.1)
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -305,7 +324,7 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.seed_record(progress="waiting")
         result = self.rename("apply")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("alpha-unit is stopping (waiting); rerun apply once it has stopped", result.stderr)
+        self.assertIn("alpha-unit is still waiting after 0 s; rerun apply once it has stopped", result.stderr)
         self.assertEqual(self.journal()["step"], 0)
 
     def test_verify_fails_on_an_unclassified_stale_reference(self) -> None:
@@ -361,30 +380,81 @@ class UnitRenameTests(unittest.TestCase):
                 self.assert_refused(self.rename("apply", old, new), text)
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
 
-    def mark_live(self, unit: str, session_id: str) -> None:
-        """A live Claude in a herdr session marked as `unit` of this production."""
+    def mark_live(self, unit: str, session_id: str) -> Callable[[], None]:
+        """A live Claude in a herdr session marked as `unit` of this production; the result ends it."""
         held = fake_showrunner.write_session(self.root / "state/sessions", unit.removesuffix("-unit"), session_id)
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
             f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit})])
         fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
 
+        def end() -> None:
+            held.close()
+            (self.root / "state/sessions" / f"{session_id}.sock").unlink()
+            fake_unit_host.write(self.env, [])
+        return end
+
+    def test_one_apply_stops_the_unit_waits_and_relaunches_it_with_no_rerun(self) -> None:
+        log = self.seed_record()
+        record = self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
+        stopped = cast(dict[str, object], json.loads(record.read_text()))
+        record.unlink()
+        end = self.mark_live("alpha-unit", "sid-alpha")
+        self.env.update({"RENAME_UNIT_STOP_WAIT": "60", "RENAME_UNIT_LIVE_WAIT": "60"})
+        process = self.start_apply()
+        calls: Callable[[], list[list[str]]] = lambda: ([cast(list[str], json.loads(line)) for line in
+                                                         log.read_text().splitlines()] if log.exists() else [])
+        self.wait_for(lambda: ["down", "--only", "sid-alpha", "--here"] in calls())
+        # The shutdown path ends the unit; its record reads stopping, and stopped a moment later.
+        end()
+        _ = record.write_text(json.dumps({**stopped, "progress": {"kind": "stopping", "at": "2026-10-09T21:49:30+00:00"}}))
+        time.sleep(1.5)
+        self.assertIsNone(process.poll())
+        _ = record.write_text(json.dumps(stopped))
+        self.wait_for(lambda: ["restart", "--only", "sid-alpha", "--here"] in calls())
+        # The relaunched unit comes up under its new id after the restart returns.
+        time.sleep(1.5)
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        stdout, stderr = process.communicate(timeout=120)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertIn("stop: waiting — alpha-unit is stopping", stdout)
+        self.assertIn("alpha-unit is now gamma-unit, relaunched in", stdout)
+        self.assertEqual((self.journal()["done"], self.journal()["claimed"]), (True, False))
+
+    def test_apply_waits_for_a_merge_gate_before_it_writes_the_merge_branch(self) -> None:
+        _ = self.seed_record()
+        common = subprocess.run(["git", "-C", str(self.checkout), "rev-parse", "--path-format=absolute",
+                                 "--git-common-dir"], capture_output=True, text=True, check=True).stdout.strip()
+        with (Path(common) / f"showrunner-merge-{SLUG}.lock").open("a") as gate:
+            fcntl.flock(gate, fcntl.LOCK_EX)
+            process = self.start_apply()
+            time.sleep(2)
+            # The gate holds the merge branch: the rename has not even checked the checkout yet.
+            self.assertIsNone(process.poll())
+            self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
+            fcntl.flock(gate, fcntl.LOCK_UN)
+        stdout, stderr = process.communicate(timeout=120)
+        self.assertIn("merge lock: waiting — a merge gate or a unit rename is writing demo's merge branch", stdout)
+        # The fake restart starts nothing; every step before verify ran once the gate was done.
+        self.assertIn("gamma-unit is not running", stderr)
+        self.assertEqual(self.journal()["step"], 10)
+
     def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
         log = self.seed_record()
         (self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json").unlink()
-        self.mark_live("alpha-unit", "sid-alpha")
+        _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
         self.assertIn("1. stop alpha-unit through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
-        self.assertIn("alpha-unit is stopping; rerun apply once it has stopped", applied.stderr)
+        self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)
         self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
                          [["down", "--only", "sid-alpha", "--here"]])
         self.assertEqual(self.journal()["step"], 0)
 
     def test_a_running_new_id_is_refused(self) -> None:
-        self.mark_live("gamma-unit", "sid-gamma")
+        _ = self.mark_live("gamma-unit", "sid-gamma")
         self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
 
     def test_an_older_run_keeps_the_old_path_as_history(self) -> None:

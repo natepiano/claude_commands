@@ -1395,6 +1395,40 @@ def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | Unrea
     return Untrusted(folder, claude_json, keys)
 
 
+def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Untrusted | UnreadableTrustFile:
+    """Give the target account file the source account's trust for this folder, and nothing more.
+
+    The target gains only the one key the source already trusts. The file is replaced in one step,
+    so Claude never reads half of it; every other value in it stays as it was.
+    """
+    present = claude_trust(folder, target)
+    if not isinstance(present, Untrusted):
+        return present
+    granted = claude_trust(folder, source)
+    if not isinstance(granted, Trusted):
+        return granted
+    try:
+        raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+        if not isinstance(raw, dict):
+            raise ValueError()
+        settings = cast(dict[str, object], raw)
+        projects = settings.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError()
+        entry = cast(dict[str, object], projects).setdefault(str(granted.project_key), {})
+        if not isinstance(entry, dict):
+            raise ValueError()
+        cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
+        staged = target.with_name(f".{target.name}.trust-{os.getpid()}")
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(settings, output, indent=2)
+        os.replace(staged, target)
+    except (OSError, UnicodeError, ValueError) as error:
+        return UnreadableTrustFile(folder, target, type(error).__name__)
+    return Trusted(folder, target, granted.project_key)
+
+
 def repository_root(directory: Path) -> Path:
     return _repository_key(directory, "--show-toplevel")
 
