@@ -22,6 +22,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. The unit director names the worktree and branch git reports at dispatch in every Work Order.
+- **Project started:** 2026-10-19T08:52:48.640+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright; SQLite (the usage ledger); Claude Code transcripts (JSONL) and Codex rollouts (JSONL).
 - **Layout:** Phase 1 edits `scripts/production/` and `scripts/statusline/` tests, `docs/production_format.md`. Phases 2–6 edit no file in the repo except this plan. Their scripts and reports go in the study folder `~/.local/state/nightly-review/token-study/` (outside git; the unit owns `~/.local/state/nightly-review/` per the production doc's Units row).
 - **Key files:**
@@ -47,7 +48,8 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 ## Phases
 
-### Phase 1 — "N efficiency proposals" in the For you row  · status: todo
+### Phase 1 — "N efficiency proposals" in the For you row  · status: done
+**Depends on:** none
 
 #### Work Order
 
@@ -81,6 +83,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 **Acceptance gate:** merge_gate `--tests-only` green; basedpyright `0 errors, 0 warnings` on `scripts/production scripts/statusline`; `python3 -c` over the live ledger with the new `efficiency()` prints 130 (or the live count, matched by hand with `grep`).
 
 ### Phase 2 — Where the tokens go  · status: todo
+**Depends on:** none
 
 #### Work Order
 
@@ -94,7 +97,8 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 - Name the 10 largest sinks as (production, role, class) cells with weekly weighted tokens and share.
 - Report `token-study/2-map/report.md`; scripts in `token-study/2-map/work/`.
 
-**Files:** none in the repo. `~/.local/state/nightly-review/token-study/2-map/`.
+**Files:**
+- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/2-map/` (outside git).
 
 **Workers:** 2 writers (no test lane), split by family.
 - `impl` — Claude turns (showrunners, directors, interactive, subagents).
@@ -106,6 +110,7 @@ The unit director merges the two halves into `report.md`.
 **Acceptance gate:** the per-cell totals sum to `usage_report.py weighted` for the window within 1%; every number cites its query; `git -C ~/.claude status --porcelain` and every production repo's status are unchanged from phase start; the worktree diff holds only this plan.
 
 ### Phase 3 — The fixed cost of every request  · status: todo
+**Depends on:** Phase 2
 
 #### Work Order
 
@@ -118,7 +123,8 @@ The unit director merges the two halves into `report.md`.
 - Re-measure the open ledger findings that fall here (Artifact tool, CLAUDE.md twice and its repeats, memory index lines, context-usage hook repeats, handoff instruction) on this window; mark each as confirmed, changed or gone.
 - Output: a table part → tokens per request → requests per week → weighted tokens per week → share; `token-study/3-fixed/report.md`.
 
-**Files:** none in the repo. `~/.local/state/nightly-review/token-study/3-fixed/`.
+**Files:**
+- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/3-fixed/` (outside git).
 
 **Workers:** 2 writers (no test lane).
 - `impl` — Claude fixed parts and per-turn reminders.
@@ -129,6 +135,7 @@ The unit director merges the two halves into `report.md`.
 **Acceptance gate:** the parts of each role's start size add up to the measured start size within 5%, or the report names the unexplained part; the shares use Phase 2's totals; Invariants checks as Phase 2.
 
 ### Phase 4 — What the turns do  · status: todo
+**Depends on:** Phase 2, Phase 3
 
 #### Work Order
 
@@ -146,7 +153,8 @@ The unit director merges the two halves into `report.md`.
 - Compare productions on `weighted_per_checkpoint`; explain the spread.
 - Output: one row per pattern with evidence (session ids, turn counts), `token-study/4-turns/report.md`.
 
-**Files:** none in the repo. `~/.local/state/nightly-review/token-study/4-turns/`.
+**Files:**
+- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/4-turns/` (outside git).
 
 **Workers:** 2 writers (no test lane).
 - `impl` — Claude sessions (showrunners, directors, subagents).
@@ -157,6 +165,7 @@ The unit director merges the two halves into `report.md`.
 **Acceptance gate:** each pattern names at least two sessions as evidence and its weekly tokens; the patterns do not count one token twice with Phase 3 (the report says how overlap was removed); Invariants checks as Phase 2.
 
 ### Phase 5 — Throwaway experiments  · status: todo
+**Depends on:** Phase 3, Phase 4
 
 #### Work Order
 
@@ -168,7 +177,8 @@ The unit director merges the two halves into `report.md`.
 - Budget per Invariants (3M weighted tokens in total).
 - Output: one row per experiment: change, measured saving per request or per thread, scaled to weekly tokens with a range; `token-study/5-experiments/report.md`; setups kept under `token-study/experiments/`.
 
-**Files:** none in the repo. `~/.local/state/nightly-review/token-study/5-experiments/`, `token-study/experiments/`.
+**Files:**
+- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Nothing else in the repo; the work goes in `~/.local/state/nightly-review/token-study/5-experiments/` and `token-study/experiments/` (outside git).
 
 **Workers:** 2 writers (no test lane), one experiment set each; the unit director assigns experiments by family.
 
@@ -177,6 +187,7 @@ The unit director merges the two halves into `report.md`.
 **Acceptance gate:** each experiment reports before/after numbers, its cost and a pass/fail against its estimate; total cost under budget; Invariants checks as Phase 2.
 
 ### Phase 6 — Ranked proposals  · status: todo
+**Depends on:** Phase 5
 
 #### Work Order
 
@@ -190,7 +201,8 @@ The unit director merges the two halves into `report.md`.
 - Write `token-study/report.md`: the token map summary, the ranked table, the experiment results, and what the study did not cover.
 - Send the showrunner the ranked table (top 10) and the report path.
 
-**Files:** `~/.local/state/nightly-review/ledger.md`, `~/.local/state/nightly-review/token-study/report.md`.
+**Files:**
+- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Outside git: `~/.local/state/nightly-review/ledger.md` and `~/.local/state/nightly-review/token-study/report.md`.
 
 **Workers:** nothing splits: the unit director writes the ranking and the ledger lines from the phase reports; no worker opens.
 

@@ -36,6 +36,17 @@ LEDGER = """# Plan backlog
 - 2026-10-11 Later (g.md) — deferred
 """
 
+EFFICIENCY_LEDGER = """# Efficiency proposals
+
+- 2026-10-19 config: Open idea — proposed; from config review
+- 2026-10-19 messages: Later idea — deferred until next week
+- 2026-10-19 rust: Shipped idea — accepted, applied
+- 2026-10-19 config: Rejected idea — declined
+- 2026-10-19 messages: Nothing found — no proposal
+- 2026-10-19 config: Shipped group — accepted, applied; from Also found: X — proposed
+- config: Undated idea — proposed
+"""
+
 
 def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "production") -> None:
     """An issue; its default proposer is the test doc's own production, `production.md`."""
@@ -91,9 +102,35 @@ class FooterCountsTests(unittest.TestCase):
         issue(folder, "bug", "open", "bug")
         ledger = self.root / "ledger.md"
         _ = ledger.write_text(LEDGER, encoding="utf-8")
+        efficiency = self.root / "efficiency.md"
+        _ = efficiency.write_text(EFFICIENCY_LEDGER, encoding="utf-8")
         doc = self.doc(f"- **Change review:** `{listing}`", f"- **Proposals:** {folder}",
-                       f"- **Improvement queue:** {ledger}")
-        self.assertEqual(footer_counts.read_counts(doc, questions=1), FooterCounts(2, 1, 2, 1))
+                       f"- **Improvement queue:** {ledger}", f"- **Efficiency ledger:** `{efficiency}`")
+        self.assertEqual(footer_counts.read_counts(doc, questions=1), FooterCounts(2, 1, 2, 1, 2))
+
+    def test_efficiency_counts_only_dated_proposed_and_deferred_first_statuses(self) -> None:
+        ledger = self.root / "efficiency.md"
+        _ = ledger.write_text(EFFICIENCY_LEDGER, encoding="utf-8")
+        doc = self.doc(f"- **Efficiency ledger:** {ledger}")
+        self.assertEqual(footer_counts.efficiency(doc), 2)
+
+    def test_efficiency_without_a_readable_ledger_counts_nothing(self) -> None:
+        for field in ("", f"- **Efficiency ledger:** {self.root / 'absent.md'}",
+                      f"- **Efficiency ledger:** {self.root}"):
+            with self.subTest(field=field):
+                self.assertEqual(footer_counts.efficiency(self.doc(field)), 0)
+
+    def test_a_ledger_that_is_not_utf8_counts_nothing(self) -> None:
+        ledger = self.root / "binary.md"
+        _ = ledger.write_bytes(b"- 2026-10-19 config: x \xe2\x80\x94 proposed\n\xff\n")
+        doc = self.doc(f"- **Efficiency ledger:** {ledger}")
+        self.assertEqual(footer_counts.efficiency(doc), 0)
+        self.assertIn(ledger, footer_counts.sources(doc))
+
+    def test_sources_include_the_efficiency_ledger_even_before_it_exists(self) -> None:
+        ledger = self.root / "efficiency.md"
+        doc = self.doc(f"- **Efficiency ledger:** `{ledger}`")
+        self.assertIn(ledger, footer_counts.sources(doc))
 
     def test_sources_name_each_file_a_count_reads_and_each_open_proposal(self) -> None:
         listing = self.root / "change-review.md"
@@ -145,9 +182,15 @@ class FooterCountsTests(unittest.TestCase):
                          "For you: 1 change to review, 2 questions")
         self.assertIsNone(footer_counts.counts_line(FooterCounts()))
 
+    def test_efficiency_proposals_follow_proposals_and_use_their_own_plural(self) -> None:
+        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 2, 3, 1, 130)),
+                         "For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question")
+        self.assertEqual(footer_counts.counts_line(FooterCounts(efficiency=1)),
+                         "For you: 1 efficiency proposal")
+
     def test_counts_add_across_productions(self) -> None:
-        self.assertEqual(footer_counts.total([FooterCounts(1, 0, 2, 0), FooterCounts(0, 3, 1, 0)]),
-                         FooterCounts(1, 3, 3, 0))
+        self.assertEqual(footer_counts.total([FooterCounts(1, 0, 2, 0, 4), FooterCounts(0, 3, 1, 0, 7)]),
+                         FooterCounts(1, 3, 3, 0, 11))
         self.assertEqual(footer_counts.total([]), FooterCounts())
 
 
