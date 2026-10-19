@@ -2108,3 +2108,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - With no refusal on record, a fresh reading with room is enough, also when it was taken before the failure. A recorded refusal still blocks such a reading.
 - The unreadable-thread cleanup test started a real app-server from its scratch HOME after a long suite run (its fake epoch made the process look older than the synthetic sign-in). Its `ensure_server` is now pinned to the stub port.
 - `scripts.agents.test_codex_mesh` ran about 20 minutes, and this phase's merge gate took 1258 s, where the Phase 75 gates took about 300 s. Reported to the showrunner; not diagnosed.
+
+### Phase 77 — A follow with no stored refusal returns at once  · status: done
+
+#### As-built
+
+- `codex_mesh.WorkerWaitingForRoom(reason, client, port, thread_id)` is a `WorkerMoveResult` that is not a live turn. `_move_idle_worker` returns it for a known account with no stored refusal and no fresh reading with room. The refused-account wait and the unknown-account hold do not change.
+- `_wait_for_room` adopts the carried client, port and thread, then logs `<seat> waits for room on <account>: <reason>; the continuation stays owed` once. A follow or one-turn launch keeps `continuation_owed` and the held messages for the next dispatch and finishes at once. A resident stays.
+- `_start_workers_turn`, `_resume_account_move`, the capacity retry, the context-overflow continuation and the account-move resume all hand the wait to `_wait_for_room`. A capacity retry that meets the wait clears `resume_owed`, so the quota continuation is the one continuation.
+- The showrunner reported it (2026-10-19), and test-threads found the cause: Phase 76 returned `WorkerWaitingOnLiveTurn` there, and the follow loops polled until `CALL_TIMEOUT_SECS` (300 s).
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the new result and its handling.
+- `scripts/agents/test_codex_mesh.py` — the four refusal tests store their refusal; tests for the follow, launch, resident, moved connection and single continuation.
+
+**Gotchas:**
+- The Phase 76 regression made four tests wait 300 s each and the merge gate take about 1260 s. After this phase the gate took 121 s.
+- The one pool review found two blockers: the wait dropped the connection and thread a refused move had already adopted, and a capacity retry left `resume_owed` set. Both are fixed with regression tests.
