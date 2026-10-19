@@ -64,6 +64,17 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
 
+def failed_read_cell(read: datetime) -> str:
+    """The Read cell after a failed attempt: a read from an earlier day in the status zone also shows its date.
+
+    A read some minutes old falls on the day before just after midnight, so a fixed form fails then.
+    """
+    zone = ZoneInfo("America/Los_Angeles")
+    local = read.astimezone(zone)
+    form = "%H:%M %Z" if local.date() == datetime.now(zone).date() else "%m-%d %H:%M %Z"
+    return local.strftime(form) + "*"
+
+
 def named_prefix(config_dir: Path) -> str:
     return "".join(
         f"{name}={shlex.quote(value)} "
@@ -3844,7 +3855,7 @@ class AccountsTests(unittest.TestCase):
         rows = self.status_rows()
 
         self.assertEqual(rows[0][4], "75%")
-        self.assertEqual(rows[0][8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*")
+        self.assertEqual(rows[0][8], failed_read_cell(read))
         # claude3 has no good reading. Its failed attempt still gets a star.
         self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 2, "—", "—", "—*"))
         self.assertEqual(self.live_reads.call_count, 2)
@@ -4038,7 +4049,7 @@ class AccountsTests(unittest.TestCase):
         row = self.status_rows()[0]
         self.assertEqual(row[4], "75%")
         self.assertEqual(row[5], reset.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"))
-        self.assertEqual(row[8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*")
+        self.assertEqual(row[8], failed_read_cell(read))
         self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
 
     def test_status_stale_token_skip_without_any_stored_reading_stays_unavailable(self) -> None:

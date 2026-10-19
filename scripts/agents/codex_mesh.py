@@ -3792,7 +3792,11 @@ def _quota_continuation_ready(client: Client, selected_home: Path) -> bool:
     if isinstance(identity, UnknownCodexAccount):
         return False
     refusal = refusals.load().get(refusals.key("codex", identity.login))
-    if refusal is None or not refusals.resolved(refusal, refusals.stored_reading("codex", identity.login, now), now):
+    reading = refusals.stored_reading("codex", identity.login, now)
+    if refusal is None:
+        return (isinstance(reading, refusals.FreshReading) and reading.weekly.left > 0
+                and (isinstance(reading.five_hour, refusals.NoWindow) or reading.five_hour.left > 0))
+    if not refusals.resolved(refusal, reading, now):
         return False
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
@@ -3896,9 +3900,10 @@ def _move_idle_worker(
             if owes_continuation and not _quota_continuation_ready(client, worker_home_for_turn):
                 from scripts.accounts import refusals
                 identity = client.serving.account
-                if (isinstance(identity, UnknownCodexAccount) or
-                        refusals.key("codex", identity.login) not in refusals.load()):
+                if isinstance(identity, UnknownCodexAccount):
                     return WorkerThreadStateUnknown("quota handoff did not establish a recoverable account; continuation is held")
+                if refusals.key("codex", identity.login) not in refusals.load():
+                    return WorkerWaitingOnLiveTurn("no fresh reading shows room on the account")
                 return WorkerWaitingOnLiveTurn("the refused account has not recovered")
             if isinstance(client.serving, NotBoundCodexServer):
                 _ = _bind_serving_server(client, session_dir, started_here=_fresh)

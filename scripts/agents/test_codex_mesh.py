@@ -4395,6 +4395,77 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
         self.assertEqual({entry["move_id"] for entry in entries}, {"refused-turn-wait"})
 
+    def test_owed_continuation_without_a_refusal_starts_on_its_serving_account_with_room(self) -> None:
+        account = self.prepare_refusing_account()
+        now = datetime.now(timezone.utc)
+        window = refusals.ReadingWindow(100, refusals.NoResetKnown(), now)
+        for five_hour in (refusals.NoWindow(), window):
+            with self.subTest(five_hour=five_hour):
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed",
+                                                  "continuation_owed": True}})
+                starts_before = len(self.methods("turn/start"))
+                with (contextlib.closing(codex_mesh.Client(self.server.port, "worker")) as client,
+                      patch.object(refusals, "load", return_value={}),
+                      patch.object(refusals, "stored_reading",
+                                   return_value=refusals.FreshReading(window, five_hour, "")) as reading):
+                    client.serving = codex_mesh.ServingCodexServer(self.server.port, os.getpid(), account.home, account)
+                    result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, codex_mesh.MovedWorker)
+                reading.assert_called_once()
+                self.assertEqual(reading.call_args.args[:2], ("codex", account.login))
+                self.assertEqual(len(self.methods("turn/start")), starts_before + 1)
+                start = self.methods("turn/start")[-1]
+                params = cast(dict[str, object], start["params"])
+                self.assertEqual(params["threadId"], THREAD_ID)
+                self.assertEqual(params["input"], [{"type": "text", "text": "Continue where you stopped."}])
+                self.assertIs(self.worker_record().get("continuation_owed"), False)
+                self.assertEqual(self.methods("thread/resume"), [])
+
+    def test_owed_continuation_without_a_refusal_waits_then_starts_when_a_reading_shows_room(self) -> None:
+        account = self.prepare_refusing_account()
+        now = datetime.now(timezone.utc)
+        room = refusals.ReadingWindow(100, refusals.NoResetKnown(), now)
+        empty = refusals.ReadingWindow(0, refusals.NoResetKnown(), now)
+        unavailable = (refusals.NoReading(), refusals.StaleReading(),
+                       refusals.FreshReading(empty, room, ""), refusals.FreshReading(room, empty, ""))
+        for reading in unavailable:
+            with self.subTest(reading=reading):
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed",
+                                                  "continuation_owed": True}})
+                previous = self.worker_record()
+                starts_before = len(self.methods("turn/start"))
+                with (contextlib.closing(codex_mesh.Client(self.server.port, "worker")) as client,
+                      patch.object(refusals, "load", return_value={}),
+                      patch.object(refusals, "stored_reading", return_value=reading) as stored):
+                    client.serving = codex_mesh.ServingCodexServer(self.server.port, os.getpid(), account.home, account)
+                    result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+                    self.assertIsInstance(result, codex_mesh.WorkerWaitingOnLiveTurn)
+                    self.assertEqual(self.worker_record(), previous)
+                    self.assertEqual(len(self.methods("turn/start")), starts_before)
+                    stored.return_value = refusals.FreshReading(room, room, "")
+                    result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, codex_mesh.MovedWorker)
+                self.assertEqual(len(self.methods("turn/start")), starts_before + 1)
+                params = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
+                self.assertEqual(params["threadId"], THREAD_ID)
+                self.assertEqual(params["input"], [{"type": "text", "text": "Continue where you stopped."}])
+                self.assertIs(self.worker_record().get("continuation_owed"), False)
+
+    def test_owed_continuation_on_an_unknown_account_stays_unknown(self) -> None:
+        account = self.prepare_refusing_account()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "failed",
+                                          "continuation_owed": True}})
+        previous = self.worker_record()
+        with (contextlib.closing(codex_mesh.Client(self.server.port, "worker")) as client,
+              patch.object(refusals, "stored_reading") as reading):
+            client.serving = codex_mesh.ServingCodexServer(self.server.port, os.getpid(), account.home,
+                agent_accounts.UnknownCodexAccount(account.home, "fixture identity unavailable"))
+            result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, codex_mesh.WorkerThreadStateUnknown)
+        reading.assert_not_called()
+        self.assertEqual(self.worker_record(), previous)
+        self.assertEqual(self.methods("turn/start"), [])
+
     def test_capacity_retry_after_a_role_change_starts_once_on_the_new_home(self) -> None:
         _, new = self.prepare_workers_move()
         def wait(seconds: float) -> None:
@@ -5468,7 +5539,9 @@ class MeshCommandTests(unittest.TestCase):
             return original_next_frame(client, deadline)
 
         self.server.respond = unreadable_after_completion
+        # The fake epoch must not age the stub process into a sign-in replacement.
         with patch.object(codex_mesh, "time", SimpleNamespace(time=clock, monotonic=clock, sleep=time.sleep)), \
+             patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, False)), \
              patch.object(codex_mesh.Client, "next_frame", no_second_wait):
             code, errors = self.run_start()
         self.assertEqual(code, 1)
