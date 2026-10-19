@@ -268,30 +268,8 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 
 ### Phase 13 — The ticket line names the ledger's ticket  · status: done
 
-#### Work Order
+#### As-built
+`unit_ticket_progress` reads the style ledger once (`mode=ro`, `timeout=0`) for the merged count and the unit's newest `assigned` or `checkpointed` ticket. A ticket phase's `id` is that ticket; with none, the title's leading `<unit>-<n>`, else the phase id. The title drops the leading id, the stage reads `Ticket <id> running`, and an empty title leaves no gap in the board heading or unit view.
 
-**Goal:** A standing unit's board line names its full ticket id from the style ledger, shows that id once, and its stage says `Ticket <id> running`.
-
-**Spec:**
-
-Source: the phase 12 live check, 2026-10-18 20:42. `style_plan.py` writes a ticket heading as `### Phase 63 — names-unit-63`, so the open phase id is the bare number and the ticket id is the title. The board showed `Ticket 63 · 62 merged  names-unit-63` and the stage `Phase 124 running`. The ledger also runs ahead of the run record: types showed phase 124 while the ledger had `types-unit-125` assigned.
-
-1. **One ledger read.** `merged_tickets` becomes one read-only read (same path, `mode=ro`, `timeout=0`) that gives the merged count and the unit's open ticket: the newest (`created_at`) ticket with `unit = ?` and `state IN ('assigned', 'checkpointed')`. Return a small frozen dataclass, not a tuple. A missing, failed or locked ledger gives count 0 and no open ticket.
-2. **The ticket id.** For a ticket phase, `id` is the ledger's open ticket id. With no open ticket in the ledger, `id` is the first word of the phase title when it matches `<unit name>-<digits>`, else the phase id.
-3. **The title.** For a ticket phase, `title` is the phase title with a leading `<id>` and a following ` — ` (or spaces) removed; it is empty when nothing remains.
-4. **The stage.** `stage()` says `Ticket <id> running` for a ticket phase where it says `Phase <n> running` for a plan phase. Every other stage is unchanged.
-5. **The views.** `board.tsx` and `unit.tsx` leave out the title, and the gap before it, when it is empty. The heading keeps `Ticket <id> · <merged> merged`.
-
-**Files:**
-- `scripts/delegate/board_json.py` — the ledger read, the ticket id, the title and the stage.
-- `mods/unit-board/hooks/board.tsx` — an empty ticket title.
-- `mods/unit-board/hooks/unit.tsx` — an empty ticket title.
-- `mods/unit-board/tests/board.test.tsx`, `scripts/delegate/test_board_json.py` — tests.
-
-**Workers:** 1 writer + 1 tester.
-- `impl` — `scripts/delegate/board_json.py`, `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`.
-- `test` — `scripts/delegate/test_board_json.py`, `mods/unit-board/tests/board.test.tsx`, from this Spec alone: a `### Phase 63 — names-unit-63` plan with an assigned `names-unit-63` ledger row gives id `names-unit-63`, an empty title and stage `Ticket names-unit-63 running`; a ledger ahead of the run (`types-unit-125` assigned, phase 124 open) gives `types-unit-125`; no ledger row gives the title's id; no ledger at all gives the title's id and 0; a title `values-unit-8 — read time` gives `read time`; the board heading with an empty title at a 76-column pane.
-
-**Constraints from prior phases:** phase 12's read-only ledger rules hold: never construct `style_ledger.Ledger`, `timeout=0`, the ledger file is a watched source. Plan phases do not change.
-
-**Acceptance gate:** mod tsc, mod tests, strict validate, basedpyright 0/0, the full merge gate. After promotion, a live capture at 170x50 from the remove-running-section session: each cargo-liner-style unit shows `Ticket <unit>-<n> · <m> merged` with no repeated id.
+**Files:** `scripts/delegate/board_json.py`, `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx`, tests.
+**Gotchas:** `style_plan.py` writes `### Phase <n> — <ticket id>`, so the phase id is the bare number. The run record can lag the ledger by a ticket after refill.
