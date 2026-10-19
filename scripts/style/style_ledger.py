@@ -39,6 +39,15 @@ class DeclaredInputScope(StrEnum):
     FILE = "file"
 
 
+@dataclass(frozen=True)
+class UndeclaredInputScope:
+    """The judge gave no input scope; a cell that allows file scope refuses a scoped verdict."""
+
+
+UNDECLARED_INPUT_SCOPE = UndeclaredInputScope()
+SCOPED_VERDICTS: tuple[Verdict, ...] = ("clean", "exception", "held")
+
+
 class CellInputScope(StrEnum):
     FILE = "file"
     CRATE = "crate"
@@ -1522,10 +1531,10 @@ class Ledger:
     def record(
         self, rule: str, path: str, commit: str, rule_blob: str, verdict: Verdict,
         detail: str = "", ticket: str = "", worker: str = "", *,
-        input_scope: DeclaredInputScope = DeclaredInputScope.RULE,
+        input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE,
     ) -> None:
-        if input_scope == DeclaredInputScope.FILE and verdict not in ("clean", "exception"):
-            raise LedgerError(f"{verdict}: file input scope requires clean or exception")
+        if input_scope == DeclaredInputScope.FILE and verdict not in SCOPED_VERDICTS:
+            raise LedgerError(f"{verdict}: file input scope requires clean, exception or held")
         self._catalog = rule_catalog.load_rules(self.repo)
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
@@ -1562,10 +1571,18 @@ class Ledger:
                 raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
-        if input_scope == DeclaredInputScope.FILE:
+        file_scope_allowed = scope in (CellInputScope.CRATE, CellInputScope.MODULE) and path in tip.rust_files
+        if isinstance(input_scope, UndeclaredInputScope):
+            if file_scope_allowed and verdict in SCOPED_VERDICTS:
+                raise LedgerError(
+                    f"{rule}: {path}: say --input-scope file (the verdict rests on this file alone; "
+                    + "it stays current when other files change) or --input-scope rule "
+                    + "(the verdict rests on the rule's crate or module scope)")
+            input_scope = DeclaredInputScope.RULE
+        elif input_scope == DeclaredInputScope.FILE:
             if scope == CellInputScope.FILE:
                 input_scope = DeclaredInputScope.RULE
-            elif scope == CellInputScope.MANIFEST or path not in tip.rust_files:
+            elif not file_scope_allowed:
                 raise LedgerError(f"{rule}: {path}: file input scope requires an included Rust file, not a manifest or crate cell")
             else:
                 scope = _comparison_scope(input_scope, scope)
@@ -1801,7 +1818,7 @@ class LedgerArguments(argparse.Namespace):
     commit: str = ""
     rule_blob: str = ""
     verdict: Verdict = "clean"
-    input_scope: DeclaredInputScope = DeclaredInputScope.RULE
+    input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE
     detail: str = ""
     ticket: str = ""
     worker: str = ""
@@ -1901,7 +1918,7 @@ def main() -> None:
     _ = record.add_argument("--rule-blob", default="")
     _ = record.add_argument("--verdict", choices=("clean", "fixed", "exception", "held", "waived"), required=True)
     _ = record.add_argument("--detail", default="")
-    _ = record.add_argument("--input-scope", choices=(DeclaredInputScope.FILE,), type=DeclaredInputScope, default=DeclaredInputScope.RULE)
+    _ = record.add_argument("--input-scope", choices=tuple(DeclaredInputScope), type=DeclaredInputScope, default=UNDECLARED_INPUT_SCOPE)
     candidate = commands.add_parser("candidate")
     for field in ("ticket", "site", "idea"):
         _ = candidate.add_argument(f"--{field}", required=True)

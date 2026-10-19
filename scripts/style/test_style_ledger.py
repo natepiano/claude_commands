@@ -128,11 +128,12 @@ class StyleLedgerTests(unittest.TestCase):
     def record(
         self, rule_id: str, path: str, commit: str, verdict: str = "clean", *,
         rule_blob: str = "", detail: str = "", ticket: str = "unit-1",
+        input_scope: style_ledger.DeclaredInputScope = style_ledger.DeclaredInputScope.RULE,
     ) -> None:
         _ = self.cli(
             "record", "--rule", rule_id, "--path", path, "--commit", commit,
             "--rule-blob", rule_blob or self.blob(rule_id), "--verdict", verdict,
-            "--detail", detail, "--ticket", ticket, "--worker", "test-worker",
+            "--detail", detail, "--ticket", ticket, "--worker", "test-worker", "--input-scope", input_scope,
         )
 
     def ledger(self) -> style_ledger.Ledger:
@@ -391,11 +392,106 @@ class StyleLedgerTests(unittest.TestCase):
     def test_file_scope_verdict_rejects_other_verdicts(self) -> None:
         rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
         ledger = self.ledger()
-        for verdict in ("held", "fixed", "waived"):
+        for verdict in ("fixed", "waived"):
             with self.subTest(verdict=verdict), self.assertRaisesRegex(style_ledger.LedgerError, verdict):
                 ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), verdict,
                               input_scope=style_ledger.DeclaredInputScope.FILE)
-        self.assertEqual(ledger.latest_held_judgments(), {})
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM judgments").fetchone(), (0,))
+
+    def test_scoped_verdict_without_input_scope_is_refused_on_crate_and_module_cells(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        module_path, _, _, base = self.structure_module()
+        ledger = self.ledger()
+        refusal = "say --input-scope file \\(the verdict rests on this file alone; .*--input-scope rule \\("
+        for rule, path in ((read, self.sources[0]), (structure, module_path)):
+            for verdict in style_ledger.SCOPED_VERDICTS:
+                with self.subTest(rule=rule, verdict=verdict), self.assertRaisesRegex(style_ledger.LedgerError, refusal):
+                    ledger.record(rule, path, base, self.blob(rule), verdict)
+        result = self.cli("record", "--rule", read, "--path", self.sources[0], "--commit", base,
+                          "--rule-blob", self.blob(read), "--verdict", "clean", "--ticket", "outside", "--worker", "test", success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{read}: {self.sources[0]}: say --input-scope file", result.stderr)
+        self.assertIn("or --input-scope rule", result.stderr)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM judgments").fetchone(), (0,))
+
+    def test_scoped_verdicts_record_with_either_declared_scope(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\n")
+        module_path, _, _, base = self.structure_module()
+        ledger = self.ledger()
+        recorded: list[tuple[str, str, str, str]] = []
+        for rule, path in ((read, self.sources[0]), (structure, module_path)):
+            for verdict in style_ledger.SCOPED_VERDICTS:
+                for scope in style_ledger.DeclaredInputScope:
+                    ledger.record(rule, path, base, self.blob(rule), verdict, ticket=f"{verdict}-{scope}",
+                                  input_scope=scope)
+                    recorded.append((rule, verdict, scope.value, self.git("rev-parse", f"{base}:{path}")
+                                     if scope == style_ledger.DeclaredInputScope.FILE else ""))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            rows = cast(list[tuple[str, str, str, str, str]], connection.execute(
+                "SELECT rule,verdict,declared_scope,input_scope,input_fingerprint FROM judgments ORDER BY id").fetchall())
+        self.assertEqual([(rule, verdict, declared, fingerprint if declared == "file" else "")
+                          for rule, verdict, declared, _, fingerprint in rows], recorded)
+        self.assertEqual({(declared, scope) for _, _, declared, scope, _ in rows},
+                         {("file", "file"), ("rule", "crate"), ("rule", "module")})
+
+    def test_file_scoped_held_verdict_stays_current_after_a_crate_change(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        findings: dict[str, style_ledger.HeldFinding] = {}
+        for path, scope in ((self.sources[0], style_ledger.DeclaredInputScope.FILE),
+                            (self.sources[1], style_ledger.DeclaredInputScope.RULE)):
+            findings[path] = ledger.hold(rule, path, 1, "Rename value", "rename", "value", "amount", self.blob(rule), "outside")
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), "held", ticket="outside", input_scope=scope)
+        self.write("crates/alpha/src/added.rs", "pub fn added() {}\n")
+        self.set_tip(self.commit("Add a file to the crate"))
+        self.assertEqual({path: state for path, state in self.states(rule).items() if path in findings},
+                         {self.sources[0]: "current", self.sources[1]: "stale"})
+        self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository())
+                              if row.rule_id == rule).held, 1)
+        outcomes = ledger.decline_findings((finding.finding_id for finding in findings.values()), "declined")
+        self.assertIsInstance(outcomes[findings[self.sources[0]].finding_id], style_ledger.CellWaived)
+        self.assertIsInstance(outcomes[findings[self.sources[1]].finding_id], style_ledger.InputChangedSinceJudged)
+
+    def test_local_rule_cell_requires_an_input_scope_like_a_catalog_rule(self) -> None:
+        local_dir = self.repo / "docs/style"
+        local_dir.mkdir(parents=True)
+        _ = (local_dir / "local.md").write_text("---\ntier: C\nfamily: names\ninput_scope: crate\n---\n# Local\n")
+        rule = "local:docs/style/local.md"
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"{rule}: {self.sources[0]}: say --input-scope file"):
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean")
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.FILE)
+        ledger.record(rule, self.sources[1], self.initial_tip, self.blob(rule), "clean",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        self.write("crates/alpha/src/added.rs", "pub fn added() {}\n")
+        self.set_tip(self.commit("Add a file to the crate"))
+        self.assertEqual({path: state for path, state in self.states(rule).items() if path in self.sources[:2]},
+                         {self.sources[0]: "current", self.sources[1]: "stale"})
+
+    def test_cells_without_file_scope_record_without_an_input_scope(self) -> None:
+        read = self.rule("read")
+        crate_read = self.rule("crate-read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        ledger = self.ledger()
+        cells: tuple[tuple[str, str, style_ledger.Verdict], ...] = (
+            (read, self.sources[0], "clean"), (manifest, "crates/alpha", "held"),
+            (structure, "crates/alpha", "exception"),
+            (crate_read, self.sources[0], "fixed"), (crate_read, self.sources[1], "waived"),
+        )
+        for rule, path, verdict in cells:
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), verdict)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            rows = cast(list[tuple[str, str, str]], connection.execute(
+                "SELECT rule,path,declared_scope FROM judgments ORDER BY id").fetchall())
+        self.assertEqual(rows, [(rule, path, "rule") for rule, path, _ in cells])
 
     def test_file_scope_verdict_rejects_manifest_crate_and_excluded_paths(self) -> None:
         manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
@@ -514,7 +610,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean",
                       input_scope=style_ledger.DeclaredInputScope.FILE)
-        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "exception")
+        ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "exception",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
         self.write(self.sources[1], "pub fn sibling_changed() {}\n")
         tip = self.commit("Change sibling")
         self.set_tip(tip)
@@ -701,7 +798,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.ticket_assign("modules-1", "main")
         with self.assertRaisesRegex(style_ledger.LedgerError, f"{rule} {self.sources[1]} is outside ticket cells"):
             ledger.record(rule, self.sources[1], self.initial_tip, "", "clean", ticket="modules-1")
-        ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="modules-1")
+        ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="modules-1",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
         self.assertEqual(ledger.unjudged_ticket_cells("modules-1"), ())
         with self.assertRaisesRegex(style_ledger.LedgerError, "different fields"):
             ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha",

@@ -146,7 +146,8 @@ class StylePlanTests(unittest.TestCase):
     def record(self, rule: str, path: str, commit: str, ticket: str = "outside") -> None:
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule.removesuffix("#uncovered"))
-            ledger.record(rule=rule, path=path, commit=commit, verdict="clean", detail="", ticket=ticket, worker="test", rule_blob=blob)
+            ledger.record(rule=rule, path=path, commit=commit, verdict="clean", detail="", ticket=ticket, worker="test", rule_blob=blob,
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def held_proposal(self, rule: str, path: str) -> Path:
         issue = self.root / "proposal.md"
@@ -155,7 +156,7 @@ class StylePlanTests(unittest.TestCase):
             finding = ledger.hold(rule, path, 1, "held defect", "restructure", "before", "after", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
             ledger.record(rule=rule, path=path, commit=self.tip, verdict="held", detail="", ticket="outside",
-                          worker="test", rule_blob=blob)
+                          worker="test", rule_blob=blob, input_scope=style_ledger.DeclaredInputScope.RULE)
         _ = issue.write_text(f"---\nstatus: open\nstyle_findings: [{finding.finding_id}]\n---\n")
         return issue
 
@@ -254,7 +255,7 @@ class StylePlanTests(unittest.TestCase):
             + "A cell is recorded only after both judges have judged it: held when either judge holds a finding in it, ",
             self.plan.read_text())
 
-    def test_written_phase_limits_file_scope_verdicts_to_file_local_clean_or_exception(self) -> None:
+    def test_written_phase_requires_an_input_scope_on_crate_and_module_cells(self) -> None:
         _ = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
@@ -262,9 +263,9 @@ class StylePlanTests(unittest.TestCase):
         self.assertIn(
             f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; "
             + "the ledger takes its pinned rule blob.\n"
-            + "Add `--input-scope file` only to a crate or module cell of a Rust source file.\n"
-            + "Use it only for a `clean` or `exception` verdict based on that file alone.\n"
-            + "Without this flag, changes to any file in the crate or module scope can make the verdict stale.\n",
+            + "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.\n"
+            + "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.\n"
+            + "Use `--input-scope rule` when the verdict rests on other files in the crate or module.\n",
             self.plan.read_text(),
         )
 
