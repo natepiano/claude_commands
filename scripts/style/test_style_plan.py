@@ -18,6 +18,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import approved_renames
+import style_footprint
 import style_plan
 import style_proposals
 import proposal_issue
@@ -146,7 +148,8 @@ class StylePlanTests(unittest.TestCase):
     def record(self, rule: str, path: str, commit: str, ticket: str = "outside") -> None:
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule.removesuffix("#uncovered"))
-            ledger.record(rule=rule, path=path, commit=commit, verdict="clean", detail="", ticket=ticket, worker="test", rule_blob=blob)
+            ledger.record(rule=rule, path=path, commit=commit, verdict="clean", detail="", ticket=ticket, worker="test", rule_blob=blob,
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def held_proposal(self, rule: str, path: str) -> Path:
         issue = self.root / "proposal.md"
@@ -155,7 +158,7 @@ class StylePlanTests(unittest.TestCase):
             finding = ledger.hold(rule, path, 1, "held defect", "restructure", "before", "after", blob, "outside")
             ledger.file_held(finding.finding_id, issue)
             ledger.record(rule=rule, path=path, commit=self.tip, verdict="held", detail="", ticket="outside",
-                          worker="test", rule_blob=blob)
+                          worker="test", rule_blob=blob, input_scope=style_ledger.DeclaredInputScope.RULE)
         _ = issue.write_text(f"---\nstatus: open\nstyle_findings: [{finding.finding_id}]\n---\n")
         return issue
 
@@ -254,7 +257,7 @@ class StylePlanTests(unittest.TestCase):
             + "A cell is recorded only after both judges have judged it: held when either judge holds a finding in it, ",
             self.plan.read_text())
 
-    def test_written_phase_limits_file_scope_verdicts_to_file_local_clean_or_exception(self) -> None:
+    def test_written_phase_requires_an_input_scope_on_crate_and_module_cells(self) -> None:
         _ = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
@@ -262,9 +265,9 @@ class StylePlanTests(unittest.TestCase):
         self.assertIn(
             f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; "
             + "the ledger takes its pinned rule blob.\n"
-            + "Add `--input-scope file` only to a crate or module cell of a Rust source file.\n"
-            + "Use it only for a `clean` or `exception` verdict based on that file alone.\n"
-            + "Without this flag, changes to any file in the crate or module scope can make the verdict stale.\n",
+            + "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.\n"
+            + "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.\n"
+            + "Use `--input-scope rule` when the verdict rests on other files in the crate or module.\n",
             self.plan.read_text(),
         )
 
@@ -665,6 +668,32 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "mechanical\n", ""))
         ledger.ticket_checkpoint("modules-unit-1", self.tip)
         self.assertEqual(ledger.ticket_open("modules-unit")[0]["state"], "checkpointed")
+
+    def test_gate_reports_a_locked_ledger_as_an_error_and_a_rerun_gives_the_review(self) -> None:
+        database = self.ledger().database
+        _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.05))
+        with closing(sqlite3.connect(database)) as holder:
+            _ = holder.execute("BEGIN EXCLUSIVE")
+            self.assertEqual(self.reference_gate("names-unit-9"), (2, "error: database is locked\n"))
+            holder.rollback()
+        self.assertEqual(self.reference_gate("names-unit-9"), (1, "review: unknown ticket names-unit-9\n"))
+
+    def test_gate_passes_a_footprint_error_through_as_exit_two(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.tip)
+        path = self.sources[0]
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          [path], [rule], cells=((rule, path),))
+        ledger.ticket_assign("modules-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("modules-unit-1")
+        self.record(rule, path, self.tip, "modules-unit-1")
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", ("0" * 40, "modules-unit-1"))
+        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("error: "), result.stdout)
 
     def test_structure_batches_cover_pending_files_once_keep_directories_and_isolate_large_files(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -2113,7 +2142,18 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed_without_this_ticket() {}\n")
         self.assertEqual(self.reference_gate(ticket)[0], 1)
         self.write(self.sources[1], "pub fn value() {}\n")
-        self.write(self.sources[0], "pub fn approved_change() {}\n")
+        self.write(self.sources[0], "pub fn approved_change() {}\nenum Outcome { NewName }\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_decision_gate_refuses_until_each_approved_rename_is_applied(self) -> None:
+        ticket = self.approved_reference_ticket()
+        origin = self.ledger().ticket_origin(ticket)
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        finding_id, = origin.finding_ids
+        self.write(self.sources[0], "enum Outcome { OldName }\n")
+        self.assertEqual(self.reference_gate(ticket), (1, f"review: {finding_id}: Outcome::OldName -> Outcome::NewName "
+                                                          + f"not applied in {self.sources[0]}\n"))
+        self.write(self.sources[0], "enum Outcome { NewName }\n")
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
 
     def test_decision_refill_slices_forty_restructure_files_and_releases_dropped_slice(self) -> None:
@@ -2158,7 +2198,11 @@ class StylePlanTests(unittest.TestCase):
                 self.assertFalse(built & set(ticket["files"]))
                 built.update(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)
-                ledger.ticket_merge(ticket["id"])
+                not_built = ledger.ticket_merge(ticket["id"])
+                self.assertEqual(not_built, tuple(style_ledger.FindingNotBuilt(identity, approved_renames.NoAppliedCheck("restructure"))
+                                                  for identity in sorted(ticket["finding_ids"])))
+                for identity in ticket["finding_ids"]:
+                    ledger.mark_built(identity)
                 if len(built) == 40:
                     break
         self.assertEqual(built, set(files))
@@ -2171,7 +2215,7 @@ class StylePlanTests(unittest.TestCase):
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
             for path in files:
-                finding = ledger.hold(rule, path, 1, "change", kind, "before", "after", blob, "outside")
+                finding = ledger.hold(rule, path, 1, "change", kind, "Outcome::Old", "Outcome::New", blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
@@ -2203,7 +2247,9 @@ class StylePlanTests(unittest.TestCase):
                 self.assertEqual(ticket["kind"], "proposal")
                 tickets.append(ticket["files"])
                 ledger.ticket_checkpoint(ticket["id"], self.tip)
-                ledger.ticket_merge(ticket["id"])
+                _ = ledger.ticket_merge(ticket["id"])
+                for identity in ticket["finding_ids"]:
+                    ledger.mark_built(identity)
             self.assertEqual(self.run_next()[0], 0)
         self.assertEqual(sorted(tuple(files) for files in tickets), sorted(expected))
         self.assertEqual(len(ledger.proposal_tickets()), 2)
@@ -2228,6 +2274,7 @@ class StylePlanTests(unittest.TestCase):
         issue = self.approved_decision(rule, self.sources[:2], "rename")
         gone = next(finding for finding in self.ledger().proposal_findings(issue) if finding.path == self.sources[1])
         _ = self.git("rm", "-q", self.sources[1])
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
         self.commit_to_every_checkout()
         with mock.patch.object(style_proposals, "proposal_command"):
             code, output, errors = self.run_next()
@@ -2239,11 +2286,58 @@ class StylePlanTests(unittest.TestCase):
         ticket = ledger.ticket_open("names-unit")[0]
         self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
         ledger.ticket_checkpoint(ticket["id"], self.tip)
-        ledger.ticket_merge(ticket["id"])
+        _ = ledger.ticket_merge(ticket["id"])
         with (mock.patch.object(style_proposals, "proposal_command") as command,
               mock.patch.object(style_proposals, "renumber")):
             style_proposals.complete(ledger)
         command.assert_called_once_with("close", str(issue), "--reason", f"built in {ticket['id']}")
+
+    def test_decision_refill_after_a_merge_builds_only_the_unbuilt_findings(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, self.sources[:2], "rename")
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
+        self.write(self.sources[1], "pub enum Outcome { Old }\n")
+        self.commit_to_every_checkout()
+        ledger = self.ledger()
+        applied, unapplied = (next(finding for finding in ledger.proposal_findings(issue) if finding.path == path)
+                              for path in self.sources[:2])
+        with mock.patch.object(style_proposals, "proposal_command"):
+            self.assertEqual(self.run_next()[0], 0)
+            first = ledger.ticket_open("names-unit")[0]
+            self.assertEqual(sorted(first["finding_ids"]), sorted((applied.finding_id, unapplied.finding_id)))
+            ledger.ticket_checkpoint(first["id"], self.tip)
+            _ = ledger.ticket_merge(first["id"])
+            code, _, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        second = ledger.ticket_open("names-unit")[0]
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual((second["kind"], second["files"], second["finding_ids"]),
+                         ("proposal", [unapplied.path], [unapplied.finding_id]))
+
+    def test_decision_refill_skips_a_merged_type_finding_until_a_person_marks_it_built(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        issue = self.approved_decision(rule, (self.sources[0],), "type")
+        ledger = self.ledger()
+        finding, = ledger.proposal_findings(issue)
+        with mock.patch.object(style_proposals, "proposal_command"):
+            self.assertEqual(self.run_next()[0], 0)
+        ticket = ledger.ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["finding_ids"]), ("proposal", [finding.finding_id]))
+        ledger.ticket_checkpoint(ticket["id"], self.tip)
+        self.assertEqual(ledger.ticket_merge(ticket["id"]),
+                         (style_ledger.FindingNotBuilt(finding.finding_id, approved_renames.NoAppliedCheck("type")),))
+        held, = ledger.proposal_findings(issue)
+        self.assertEqual((held.state, held.build_ticket), (style_ledger.Filed(issue), style_ledger.BuildTicket(ticket["id"])))
+        code, _, errors, _ = self.refill_closing()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual([item["id"] for item in ledger.proposal_tickets()], [ticket["id"]])
+        self.assertEqual(frontmatter(issue)["status"], ["open"])
+        ledger.mark_built(finding.finding_id)
+        with mock.patch.object(style_proposals, "renumber"), redirect_stdout(io.StringIO()):
+            style_proposals.complete(ledger)
+        self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [f"built in {ticket['id']}"]))
 
     def refill_closing(self) -> tuple[int, str, str, int]:
         """Run refill with only the real close command, so a decision it closes is closed on disk.
@@ -2281,11 +2375,13 @@ class StylePlanTests(unittest.TestCase):
         ledger = self.ledger()
         built, gone = (next(finding for finding in ledger.proposal_findings(issue) if finding.path == path)
                        for path in self.sources[:2])
+        self.write(built.path, "pub enum Outcome { New }\n")
+        self.commit_to_every_checkout()
         ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [built.path], [rule],
                           proposal=str(issue), finding_ids=(built.finding_id,))
         ledger.ticket_assign("names-unit-1", "main")
         ledger.ticket_checkpoint("names-unit-1", self.tip)
-        ledger.ticket_merge("names-unit-1")
+        _ = ledger.ticket_merge("names-unit-1")
         _ = self.git("rm", "-q", gone.path)
         self.commit_to_every_checkout()
         code, output, errors, renumbers = self.refill_closing()
@@ -2394,6 +2490,15 @@ class StylePlanTests(unittest.TestCase):
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
             ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha",
                               [self.sources[0]], [rule], proposal=str(issue), finding_ids=tuple(ids))
+        # The gate passes only when the finding file declares each checkable rename's new name.
+        declared: dict[str, list[str]] = {}
+        for index, (before, after) in enumerate(pairs):
+            rename = approved_renames.approved_rename(kinds[index % len(kinds)], before, after)
+            if isinstance(rename, approved_renames.ApprovedRename):
+                declared.setdefault(rename.parent, []).append(rename.new)
+        if declared:
+            self.write(self.sources[0], "".join(f"enum {parent} {{ {', '.join(names)} }}\n"
+                                                for parent, names in declared.items()))
         return "names-unit-1"
 
     def reference_gate(self, ticket: str) -> tuple[int, str]:
@@ -2402,6 +2507,147 @@ class StylePlanTests(unittest.TestCase):
             result = style_plan.gate(self.repo, ticket)
         return result, output.getvalue()
 
+    LEDGER_MOD = ("mod handle;\nmod lock;\nmod map;\n\npub use lock::{LockError, MutationLock};\n\n"
+                  + "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n"
+                  + "    fn reads() {\n        let _ = lock::MutationLock;\n    }\n}\n")
+    LEDGER_HANDLE = ("// Takes the lock.\nuse super::lock::MutationLock;\nuse crate::ledger::lock;\n\n"
+                     + "pub struct Handle {\n    lock: MutationLock,\n}\n\n"
+                     + "pub fn take(handle: &Handle) -> lock::LockError {\n    let _ = &handle.lock;\n"
+                     + "    self::lock();\n    lock::LockError\n}\n\nfn lock() {}\n")
+
+    def file_rename_ticket(self, files: tuple[tuple[str, str], ...] = (),
+                           pairs: tuple[tuple[str, str], ...] = ()) -> str:
+        """An approved ticket that renames crates/alpha/src/ledger/lock.rs to mutation_lock.rs, at a HEAD that holds it.
+
+        Files replace or add HEAD files, and each pair adds a finding that renames an item of the file.
+        """
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")})))
+        old = "crates/alpha/src/ledger/lock.rs"
+        self.write(self.sources[0], "pub mod ledger;\n")
+        self.write("crates/alpha/src/ledger/mod.rs", self.LEDGER_MOD)
+        self.write("crates/alpha/src/ledger/handle.rs", self.LEDGER_HANDLE)
+        self.write("crates/alpha/src/ledger/map.rs", "pub fn lock() {}\n")
+        self.write(old, "pub struct MutationLock;\npub struct LockError;\n")
+        for path, text in files:
+            self.write(path, text)
+        _ = self.commit()
+        rule = self.rule("file-rename")
+        issue = self.root / "file-rename-approval.md"
+        with style_ledger.open_ledger(self.repo) as ledger:
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            findings = [ledger.hold(rule, old, 1, "pub struct MutationLock;", "rename", "The file contains MutationLock.",
+                                    "Rename ledger/lock.rs to ledger/mutation_lock.rs; update ledger/mod.rs and all "
+                                    + "super::lock paths", blob, "outside")]
+            findings.extend(ledger.hold(rule, old, 2, "pub struct LockError;", "rename", before, after, blob, "outside")
+                            for before, after in pairs)
+            for finding in findings:
+                ledger.file_held(finding.finding_id, issue)
+            _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+                                 + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [old], [rule],
+                              proposal=str(issue), finding_ids=tuple(finding.finding_id for finding in findings))
+        _ = self.git("mv", old, "crates/alpha/src/ledger/mutation_lock.rs")
+        return "names-unit-1"
+
+    def renamed_ledger(self, handle: str = LEDGER_HANDLE, error: str = "LockError") -> None:
+        """The edits a file rename makes outside the file, ordered as rustfmt orders them, with LockError named error."""
+        self.write("crates/alpha/src/ledger/mod.rs", self.LEDGER_MOD.replace(
+            "mod lock;\nmod map;\n\npub use lock::{LockError, MutationLock};",
+            f"mod map;\nmod mutation_lock;\n\npub use mutation_lock::{{{error}, MutationLock}};").replace(
+            "lock::MutationLock;\n    }", "mutation_lock::MutationLock;\n    }"))
+        self.write("crates/alpha/src/ledger/handle.rs", handle.replace(
+            "use super::lock::MutationLock;\nuse crate::ledger::lock;",
+            "use crate::ledger::mutation_lock;\nuse super::mutation_lock::MutationLock;").replace(
+            "lock::LockError", f"mutation_lock::{error}"))
+
+    def test_approved_file_rename_allows_its_mod_line_and_module_paths_in_other_files(self) -> None:
+        ticket = self.file_rename_ticket()
+        self.renamed_ledger()
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_file_rename_refuses_another_edit_in_a_file_it_changes(self) -> None:
+        ticket = self.file_rename_ticket()
+        self.renamed_ledger()
+        handle = self.repo / "crates/alpha/src/ledger/handle.rs"
+        for other in (("pub fn take(", "pub fn take_lock("), ("// Takes the lock.", "// Takes the mutation_lock."),
+                      ("    self::lock();", "    self::mutation_lock();"), ("handle.lock;", "handle.mutation_lock;")):
+            with self.subTest(other=other):
+                renamed = handle.read_text()
+                _ = handle.write_text(renamed.replace(*other))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+                _ = handle.write_text(renamed)
+
+    def test_canonical_order_drops_a_trailing_comma_only_where_it_does_not_change_the_code(self) -> None:
+        def words(text: str) -> tuple[str, ...]:
+            return style_plan.canonical_order(tuple(token.value for token in style_footprint.tokens(text)))
+        # A one-entry tuple is not the grouped expression, even when its entry holds commas.
+        self.assertNotEqual(words("let f = (|a: u8, b: u8| a + b,);"), words("let f = (|a: u8, b: u8| a + b);"))
+        self.assertNotEqual(words("let m = (HashMap::<u8, u8>::new(),);"), words("let m = (HashMap::<u8, u8>::new());"))
+        self.assertEqual(words("acquire(\n    mutation_lock::x,\n);"), words("acquire(mutation_lock::x);"))
+
+    def test_approved_file_rename_refuses_a_comment_moved_between_items(self) -> None:
+        handle = (self.LEDGER_HANDLE + "\n// a\nfn first() {}\n\n// b\nfn second() {}\n\n"
+                  + "/// c\nfn third() {}\n\n// SAFETY: d\nfn fourth() {}\n")
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),))
+        self.renamed_ledger(handle)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        path = self.repo / "crates/alpha/src/ledger/handle.rs"
+        renamed = path.read_text()
+        for first, second in (("// a", "// b"), ("/// c", "// SAFETY: d")):
+            with self.subTest(first=first, second=second):
+                _ = path.write_text(renamed.replace(first, "\0").replace(second, first).replace("\0", second))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+                _ = path.write_text(renamed)
+
+    def test_approved_file_rename_reads_a_plain_path_from_its_module_or_the_library_name(self) -> None:
+        store, beta = "crates/alpha/src/store/mod.rs", self.sources[3]
+        ticket = self.file_rename_ticket(files=(
+            (self.sources[0], "pub mod ledger;\nuse ledger::lock::MutationLock;\n"),
+            (self.sources[2], "use alpha::ledger::lock::MutationLock;\n"),
+            (store, "use archive::ledger::lock::Entry;\n"),
+            (beta, "use beta::ledger::lock::MutationLock;\n")))
+        self.renamed_ledger()
+        for path in (self.sources[0], self.sources[2]):
+            self.write(path, (self.repo / path).read_text().replace("::lock::", "::mutation_lock::"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for path in (store, beta):
+            with self.subTest(path=path):
+                text = (self.repo / path).read_text()
+                self.write(path, text.replace("::lock::", "::mutation_lock::"))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{path} (change is not an approved rename reference)", output)
+                self.write(path, text)
+
+    def test_approved_file_rename_and_item_rename_edit_one_file(self) -> None:
+        handle = self.LEDGER_HANDLE.replace("-> lock::LockError", "-> super::lock::LockError")
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),),
+                                         pairs=(("lock::LockError", "lock::LockFailure"),))
+        self.renamed_ledger(handle, "LockFailure")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        path = self.repo / "crates/alpha/src/ledger/handle.rs"
+        _ = path.write_text(path.read_text().replace("super::mutation_lock::LockFailure", "super::mutation_lock::LockFault"))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+
+    def test_approved_file_rename_leaves_a_folder_of_child_modules_to_a_person(self) -> None:
+        folder = "crates/alpha/src/ledger/lock"
+        ticket = self.file_rename_ticket(files=(
+            (f"{folder}.rs", "mod guard;\npub struct MutationLock;\npub struct LockError;\n"),
+            (f"{folder}/guard.rs", "pub struct Guard;\n")))
+        _ = self.git("mv", folder, "crates/alpha/src/ledger/mutation_lock")
+        self.renamed_ledger()
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        for name in ("lock", "mutation_lock"):
+            self.assertIn(f"crates/alpha/src/ledger/{name}/guard.rs (in crates/alpha/src/ledger/{name}/, the folder of "
+                          + "a renamed module: a person moves it)", output)
+
     def test_approved_rename_allows_only_reference_edits_in_an_outside_file(self) -> None:
         before = ('// Outcome::OldName stays in this comment.\r\n'
                   + 'fn read() { /* nested /* note */ comment */ Outcome :: OldName; '
@@ -2409,7 +2655,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], before)
         _ = self.commit()
         ticket = self.approved_reference_ticket()
-        self.write(self.sources[0], "// The finding file keeps unrestricted approval.\n")
+        self.write(self.sources[0], "// The finding file keeps unrestricted approval.\nenum Outcome { NewName }\n")
         self.write(self.sources[1], before.replace("Outcome :: OldName", "Outcome :: NewName"))
         _ = self.git("add", self.sources[1])
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
@@ -3001,7 +3247,7 @@ class StylePlanTests(unittest.TestCase):
         with mock.patch.object(berth_board, "read_board", side_effect=AssertionError("board read")):
             self.assertEqual(self.run_next(), (5, f"waiting for merge: names-unit-1 checkpointed at {self.tip[:7]}\n", ""))
         self.assertEqual(self.plan.read_bytes(), before)
-        ledger.ticket_merge(ticket["id"])
+        _ = ledger.ticket_merge(ticket["id"])
         code, output, errors = self.run_next()
         self.assertEqual((code, errors), (0, ""))
         self.assertIn("discarded names-unit-1: merged", output)

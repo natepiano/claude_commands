@@ -91,8 +91,11 @@ Loop/verbose only:
    ten-second deadline: invoke no retry.
 6. **Standing plans:** rerun the ticket's
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket <id>`
-   before staging. Exit 1 (a review or error) retains the reservation and
-   returns to repair. On exit 0, stage only this phase's code paths from
+   before staging. Exit 1 is a review: it retains the reservation and returns
+   to repair. Exit 2 means the gate could not run (`error: <reason>`, such as a
+   locked ledger): retain the reservation, do not repair, and rerun the gate.
+   If the same error comes back, stop and report it.
+   On exit 0, stage only this phase's code paths from
    `git status --porcelain`, handling renamed paths as pairs; never name the
    plan doc, `docs/style-production/` or pinned rule files in `git add`.
    Commit exactly the gated tree once using the message below, then capture
@@ -113,6 +116,10 @@ Loop/verbose only:
    --repo . --id <ticket> --commit <captured HEAD>` then
    `style_ledger.py ticket merge --repo . --id <ticket>` through
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py`.
+   For each `has no applied check` line that merge prints, check the change in
+   the code and run the printed `held built` command when the change is there.
+   A finding whose change is not there waits for a person, who makes the change
+   and runs that command, or waives the finding with `style_ledger.py held waive`.
    From `Active`, atomically replace the durable record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
    full id as `checkpoint_commit`, and read it back. This is the one case where

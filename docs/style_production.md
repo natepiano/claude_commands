@@ -80,7 +80,8 @@ checking once more for work; delivery clears only that wait, preserving a later 
 A ticket with no code changes makes no commit: record its cells at HEAD, verify
 `git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
 `style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD>`
-and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Follow
+and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Act on
+its `not built` lines as after a showrunner's `ticket merge` (**Merging back**). Follow
 the checkpoint procedure's atomic committed-awaiting-release record using that
 ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
@@ -151,7 +152,8 @@ judged. Both `queue` and `next-phase` read the unit's own copy.
 One style production and one synced branch point per repository. The ledger is
 `~/.local/state/style/<repo>/ledger.sqlite`; only `style_ledger.py` writes it.
 Startup runs `style_ledger.py reconcile --repo <checkout> --branch-point <branch>
---style-branch <style branch>` and logs its change lines. Reconcile recovers work
+--style-branch <style branch>` and logs its change lines. Act on its `not built`
+lines as after `ticket merge` (**Merging back**). Reconcile recovers work
 state from Git without advancing a tip already associated with that style branch.
 When initializing or changing the style branch, reconcile syncs the ledger at
 that branch's commit, falling back to the branch-point tip only if the style
@@ -183,9 +185,10 @@ Bootstrap and sync store the style branch with
 without one, unmerged judgments read `stale`.
 
 Fingerprints use committed Git objects at the rule's `file`, `crate` or
-`manifest` scope. A `clean` or `exception` verdict with `--input-scope file` uses
-the file's own fingerprint. It stays current when other files in its crate or
-module change. The manifest scope covers the workspace root and member
+`manifest` scope. A `clean`, `exception` or `held` verdict with `--input-scope file`
+uses the file's own fingerprint. It stays current when other files in its crate
+or module change. On a crate or module cell of a Rust file, these three verdicts
+must give `--input-scope file` or `--input-scope rule`. The manifest scope covers the workspace root and member
 manifests; crate `.` covers only its own files. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
@@ -261,6 +264,12 @@ with one `--also <path>` for each entry of the unit's open ticket's `files`
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
 to wake every unit waiting for sync, and send the owning unit director
 `From the showrunner of <style slug>: ticket <id> merged; refill.`
+For each `has no applied check` line that merge prints, check the change in the
+code, and run the printed `held built` command when the change is there. A rerun
+of `ticket merge` on a merged ticket prints these lines again. A finding whose
+change is not there waits for a person, who makes the change and
+runs that command, or waives the finding with
+`style_ledger.py held waive --repo <checkout> --id <finding id>`.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
@@ -291,7 +300,8 @@ as unit checkpoints.
 
 At startup, first run
 `style_sync.py resume --repo <checkout> --slug <style slug> --branch-point <branch point> --style-branch <style merge branch>`
-and append its reconcile change lines to **Log**. Reconcile stores the branch
+and append its reconcile change lines to **Log**. Act on its `not built` lines as
+after `ticket merge`. Reconcile stores the branch
 point before any acknowledgment and marks merged hand-offs by ancestry.
 Replay proceeds oldest first: pending notices are sent then recorded; sent
 notices are sent again; a notice sent to another parent is sent to the current
@@ -341,7 +351,7 @@ Apply a fix without asking only when all mechanical criteria hold:
 3. No type gains or loses a field, variant, generic parameter or trait impl,
    and no new type, trait or error type appears.
 4. A rename's sites are in one crate and at most 10 files.
-5. The finding's diff is under 200 changed lines.
+5. Each file in the finding has under 200 changed lines.
 6. Behavior is preserved: no condition, literal value or control flow changes
    meaning, and no serialized, reflected or configured name changes (serde and
    reflect names, config keys, documented usage).
@@ -359,8 +369,9 @@ Run from the unit worktree, using the ticket's recorded start commit:
 ```
 
 Exit 0 means every finding is `mechanical`; exit 1 prints `review: <reasons>`
-for anything the filter cannot clear. Without `--finding-map`, the whole diff
-is one finding. An optional JSON map assigns finding ids to file lists, or to
+for anything the filter cannot clear. Exit 2 prints `error: <reason>` when the
+check could not run: a git failure, such as a missing revision, or a file
+error. Without `--finding-map`, the whole diff is one finding. An optional JSON map assigns finding ids to file lists, or to
 objects with `files` and `hunks` lists. A hunk is identified by its `path`,
 `old_start` and `new_start` from a zero-context diff; every changed hunk must
 have one owner. The gate folds merged-in parents into the comparison base so
@@ -416,6 +427,60 @@ closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
 
+A finding is built only when its change is in the code. A rename finding
+whose `before` and `after` are one `<parent>::<name>` pair has an applied check
+in the finding's file. It is not applied while the old name has a declaration
+under its parent, and applied when only the new name has one. A parent is an
+enum, struct, union, trait, impl or inline module, or the file itself as its
+module (`crate` for `lib.rs` and `main.rs`). The gate refuses an approved ticket
+while any such rename is not applied in the worktree, with one line per rename:
+`review: <finding id>: <before> -> <after> not applied in <path>`.
+`ticket merge` marks a finding built only when its check passes at the
+ticket's checkpoint, and prints one line for each other finding. A rename that
+is not applied stays filed with no build ticket, so the next refill takes it
+into a new ticket: `not built <finding id>: rename not applied in <path>`.
+A finding with no applied check stays filed and keeps its merged ticket, so
+refill skips it until a person marks it built:
+`not built <finding id>: <kind> has no applied check; mark it built with style_ledger.py held built --repo <checkout> --id <finding id> after checking`.
+`held built` refuses a finding with no merged build ticket, and a rename that is
+not applied at that ticket's checkpoint.
+A rename also has no check when its file declares neither name under one
+parent, or when more than one item in the file has the parent's name.
+
+A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
+where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
+Neither file name may be a Rust keyword, and the rest of `after` may not name a
+second `<x>.rs to <y>.rs` pair or a move, split or merge.
+It is applied when only the new file is in the code, and not applied when only the
+old file is. It has no check when a folder of child modules (`lock/` or
+`mutation_lock/`) is there; the gate refuses changes in that folder, and a person
+moves it. The gate allows the old file to go and the new file to come, with any
+content. In other Rust files it allows only the `mod <old>;` line and the path
+segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
+`ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file
+outside the crate (where `alpha` is the library's name), a `pub use lock::...`
+re-export, and `lock::` where a `mod` line, import or glob binds the module. When
+the ticket also renames an item, its qualified references there change too. The
+`use` and `mod` lines may take the order rustfmt gives them, and a call's trailing
+comma may change. The gate refuses every other change in those files. Comments stay
+in their order; only comments inside a block of `use` and `mod` lines move with them.
+The decision stays open and approved until every finding is built or waived.
+
+To repair a decision or an old issue that closed too early, run
+`style_proposals.py reopen --repo <style checkout> --issue <issue> --parent <slug> [--dry-run]`.
+It checks each built rename at the synced tip and sets each one that is not
+applied back to filed, with no build ticket. Findings with no check stay built.
+A decision opens again with its approval. The findings of an old issue move to
+the decision for their rule, crate and rule blob, as migrate moves them; a new
+decision takes the old issue's approval. Reopen prints
+`filed again <finding id> in <decision>: <before> -> <after> not applied in <path>`
+for each finding, or `nothing to reopen: every built finding is applied`.
+The dry run prints the same lines and writes nothing. Reopen refuses an issue
+that is not approved, an issue that an open ticket builds, an issue with a
+merged ticket whose checkpoint the synced tip does not hold yet (sync first), and
+an old issue that migrate would refuse or whose decision is declined or has no
+answer. A refusal writes nothing.
+
 After each merge and at startup, run `style_proposals.py complete --repo
 <style checkout>`. It closes only approved decisions, and only when all their
 findings are built or waived. It also closes an approved decision with no merged
@@ -437,6 +502,8 @@ its decision: a declined decision waives it with the stored words, and a
 decision closed as built opens again with its approval. A decision closed with
 nothing left to build also opens again with its approval for a later finding. Migration leaves an
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
+Migration does not change an off-rule issue that a style unit filed through
+`/issue`; it lists the issue as `skipped: off-rule <path>` and counts it in its totals.
 
 ## Lifetime
 

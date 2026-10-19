@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
 import add_unit  # noqa: E402
 import issues  # noqa: E402
@@ -43,6 +44,7 @@ import phase_table  # noqa: E402
 import production_units  # noqa: E402
 import proposal_issue  # noqa: E402
 import proposals_folder  # noqa: E402
+import pane_record  # noqa: E402
 import rename_state  # noqa: E402
 import review_pool  # noqa: E402
 import showrunners  # noqa: E402
@@ -62,7 +64,7 @@ else:
     import record as shutdown_record
     from record import SessionShutdown
 
-RESERVED = frozenset({"review-unit", add_unit.NIGHTLY_REVIEW_UNIT})
+RESERVED = frozenset({add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.
 EDITED_COLUMNS = {"## Hub files": ("Owner unit", "Other units that touch it"), "## Gates": ("Waiting", "Waits on")}
 PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept", "old_session")
@@ -418,6 +420,8 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch))
+    # The relaunched unit records its new pane at SessionStart; its old pane's entry would resume the old name.
+    _ = pane_record.forget_unit(rename.old)
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
                             stall_watch.stretch_path(rename.slug, rename.new)))
     try:
@@ -771,7 +775,7 @@ def _describe_merge_rename(r: UnitRename) -> str:
 
 
 def _describe_state(r: UnitRename) -> str:
-    return ("state: report scratch, stall-watch stretch, reviewer leases and memory, run record, open proposals, "
+    return ("state: report scratch, stall-watch stretch, reviewer leases, run record, open proposals, "
             + f"phase notes: {r.old} -> {r.new}")
 
 

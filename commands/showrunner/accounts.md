@@ -8,7 +8,7 @@ argument-hint: '[--detail | exec claudeN|codexN|units|showrunners|workers [argsâ
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/accounts/accounts.py" $ARGUMENTS`
 and print its output exactly as it comes, with nothing added.
 
-- No arguments: the units and showrunners accounts, then one Markdown table for numbered Claude and Codex accounts, logged in or not. `~/.claude` has no row; `~/.codex` has one only while signed in. Problems follow the table.
+- No arguments: one Markdown table for numbered Claude and Codex accounts, logged in or not. `~/.claude` has no row; `~/.codex` has one only while signed in. Problems follow the table.
 - `--detail`: the same, then each live session's account, the Codex workers line with its refusal destination
   and held worker continuations, the last ten account moves with their cause and outcomes, and `Codex work routing:` with open, recovered or failed assignment fallbacks.
 - An argument it does not recognise: run the no-argument form instead and print only its output, with no explanation.

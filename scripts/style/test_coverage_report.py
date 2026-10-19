@@ -106,7 +106,8 @@ class CoverageReportTests(unittest.TestCase):
         definition = next(row for row in rules.load_rules(self.repo)
                           if row.rule_id == rule.removesuffix("#uncovered"))
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.record(rule, path, self.tip, definition.blob, verdict, ticket="report-1", worker="test")
+            ledger.record(rule, path, self.tip, definition.blob, verdict, ticket="report-1", worker="test",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
 
     def report(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(

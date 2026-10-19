@@ -105,9 +105,9 @@ mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 When the production doc names a review pool, send code reviews with
 `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
-review resumes the unit's own reviewer, which is never reset. A refusal ending
-`no primed code template` means `review-unit` has not primed the pool yet: send
-that review to an idle worker with `--to`, and tell the showrunner once.
+review resumes the unit's own reviewer, which is never reset. A refusal
+`no primed code template: <cause>` means the pool could not prime itself: send
+that review to an idle worker with `--to`, and tell the showrunner the cause once.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
@@ -1296,9 +1296,8 @@ instructions name; with none, skip and say so in one line.
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
      `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
-     in the background. The launcher resumes the unit's UI reviewer, sends
-     every listed image, and sends the unit's memory on that reviewer's
-     first turn only; its thread carries the memory after that.
+     in the background. The launcher resumes the unit's UI reviewer and sends
+     every listed image; its thread carries what it learned from earlier reviews.
    - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
      also start the fresh Claude helper with the prompt from its helper file
      and those shots;
@@ -1531,8 +1530,10 @@ The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
 worktree. Run it again at <CheckpointCommit/> step 6 before staging. The gate and
 `ticket checkpoint` refuse unjudged owned cells, naming each one. Coverage
 selection runs the mechanical filter at the ticket's recorded base; an approved
-proposal permits only files of its approved findings. Exit 1 retains the
-reservation and returns to repair. Exit 0 permits committing exactly that tree,
+proposal permits only files of its approved findings. Exit 1 prints `review:`,
+retains the reservation and returns to repair. Exit 2 prints `error:` when the
+gate could not run, such as a locked ledger: retain the reservation and rerun
+it; if the same error comes back, stop and report it. Exit 0 permits committing exactly that tree,
 then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit>`
 before marking the phase done. Both gates run this one command, so they cannot drift.
 </StandingPlanRefill>

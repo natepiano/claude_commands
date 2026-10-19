@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.production.showrunners import canonical_slug  # noqa: E402
+from scripts.production.showrunners import canonical_slug, timer_docs  # noqa: E402
 
 ReviewerType = Literal["code", "ui"]
 
@@ -288,10 +288,62 @@ def _thread_id(result: subprocess.CompletedProcess[str]) -> str:
     return thread_id
 
 
-def command_prime(args: PoolArguments) -> int:
-    production = _production(str(args.production))
-    reviewer_type = args.type
-    content = Path(str(args.instructions_file)).read_bytes()
+def _config_dir() -> Path:
+    return Path(os.environ.get("REVIEW_POOL_CONFIG") or Path(__file__).resolve().parents[2] / "config" / "review_pool")
+
+
+def _ux_rules(guide: Path) -> list[Path]:
+    """The guide's rule files: a `.md` in its root whose frontmatter carries a non-empty `test:`."""
+    rules: list[Path] = []
+    for path in sorted(guide.glob("*.md")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines or lines[0].strip() != "---":
+            continue
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            if line.startswith("test:") and line.removeprefix("test:").strip().strip("\"'"):
+                rules.append(path)
+                break
+    return rules
+
+
+def _ui_parts(slug: str) -> list[str]:
+    """The ui prompt's parts after its base: the UX guide's rules, then the repository's design decisions and targets."""
+    doc = timer_docs().get(slug)
+    if doc is None:
+        raise PoolError(f"no production doc for {slug}")
+    lines = doc.read_text(encoding="utf-8").splitlines()
+    value = next((line.removeprefix("- **UX guide:** ") for line in lines if line.startswith("- **UX guide:** ")), "")
+    if not value.split():
+        raise PoolError("production has no UX guide")
+    guide = Path(value.split()[0].strip("`;,.")).expanduser().resolve()
+    parts = ["## Rules", f"UX guide: {guide}"]
+    parts.extend(f"### {rule.name}\n\n{rule.read_text(encoding='utf-8').rstrip()}" for rule in _ux_rules(guide))
+    top = subprocess.run(["git", "-C", str(doc.parent), "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True, check=False).stdout.strip()
+    repository = Path(top) if top else doc.parent
+    for heading, relative in (("Design decisions", "docs/design-decisions.md"), ("Targets", "docs/hana/targets.md")):
+        path = repository / relative
+        if path.is_file():
+            parts.append(f"## {heading}\n\n{path.read_text(encoding='utf-8').rstrip()}")
+    return parts
+
+
+def standing_prompt(slug: str, reviewer_type: ReviewerType) -> bytes:
+    """The prompt a template is primed with: the type's base prompt, and for ui the production's UX rules."""
+    base = _config_dir() / f"{reviewer_type}.md"
+    try:
+        parts = [base.read_text(encoding="utf-8").rstrip()]
+    except OSError as exc:
+        raise PoolError(f"no {reviewer_type} base prompt: {exc}") from exc
+    if reviewer_type == "ui":
+        parts.extend(_ui_parts(slug))
+    return ("\n\n".join(parts) + "\n").encode()
+
+
+def _prime(production: ProductionPool, reviewer_type: ReviewerType, content: bytes) -> str:
+    """Prime the type's template from `content` unless it already holds it; returns the prompt hash."""
     prime_hash = hashlib.sha256(content).hexdigest()
     prompt_path = production.directory / "prime" / f"{prime_hash}.md"
     with production.locked() as pool:
@@ -324,12 +376,31 @@ def command_prime(args: PoolArguments) -> int:
     with production.locked(write=False) as pool:
         _generation(pool, generation)
         production.collect_prompts(pool)
-    print(prime_hash)
+    return prime_hash
+
+
+def command_prime(args: PoolArguments) -> int:
+    print(_prime(_production(str(args.production)), args.type, Path(str(args.instructions_file)).read_bytes()))
     return 0
 
 
+def _prime_standing(production: ProductionPool, reviewer_type: ReviewerType) -> None:
+    """Prime the template from the standing prompt when it is absent or out of date; the first allocate primes it."""
+    with production.locked(write=False) as pool:
+        _require_finished_stop(pool)
+        primed = reviewer_type in pool.templates
+    try:
+        content = standing_prompt(production.directory.name, reviewer_type)
+    except (PoolError, OSError, UnicodeError) as exc:
+        if not primed:
+            raise PoolError(f"no primed {reviewer_type} template: {exc}") from exc
+        print(f"review_pool: {exc}; the {reviewer_type} template keeps its prompt", file=sys.stderr)
+        return
+    _ = _prime(production, reviewer_type, content)
+
+
 def rename_unit(production: str, old: str, new: str) -> int:
-    """Carry a renamed unit's reviewers and memory to its new id; returns the leases moved.
+    """Carry a renamed unit's reviewers to its new id; returns the leases moved.
 
     Thread ids and ordinals stay, so the unit keeps the reviewers that already know it.
     """
@@ -345,25 +416,7 @@ def rename_unit(production: str, old: str, new: str) -> int:
             if isinstance(lease, UnitLease) and lease.unit == old:
                 reviewer.lease = UnitLease(new, lease.ordinal)
                 moved += 1
-        memory = pool_dir.directory / "memory"
-        source, destination = memory / f"{old}.md", memory / f"{new}.md"
-        if source.exists():
-            if destination.exists():
-                raise PoolError(f"memory for {new} already exists")
-            _ = source.rename(destination)
     return moved
-
-
-def command_unit_memory(args: PoolArguments) -> int:
-    if not args.unit or Path(args.unit).name != args.unit or args.unit in (".", ".."):
-        raise PoolError("unit must name one memory file")
-    path = _production(args.production).directory / "memory" / f"{args.unit}.md"
-    try:
-        content = path.read_bytes()
-    except FileNotFoundError:
-        return 0
-    _ = sys.stdout.buffer.write(content)
-    return 0
 
 
 def _owns(reviewer: Reviewer, pid: int, thread_id: str) -> bool:
@@ -483,10 +536,12 @@ def _choose(pool: Pool, reviewer_type: ReviewerType, unit: str, pid: int) -> tup
 def command_allocate(args: PoolArguments) -> int:
     production = _production(str(args.production))
     pid = int(args.pid)
+    _prime_standing(production, args.type)
+    unit = _lease_unit(production, str(args.unit))
     with production.locked() as pool:
         generation = pool.generation
         _require_finished_stop(pool)
-        name, reviewer, source = _choose(pool, args.type, str(args.unit), pid)
+        name, reviewer, source = _choose(pool, args.type, unit, pid)
         template_name = pool.templates[args.type].name
     newly_forked = not reviewer.thread_id
     if newly_forked:
@@ -516,8 +571,8 @@ def command_allocate(args: PoolArguments) -> int:
             if thread_id:
                 current.thread_id = thread_id
                 if source == template_name:
-                    # A template fork has none of the unit's context: its first turn carries the unit memory.
-                    current.lease = UnitLease(str(args.unit), 1)
+                    # A template fork has none of the unit's context: its lease starts again at the first review.
+                    current.lease = UnitLease(unit, 1)
                     current.prime_hash = pool.templates[args.type].prime_hash
                 reviewer = current
         if not thread_id:
@@ -549,7 +604,7 @@ def command_release(args: PoolArguments) -> int:
         reviewer = pool.reviewers.get(str(args.reviewer))
         if reviewer is not None and isinstance(reviewer.ownership, ClaimedReviewer) and reviewer.ownership.pid == int(args.pid):
             if args.thread_id and args.thread_id != reviewer.thread_id:
-                # The mesh refused the resume and started a new thread: its next review carries the unit memory again.
+                # The mesh refused the resume and started a new thread: it starts the unit's reviews again.
                 reviewer.thread_id = args.thread_id
                 if isinstance(reviewer.lease, UnitLease):
                     reviewer.lease = UnitLease(reviewer.lease.unit, 0)
@@ -558,21 +613,45 @@ def command_release(args: PoolArguments) -> int:
     return 0
 
 
-def _same_unit(lease: UnitLease, unit: str) -> bool:
-    # Lease names predate one spelling: some directors gave `trunk`, others `trunk-unit`.
-    return lease.unit.removesuffix("-unit") == unit.removesuffix("-unit")
+def _lease_unit(production: ProductionPool, unit: str) -> str:
+    """The lease name a caller means: a name some reviewer is leased under wins, else its Units row."""
+    with production.locked(write=False) as pool:
+        if any(isinstance(reviewer.lease, UnitLease) and reviewer.lease.unit == unit for reviewer in pool.reviewers.values()):
+            return unit
+    return _unit_id(production.directory.name, unit)
+
+
+def _unit_id(slug: str, unit: str) -> str:
+    """The Units table id a caller means: `trunk` is `trunk-unit` when only that row exists.
+
+    A unit absent from the table, or a production with no readable doc, keeps the name given.
+    """
+    doc = timer_docs().get(slug)
+    if doc is None:
+        return unit
+    production_scripts = str(Path(__file__).resolve().parents[1] / "production")
+    if production_scripts not in sys.path:
+        sys.path.insert(0, production_scripts)
+    import production_units
+
+    try:
+        rows = production_units.unit_table(doc.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError, ValueError, production_units.Refusal):
+        return unit
+    ids = {production_units.cell_value(cells.get("Unit", "")) for cells in rows}
+    return unit if unit in ids or f"{unit}-unit" not in ids else f"{unit}-unit"
 
 
 def command_retire(args: PoolArguments) -> int:
     """End the unit's reviewers; one still reviewing keeps its turn and is left in place."""
     production = _production(str(args.production))
-    unit = str(args.unit)
+    unit = _lease_unit(production, str(args.unit))
     pid = os.getpid()
     with production.locked(write=False) as pool:
         _require_finished_stop(pool)
         generation = pool.generation
         names = [name for name, reviewer in pool.reviewers.items()
-                 if isinstance(reviewer.lease, UnitLease) and _same_unit(reviewer.lease, unit)]
+                 if isinstance(reviewer.lease, UnitLease) and reviewer.lease.unit == unit]
     for name in names:
         with production.locked() as pool:
             _generation(pool, generation)
@@ -709,15 +788,14 @@ def command_stop(args: PoolArguments) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="verb", required=True)
-    for verb in ("prime", "allocate", "release", "retire", "end-lease", "status", "stop", "unit-memory",
-                 "migrate"):
+    for verb in ("prime", "allocate", "release", "retire", "end-lease", "status", "stop", "migrate"):
         command = subparsers.add_parser(verb)
         _ = command.add_argument("--production", required=True)
         if verb in ("prime", "allocate"):
             _ = command.add_argument("--type", choices=("code", "ui"), required=True)
         if verb == "prime":
             _ = command.add_argument("--instructions-file", required=True)
-        if verb in ("unit-memory", "retire"):
+        if verb == "retire":
             _ = command.add_argument("--unit", required=True)
         if verb in ("allocate", "end-lease"):
             _ = command.add_argument("--unit", required=verb == "allocate", default="")
@@ -740,7 +818,7 @@ def main() -> int:
         "allocate": command_allocate, "release": command_release, "retire": command_retire,
         "end-lease": command_end_lease,
         "status": command_status, "stop": command_stop,
-        "unit-memory": command_unit_memory, "migrate": command_migrate,
+        "migrate": command_migrate,
     }
     try:
         return handlers[str(args.verb)](args)

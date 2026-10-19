@@ -126,6 +126,9 @@ run_nextest "$@"
             "BUILDLOG_OFF": "1",
             "BUILDLOG_CALL_ID": "",
             "BUILDLOG_CALLER": "",
+            # Every lint step waits for natedev's hold: a real hold must not stop the case.
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "LINT_CONFIG_READER": str(config_reader),
         }
         result = subprocess.run(
