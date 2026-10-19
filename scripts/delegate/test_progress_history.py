@@ -295,10 +295,6 @@ print('two homes isolated; recorder lock retained; caller restored')
             )
         with (
             patch.dict(os.environ, environment, clear=True),
-            patch(
-                "scripts.delegate.progress_history.shutil.which",
-                return_value=None,
-            ),
             run_patch,
             redirect_stdout(stdout),
             redirect_stderr(stderr),
@@ -589,7 +585,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             ],
         )
         self.assertIn("▸ **Fix 2 - correcting retry recovery**", header)
-        self.assertEqual(header.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+        self.assertEqual(header.splitlines()[-1], "**now 1970-01-01 05:35:00**")
 
         _ = self.run_command(
             "calibrate",
@@ -728,7 +724,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 ]
                 self.assertEqual(report.splitlines()[:6], expected)
                 self.assertEqual(report.splitlines()[-1],
-                                 "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+                                 "**now 1970-01-01 05:35:00**")
                 if tables:
                     self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:3],
                                      ["Phase 3", "20", "00:01:40"])
@@ -738,7 +734,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     )
                 else:
                     self.assertEqual(report.splitlines(), [
-                        *expected, "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                        *expected, "**now 1970-01-01 05:35:00**",
                     ])
 
     def test_ad_hoc_run_reuses_plan_project_time_for_the_same_worktree_branch(
@@ -817,156 +813,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("| Project |  40 | 1 day 03:30:10 ", header)
         self.assertIn("| Phase 3 |  10 |       00:00:10 |", header)
 
-    def test_the_clock_line_names_the_armed_timer_then_falls_back_to_the_interval(
-        self,
-    ) -> None:
-        started_at = 20_000
-        session_dir = self.start_run("clock", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-
-        # A timer armed and still ahead of the clock is the real next tick, so
-        # its deadline wins over the interval added to the current time.
-        _ = (session_dir / "progress_timer").write_text(
-            f"deadline_epoch={started_at + 400}\npid=1234\ninterval_seconds=600\n",
-            encoding="utf-8",
-        )
-        armed = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:40:00**", armed)
-
-        # progress_timer.sh clears the marker as it ticks, and an expired one
-        # left behind names a tick that has already happened. Both fall through
-        # to the configured interval.
-        _ = (session_dir / "progress_timer").write_text(
-            f"deadline_epoch={started_at + 50}\npid=1234\ninterval_seconds=600\n",
-            encoding="utf-8",
-        )
-        expired = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:38:00**", expired)
-
-        (session_dir / "progress_timer").unlink()
-        self.write_interval(90_000)
-        crosses_midnight = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn(
-            "**now 1970-01-01 05:35:00 - next report 1970-01-02 06:35:00**",
-            crosses_midnight,
-        )
-
-        # An unusable interval degrades the clause rather than stopping the
-        # header: the report is not the timer, and progress_timer.sh is the
-        # caller that fails loudly on the same key.
-        self.write_interval("not-a-number")
-        unusable = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn("**now 1970-01-01 05:35:00**", unusable)
-        self.assertNotIn("next report", unusable)
-
-    def test_the_clock_line_uses_the_restarted_unit_notifier(self) -> None:
-        started_at = 20_000
-        report_at = started_at + 100
-        session_dir = self.start_run("notifier-clock", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-        state_dir = self.root / "notifier"
-        environment = os.environ.copy()
-        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
-        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = subprocess.run(
-            [
-                "zsh",
-                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
-                "new",
-                f"unit-{session_dir.name}",
-                "--to",
-                "session:test-claude-session",
-                "--every",
-                "15",
-                "--command",
-                "/unit:report",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        # A legacy marker must yield to the live instance's new deadline.
-        _ = (session_dir / "progress_timer").write_text(
-            f"deadline_epoch={started_at + 400}\npid=1234\ninterval_seconds=600\n",
-            encoding="utf-8",
-        )
-        with patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(state_dir)}):
-            report = self.run_progress(session_dir, at=report_at)
-        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:50:00**", report)
-        state = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(state["LAST_RESTART"], str(report_at))
-        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
-
-    def test_missing_cap_stage_restarts_unit_notifier(self) -> None:
-        started_at = 50_000
-        report_at = started_at + 100
-        session_dir = self.start_run("refused-cap-stage", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-        state_dir = self.root / "notifier"
-        environment = os.environ.copy()
-        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
-        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = subprocess.run(
-            [
-                "zsh",
-                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
-                "new",
-                f"unit-{session_dir.name}",
-                "--to",
-                "session:test-claude-session",
-                "--every",
-                "15",
-                "--command",
-                "/unit:report",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        with patch.dict(
-            os.environ,
-            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
-        ):
-            result = self.run_failing_command(
-                "progress", "--tables",
-                "--session-dir",
-                str(session_dir),
-                "--project-raw-percent",
-                "40",
-                "--project-percent",
-                "40",
-                "--phase-raw-percent",
-                "40",
-                "--phase-percent",
-                "40",
-                "--activity",
-                "implementing",
-                at=report_at,
-            )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--cap-stage is required", result.stderr)
-        state = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(state["LAST_RESTART"], str(report_at))
-        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
-
-    def test_a_finished_phase_is_refused_and_restarts_unit_notifier(self) -> None:
-        """With no active phase there is nothing to report, and the clock still moves."""
+    def test_a_finished_phase_is_refused(self) -> None:
+        """With no active phase there is nothing to report."""
         started_at = 20_000
         report_at = started_at + 100
         session_dir = self.start_run("refused-phase", started_at)
@@ -979,53 +827,17 @@ print('two homes isolated; recorder lock retained; caller restored')
             "completed",
             at=started_at + 60,
         )
-        state_dir = self.root / "notifier"
-        environment = os.environ.copy()
-        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
-        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = subprocess.run(
-            [
-                "zsh",
-                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
-                "new",
-                f"unit-{session_dir.name}",
-                "--to",
-                "session:test-claude-session",
-                "--every",
-                "15",
-                "--command",
-                "/unit:report",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
+        result = self.run_failing_command(
+            "progress", "--tables",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "implementing",
+            at=report_at,
         )
-        with patch.dict(
-            os.environ,
-            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
-        ):
-            result = self.run_failing_command(
-                "progress", "--tables",
-                "--session-dir",
-                str(session_dir),
-                "--activity",
-                "implementing",
-                at=report_at,
-            )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No active phase to report: phase completed.", result.stderr)
         self.assertIn("say nothing about whether the workers are alive", result.stderr)
-        state = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(state["LAST_RESTART"], str(report_at))
-        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
     def test_a_closed_phase_with_a_running_activity_reports_its_last_tables(
         self,
@@ -1111,7 +923,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertNotIn("No pass or activity is open.", report)
         self.assertEqual(
             report.splitlines()[-1],
-            "**now 1970-01-01 05:40:00 - next report 05:43:00**",
+            "**now 1970-01-01 05:40:00**",
         )
         self.assertEqual(history.read_text(encoding="utf-8"), events_before)
         self.assertEqual(state_path.read_text(encoding="utf-8"), state_before)
@@ -1187,7 +999,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             [["Fix 2", "05:33:30", "1m", "fix 1m running", "-", "running"]],
         )
         self.assertIn("▸ **Fix 2 - implementing**", report)
-        self.assertEqual(report.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+        self.assertEqual(report.splitlines()[-1], "**now 1970-01-01 05:35:00**")
 
     def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
         started_at = 21_000
@@ -1507,14 +1319,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertGreater(lines.index(warning), lines.index(next(
             line for line in lines if line.startswith("| Fix 2 ")
         )))
-        self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
-        restart = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(restart["LAST_RESTART"], str(report_at))
+        self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00**")
 
     def test_a_phase_between_windows_prints_recorded_summary_without_tables_flag(self) -> None:
         started_at = 20_000
