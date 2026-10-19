@@ -350,6 +350,16 @@ class UnitLookupTests(unittest.TestCase):
         self.hosts({})
         self.assertEqual(unit_lookup.every_marked_unit(), unit_lookup.MarkedProductions({}, {}))
 
+    def test_a_detached_run_carrying_the_marks_does_not_double_the_units_pane(self) -> None:
+        # A worker build that mesh_runs supervises keeps the unit's marks and an old pane id.
+        self.hosts({"$1": marked("agents", "w2:pS", "trunk-unit"), "$2": marked("runs", "w2:pE", "trunk-unit")})
+        self.claude("trunk", "w2:pS")
+        found = unit_lookup.every_marked_unit()
+        self.assertEqual(found.faults, {})
+        unit = found.units["show"]["trunk-unit"]
+        self.assertEqual(unit.place, herdr.HerdrPlace("agents", "w2:pS"))
+        self.assertIsInstance(unit.claude, LiveClaude)
+
     def test_one_duplicate_mark_leaves_out_only_its_own_unit(self) -> None:
         self.hosts({
             "first": marked("first", "w1:p1", "one-unit"),

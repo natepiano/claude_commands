@@ -2259,6 +2259,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
                                      {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "p1"))
+                    self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
 
     def test_shared_scope_handoff_uses_preserved_shells_without_reading_unrelated_environments(self) -> None:
         servers = [self.process(pid, 1, ["herdr", "server"], {}) for pid in (30, 40)]
@@ -2298,6 +2299,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(next(row.marks for row in rows if row.pid == 12),
                                      {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "unit"})
                     self.assertEqual(herdr.herdr_place_of(12), herdr.HerdrPlace("writing", "w1:p1"))
+                    self.assertEqual(herdr.herdr_places(), {row.pid: row.place for row in rows})
 
     def test_a_slow_start_on_a_loaded_machine_still_gets_its_opening_prompt(self) -> None:
         # Claude is ready for input 200 s after the start: past the 90 s limit, inside it scaled by load.
