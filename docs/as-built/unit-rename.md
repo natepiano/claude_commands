@@ -8,7 +8,7 @@ with three actions: `plan`, `apply` and `verify`.
 
 - The unit id (`<stem>-unit`) is the key. The branch `<slug>-<stem>` and the worktree are built from
   the stem.
-- A session name is a label: the rename changes it only while it is still add_unit's default.
+- The Claude session always takes the new stem, and verify fails while the live session or a herdr pane label still has the old session name (user, 2026-10-19). `<old>` may be the session name; when the id already matches, only stop, record, relaunch and verify run.
 - Rule: store only what cannot be looked up, and never rewrite history.
   - Merge subjects, logs, transcripts and plan prose keep the old id.
   - `merge_checkpoint.merge_branch_history` follows the commit `chore(<slug>): rename unit <old> to
