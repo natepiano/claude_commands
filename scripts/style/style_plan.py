@@ -169,6 +169,204 @@ def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, bo
     return BusyFiles(board, busy)
 
 
+@dataclass(frozen=True)
+class ApprovedRename:
+    parent: str
+    old: str
+    new: str
+
+
+def approved_rename_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[ApprovedRename, ...]:
+    pairs: list[ApprovedRename] = []
+    for finding in findings:
+        before, after = finding.before.split("::"), finding.after.split("::")
+        if (finding.kind != "rename" or len(before) < 2 or len(before) != len(after)
+                or before[:-1] != after[:-1] or before[-1] == after[-1]
+                or not style_footprint.IDENTIFIER.fullmatch(before[-1])
+                or not style_footprint.IDENTIFIER.fullmatch(after[-1])):
+            return ()
+        pairs.append(ApprovedRename(before[-2], before[-1], after[-1]))
+    return tuple(pairs)
+
+
+def modified_reference_files(repo: Path) -> frozenset[str]:
+    """Accept only in-place edits in both the index and the worktree."""
+    entries = iter(git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all").split("\0"))
+    modified: set[str] = set()
+    rejected: set[str] = set()
+    for entry in entries:
+        if not entry:
+            continue
+        status, path = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            rejected.update((path, next(entries)))
+        elif status in {" M", "M ", "MM"}:
+            modified.add(path)
+        else:
+            rejected.add(path)
+    return frozenset(modified - rejected)
+
+
+def use_reference_parents(words: tuple[str, ...]) -> dict[int, str]:
+    """Associate a use leaf with the path that owns its brace group."""
+    parents: dict[int, str] = {}
+    cursor = 0
+    while cursor < len(words):
+        if words[cursor] != "use":
+            cursor += 1
+            continue
+        cursor += 1
+        groups: list[str] = []
+        while cursor < len(words) and words[cursor] != ";":
+            word = words[cursor]
+            if word == "{":
+                parent = words[cursor - 2] if cursor >= 2 and words[cursor - 1] == "::" else ""
+                groups.append(parent)
+            elif word == "}":
+                if groups:
+                    _ = groups.pop()
+            elif style_footprint.IDENTIFIER.fullmatch(word):
+                previous = words[cursor - 1] if cursor else ""
+                following = words[cursor + 1] if cursor + 1 < len(words) else ""
+                if previous != "as" and following != "::":
+                    if previous == "::" and cursor >= 2:
+                        parents[cursor] = words[cursor - 2]
+                    elif groups and previous in {"{", ","}:
+                        parents[cursor] = groups[-1]
+            cursor += 1
+    return parents
+
+
+def approved_reference_qualifier(
+    words: tuple[str, ...], index: int, use_parents: Mapping[int, str], pair: ApprovedRename,
+) -> bool:
+    parent = words[index - 2] if index >= 2 and words[index - 1] == "::" else use_parents.get(index, "")
+    return parent != "Self" and parent == pair.parent
+
+
+def approved_declaration_sites(words: tuple[str, ...], pair: ApprovedRename) -> frozenset[int]:
+    sites = {index for body in style_footprint.enum_bodies(words) if body.name == pair.parent
+             for index in body.variants if words[index] == pair.old}
+    bodies = list(style_footprint.impl_bodies(words, pair.parent))
+    for index, word in enumerate(words[:-2]):
+        if word in {"mod", "trait"} and words[index + 1] == pair.parent:
+            start = next((i for i in range(index + 2, len(words)) if words[i] in {"{", ";"}), len(words))
+            if start < len(words) and words[start] == "{":
+                bodies.append((start, style_footprint.closing(words, start)))
+    for start, end in bodies:
+        cursor = start + 1
+        while cursor < end:
+            if words[cursor] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
+                if cursor + 1 < end and words[cursor + 1] == pair.old:
+                    sites.add(cursor + 1)
+            if words[cursor] in {"{", "(", "["}:
+                cursor = style_footprint.closing(words, cursor)
+            cursor += 1
+    return frozenset(sites)
+
+
+def unique_rename_mentions(
+    repo: Path, pairs: tuple[ApprovedRename, ...], finding_files: set[str],
+) -> frozenset[ApprovedRename]:
+    """Prove which bare names refer only to the approved item at HEAD."""
+    unique = set(pairs)
+    matching = subprocess.run(
+        ["git", "-C", str(repo), "grep", "-l", "-z", "-w",
+         *(argument for pair in pairs for argument in ("-e", pair.old)), "HEAD", "--", "*.rs"],
+        capture_output=True, text=True, check=False,
+    )
+    if matching.returncode == 1:
+        return frozenset(unique)
+    if matching.returncode:
+        return frozenset()
+    for entry in matching.stdout.split("\0"):
+        if not entry:
+            continue
+        path = entry.removeprefix("HEAD:")
+        source = style_footprint.tokens(git(repo, "show", f"HEAD:{path}"))
+        if any(token.kind == "unknown" for token in source):
+            return frozenset()
+        words = tuple(token.value for token in source)
+        use_parents = use_reference_parents(words)
+        for pair in tuple(unique):
+            declarations = approved_declaration_sites(words, pair) if path in finding_files else frozenset[int]()
+            for index, token in enumerate(source):
+                if token.kind != "identifier" or token.value != pair.old:
+                    continue
+                if approved_reference_qualifier(words, index, use_parents, pair):
+                    continue
+                if path in finding_files:
+                    if index >= 2 and words[index - 2:index] == ("Self", "::"):
+                        continue
+                    if index in declarations:
+                        continue
+                unique.discard(pair)
+                break
+    return frozenset(unique)
+
+
+def approved_word_swaps(
+    before: str, after: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
+) -> bool:
+    """Keep each text part exact except for approved whole identifier words."""
+    parts = r"[A-Za-z0-9_]+|[^A-Za-z0-9_]+"
+    old, new = tuple(re.finditer(parts, before)), tuple(re.finditer(parts, after))
+    if len(old) != len(new):
+        return False
+    for left, right in zip(old, new, strict=True):
+        if left[0] == right[0]:
+            continue
+        qualifier = re.search(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*::\s*$", before[:left.start()])
+        if not any(left[0] == pair.old and right[0] == pair.new
+                   and (qualifier[1] == pair.parent if qualifier else pair in unique) for pair in pairs):
+            return False
+    return True
+
+
+def approved_reference_tokens(
+    before: str, after: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
+) -> bool:
+    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    if (before == after or len(old) != len(new)
+            or len(old) != len(style_footprint.tokens(before))
+            or len(new) != len(style_footprint.tokens(after))):
+        return False
+    words = tuple(span.token.value for span in old)
+    use_parents = use_reference_parents(words)
+    old_cursor = new_cursor = 0
+    for index, (span, target) in enumerate(zip(old, new, strict=True)):
+        # Gaps contain only comments and whitespace; literals stay code tokens.
+        if not approved_word_swaps(before[old_cursor:span.start], after[new_cursor:target.start], pairs, unique):
+            return False
+        old_cursor, new_cursor = span.end, target.end
+        if span.token == target.token:
+            continue
+        if span.token.kind != "identifier" or target.token.kind != "identifier":
+            return False
+        if not any(pair.old == span.token.value and pair.new == target.token.value
+                   and approved_reference_qualifier(words, index, use_parents, pair) for pair in pairs):
+            return False
+    return approved_word_swaps(before[old_cursor:], after[new_cursor:], pairs, unique)
+
+
+def approved_reference_file(
+    repo: Path, path: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
+) -> bool:
+    target = repo / path
+    if not pairs or target.is_symlink() or not target.is_file():
+        return False
+    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
+    if result.returncode:
+        return False
+    try:
+        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return False
+    if target.suffix == ".md":
+        return before != after and approved_word_swaps(before, after, pairs, unique)
+    return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     try:
         with style_ledger.open_ledger(repo) as ledger:
@@ -193,7 +391,14 @@ def gate(repo: Path, ticket_id: str) -> int:
             allowed = {finding.path for finding in findings}
             outside = changed_files(repo) - allowed
             if outside:
-                raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(sorted(outside)))
+                pairs = approved_rename_pairs(findings)
+                unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
+                modified = modified_reference_files(repo)
+                refused = [path for path in sorted(outside)
+                           if path not in modified or not approved_reference_file(repo, path, pairs, unique)]
+                if refused:
+                    raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
+                        f"{path} (change is not an approved rename reference)" for path in refused))
             print("approved proposal")
             return 0
     except (OSError, ValueError, sqlite3.Error) as error:
@@ -616,7 +821,13 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             ]),
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
-        ("Apply the approved findings. Hold other findings: " if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
+        (("Apply the approved findings. "
+          + ("For a rename, find every use through the compiler, not a text search, and update each one "
+             + "in other files. Also update every comment and Markdown doc in the repo that means the "
+             + "renamed item, and leave mentions of other items with the same name. "
+             + "Change nothing else in those files. "
+             if approved_rename_pairs(held_findings) else "")
+          + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
         f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
@@ -665,6 +876,8 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                   if finding.path in ticket["files"] and finding.rule in ticket["rules"]
                   and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
             if ticket["kind"] == "structure" and ticket["cells"] else ())
+    if ticket["kind"] == "proposal":
+        held = style_proposals.issue_findings(ledger, Path(ticket["proposal"]))
     phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
